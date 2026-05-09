@@ -28,31 +28,39 @@ fn create_mvcc_db(io: &Arc<dyn turso_core::io::IO + Send>, path: &Path) -> anyho
 #[derive(Debug)]
 struct RecordingDurableStorage {
     inner: Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>,
-    used_log_tx: std::sync::atomic::AtomicBool,
+    used_log_tx_streaming: std::sync::atomic::AtomicBool,
 }
 
 impl RecordingDurableStorage {
     fn new(inner: Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>) -> Self {
         Self {
             inner,
-            used_log_tx: std::sync::atomic::AtomicBool::new(false),
+            used_log_tx_streaming: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    fn saw_log_tx(&self) -> bool {
-        self.used_log_tx.load(std::sync::atomic::Ordering::SeqCst)
+    fn saw_log_tx_streaming(&self) -> bool {
+        self.used_log_tx_streaming
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
 impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableStorage {
-    fn log_tx(
+    fn log_tx_streaming(
         &self,
-        m: &turso_core::mvcc::database::LogRecord,
-        on_serialization_complete: Option<&dyn Fn(&[u8], u32) -> turso_core::Result<()>>,
+        commit_ts: u64,
+        header: Option<turso_core::storage::sqlite3_ondisk::DatabaseHeader>,
+        visit: &dyn Fn(
+            &mut dyn FnMut(
+                turso_core::mvcc::database::MVTableId,
+                &turso_core::mvcc::database::RowVersion,
+                turso_core::mvcc::database::StampedSidecar,
+            ) -> turso_core::Result<std::ops::ControlFlow<()>>,
+        ) -> turso_core::Result<()>,
     ) -> turso_core::Result<(turso_core::Completion, u64)> {
-        self.used_log_tx
+        self.used_log_tx_streaming
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.inner.log_tx(m, on_serialization_complete)
+        self.inner.log_tx_streaming(commit_ts, header, visit)
     }
 
     fn sync(
@@ -166,8 +174,8 @@ fn test_mvcc_custom_durable_storage_injected(tmp_db: TempDatabase) -> anyhow::Re
 
     // Assert the injected storage was actually used.
     assert!(
-        recording.saw_log_tx(),
-        "expected MVCC commit to call injected DurableStorage::log_tx()"
+        recording.saw_log_tx_streaming(),
+        "expected MVCC commit to call injected DurableStorage::log_tx_streaming()"
     );
 
     conn.close()?;

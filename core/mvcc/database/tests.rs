@@ -2615,10 +2615,10 @@ fn collect_via_visitor(
     sm: &CommitStateMachine<MvccClock>,
     mvcc_store: &Arc<MvStore<MvccClock>>,
     end_ts: u64,
-) -> Vec<(MVTableId, RowVersion)> {
-    let mut yielded: Vec<(MVTableId, RowVersion)> = Vec::new();
-    sm.for_each_committed_image(mvcc_store, end_ts, |canonical, rv| {
-        yielded.push((canonical, rv.clone()));
+) -> Vec<(MVTableId, RowVersion, StampedSidecar)> {
+    let mut yielded: Vec<(MVTableId, RowVersion, StampedSidecar)> = Vec::new();
+    sm.for_each_committed_image(mvcc_store, end_ts, |canonical, rv, sidecar| {
+        yielded.push((canonical, rv.clone(), sidecar));
         Ok(ControlFlow::Continue(()))
     })
     .unwrap();
@@ -2647,7 +2647,7 @@ fn test_for_each_committed_image_visitor_break_short_circuits() {
     let end_ts: u64 = 12345;
 
     let mut count = 0;
-    sm.for_each_committed_image(&db.mvcc_store, end_ts, |_canonical, _rv| {
+    sm.for_each_committed_image(&db.mvcc_store, end_ts, |_canonical, _rv, _sidecar| {
         count += 1;
         if count == 1 {
             Ok(ControlFlow::Break(()))
@@ -2679,10 +2679,11 @@ fn test_for_each_committed_image_visitor_err_propagates() {
     let end_ts: u64 = 12345;
 
     let mut count = 0;
-    let result = sm.for_each_committed_image(&db.mvcc_store, end_ts, |_canonical, _rv| {
-        count += 1;
-        Err::<ControlFlow<()>, _>(LimboError::InternalError("stop".to_string()))
-    });
+    let result =
+        sm.for_each_committed_image(&db.mvcc_store, end_ts, |_canonical, _rv, _sidecar| {
+            count += 1;
+            Err::<ControlFlow<()>, _>(LimboError::InternalError("stop".to_string()))
+        });
 
     assert!(matches!(result, Err(LimboError::InternalError(_))));
     assert_eq!(count, 1, "Err must stop iteration after the first yield");
@@ -2712,11 +2713,103 @@ fn test_for_each_committed_image_canonical_id_reflects_remapping() {
     let yielded = collect_via_visitor(&sm, &db.mvcc_store, end_ts);
 
     assert_eq!(yielded.len(), 1);
-    let (canonical_id, _) = &yielded[0];
+    let (canonical_id, _, _) = &yielded[0];
     assert_eq!(
         *canonical_id,
         MVTableId::from(-(canonical_root_page as i64)),
         "canonical id must be -(root_page)"
+    );
+}
+
+/// `our_committed_image_for` covers the four rows of the Hekaton-stamping
+/// case table from `MVCC_COMMIT_PLAN.md` §1a, including the speculative-end
+/// row. This is the unit-level companion to the e2e test
+/// `test_concurrent_update_then_delete_serializes_correctly_across_restart`.
+///
+/// The speculative-end case is the one that would silently regress if a
+/// future change made `is_delete` field-state-based (`rv.end.is_some()`)
+/// rather than membership-based (`our_end`).
+#[test]
+fn test_our_committed_image_for_case_table() {
+    use super::our_committed_image_for;
+
+    let our_tx_id: TxID = 5;
+    let other_tx_id: TxID = 7;
+    let predecessor_ts: u64 = 50;
+    let end_ts: u64 = 100;
+    let table_id: MVTableId = (-2).into();
+    let row = generate_simple_string_row(table_id, 1, "x");
+
+    let mk = |begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>| RowVersion {
+        id: 1,
+        begin,
+        end,
+        row: row.clone(),
+        btree_resident: false,
+    };
+
+    // Row 1: our_begin && our_end (delete-our-own-insert).
+    let rv = mk(
+        Some(TxTimestampOrID::TxID(our_tx_id)),
+        Some(TxTimestampOrID::TxID(our_tx_id)),
+    );
+    let s = our_committed_image_for(&rv, our_tx_id, end_ts).expect("must yield");
+    assert_eq!(s.stamped_begin, Some(TxTimestampOrID::Timestamp(end_ts)));
+    assert!(s.is_delete);
+
+    // Row 2: our_begin && !our_end with end=None (plain insert).
+    let rv = mk(Some(TxTimestampOrID::TxID(our_tx_id)), None);
+    let s = our_committed_image_for(&rv, our_tx_id, end_ts).expect("must yield");
+    assert_eq!(s.stamped_begin, Some(TxTimestampOrID::Timestamp(end_ts)));
+    assert!(!s.is_delete);
+
+    // Row 2 (speculative-end variant): our_begin && !our_end with
+    // end=Some(TxID(other)). A concurrent tx C has speculatively claimed
+    // our version's `end`. Membership-based `is_delete` must be false: C's
+    // claim is not our contribution.
+    let rv = mk(
+        Some(TxTimestampOrID::TxID(our_tx_id)),
+        Some(TxTimestampOrID::TxID(other_tx_id)),
+    );
+    let s = our_committed_image_for(&rv, our_tx_id, end_ts).expect("must yield");
+    assert_eq!(s.stamped_begin, Some(TxTimestampOrID::Timestamp(end_ts)));
+    assert!(
+        !s.is_delete,
+        "speculative-end (rv.end = TxID(other)) must NOT mark our contribution as delete; \
+         a field-state-based `rv.end.is_some()` would regress this case"
+    );
+
+    // Row 3: !our_begin && our_end (delete of pre-existing committed version).
+    let rv = mk(
+        Some(TxTimestampOrID::Timestamp(predecessor_ts)),
+        Some(TxTimestampOrID::TxID(our_tx_id)),
+    );
+    let s = our_committed_image_for(&rv, our_tx_id, end_ts).expect("must yield");
+    assert_eq!(
+        s.stamped_begin,
+        Some(TxTimestampOrID::Timestamp(predecessor_ts)),
+        "end-only contribution must keep predecessor's begin unchanged"
+    );
+    assert!(s.is_delete);
+
+    // Row 3 (B-tree tombstone variant): !our_begin && our_end with
+    // begin=None (insert_tombstone_to_table_or_index path).
+    let rv = mk(None, Some(TxTimestampOrID::TxID(our_tx_id)));
+    let s = our_committed_image_for(&rv, our_tx_id, end_ts).expect("must yield");
+    assert_eq!(
+        s.stamped_begin, None,
+        "B-tree tombstone keeps stamped_begin = None"
+    );
+    assert!(s.is_delete);
+
+    // Row 4: !our_begin && !our_end (someone else's chain entry — skip).
+    let rv = mk(
+        Some(TxTimestampOrID::Timestamp(predecessor_ts)),
+        Some(TxTimestampOrID::TxID(other_tx_id)),
+    );
+    assert!(
+        our_committed_image_for(&rv, our_tx_id, end_ts).is_none(),
+        "non-contributing chain entry must not yield"
     );
 }
 

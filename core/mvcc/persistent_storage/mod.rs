@@ -6,62 +6,36 @@ use crate::sync::RwLock;
 use std::fmt::Debug;
 
 pub mod logical_log;
-use crate::mvcc::database::{LogRecord, MVTableId, RowVersion};
+use crate::mvcc::database::{MVTableId, RowVersion, StampedSidecar};
 use crate::mvcc::persistent_storage::logical_log::{
-    LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
+    LogicalLog, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
 };
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::{CheckpointResult, Completion, File, Result};
 use std::ops::ControlFlow;
 
 pub trait DurableStorage: Send + Sync + Debug {
-    /// Write a transaction to the logical log without advancing the writer offset.
-    ///
-    /// If `on_serialization_complete` is provided, it is called with a zero-copy
-    /// reference to the serialized frame bytes and the running CRC after
-    /// serialization but before the disk write. The callback runs while the
-    /// internal write lock is held, so it should be fast (e.g. memcpy to a side
-    /// buffer).
-    fn log_tx(
-        &self,
-        m: &LogRecord,
-        on_serialization_complete: OnSerializationComplete<'_>,
-    ) -> Result<(Completion, u64)>;
-
     /// Stream a transaction's log frame using a visitor-driven two-pass
     /// emitter. The visitor is invoked twice (size pass, emit pass) and must
-    /// produce the same sequence of `(canonical_table_id, &RowVersion)`
-    /// pairs each time.
+    /// produce the same `(canonical_table_id, &RowVersion, StampedSidecar)`
+    /// triples on both passes. The sidecar carries the Hekaton-stamped
+    /// `is_delete` and `stamped_begin` so the serializer never reads the
+    /// raw chain entry's `end` (avoiding the speculative-end miscoding
+    /// described in `MVCC_COMMIT_PLAN.md` §1a).
     ///
-    /// The default impl falls back to building a [`LogRecord`] in memory and
-    /// dispatching through [`Self::log_tx`] — the legacy single-`pwrite`
-    /// path — so external trait implementors (e.g. `RecordingDurableStorage`
-    /// in integration tests) keep working without changes. The concrete
-    /// `Storage` impl overrides this to drive the streaming `pwrite/pwritev`
-    /// path that avoids the per-frame `LogRecord` clone and the
-    /// `write_buf.to_vec()` copy. See `MVCC_COMMIT_IMPL_STEPS_V2.md`
-    /// step A.4.
+    /// This is the only required method on the trait. There is intentionally
+    /// no `log_tx(&LogRecord)` fallback: a default that built a `LogRecord`
+    /// from raw chain entries would lose the sidecar's `is_delete` membership
+    /// information and silently emit `OP_DELETE_*` for the speculative-end
+    /// case.
     fn log_tx_streaming(
         &self,
         commit_ts: u64,
         header: Option<DatabaseHeader>,
         visit: &dyn Fn(
-            &mut dyn FnMut(MVTableId, &RowVersion) -> Result<ControlFlow<()>>,
+            &mut dyn FnMut(MVTableId, &RowVersion, StampedSidecar) -> Result<ControlFlow<()>>,
         ) -> Result<()>,
-    ) -> Result<(Completion, u64)> {
-        let mut log_record = LogRecord {
-            tx_timestamp: commit_ts,
-            row_versions: Vec::new(),
-            header,
-        };
-        visit(&mut |canonical_id, rv| {
-            let mut cloned = rv.clone();
-            cloned.row.id.table_id = canonical_id;
-            log_record.row_versions.push(cloned);
-            Ok(ControlFlow::Continue(()))
-        })?;
-        self.log_tx(&log_record, None)
-    }
+    ) -> Result<(Completion, u64)>;
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
 
@@ -142,22 +116,12 @@ impl Storage {
 }
 
 impl DurableStorage for Storage {
-    fn log_tx(
-        &self,
-        m: &LogRecord,
-        on_serialization_complete: OnSerializationComplete<'_>,
-    ) -> Result<(Completion, u64)> {
-        self.logical_log
-            .write()
-            .log_tx_deferred_offset(m, on_serialization_complete)
-    }
-
     fn log_tx_streaming(
         &self,
         commit_ts: u64,
         header: Option<DatabaseHeader>,
         visit: &dyn Fn(
-            &mut dyn FnMut(MVTableId, &RowVersion) -> Result<ControlFlow<()>>,
+            &mut dyn FnMut(MVTableId, &RowVersion, StampedSidecar) -> Result<ControlFlow<()>>,
         ) -> Result<()>,
     ) -> Result<(Completion, u64)> {
         // Drive the streaming path: pass-1 sizing, allocate `Arc<Buffer>`

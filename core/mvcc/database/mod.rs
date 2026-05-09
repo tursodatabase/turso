@@ -348,12 +348,55 @@ pub struct LogRecord {
 /// phase of the transaction. During the active phase, new versions track the
 /// transaction ID in the `begin` and `end` fields. After a transaction commits,
 /// versions switch to tracking timestamps.
-#[derive(Clone, Debug, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub enum TxTimestampOrID {
     /// A committed transaction's timestamp.
     Timestamp(u64),
     /// The ID of a non-committed transaction.
     TxID(TxID),
+}
+
+/// Hekaton §3.6 stamping projection used by the MVCC commit-path visitor.
+///
+/// The streaming commit emitter walks chain `RowVersion`s by reference and
+/// passes a `StampedSidecar` alongside each yield instead of cloning and
+/// mutating `begin`/`end` in place.
+///
+/// **Membership-based, not field-state-based.**
+/// `is_delete` is computed from membership (`our_end ≡ rv.end ==
+/// Some(TxID(our_tx_id))`), *not* from `rv.end.is_some()`. The distinction
+/// matters in the speculative-end case: a concurrent transaction C may have
+/// claimed the version's `end` slot (`end = Some(TxID(C))`) while our commit
+/// is in flight; that is C's contribution, not ours, and our log frame must
+/// emit an `OP_UPSERT_*`, not an `OP_DELETE_*`. A future "simplification"
+/// that reads `rv.end.is_some()` here would silently regress that case.
+#[derive(Copy, Clone, Debug)]
+pub struct StampedSidecar {
+    /// `begin` after stamping. `Some(Timestamp(end_ts))` when `our_begin`;
+    /// otherwise the chain entry's existing `begin` (which is `None` for
+    /// B-tree tombstones written via
+    /// [`MvStore::insert_tombstone_to_table_or_index`]).
+    pub stamped_begin: Option<TxTimestampOrID>,
+    /// True iff our transaction wrote the `end` slot (`our_end`).
+    pub is_delete: bool,
+}
+
+impl StampedSidecar {
+    /// Derive a sidecar from a `RowVersion` whose `begin`/`end` are already
+    /// in committed (`Timestamp(_)`) form — i.e., not a raw chain entry.
+    ///
+    /// This helper is for legacy callers that serialize a [`LogRecord`]
+    /// (already-stamped versions held by value), not for the streaming
+    /// commit emitter. The streaming emitter MUST use
+    /// [`our_committed_image_for`] instead, because `rv.end.is_some()` on a
+    /// raw chain entry can include a concurrent tx's speculative claim and
+    /// would produce a spurious DELETE.
+    pub fn from_already_stamped(rv: &RowVersion) -> Self {
+        Self {
+            stamped_begin: rv.begin,
+            is_delete: rv.end.is_some(),
+        }
+    }
 }
 
 /// Tracks versions created/modified during a savepoint for rollback.
@@ -1024,12 +1067,19 @@ pub struct DeleteRowStateMachine {
 }
 
 /// Apply Hekaton §3.6 timestamp stamping to a chain `RowVersion`, returning
-/// the committed image our transaction must log, or `None` if our tx did not
-/// contribute to this version.
+/// a [`StampedSidecar`] our transaction must yield, or `None` if our tx did
+/// not contribute to this version.
 ///
-/// Used by [`CommitStateMachine::for_each_committed_image`] to build the
-/// stamped image yielded to the streaming log emitter.
-fn our_committed_image_for(rv: &RowVersion, our_tx_id: TxID, end_ts: u64) -> Option<RowVersion> {
+/// Used by [`CommitStateMachine::for_each_committed_image`] (via
+/// [`visit_committed_for_id`]) to drive the streaming log emitter without
+/// cloning the chain entry. The visitor sink consumes both the borrowed
+/// `&RowVersion` (for `row.id` / payload) and the sidecar (for `is_delete`
+/// and `stamped_begin`).
+fn our_committed_image_for(
+    rv: &RowVersion,
+    our_tx_id: TxID,
+    end_ts: u64,
+) -> Option<StampedSidecar> {
     let our_begin = matches!(
         rv.begin,
         Some(TxTimestampOrID::TxID(vid)) if vid == our_tx_id
@@ -1041,20 +1091,23 @@ fn our_committed_image_for(rv: &RowVersion, our_tx_id: TxID, end_ts: u64) -> Opt
     if !our_begin && !our_end {
         return None;
     }
-    let mut committed = rv.clone();
-    if our_begin {
-        committed.begin = Some(TxTimestampOrID::Timestamp(end_ts));
-        if !our_end {
-            // A concurrent tx may have speculatively claimed this row's `end`
-            // (Hekaton §3.1, "check updatability"). That deletion is its
-            // contribution, not ours; clear it so we serialize an OP_UPSERT.
-            committed.end = None;
-        }
-    }
-    if our_end {
-        committed.end = Some(TxTimestampOrID::Timestamp(end_ts));
-    }
-    Some(committed)
+    // Stamping rules (Hekaton §3.6):
+    //   our_begin               -> stamped_begin = Some(Timestamp(end_ts))
+    //   !our_begin && our_end   -> stamped_begin unchanged (predecessor's begin,
+    //                              or `None` for B-tree tombstones written by
+    //                              `insert_tombstone_to_table_or_index`)
+    // The speculative-end case (our_begin && !our_end with `end = Some(TxID(C))`)
+    // is captured by `is_delete = our_end`: C's claim is *not* our contribution,
+    // so we serialize an OP_UPSERT.
+    let stamped_begin = if our_begin {
+        Some(TxTimestampOrID::Timestamp(end_ts))
+    } else {
+        rv.begin
+    };
+    Some(StampedSidecar {
+        stamped_begin,
+        is_delete: our_end,
+    })
 }
 
 /// Resolve a `MVTableId` to its canonical (root-page-derived) form so that
@@ -1080,14 +1133,69 @@ fn canonical_table_id_for<C: LogicalClock>(
     table_id
 }
 
-/// Walk one `RowID`'s chains (table chain in `mvcc_store.rows` and, if it is
-/// an index entry, the index chain in `mvcc_store.index_rows`), build each
-/// stamped committed image, apply the same equal-`Timestamp(x)`-begin
-/// collapse rule as [`MvStore::insert_version_raw`], and yield each
-/// surviving image to `visit`.
+thread_local! {
+    /// Re-entrancy detector for [`visit_committed_for_id`]. Set true while a
+    /// chain `RwLockReadGuard` is held and `visit` is being called; cleared on
+    /// guard release. A nested `visit_committed_for_id` from inside `visit`
+    /// would today silently deadlock on the same RowID's `RwLock`; this
+    /// thread-local turns it into a debuggable assertion.
+    static IN_VISIT_COMMITTED_FOR_ID: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard for [`IN_VISIT_COMMITTED_FOR_ID`]. Asserts the flag is clear on
+/// acquire and clears it on drop. See `visit_committed_for_id` and
+/// `MVCC_COMMIT_PLAN.md` §1d.
+struct VisitCommittedReentrancyGuard;
+
+impl VisitCommittedReentrancyGuard {
+    fn acquire() -> Self {
+        IN_VISIT_COMMITTED_FOR_ID.with(|cell| {
+            turso_assert!(
+                !cell.get(),
+                "visit_committed_for_id called re-entrantly: visitors must not re-enter mvcc_store while a chain read guard is held"
+            );
+            cell.set(true);
+        });
+        Self
+    }
+}
+
+impl Drop for VisitCommittedReentrancyGuard {
+    fn drop(&mut self) {
+        IN_VISIT_COMMITTED_FOR_ID.with(|cell| cell.set(false));
+    }
+}
+
+/// Walk one `RowID`'s chain (the table chain in `mvcc_store.rows` for
+/// `RowKey::Int`, the index chain in `mvcc_store.index_rows` for
+/// `RowKey::Record`), classify each yielding entry into the two-slot
+/// sentinel, and yield the surviving images to `visit`.
 ///
-/// The chain `RwLockReadGuard` is dropped before any `visit` call so the
-/// visitor can re-enter the MVCC store without risking a deadlock.
+/// **Two-slot sentinel.** A single tx can contribute at most two yielding
+/// entries on one RowID:
+/// - the `end_only` slot (`!our_begin && our_end`) — our delete of a
+///   pre-existing committed version. Its `stamped_begin` is the predecessor's
+///   timestamp.
+/// - the `our_begin` slot (`our_begin`, with or without `our_end`) — our
+///   insert/upsert (or delete-then-reinsert tombstone collapsed via
+///   "latest wins" within the same `Timestamp(end_ts)` family).
+///
+/// A chain cannot produce two `end_only` entries because at most one chain
+/// entry has `end = None` at any time (the chain is a totally-ordered
+/// version history).
+///
+/// **Lock-hold contract.** `visit` is invoked while the chain
+/// `RwLockReadGuard` is still held — the borrowed `&RowVersion` lives in the
+/// guarded `Vec<RowVersion>`. Callers MUST NOT re-enter `mvcc_store` for the
+/// same RowID from inside `visit`; doing so would deadlock on the same
+/// `RwLock`. Re-entrant access to *other* RowIDs is documented as permitted
+/// by the contract, but the runtime [`VisitCommittedReentrancyGuard`] is
+/// stricter: it rejects *any* nested `visit_committed_for_id` call from
+/// inside `visit`. That conservatism catches future visitors (recovery
+/// replay, encrypted-streaming readers) that accidentally re-enter; if a
+/// legitimate cross-RowID re-entry use case appears, revisit the guard's
+/// strictness.
 fn visit_committed_for_id<Clock: LogicalClock, F>(
     our_tx_id: TxID,
     mvcc_store: &Arc<MvStore<Clock>>,
@@ -1096,67 +1204,97 @@ fn visit_committed_for_id<Clock: LogicalClock, F>(
     visit: &mut F,
 ) -> Result<ControlFlow<()>>
 where
-    F: FnMut(MVTableId, &RowVersion) -> Result<ControlFlow<()>>,
+    F: FnMut(MVTableId, &RowVersion, StampedSidecar) -> Result<ControlFlow<()>>,
 {
-    // Buffer images for THIS RowID's chains so we can apply the collapse
-    // rule before yielding. Typical workloads put 1–2 entries here; the
-    // legacy path holds clones for ALL rows simultaneously in
-    // `LogRecord.row_versions`, so even with the local buffer the peak heap
-    // is bounded by the largest single chain instead of the whole tx.
-    let mut buffer: Vec<(MVTableId, RowVersion)> = Vec::new();
+    let _reentrancy_guard = VisitCommittedReentrancyGuard::acquire();
 
-    let push_with_collapse =
-        |buf: &mut Vec<(MVTableId, RowVersion)>, canonical: MVTableId, stamped: RowVersion| {
-            if let Some(idx) = buf.iter().position(|(_, existing)| {
-                existing.row.id == stamped.row.id
-                    && matches!(
-                        (&existing.begin, &stamped.begin),
-                        (
-                            Some(TxTimestampOrID::Timestamp(a)),
-                            Some(TxTimestampOrID::Timestamp(b)),
-                        ) if a == b
-                    )
-            }) {
-                buf[idx] = (canonical, stamped);
-            } else {
-                buf.push((canonical, stamped));
-            }
-        };
-
-    if let Some(row_versions) = mvcc_store.rows.get(id) {
-        let row_versions = row_versions.value().read();
-        for rv in row_versions.iter() {
-            if let Some(stamped) = our_committed_image_for(rv, our_tx_id, end_ts) {
-                let canonical = canonical_table_id_for(mvcc_store, stamped.row.id.table_id);
-                push_with_collapse(&mut buffer, canonical, stamped);
-            }
-        }
-    }
-    if let Some(index) = mvcc_store.index_rows.get(&id.table_id) {
-        let RowKey::Record(ref index_key) = id.row_id else {
-            panic!("Index writes must have a record key");
-        };
-        if let Some(row_versions) = index.value().get(index_key) {
+    // Discriminate on the `RowKey` variant directly: future RowKey-shape
+    // changes must not silently bypass the sentinel by entering both
+    // branches or neither.
+    match &id.row_id {
+        RowKey::Int(_) => {
+            let Some(row_versions) = mvcc_store.rows.get(id) else {
+                return Ok(ControlFlow::Continue(()));
+            };
             let row_versions = row_versions.value().read();
-            for rv in row_versions.iter() {
-                if let Some(stamped) = our_committed_image_for(rv, our_tx_id, end_ts) {
-                    let canonical = canonical_table_id_for(mvcc_store, stamped.row.id.table_id);
-                    push_with_collapse(&mut buffer, canonical, stamped);
-                }
-            }
+            collect_and_flush_sentinel(
+                our_tx_id,
+                mvcc_store,
+                end_ts,
+                row_versions.iter(),
+                visit,
+            )
+        }
+        RowKey::Record(index_key) => {
+            let Some(index) = mvcc_store.index_rows.get(&id.table_id) else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let index = index.value();
+            let Some(row_versions) = index.get(index_key) else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let row_versions = row_versions.value().read();
+            collect_and_flush_sentinel(
+                our_tx_id,
+                mvcc_store,
+                end_ts,
+                row_versions.iter(),
+                visit,
+            )
         }
     }
+}
 
-    // Match `insert_version_raw`'s ordering: sort by resolved begin so that
-    // older Timestamp begins (our-end-only contributions over predecessor
-    // versions) come before our-begin contributions stamped at end_ts.
-    buffer.sort_by_key(|(_, rv)| match rv.begin {
-        Some(TxTimestampOrID::Timestamp(ts)) => ts,
-        Some(TxTimestampOrID::TxID(_)) | None => 0,
-    });
-
-    for (canonical, stamped) in &buffer {
-        if visit(*canonical, stamped)?.is_break() {
+/// Two-slot sentinel walk over a single chain. Borrows from the caller's
+/// chain read guard via the `&'a RowVersion` iterator; flushes both slots
+/// (end_only first, then our_begin) while the guard is still live.
+fn collect_and_flush_sentinel<'a, Clock, I, F>(
+    our_tx_id: TxID,
+    mvcc_store: &Arc<MvStore<Clock>>,
+    end_ts: u64,
+    chain: I,
+    visit: &mut F,
+) -> Result<ControlFlow<()>>
+where
+    Clock: LogicalClock,
+    I: Iterator<Item = &'a RowVersion>,
+    F: FnMut(MVTableId, &RowVersion, StampedSidecar) -> Result<ControlFlow<()>>,
+{
+    let mut end_only: Option<(MVTableId, &'a RowVersion, StampedSidecar)> = None;
+    let mut our_begin: Option<(MVTableId, &'a RowVersion, StampedSidecar)> = None;
+    for rv in chain {
+        let Some(sidecar) = our_committed_image_for(rv, our_tx_id, end_ts) else {
+            continue;
+        };
+        let canonical = canonical_table_id_for(mvcc_store, rv.row.id.table_id);
+        // `stamped_begin == Some(Timestamp(end_ts))` ⇔ our_begin slot
+        // (our_committed_image_for sets `Some(Timestamp(end_ts))` only when
+        // our_begin; otherwise it leaves `rv.begin` as-is, which can be
+        // `None` for B-tree tombstones). Anything else lands in the
+        // end_only slot. `latest wins` falls out naturally: the our_begin
+        // slot is overwritten on the second matching entry, which
+        // reproduces the existing equal-`Timestamp(end_ts)` collapse for
+        // the in-tx INSERT-then-UPDATE case.
+        let is_our_begin_slot = matches!(
+            sidecar.stamped_begin,
+            Some(TxTimestampOrID::Timestamp(ts)) if ts == end_ts
+        );
+        if is_our_begin_slot {
+            our_begin = Some((canonical, rv, sidecar));
+        } else {
+            end_only = Some((canonical, rv, sidecar));
+        }
+    }
+    // Flush order: end_only first, then our_begin. Matches the order the
+    // legacy buffer-then-sort-by-begin path produced (older Timestamp begins
+    // come before Timestamp(end_ts)).
+    if let Some((canonical, rv, sidecar)) = end_only {
+        if visit(canonical, rv, sidecar)?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+    }
+    if let Some((canonical, rv, sidecar)) = our_begin {
+        if visit(canonical, rv, sidecar)?.is_break() {
             return Ok(ControlFlow::Break(()));
         }
     }
@@ -1473,7 +1611,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         mut visit: F,
     ) -> Result<()>
     where
-        F: FnMut(MVTableId, &RowVersion) -> Result<ControlFlow<()>>,
+        F: FnMut(MVTableId, &RowVersion, StampedSidecar) -> Result<ControlFlow<()>>,
     {
         for id in self
             .write_set
@@ -1859,7 +1997,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     None
                 };
                 let mut has_row_writes = false;
-                self.for_each_committed_image(mvcc_store, end_ts, |_id, _rv| {
+                self.for_each_committed_image(mvcc_store, end_ts, |_id, _rv, _sidecar| {
                     has_row_writes = true;
                     Ok(ControlFlow::Break(()))
                 })?;
@@ -1904,14 +2042,17 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let header_snapshot = *header;
                 // The streaming emitter walks `for_each_committed_image` twice
                 // (size + emit). The visitor is `Fn`, so each call rebuilds
-                // the per-row stamped images on the fly — the LogRecord clone
-                // and its inner `Vec<RowVersion>` are gone.
+                // the per-row sidecar on the fly — the LogRecord clone and
+                // its inner `Vec<RowVersion>` are gone.
                 let visitor = |sink: &mut dyn FnMut(
                     MVTableId,
                     &RowVersion,
+                    StampedSidecar,
                 ) -> Result<ControlFlow<()>>|
                  -> Result<()> {
-                    self.for_each_committed_image(mvcc_store, end_ts, |id, rv| sink(id, rv))
+                    self.for_each_committed_image(mvcc_store, end_ts, |id, rv, sidecar| {
+                        sink(id, rv, sidecar)
+                    })
                 };
                 let (c, append_bytes) =
                     mvcc_store

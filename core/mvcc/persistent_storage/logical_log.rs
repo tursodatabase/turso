@@ -220,7 +220,9 @@ use crate::sync::RwLock;
 use crate::turso_assert;
 use crate::{
     io::ReadComplete,
-    mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
+    mvcc::database::{
+        LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey, StampedSidecar,
+    },
     storage::sqlite3_ondisk::{
         read_varint, read_varint_partial, varint_len, write_varint_to_vec, DatabaseHeader,
     },
@@ -671,10 +673,22 @@ impl LogicalLog {
         // *use* this number to pre-size streaming chunks; here we only assert
         // that the size helpers stay byte-exact with serialize_op_entry /
         // serialize_header_entry so the streaming path can rely on them.
+        //
+        // `LogRecord.row_versions` always carries already-stamped versions
+        // (`begin`/`end` either `None` or `Timestamp(_)`), so deriving the
+        // sidecar via [`StampedSidecar::from_already_stamped`] here is sound;
+        // it would NOT be sound on raw chain entries (see the streaming
+        // commit path).
         let predicted_payload_size: u64 = tx
             .row_versions
             .iter()
-            .map(|rv| serialized_op_size(rv, rv.row.id.table_id) as u64)
+            .map(|rv| {
+                serialized_op_size(
+                    rv,
+                    rv.row.id.table_id,
+                    StampedSidecar::from_already_stamped(rv),
+                ) as u64
+            })
             .sum::<u64>()
             + if tx.header.is_some() {
                 serialized_header_size() as u64
@@ -685,15 +699,11 @@ impl LogicalLog {
         if let Some(enc_ctx) = &self.encryption_ctx {
             self.encryption_scratch_buffer.clear();
             for row_version in &tx.row_versions {
-                // Callers of `log_tx(&LogRecord)` (the default
-                // `DurableStorage::log_tx_streaming` shim, used by external
-                // impls like `RecordingDurableStorage`) already wrote the
-                // canonical id into `row.id.table_id` while building the
-                // record, so passing it as the sidecar is a no-op rebind.
                 serialize_op_entry(
                     &mut self.encryption_scratch_buffer,
                     row_version,
                     row_version.row.id.table_id,
+                    StampedSidecar::from_already_stamped(row_version),
                 )?;
             }
             if let Some(hdr) = tx.header {
@@ -768,6 +778,7 @@ impl LogicalLog {
                     &mut self.write_buf,
                     row_version,
                     row_version.row.id.table_id,
+                    StampedSidecar::from_already_stamped(row_version),
                 )?;
             }
             if let Some(header) = tx.header {
@@ -830,7 +841,9 @@ impl LogicalLog {
         visit: V,
     ) -> Result<(Completion, u64)>
     where
-        V: Fn(&mut dyn FnMut(MVTableId, &RowVersion) -> Result<ControlFlow<()>>) -> Result<()>,
+        V: Fn(
+            &mut dyn FnMut(MVTableId, &RowVersion, StampedSidecar) -> Result<ControlFlow<()>>,
+        ) -> Result<()>,
     {
         // --- Optional log header on the very first append. ---
         let is_first_write = self.offset == 0;
@@ -856,10 +869,10 @@ impl LogicalLog {
         let mut payload_size_acc: u64 = 0;
         let pass1_overflow =
             || LimboError::InternalError("log_tx_streaming size overflow".to_string());
-        visit(&mut |canonical_table_id, rv| {
+        visit(&mut |canonical_table_id, rv, sidecar| {
             op_count_acc = op_count_acc.checked_add(1).ok_or_else(pass1_overflow)?;
             payload_size_acc = payload_size_acc
-                .checked_add(serialized_op_size(rv, canonical_table_id) as u64)
+                .checked_add(serialized_op_size(rv, canonical_table_id, sidecar) as u64)
                 .ok_or_else(pass1_overflow)?;
             Ok(ControlFlow::Continue(()))
         })?;
@@ -915,8 +928,8 @@ impl LogicalLog {
             self.encryption_scratch_buffer
                 .reserve(payload_size as usize);
             let scratch = &mut self.encryption_scratch_buffer;
-            visit(&mut |canonical_table_id, rv| {
-                serialize_op_entry(scratch, rv, canonical_table_id)?;
+            visit(&mut |canonical_table_id, rv, sidecar| {
+                serialize_op_entry(scratch, rv, canonical_table_id, sidecar)?;
                 Ok(ControlFlow::Continue(()))
             })?;
             if let Some(hdr) = header.as_ref() {
@@ -976,9 +989,9 @@ impl LogicalLog {
             let mut op_scratch: Vec<u8> = Vec::with_capacity(64);
             let chunks_ref = &chunks;
             let cursor_cell = std::cell::Cell::new(payload_offset);
-            visit(&mut |canonical_table_id, rv| {
+            visit(&mut |canonical_table_id, rv, sidecar| {
                 op_scratch.clear();
-                serialize_op_entry(&mut op_scratch, rv, canonical_table_id)?;
+                serialize_op_entry(&mut op_scratch, rv, canonical_table_id, sidecar)?;
                 let pos = cursor_cell.get();
                 write_at_in_chunks(chunks_ref, pos, &op_scratch);
                 cursor_cell.set(pos + op_scratch.len());
@@ -1126,13 +1139,19 @@ impl LogicalLog {
 
 /// Serialize one op into `buffer`.
 /// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
+///
+/// `sidecar.is_delete` is membership-based (does *our* tx own the chain
+/// entry's `end`?), not a read of `row_version.end.is_some()`. See the doc
+/// on [`StampedSidecar`] for why this distinction matters in the
+/// speculative-end case.
 fn serialize_op_entry(
     buffer: &mut Vec<u8>,
     row_version: &RowVersion,
     canonical_table_id: MVTableId,
+    sidecar: StampedSidecar,
 ) -> Result<()> {
     let start_len = buffer.len();
-    let is_delete = row_version.end.is_some();
+    let is_delete = sidecar.is_delete;
     let tag = match (&row_version.row.id.row_id, is_delete) {
         (RowKey::Int(_), false) => OP_UPSERT_TABLE,
         (RowKey::Int(_), true) => OP_DELETE_TABLE,
@@ -1201,11 +1220,17 @@ fn serialize_op_entry(
         }
     }
 
-    debug_assert_eq!(
-        buffer.len() - start_len,
-        serialized_op_size(row_version, canonical_table_id),
-        "serialize_op_entry / serialized_op_size byte-count drift for {:?}",
-        row_version.row.id,
+    // Promoted from `debug_assert_eq!`: a release-mode disagreement between
+    // size pass and emit pass under-allocates the streaming chunks, so
+    // `extend_from_slice` reallocates and the trailer offset baked into
+    // `total_frame_size` is wrong — the result is a CRC mismatch on log
+    // replay (a frame that looked committed but fails recovery). Strictly
+    // worse than a panic; see `MVCC_COMMIT_PLAN.md` §1b.
+    let actual = buffer.len() - start_len;
+    let predicted = serialized_op_size(row_version, canonical_table_id, sidecar);
+    turso_assert!(
+        actual == predicted,
+        "serialize_op_entry / serialized_op_size byte-count drift (actual={actual}, predicted={predicted})"
     );
     Ok(())
 }
@@ -1214,11 +1239,21 @@ fn serialize_op_entry(
 ///
 /// `canonical_table_id` is unused for size accounting — `table_id` is a fixed
 /// 4-byte `i32` regardless of value — but appears in the signature for parity
-/// with the canonical-id sidecar that A.3 will plumb through the streaming path
-/// (see `MVCC_COMMIT_IMPL_STEPS_V2.md`). The size is determined entirely by the
-/// op tag (delete vs upsert, table vs index) and the payload length.
-fn serialized_op_size(rv: &RowVersion, _canonical_table_id: MVTableId) -> usize {
-    let is_delete = rv.end.is_some();
+/// with the canonical-id sidecar threaded through the streaming path. The
+/// size is determined entirely by the op tag (delete vs upsert, table vs
+/// index) and the payload length.
+///
+/// `sidecar.is_delete` is the same membership-based bit consumed by
+/// [`serialize_op_entry`]; this is a correctness requirement (not signature
+/// parity) because for `RowKey::Int` the on-disk payload size depends on
+/// `is_delete`. The size pass and emit pass MUST see the same bit, or the
+/// frame is mis-sized.
+fn serialized_op_size(
+    rv: &RowVersion,
+    _canonical_table_id: MVTableId,
+    sidecar: StampedSidecar,
+) -> usize {
+    let is_delete = sidecar.is_delete;
     let payload_len = match (&rv.row.id.row_id, is_delete) {
         (RowKey::Int(rowid), false) => varint_len(*rowid as u64) + rv.row.payload().len(),
         (RowKey::Int(rowid), true) => varint_len(*rowid as u64),
@@ -2726,7 +2761,7 @@ mod tests {
     use crate::{
         mvcc::database::{
             tests::{commit_tx, generate_simple_string_row, MvccTestDbNoConn},
-            LogRecord, MVTableId, Row, RowID, RowKey, SortableIndexKey,
+            LogRecord, MVTableId, Row, RowID, RowKey, SortableIndexKey, StampedSidecar,
         },
         schema::Table,
         storage::sqlite3_ondisk::{
@@ -4786,7 +4821,13 @@ mod tests {
         let mut encoded = Vec::new();
         let value = "x".repeat(text_len);
         let row_version = make_test_row_version((-2).into(), rowid, &value, 100);
-        serialize_op_entry(&mut encoded, &row_version, row_version.row.id.table_id).unwrap();
+        serialize_op_entry(
+            &mut encoded,
+            &row_version,
+            row_version.row.id.table_id,
+            StampedSidecar::from_already_stamped(&row_version),
+        )
+        .unwrap();
         encoded.len()
     }
 
@@ -4825,8 +4866,9 @@ mod tests {
 
         for rv in &fixtures {
             let mut buf = Vec::new();
-            serialize_op_entry(&mut buf, rv, rv.row.id.table_id).unwrap();
-            let predicted = serialized_op_size(rv, rv.row.id.table_id);
+            let sidecar = StampedSidecar::from_already_stamped(rv);
+            serialize_op_entry(&mut buf, rv, rv.row.id.table_id, sidecar).unwrap();
+            let predicted = serialized_op_size(rv, rv.row.id.table_id, sidecar);
             assert_eq!(
                 buf.len(),
                 predicted,
@@ -4895,7 +4937,11 @@ mod tests {
     fn write_via_streaming(log: &mut LogicalLog, tx: &LogRecord) -> (Completion, u64) {
         log.log_tx_streaming_inner(tx.tx_timestamp, tx.header, |sink| {
             for rv in &tx.row_versions {
-                if matches!(sink(rv.row.id.table_id, rv)?, ControlFlow::Break(())) {
+                let sidecar = StampedSidecar::from_already_stamped(rv);
+                if matches!(
+                    sink(rv.row.id.table_id, rv, sidecar)?,
+                    ControlFlow::Break(())
+                ) {
                     return Ok(());
                 }
             }
@@ -5099,7 +5145,11 @@ mod tests {
                 if visit_count.get() == 3 {
                     return Err(LimboError::InternalError(sentinel.to_string()));
                 }
-                if matches!(sink(rv.row.id.table_id, rv)?, ControlFlow::Break(())) {
+                let sidecar = StampedSidecar::from_already_stamped(rv);
+                if matches!(
+                    sink(rv.row.id.table_id, rv, sidecar)?,
+                    ControlFlow::Break(())
+                ) {
                     return Ok(());
                 }
             }
@@ -5526,12 +5576,19 @@ mod tests {
         chunk_size: usize,
     ) {
         let mut filler_buf = Vec::new();
-        serialize_op_entry(&mut filler_buf, short_filler, short_filler.row.id.table_id).unwrap();
+        serialize_op_entry(
+            &mut filler_buf,
+            short_filler,
+            short_filler.row.id.table_id,
+            StampedSidecar::from_already_stamped(short_filler),
+        )
+        .unwrap();
         let mut short_upsert_buf = Vec::new();
         serialize_op_entry(
             &mut short_upsert_buf,
             short_upsert,
             short_upsert.row.id.table_id,
+            StampedSidecar::from_already_stamped(short_upsert),
         )
         .unwrap();
         let mut long_upsert_buf = Vec::new();
@@ -5539,6 +5596,7 @@ mod tests {
             &mut long_upsert_buf,
             long_upsert,
             long_upsert.row.id.table_id,
+            StampedSidecar::from_already_stamped(long_upsert),
         )
         .unwrap();
 
@@ -5594,6 +5652,7 @@ mod tests {
             &mut short_upsert_buf,
             &short_upsert,
             short_upsert.row.id.table_id,
+            StampedSidecar::from_already_stamped(&short_upsert),
         )
         .unwrap();
         turso_assert_less_than!(
@@ -6206,11 +6265,23 @@ mod tests {
         let expected_second_record_bytes = second.row.payload().to_vec();
 
         let mut filler_buf = Vec::new();
-        serialize_op_entry(&mut filler_buf, &filler, filler.row.id.table_id).unwrap();
+        serialize_op_entry(
+            &mut filler_buf,
+            &filler,
+            filler.row.id.table_id,
+            StampedSidecar::from_already_stamped(&filler),
+        )
+        .unwrap();
         assert_eq!(filler_buf.len(), ENCRYPTED_PAYLOAD_CHUNK_SIZE - 7);
 
         let mut second_buf = Vec::new();
-        serialize_op_entry(&mut second_buf, &second, second.row.id.table_id).unwrap();
+        serialize_op_entry(
+            &mut second_buf,
+            &second,
+            second.row.id.table_id,
+            StampedSidecar::from_already_stamped(&second),
+        )
+        .unwrap();
         // Table ops begin with a fixed 6-byte prelude:
         // 1 byte op tag + 1 byte flags + 4 bytes table_id.
         // The payload_len varint begins immediately after that prefix.
@@ -6263,7 +6334,13 @@ mod tests {
         let expected_filler_record_bytes = filler.row.payload().to_vec();
 
         let mut filler_buf = Vec::new();
-        serialize_op_entry(&mut filler_buf, &filler, filler.row.id.table_id).unwrap();
+        serialize_op_entry(
+            &mut filler_buf,
+            &filler,
+            filler.row.id.table_id,
+            StampedSidecar::from_already_stamped(&filler),
+        )
+        .unwrap();
         assert_eq!(filler_buf.len(), filler_payload_size);
         assert_eq!(
             filler_buf.len() + header_buf.len() - 1,
