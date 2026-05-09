@@ -342,16 +342,6 @@ pub struct LogRecord {
     pub header: Option<DatabaseHeader>,
 }
 
-impl LogRecord {
-    fn new(tx_timestamp: TxID) -> Self {
-        Self {
-            tx_timestamp,
-            row_versions: Vec::new(),
-            header: None,
-        }
-    }
-}
-
 /// A transaction timestamp or ID.
 ///
 /// Versions either track a timestamp or a transaction ID, depending on the
@@ -1037,9 +1027,8 @@ pub struct DeleteRowStateMachine {
 /// the committed image our transaction must log, or `None` if our tx did not
 /// contribute to this version.
 ///
-/// Mirrors the in-place closure inside
-/// [`CommitStateMachine::build_committed_log_record`]; both call sites must
-/// stay in sync until A.5 deletes the legacy path.
+/// Used by [`CommitStateMachine::for_each_committed_image`] to build the
+/// stamped image yielded to the streaming log emitter.
 fn our_committed_image_for(rv: &RowVersion, our_tx_id: TxID, end_ts: u64) -> Option<RowVersion> {
     let our_begin = matches!(
         rv.begin,
@@ -1463,143 +1452,13 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         Ok(())
     }
 
-    /// Build the committed image for the logical log without mutating the
-    /// live MVCC version chains, which must stay TxID-backed until CommitEnd.
-    fn build_committed_log_record(
-        &mut self,
-        mvcc_store: &Arc<MvStore<Clock>>,
-        tx: &Transaction,
-        end_ts: u64,
-    ) -> LogRecord {
-        let mut log_record = LogRecord::new(end_ts);
-        if tx.header_dirty.load(Ordering::Acquire) {
-            // Persist the transaction-local header snapshot in the same logical-log frame.
-            log_record.header = Some(*tx.header.read());
-        }
-
-        // Process schema rows (sqlite_schema) before data rows so that during log
-        // replay the table_id_to_rootpage map is populated before data row inserts
-        // reference it. `self.write_set` is sorted by table_id descending (most
-        // negative first), which would otherwise place data table rows
-        // (e.g. table_id=-3) before schema rows (table_id=-1).
-
-        // Remap a table_id to its canonical form for the log. After checkpoint,
-        // a table's in-memory table_id (e.g. -53) may differ from -(root_page)
-        // (e.g. -58). On recovery, bootstrap reconstructs the map using
-        // -(root_page), so log records must use that canonical form to be found.
-        let canonicalize_table_id = |version: &mut RowVersion| {
-            let table_id = version.row.id.table_id;
-            if table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                return;
-            }
-            if let Some(entry) = mvcc_store.table_id_to_rootpage.get(&table_id) {
-                if let Some(root_page) = *entry.value() {
-                    let canonical = MVTableId::from(-(root_page as i64));
-                    if canonical != table_id {
-                        version.row.id.table_id = canonical;
-                    }
-                }
-            }
-        };
-
-        // Returns Some(row_version) if our tx contributed to it and if we must therefore log it.
-        let our_committed_image = |row_version: &RowVersion| -> Option<RowVersion> {
-            let our_begin = matches!(
-                row_version.begin,
-                Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id
-            );
-            let our_end = matches!(
-                row_version.end,
-                Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id
-            );
-            if !our_begin && !our_end {
-                // row_version belongs to another tx
-                return None;
-            }
-            let mut committed = row_version.clone();
-            if our_begin {
-                // New version is valid STARTING FROM the committing
-                // transaction's end timestamp. See Hekaton page 299.
-                committed.begin = Some(TxTimestampOrID::Timestamp(end_ts));
-
-                if !our_end {
-                    // A version row_version we inserted may have row_version.end == tx_b.tx_id,
-                    // where tx_b is a concurrent tx. This is because when a tx transitions to
-                    // Preparing, its row_version becomes *speculatively updatable*, and a tx tx_b
-                    // is allowed to change row_version.end from None to tx_b.tx_id to delete it
-                    // (see the Hekaton paper, §3.1, heading "check updatability").
-                    //
-                    // That deletion is tx_b's contribution, and tx_b will log it on its own commit.
-                    // Our log record must capture our own contribution, but if the `end` field is
-                    // set, it will be serialized as a OP_DELETE_* in the logical log, so we unset
-                    // it so that it will be serialized as an OP_UPSERT_*. tx_b will take care of
-                    // logging the deletion.
-                    committed.end = None;
-                }
-            }
-            if our_end {
-                // Old version is valid UNTIL the committing
-                // transaction's end timestamp. See Hekaton page 299.
-                committed.end = Some(TxTimestampOrID::Timestamp(end_ts));
-            }
-            Some(committed)
-        };
-
-        let collect_versions = |id: &RowID, log_record: &mut LogRecord| {
-            if let Some(row_versions) = mvcc_store.rows.get(id) {
-                let row_versions = row_versions.value().read();
-                for row_version in row_versions.iter() {
-                    if let Some(mut committed_version) = our_committed_image(row_version) {
-                        canonicalize_table_id(&mut committed_version);
-                        mvcc_store
-                            .insert_version_raw(&mut log_record.row_versions, committed_version);
-                    }
-                }
-            }
-
-            if let Some(index) = mvcc_store.index_rows.get(&id.table_id) {
-                let index = index.value();
-                let RowKey::Record(ref index_key) = id.row_id else {
-                    panic!("Index writes must have a record key");
-                };
-                if let Some(row_versions) = index.get(index_key) {
-                    let row_versions = row_versions.value().read();
-                    for row_version in row_versions.iter() {
-                        if let Some(mut committed_version) = our_committed_image(row_version) {
-                            canonicalize_table_id(&mut committed_version);
-                            mvcc_store.insert_version_raw(
-                                &mut log_record.row_versions,
-                                committed_version,
-                            );
-                        }
-                    }
-                }
-            }
-        };
-
-        // First pass: schema rows only (ordering matters for recovery)
-        for id in &self.write_set {
-            if id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                collect_versions(id, &mut log_record);
-            }
-        }
-        // Second pass: all non-schema rows
-        for id in &self.write_set {
-            if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                collect_versions(id, &mut log_record);
-            }
-        }
-
-        log_record
-    }
-
     /// Walk this transaction's committed contributions in the schema-first
     /// order required by recovery, yielding `(canonical_table_id, &stamped_row_version)`
     /// to the visitor for each surviving committed image.
     ///
     /// Schema rows are yielded before data rows so that on log replay the
     /// `table_id_to_rootpage` map is populated before data inserts reference
-    /// it — same ordering as [`Self::build_committed_log_record`].
+    /// it.
     ///
     /// `Ok(ControlFlow::Break(()))` from the visitor short-circuits the walk
     /// and returns `Ok(())` to the caller.

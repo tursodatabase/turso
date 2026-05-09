@@ -2585,9 +2585,8 @@ fn test_commit() {
 
 /// Build a `CommitStateMachine` for `tx_id` and populate its `write_set`
 /// from the active transaction's writes, mirroring what `CommitState::Initial`
-/// does at `mod.rs:1666-1678`. Lets us call commit-side helpers
-/// (`build_committed_log_record`, `for_each_committed_image`) directly without
-/// stepping through the whole state machine.
+/// does at `mod.rs:1666-1678`. Lets us call `for_each_committed_image`
+/// directly without stepping through the whole state machine.
 fn make_commit_state_machine_with_write_set(
     db: &MvccTestDb,
     tx_id: TxID,
@@ -2624,111 +2623,6 @@ fn collect_via_visitor(
     })
     .unwrap();
     yielded
-}
-
-/// for_each_committed_image must yield the same stamped images as the legacy
-/// `build_committed_log_record` for a single insert. This is the smoke case:
-/// one chain entry, no collapse.
-#[test]
-fn test_for_each_committed_image_matches_legacy_simple_insert() {
-    let db = MvccTestDb::new();
-    let tx_id = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
-        .unwrap();
-    let row = generate_simple_string_row((-2).into(), 1, "Hello");
-    db.mvcc_store.insert(tx_id, row).unwrap();
-
-    let mut sm = make_commit_state_machine_with_write_set(&db, tx_id);
-    let end_ts: u64 = 12345;
-    let tx_entry = db.mvcc_store.txs.get(&tx_id).unwrap();
-    let tx_ref = tx_entry.value();
-
-    let legacy = sm.build_committed_log_record(&db.mvcc_store, tx_ref, end_ts);
-    drop(tx_entry);
-
-    let yielded = collect_via_visitor(&sm, &db.mvcc_store, end_ts);
-
-    assert_eq!(legacy.row_versions.len(), 1);
-    assert_eq!(yielded.len(), 1);
-    let (canonical_id, yielded_rv) = &yielded[0];
-    let legacy_rv = &legacy.row_versions[0];
-    // Legacy mutates row.id.table_id to canonical; visitor returns canonical
-    // as a sidecar and leaves row.id.table_id alone. With no checkpoint having
-    // run, canonical == original, so they should match.
-    assert_eq!(*canonical_id, legacy_rv.row.id.table_id);
-    assert_eq!(yielded_rv, legacy_rv);
-}
-
-/// Insert + update of the same row in one tx leaves two chain entries with
-/// `our_begin = true`. After timestamp stamping both have
-/// `begin = Timestamp(end_ts)`, and `insert_version_raw`'s collapse rule
-/// keeps only the later one (the upsert image). The visitor must replicate
-/// that or it would emit the obsolete delete-marker image.
-///
-/// This is the regression test the V2 plan calls out for the
-/// "multi-contribution-per-RowID" case (step A.3, point 4).
-#[test]
-fn test_for_each_committed_image_collapses_insert_then_update_same_row() {
-    let db = MvccTestDb::new();
-    let tx_id = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
-        .unwrap();
-    let row_v1 = generate_simple_string_row((-2).into(), 1, "Hello");
-    let row_v2 = generate_simple_string_row((-2).into(), 1, "World");
-    db.mvcc_store.insert(tx_id, row_v1).unwrap();
-    db.mvcc_store.update(tx_id, row_v2.clone()).unwrap();
-
-    // Sanity: chain has the two entries we expect (delete-marker + new row).
-    let chain_len = db
-        .mvcc_store
-        .rows
-        .get(&RowID {
-            table_id: (-2).into(),
-            row_id: RowKey::Int(1),
-        })
-        .map(|e| e.value().read().len())
-        .unwrap();
-    assert_eq!(
-        chain_len, 2,
-        "insert+update should leave two chain entries before collapse"
-    );
-
-    let mut sm = make_commit_state_machine_with_write_set(&db, tx_id);
-    let end_ts: u64 = 12345;
-    let tx_entry = db.mvcc_store.txs.get(&tx_id).unwrap();
-    let tx_ref = tx_entry.value();
-
-    let legacy = sm.build_committed_log_record(&db.mvcc_store, tx_ref, end_ts);
-    drop(tx_entry);
-
-    let yielded = collect_via_visitor(&sm, &db.mvcc_store, end_ts);
-
-    assert_eq!(
-        legacy.row_versions.len(),
-        1,
-        "legacy collapse should leave exactly the upsert image"
-    );
-    assert_eq!(
-        yielded.len(),
-        1,
-        "visitor collapse should leave exactly the upsert image"
-    );
-    let legacy_rv = &legacy.row_versions[0];
-    let (yielded_canonical, yielded_rv) = &yielded[0];
-    assert_eq!(*yielded_canonical, legacy_rv.row.id.table_id);
-    assert_eq!(yielded_rv, legacy_rv);
-    // The surviving image is the upsert (end == None), not the delete-marker.
-    assert!(
-        yielded_rv.end.is_none(),
-        "collapse must keep the upsert (end=None), got end={:?}",
-        yielded_rv.end
-    );
-    assert_eq!(
-        yielded_rv.row.data.as_deref(),
-        Some(row_v2.data.as_deref().unwrap())
-    );
 }
 
 /// `Ok(ControlFlow::Break(()))` from the visitor short-circuits iteration.

@@ -685,8 +685,11 @@ impl LogicalLog {
         if let Some(enc_ctx) = &self.encryption_ctx {
             self.encryption_scratch_buffer.clear();
             for row_version in &tx.row_versions {
-                // Legacy `build_committed_log_record` already canonicalized
-                // `row.id.table_id` in place, so we pass it as the sidecar.
+                // Callers of `log_tx(&LogRecord)` (the default
+                // `DurableStorage::log_tx_streaming` shim, used by external
+                // impls like `RecordingDurableStorage`) already wrote the
+                // canonical id into `row.id.table_id` while building the
+                // record, so passing it as the sidecar is a no-op rebind.
                 serialize_op_entry(
                     &mut self.encryption_scratch_buffer,
                     row_version,
