@@ -186,6 +186,48 @@ impl Profile {
         profile
     }
 
+    /// Forces overflow-page allocation on every INSERT and UPDATE
+    /// (`padding_size = 8K`, well past the ~1004B inline threshold).
+    /// Cache held at maximum so cache-pressure bugs do not dominate the
+    /// failure population.
+    pub fn overflow_stress() -> Self {
+        let profile = Profile {
+            cache_size_pages: Some(2000),
+            query: QueryProfile {
+                gen_opts: Opts {
+                    query: QueryOpts {
+                        insert: InsertOpts {
+                            min_rows: NonZeroU32::new(3).unwrap(),
+                            max_rows: NonZeroU32::new(15).unwrap(),
+                            padding_size: Some(8_000),
+                            ..Default::default()
+                        },
+                        update: UpdateOpts {
+                            padding_size: Some(8_000),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                insert_weight: 50,
+                update_weight: 20,
+                delete_weight: 15,
+                select_weight: 10,
+                create_index_weight: 5,
+                create_table_weight: 3,
+                drop_table_weight: 0,
+                alter_table_weight: 0,
+                drop_index: 0,
+                pragma_weight: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        profile.validate().unwrap();
+        profile
+    }
+
     pub fn faultless() -> Self {
         let profile = Profile {
             io: IOProfile {
@@ -235,6 +277,7 @@ impl Profile {
             ProfileType::SimpleMvcc => Self::simple_mvcc(),
             ProfileType::WriteStress => Self::write_stress(),
             ProfileType::SavepointStress => Self::savepoint_stress(),
+            ProfileType::OverflowStress => Self::overflow_stress(),
             ProfileType::Custom(path) => {
                 Self::parse(path).with_context(|| "failed to parse JSON profile")?
             }
@@ -277,6 +320,7 @@ pub enum ProfileType {
     SimpleMvcc,
     WriteStress,
     SavepointStress,
+    OverflowStress,
     #[strum(disabled)]
     Custom(PathBuf),
 }
