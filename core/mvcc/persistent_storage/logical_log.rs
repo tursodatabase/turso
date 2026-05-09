@@ -227,6 +227,7 @@ use crate::{
     types::IndexInfo,
     Buffer, Completion, CompletionError, LimboError, Result,
 };
+use std::ops::ControlFlow;
 
 use crate::storage::encryption::EncryptionContext;
 use crate::File;
@@ -268,6 +269,12 @@ const OP_FLAG_BTREE_RESIDENT: u8 = 1 << 0;
 const TX_HEADER_SIZE: usize = 24; // FRAME_MAGIC(4) + payload_size(8) + op_count(4) + commit_ts(8)
 const TX_TRAILER_SIZE: usize = 8; // crc32c(4) + END_MAGIC(4)
 const TX_MIN_FRAME_SIZE: usize = TX_HEADER_SIZE + TX_TRAILER_SIZE; // 32
+
+/// Plaintext bytes per streaming output chunk in `log_tx_streaming`. Each chunk
+/// becomes one `Arc<Buffer>` submitted via `pwritev` (or `pwrite` if there's
+/// only one). Sized at 256 KiB as a typical I/O sweet spot; see
+/// `MVCC_COMMIT_IMPL_STEPS_V2.md` (A.2).
+pub(crate) const STREAM_CHUNK_BYTES: usize = 256 * 1024;
 
 fn encrypted_payload_chunk_count(payload_size: usize, chunk_size: usize) -> usize {
     if payload_size == 0 {
@@ -784,6 +791,243 @@ impl LogicalLog {
         self.serialize_and_pwrite_tx(tx, false, on_serialization_complete)
     }
 
+    /// Two-pass, visitor-driven log frame emission.
+    ///
+    /// Unlike [`Self::log_tx_deferred_offset`], the caller does not provide a
+    /// `LogRecord`; instead it provides a closure invoked twice. The first
+    /// pass accumulates `op_count` and `payload_size`; the second pass writes
+    /// each op directly into pre-sized [`Arc<Buffer>`] chunks. The frame is
+    /// submitted via `pwrite` (one chunk) or `pwritev` (multiple chunks),
+    /// avoiding the `write_buf.to_vec()` copy of the legacy single-shot path.
+    ///
+    /// On success the offset is *not* advanced; the caller must call
+    /// [`Self::advance_offset_after_success`] after the I/O completes.
+    /// On error before the pwrite is submitted, `pending_running_crc` is left
+    /// as `None` (or whatever it was prior to the call), so the next commit
+    /// observes a clean state.
+    ///
+    /// The visitor must be deterministic — the same `(canonical_table_id, &RowVersion)`
+    /// sequence on both passes — or pass-1 sizing and pass-2 emission will
+    /// disagree, tripping the per-op `debug_assert_eq!` and the frame-level
+    /// `turso_assert!`.
+    pub(crate) fn log_tx_streaming_inner<V>(
+        &mut self,
+        commit_ts: u64,
+        header: Option<DatabaseHeader>,
+        visit: V,
+    ) -> Result<(Completion, u64)>
+    where
+        V: Fn(&mut dyn FnMut(MVTableId, &RowVersion) -> Result<ControlFlow<()>>) -> Result<()>,
+    {
+        // --- Optional log header on the very first append. ---
+        let is_first_write = self.offset == 0;
+        let log_header_bytes: Option<[u8; LOG_HDR_SIZE]> = if is_first_write {
+            if self.header.is_none() {
+                let h = LogHeader::new(&self.io);
+                self.running_crc = derive_initial_crc(h.salt);
+                self.header = Some(h);
+            }
+            Some(self.header.as_ref().unwrap().encode())
+        } else {
+            None
+        };
+        let log_hdr_in_frame = if log_header_bytes.is_some() {
+            LOG_HDR_SIZE
+        } else {
+            0
+        };
+
+        // --- Pass 1: sizing. The visitor is called with a sink that records
+        //     each op's contribution to op_count and plaintext payload size. ---
+        let mut op_count_acc: u32 = 0;
+        let mut payload_size_acc: u64 = 0;
+        let pass1_overflow =
+            || LimboError::InternalError("log_tx_streaming size overflow".to_string());
+        visit(&mut |canonical_table_id, rv| {
+            op_count_acc = op_count_acc.checked_add(1).ok_or_else(pass1_overflow)?;
+            payload_size_acc = payload_size_acc
+                .checked_add(serialized_op_size(rv, canonical_table_id) as u64)
+                .ok_or_else(pass1_overflow)?;
+            Ok(ControlFlow::Continue(()))
+        })?;
+        if header.is_some() {
+            op_count_acc = op_count_acc.checked_add(1).ok_or_else(pass1_overflow)?;
+            payload_size_acc = payload_size_acc
+                .checked_add(serialized_header_size() as u64)
+                .ok_or_else(pass1_overflow)?;
+        }
+        let op_count = op_count_acc;
+        let payload_size = payload_size_acc;
+
+        // --- On-disk payload size differs under encryption (per-chunk tag/nonce overhead). ---
+        let on_disk_payload_size = if let Some(enc_ctx) = &self.encryption_ctx {
+            encrypted_payload_blob_size(
+                payload_size as usize,
+                self.encrypted_payload_chunk_size,
+                enc_ctx.tag_size(),
+                enc_ctx.nonce_size(),
+            )?
+        } else {
+            payload_size as usize
+        };
+
+        let total_frame_size: u64 = log_hdr_in_frame as u64
+            + TX_HEADER_SIZE as u64
+            + on_disk_payload_size as u64
+            + TX_TRAILER_SIZE as u64;
+
+        // --- Allocate output chunks. The last chunk is sized to the remainder
+        //     so pwritev does not write trailing zeros. ---
+        let chunks = allocate_streaming_chunks(total_frame_size as usize);
+
+        // Frame-relative offsets used during emission and CRC calculation.
+        let tx_header_offset = log_hdr_in_frame;
+        let payload_offset = tx_header_offset + TX_HEADER_SIZE;
+        let trailer_offset = payload_offset + on_disk_payload_size;
+        debug_assert_eq!(trailer_offset + TX_TRAILER_SIZE, total_frame_size as usize);
+
+        // --- Write the optional log header at offset 0. ---
+        if let Some(hdr_bytes) = log_header_bytes {
+            write_at_in_chunks(&chunks, 0, &hdr_bytes);
+        }
+
+        // --- Pass 2: emit ops into chunks. ---
+        if let Some(enc_ctx) = &self.encryption_ctx {
+            // Encrypted path: serialise plaintext into the existing
+            // encryption_scratch_buffer (reused across commits), then encrypt
+            // chunk-by-chunk into the output region. True chunked-plaintext
+            // streaming under encryption is a follow-up; the freeze on
+            // payload_size from pass 1 is what makes the AAD sound.
+            self.encryption_scratch_buffer.clear();
+            self.encryption_scratch_buffer
+                .reserve(payload_size as usize);
+            let scratch = &mut self.encryption_scratch_buffer;
+            visit(&mut |_canonical_table_id, rv| {
+                serialize_op_entry(scratch, rv)?;
+                Ok(ControlFlow::Continue(()))
+            })?;
+            if let Some(hdr) = header.as_ref() {
+                serialize_header_entry(scratch, hdr);
+            }
+            let scratch_len = scratch.len() as u64;
+            turso_assert!(
+                scratch_len == payload_size,
+                "log_tx_streaming encrypted plaintext drift: actual={scratch_len} predicted={payload_size}"
+            );
+            let salt = self
+                .header
+                .as_ref()
+                .expect("log header must be set before writing")
+                .salt;
+            let chunk_count = encrypted_payload_chunk_count(
+                payload_size as usize,
+                self.encrypted_payload_chunk_size,
+            );
+            let mut on_disk_cursor = payload_offset;
+            for (chunk_index, plaintext_chunk) in self
+                .encryption_scratch_buffer
+                .chunks(self.encrypted_payload_chunk_size)
+                .enumerate()
+            {
+                let is_last_chunk = chunk_index + 1 == chunk_count;
+                let aad = build_encrypted_chunk_aad(
+                    salt,
+                    is_last_chunk.then_some(payload_size),
+                    op_count,
+                    commit_ts,
+                    u32::try_from(chunk_index).map_err(|_| {
+                        LimboError::InternalError(
+                            "encrypted payload chunk index exceeds u32".to_string(),
+                        )
+                    })?,
+                );
+                let (ciphertext, nonce) = enc_ctx.encrypt_chunk(plaintext_chunk, &aad)?;
+                debug_assert_eq!(
+                    ciphertext.len(),
+                    plaintext_chunk.len() + enc_ctx.tag_size(),
+                    "encrypt_chunk output size mismatch",
+                );
+                write_at_in_chunks(&chunks, on_disk_cursor, &ciphertext);
+                on_disk_cursor += ciphertext.len();
+                write_at_in_chunks(&chunks, on_disk_cursor, &nonce);
+                on_disk_cursor += nonce.len();
+            }
+            turso_assert!(
+                on_disk_cursor == trailer_offset,
+                "log_tx_streaming encrypted on-disk drift: cursor={on_disk_cursor} expected={trailer_offset}"
+            );
+        } else {
+            // Plaintext path: stream serialize_op_entry output one op at a
+            // time into a small reusable scratch, then copy into the chunk
+            // sequence. The scratch holds at most one op's bytes.
+            let mut op_scratch: Vec<u8> = Vec::with_capacity(64);
+            let chunks_ref = &chunks;
+            let cursor_cell = std::cell::Cell::new(payload_offset);
+            visit(&mut |_canonical_table_id, rv| {
+                op_scratch.clear();
+                serialize_op_entry(&mut op_scratch, rv)?;
+                let pos = cursor_cell.get();
+                write_at_in_chunks(chunks_ref, pos, &op_scratch);
+                cursor_cell.set(pos + op_scratch.len());
+                Ok(ControlFlow::Continue(()))
+            })?;
+            if let Some(hdr) = header.as_ref() {
+                op_scratch.clear();
+                serialize_header_entry(&mut op_scratch, hdr);
+                let pos = cursor_cell.get();
+                write_at_in_chunks(&chunks, pos, &op_scratch);
+                cursor_cell.set(pos + op_scratch.len());
+            }
+            let written = cursor_cell.get();
+            turso_assert!(
+                written == trailer_offset,
+                "log_tx_streaming plaintext payload drift: written={written} expected={trailer_offset}"
+            );
+        }
+
+        // --- Backfill TX header (now that payload_size and op_count are known). ---
+        let mut tx_header_buf = [0u8; TX_HEADER_SIZE];
+        tx_header_buf[0..4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+        tx_header_buf[4..12].copy_from_slice(&payload_size.to_le_bytes());
+        tx_header_buf[12..16].copy_from_slice(&op_count.to_le_bytes());
+        tx_header_buf[16..24].copy_from_slice(&commit_ts.to_le_bytes());
+        write_at_in_chunks(&chunks, tx_header_offset, &tx_header_buf);
+
+        // --- Chained CRC over [TX header || payload]. ---
+        let crc =
+            crc_over_range_in_chunks(self.running_crc, &chunks, tx_header_offset, trailer_offset);
+
+        // --- Trailer. ---
+        let mut trailer = [0u8; TX_TRAILER_SIZE];
+        trailer[0..4].copy_from_slice(&crc.to_le_bytes());
+        trailer[4..8].copy_from_slice(&END_MAGIC.to_le_bytes());
+        write_at_in_chunks(&chunks, trailer_offset, &trailer);
+
+        // --- Submit pwrite (1 chunk) or pwritev (multi). ---
+        let buffer_len = total_frame_size;
+        let c = Completion::new_write(move |res: Result<i32, CompletionError>| {
+            let Ok(bytes_written) = res else {
+                return;
+            };
+            turso_assert!(
+                bytes_written == buffer_len as i32,
+                "wrote({bytes_written}) != expected({buffer_len})"
+            );
+        });
+        let c = if chunks.len() == 1 {
+            self.file
+                .pwrite(self.offset, chunks.into_iter().next().unwrap(), c)?
+        } else {
+            self.file.pwritev(self.offset, chunks, c)?
+        };
+
+        // The pwrite is in flight. Stamp pending_running_crc *after* a
+        // successful submit so an early Err from pass-1/pass-2/encrypt above
+        // leaves `pending_running_crc` untouched.
+        self.pending_running_crc = Some(crc);
+        Ok((c, buffer_len))
+    }
+
     pub fn advance_offset_after_success(&mut self, bytes: u64) {
         self.offset = self
             .offset
@@ -973,6 +1217,84 @@ fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
 fn serialized_header_size() -> usize {
     // tag(1) + flags(1) + table_id(4) + payload_len varint + DatabaseHeader bytes
     1 + 1 + 4 + varint_len(DatabaseHeader::SIZE as u64) + DatabaseHeader::SIZE
+}
+
+/// Allocate a sequence of `Arc<Buffer>` chunks summing to exactly `total` bytes.
+///
+/// All chunks except the last are exactly [`STREAM_CHUNK_BYTES`]; the last
+/// chunk is sized to its remainder so `pwritev` writes no trailing zeros.
+fn allocate_streaming_chunks(total: usize) -> Vec<Arc<Buffer>> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let full_chunks = total / STREAM_CHUNK_BYTES;
+    let remainder = total % STREAM_CHUNK_BYTES;
+    let mut chunks = Vec::with_capacity(full_chunks + usize::from(remainder > 0));
+    for _ in 0..full_chunks {
+        chunks.push(Arc::new(Buffer::new_temporary(STREAM_CHUNK_BYTES)));
+    }
+    if remainder > 0 {
+        chunks.push(Arc::new(Buffer::new_temporary(remainder)));
+    }
+    chunks
+}
+
+/// Write `data` into the chunk sequence starting at byte `frame_offset`,
+/// splitting writes across chunk boundaries. Caller must hold exclusive
+/// access to the chunks (i.e. before they are submitted to the I/O backend).
+fn write_at_in_chunks(chunks: &[Arc<Buffer>], frame_offset: usize, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    let mut chunk_idx = 0;
+    let mut local_offset = frame_offset;
+    while chunk_idx < chunks.len() && local_offset >= chunks[chunk_idx].len() {
+        local_offset -= chunks[chunk_idx].len();
+        chunk_idx += 1;
+    }
+    debug_assert!(
+        chunk_idx < chunks.len(),
+        "write_at_in_chunks: frame_offset out of range",
+    );
+    let mut remaining = data;
+    while !remaining.is_empty() {
+        let chunk = &chunks[chunk_idx];
+        let chunk_len = chunk.len();
+        let space = chunk_len - local_offset;
+        let take = remaining.len().min(space);
+        chunk.as_mut_slice()[local_offset..local_offset + take].copy_from_slice(&remaining[..take]);
+        remaining = &remaining[take..];
+        local_offset += take;
+        if local_offset == chunk_len {
+            chunk_idx += 1;
+            local_offset = 0;
+        }
+    }
+}
+
+/// Compute `crc32c_append(seed, &chunks_concat[start..end])` without
+/// materialising the concatenated buffer.
+fn crc_over_range_in_chunks(seed: u32, chunks: &[Arc<Buffer>], start: usize, end: usize) -> u32 {
+    debug_assert!(start <= end);
+    let mut crc = seed;
+    let mut frame_offset = 0;
+    for chunk in chunks {
+        let chunk_len = chunk.len();
+        let chunk_start = frame_offset;
+        let chunk_end = chunk_start + chunk_len;
+        let lo = start.max(chunk_start);
+        let hi = end.min(chunk_end);
+        if lo < hi {
+            let chunk_lo = lo - chunk_start;
+            let chunk_hi = hi - chunk_start;
+            crc = crc32c::crc32c_append(crc, &chunk.as_slice()[chunk_lo..chunk_hi]);
+        }
+        frame_offset = chunk_end;
+        if frame_offset >= end {
+            break;
+        }
+    }
+    crc
 }
 
 /// Parse all ops from a decrypted plaintext buffer.
@@ -2380,7 +2702,7 @@ mod tests {
     use crate::{
         mvcc::database::{
             tests::{commit_tx, generate_simple_string_row, MvccTestDbNoConn},
-            MVTableId, Row, RowID, RowKey, SortableIndexKey,
+            LogRecord, MVTableId, Row, RowID, RowKey, SortableIndexKey,
         },
         schema::Table,
         storage::sqlite3_ondisk::{
@@ -2389,6 +2711,7 @@ mod tests {
         types::{ImmutableRecord, IndexInfo, Text},
         Buffer, Completion, LimboError, Value, ValueRef,
     };
+    use std::ops::ControlFlow;
 
     use super::{
         build_encrypted_chunk_aad, encrypted_chunk_blob_size, encrypted_chunk_plaintext_len,
@@ -2396,8 +2719,8 @@ mod tests {
         serialize_op_entry, serialized_header_size, serialized_op_size, HeaderReadResult,
         LogHeader, LogicalLog, ParseResult, ParsedOp, StreamingLogicalLogReader, StreamingResult,
         ENCRYPTED_CHUNK_AAD_SIZE, ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC, FRAME_MAGIC,
-        LOG_HDR_CRC_START, LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION, TX_HEADER_SIZE,
-        TX_TRAILER_SIZE,
+        LOG_HDR_CRC_START, LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION, STREAM_CHUNK_BYTES,
+        TX_HEADER_SIZE, TX_TRAILER_SIZE,
     };
     use crate::OpenFlags;
     use crate::{turso_assert, turso_assert_less_than};
@@ -4500,6 +4823,331 @@ mod tests {
         let mut buf = Vec::new();
         serialize_header_entry(&mut buf, &header);
         assert_eq!(buf.len(), serialized_header_size());
+    }
+
+    /// Read the entire backing file into a `Vec<u8>`. Used by the byte-equivalence
+    /// tests to compare two write paths' on-disk output.
+    fn read_full_file(io: &Arc<dyn crate::IO>, file: &Arc<dyn crate::File>) -> Vec<u8> {
+        let size = file.size().unwrap() as usize;
+        if size == 0 {
+            return Vec::new();
+        }
+        let read_buf = Arc::new(Buffer::new_temporary(size));
+        let c = file
+            .pread(0, Completion::new_read(read_buf.clone(), |_| None))
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        read_buf.as_slice()[..size].to_vec()
+    }
+
+    /// Build a `LogRecord` fixture exercising several op tags + a header update.
+    /// Used to drive both the legacy `log_tx` path and the new `log_tx_streaming`
+    /// path so they can be compared on disk byte-for-byte.
+    fn make_streaming_test_record(commit_ts: u64, include_header: bool) -> LogRecord {
+        let table_id: MVTableId = (-7).into();
+        let mut row_versions = vec![
+            make_test_row_version(table_id, 1, "alpha", commit_ts),
+            make_test_row_version(table_id, 2, "beta", commit_ts),
+            // OP_DELETE_TABLE — exercises the delete-arm sizing branch.
+            make_test_raw_table_row_version(table_id, 3, b"unused".to_vec(), commit_ts, true),
+            // OP_UPSERT_INDEX — record-keyed, non-empty payload.
+            make_test_index_row_version(table_id, 4, "index-key", commit_ts),
+            // OP_DELETE_INDEX.
+            make_test_raw_index_row_version(table_id, 5, b"keyblob".to_vec(), commit_ts, true),
+        ];
+        // OP_UPSERT_TABLE with btree_resident flag set.
+        let mut resident = make_test_row_version(table_id, 6, "gamma", commit_ts);
+        resident.btree_resident = true;
+        row_versions.push(resident);
+
+        LogRecord {
+            tx_timestamp: commit_ts,
+            row_versions,
+            header: include_header.then(DatabaseHeader::default),
+        }
+    }
+
+    /// Drive the log frame via `log_tx_streaming_inner` using the row sequence in `tx`.
+    fn write_via_streaming(log: &mut LogicalLog, tx: &LogRecord) -> (Completion, u64) {
+        log.log_tx_streaming_inner(tx.tx_timestamp, tx.header, |sink| {
+            for rv in &tx.row_versions {
+                if matches!(sink(rv.row.id.table_id, rv)?, ControlFlow::Break(())) {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    /// What this test checks: a transaction frame written via the legacy
+    /// `log_tx` path produces byte-identical bytes to the same logical record
+    /// written via `log_tx_streaming_inner` (plaintext).
+    /// Why this matters: `log_tx_streaming` is what A.4 will switch the commit
+    /// path to; any mismatch would change recovery semantics or break CRC chaining.
+    #[test]
+    fn test_log_tx_streaming_byte_equivalent_plaintext() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::MemoryIO::new());
+
+        let file_legacy = io
+            .open_file("legacy.log", OpenFlags::Create, false)
+            .unwrap();
+        let file_stream = io
+            .open_file("stream.log", OpenFlags::Create, false)
+            .unwrap();
+
+        let tx = make_streaming_test_record(123, true);
+
+        let mut log_legacy = LogicalLog::new(file_legacy.clone(), io.clone(), None);
+        // Pin the log header salt to a known value so both paths derive the
+        // same running CRC seed (otherwise each `LogicalLog::new` would mint a
+        // different random salt and the two logs would write different bytes).
+        let header = LogHeader {
+            salt: 0xDEADBEEFCAFEF00D,
+            ..LogHeader::new(&io)
+        };
+        log_legacy.set_header(header.clone());
+        let c = log_legacy.log_tx(&tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let mut log_stream = LogicalLog::new(file_stream.clone(), io.clone(), None);
+        log_stream.set_header(header);
+        let (c, bytes) = write_via_streaming(&mut log_stream, &tx);
+        io.wait_for_completion(c).unwrap();
+        log_stream.advance_offset_after_success(bytes);
+
+        let legacy_bytes = read_full_file(&io, &file_legacy);
+        let stream_bytes = read_full_file(&io, &file_stream);
+        assert_eq!(
+            legacy_bytes, stream_bytes,
+            "log_tx vs log_tx_streaming on-disk bytes diverged",
+        );
+        assert_eq!(log_legacy.offset, log_stream.offset);
+        assert_eq!(log_legacy.running_crc, log_stream.running_crc);
+    }
+
+    /// Drain the encrypted (or plaintext) frame written at the start of `file`
+    /// into a vector of `(commit_ts, ParsedOp)` pairs by running it through the
+    /// reader. Used by the encrypted byte-equivalence test where ciphertext
+    /// differs (fresh nonces per chunk) but decrypted plaintext must match.
+    fn parse_first_frame_records(
+        file: Arc<dyn crate::File>,
+        io: &Arc<dyn crate::IO>,
+        enc: Option<crate::storage::encryption::EncryptionContext>,
+    ) -> Vec<StreamingResult> {
+        let mut reader = StreamingLogicalLogReader::new(file, enc);
+        reader.read_header(io).unwrap();
+        let mut records = Vec::new();
+        loop {
+            let r = reader
+                .next_record(io, |_id| {
+                    Err(LimboError::InternalError("no index".to_string()))
+                })
+                .unwrap();
+            if matches!(r, StreamingResult::Eof) {
+                break;
+            }
+            records.push(r);
+        }
+        records
+    }
+
+    /// What this test checks: an encrypted frame written via `log_tx_streaming`
+    /// decrypts to the same operations as one written via the legacy `log_tx`.
+    /// Each `encrypt_chunk` call mints a fresh per-chunk nonce, so the
+    /// ciphertext (and the chained CRC over it) deliberately differs between
+    /// the two paths — only the decrypted plaintext is required to match.
+    /// Why this matters: A.4 will route encrypted commits through this path,
+    /// so the AEAD AAD layout (salt | payload_size_or_zero | op_count |
+    /// commit_ts | chunk_index) must match the legacy path bit-for-bit, or
+    /// readers will reject the streaming-produced frames.
+    #[test]
+    fn test_log_tx_streaming_encrypted_decrypts_equivalent() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::MemoryIO::new());
+        let file_legacy = io
+            .open_file("legacy_enc.log", OpenFlags::Create, false)
+            .unwrap();
+        let file_stream = io
+            .open_file("stream_enc.log", OpenFlags::Create, false)
+            .unwrap();
+
+        // Use a record with table ops only — the reader's record-key index
+        // lookup path expects index metadata we don't wire up here.
+        let table_id: MVTableId = (-7).into();
+        let tx = LogRecord {
+            tx_timestamp: 456,
+            row_versions: vec![
+                make_test_row_version(table_id, 1, "alpha", 456),
+                make_test_row_version(table_id, 2, "beta", 456),
+                make_test_raw_table_row_version(table_id, 3, b"unused".to_vec(), 456, true),
+            ],
+            header: None,
+        };
+
+        let header = LogHeader {
+            salt: 0x0BADC0DE_DEADBEEF,
+            ..LogHeader::new(&io)
+        };
+
+        // Small chunk size forces multiple encrypted chunks per frame, so the
+        // multi-chunk AAD wiring (is_last_chunk flag, chunk index increment)
+        // is exercised on both paths.
+        let chunk_size = 64;
+        let mut log_legacy = LogicalLog::new_with_payload_chunk_size(
+            file_legacy.clone(),
+            io.clone(),
+            Some(test_enc_ctx()),
+            chunk_size,
+        );
+        log_legacy.set_header(header.clone());
+        let c = log_legacy.log_tx(&tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let mut log_stream = LogicalLog::new_with_payload_chunk_size(
+            file_stream.clone(),
+            io.clone(),
+            Some(test_enc_ctx()),
+            chunk_size,
+        );
+        log_stream.set_header(header);
+        let (c, bytes) = write_via_streaming(&mut log_stream, &tx);
+        io.wait_for_completion(c).unwrap();
+        log_stream.advance_offset_after_success(bytes);
+
+        // The TX header (24 B) is plaintext and deterministic — payload_size,
+        // op_count, commit_ts are all derived from the same inputs. Verify
+        // those bytes match across paths.
+        let legacy_bytes = read_full_file(&io, &file_legacy);
+        let stream_bytes = read_full_file(&io, &file_stream);
+        assert_eq!(
+            &legacy_bytes[..LOG_HDR_SIZE + TX_HEADER_SIZE],
+            &stream_bytes[..LOG_HDR_SIZE + TX_HEADER_SIZE],
+            "plaintext prefix (log header + TX header) must be byte-identical",
+        );
+        assert_eq!(
+            legacy_bytes.len(),
+            stream_bytes.len(),
+            "encrypted frame on-disk size must match",
+        );
+
+        // Decrypted records must match.
+        let legacy_records = parse_first_frame_records(file_legacy, &io, Some(test_enc_ctx()));
+        let stream_records = parse_first_frame_records(file_stream, &io, Some(test_enc_ctx()));
+        assert_eq!(
+            legacy_records.len(),
+            stream_records.len(),
+            "decrypted op count differs",
+        );
+        for (l, s) in legacy_records.iter().zip(stream_records.iter()) {
+            // Compare via Debug — StreamingResult doesn't impl PartialEq, but
+            // its Debug output is deterministic for the cases we exercise.
+            assert_eq!(format!("{l:?}"), format!("{s:?}"), "decrypted op differs");
+        }
+    }
+
+    /// What this test checks: when the visitor returns `Err` mid-emission, the
+    /// streaming path returns the same `Err` *and* leaves `pending_running_crc`
+    /// untouched (`None` here, since this is the first append).
+    /// Why this matters: A.4 will call `advance_offset_after_success` on the
+    /// happy path, which `expect()`s a pending CRC. If a failed streaming
+    /// emission left a stale `Some(_)` from this commit, the *next* commit's
+    /// advance call would silently use the wrong CRC seed and corrupt the chain.
+    #[test]
+    fn test_log_tx_streaming_visitor_err_clears_pending_crc() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::MemoryIO::new());
+        let file = io
+            .open_file("err_visit.log", OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file, io, None);
+        log.set_header(LogHeader::new(&log.io));
+        assert!(log.pending_running_crc.is_none());
+
+        let tx = make_streaming_test_record(789, false);
+        // Sentinel error injected on the third sink invocation.
+        let sentinel = "log_tx_streaming visitor sentinel error";
+        let visit_count = std::cell::Cell::new(0u32);
+        let result = log.log_tx_streaming_inner(tx.tx_timestamp, tx.header, |sink| {
+            for rv in &tx.row_versions {
+                visit_count.set(visit_count.get() + 1);
+                if visit_count.get() == 3 {
+                    return Err(LimboError::InternalError(sentinel.to_string()));
+                }
+                if matches!(sink(rv.row.id.table_id, rv)?, ControlFlow::Break(())) {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        });
+        match result {
+            Err(LimboError::InternalError(msg)) if msg == sentinel => {}
+            other => panic!("expected sentinel InternalError, got {other:?}"),
+        }
+        assert!(
+            log.pending_running_crc.is_none(),
+            "pending_running_crc must remain None after visitor error",
+        );
+        assert_eq!(log.offset, 0, "offset must not advance on early error");
+    }
+
+    /// What this test checks: a frame larger than `STREAM_CHUNK_BYTES` is
+    /// emitted across multiple `Arc<Buffer>` chunks (taking the `pwritev`
+    /// path), still byte-identical to the legacy single-pwrite output.
+    /// Why this matters: the `pwritev` branch is where the memory-elimination
+    /// payoff lives — a single big commit must not fall back to assembling one
+    /// monolithic buffer.
+    #[test]
+    fn test_log_tx_streaming_multi_chunk_pwritev() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::MemoryIO::new());
+        let file_legacy = io
+            .open_file("legacy_multi.log", OpenFlags::Create, false)
+            .unwrap();
+        let file_stream = io
+            .open_file("stream_multi.log", OpenFlags::Create, false)
+            .unwrap();
+
+        // 300 KiB record forces total_frame_size > STREAM_CHUNK_BYTES (256 KiB),
+        // so the streaming path takes the multi-chunk pwritev branch.
+        let table_id: MVTableId = (-9).into();
+        let big_payload = vec![0xABu8; 300 * 1024];
+        let row_version = make_test_raw_table_row_version(table_id, 1, big_payload, 100, false);
+        let tx = LogRecord {
+            tx_timestamp: 100,
+            row_versions: vec![row_version],
+            header: None,
+        };
+
+        let header = LogHeader {
+            salt: 0xCAFEBABE_F00DD00D,
+            ..LogHeader::new(&io)
+        };
+
+        let mut log_legacy = LogicalLog::new(file_legacy.clone(), io.clone(), None);
+        log_legacy.set_header(header.clone());
+        let c = log_legacy.log_tx(&tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let mut log_stream = LogicalLog::new(file_stream.clone(), io.clone(), None);
+        log_stream.set_header(header);
+        let (c, bytes) = write_via_streaming(&mut log_stream, &tx);
+        io.wait_for_completion(c).unwrap();
+        log_stream.advance_offset_after_success(bytes);
+
+        let legacy_bytes = read_full_file(&io, &file_legacy);
+        let stream_bytes = read_full_file(&io, &file_stream);
+        assert!(
+            legacy_bytes.len() > STREAM_CHUNK_BYTES,
+            "test fixture should span multiple stream chunks (got {} bytes, threshold {})",
+            legacy_bytes.len(),
+            STREAM_CHUNK_BYTES,
+        );
+        assert_eq!(
+            legacy_bytes, stream_bytes,
+            "multi-chunk log_tx vs log_tx_streaming on-disk bytes diverged",
+        );
     }
 
     fn try_text_len_for_single_upsert_table_op_size(

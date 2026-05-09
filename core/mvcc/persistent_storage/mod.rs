@@ -6,11 +6,13 @@ use crate::sync::RwLock;
 use std::fmt::Debug;
 
 pub mod logical_log;
-use crate::mvcc::database::LogRecord;
+use crate::mvcc::database::{LogRecord, MVTableId, RowVersion};
 use crate::mvcc::persistent_storage::logical_log::{
     LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
 };
+use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::{CheckpointResult, Completion, File, Result};
+use std::ops::ControlFlow;
 
 pub trait DurableStorage: Send + Sync + Debug {
     /// Write a transaction to the logical log without advancing the writer offset.
@@ -101,6 +103,34 @@ impl Storage {
     #[inline(always)]
     fn shadow_offset_advance(&self, bytes: u64) {
         self.log_offset.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Stream a transaction's log frame using a visitor-driven two-pass emitter.
+    ///
+    /// `visit` is invoked twice (size pass, then emit pass) and must produce
+    /// the same `(canonical_table_id, &RowVersion)` sequence on each call.
+    ///
+    /// Returns the I/O completion plus the on-disk frame size in bytes (used
+    /// by the commit machine to advance the writer offset after a successful
+    /// fsync). The writer offset is *not* advanced here — the caller must
+    /// invoke [`DurableStorage::advance_logical_log_offset_after_success`]
+    /// after the commit's I/O completes.
+    ///
+    /// This is an inherent method (not on the [`DurableStorage`] trait) so
+    /// external implementations like `RecordingDurableStorage` keep compiling
+    /// without changes. See `MVCC_COMMIT_IMPL_STEPS_V2.md` step A.2.
+    pub fn log_tx_streaming<V>(
+        &self,
+        commit_ts: u64,
+        header: Option<DatabaseHeader>,
+        visit: V,
+    ) -> Result<(Completion, u64)>
+    where
+        V: Fn(&mut dyn FnMut(MVTableId, &RowVersion) -> Result<ControlFlow<()>>) -> Result<()>,
+    {
+        self.logical_log
+            .write()
+            .log_tx_streaming_inner(commit_ts, header, visit)
     }
 }
 
