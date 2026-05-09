@@ -1986,21 +1986,23 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 }
 
                 // All dependencies resolved. Snapshot the header (if dirty)
-                // and peek whether we have any row writes; the streaming
-                // commit path will re-walk the chains for both sizing and
-                // emission. Live row versions stay on TxID references until
-                // CommitEnd so rollback of an abandoned commit can still
-                // match them.
+                // and check whether we have any row writes; the streaming
+                // commit path walks the chains in a single pass for sizing
+                // and emission. Live row versions stay on TxID references
+                // until CommitEnd so rollback of an abandoned commit can
+                // still match them.
                 let header = if tx.header_dirty.load(Ordering::Acquire) {
                     Some(*tx.header.read())
                 } else {
                     None
                 };
-                let mut has_row_writes = false;
-                self.for_each_committed_image(mvcc_store, end_ts, |_id, _rv, _sidecar| {
-                    has_row_writes = true;
-                    Ok(ControlFlow::Break(()))
-                })?;
+                // `self.write_set` is the deduped commit-machine snapshot of
+                // tx writes. Savepoint rollbacks call
+                // `remove_rolled_back_rows_from_write_set`, so a non-empty
+                // `self.write_set` is sound proxy for "the chain walk would
+                // yield at least one entry". This avoids a full
+                // `for_each_committed_image` peek pass.
+                let has_row_writes = !self.write_set.is_empty();
                 tracing::trace!(
                     "prepared_log_record(tx_id={}, header={}, row_writes={})",
                     self.tx_id,

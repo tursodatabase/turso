@@ -508,8 +508,14 @@ pub struct LogicalLog {
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
     encrypted_payload_chunk_size: usize,
-    /// Reusable scratch buffer for ops serialization on the encrypted write path.
-    encryption_scratch_buffer: Vec<u8>,
+    /// Reusable scratch buffer for plaintext op serialization. Used by both
+    /// the plaintext and encrypted write paths so the streaming commit
+    /// emitter walks chains exactly once per commit (`MVCC_COMMIT_PLAN.md`
+    /// §Step 2). Grows to the largest committed frame's payload size and is
+    /// reused thereafter; for write-heavy workloads with one giant frame
+    /// (canonical CREATE INDEX over 1M rows) this can be ~110 MB resident,
+    /// but the allocation is amortized across subsequent commits.
+    payload_scratch_buffer: Vec<u8>,
 }
 
 impl LogicalLog {
@@ -529,7 +535,7 @@ impl LogicalLog {
             pending_running_crc: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
-            encryption_scratch_buffer: Vec::new(),
+            payload_scratch_buffer: Vec::new(),
         }
     }
 
@@ -697,19 +703,19 @@ impl LogicalLog {
             };
 
         if let Some(enc_ctx) = &self.encryption_ctx {
-            self.encryption_scratch_buffer.clear();
+            self.payload_scratch_buffer.clear();
             for row_version in &tx.row_versions {
                 serialize_op_entry(
-                    &mut self.encryption_scratch_buffer,
+                    &mut self.payload_scratch_buffer,
                     row_version,
                     row_version.row.id.table_id,
                     StampedSidecar::from_already_stamped(row_version),
                 )?;
             }
             if let Some(hdr) = tx.header {
-                serialize_header_entry(&mut self.encryption_scratch_buffer, &hdr);
+                serialize_header_entry(&mut self.payload_scratch_buffer, &hdr);
             }
-            let payload_size = self.encryption_scratch_buffer.len();
+            let payload_size = self.payload_scratch_buffer.len();
             let actual = payload_size as u64;
             turso_assert!(
                 actual == predicted_payload_size,
@@ -734,7 +740,7 @@ impl LogicalLog {
 
             let payload_size = payload_size as u64;
             for (chunk_index, plaintext_chunk) in self
-                .encryption_scratch_buffer
+                .payload_scratch_buffer
                 .chunks(self.encrypted_payload_chunk_size)
                 .enumerate()
             {
@@ -815,14 +821,18 @@ impl LogicalLog {
         self.serialize_and_pwrite_tx(tx, false, on_serialization_complete)
     }
 
-    /// Two-pass, visitor-driven log frame emission.
+    /// Single-walk, visitor-driven log frame emission.
     ///
     /// Unlike [`Self::log_tx_deferred_offset`], the caller does not provide a
-    /// `LogRecord`; instead it provides a closure invoked twice. The first
-    /// pass accumulates `op_count` and `payload_size`; the second pass writes
-    /// each op directly into pre-sized [`Arc<Buffer>`] chunks. The frame is
-    /// submitted via `pwrite` (one chunk) or `pwritev` (multiple chunks),
-    /// avoiding the `write_buf.to_vec()` copy of the legacy single-shot path.
+    /// `LogRecord`; instead it provides a closure invoked **once**. The
+    /// closure walks the chains and serializes each op into the reusable
+    /// [`Self::payload_scratch_buffer`]; after the walk, `payload_size` is
+    /// known (`scratch.len()`) and the output [`Arc<Buffer>`] chunks are
+    /// allocated. For the plaintext path the scratch is memcpy'd into the
+    /// chunks; for the encrypted path the scratch is encrypted chunk-by-chunk
+    /// into the output region. The frame is submitted via `pwrite` (one
+    /// chunk) or `pwritev` (multiple chunks), avoiding the
+    /// `write_buf.to_vec()` copy of the legacy single-shot path.
     ///
     /// On success the offset is *not* advanced; the caller must call
     /// [`Self::advance_offset_after_success`] after the I/O completes.
@@ -830,10 +840,10 @@ impl LogicalLog {
     /// as `None` (or whatever it was prior to the call), so the next commit
     /// observes a clean state.
     ///
-    /// The visitor must be deterministic — the same `(canonical_table_id, &RowVersion)`
-    /// sequence on both passes — or pass-1 sizing and pass-2 emission will
-    /// disagree, tripping the per-op `debug_assert_eq!` and the frame-level
-    /// `turso_assert!`.
+    /// `MVCC_COMMIT_PLAN.md` §Step 2: this is the single-pass shape that
+    /// replaces the previous size-then-emit two-pass walk, eliminating one
+    /// full pass of chain SkipMap probes per commit at the cost of holding
+    /// the full plaintext payload in `payload_scratch_buffer`.
     pub(crate) fn log_tx_streaming_inner<V>(
         &mut self,
         commit_ts: u64,
@@ -863,27 +873,29 @@ impl LogicalLog {
             0
         };
 
-        // --- Pass 1: sizing. The visitor is called with a sink that records
-        //     each op's contribution to op_count and plaintext payload size. ---
+        // --- Single walk: serialize ops into the reusable plaintext scratch.
+        //     Tracks op_count as it goes; payload_size falls out of
+        //     scratch.len() afterwards so we never have to call
+        //     `serialized_op_size` independently. ---
         let mut op_count_acc: u32 = 0;
-        let mut payload_size_acc: u64 = 0;
-        let pass1_overflow =
-            || LimboError::InternalError("log_tx_streaming size overflow".to_string());
+        let count_overflow =
+            || LimboError::InternalError("log_tx_streaming op_count overflow".to_string());
+        self.payload_scratch_buffer.clear();
+        // Borrow the scratch through a local that does not alias `self` so the
+        // closure can pass it to `serialize_op_entry` without clashing with
+        // the surrounding `&mut self`.
+        let scratch = &mut self.payload_scratch_buffer;
         visit(&mut |canonical_table_id, rv, sidecar| {
-            op_count_acc = op_count_acc.checked_add(1).ok_or_else(pass1_overflow)?;
-            payload_size_acc = payload_size_acc
-                .checked_add(serialized_op_size(rv, canonical_table_id, sidecar) as u64)
-                .ok_or_else(pass1_overflow)?;
+            op_count_acc = op_count_acc.checked_add(1).ok_or_else(count_overflow)?;
+            serialize_op_entry(scratch, rv, canonical_table_id, sidecar)?;
             Ok(ControlFlow::Continue(()))
         })?;
-        if header.is_some() {
-            op_count_acc = op_count_acc.checked_add(1).ok_or_else(pass1_overflow)?;
-            payload_size_acc = payload_size_acc
-                .checked_add(serialized_header_size() as u64)
-                .ok_or_else(pass1_overflow)?;
+        if let Some(hdr) = header.as_ref() {
+            op_count_acc = op_count_acc.checked_add(1).ok_or_else(count_overflow)?;
+            serialize_header_entry(scratch, hdr);
         }
         let op_count = op_count_acc;
-        let payload_size = payload_size_acc;
+        let payload_size: u64 = self.payload_scratch_buffer.len() as u64;
 
         // --- On-disk payload size differs under encryption (per-chunk tag/nonce overhead). ---
         let on_disk_payload_size = if let Some(enc_ctx) = &self.encryption_ctx {
@@ -917,29 +929,12 @@ impl LogicalLog {
             write_at_in_chunks(&chunks, 0, &hdr_bytes);
         }
 
-        // --- Pass 2: emit ops into chunks. ---
+        // --- Copy/encrypt the scratch into the pre-allocated chunks. ---
         if let Some(enc_ctx) = &self.encryption_ctx {
-            // Encrypted path: serialise plaintext into the existing
-            // encryption_scratch_buffer (reused across commits), then encrypt
-            // chunk-by-chunk into the output region. True chunked-plaintext
-            // streaming under encryption is a follow-up; the freeze on
-            // payload_size from pass 1 is what makes the AAD sound.
-            self.encryption_scratch_buffer.clear();
-            self.encryption_scratch_buffer
-                .reserve(payload_size as usize);
-            let scratch = &mut self.encryption_scratch_buffer;
-            visit(&mut |canonical_table_id, rv, sidecar| {
-                serialize_op_entry(scratch, rv, canonical_table_id, sidecar)?;
-                Ok(ControlFlow::Continue(()))
-            })?;
-            if let Some(hdr) = header.as_ref() {
-                serialize_header_entry(scratch, hdr);
-            }
-            let scratch_len = scratch.len() as u64;
-            turso_assert!(
-                scratch_len == payload_size,
-                "log_tx_streaming encrypted plaintext drift: actual={scratch_len} predicted={payload_size}"
-            );
+            // Encrypt the plaintext scratch chunk-by-chunk into the on-disk
+            // region. True chunked-plaintext streaming under encryption is a
+            // follow-up; today we encrypt fixed-size chunks of the existing
+            // scratch buffer.
             let salt = self
                 .header
                 .as_ref()
@@ -951,7 +946,7 @@ impl LogicalLog {
             );
             let mut on_disk_cursor = payload_offset;
             for (chunk_index, plaintext_chunk) in self
-                .encryption_scratch_buffer
+                .payload_scratch_buffer
                 .chunks(self.encrypted_payload_chunk_size)
                 .enumerate()
             {
@@ -983,32 +978,10 @@ impl LogicalLog {
                 "log_tx_streaming encrypted on-disk drift: cursor={on_disk_cursor} expected={trailer_offset}"
             );
         } else {
-            // Plaintext path: stream serialize_op_entry output one op at a
-            // time into a small reusable scratch, then copy into the chunk
-            // sequence. The scratch holds at most one op's bytes.
-            let mut op_scratch: Vec<u8> = Vec::with_capacity(64);
-            let chunks_ref = &chunks;
-            let cursor_cell = std::cell::Cell::new(payload_offset);
-            visit(&mut |canonical_table_id, rv, sidecar| {
-                op_scratch.clear();
-                serialize_op_entry(&mut op_scratch, rv, canonical_table_id, sidecar)?;
-                let pos = cursor_cell.get();
-                write_at_in_chunks(chunks_ref, pos, &op_scratch);
-                cursor_cell.set(pos + op_scratch.len());
-                Ok(ControlFlow::Continue(()))
-            })?;
-            if let Some(hdr) = header.as_ref() {
-                op_scratch.clear();
-                serialize_header_entry(&mut op_scratch, hdr);
-                let pos = cursor_cell.get();
-                write_at_in_chunks(&chunks, pos, &op_scratch);
-                cursor_cell.set(pos + op_scratch.len());
-            }
-            let written = cursor_cell.get();
-            turso_assert!(
-                written == trailer_offset,
-                "log_tx_streaming plaintext payload drift: written={written} expected={trailer_offset}"
-            );
+            // Plaintext path: one memcpy from the frame-level scratch into the
+            // pre-allocated chunks. `write_at_in_chunks` walks the chunk
+            // boundary as needed.
+            write_at_in_chunks(&chunks, payload_offset, &self.payload_scratch_buffer);
         }
 
         // --- Backfill TX header (now that payload_size and op_count are known). ---
