@@ -79,10 +79,10 @@ impl Numeric {
                         match optional_integer {
                             None => Some(Self::Float(real)),
                             Some(val) => Some(if real == val as f64 {
-                                                Self::Integer(val)
-                                            } else {
-                                                Self::Float(real)
-                                            })
+                                Self::Integer(val)
+                            } else {
+                                Self::Float(real)
+                            }),
                         }
                     }
                 }
@@ -200,14 +200,16 @@ impl<T: AsRef<str>> From<T> for Numeric {
                 Self::Float(value)
             }
             Some(StrToF64::Decimal(real) | StrToF64::DecimalPrefix(real)) => {
-                let optional_integer = str_to_i64(s);
+                let optional_integer = str_to_i64(text);
                 match optional_integer {
                     None => Self::Float(real),
-                    Some(val) => if real == val as f64 {
-                                        Self::Integer(val)
-                                    } else {
-                                        Self::Float(real)
-                                    }
+                    Some(val) => {
+                        if real == val as f64 {
+                            Self::Integer(val)
+                        } else {
+                            Self::Float(real)
+                        }
+                    }
                 }
             }
         }
