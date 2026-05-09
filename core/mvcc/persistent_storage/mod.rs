@@ -28,6 +28,41 @@ pub trait DurableStorage: Send + Sync + Debug {
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)>;
 
+    /// Stream a transaction's log frame using a visitor-driven two-pass
+    /// emitter. The visitor is invoked twice (size pass, emit pass) and must
+    /// produce the same sequence of `(canonical_table_id, &RowVersion)`
+    /// pairs each time.
+    ///
+    /// The default impl falls back to building a [`LogRecord`] in memory and
+    /// dispatching through [`Self::log_tx`] — the legacy single-`pwrite`
+    /// path — so external trait implementors (e.g. `RecordingDurableStorage`
+    /// in integration tests) keep working without changes. The concrete
+    /// `Storage` impl overrides this to drive the streaming `pwrite/pwritev`
+    /// path that avoids the per-frame `LogRecord` clone and the
+    /// `write_buf.to_vec()` copy. See `MVCC_COMMIT_IMPL_STEPS_V2.md`
+    /// step A.4.
+    fn log_tx_streaming(
+        &self,
+        commit_ts: u64,
+        header: Option<DatabaseHeader>,
+        visit: &dyn Fn(
+            &mut dyn FnMut(MVTableId, &RowVersion) -> Result<ControlFlow<()>>,
+        ) -> Result<()>,
+    ) -> Result<(Completion, u64)> {
+        let mut log_record = LogRecord {
+            tx_timestamp: commit_ts,
+            row_versions: Vec::new(),
+            header,
+        };
+        visit(&mut |canonical_id, rv| {
+            let mut cloned = rv.clone();
+            cloned.row.id.table_id = canonical_id;
+            log_record.row_versions.push(cloned);
+            Ok(ControlFlow::Continue(()))
+        })?;
+        self.log_tx(&log_record, None)
+    }
+
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
 
     /// Persist the current logical-log header to durable storage.
@@ -104,34 +139,6 @@ impl Storage {
     fn shadow_offset_advance(&self, bytes: u64) {
         self.log_offset.fetch_add(bytes, Ordering::Relaxed);
     }
-
-    /// Stream a transaction's log frame using a visitor-driven two-pass emitter.
-    ///
-    /// `visit` is invoked twice (size pass, then emit pass) and must produce
-    /// the same `(canonical_table_id, &RowVersion)` sequence on each call.
-    ///
-    /// Returns the I/O completion plus the on-disk frame size in bytes (used
-    /// by the commit machine to advance the writer offset after a successful
-    /// fsync). The writer offset is *not* advanced here — the caller must
-    /// invoke [`DurableStorage::advance_logical_log_offset_after_success`]
-    /// after the commit's I/O completes.
-    ///
-    /// This is an inherent method (not on the [`DurableStorage`] trait) so
-    /// external implementations like `RecordingDurableStorage` keep compiling
-    /// without changes. See `MVCC_COMMIT_IMPL_STEPS_V2.md` step A.2.
-    pub fn log_tx_streaming<V>(
-        &self,
-        commit_ts: u64,
-        header: Option<DatabaseHeader>,
-        visit: V,
-    ) -> Result<(Completion, u64)>
-    where
-        V: Fn(&mut dyn FnMut(MVTableId, &RowVersion) -> Result<ControlFlow<()>>) -> Result<()>,
-    {
-        self.logical_log
-            .write()
-            .log_tx_streaming_inner(commit_ts, header, visit)
-    }
 }
 
 impl DurableStorage for Storage {
@@ -143,6 +150,24 @@ impl DurableStorage for Storage {
         self.logical_log
             .write()
             .log_tx_deferred_offset(m, on_serialization_complete)
+    }
+
+    fn log_tx_streaming(
+        &self,
+        commit_ts: u64,
+        header: Option<DatabaseHeader>,
+        visit: &dyn Fn(
+            &mut dyn FnMut(MVTableId, &RowVersion) -> Result<ControlFlow<()>>,
+        ) -> Result<()>,
+    ) -> Result<(Completion, u64)> {
+        // Drive the streaming path: pass-1 sizing, allocate `Arc<Buffer>`
+        // chunks, pass-2 emit, submit via pwrite/pwritev. The visitor is
+        // `&dyn Fn` for trait object-safety; the inherent
+        // `log_tx_streaming_inner` accepts a generic `Fn`, and `&dyn Fn` auto-
+        // implements `Fn`, so we can forward directly.
+        self.logical_log
+            .write()
+            .log_tx_streaming_inner(commit_ts, header, visit)
     }
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {

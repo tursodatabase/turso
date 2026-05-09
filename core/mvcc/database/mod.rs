@@ -46,6 +46,7 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
+use std::ops::ControlFlow;
 #[cfg(any(test, injected_yields))]
 use strum::EnumCount;
 use tracing::instrument;
@@ -888,7 +889,11 @@ pub enum CommitState<Clock: LogicalClock> {
     },
     BeginCommitLogicalLog {
         end_ts: u64,
-        log_record: LogRecord,
+        /// `Some` when `tx.header_dirty`, otherwise `None`. Streamed alongside
+        /// the row writes by `log_tx_streaming`. We snapshot the header before
+        /// transitioning here so the streaming visitor doesn't have to re-read
+        /// `tx.header` on each pass.
+        header: Option<DatabaseHeader>,
     },
     EndCommitLogicalLog {
         end_ts: u64,
@@ -1026,6 +1031,147 @@ pub struct DeleteRowStateMachine {
     is_finalized: bool,
     rowid: RowID,
     cursor: Arc<RwLock<BTreeCursor>>,
+}
+
+/// Apply Hekaton §3.6 timestamp stamping to a chain `RowVersion`, returning
+/// the committed image our transaction must log, or `None` if our tx did not
+/// contribute to this version.
+///
+/// Mirrors the in-place closure inside
+/// [`CommitStateMachine::build_committed_log_record`]; both call sites must
+/// stay in sync until A.5 deletes the legacy path.
+fn our_committed_image_for(rv: &RowVersion, our_tx_id: TxID, end_ts: u64) -> Option<RowVersion> {
+    let our_begin = matches!(
+        rv.begin,
+        Some(TxTimestampOrID::TxID(vid)) if vid == our_tx_id
+    );
+    let our_end = matches!(
+        rv.end,
+        Some(TxTimestampOrID::TxID(vid)) if vid == our_tx_id
+    );
+    if !our_begin && !our_end {
+        return None;
+    }
+    let mut committed = rv.clone();
+    if our_begin {
+        committed.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+        if !our_end {
+            // A concurrent tx may have speculatively claimed this row's `end`
+            // (Hekaton §3.1, "check updatability"). That deletion is its
+            // contribution, not ours; clear it so we serialize an OP_UPSERT.
+            committed.end = None;
+        }
+    }
+    if our_end {
+        committed.end = Some(TxTimestampOrID::Timestamp(end_ts));
+    }
+    Some(committed)
+}
+
+/// Resolve a `MVTableId` to its canonical (root-page-derived) form so that
+/// recovery — which reconstructs `table_id_to_rootpage` from on-disk root
+/// pages — can match log entries against the live in-memory map after a
+/// checkpoint may have remapped the table id.
+///
+/// Returns the input unchanged for [`SQLITE_SCHEMA_MVCC_TABLE_ID`] (its
+/// canonical form is fixed at -1) and for tables not present in the
+/// rootpage map.
+fn canonical_table_id_for<C: LogicalClock>(
+    mvcc_store: &MvStore<C>,
+    table_id: MVTableId,
+) -> MVTableId {
+    if table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+        return table_id;
+    }
+    if let Some(entry) = mvcc_store.table_id_to_rootpage.get(&table_id) {
+        if let Some(root_page) = *entry.value() {
+            return MVTableId::from(-(root_page as i64));
+        }
+    }
+    table_id
+}
+
+/// Walk one `RowID`'s chains (table chain in `mvcc_store.rows` and, if it is
+/// an index entry, the index chain in `mvcc_store.index_rows`), build each
+/// stamped committed image, apply the same equal-`Timestamp(x)`-begin
+/// collapse rule as [`MvStore::insert_version_raw`], and yield each
+/// surviving image to `visit`.
+///
+/// The chain `RwLockReadGuard` is dropped before any `visit` call so the
+/// visitor can re-enter the MVCC store without risking a deadlock.
+fn visit_committed_for_id<Clock: LogicalClock, F>(
+    our_tx_id: TxID,
+    mvcc_store: &Arc<MvStore<Clock>>,
+    id: &RowID,
+    end_ts: u64,
+    visit: &mut F,
+) -> Result<ControlFlow<()>>
+where
+    F: FnMut(MVTableId, &RowVersion) -> Result<ControlFlow<()>>,
+{
+    // Buffer images for THIS RowID's chains so we can apply the collapse
+    // rule before yielding. Typical workloads put 1–2 entries here; the
+    // legacy path holds clones for ALL rows simultaneously in
+    // `LogRecord.row_versions`, so even with the local buffer the peak heap
+    // is bounded by the largest single chain instead of the whole tx.
+    let mut buffer: Vec<(MVTableId, RowVersion)> = Vec::new();
+
+    let push_with_collapse =
+        |buf: &mut Vec<(MVTableId, RowVersion)>, canonical: MVTableId, stamped: RowVersion| {
+            if let Some(idx) = buf.iter().position(|(_, existing)| {
+                existing.row.id == stamped.row.id
+                    && matches!(
+                        (&existing.begin, &stamped.begin),
+                        (
+                            Some(TxTimestampOrID::Timestamp(a)),
+                            Some(TxTimestampOrID::Timestamp(b)),
+                        ) if a == b
+                    )
+            }) {
+                buf[idx] = (canonical, stamped);
+            } else {
+                buf.push((canonical, stamped));
+            }
+        };
+
+    if let Some(row_versions) = mvcc_store.rows.get(id) {
+        let row_versions = row_versions.value().read();
+        for rv in row_versions.iter() {
+            if let Some(stamped) = our_committed_image_for(rv, our_tx_id, end_ts) {
+                let canonical = canonical_table_id_for(mvcc_store, stamped.row.id.table_id);
+                push_with_collapse(&mut buffer, canonical, stamped);
+            }
+        }
+    }
+    if let Some(index) = mvcc_store.index_rows.get(&id.table_id) {
+        let RowKey::Record(ref index_key) = id.row_id else {
+            panic!("Index writes must have a record key");
+        };
+        if let Some(row_versions) = index.value().get(index_key) {
+            let row_versions = row_versions.value().read();
+            for rv in row_versions.iter() {
+                if let Some(stamped) = our_committed_image_for(rv, our_tx_id, end_ts) {
+                    let canonical = canonical_table_id_for(mvcc_store, stamped.row.id.table_id);
+                    push_with_collapse(&mut buffer, canonical, stamped);
+                }
+            }
+        }
+    }
+
+    // Match `insert_version_raw`'s ordering: sort by resolved begin so that
+    // older Timestamp begins (our-end-only contributions over predecessor
+    // versions) come before our-begin contributions stamped at end_ts.
+    buffer.sort_by_key(|(_, rv)| match rv.begin {
+        Some(TxTimestampOrID::Timestamp(ts)) => ts,
+        Some(TxTimestampOrID::TxID(_)) | None => 0,
+    });
+
+    for (canonical, stamped) in &buffer {
+        if visit(*canonical, stamped)?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+    }
+    Ok(ControlFlow::Continue(()))
 }
 
 impl<Clock: LogicalClock> CommitStateMachine<Clock> {
@@ -1447,6 +1593,50 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         log_record
     }
 
+    /// Walk this transaction's committed contributions in the schema-first
+    /// order required by recovery, yielding `(canonical_table_id, &stamped_row_version)`
+    /// to the visitor for each surviving committed image.
+    ///
+    /// Schema rows are yielded before data rows so that on log replay the
+    /// `table_id_to_rootpage` map is populated before data inserts reference
+    /// it — same ordering as [`Self::build_committed_log_record`].
+    ///
+    /// `Ok(ControlFlow::Break(()))` from the visitor short-circuits the walk
+    /// and returns `Ok(())` to the caller.
+    ///
+    /// Used by the streaming commit path
+    /// ([`crate::mvcc::persistent_storage::Storage::log_tx_streaming`]); see
+    /// `MVCC_COMMIT_IMPL_STEPS_V2.md` step A.3.
+    pub(crate) fn for_each_committed_image<F>(
+        &self,
+        mvcc_store: &Arc<MvStore<Clock>>,
+        end_ts: u64,
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(MVTableId, &RowVersion) -> Result<ControlFlow<()>>,
+    {
+        for id in self
+            .write_set
+            .iter()
+            .filter(|id| id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID)
+        {
+            if visit_committed_for_id(self.tx_id, mvcc_store, id, end_ts, &mut visit)?.is_break() {
+                return Ok(());
+            }
+        }
+        for id in self
+            .write_set
+            .iter()
+            .filter(|id| id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID)
+        {
+            if visit_committed_for_id(self.tx_id, mvcc_store, id, end_ts, &mut visit)?.is_break() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     /// Publish committed timestamps into the live MVCC chains after the
     /// transaction has been finalized as Committed(end_ts).
     /// This must run as postprocessing step i.e. the txn is written to log and is durable
@@ -1798,28 +1988,45 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Ok(TransitionResult::Done(()));
                 }
 
-                // All dependencies resolved. Build the committed image for the
-                // logical log, but keep live row versions on TxID references
-                // until CommitEnd so rollback of an abandoned commit can still
+                // All dependencies resolved. Snapshot the header (if dirty)
+                // and peek whether we have any row writes; the streaming
+                // commit path will re-walk the chains for both sizing and
+                // emission. Live row versions stay on TxID references until
+                // CommitEnd so rollback of an abandoned commit can still
                 // match them.
-                let log_record = self.build_committed_log_record(mvcc_store, tx, end_ts);
-                tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
+                let header = if tx.header_dirty.load(Ordering::Acquire) {
+                    Some(*tx.header.read())
+                } else {
+                    None
+                };
+                let mut has_row_writes = false;
+                self.for_each_committed_image(mvcc_store, end_ts, |_id, _rv| {
+                    has_row_writes = true;
+                    Ok(ControlFlow::Break(()))
+                })?;
+                tracing::trace!(
+                    "prepared_log_record(tx_id={}, header={}, row_writes={})",
+                    self.tx_id,
+                    header.is_some(),
+                    has_row_writes,
+                );
 
-                if log_record.row_versions.is_empty() && log_record.header.is_none() {
-                    // Nothing to do, just end commit.
+                if !has_row_writes && header.is_none() {
+                    // Nothing to log; skip BeginCommitLogicalLog entirely so
+                    // we don't acquire `pager_commit_lock` for a no-op write.
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.unlock_commit_lock_if_held(tx);
                     }
                     self.state = CommitState::CommitEnd { end_ts };
                 } else {
-                    self.state = CommitState::BeginCommitLogicalLog { end_ts, log_record };
+                    self.state = CommitState::BeginCommitLogicalLog { end_ts, header };
                 }
                 inject_transition_yield!(self, CommitYieldPoint::LogRecordPrepared);
                 return Ok(TransitionResult::Continue);
             }
-            CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
+            CommitState::BeginCommitLogicalLog { end_ts, header } => {
                 if !mvcc_store.is_exclusive_tx(&self.tx_id) {
-                    // logical log needs to be serialized
+                    // Logical-log writes must be serialized.
                     let locked = self.commit_coordinator.pager_commit_lock.write();
                     if !locked {
                         return Ok(TransitionResult::Io(IOCompletions::Single(
@@ -1834,10 +2041,25 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .pager_commit_lock_held
                         .store(true, Ordering::Release);
                 }
-                let (c, append_bytes) = mvcc_store.storage.log_tx(log_record, None)?;
+                let end_ts = *end_ts;
+                let header_snapshot = *header;
+                // The streaming emitter walks `for_each_committed_image` twice
+                // (size + emit). The visitor is `Fn`, so each call rebuilds
+                // the per-row stamped images on the fly — the LogRecord clone
+                // and its inner `Vec<RowVersion>` are gone.
+                let visitor = |sink: &mut dyn FnMut(
+                    MVTableId,
+                    &RowVersion,
+                ) -> Result<ControlFlow<()>>|
+                 -> Result<()> {
+                    self.for_each_committed_image(mvcc_store, end_ts, |id, rv| sink(id, rv))
+                };
+                let (c, append_bytes) =
+                    mvcc_store
+                        .storage
+                        .log_tx_streaming(end_ts, header_snapshot, &visitor)?;
                 self.pending_log_append_bytes = Some(append_bytes);
-                self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
-                // if Completion Completed without errors we can continue
+                self.state = CommitState::SyncLogicalLog { end_ts };
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
@@ -5112,11 +5334,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
                         panic!("Index writes must be to a record");
                     };
-                    self.insert_index_version(
-                        rowid.table_id,
-                        Arc::new(sortable_key),
-                        row_version,
-                    );
+                    self.insert_index_version(rowid.table_id, Arc::new(sortable_key), row_version);
                 }
                 StreamingResult::DeleteIndexRow {
                     row,
@@ -5714,10 +5932,10 @@ impl<Clock: LogicalClock> Debug for CommitState<Clock> {
                 .debug_struct("WaitForDependencies")
                 .field("end_ts", end_ts)
                 .finish(),
-            Self::BeginCommitLogicalLog { end_ts, log_record } => f
+            Self::BeginCommitLogicalLog { end_ts, header } => f
                 .debug_struct("BeginCommitLogicalLog")
                 .field("end_ts", end_ts)
-                .field("log_record", log_record)
+                .field("header_dirty", &header.is_some())
                 .finish(),
             Self::EndCommitLogicalLog { end_ts } => f
                 .debug_struct("EndCommitLogicalLog")

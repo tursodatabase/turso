@@ -1,4 +1,5 @@
 use rustc_hash::FxHashSet as HashSet;
+use std::ops::ControlFlow;
 
 use super::*;
 use crate::io::PlatformIO;
@@ -2580,6 +2581,249 @@ fn test_commit() {
     commit_tx(db.mvcc_store.clone(), &db.conn, tx2).unwrap();
     assert_eq!(tx1_updated_row, row);
     db.mvcc_store.drop_unused_row_versions();
+}
+
+/// Build a `CommitStateMachine` for `tx_id` and populate its `write_set`
+/// from the active transaction's writes, mirroring what `CommitState::Initial`
+/// does at `mod.rs:1666-1678`. Lets us call commit-side helpers
+/// (`build_committed_log_record`, `for_each_committed_image`) directly without
+/// stepping through the whole state machine.
+fn make_commit_state_machine_with_write_set(
+    db: &MvccTestDb,
+    tx_id: TxID,
+) -> CommitStateMachine<MvccClock> {
+    let mut sm = CommitStateMachine::new(
+        CommitState::Initial,
+        tx_id,
+        db.conn.clone(),
+        crate::MAIN_DB_ID,
+        db.mvcc_store.commit_coordinator.clone(),
+        db.mvcc_store.global_header.clone(),
+        db.conn.get_sync_mode(),
+    );
+    {
+        let tx_entry = db.mvcc_store.txs.get(&tx_id).unwrap();
+        let tx_writes = tx_entry.value().write_set.lock();
+        sm.write_set.extend_from_slice(&tx_writes);
+    }
+    sm.write_set
+        .sort_by(|a, b| b.table_id.cmp(&a.table_id).then(a.row_id.cmp(&b.row_id)));
+    sm.write_set.dedup();
+    sm
+}
+
+fn collect_via_visitor(
+    sm: &CommitStateMachine<MvccClock>,
+    mvcc_store: &Arc<MvStore<MvccClock>>,
+    end_ts: u64,
+) -> Vec<(MVTableId, RowVersion)> {
+    let mut yielded: Vec<(MVTableId, RowVersion)> = Vec::new();
+    sm.for_each_committed_image(mvcc_store, end_ts, |canonical, rv| {
+        yielded.push((canonical, rv.clone()));
+        Ok(ControlFlow::Continue(()))
+    })
+    .unwrap();
+    yielded
+}
+
+/// for_each_committed_image must yield the same stamped images as the legacy
+/// `build_committed_log_record` for a single insert. This is the smoke case:
+/// one chain entry, no collapse.
+#[test]
+fn test_for_each_committed_image_matches_legacy_simple_insert() {
+    let db = MvccTestDb::new();
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let row = generate_simple_string_row((-2).into(), 1, "Hello");
+    db.mvcc_store.insert(tx_id, row).unwrap();
+
+    let mut sm = make_commit_state_machine_with_write_set(&db, tx_id);
+    let end_ts: u64 = 12345;
+    let tx_entry = db.mvcc_store.txs.get(&tx_id).unwrap();
+    let tx_ref = tx_entry.value();
+
+    let legacy = sm.build_committed_log_record(&db.mvcc_store, tx_ref, end_ts);
+    drop(tx_entry);
+
+    let yielded = collect_via_visitor(&sm, &db.mvcc_store, end_ts);
+
+    assert_eq!(legacy.row_versions.len(), 1);
+    assert_eq!(yielded.len(), 1);
+    let (canonical_id, yielded_rv) = &yielded[0];
+    let legacy_rv = &legacy.row_versions[0];
+    // Legacy mutates row.id.table_id to canonical; visitor returns canonical
+    // as a sidecar and leaves row.id.table_id alone. With no checkpoint having
+    // run, canonical == original, so they should match.
+    assert_eq!(*canonical_id, legacy_rv.row.id.table_id);
+    assert_eq!(yielded_rv, legacy_rv);
+}
+
+/// Insert + update of the same row in one tx leaves two chain entries with
+/// `our_begin = true`. After timestamp stamping both have
+/// `begin = Timestamp(end_ts)`, and `insert_version_raw`'s collapse rule
+/// keeps only the later one (the upsert image). The visitor must replicate
+/// that or it would emit the obsolete delete-marker image.
+///
+/// This is the regression test the V2 plan calls out for the
+/// "multi-contribution-per-RowID" case (step A.3, point 4).
+#[test]
+fn test_for_each_committed_image_collapses_insert_then_update_same_row() {
+    let db = MvccTestDb::new();
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let row_v1 = generate_simple_string_row((-2).into(), 1, "Hello");
+    let row_v2 = generate_simple_string_row((-2).into(), 1, "World");
+    db.mvcc_store.insert(tx_id, row_v1).unwrap();
+    db.mvcc_store.update(tx_id, row_v2.clone()).unwrap();
+
+    // Sanity: chain has the two entries we expect (delete-marker + new row).
+    let chain_len = db
+        .mvcc_store
+        .rows
+        .get(&RowID {
+            table_id: (-2).into(),
+            row_id: RowKey::Int(1),
+        })
+        .map(|e| e.value().read().len())
+        .unwrap();
+    assert_eq!(
+        chain_len, 2,
+        "insert+update should leave two chain entries before collapse"
+    );
+
+    let mut sm = make_commit_state_machine_with_write_set(&db, tx_id);
+    let end_ts: u64 = 12345;
+    let tx_entry = db.mvcc_store.txs.get(&tx_id).unwrap();
+    let tx_ref = tx_entry.value();
+
+    let legacy = sm.build_committed_log_record(&db.mvcc_store, tx_ref, end_ts);
+    drop(tx_entry);
+
+    let yielded = collect_via_visitor(&sm, &db.mvcc_store, end_ts);
+
+    assert_eq!(
+        legacy.row_versions.len(),
+        1,
+        "legacy collapse should leave exactly the upsert image"
+    );
+    assert_eq!(
+        yielded.len(),
+        1,
+        "visitor collapse should leave exactly the upsert image"
+    );
+    let legacy_rv = &legacy.row_versions[0];
+    let (yielded_canonical, yielded_rv) = &yielded[0];
+    assert_eq!(*yielded_canonical, legacy_rv.row.id.table_id);
+    assert_eq!(yielded_rv, legacy_rv);
+    // The surviving image is the upsert (end == None), not the delete-marker.
+    assert!(
+        yielded_rv.end.is_none(),
+        "collapse must keep the upsert (end=None), got end={:?}",
+        yielded_rv.end
+    );
+    assert_eq!(
+        yielded_rv.row.data.as_deref(),
+        Some(row_v2.data.as_deref().unwrap())
+    );
+}
+
+/// `Ok(ControlFlow::Break(()))` from the visitor short-circuits iteration.
+#[test]
+fn test_for_each_committed_image_visitor_break_short_circuits() {
+    let db = MvccTestDb::new();
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .insert(tx_id, generate_simple_string_row((-2).into(), 1, "a"))
+        .unwrap();
+    db.mvcc_store
+        .insert(tx_id, generate_simple_string_row((-2).into(), 2, "b"))
+        .unwrap();
+    db.mvcc_store
+        .insert(tx_id, generate_simple_string_row((-2).into(), 3, "c"))
+        .unwrap();
+
+    let sm = make_commit_state_machine_with_write_set(&db, tx_id);
+    let end_ts: u64 = 12345;
+
+    let mut count = 0;
+    sm.for_each_committed_image(&db.mvcc_store, end_ts, |_canonical, _rv| {
+        count += 1;
+        if count == 1 {
+            Ok(ControlFlow::Break(()))
+        } else {
+            Ok(ControlFlow::Continue(()))
+        }
+    })
+    .unwrap();
+
+    assert_eq!(count, 1, "Break must stop iteration after the first yield");
+}
+
+/// `Err` from the visitor propagates and stops iteration (no further yields).
+#[test]
+fn test_for_each_committed_image_visitor_err_propagates() {
+    let db = MvccTestDb::new();
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .insert(tx_id, generate_simple_string_row((-2).into(), 1, "a"))
+        .unwrap();
+    db.mvcc_store
+        .insert(tx_id, generate_simple_string_row((-2).into(), 2, "b"))
+        .unwrap();
+
+    let sm = make_commit_state_machine_with_write_set(&db, tx_id);
+    let end_ts: u64 = 12345;
+
+    let mut count = 0;
+    let result = sm.for_each_committed_image(&db.mvcc_store, end_ts, |_canonical, _rv| {
+        count += 1;
+        Err::<ControlFlow<()>, _>(LimboError::InternalError("stop".to_string()))
+    });
+
+    assert!(matches!(result, Err(LimboError::InternalError(_))));
+    assert_eq!(count, 1, "Err must stop iteration after the first yield");
+}
+
+/// `canonical_table_id_for` (and therefore the canonical-id sidecar yielded
+/// to `visit`) must reflect the `table_id_to_rootpage` map even when the
+/// in-memory `table_id` differs from `-(root_page)`. This guards the
+/// post-checkpoint canonicalization-mismatch path mentioned in the V2 plan.
+#[test]
+fn test_for_each_committed_image_canonical_id_reflects_remapping() {
+    let db = MvccTestDb::new();
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let live_table_id: MVTableId = (-53).into();
+    let canonical_root_page: u64 = 58;
+    db.mvcc_store
+        .insert_table_id_to_rootpage(live_table_id, Some(canonical_root_page));
+    db.mvcc_store
+        .insert(tx_id, generate_simple_string_row(live_table_id, 1, "X"))
+        .unwrap();
+
+    let sm = make_commit_state_machine_with_write_set(&db, tx_id);
+    let end_ts: u64 = 999;
+    let yielded = collect_via_visitor(&sm, &db.mvcc_store, end_ts);
+
+    assert_eq!(yielded.len(), 1);
+    let (canonical_id, _) = &yielded[0];
+    assert_eq!(
+        *canonical_id,
+        MVTableId::from(-(canonical_root_page as i64)),
+        "canonical id must be -(root_page)"
+    );
 }
 
 /// What this test checks: Rollback/savepoint behavior restores exactly the intended state when statements or transactions fail.

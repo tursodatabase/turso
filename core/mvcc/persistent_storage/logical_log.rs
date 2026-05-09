@@ -685,7 +685,13 @@ impl LogicalLog {
         if let Some(enc_ctx) = &self.encryption_ctx {
             self.encryption_scratch_buffer.clear();
             for row_version in &tx.row_versions {
-                serialize_op_entry(&mut self.encryption_scratch_buffer, row_version)?;
+                // Legacy `build_committed_log_record` already canonicalized
+                // `row.id.table_id` in place, so we pass it as the sidecar.
+                serialize_op_entry(
+                    &mut self.encryption_scratch_buffer,
+                    row_version,
+                    row_version.row.id.table_id,
+                )?;
             }
             if let Some(hdr) = tx.header {
                 serialize_header_entry(&mut self.encryption_scratch_buffer, &hdr);
@@ -755,7 +761,11 @@ impl LogicalLog {
         } else {
             let payload_start = self.write_buf.len();
             for row_version in &tx.row_versions {
-                serialize_op_entry(&mut self.write_buf, row_version)?;
+                serialize_op_entry(
+                    &mut self.write_buf,
+                    row_version,
+                    row_version.row.id.table_id,
+                )?;
             }
             if let Some(header) = tx.header {
                 serialize_header_entry(&mut self.write_buf, &header);
@@ -902,8 +912,8 @@ impl LogicalLog {
             self.encryption_scratch_buffer
                 .reserve(payload_size as usize);
             let scratch = &mut self.encryption_scratch_buffer;
-            visit(&mut |_canonical_table_id, rv| {
-                serialize_op_entry(scratch, rv)?;
+            visit(&mut |canonical_table_id, rv| {
+                serialize_op_entry(scratch, rv, canonical_table_id)?;
                 Ok(ControlFlow::Continue(()))
             })?;
             if let Some(hdr) = header.as_ref() {
@@ -963,9 +973,9 @@ impl LogicalLog {
             let mut op_scratch: Vec<u8> = Vec::with_capacity(64);
             let chunks_ref = &chunks;
             let cursor_cell = std::cell::Cell::new(payload_offset);
-            visit(&mut |_canonical_table_id, rv| {
+            visit(&mut |canonical_table_id, rv| {
                 op_scratch.clear();
-                serialize_op_entry(&mut op_scratch, rv)?;
+                serialize_op_entry(&mut op_scratch, rv, canonical_table_id)?;
                 let pos = cursor_cell.get();
                 write_at_in_chunks(chunks_ref, pos, &op_scratch);
                 cursor_cell.set(pos + op_scratch.len());
@@ -1113,7 +1123,11 @@ impl LogicalLog {
 
 /// Serialize one op into `buffer`.
 /// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
-fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<()> {
+fn serialize_op_entry(
+    buffer: &mut Vec<u8>,
+    row_version: &RowVersion,
+    canonical_table_id: MVTableId,
+) -> Result<()> {
     let start_len = buffer.len();
     let is_delete = row_version.end.is_some();
     let tag = match (&row_version.row.id.row_id, is_delete) {
@@ -1128,7 +1142,14 @@ fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<
         flags |= OP_FLAG_BTREE_RESIDENT;
     }
 
-    let table_id_i64: i64 = row_version.row.id.table_id.into();
+    // Use the canonical sidecar (computed from `table_id_to_rootpage`) instead
+    // of `row_version.row.id.table_id`. Recovery looks frames up by canonical
+    // root-page-derived id, and the live in-memory id may diverge after a
+    // checkpoint remaps it. The legacy commit path mutated `row.id.table_id`
+    // in-place before serializing; the streaming path threads the canonical
+    // id alongside the borrow to avoid that mutation (and the clone it would
+    // require under read locks). See `MVCC_COMMIT_IMPL_STEPS_V2.md` step A.4.
+    let table_id_i64: i64 = canonical_table_id.into();
     turso_assert!(
         table_id_i64 < 0,
         "table_id_i64 should be negative, but got {table_id_i64}"
@@ -1179,7 +1200,7 @@ fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<
 
     debug_assert_eq!(
         buffer.len() - start_len,
-        serialized_op_size(row_version, row_version.row.id.table_id),
+        serialized_op_size(row_version, canonical_table_id),
         "serialize_op_entry / serialized_op_size byte-count drift for {:?}",
         row_version.row.id,
     );
@@ -4762,7 +4783,7 @@ mod tests {
         let mut encoded = Vec::new();
         let value = "x".repeat(text_len);
         let row_version = make_test_row_version((-2).into(), rowid, &value, 100);
-        serialize_op_entry(&mut encoded, &row_version).unwrap();
+        serialize_op_entry(&mut encoded, &row_version, row_version.row.id.table_id).unwrap();
         encoded.len()
     }
 
@@ -4801,7 +4822,7 @@ mod tests {
 
         for rv in &fixtures {
             let mut buf = Vec::new();
-            serialize_op_entry(&mut buf, rv).unwrap();
+            serialize_op_entry(&mut buf, rv, rv.row.id.table_id).unwrap();
             let predicted = serialized_op_size(rv, rv.row.id.table_id);
             assert_eq!(
                 buf.len(),
@@ -5502,11 +5523,21 @@ mod tests {
         chunk_size: usize,
     ) {
         let mut filler_buf = Vec::new();
-        serialize_op_entry(&mut filler_buf, short_filler).unwrap();
+        serialize_op_entry(&mut filler_buf, short_filler, short_filler.row.id.table_id).unwrap();
         let mut short_upsert_buf = Vec::new();
-        serialize_op_entry(&mut short_upsert_buf, short_upsert).unwrap();
+        serialize_op_entry(
+            &mut short_upsert_buf,
+            short_upsert,
+            short_upsert.row.id.table_id,
+        )
+        .unwrap();
         let mut long_upsert_buf = Vec::new();
-        serialize_op_entry(&mut long_upsert_buf, long_upsert).unwrap();
+        serialize_op_entry(
+            &mut long_upsert_buf,
+            long_upsert,
+            long_upsert.row.id.table_id,
+        )
+        .unwrap();
 
         turso_assert_less_than!(
             filler_buf.len(),
@@ -5556,7 +5587,12 @@ mod tests {
             false,
         );
         let mut short_upsert_buf = Vec::new();
-        serialize_op_entry(&mut short_upsert_buf, &short_upsert).unwrap();
+        serialize_op_entry(
+            &mut short_upsert_buf,
+            &short_upsert,
+            short_upsert.row.id.table_id,
+        )
+        .unwrap();
         turso_assert_less_than!(
             short_upsert_buf.len(),
             StreamingLogicalLogReader::MAX_SERIALIZED_OP_PREFIX_LEN,
@@ -6167,11 +6203,11 @@ mod tests {
         let expected_second_record_bytes = second.row.payload().to_vec();
 
         let mut filler_buf = Vec::new();
-        serialize_op_entry(&mut filler_buf, &filler).unwrap();
+        serialize_op_entry(&mut filler_buf, &filler, filler.row.id.table_id).unwrap();
         assert_eq!(filler_buf.len(), ENCRYPTED_PAYLOAD_CHUNK_SIZE - 7);
 
         let mut second_buf = Vec::new();
-        serialize_op_entry(&mut second_buf, &second).unwrap();
+        serialize_op_entry(&mut second_buf, &second, second.row.id.table_id).unwrap();
         // Table ops begin with a fixed 6-byte prelude:
         // 1 byte op tag + 1 byte flags + 4 bytes table_id.
         // The payload_len varint begins immediately after that prefix.
@@ -6224,7 +6260,7 @@ mod tests {
         let expected_filler_record_bytes = filler.row.payload().to_vec();
 
         let mut filler_buf = Vec::new();
-        serialize_op_entry(&mut filler_buf, &filler).unwrap();
+        serialize_op_entry(&mut filler_buf, &filler, filler.row.id.table_id).unwrap();
         assert_eq!(filler_buf.len(), filler_payload_size);
         assert_eq!(
             filler_buf.len() + header_buf.len() - 1,
