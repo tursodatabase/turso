@@ -2596,6 +2596,7 @@ fn make_commit_state_machine_with_write_set(
         tx_id,
         db.conn.clone(),
         crate::MAIN_DB_ID,
+        db.mvcc_store.clone(),
         db.mvcc_store.commit_coordinator.clone(),
         db.mvcc_store.global_header.clone(),
         db.conn.get_sync_mode(),
@@ -2608,6 +2609,12 @@ fn make_commit_state_machine_with_write_set(
     sm.write_set
         .sort_by(|a, b| b.table_id.cmp(&a.table_id).then(a.row_id.cmp(&b.row_id)));
     sm.write_set.dedup();
+    // The synthetic SM never runs through `step` (so its `Drop` impl
+    // would otherwise try to "restore" the cloned write_set into
+    // `tx.write_set`, which still has its originals — duplicating
+    // entries). Marking it finalized here short-circuits Drop without
+    // affecting the visitor logic the tests exercise.
+    sm.is_finalized = true;
     sm
 }
 
@@ -3725,6 +3732,7 @@ fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
+        had_writes: AtomicBool::new(false),
     }
 }
 
@@ -5094,6 +5102,7 @@ fn transaction_display() {
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
+        had_writes: AtomicBool::new(false),
     };
 
     let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }], read_set: [RowID { table_id: MVTableId(-2), row_id: Int(17) }, RowID { table_id: MVTableId(-2), row_id: Int(19) }] }";

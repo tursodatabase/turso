@@ -108,6 +108,37 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
     }
 }
 
+/// What this test checks: a row committed by tx A is immediately visible
+/// to a *different* connection's read after `commit_tx` returns.
+///
+/// Why this matters: `MVCC_COMMIT_PLAN.md` §Step 3 drains
+/// `tx.write_set` into the commit state machine in `Initial`. After
+/// drain, `tx.write_set.lock().is_empty()` is `true` even for write-heavy
+/// txs, so `remove_tx`'s `finalized_tx_states.insert` gate would
+/// previously skip the cache insertion. A reader looking up the tx state
+/// after `txs.remove` would then fall through to the conservative
+/// "false" branch in `is_begin_visible` / `is_end_visible` — committed
+/// rows would go invisible.
+///
+/// `had_writes` (set on drain) is the new gate; this test exercises the
+/// user-visible regression that would surface if the gate ever read
+/// `tx.write_set.is_empty()` again.
+#[turso_macros::test(mvcc)]
+fn test_mvcc_committed_row_visible_to_other_connection(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn_w = tmp_db.connect_limbo();
+    conn_w.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn_w.execute("INSERT INTO t(id, v) VALUES (1, 'committed')")?;
+
+    let conn_r = tmp_db.connect_limbo();
+    let rows: Vec<(i64, String)> = conn_r.exec_rows("SELECT id, v FROM t");
+    assert_eq!(rows.len(), 1, "committed row must be visible across connections");
+    assert_eq!(rows[0], (1, "committed".to_string()));
+
+    Ok(())
+}
+
 /// CREATE TABLE on an attached MVCC database must not deadlock.
 /// op_parse_schema must release the database_schemas lock before executing the
 /// nested statement that reads sqlite_schema, since reprepare() also acquires

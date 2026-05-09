@@ -524,6 +524,15 @@ pub struct Transaction {
     /// Hekaton Section 2.7: "CommitDepSet, that stores transaction IDs of the
     /// transactions that depend on T."
     commit_dep_set: Mutex<HashSet<TxID>>,
+    /// True iff this tx had pending writes when its [`CommitStateMachine`]
+    /// drained `write_set` into the commit machine. Once drained,
+    /// `write_set.lock()` is empty even though the transaction does have
+    /// writes to log; `remove_tx` reads this flag to gate
+    /// `finalized_tx_states.insert` so post-commit visibility lookups
+    /// don't fall through to the conservative-fallback path. Set by the
+    /// commit-machine Initial arm; never cleared (the transaction is
+    /// removed shortly after).
+    had_writes: AtomicBool,
 }
 
 impl Transaction {
@@ -541,6 +550,7 @@ impl Transaction {
             commit_dep_counter: AtomicU64::new(0),
             abort_now: AtomicBool::new(false),
             commit_dep_set: Mutex::new(HashSet::default()),
+            had_writes: AtomicBool::new(false),
         }
     }
 
@@ -1019,8 +1029,15 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     /// Threaded through so that `finish_committed_tx` can clear the matching
     /// connection-level mv_tx slot atomically with `remove_tx`.
     db_id: usize,
-    /// Write set sorted by table id and row id
+    /// Write set sorted by table id and row id. Drained out of
+    /// `tx.write_set` in the `Initial` arm; restored to `tx.write_set` by
+    /// the [`Drop`] impl when the commit fails (so `rollback_tx` can walk
+    /// the chain entries to clean up). See `MVCC_COMMIT_PLAN.md` §Step 3.
     write_set: Vec<RowID>,
+    /// Owning reference to the MVCC store. Held so the [`Drop`] impl can
+    /// restore `tx.write_set` from `self.write_set` on a failed commit
+    /// without taking the store as an additional Drop-time argument.
+    mvcc_store: Arc<MvStore<Clock>>,
     commit_coordinator: Arc<CommitCoordinator>,
     header: Arc<RwLock<Option<DatabaseHeader>>>,
     pager: Arc<Pager>,
@@ -1037,6 +1054,50 @@ impl<Clock: LogicalClock> Debug for CommitStateMachine<Clock> {
             .field("state", &self.state)
             .field("is_finalized", &self.is_finalized)
             .finish()
+    }
+}
+
+/// On a failed commit (state machine dropped without `finalize` running),
+/// restore the drained `tx.write_set` so the subsequent `rollback_tx` can
+/// walk it to clean up chain entries with `TxID(this_tx)` references.
+///
+/// Without this restore, the tx's chain entries would only be invalidated
+/// by `tx.state.store(Aborted)` and would leak memory until the next GC
+/// pass — and crucially, `rollback_rowid` (called from `rollback_tx`)
+/// would never run for any of the drained writes, leaving the chains in
+/// an inconsistent state until GC.
+///
+/// Same connection cannot issue savepoint rollback while the SM yields
+/// (the connection is blocked inside `commit_tx`), so this Drop has no
+/// race with `tx.write_set` mutations from concurrent statements.
+impl<Clock: LogicalClock> Drop for CommitStateMachine<Clock> {
+    fn drop(&mut self) {
+        if self.is_finalized {
+            return;
+        }
+        if self.write_set.is_empty() {
+            return;
+        }
+        let Some(entry) = self.mvcc_store.txs.get(&self.tx_id) else {
+            // The tx has been removed already (e.g. fast-path read-only
+            // finalize before drain happened, or the tx was forcibly
+            // aborted and removed by another path). Nothing to restore.
+            return;
+        };
+        let tx = entry.value();
+        let drained = std::mem::take(&mut self.write_set);
+        let mut source = tx.write_set.lock();
+        // Same-connection invariant: while this SM is being dropped from
+        // a failed commit, the same connection cannot have issued
+        // rollback_savepoint_changes / remove_rolled_back_rows_from_write_set
+        // against `tx.write_set`. The lock is uncontended and `*source` is
+        // empty. We append rather than overwrite as a defensive measure
+        // against future relaxations of that invariant.
+        if source.is_empty() {
+            *source = drained;
+        } else {
+            source.extend(drained);
+        }
     }
 }
 
@@ -1307,6 +1368,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         tx_id: TxID,
         connection: Arc<Connection>,
         db_id: usize,
+        mvcc_store: Arc<MvStore<Clock>>,
         commit_coordinator: Arc<CommitCoordinator>,
         header: Arc<RwLock<Option<DatabaseHeader>>>,
         sync_mode: SyncMode,
@@ -1333,6 +1395,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             connection,
             db_id,
             write_set: Vec::new(),
+            mvcc_store,
             commit_coordinator,
             pager,
             header,
@@ -1851,8 +1914,21 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                  ** 2. Validate if there are no phantoms by walking the scans from scan_set
                  */
                 tracing::trace!("commit_tx(tx_id={})", self.tx_id);
-                self.write_set
-                    .extend_from_slice(tx.write_set.lock().as_slice());
+                // Drain the tx's `write_set` into the commit machine instead
+                // of element-wise cloning each `RowID` (each carries a
+                // `Vec<u8>` and `Arc<IndexInfo>` via `RowKey::Record`).
+                // `tx.had_writes` becomes the source of truth for
+                // `remove_tx`'s `finalized_tx_states.insert` gate, since
+                // `tx.write_set.lock().is_empty()` would now be true even
+                // for write-heavy transactions. If commit fails after
+                // drain, the [`Drop`] impl on `CommitStateMachine`
+                // restores `tx.write_set` so `rollback_tx` can walk the
+                // chain entries. See `MVCC_COMMIT_PLAN.md` §Step 3.
+                {
+                    let mut source = tx.write_set.lock();
+                    tx.had_writes.store(!source.is_empty(), Ordering::Release);
+                    self.write_set = std::mem::take(&mut *source);
+                }
                 self.write_set.sort_by(|a, b| {
                     // table ids are negative, and sqlite_schema has id -1 so we want to sort in descending order of table id
                     b.table_id.cmp(&a.table_id).then(a.row_id.cmp(&b.row_id))
@@ -3757,7 +3833,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             if let TransactionState::Committed(commit_ts) = tx.state.load() {
                 // Read-only transactions cannot leave row versions with stale TxID
                 // references, so they do not need finalized-state caching.
-                if !tx.write_set.lock().is_empty() {
+                //
+                // Read `had_writes`, not `write_set.lock().is_empty()`: the
+                // commit state machine drains `write_set` in its `Initial`
+                // arm, so the lock observes an empty set even for
+                // write-heavy transactions. `had_writes` was set to the
+                // pre-drain emptiness of `write_set`; it remains the source
+                // of truth across the SM's yield window. See
+                // `MVCC_COMMIT_PLAN.md` §Step 3.
+                if tx.had_writes.load(Ordering::Acquire) {
                     self.finalized_tx_states
                         .insert(tx_id, TransactionState::Committed(commit_ts));
                 }
@@ -3910,7 +3994,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ///
     /// * `tx_id` - The ID of the transaction to commit.
     pub fn commit_tx(
-        &self,
+        self: &Arc<Self>,
         tx_id: TxID,
         connection: &Arc<Connection>,
         db_id: usize,
@@ -3920,6 +4004,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             tx_id,
             connection.clone(),
             db_id,
+            self.clone(),
             self.commit_coordinator.clone(),
             self.global_header.clone(),
             connection.get_sync_mode(),
