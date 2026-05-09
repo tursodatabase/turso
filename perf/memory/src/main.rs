@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use profile::{
-    Phase, Profile, WorkItem, checkpoint::Checkpoint, insert::InsertHeavy, mixed::Mixed,
-    read::ReadHeavy, scan::ScanHeavy, series_blob::SeriesBlob,
+    Phase, Profile, WorkItem, checkpoint::Checkpoint, create_index::CreateIndex,
+    insert::InsertHeavy, mixed::Mixed, read::ReadHeavy, scan::ScanHeavy, series_blob::SeriesBlob,
 };
 use turso::Connection;
 use turso::params::Params;
@@ -43,6 +43,7 @@ enum WorkloadProfile {
     Mixed,
     ScanHeavy,
     SeriesBlob,
+    CreateIndex,
 }
 
 impl std::fmt::Display for WorkloadProfile {
@@ -53,6 +54,7 @@ impl std::fmt::Display for WorkloadProfile {
             WorkloadProfile::Mixed => write!(f, "mixed"),
             WorkloadProfile::ScanHeavy => write!(f, "scan-heavy"),
             WorkloadProfile::SeriesBlob => write!(f, "series-blob"),
+            WorkloadProfile::CreateIndex => write!(f, "create-index"),
         }
     }
 }
@@ -202,6 +204,7 @@ async fn async_main(args: Args) -> Result<()> {
             Phase::Run => {
                 // Run phase: dispatch batches concurrently across connections.
                 let mut handles = Vec::with_capacity(batches.len());
+                let wraps_tx = profile.wraps_run_in_tx();
                 for items in batches {
                     if items.is_empty() {
                         continue;
@@ -210,9 +213,16 @@ async fn async_main(args: Args) -> Result<()> {
                     conn.busy_timeout(timeout)?;
                     let begin = begin_stmt.to_string();
                     handles.push(tokio::spawn(async move {
-                        conn.execute(&begin, ()).await?;
-                        execute_items(&conn, items).await?;
-                        conn.execute("COMMIT", ()).await?;
+                        if wraps_tx {
+                            conn.execute(&begin, ()).await?;
+                            execute_items(&conn, items).await?;
+                            conn.execute("COMMIT", ()).await?;
+                        } else {
+                            // Profiles with DDL or autocommit-friendly
+                            // workloads run statements as their own
+                            // implicit txs (no surrounding BEGIN/COMMIT).
+                            execute_items(&conn, items).await?;
+                        }
                         Ok::<_, turso::Error>(())
                     }));
                 }
@@ -317,6 +327,7 @@ fn create_profile(
         WorkloadProfile::Mixed => Box::new(Mixed::new(iterations, batch_size)),
         WorkloadProfile::ScanHeavy => Box::new(ScanHeavy::new(iterations, batch_size)),
         WorkloadProfile::SeriesBlob => Box::new(SeriesBlob::new(iterations, batch_size)),
+        WorkloadProfile::CreateIndex => Box::new(CreateIndex::new(iterations, batch_size)),
     };
 
     if checkpoint {

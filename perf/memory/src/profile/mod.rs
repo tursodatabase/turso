@@ -1,4 +1,5 @@
 pub mod checkpoint;
+pub mod create_index;
 pub mod insert;
 pub mod mixed;
 pub mod read;
@@ -37,4 +38,14 @@ pub trait Profile {
 
     /// Returns the current phase and batches of work items (one per connection).
     fn next_batch(&mut self, connections: usize) -> (Phase, Vec<Vec<WorkItem>>);
+
+    /// Whether each Run batch should be wrapped in `BEGIN[ CONCURRENT]; …;
+    /// COMMIT`. Default `true`. Set to `false` for workloads that include
+    /// DDL — MVCC rejects DDL inside `BEGIN CONCURRENT` (it needs an
+    /// exclusive tx) and autocommit is the canonical mode for those
+    /// statements anyway. With this off, each `WorkItem` autocommits as
+    /// its own tx.
+    fn wraps_run_in_tx(&self) -> bool {
+        true
+    }
 }
