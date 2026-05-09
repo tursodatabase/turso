@@ -944,6 +944,7 @@ impl Property {
             }
             Property::FaultyQuery { query } => {
                 let query_clone = query.clone();
+                let deps: Vec<String> = query.dependencies().into_iter().collect();
                 // A fault may not occur as we first signal we want a fault injected,
                 // then when IO is called the fault triggers. It may happen that a fault is injected
                 // but no IO happens right after it
@@ -980,15 +981,15 @@ impl Property {
                             }
                         }
                     },
-                    query.dependencies().into_iter().collect(),
+                    deps.clone(),
                 );
-                [
-                    InteractionType::FaultyQuery(query.clone()),
-                    InteractionType::Assertion(assert),
+                vec![
+                    InteractionBuilder::with_interaction(InteractionType::FaultyQuery(
+                        query.clone(),
+                    )),
+                    InteractionBuilder::with_interaction(InteractionType::Assertion(assert)),
+                    assert_integrity_check("faulty query", &deps, connection_index),
                 ]
-                .into_iter()
-                .map(InteractionBuilder::with_interaction)
-                .collect()
             }
             Property::WhereTrueFalseNull { select, predicate } => {
                 let tables_dependencies = select.dependencies().into_iter().collect::<Vec<_>>();
@@ -1230,7 +1231,11 @@ impl Property {
                     })),
                 ));
                 interactions.extend(assert_all_table_values(tables, connection_index));
-                interactions.push(assert_integrity_check(tables, connection_index));
+                interactions.push(assert_integrity_check(
+                    "savepoint rollback",
+                    tables,
+                    connection_index,
+                ));
                 interactions
             }
         };
@@ -1414,10 +1419,14 @@ fn random_main_table_delete<R: rand::Rng + ?Sized>(rng: &mut R, table: &Table) -
     })
 }
 
-fn assert_integrity_check(tables: &[String], connection_index: usize) -> InteractionBuilder {
+fn assert_integrity_check(
+    label: &str,
+    tables: &[String],
+    connection_index: usize,
+) -> InteractionBuilder {
     let tables = tables.to_vec();
     InteractionBuilder::with_interaction(InteractionType::Assertion(Assertion::new(
-        "PRAGMA integrity_check should be ok after savepoint rollback".to_string(),
+        format!("PRAGMA integrity_check should be ok after {label}"),
         move |_stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
             let result = run_integrity_check(env, connection_index)?;
             if result == "ok" {
