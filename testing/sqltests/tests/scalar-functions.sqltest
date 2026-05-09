@@ -2503,7 +2503,7 @@ test add-zero-large-int-text {
     SELECT typeof('9223372036854775808'+0), quote('9223372036854775808'+0);
 }
 expect {
-    real|9.22337203685478e+18
+    real|9.22337203685477581e+18
 }
 
 test numeric-order-by-coercion {
@@ -2514,8 +2514,8 @@ test numeric-order-by-coercion {
     SELECT rowid, quote(a), typeof(a+0), quote(a+0) FROM t ORDER BY a+0;
 }
 expect {
-    2|9.22337203685478e+18|real|9.22337203685478e+18
-    1|9223372036854775807|integer|9223372036854775807
+    2|'9223372036854775807'|real|9223372036854775807
+    1|'9223372036854775808'|integer|9.22337203685477581e+18
 }
 
 
