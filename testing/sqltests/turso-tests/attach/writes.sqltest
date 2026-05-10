@@ -35,6 +35,28 @@ expect {
     0
 }
 
+# Regression test for #6772: DROP TABLE on attached DB must destroy
+# the attached DB's index pages, not the main DB's.  Before the fix,
+# resolver.schema().get_indices() always read from main, so dropping
+# an attached table with an index would either leak pages or try to
+# destroy a wrong root page (ShortRead / corruption).
+test attach-write-drop-table-with-index-no-leak {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE INDEX aux.idx_t1_x ON t1(x);
+    INSERT INTO aux.t1 VALUES(1, 10);
+    DROP TABLE aux.t1;
+    SELECT count(*) FROM aux.sqlite_schema WHERE name='t1' OR name='idx_t1_x';
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE INDEX aux.idx_t1_x ON t1(x);
+    INSERT INTO aux.t1 VALUES(1, 10);
+    SELECT * FROM aux.t1;
+}
+expect {
+    0
+    1|10
+}
+
 test attach-write-drop-table-if-exists {
     ATTACH ':memory:' AS aux;
     DROP TABLE IF EXISTS aux.t1;
