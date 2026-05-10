@@ -2749,8 +2749,8 @@ fn test_our_committed_image_for_case_table() {
 
     let mk = |begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>| RowVersion {
         id: 1,
-        begin,
-        end,
+        begin: PackedTsOrId::from_option(begin),
+        end: PackedTsOrId::from_option(end),
         row: row.clone(),
         btree_resident: false,
     };
@@ -2761,13 +2761,13 @@ fn test_our_committed_image_for_case_table() {
         Some(TxTimestampOrID::TxID(our_tx_id)),
     );
     let s = our_committed_image_for(&rv, our_tx_id, end_ts).expect("must yield");
-    assert_eq!(s.stamped_begin, Some(TxTimestampOrID::Timestamp(end_ts)));
+    assert_eq!(s.stamped_begin.unpack(), Some(TxTimestampOrID::Timestamp(end_ts)));
     assert!(s.is_delete);
 
     // Row 2: our_begin && !our_end with end=None (plain insert).
     let rv = mk(Some(TxTimestampOrID::TxID(our_tx_id)), None);
     let s = our_committed_image_for(&rv, our_tx_id, end_ts).expect("must yield");
-    assert_eq!(s.stamped_begin, Some(TxTimestampOrID::Timestamp(end_ts)));
+    assert_eq!(s.stamped_begin.unpack(), Some(TxTimestampOrID::Timestamp(end_ts)));
     assert!(!s.is_delete);
 
     // Row 2 (speculative-end variant): our_begin && !our_end with
@@ -2779,7 +2779,7 @@ fn test_our_committed_image_for_case_table() {
         Some(TxTimestampOrID::TxID(other_tx_id)),
     );
     let s = our_committed_image_for(&rv, our_tx_id, end_ts).expect("must yield");
-    assert_eq!(s.stamped_begin, Some(TxTimestampOrID::Timestamp(end_ts)));
+    assert_eq!(s.stamped_begin.unpack(), Some(TxTimestampOrID::Timestamp(end_ts)));
     assert!(
         !s.is_delete,
         "speculative-end (rv.end = TxID(other)) must NOT mark our contribution as delete; \
@@ -2793,7 +2793,7 @@ fn test_our_committed_image_for_case_table() {
     );
     let s = our_committed_image_for(&rv, our_tx_id, end_ts).expect("must yield");
     assert_eq!(
-        s.stamped_begin,
+        s.stamped_begin.unpack(),
         Some(TxTimestampOrID::Timestamp(predecessor_ts)),
         "end-only contribution must keep predecessor's begin unchanged"
     );
@@ -2804,7 +2804,8 @@ fn test_our_committed_image_for_case_table() {
     let rv = mk(None, Some(TxTimestampOrID::TxID(our_tx_id)));
     let s = our_committed_image_for(&rv, our_tx_id, end_ts).expect("must yield");
     assert_eq!(
-        s.stamped_begin, None,
+        s.stamped_begin.unpack(),
+        None,
         "B-tree tombstone keeps stamped_begin = None"
     );
     assert!(s.is_delete);
@@ -3757,8 +3758,8 @@ fn test_snapshot_isolation_tx_visible1() {
     let rv_visible = |begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>| {
         let row_version = RowVersion {
             id: 0, // Dummy ID for visibility tests
-            begin,
-            end,
+            begin: PackedTsOrId::from_option(begin),
+            end: PackedTsOrId::from_option(end),
             row: generate_simple_string_row((-2).into(), 1, "testme"),
             btree_resident: false,
         };
@@ -3779,21 +3780,21 @@ fn test_snapshot_isolation_tx_visible1() {
     // begin visible:   timestamp < current_tx.begin_ts
     // end invisible:   transaction committed with ts > current_tx.begin_ts
     assert!(!rv_visible(
-        Some(TxTimestampOrID::Timestamp(0)),
+        Some(TxTimestampOrID::Timestamp(1)),
         Some(TxTimestampOrID::TxID(1))
     ));
 
     // begin visible:   timestamp < current_tx.begin_ts
     // end visible:     transaction committed with ts < current_tx.begin_ts
     assert!(rv_visible(
-        Some(TxTimestampOrID::Timestamp(0)),
+        Some(TxTimestampOrID::Timestamp(1)),
         Some(TxTimestampOrID::TxID(2))
     ));
 
     // begin visible:   timestamp < current_tx.begin_ts
     // end visible:     transaction aborted, delete never happened (Table 2)
     assert!(rv_visible(
-        Some(TxTimestampOrID::Timestamp(0)),
+        Some(TxTimestampOrID::Timestamp(1)),
         Some(TxTimestampOrID::TxID(3))
     ));
 
@@ -3826,7 +3827,7 @@ fn test_snapshot_isolation_tx_visible1() {
     // begin visible:   timestamp < current_tx.begin_ts
     // end visible:     transaction preparing with TS(8) > RT(4) (Table 2)
     assert!(rv_visible(
-        Some(TxTimestampOrID::Timestamp(0)),
+        Some(TxTimestampOrID::Timestamp(1)),
         Some(TxTimestampOrID::TxID(5))
     ));
 
@@ -3841,7 +3842,7 @@ fn test_snapshot_isolation_tx_visible1() {
     //                  but that hasn't happened
     //                  (this is the https://avi.im/blag/2023/hekaton-paper-typo/ case, I believe!)
     assert!(rv_visible(
-        Some(TxTimestampOrID::Timestamp(0)),
+        Some(TxTimestampOrID::Timestamp(1)),
         Some(TxTimestampOrID::TxID(7))
     ));
 
@@ -3857,8 +3858,8 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
 
     let inserted_row = RowVersion {
         id: 1,
-        begin: Some(TxTimestampOrID::TxID(42)),
-        end: None,
+        begin: PackedTsOrId::tx_id(42),
+        end: PackedTsOrId::none(),
         row: generate_simple_string_row((-2).into(), 1, "x"),
         btree_resident: false,
     };
@@ -3869,8 +3870,8 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
 
     let deleted_row = RowVersion {
         id: 2,
-        begin: Some(TxTimestampOrID::Timestamp(1)),
-        end: Some(TxTimestampOrID::TxID(42)),
+        begin: PackedTsOrId::timestamp(1),
+        end: PackedTsOrId::tx_id(42),
         row: generate_simple_string_row((-2).into(), 2, "y"),
         btree_resident: false,
     };
@@ -3944,8 +3945,8 @@ fn test_commit_dependency_speculative_read() {
 
     let rv = RowVersion {
         id: 0,
-        begin: Some(TxTimestampOrID::TxID(1)),
-        end: None,
+        begin: PackedTsOrId::tx_id(1),
+        end: PackedTsOrId::none(),
         row: generate_simple_string_row((-2).into(), 1, "test"),
         btree_resident: false,
     };
@@ -3976,8 +3977,8 @@ fn test_commit_dependency_cascade_abort() {
 
     let rv = RowVersion {
         id: 0,
-        begin: Some(TxTimestampOrID::TxID(1)),
-        end: None,
+        begin: PackedTsOrId::tx_id(1),
+        end: PackedTsOrId::none(),
         row: generate_simple_string_row((-2).into(), 1, "test"),
         btree_resident: false,
     };
@@ -4051,8 +4052,8 @@ fn test_commit_dependency_speculative_ignore() {
 
     let rv = RowVersion {
         id: 0,
-        begin: Some(TxTimestampOrID::Timestamp(2)),
-        end: Some(TxTimestampOrID::TxID(3)),
+        begin: PackedTsOrId::timestamp(2),
+        end: PackedTsOrId::tx_id(3),
         row: generate_simple_string_row((-2).into(), 1, "test"),
         btree_resident: false,
     };
@@ -4080,8 +4081,8 @@ fn test_commit_dependency_multiple_reads_dedup() {
 
     let make_rv = |row_id: i64| RowVersion {
         id: row_id as u64,
-        begin: Some(TxTimestampOrID::TxID(1)),
-        end: None,
+        begin: PackedTsOrId::tx_id(1),
+        end: PackedTsOrId::none(),
         row: generate_simple_string_row((-2).into(), row_id, "test"),
         btree_resident: false,
     };
@@ -4385,11 +4386,11 @@ fn test_commit_dep_threaded_commit_resolves() {
         for entry in mvcc_store.rows.iter() {
             let mut rvs = entry.value().write();
             for rv in rvs.iter_mut() {
-                if rv.begin == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                if rv.begin.is_tx_id_for(writer_tx_id) {
+                    rv.begin = PackedTsOrId::timestamp(end_ts);
                 }
-                if rv.end == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                if rv.end.is_tx_id_for(writer_tx_id) {
+                    rv.end = PackedTsOrId::timestamp(end_ts);
                 }
             }
         }
@@ -4637,11 +4638,11 @@ fn test_commit_dep_readonly_does_not_advance_timestamp() {
         for entry in mvcc_store.rows.iter() {
             let mut rvs = entry.value().write();
             for rv in rvs.iter_mut() {
-                if rv.begin == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                if rv.begin.is_tx_id_for(writer_tx_id) {
+                    rv.begin = PackedTsOrId::timestamp(end_ts);
                 }
-                if rv.end == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                if rv.end.is_tx_id_for(writer_tx_id) {
+                    rv.end = PackedTsOrId::timestamp(end_ts);
                 }
             }
         }
@@ -4738,11 +4739,11 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
         for entry in mvcc_store.rows.iter() {
             let mut rvs = entry.value().write();
             for rv in rvs.iter_mut() {
-                if rv.begin == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                if rv.begin.is_tx_id_for(writer_tx_id) {
+                    rv.begin = PackedTsOrId::timestamp(end_ts);
                 }
-                if rv.end == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                if rv.end.is_tx_id_for(writer_tx_id) {
+                    rv.end = PackedTsOrId::timestamp(end_ts);
                 }
             }
         }
@@ -5861,8 +5862,8 @@ fn test_update_multiple_unique_columns_partial_rollback() {
 fn make_rv(begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>) -> RowVersion {
     RowVersion {
         id: 0,
-        begin,
-        end,
+        begin: PackedTsOrId::from_option(begin),
+        end: PackedTsOrId::from_option(end),
         row: generate_simple_string_row((-2).into(), 1, "gc_test"),
         btree_resident: false,
     }
@@ -6450,8 +6451,8 @@ fn arbitrary_row_version(g: &mut Gen) -> RowVersion {
 
     RowVersion {
         id: 0,
-        begin,
-        end,
+        begin: PackedTsOrId::from_option(begin),
+        end: PackedTsOrId::from_option(end),
         row: generate_simple_string_row((-2).into(), 1, "qc"),
         btree_resident: bool::arbitrary(g),
     }
@@ -6518,7 +6519,7 @@ fn prop_gc_removes_all_aborted_garbage(chain: ArbitraryVersionChain) -> bool {
     MvStore::<MvccClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
     versions
         .iter()
-        .all(|rv| !matches!((&rv.begin, &rv.end), (None, None)))
+        .all(|rv| !(rv.begin.is_none() && rv.end.is_none()))
 }
 
 /// Uncommitted inserts (begin=TxID, end=None) belong to an in-flight transaction.
@@ -6529,13 +6530,13 @@ fn prop_gc_retains_txid_begins(chain: ArbitraryVersionChain) -> bool {
     let txid_begins_before: usize = chain
         .versions
         .iter()
-        .filter(|rv| matches!(&rv.begin, Some(TxTimestampOrID::TxID(_))) && rv.end.is_none())
+        .filter(|rv| matches!(rv.begin.unpack(), Some(TxTimestampOrID::TxID(_))) && rv.end.is_none())
         .count();
     let mut versions = chain.versions;
     MvStore::<MvccClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
     let txid_begins_after: usize = versions
         .iter()
-        .filter(|rv| matches!(&rv.begin, Some(TxTimestampOrID::TxID(_))) && rv.end.is_none())
+        .filter(|rv| matches!(rv.begin.unpack(), Some(TxTimestampOrID::TxID(_))) && rv.end.is_none())
         .count();
     // Active uncommitted versions (begin=TxID, end=None) are never aborted garbage
     // and don't match rule 2 or 3, so they should be retained.
@@ -6549,8 +6550,9 @@ fn prop_gc_retains_txid_begins(chain: ArbitraryVersionChain) -> bool {
 fn prop_gc_retains_txid_ends(chain: ArbitraryVersionChain) -> bool {
     // Versions with end=TxID and non-None begin are not matched by any removal
     // rule (rule 1 requires (None,None), rule 2 requires end=Timestamp).
-    let filter =
-        |rv: &&RowVersion| matches!(&rv.end, Some(TxTimestampOrID::TxID(_))) && rv.begin.is_some();
+    let filter = |rv: &&RowVersion| {
+        matches!(rv.end.unpack(), Some(TxTimestampOrID::TxID(_))) && rv.begin.is_some()
+    };
     let txid_ends_before: usize = chain.versions.iter().filter(filter).count();
     let mut versions = chain.versions;
     MvStore::<MvccClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
@@ -6567,10 +6569,7 @@ fn prop_gc_current_versions_protected_before_checkpoint(chain: ArbitraryVersionC
         .versions
         .iter()
         .filter(|rv| {
-            matches!(
-                (&rv.begin, &rv.end),
-                (Some(TxTimestampOrID::Timestamp(_)), None)
-            )
+            matches!(rv.begin.unpack(), Some(TxTimestampOrID::Timestamp(_))) && rv.end.is_none()
         })
         .count();
     let mut versions = chain.versions;
@@ -6578,10 +6577,7 @@ fn prop_gc_current_versions_protected_before_checkpoint(chain: ArbitraryVersionC
     let current_after: usize = versions
         .iter()
         .filter(|rv| {
-            matches!(
-                (&rv.begin, &rv.end),
-                (Some(TxTimestampOrID::Timestamp(_)), None)
-            )
+            matches!(rv.begin.unpack(), Some(TxTimestampOrID::Timestamp(_))) && rv.end.is_none()
         })
         .count();
     current_after == current_before
@@ -6602,19 +6598,17 @@ fn prop_gc_tombstone_guard_preserves_btree_safety(chain: ArbitraryVersionChain) 
 
     // Check: if pre-GC chain had no committed current version AND had a
     // superseded version with e > ckpt_max, post-GC chain must not be empty.
-    let had_committed_current = chain
-        .versions
-        .iter()
-        .any(|rv| rv.end.is_none() && matches!(&rv.begin, Some(TxTimestampOrID::Timestamp(_))));
-    let had_uncheckpointed_tombstone = chain
-        .versions
-        .iter()
-        .any(|rv| matches!(&rv.end, Some(TxTimestampOrID::Timestamp(e)) if *e > chain.ckpt_max));
+    let had_committed_current = chain.versions.iter().any(|rv| {
+        rv.end.is_none() && matches!(rv.begin.unpack(), Some(TxTimestampOrID::Timestamp(_)))
+    });
+    let had_uncheckpointed_tombstone = chain.versions.iter().any(
+        |rv| matches!(rv.end.unpack(), Some(TxTimestampOrID::Timestamp(e)) if e > chain.ckpt_max),
+    );
     // Only non-garbage versions matter (aborted garbage is always removed first)
     let had_non_garbage = chain
         .versions
         .iter()
-        .any(|rv| !matches!((&rv.begin, &rv.end), (None, None)));
+        .any(|rv| !(rv.begin.is_none() && rv.end.is_none()));
 
     if !had_committed_current && had_uncheckpointed_tombstone && had_non_garbage {
         !versions.is_empty()
@@ -6637,38 +6631,23 @@ fn prop_gc_no_orphaned_superseded_versions(chain: ArbitraryVersionChain) -> bool
     let mut versions = chain.versions;
     MvStore::<MvccClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
 
-    let has_committed_current = versions
-        .iter()
-        .any(|rv| rv.end.is_none() && matches!(&rv.begin, Some(TxTimestampOrID::Timestamp(_))));
-    let has_superseded = versions.iter().any(|rv| {
-        matches!(
-            (&rv.begin, &rv.end),
-            (
-                Some(TxTimestampOrID::Timestamp(_)),
-                Some(TxTimestampOrID::Timestamp(_))
-            )
-        )
+    let has_committed_current = versions.iter().any(|rv| {
+        rv.end.is_none() && matches!(rv.begin.unpack(), Some(TxTimestampOrID::Timestamp(_)))
     });
+    let is_superseded = |rv: &RowVersion| {
+        matches!(rv.begin.unpack(), Some(TxTimestampOrID::Timestamp(_)))
+            && matches!(rv.end.unpack(), Some(TxTimestampOrID::Timestamp(_)))
+    };
+    let has_superseded = versions.iter().any(is_superseded);
 
     if has_superseded && !has_committed_current {
-        versions
-            .iter()
-            .filter(|rv| {
-                matches!(
-                    (&rv.begin, &rv.end),
-                    (
-                        Some(TxTimestampOrID::Timestamp(_)),
-                        Some(TxTimestampOrID::Timestamp(_))
-                    )
-                )
-            })
-            .all(|rv| {
-                if let Some(TxTimestampOrID::Timestamp(e)) = &rv.end {
-                    *e > chain.lwm || *e > chain.ckpt_max
-                } else {
-                    false
-                }
-            })
+        versions.iter().filter(|rv| is_superseded(rv)).all(|rv| {
+            if let Some(TxTimestampOrID::Timestamp(e)) = rv.end.unpack() {
+                e > chain.lwm || e > chain.ckpt_max
+            } else {
+                false
+            }
+        })
     } else {
         true
     }
@@ -8139,7 +8118,7 @@ fn test_double_delete_btree_resident_row_with_unique_index() {
     conn1.execute("BEGIN CONCURRENT").unwrap();
     conn2.execute("BEGIN CONCURRENT").unwrap();
 
-    // T1 deletes row 1 — creates tombstone (begin: None, end: TxID(T1))
+    // T1 deletes row 1 — creates tombstone (begin: PackedTsOrId::none(), end: TxID(T1))
     conn1.execute("DELETE FROM t WHERE id = 1").unwrap();
 
     // T2 deletes the same row — creates a second tombstone at execute time

@@ -1,8 +1,12 @@
 pub mod checkpoint;
 pub mod create_index;
+pub mod create_index_encrypted;
+pub mod delete_heavy;
+pub mod explicit_rollback;
 pub mod insert;
 pub mod mixed;
 pub mod read;
+pub mod savepoint_churn;
 pub mod scan;
 pub mod series_blob;
 
@@ -47,5 +51,21 @@ pub trait Profile {
     /// its own tx.
     fn wraps_run_in_tx(&self) -> bool {
         true
+    }
+
+    /// Statement that terminates a Run-phase wrapping tx. Default `COMMIT`.
+    /// `explicit-rollback` overrides to `ROLLBACK` so the tx exits via the
+    /// rollback path that Step 1 of `MVCC_COMMIT_MEMORY_NEXT.md` measures.
+    /// Only consulted when `wraps_run_in_tx()` is true.
+    fn run_terminator(&self) -> &str {
+        "COMMIT"
+    }
+
+    /// Extra `PRAGMA …` statements to apply to every connection (the
+    /// setup connection and every Run-phase connection) BEFORE `journal_mode`
+    /// is set. Used by encrypted profiles to install `cipher` and `hexkey`
+    /// before any DB I/O happens. Default empty.
+    fn connection_pragmas(&self) -> Vec<String> {
+        Vec::new()
     }
 }

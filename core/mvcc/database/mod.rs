@@ -309,14 +309,16 @@ impl Row {
 }
 
 /// A row version.
-/// TODO: we can optimize this by using bitpacking for the begin and end fields.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowVersion {
     /// Unique identifier for this version within the MvStore.
     /// Used for savepoint tracking to identify specific versions to rollback.
     pub id: u64,
-    pub begin: Option<TxTimestampOrID>,
-    pub end: Option<TxTimestampOrID>,
+    /// 8-byte packed encoding (see [`PackedTsOrId`]). Replaces the
+    /// 16-byte `Option<TxTimestampOrID>` representation; shrinks
+    /// `RowVersion` from 128 B to 112 B.
+    pub begin: PackedTsOrId,
+    pub end: PackedTsOrId,
     pub row: Row,
     /// Indicates this version was created for a row that existed in B-tree before
     /// MVCC was enabled (e.g., after switching from WAL to MVCC journal mode).
@@ -356,6 +358,130 @@ pub enum TxTimestampOrID {
     TxID(TxID),
 }
 
+/// 8-byte packed encoding of `Option<TxTimestampOrID>`.
+///
+/// Layout (MSB = bit 63):
+///   `0`                     — `None` (sentinel reserved by `MvccClock` and
+///                             the logical-log parser; see Step 2 of
+///                             `MVCC_COMMIT_MEMORY_NEXT.md`).
+///   bit 63 = 0, value > 0   — `Some(Timestamp(value))`.
+///   bit 63 = 1              — `Some(TxID(value & !(1 << 63)))`.
+///
+/// Replaces the 16-byte `Option<TxTimestampOrID>` (8-byte enum tag + 8-byte
+/// u64 payload) on `RowVersion`'s `begin` / `end` fields, shrinking
+/// `RowVersion` from 128 B to 112 B (Step 4 of `MVCC_COMMIT_MEMORY_NEXT.md`).
+///
+/// ## Invariants
+///
+/// `Timestamp` and `TxID` payloads MUST be in `(0, 1 << 63)`. Step 2's
+/// clock and parser changes guarantee this at every generation and
+/// deserialization site, so the `turso_assert!` in the constructors is a
+/// safety net for future regressions, not an expected runtime check.
+///
+/// ## Hashing
+///
+/// `Hash` is derived over the packed `u64`, not the unpacked variant.
+/// Today nothing hashes `RowVersion` or its `begin`/`end` fields; if a
+/// future caller needs hash equivalence with `Option<TxTimestampOrID>`,
+/// it MUST hash `PackedTsOrId` directly (or document the convention) so
+/// the two representations stay in lockstep.
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+pub struct PackedTsOrId(u64);
+
+const PACKED_NONE: u64 = 0;
+const PACKED_TX_ID_BIT: u64 = 1u64 << 63;
+const PACKED_VALUE_MASK: u64 = !PACKED_TX_ID_BIT;
+
+impl PackedTsOrId {
+    pub const fn none() -> Self {
+        Self(PACKED_NONE)
+    }
+
+    pub fn timestamp(ts: u64) -> Self {
+        turso_assert!(
+            ts != 0 && ts < (1 << 63),
+            "PackedTsOrId::timestamp: ts={ts} violates non-zero, <2^63 invariant"
+        );
+        Self(ts)
+    }
+
+    pub fn tx_id(id: TxID) -> Self {
+        turso_assert!(
+            id != 0 && id < (1 << 63),
+            "PackedTsOrId::tx_id: id={id} violates non-zero, <2^63 invariant"
+        );
+        Self(id | PACKED_TX_ID_BIT)
+    }
+
+    /// Construct from an `Option<TxTimestampOrID>`. Used at the few sites
+    /// (test helpers, recovery deserialization) where the unpacked form
+    /// is the most natural input. Hot paths should call the typed
+    /// constructors (`timestamp` / `tx_id` / `none`) directly.
+    pub fn from_option(opt: Option<TxTimestampOrID>) -> Self {
+        match opt {
+            None => Self::none(),
+            Some(TxTimestampOrID::Timestamp(ts)) => Self::timestamp(ts),
+            Some(TxTimestampOrID::TxID(id)) => Self::tx_id(id),
+        }
+    }
+
+    #[inline]
+    pub fn is_none(self) -> bool {
+        self.0 == PACKED_NONE
+    }
+
+    #[inline]
+    pub fn is_some(self) -> bool {
+        self.0 != PACKED_NONE
+    }
+
+    /// True iff this is `Some(TxID(id))` for the given `id`.
+    #[inline]
+    pub fn is_tx_id_for(self, id: TxID) -> bool {
+        // id is non-zero and fits in 63 bits by Step 2's invariant; the
+        // bitwise OR with PACKED_TX_ID_BIT produces the unique encoding.
+        self.0 == (id | PACKED_TX_ID_BIT)
+    }
+
+    /// True iff this is `Some(Timestamp(ts))` for the given `ts`.
+    #[inline]
+    pub fn is_timestamp_eq(self, ts: u64) -> bool {
+        // PACKED_NONE encodes as 0; ts == 0 is forbidden by Step 2's
+        // invariant, so an `is_timestamp_eq(0)` correctly returns false.
+        self.0 == ts && self.0 != PACKED_NONE
+    }
+
+    /// Branches reordered to predict the post-commit `Timestamp` case
+    /// (the dominant read pattern after the commit emitter has stamped
+    /// every chain entry).
+    #[inline]
+    pub fn unpack(self) -> Option<TxTimestampOrID> {
+        if self.0 & PACKED_TX_ID_BIT != 0 {
+            Some(TxTimestampOrID::TxID(self.0 & PACKED_VALUE_MASK))
+        } else if self.0 != PACKED_NONE {
+            Some(TxTimestampOrID::Timestamp(self.0))
+        } else {
+            None
+        }
+    }
+}
+
+impl std::fmt::Debug for PackedTsOrId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.unpack() {
+            None => write!(f, "None"),
+            Some(TxTimestampOrID::Timestamp(t)) => write!(f, "Timestamp({t})"),
+            Some(TxTimestampOrID::TxID(id)) => write!(f, "TxID({id})"),
+        }
+    }
+}
+
+// Compile-time check that the bitpacking is in fact 8 bytes — the entire point
+// of `PackedTsOrId` is to shrink `Option<TxTimestampOrID>` (16 B) to a single
+// `u64`. A regression here (e.g. someone adding a field) silently undoes
+// Step 4 of `MVCC_COMMIT_MEMORY_NEXT.md`.
+const _: () = assert!(std::mem::size_of::<PackedTsOrId>() == 8);
+
 /// Hekaton §3.6 stamping projection used by the MVCC commit-path visitor.
 ///
 /// The streaming commit emitter walks chain `RowVersion`s by reference and
@@ -372,11 +498,11 @@ pub enum TxTimestampOrID {
 /// that reads `rv.end.is_some()` here would silently regress that case.
 #[derive(Copy, Clone, Debug)]
 pub struct StampedSidecar {
-    /// `begin` after stamping. `Some(Timestamp(end_ts))` when `our_begin`;
-    /// otherwise the chain entry's existing `begin` (which is `None` for
-    /// B-tree tombstones written via
+    /// `begin` after stamping. `PackedTsOrId::timestamp(end_ts)` when
+    /// `our_begin`; otherwise the chain entry's existing `begin`
+    /// (which is `PackedTsOrId::none()` for B-tree tombstones written via
     /// [`MvStore::insert_tombstone_to_table_or_index`]).
-    pub stamped_begin: Option<TxTimestampOrID>,
+    pub stamped_begin: PackedTsOrId,
     /// True iff our transaction wrote the `end` slot (`our_end`).
     pub is_delete: bool,
 }
@@ -1141,27 +1267,21 @@ fn our_committed_image_for(
     our_tx_id: TxID,
     end_ts: u64,
 ) -> Option<StampedSidecar> {
-    let our_begin = matches!(
-        rv.begin,
-        Some(TxTimestampOrID::TxID(vid)) if vid == our_tx_id
-    );
-    let our_end = matches!(
-        rv.end,
-        Some(TxTimestampOrID::TxID(vid)) if vid == our_tx_id
-    );
+    let our_begin = rv.begin.is_tx_id_for(our_tx_id);
+    let our_end = rv.end.is_tx_id_for(our_tx_id);
     if !our_begin && !our_end {
         return None;
     }
     // Stamping rules (Hekaton §3.6):
-    //   our_begin               -> stamped_begin = Some(Timestamp(end_ts))
+    //   our_begin               -> stamped_begin = Timestamp(end_ts)
     //   !our_begin && our_end   -> stamped_begin unchanged (predecessor's begin,
     //                              or `None` for B-tree tombstones written by
     //                              `insert_tombstone_to_table_or_index`)
-    // The speculative-end case (our_begin && !our_end with `end = Some(TxID(C))`)
+    // The speculative-end case (our_begin && !our_end with `end = TxID(C)`)
     // is captured by `is_delete = our_end`: C's claim is *not* our contribution,
     // so we serialize an OP_UPSERT.
     let stamped_begin = if our_begin {
-        Some(TxTimestampOrID::Timestamp(end_ts))
+        PackedTsOrId::timestamp(end_ts)
     } else {
         rv.begin
     };
@@ -1336,10 +1456,7 @@ where
         // slot is overwritten on the second matching entry, which
         // reproduces the existing equal-`Timestamp(end_ts)` collapse for
         // the in-tx INSERT-then-UPDATE case.
-        let is_our_begin_slot = matches!(
-            sidecar.stamped_begin,
-            Some(TxTimestampOrID::Timestamp(ts)) if ts == end_ts
-        );
+        let is_our_begin_slot = sidecar.stamped_begin.is_timestamp_eq(end_ts);
         if is_our_begin_slot {
             our_begin = Some((canonical, rv, sidecar));
         } else {
@@ -1507,7 +1624,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             // A row that we are trying to commit was deleted/updated by another
             // committed transaction after our begin timestamp. Even if that
             // version is now "ended", this is still a write-write conflict.
-            if let Some(TxTimestampOrID::Timestamp(end_ts)) = version.end {
+            if let Some(TxTimestampOrID::Timestamp(end_ts)) = version.end.unpack() {
                 turso_assert!(
                     end_ts != tx.begin_ts,
                     "committed end_ts and begin_ts cannot be equal: txn timestamps are strictly monotonic"
@@ -1527,7 +1644,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 // Committed tombstones (end: Timestamp) are already handled by
                 // the check above at lines 1070-1074. Here we only need to check
                 // in-flight tombstones (end: TxID) from other transactions.
-                if let Some(TxTimestampOrID::TxID(other_tx_id)) = version.end {
+                if let Some(TxTimestampOrID::TxID(other_tx_id)) = version.end.unpack() {
                     if other_tx_id != self.tx_id {
                         let other_tx = mvcc_store.txs.get(&other_tx_id).expect(
                             "check_version_conflicts: tombstone end TxID not found in txn map",
@@ -1551,7 +1668,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 continue;
             }
 
-            match version.end {
+            match version.end.unpack() {
                 Some(TxTimestampOrID::Timestamp(end_ts)) => {
                     // Committed deletion. If end_ts > our begin_ts, the conflict
                     // would have been already caught earlier when we iterate through
@@ -1594,7 +1711,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 }
             }
 
-            match version.begin {
+            match version.begin.unpack() {
                 Some(TxTimestampOrID::TxID(other_tx_id)) => {
                     // Skip our own version
                     if other_tx_id == self.tx_id {
@@ -1714,21 +1831,17 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             if let Some(row_versions) = mvcc_store.rows.get(id) {
                 let mut row_versions = row_versions.value().write();
                 for row_version in row_versions.iter_mut() {
-                    if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
-                        if id == self.tx_id {
-                            // Publish the committed begin timestamp into the live
-                            // version chain only after CommitEnd has decided the
-                            // transaction's fate.
-                            row_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
-                        }
+                    if row_version.begin.is_tx_id_for(self.tx_id) {
+                        // Publish the committed begin timestamp into the live
+                        // version chain only after CommitEnd has decided the
+                        // transaction's fate.
+                        row_version.begin = PackedTsOrId::timestamp(end_ts);
                     }
-                    if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
-                        if id == self.tx_id {
-                            // Publish the committed end timestamp into the live
-                            // version chain only after CommitEnd has decided the
-                            // transaction's fate.
-                            row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
-                        }
+                    if row_version.end.is_tx_id_for(self.tx_id) {
+                        // Publish the committed end timestamp into the live
+                        // version chain only after CommitEnd has decided the
+                        // transaction's fate.
+                        row_version.end = PackedTsOrId::timestamp(end_ts);
                     }
                 }
             }
@@ -1741,21 +1854,17 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 if let Some(row_versions) = index.get(index_key) {
                     let mut row_versions = row_versions.value().write();
                     for row_version in row_versions.iter_mut() {
-                        if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
-                            if id == self.tx_id {
-                                // Publish the committed begin timestamp into the live
-                                // version chain only after CommitEnd has decided the
-                                // transaction's fate.
-                                row_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
-                            }
+                        if row_version.begin.is_tx_id_for(self.tx_id) {
+                            // Publish the committed begin timestamp into the live
+                            // version chain only after CommitEnd has decided the
+                            // transaction's fate.
+                            row_version.begin = PackedTsOrId::timestamp(end_ts);
                         }
-                        if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
-                            if id == self.tx_id {
-                                // Publish the committed end timestamp into the live
-                                // version chain only after CommitEnd has decided the
-                                // transaction's fate.
-                                row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
-                            }
+                        if row_version.end.is_tx_id_for(self.tx_id) {
+                            // Publish the committed end timestamp into the live
+                            // version chain only after CommitEnd has decided the
+                            // transaction's fate.
+                            row_version.end = PackedTsOrId::timestamp(end_ts);
                         }
                     }
                 }
@@ -2673,7 +2782,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             index_rows: SkipMap::new(),
             txs: SkipMap::new(),
             finalized_tx_states: SkipMap::new(),
-            tx_ids: AtomicU64::new(1), // let's reserve transaction 0 for special purposes
+            // TxIDs (and timestamps from `MvccClock`) are non-zero, fit in
+            // 63 bits, and are produced monotonically. `0` is reserved as a
+            // `None` sentinel for downstream encodings (see
+            // `core/mvcc/clock.rs` and `PackedTsOrId`).
+            tx_ids: AtomicU64::new(1),
             version_id_counter: AtomicU64::new(1), // Reserve 0 for special purposes
             next_rowid: AtomicU64::new(0), // TODO: determine this from B-Tree
             next_table_id: AtomicI64::new(-2), // table id -1 / root page 1 is always sqlite_schema.
@@ -3038,8 +3151,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let version_id = self.get_version_id();
                 let row_version = RowVersion {
                     id: version_id,
-                    begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
-                    end: None,
+                    begin: PackedTsOrId::tx_id(tx.tx_id),
+                    end: PackedTsOrId::none(),
                     row: row.clone(),
                     btree_resident: false,
                 };
@@ -3063,8 +3176,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let version_id = self.get_version_id();
                 let row_version = RowVersion {
                     id: version_id,
-                    begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
-                    end: None,
+                    begin: PackedTsOrId::tx_id(tx.tx_id),
+                    end: PackedTsOrId::none(),
                     row,
                     btree_resident: false,
                 };
@@ -3092,8 +3205,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             id: version_id,
             // Tombstones over B-tree-resident rows have no MVCC creator begin.
             // They invalidate B-tree visibility via end timestamp only.
-            begin: None,
-            end: Some(TxTimestampOrID::TxID(tx_id)),
+            begin: PackedTsOrId::none(),
+            end: PackedTsOrId::tx_id(tx_id),
             row: row.clone(),
             btree_resident: true,
         };
@@ -3147,8 +3260,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let version_id = self.get_version_id();
                 let row_version = RowVersion {
                     id: version_id,
-                    begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
-                    end: None,
+                    begin: PackedTsOrId::tx_id(tx.tx_id),
+                    end: PackedTsOrId::none(),
                     row: row.clone(),
                     btree_resident: true,
                 };
@@ -3164,8 +3277,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let version_id = self.get_version_id();
                 let row_version = RowVersion {
                     id: version_id,
-                    begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
-                    end: None,
+                    begin: PackedTsOrId::tx_id(tx.tx_id),
+                    end: PackedTsOrId::none(),
                     row,
                     btree_resident: true,
                 };
@@ -3291,7 +3404,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         }
 
                         let version_id = rv.id;
-                        rv.end = Some(TxTimestampOrID::TxID(tx.tx_id));
+                        rv.end = PackedTsOrId::tx_id(tx.tx_id);
                         let tx = self
                             .txs
                             .get(&tx_id)
@@ -3328,7 +3441,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         }
 
                         let version_id = rv.id;
-                        rv.end = Some(TxTimestampOrID::TxID(tx.tx_id));
+                        rv.end = PackedTsOrId::tx_id(tx.tx_id);
                         drop(row_versions);
                         drop(row_versions_opt);
                         let tx = self
@@ -4067,10 +4180,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.release_exclusive_tx(&tx_id);
         }
 
-        // Snapshot under the lock so we can drop it before recursing into
-        // `rollback_rowid` (which may take other locks).
-        let write_set_snapshot: Vec<RowID> = tx.write_set.lock().clone();
-        for rowid in &write_set_snapshot {
+        // Drain the write set so we can drop the lock before recursing into
+        // `rollback_rowid` (which may take other locks). `rollback_tx` runs on
+        // the rolling-back connection's executor; no other thread mutates this
+        // tx's `write_set` while we hold this drain (cross-connection paths
+        // only touch `abort_now` / `commit_dep_counter`, and the
+        // `CommitStateMachine` Drop impl runs before rollback is invoked).
+        let drained: Vec<RowID> = std::mem::take(&mut *tx.write_set.lock());
+        for rowid in &drained {
             self.rollback_rowid(tx_id, rowid);
         }
 
@@ -4281,7 +4398,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let mut versions = entry.value().write();
                 for rv in versions.iter_mut() {
                     if rv.id == version_id {
-                        rv.end = None;
+                        rv.end = PackedTsOrId::none();
                         tracing::debug!(
                             "rollback_savepoint: restored table version(table_id={}, row_id={}, version_id={})",
                             rowid.table_id,
@@ -4300,7 +4417,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     let mut versions = entry.value().write();
                     for rv in versions.iter_mut() {
                         if rv.id == version_id {
-                            rv.end = None;
+                            rv.end = PackedTsOrId::none();
                             tracing::debug!(
                                 "rollback_savepoint: restored index version(table_id={}, version_id={})",
                                 table_id,
@@ -4332,8 +4449,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             };
             let versions = entry.value().read();
             return versions.iter().any(|rv| {
-                rv.begin == Some(TxTimestampOrID::TxID(tx_id))
-                    || rv.end == Some(TxTimestampOrID::TxID(tx_id))
+                rv.begin.is_tx_id_for(tx_id) || rv.end.is_tx_id_for(tx_id)
             });
         }
 
@@ -4348,8 +4464,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         };
         let versions = entry.value().read();
         versions.iter().any(|rv| {
-            rv.begin == Some(TxTimestampOrID::TxID(tx_id))
-                || rv.end == Some(TxTimestampOrID::TxID(tx_id))
+            rv.begin.is_tx_id_for(tx_id) || rv.end.is_tx_id_for(tx_id)
         })
     }
 
@@ -4527,10 +4642,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     fn collect_referenced_txids(versions: &[RowVersion], referenced_tx_ids: &mut HashSet<TxID>) {
         for version in versions {
-            if let Some(TxTimestampOrID::TxID(tx_id)) = version.begin {
+            if let Some(TxTimestampOrID::TxID(tx_id)) = version.begin.unpack() {
                 referenced_tx_ids.insert(tx_id);
             }
-            if let Some(TxTimestampOrID::TxID(tx_id)) = version.end {
+            if let Some(TxTimestampOrID::TxID(tx_id)) = version.end.unpack() {
                 referenced_tx_ids.insert(tx_id);
             }
         }
@@ -4570,7 +4685,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let before = versions.len();
 
         // Rule 1: aborted garbage
-        versions.retain(|rv| !matches!((&rv.begin, &rv.end), (None, None)));
+        versions.retain(|rv| !(rv.begin.is_none() && rv.end.is_none()));
 
         // Rule 2: superseded versions below LWM, with tombstone guard.
         // A superseded version with e <= lwm is invisible to all readers and
@@ -4582,13 +4697,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // has_current only counts committed current versions (begin=Timestamp).
         // Pending inserts (begin=TxID) don't count — they might roll back,
         // which would resurrect the B-tree row if the tombstone was removed.
-        let has_current = versions
-            .iter()
-            .any(|rv| rv.end.is_none() && matches!(&rv.begin, Some(TxTimestampOrID::Timestamp(_))));
-        versions.retain(|rv| match &rv.end {
-            Some(TxTimestampOrID::Timestamp(e)) if *e <= lwm => {
+        let has_current = versions.iter().any(|rv| {
+            rv.end.is_none() && matches!(rv.begin.unpack(), Some(TxTimestampOrID::Timestamp(_)))
+        });
+        versions.retain(|rv| match rv.end.unpack() {
+            Some(TxTimestampOrID::Timestamp(e)) if e <= lwm => {
                 // Retain only if this is a tombstone AND not yet checkpointed.
-                !has_current && *e > ckpt_max
+                !has_current && e > ckpt_max
             }
             _ => true,
         });
@@ -4597,11 +4712,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // Safe to remove only when the B-tree has the data (b <= ckpt_max),
         // no reader needs the MVCC copy (b < lwm), and no superseded versions
         // remain that would poison is_btree_invalidating_version.
-        if versions.len() == 1 {
-            if let (Some(TxTimestampOrID::Timestamp(b)), None) =
-                (&versions[0].begin, &versions[0].end)
-            {
-                if *b <= ckpt_max && *b < lwm {
+        if versions.len() == 1 && versions[0].end.is_none() {
+            if let Some(TxTimestampOrID::Timestamp(b)) = versions[0].begin.unpack() {
+                if b <= ckpt_max && b < lwm {
                     versions.clear();
                 }
             }
@@ -4612,12 +4725,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     // Extracts the begin timestamp from a transaction
     #[inline]
-    fn resolve_begin_timestamp(&self, ts_or_id: &Option<TxTimestampOrID>) -> u64 {
-        match ts_or_id {
-            Some(TxTimestampOrID::Timestamp(ts)) => *ts,
+    fn resolve_begin_timestamp(&self, ts_or_id: PackedTsOrId) -> u64 {
+        match ts_or_id.unpack() {
+            Some(TxTimestampOrID::Timestamp(ts)) => ts,
             Some(TxTimestampOrID::TxID(tx_id)) => {
                 self.txs
-                    .get(tx_id)
+                    .get(&tx_id)
                     .expect("transaction should exist in txs map")
                     .value()
                     .begin_ts
@@ -4693,8 +4806,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // which performs a binary search for the insertion point.
         let mut position = 0_usize;
         for (i, v) in versions.iter().enumerate().rev() {
-            let existing_begin = self.resolve_begin_timestamp(&v.begin);
-            let new_begin = self.resolve_begin_timestamp(&row_version.begin);
+            let existing_begin = self.resolve_begin_timestamp(v.begin);
+            let new_begin = self.resolve_begin_timestamp(row_version.begin);
             if existing_begin <= new_begin {
                 // Recovery can replay multiple operations for the same row from one transaction
                 // (e.g. insert then delete), which share the same begin timestamp.
@@ -4705,7 +4818,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 // must never be conflated with a later statement's transient tombstone.
                 if versions[i].row.id == row_version.row.id
                     && matches!(
-                        (&versions[i].begin, &row_version.begin),
+                        (versions[i].begin.unpack(), row_version.begin.unpack()),
                         (
                             Some(TxTimestampOrID::Timestamp(existing)),
                             Some(TxTimestampOrID::Timestamp(new))
@@ -5285,8 +5398,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     let version_id = self.get_version_id();
                     let row_version = RowVersion {
                         id: version_id,
-                        begin: Some(TxTimestampOrID::Timestamp(commit_ts)),
-                        end: None,
+                        begin: PackedTsOrId::timestamp(commit_ts),
+                        end: PackedTsOrId::none(),
                         row: row.clone(),
                         btree_resident,
                     };
@@ -5338,15 +5451,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let mut versions = versions.value().write();
                         if let Some(existing) = versions.iter_mut().rev().find(|rv| {
                             rv.end.is_none()
-                                && matches!(rv.begin, Some(TxTimestampOrID::Timestamp(b)) if b < commit_ts)
+                                && matches!(rv.begin.unpack(), Some(TxTimestampOrID::Timestamp(b)) if b < commit_ts)
                         }) {
-                            existing.end = Some(TxTimestampOrID::Timestamp(commit_ts));
+                            existing.end = PackedTsOrId::timestamp(commit_ts);
                         } else {
                             let version_id = self.get_version_id();
                             let row_version = RowVersion {
                                 id: version_id,
-                                begin: None,
-                                end: Some(TxTimestampOrID::Timestamp(commit_ts)),
+                                begin: PackedTsOrId::none(),
+                                end: PackedTsOrId::timestamp(commit_ts),
                                 row: tombstone_row.clone(),
                                 btree_resident,
                             };
@@ -5356,8 +5469,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let version_id = self.get_version_id();
                         let row_version = RowVersion {
                             id: version_id,
-                            begin: None,
-                            end: Some(TxTimestampOrID::Timestamp(commit_ts)),
+                            begin: PackedTsOrId::none(),
+                            end: PackedTsOrId::timestamp(commit_ts),
                             row: tombstone_row,
                             btree_resident,
                         };
@@ -5413,8 +5526,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     let version_id = self.get_version_id();
                     let row_version = RowVersion {
                         id: version_id,
-                        begin: Some(TxTimestampOrID::Timestamp(commit_ts)),
-                        end: None,
+                        begin: PackedTsOrId::timestamp(commit_ts),
+                        end: PackedTsOrId::none(),
                         row: row.clone(),
                         btree_resident,
                     };
@@ -5443,9 +5556,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             let mut versions = versions.value().write();
                             if let Some(existing) = versions.iter_mut().rev().find(|rv| {
                                 rv.end.is_none()
-                                    && matches!(rv.begin, Some(TxTimestampOrID::Timestamp(b)) if b < commit_ts)
+                                    && matches!(rv.begin.unpack(), Some(TxTimestampOrID::Timestamp(b)) if b < commit_ts)
                             }) {
-                                existing.end = Some(TxTimestampOrID::Timestamp(commit_ts));
+                                existing.end = PackedTsOrId::timestamp(commit_ts);
                                 continue;
                             }
                         }
@@ -5453,8 +5566,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     let version_id = self.get_version_id();
                     let row_version = RowVersion {
                         id: version_id,
-                        begin: None,
-                        end: Some(TxTimestampOrID::Timestamp(commit_ts)),
+                        begin: PackedTsOrId::none(),
+                        end: PackedTsOrId::timestamp(commit_ts),
                         row: row.clone(),
                         btree_resident,
                     };
@@ -5546,16 +5659,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 }
 
 fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) {
-    if rv.begin == Some(TxTimestampOrID::TxID(tx_id)) {
+    if rv.begin.is_tx_id_for(tx_id) {
         // If the transaction has aborted,
         // it marks all its new versions as garbage and sets their Begin
         // and End timestamps to infinity to make them invisible
         // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-        rv.begin = None;
-        rv.end = None;
-    } else if rv.end == Some(TxTimestampOrID::TxID(tx_id)) {
+        rv.begin = PackedTsOrId::none();
+        rv.end = PackedTsOrId::none();
+    } else if rv.end.is_tx_id_for(tx_id) {
         // undo deletions by this transaction
-        rv.end = None;
+        rv.end = PackedTsOrId::none();
     }
 }
 
@@ -5650,7 +5763,7 @@ fn is_write_write_conflict(
     tx: &Transaction,
     rv: &RowVersion,
 ) -> bool {
-    match rv.end {
+    match rv.end.unpack() {
         Some(TxTimestampOrID::TxID(rv_end)) => {
             if rv_end == tx.tx_id {
                 return false;
@@ -5713,7 +5826,7 @@ impl RowVersion {
         }
 
         // Check if this version represents a deletion/update that affects us
-        match self.end {
+        match self.end.unpack() {
             Some(TxTimestampOrID::Timestamp(end_ts)) => {
                 // Row was deleted at end_ts. If we started after end_ts, we shouldn't see it
                 turso_assert!(
@@ -5856,7 +5969,7 @@ fn is_begin_visible(
     tx: &Transaction,
     rv: &RowVersion,
 ) -> bool {
-    match rv.begin {
+    match rv.begin.unpack() {
         Some(TxTimestampOrID::Timestamp(rv_begin_ts)) => {
             turso_assert!(
                 tx.begin_ts != rv_begin_ts,
@@ -5947,7 +6060,7 @@ fn is_end_visible(
     current_tx: &Transaction,
     row_version: &RowVersion,
 ) -> bool {
-    match row_version.end {
+    match row_version.end.unpack() {
         Some(TxTimestampOrID::Timestamp(rv_end_ts)) => current_tx.begin_ts < rv_end_ts,
         Some(TxTimestampOrID::TxID(rv_end)) => {
             let visible = match txs.get(&rv_end) {

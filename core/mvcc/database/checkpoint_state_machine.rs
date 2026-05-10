@@ -1,8 +1,8 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, TxTimestampOrID,
-    WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME,
-    SQLITE_SCHEMA_MVCC_TABLE_ID,
+    DeleteRowStateMachine, MVTableId, MvStore, PackedTsOrId, Row, RowID, RowKey, RowVersion,
+    TxTimestampOrID, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
+    MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::schema::Index;
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
@@ -377,7 +377,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
             // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
             let mut begin_ts = None;
-            if let Some(TxTimestampOrID::Timestamp(b)) = version.begin {
+            if let Some(TxTimestampOrID::Timestamp(b)) = version.begin.unpack() {
                 begin_ts = Some(b);
                 // A row exists in the DB file if it was checkpointed in a previous checkpoint.
                 // For btree_resident rows we set exists_in_db_file above, regardless of begin encoding.
@@ -389,7 +389,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
             }
             let mut end_ts = None;
-            if let Some(TxTimestampOrID::Timestamp(e)) = version.end {
+            if let Some(TxTimestampOrID::Timestamp(e)) = version.end.unpack() {
                 end_ts = Some(e);
                 if self
                     .durable_txid_max_old
@@ -797,8 +797,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         self.write_set.push((
             RowVersion {
                 id: 0,
-                begin: Some(TxTimestampOrID::Timestamp(new)),
-                end: None,
+                begin: PackedTsOrId::timestamp(new),
+                end: PackedTsOrId::none(),
                 row,
                 btree_resident: true,
             },
@@ -1678,8 +1678,8 @@ mod tests {
         );
         RowVersion {
             id: 1,
-            begin: begin.map(TxTimestampOrID::Timestamp),
-            end: end.map(TxTimestampOrID::Timestamp),
+            begin: begin.map(PackedTsOrId::timestamp).unwrap_or(PackedTsOrId::none()),
+            end: end.map(PackedTsOrId::timestamp).unwrap_or(PackedTsOrId::none()),
             row: Row::new_table_row(
                 RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(rowid)),
                 record.as_blob().to_vec(),
@@ -1751,8 +1751,8 @@ mod tests {
     fn sqlite_schema_identity_ignores_payloadless_tombstones() {
         let tombstone = RowVersion {
             id: 1,
-            begin: None,
-            end: Some(TxTimestampOrID::Timestamp(2)),
+            begin: PackedTsOrId::none(),
+            end: PackedTsOrId::timestamp(2),
             row: Row::new_table_row(
                 RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(9)),
                 Vec::new(),

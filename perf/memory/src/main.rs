@@ -7,7 +7,9 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use profile::{
     Phase, Profile, WorkItem, checkpoint::Checkpoint, create_index::CreateIndex,
-    insert::InsertHeavy, mixed::Mixed, read::ReadHeavy, scan::ScanHeavy, series_blob::SeriesBlob,
+    create_index_encrypted::CreateIndexEncrypted, delete_heavy::DeleteHeavy,
+    explicit_rollback::ExplicitRollback, insert::InsertHeavy, mixed::Mixed, read::ReadHeavy,
+    savepoint_churn::SavepointChurn, scan::ScanHeavy, series_blob::SeriesBlob,
 };
 use turso::Connection;
 use turso::params::Params;
@@ -44,6 +46,10 @@ enum WorkloadProfile {
     ScanHeavy,
     SeriesBlob,
     CreateIndex,
+    CreateIndexEncrypted,
+    ExplicitRollback,
+    SavepointChurn,
+    DeleteHeavy,
 }
 
 impl std::fmt::Display for WorkloadProfile {
@@ -55,6 +61,10 @@ impl std::fmt::Display for WorkloadProfile {
             WorkloadProfile::ScanHeavy => write!(f, "scan-heavy"),
             WorkloadProfile::SeriesBlob => write!(f, "series-blob"),
             WorkloadProfile::CreateIndex => write!(f, "create-index"),
+            WorkloadProfile::CreateIndexEncrypted => write!(f, "create-index-encrypted"),
+            WorkloadProfile::ExplicitRollback => write!(f, "explicit-rollback"),
+            WorkloadProfile::SavepointChurn => write!(f, "savepoint-churn"),
+            WorkloadProfile::DeleteHeavy => write!(f, "delete-heavy"),
         }
     }
 }
@@ -148,6 +158,14 @@ async fn async_main(args: Args) -> Result<()> {
     let setup_conn = db.connect()?;
     setup_conn.busy_timeout(timeout)?;
 
+    // Connection-level pragmas (e.g. encryption cipher + key) MUST be
+    // applied before journal_mode, otherwise the journal-mode handshake
+    // would touch unencrypted pages on an encrypted DB.
+    let connection_pragmas = profile.connection_pragmas();
+    for pragma in &connection_pragmas {
+        setup_conn.execute(pragma, ()).await?;
+    }
+
     let mode_str = match args.mode {
         JournalMode::Wal => "'wal'",
         JournalMode::Mvcc => "'mvcc'",
@@ -205,6 +223,7 @@ async fn async_main(args: Args) -> Result<()> {
                 // Run phase: dispatch batches concurrently across connections.
                 let mut handles = Vec::with_capacity(batches.len());
                 let wraps_tx = profile.wraps_run_in_tx();
+                let terminator = profile.run_terminator().to_string();
                 for items in batches {
                     if items.is_empty() {
                         continue;
@@ -212,11 +231,20 @@ async fn async_main(args: Args) -> Result<()> {
                     let conn = db.connect()?;
                     conn.busy_timeout(timeout)?;
                     let begin = begin_stmt.to_string();
+                    let terminator = terminator.clone();
+                    let pragmas = connection_pragmas.clone();
                     handles.push(tokio::spawn(async move {
+                        // Apply connection-level pragmas (e.g. cipher+hexkey)
+                        // on every freshly-spawned connection. Encryption
+                        // state is per-connection: the setup connection's
+                        // cipher/hexkey pragmas don't carry over.
+                        for pragma in &pragmas {
+                            conn.execute(pragma, ()).await?;
+                        }
                         if wraps_tx {
                             conn.execute(&begin, ()).await?;
                             execute_items(&conn, items).await?;
-                            conn.execute("COMMIT", ()).await?;
+                            conn.execute(&terminator, ()).await?;
                         } else {
                             // Profiles with DDL or autocommit-friendly
                             // workloads run statements as their own
@@ -328,6 +356,14 @@ fn create_profile(
         WorkloadProfile::ScanHeavy => Box::new(ScanHeavy::new(iterations, batch_size)),
         WorkloadProfile::SeriesBlob => Box::new(SeriesBlob::new(iterations, batch_size)),
         WorkloadProfile::CreateIndex => Box::new(CreateIndex::new(iterations, batch_size)),
+        WorkloadProfile::CreateIndexEncrypted => {
+            Box::new(CreateIndexEncrypted::new(iterations, batch_size))
+        }
+        WorkloadProfile::ExplicitRollback => {
+            Box::new(ExplicitRollback::new(iterations, batch_size))
+        }
+        WorkloadProfile::SavepointChurn => Box::new(SavepointChurn::new(iterations, batch_size)),
+        WorkloadProfile::DeleteHeavy => Box::new(DeleteHeavy::new(iterations, batch_size)),
     };
 
     if checkpoint {

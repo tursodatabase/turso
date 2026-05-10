@@ -116,8 +116,13 @@ Every run produces a `dhat-heap.json` in the current directory. This file contai
 | `mixed` | 50% SELECT / 50% INSERT | Seeds 10k rows |
 | `scan-heavy` | Full table scans with LIKE | Seeds 10k rows |
 | `series-blob` | `INSERT INTO bench(data) SELECT zeroblob(2048) FROM generate_series(1, ?)` | Creates `bench`; `batch-size` is the series length |
+| `create-index` | `DROP INDEX IF EXISTS idx_val; CREATE INDEX idx_val ON t(val)` per iteration. Each Run iteration is one transaction whose log frame contains every index entry — the workload that motivated the MVCC commit-log refactor (`MVCC_COMMIT_IMPL_STEPS_V2.md`). | Creates `t (id INTEGER PRIMARY KEY, val INTEGER, payload TEXT)` and seeds `batch-size` rows with pseudo-random `val`. |
+| `create-index-encrypted` | Same as `create-index`, but every connection issues `PRAGMA cipher='aegis256'` + `PRAGMA hexkey=<key>` before any DB I/O. Confirms Step 3 of `MVCC_COMMIT_MEMORY_NEXT.md` doesn't regress the encrypted log path. | Same as `create-index`. |
+| `explicit-rollback` | Each Run iteration: BEGIN; INSERT `batch-size` rows; ROLLBACK. Mirrors `create-index` shape but exits via the rollback path. Used to measure Step 1 of `MVCC_COMMIT_MEMORY_NEXT.md`. | Creates `t (id INTEGER PRIMARY KEY, val INTEGER, payload TEXT)`. |
+| `savepoint-churn` | Long-running tx with K savepoints, each updating the same 1000 seeded rows. K = `batch-size / 1000`. Stacks K-deep version chains on the seeded keys — used to gate Step 5 of `MVCC_COMMIT_MEMORY_NEXT.md` (Arc-share-factor audit). | Creates `t (id INTEGER PRIMARY KEY, val INTEGER)`, an index on `val`, and seeds 1000 rows. |
+| `delete-heavy` | Each Run iteration: BEGIN; INSERT `batch-size` rows; DELETE FROM t; COMMIT. Exercises the `is_delete` sidecar bit and TxID end-write path that Step 4 of `MVCC_COMMIT_MEMORY_NEXT.md` (PackedTsOrId) touches most. | Creates `t (id INTEGER PRIMARY KEY, val INTEGER, payload TEXT)`. |
 
-Profiles implement the `Profile` trait in `perf/memory/src/profile/`. To add a new workload, create a new file implementing the trait and wire it into the `WorkloadProfile` enum in `main.rs`.
+Profiles implement the `Profile` trait in `perf/memory/src/profile/`. To add a new workload, create a new file implementing the trait and wire it into the `WorkloadProfile` enum in `main.rs`. The trait also exposes optional `wraps_run_in_tx()` (default true), `run_terminator()` (default `"COMMIT"`; `explicit-rollback` overrides to `"ROLLBACK"`), and `connection_pragmas()` (default empty; `create-index-encrypted` returns `[PRAGMA cipher, PRAGMA hexkey]`, applied to every connection before journal_mode).
 
 ## Understanding the Output
 

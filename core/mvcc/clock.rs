@@ -88,6 +88,14 @@ pub trait LogicalClock: Send + Sync {
 /// > state."
 ///
 /// But it doesn't go into more detail about atomicity here.
+///
+/// ## Non-zero invariant
+///
+/// Timestamps produced by [`MvccClock`] are non-zero, fit in 63 bits, and
+/// are produced monotonically. `0` is reserved as a `None` sentinel by
+/// downstream encodings (see `PackedTsOrId` in `core/mvcc/database/mod.rs`
+/// and the parser hardening in
+/// `core/mvcc/persistent_storage/logical_log.rs`).
 #[derive(Debug, Default)]
 pub struct MvccClock {
     inner: Mutex<u64>,
@@ -95,8 +103,11 @@ pub struct MvccClock {
 
 impl MvccClock {
     pub fn new() -> Self {
+        // Start at 1 so the first generated timestamp is `1`, never `0`.
+        // The `Timestamp == 0` value is reserved as a `None` sentinel for
+        // downstream encodings (see module doc comment).
         Self {
-            inner: Mutex::new(0),
+            inner: Mutex::new(1),
         }
     }
 
@@ -123,5 +134,28 @@ impl LogicalClock for MvccClock {
 
     fn reset(&self, ts: u64) {
         *self.inner.lock() = ts;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_timestamp_is_non_zero() {
+        // The `0` timestamp is reserved as a `None` sentinel for downstream
+        // encodings — every fresh clock must hand out `>= 1` on its very
+        // first call so no real frame ever carries `Timestamp(0)`.
+        let clock = MvccClock::new();
+        let first_begin = clock.get_begin_timestamp();
+        assert!(
+            first_begin >= 1,
+            "MvccClock first begin_ts must be >= 1, got {first_begin}"
+        );
+        let first_commit = clock.get_commit_timestamp(no_op);
+        assert!(
+            first_commit > first_begin,
+            "subsequent commit_ts must be strictly greater than the prior ts"
+        );
     }
 }

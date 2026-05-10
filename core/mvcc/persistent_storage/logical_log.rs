@@ -224,7 +224,8 @@ use crate::{
         LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey, StampedSidecar,
     },
     storage::sqlite3_ondisk::{
-        read_varint, read_varint_partial, varint_len, write_varint_to_vec, DatabaseHeader,
+        read_varint, read_varint_partial, varint_len, write_varint, write_varint_to_vec,
+        DatabaseHeader,
     },
     types::IndexInfo,
     Buffer, Completion, CompletionError, LimboError, Result,
@@ -508,14 +509,13 @@ pub struct LogicalLog {
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
     encrypted_payload_chunk_size: usize,
-    /// Reusable scratch buffer for plaintext op serialization. Used by both
-    /// the plaintext and encrypted write paths so the streaming commit
-    /// emitter walks chains exactly once per commit (`MVCC_COMMIT_PLAN.md`
-    /// §Step 2). Grows to the largest committed frame's payload size and is
-    /// reused thereafter; for write-heavy workloads with one giant frame
-    /// (canonical CREATE INDEX over 1M rows) this can be ~110 MB resident,
-    /// but the allocation is amortized across subsequent commits.
-    payload_scratch_buffer: Vec<u8>,
+    /// Reusable scratch for the encrypted write paths only. Encrypted commits
+    /// must stage the plaintext payload here because AAD construction needs
+    /// `op_count` and `payload_size`, both unknown until end-of-walk
+    /// (`build_encrypted_chunk_aad`). The plaintext streaming path no longer
+    /// uses this — it streams directly into `Arc<Buffer>` chunks via
+    /// [`ChunkedFrameWriter`] (`MVCC_COMMIT_MEMORY_NEXT.md` Step 3).
+    encryption_scratch_buffer: Vec<u8>,
 }
 
 impl LogicalLog {
@@ -535,7 +535,7 @@ impl LogicalLog {
             pending_running_crc: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
-            payload_scratch_buffer: Vec::new(),
+            encryption_scratch_buffer: Vec::new(),
         }
     }
 
@@ -703,19 +703,19 @@ impl LogicalLog {
             };
 
         if let Some(enc_ctx) = &self.encryption_ctx {
-            self.payload_scratch_buffer.clear();
+            self.encryption_scratch_buffer.clear();
             for row_version in &tx.row_versions {
                 serialize_op_entry(
-                    &mut self.payload_scratch_buffer,
+                    &mut self.encryption_scratch_buffer,
                     row_version,
                     row_version.row.id.table_id,
                     StampedSidecar::from_already_stamped(row_version),
                 )?;
             }
             if let Some(hdr) = tx.header {
-                serialize_header_entry(&mut self.payload_scratch_buffer, &hdr);
+                serialize_header_entry(&mut self.encryption_scratch_buffer, &hdr);
             }
-            let payload_size = self.payload_scratch_buffer.len();
+            let payload_size = self.encryption_scratch_buffer.len();
             let actual = payload_size as u64;
             turso_assert!(
                 actual == predicted_payload_size,
@@ -740,7 +740,7 @@ impl LogicalLog {
 
             let payload_size = payload_size as u64;
             for (chunk_index, plaintext_chunk) in self
-                .payload_scratch_buffer
+                .encryption_scratch_buffer
                 .chunks(self.encrypted_payload_chunk_size)
                 .enumerate()
             {
@@ -873,134 +873,32 @@ impl LogicalLog {
             0
         };
 
-        // --- Single walk: serialize ops into the reusable plaintext scratch.
-        //     Tracks op_count as it goes; payload_size falls out of
-        //     scratch.len() afterwards so we never have to call
-        //     `serialized_op_size` independently. ---
-        let mut op_count_acc: u32 = 0;
         let count_overflow =
             || LimboError::InternalError("log_tx_streaming op_count overflow".to_string());
-        self.payload_scratch_buffer.clear();
-        // Borrow the scratch through a local that does not alias `self` so the
-        // closure can pass it to `serialize_op_entry` without clashing with
-        // the surrounding `&mut self`.
-        let scratch = &mut self.payload_scratch_buffer;
-        visit(&mut |canonical_table_id, rv, sidecar| {
-            op_count_acc = op_count_acc.checked_add(1).ok_or_else(count_overflow)?;
-            serialize_op_entry(scratch, rv, canonical_table_id, sidecar)?;
-            Ok(ControlFlow::Continue(()))
-        })?;
-        if let Some(hdr) = header.as_ref() {
-            op_count_acc = op_count_acc.checked_add(1).ok_or_else(count_overflow)?;
-            serialize_header_entry(scratch, hdr);
-        }
-        let op_count = op_count_acc;
-        let payload_size: u64 = self.payload_scratch_buffer.len() as u64;
 
-        // --- On-disk payload size differs under encryption (per-chunk tag/nonce overhead). ---
-        let on_disk_payload_size = if let Some(enc_ctx) = &self.encryption_ctx {
-            encrypted_payload_blob_size(
-                payload_size as usize,
-                self.encrypted_payload_chunk_size,
-                enc_ctx.tag_size(),
-                enc_ctx.nonce_size(),
+        // The two paths diverge significantly: the encrypted path must
+        // stage the plaintext payload (because AAD needs `op_count` and
+        // `payload_size`, only known at end-of-walk), while the plaintext
+        // path streams ops directly into output chunks via
+        // [`ChunkedFrameWriter`] and never materializes the full payload.
+        let (chunks, total_frame_size, crc) = if self.encryption_ctx.is_some() {
+            self.emit_encrypted_frame(
+                commit_ts,
+                header.as_ref(),
+                &visit,
+                log_header_bytes,
+                log_hdr_in_frame,
+                count_overflow,
             )?
         } else {
-            payload_size as usize
+            self.emit_plaintext_frame(
+                commit_ts,
+                header.as_ref(),
+                &visit,
+                log_header_bytes,
+                count_overflow,
+            )?
         };
-
-        let total_frame_size: u64 = log_hdr_in_frame as u64
-            + TX_HEADER_SIZE as u64
-            + on_disk_payload_size as u64
-            + TX_TRAILER_SIZE as u64;
-
-        // --- Allocate output chunks. The last chunk is sized to the remainder
-        //     so pwritev does not write trailing zeros. ---
-        let chunks = allocate_streaming_chunks(total_frame_size as usize);
-
-        // Frame-relative offsets used during emission and CRC calculation.
-        let tx_header_offset = log_hdr_in_frame;
-        let payload_offset = tx_header_offset + TX_HEADER_SIZE;
-        let trailer_offset = payload_offset + on_disk_payload_size;
-        debug_assert_eq!(trailer_offset + TX_TRAILER_SIZE, total_frame_size as usize);
-
-        // --- Write the optional log header at offset 0. ---
-        if let Some(hdr_bytes) = log_header_bytes {
-            write_at_in_chunks(&chunks, 0, &hdr_bytes);
-        }
-
-        // --- Copy/encrypt the scratch into the pre-allocated chunks. ---
-        if let Some(enc_ctx) = &self.encryption_ctx {
-            // Encrypt the plaintext scratch chunk-by-chunk into the on-disk
-            // region. True chunked-plaintext streaming under encryption is a
-            // follow-up; today we encrypt fixed-size chunks of the existing
-            // scratch buffer.
-            let salt = self
-                .header
-                .as_ref()
-                .expect("log header must be set before writing")
-                .salt;
-            let chunk_count = encrypted_payload_chunk_count(
-                payload_size as usize,
-                self.encrypted_payload_chunk_size,
-            );
-            let mut on_disk_cursor = payload_offset;
-            for (chunk_index, plaintext_chunk) in self
-                .payload_scratch_buffer
-                .chunks(self.encrypted_payload_chunk_size)
-                .enumerate()
-            {
-                let is_last_chunk = chunk_index + 1 == chunk_count;
-                let aad = build_encrypted_chunk_aad(
-                    salt,
-                    is_last_chunk.then_some(payload_size),
-                    op_count,
-                    commit_ts,
-                    u32::try_from(chunk_index).map_err(|_| {
-                        LimboError::InternalError(
-                            "encrypted payload chunk index exceeds u32".to_string(),
-                        )
-                    })?,
-                );
-                let (ciphertext, nonce) = enc_ctx.encrypt_chunk(plaintext_chunk, &aad)?;
-                debug_assert_eq!(
-                    ciphertext.len(),
-                    plaintext_chunk.len() + enc_ctx.tag_size(),
-                    "encrypt_chunk output size mismatch",
-                );
-                write_at_in_chunks(&chunks, on_disk_cursor, &ciphertext);
-                on_disk_cursor += ciphertext.len();
-                write_at_in_chunks(&chunks, on_disk_cursor, &nonce);
-                on_disk_cursor += nonce.len();
-            }
-            turso_assert!(
-                on_disk_cursor == trailer_offset,
-                "log_tx_streaming encrypted on-disk drift: cursor={on_disk_cursor} expected={trailer_offset}"
-            );
-        } else {
-            // Plaintext path: one memcpy from the frame-level scratch into the
-            // pre-allocated chunks. `write_at_in_chunks` walks the chunk
-            // boundary as needed.
-            write_at_in_chunks(&chunks, payload_offset, &self.payload_scratch_buffer);
-        }
-
-        // --- Backfill TX header (now that payload_size and op_count are known). ---
-        let mut tx_header_buf = [0u8; TX_HEADER_SIZE];
-        tx_header_buf[0..4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
-        tx_header_buf[4..12].copy_from_slice(&payload_size.to_le_bytes());
-        tx_header_buf[12..16].copy_from_slice(&op_count.to_le_bytes());
-        tx_header_buf[16..24].copy_from_slice(&commit_ts.to_le_bytes());
-        write_at_in_chunks(&chunks, tx_header_offset, &tx_header_buf);
-
-        // --- Chained CRC over [TX header || payload]. ---
-        let crc =
-            crc_over_range_in_chunks(self.running_crc, &chunks, tx_header_offset, trailer_offset);
-
-        // --- Trailer. ---
-        let mut trailer = [0u8; TX_TRAILER_SIZE];
-        trailer[0..4].copy_from_slice(&crc.to_le_bytes());
-        trailer[4..8].copy_from_slice(&END_MAGIC.to_le_bytes());
-        write_at_in_chunks(&chunks, trailer_offset, &trailer);
 
         // --- Submit pwrite (1 chunk) or pwritev (multi). ---
         let buffer_len = total_frame_size;
@@ -1025,6 +923,233 @@ impl LogicalLog {
         // leaves `pending_running_crc` untouched.
         self.pending_running_crc = Some(crc);
         Ok((c, buffer_len))
+    }
+
+    /// Encrypted plaintext-then-encrypt path. Stages the plaintext payload
+    /// in `self.encryption_scratch_buffer` because AAD construction needs
+    /// `op_count` (every chunk) and `payload_size` (last chunk only); both
+    /// are only known at end-of-walk. Returns `(chunks, total_frame_size,
+    /// crc)` ready for `pwrite`/`pwritev`.
+    fn emit_encrypted_frame<V, F>(
+        &mut self,
+        commit_ts: u64,
+        header: Option<&DatabaseHeader>,
+        visit: &V,
+        log_header_bytes: Option<[u8; LOG_HDR_SIZE]>,
+        log_hdr_in_frame: usize,
+        count_overflow: F,
+    ) -> Result<(Vec<Arc<Buffer>>, u64, u32)>
+    where
+        V: Fn(
+            &mut dyn FnMut(MVTableId, &RowVersion, StampedSidecar) -> Result<ControlFlow<()>>,
+        ) -> Result<()>,
+        F: Fn() -> LimboError + Copy,
+    {
+        let mut op_count_acc: u32 = 0;
+        self.encryption_scratch_buffer.clear();
+        let scratch = &mut self.encryption_scratch_buffer;
+        visit(&mut |canonical_table_id, rv, sidecar| {
+            op_count_acc = op_count_acc.checked_add(1).ok_or_else(count_overflow)?;
+            serialize_op_entry(scratch, rv, canonical_table_id, sidecar)?;
+            Ok(ControlFlow::Continue(()))
+        })?;
+        if let Some(hdr) = header {
+            op_count_acc = op_count_acc.checked_add(1).ok_or_else(count_overflow)?;
+            serialize_header_entry(scratch, hdr);
+        }
+        let op_count = op_count_acc;
+        let payload_size: u64 = self.encryption_scratch_buffer.len() as u64;
+
+        let enc_ctx = self
+            .encryption_ctx
+            .as_ref()
+            .expect("emit_encrypted_frame called without encryption_ctx");
+        let on_disk_payload_size = encrypted_payload_blob_size(
+            payload_size as usize,
+            self.encrypted_payload_chunk_size,
+            enc_ctx.tag_size(),
+            enc_ctx.nonce_size(),
+        )?;
+
+        let total_frame_size: u64 = log_hdr_in_frame as u64
+            + TX_HEADER_SIZE as u64
+            + on_disk_payload_size as u64
+            + TX_TRAILER_SIZE as u64;
+        let chunks = allocate_streaming_chunks(total_frame_size as usize);
+
+        let tx_header_offset = log_hdr_in_frame;
+        let payload_offset = tx_header_offset + TX_HEADER_SIZE;
+        let trailer_offset = payload_offset + on_disk_payload_size;
+        debug_assert_eq!(trailer_offset + TX_TRAILER_SIZE, total_frame_size as usize);
+
+        if let Some(hdr_bytes) = log_header_bytes {
+            write_at_in_chunks(&chunks, 0, &hdr_bytes);
+        }
+
+        let salt = self
+            .header
+            .as_ref()
+            .expect("log header must be set before writing")
+            .salt;
+        let chunk_count =
+            encrypted_payload_chunk_count(payload_size as usize, self.encrypted_payload_chunk_size);
+        let mut on_disk_cursor = payload_offset;
+        for (chunk_index, plaintext_chunk) in self
+            .encryption_scratch_buffer
+            .chunks(self.encrypted_payload_chunk_size)
+            .enumerate()
+        {
+            let is_last_chunk = chunk_index + 1 == chunk_count;
+            let aad = build_encrypted_chunk_aad(
+                salt,
+                is_last_chunk.then_some(payload_size),
+                op_count,
+                commit_ts,
+                u32::try_from(chunk_index).map_err(|_| {
+                    LimboError::InternalError(
+                        "encrypted payload chunk index exceeds u32".to_string(),
+                    )
+                })?,
+            );
+            let (ciphertext, nonce) = enc_ctx.encrypt_chunk(plaintext_chunk, &aad)?;
+            debug_assert_eq!(
+                ciphertext.len(),
+                plaintext_chunk.len() + enc_ctx.tag_size(),
+                "encrypt_chunk output size mismatch",
+            );
+            write_at_in_chunks(&chunks, on_disk_cursor, &ciphertext);
+            on_disk_cursor += ciphertext.len();
+            write_at_in_chunks(&chunks, on_disk_cursor, &nonce);
+            on_disk_cursor += nonce.len();
+        }
+        turso_assert!(
+            on_disk_cursor == trailer_offset,
+            "log_tx_streaming encrypted on-disk drift: cursor={on_disk_cursor} expected={trailer_offset}"
+        );
+
+        let mut tx_header_buf = [0u8; TX_HEADER_SIZE];
+        tx_header_buf[0..4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+        tx_header_buf[4..12].copy_from_slice(&payload_size.to_le_bytes());
+        tx_header_buf[12..16].copy_from_slice(&op_count.to_le_bytes());
+        tx_header_buf[16..24].copy_from_slice(&commit_ts.to_le_bytes());
+        write_at_in_chunks(&chunks, tx_header_offset, &tx_header_buf);
+
+        let crc =
+            crc_over_range_in_chunks(self.running_crc, &chunks, tx_header_offset, trailer_offset);
+
+        let mut trailer = [0u8; TX_TRAILER_SIZE];
+        trailer[0..4].copy_from_slice(&crc.to_le_bytes());
+        trailer[4..8].copy_from_slice(&END_MAGIC.to_le_bytes());
+        write_at_in_chunks(&chunks, trailer_offset, &trailer);
+
+        Ok((chunks, total_frame_size, crc))
+    }
+
+    /// Plaintext streaming path. Drives a [`ChunkedFrameWriter`] so each
+    /// op is serialized straight into an `Arc<Buffer>` chunk, eliminating
+    /// the long-lived `payload_scratch_buffer` (~110 MB resident on
+    /// canonical CREATE INDEX).
+    ///
+    /// Per-op fast path: when the op fits in the current chunk's tail
+    /// (always true for ~120 B ops in 256 KiB chunks except at chunk
+    /// boundaries), the op is serialized directly into the chunk slice
+    /// — zero memcpy. The slow path stages in a reusable per-call
+    /// `op_scratch` `Vec<u8>` (sized to the widest op) and then writes
+    /// it into the chunk(s) via `ChunkedFrameWriter::write`, which
+    /// straddles chunk boundaries safely.
+    fn emit_plaintext_frame<V, F>(
+        &mut self,
+        commit_ts: u64,
+        header: Option<&DatabaseHeader>,
+        visit: &V,
+        log_header_bytes: Option<[u8; LOG_HDR_SIZE]>,
+        count_overflow: F,
+    ) -> Result<(Vec<Arc<Buffer>>, u64, u32)>
+    where
+        V: Fn(
+            &mut dyn FnMut(MVTableId, &RowVersion, StampedSidecar) -> Result<ControlFlow<()>>,
+        ) -> Result<()>,
+        F: Fn() -> LimboError + Copy,
+    {
+        let mut writer = ChunkedFrameWriter::new();
+
+        // Reserve log header (if first write) and TX header at the head of
+        // the frame so the payload-size / op_count / commit_ts backfill can
+        // happen at end-of-walk without re-allocating.
+        let log_hdr_token: Option<Reservation<LOG_HDR_SIZE>> = log_header_bytes
+            .as_ref()
+            .map(|_| writer.reserve::<LOG_HDR_SIZE>());
+        let tx_header_offset = writer.cursor();
+        let tx_hdr_token = writer.reserve::<TX_HEADER_SIZE>();
+        let payload_offset = writer.cursor();
+
+        let mut op_count_acc: u32 = 0;
+        // Per-call scratch for the slow path. Reused across ops; grows to
+        // the widest op in the frame. Far smaller than the frame-wide
+        // `payload_scratch_buffer` because only one op lives here at a time.
+        let mut op_scratch: Vec<u8> = Vec::new();
+
+        visit(&mut |canonical_table_id, rv, sidecar| {
+            op_count_acc = op_count_acc.checked_add(1).ok_or_else(count_overflow)?;
+            let size = serialized_op_size(rv, canonical_table_id, sidecar);
+            if size <= writer.current_chunk_tail() {
+                let slot = writer.reserve_in_current_chunk(size);
+                serialize_op_entry_into(slot, rv, canonical_table_id, sidecar)?;
+            } else {
+                op_scratch.resize(size, 0);
+                serialize_op_entry_into(&mut op_scratch, rv, canonical_table_id, sidecar)?;
+                writer.write(&op_scratch);
+            }
+            Ok(ControlFlow::Continue(()))
+        })?;
+
+        if let Some(hdr) = header {
+            op_count_acc = op_count_acc.checked_add(1).ok_or_else(count_overflow)?;
+            let size = serialized_header_size();
+            if size <= writer.current_chunk_tail() {
+                let slot = writer.reserve_in_current_chunk(size);
+                serialize_header_entry_into(slot, hdr);
+            } else {
+                op_scratch.resize(size, 0);
+                serialize_header_entry_into(&mut op_scratch, hdr);
+                writer.write(&op_scratch);
+            }
+        }
+
+        let op_count = op_count_acc;
+        let payload_size: u64 = (writer.cursor() - payload_offset) as u64;
+        let trailer_offset = writer.cursor();
+
+        // Backfill the log header (if any) and the TX header now that
+        // payload_size / op_count are known.
+        if let (Some(token), Some(bytes)) = (log_hdr_token, log_header_bytes.as_ref()) {
+            writer.write_to(token, bytes);
+        }
+        let mut tx_header_buf = [0u8; TX_HEADER_SIZE];
+        tx_header_buf[0..4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+        tx_header_buf[4..12].copy_from_slice(&payload_size.to_le_bytes());
+        tx_header_buf[12..16].copy_from_slice(&op_count.to_le_bytes());
+        tx_header_buf[16..24].copy_from_slice(&commit_ts.to_le_bytes());
+        writer.write_to(tx_hdr_token, &tx_header_buf);
+
+        // CRC chained over [TX header || payload]. Computed BEFORE the
+        // trailer is written so the trailer's CRC field reflects only the
+        // header+payload bytes.
+        let crc = crc_over_range_in_chunks(
+            self.running_crc,
+            writer.chunks_view(),
+            tx_header_offset,
+            trailer_offset,
+        );
+
+        let mut trailer = [0u8; TX_TRAILER_SIZE];
+        trailer[0..4].copy_from_slice(&crc.to_le_bytes());
+        trailer[4..8].copy_from_slice(&END_MAGIC.to_le_bytes());
+        writer.write(&trailer);
+
+        let total_frame_size = writer.cursor() as u64;
+        let chunks = writer.into_chunks();
+        Ok((chunks, total_frame_size, crc))
     }
 
     pub fn advance_offset_after_success(&mut self, bytes: u64) {
@@ -1108,6 +1233,287 @@ impl LogicalLog {
         self.offset = 0;
         Ok(c)
     }
+}
+
+/// Compile-time-sized backfill token returned by
+/// [`ChunkedFrameWriter::reserve`]. Carries the frame-relative offset of
+/// the reserved slot; the size `N` is encoded in the type so a `write_to`
+/// of the wrong length is a type error rather than a runtime panic.
+pub(crate) struct Reservation<const N: usize> {
+    frame_offset: usize,
+    _marker: std::marker::PhantomData<[u8; N]>,
+}
+
+/// Streaming output buffer for plaintext frame emission.
+///
+/// Replaces the legacy `payload_scratch_buffer` in
+/// [`LogicalLog::log_tx_streaming_inner`] for the plaintext path: rather
+/// than staging the full payload in a single `Vec<u8>` and memcpy'ing it
+/// into pre-sized chunks at end-of-walk, the writer streams directly
+/// into `Arc<Buffer>` chunks as ops are serialized. On 1M-row CREATE
+/// INDEX commits this reclaims ~110 MB of long-lived resident heap (the
+/// scratch grew to the largest committed frame and stayed). The
+/// encrypted path keeps the scratch because AAD construction needs
+/// `op_count` and `payload_size`, both unknown until end-of-walk.
+///
+/// ## Capacity model
+///
+/// Each chunk is allocated as a fresh `Buffer::new_temporary` of
+/// `STREAM_CHUNK_BYTES` bytes when the previous chunk fills. The final
+/// chunk is replaced at [`Self::into_chunks`] time with a Buffer of
+/// exactly `current_chunk_filled` bytes so `pwritev` writes no trailing
+/// zeros after the trailer.
+///
+/// ## Cursor caching
+///
+/// `current_chunk_filled` and `cursor` are cached so per-op `write` does
+/// not re-walk chunks from index 0 (the legacy `write_at_in_chunks`
+/// pattern). Backfill writes via [`Self::write_to`] do go through
+/// [`write_at_in_chunks`] because the reserved slot may live in any
+/// previously-allocated chunk.
+pub(crate) struct ChunkedFrameWriter {
+    chunks: Vec<Arc<Buffer>>,
+    /// Bytes written into the current (last) chunk. The current chunk is
+    /// implicit: it is always `chunks.last()` once `chunks` is non-empty.
+    current_chunk_filled: usize,
+    /// Frame-level cursor: total bytes appended across all chunks.
+    cursor: usize,
+}
+
+impl ChunkedFrameWriter {
+    pub(crate) fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            current_chunk_filled: 0,
+            cursor: 0,
+        }
+    }
+
+    /// Ensure `chunks` has a non-full last chunk so subsequent writes
+    /// have somewhere to land. Allocates a fresh `STREAM_CHUNK_BYTES`
+    /// chunk when the current one is at capacity (or when there is no
+    /// current chunk).
+    #[inline]
+    fn ensure_chunk(&mut self) {
+        let need_new = match self.chunks.last() {
+            None => true,
+            Some(chunk) => self.current_chunk_filled == chunk.len(),
+        };
+        if need_new {
+            self.chunks
+                .push(Arc::new(Buffer::new_temporary(STREAM_CHUNK_BYTES)));
+            self.current_chunk_filled = 0;
+        }
+    }
+
+    /// Bytes available in the current chunk's tail. Eagerly allocates a
+    /// new chunk if the current one is full so the result is always
+    /// `>= 1`. Callers use this to decide between the fast path (write
+    /// directly into the chunk slice) and the slow path (stage in a
+    /// per-op scratch and `write` it).
+    #[inline]
+    pub(crate) fn current_chunk_tail(&mut self) -> usize {
+        self.ensure_chunk();
+        self.chunks.last().expect("ensure_chunk").len() - self.current_chunk_filled
+    }
+
+    /// Reserve `n` contiguous bytes in the current chunk and return the
+    /// mutable slice. Pre-condition: `n <= current_chunk_tail()`.
+    /// Caller MUST fill the slice in full before any other writer call.
+    #[inline]
+    pub(crate) fn reserve_in_current_chunk(&mut self, n: usize) -> &mut [u8] {
+        debug_assert!(
+            n <= self.current_chunk_tail(),
+            "reserve_in_current_chunk: caller violated precondition"
+        );
+        let start = self.current_chunk_filled;
+        self.current_chunk_filled += n;
+        self.cursor += n;
+        let chunk = self.chunks.last().expect("ensure_chunk");
+        &mut chunk.as_mut_slice()[start..start + n]
+    }
+
+    /// Append `bytes` to the writer, spilling into a fresh chunk
+    /// whenever the current one fills.
+    pub(crate) fn write(&mut self, bytes: &[u8]) {
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            self.ensure_chunk();
+            let chunk = self.chunks.last().expect("ensure_chunk");
+            let space = chunk.len() - self.current_chunk_filled;
+            let take = remaining.len().min(space);
+            chunk.as_mut_slice()
+                [self.current_chunk_filled..self.current_chunk_filled + take]
+                .copy_from_slice(&remaining[..take]);
+            self.current_chunk_filled += take;
+            self.cursor += take;
+            remaining = &remaining[take..];
+        }
+    }
+
+    /// Reserve `N` bytes at the current cursor, returning a typed token
+    /// that the caller backfills via [`Self::write_to`]. The reserved
+    /// slot may straddle a chunk boundary; backfill goes through
+    /// [`write_at_in_chunks`].
+    pub(crate) fn reserve<const N: usize>(&mut self) -> Reservation<N> {
+        let frame_offset = self.cursor;
+        let mut remaining = N;
+        while remaining > 0 {
+            self.ensure_chunk();
+            let chunk = self.chunks.last().expect("ensure_chunk");
+            let space = chunk.len() - self.current_chunk_filled;
+            let take = remaining.min(space);
+            self.current_chunk_filled += take;
+            self.cursor += take;
+            remaining -= take;
+        }
+        Reservation {
+            frame_offset,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Backfill exactly `N` bytes into a slot previously returned by
+    /// [`Self::reserve`]. The size mismatch between the reservation and
+    /// the backfill is a compile-time error.
+    #[inline]
+    pub(crate) fn write_to<const N: usize>(
+        &mut self,
+        token: Reservation<N>,
+        bytes: &[u8; N],
+    ) {
+        write_at_in_chunks(&self.chunks, token.frame_offset, bytes);
+    }
+
+    #[inline]
+    pub(crate) fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    #[inline]
+    pub(crate) fn chunks_view(&self) -> &[Arc<Buffer>] {
+        &self.chunks
+    }
+
+    /// Consume the writer and return the chunk vector ready for `pwrite`
+    /// or `pwritev`. The final chunk is replaced with a smaller buffer
+    /// holding exactly `current_chunk_filled` bytes so the I/O backend
+    /// never writes the trailing-zero region of an under-filled chunk.
+    pub(crate) fn into_chunks(mut self) -> Vec<Arc<Buffer>> {
+        if let Some(last_idx) = self.chunks.len().checked_sub(1) {
+            let last = &self.chunks[last_idx];
+            if self.current_chunk_filled < last.len() {
+                let mut data = vec![0u8; self.current_chunk_filled];
+                data.copy_from_slice(&last.as_slice()[..self.current_chunk_filled]);
+                self.chunks[last_idx] = Arc::new(Buffer::new(data));
+            }
+        }
+        self.chunks
+    }
+}
+
+/// Slice-targeted variant of [`serialize_op_entry`]. The caller must
+/// provide a slice of length exactly [`serialized_op_size`] for `rv`;
+/// the function fills it in place and asserts the cursor lands on
+/// `buf.len()`.
+fn serialize_op_entry_into(
+    buf: &mut [u8],
+    row_version: &RowVersion,
+    canonical_table_id: MVTableId,
+    sidecar: StampedSidecar,
+) -> Result<()> {
+    let is_delete = sidecar.is_delete;
+    let tag = match (&row_version.row.id.row_id, is_delete) {
+        (RowKey::Int(_), false) => OP_UPSERT_TABLE,
+        (RowKey::Int(_), true) => OP_DELETE_TABLE,
+        (RowKey::Record(_), false) => OP_UPSERT_INDEX,
+        (RowKey::Record(_), true) => OP_DELETE_INDEX,
+    };
+
+    let mut flags = 0u8;
+    if row_version.btree_resident {
+        flags |= OP_FLAG_BTREE_RESIDENT;
+    }
+
+    let table_id_i64: i64 = canonical_table_id.into();
+    turso_assert!(
+        table_id_i64 < 0,
+        "table_id_i64 should be negative, but got {table_id_i64}"
+    );
+    turso_assert!(
+        (i32::MIN as i64..=i32::MAX as i64).contains(&table_id_i64),
+        "table_id_i64 out of i32 range: {table_id_i64}"
+    );
+    let table_id_i32 = table_id_i64 as i32;
+
+    buf[0] = tag;
+    buf[1] = flags;
+    buf[2..6].copy_from_slice(&table_id_i32.to_le_bytes());
+    let mut cursor: usize = 6;
+
+    match tag {
+        OP_UPSERT_TABLE => {
+            let RowKey::Int(rowid) = row_version.row.id.row_id else {
+                unreachable!("table ops must have RowKey::Int")
+            };
+            let record_bytes = row_version.row.payload();
+            let rowid_u64 = rowid as u64;
+            let rowid_len = varint_len(rowid_u64);
+            let payload_len = rowid_len + record_bytes.len();
+            cursor += write_varint(&mut buf[cursor..], payload_len as u64);
+            cursor += write_varint(&mut buf[cursor..], rowid_u64);
+            buf[cursor..cursor + record_bytes.len()].copy_from_slice(record_bytes);
+            cursor += record_bytes.len();
+        }
+        OP_DELETE_TABLE => {
+            let RowKey::Int(rowid) = row_version.row.id.row_id else {
+                unreachable!("table ops must have RowKey::Int")
+            };
+            let rowid_u64 = rowid as u64;
+            let rowid_len = varint_len(rowid_u64);
+            cursor += write_varint(&mut buf[cursor..], rowid_len as u64);
+            cursor += write_varint(&mut buf[cursor..], rowid_u64);
+        }
+        OP_UPSERT_INDEX | OP_DELETE_INDEX => {
+            let key_bytes = row_version.row.payload();
+            cursor += write_varint(&mut buf[cursor..], key_bytes.len() as u64);
+            buf[cursor..cursor + key_bytes.len()].copy_from_slice(key_bytes);
+            cursor += key_bytes.len();
+        }
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "invalid logical log op tag: {tag}"
+            )));
+        }
+    }
+
+    // Same load-bearing assertion as the Vec variant: a release-mode
+    // disagreement between the size pass (which drives chunk reservation)
+    // and the emit pass produces a CRC-mismatched frame on replay.
+    let slot_len = buf.len();
+    turso_assert!(
+        cursor == slot_len,
+        "serialize_op_entry_into byte-count drift (cursor={cursor}, slot_len={slot_len})"
+    );
+    Ok(())
+}
+
+/// Slice-targeted variant of [`serialize_header_entry`]. The caller must
+/// provide a slice of length exactly [`serialized_header_size`].
+fn serialize_header_entry_into(buf: &mut [u8], header: &DatabaseHeader) {
+    buf[0] = OP_UPDATE_HEADER;
+    buf[1] = 0;
+    buf[2..6].copy_from_slice(&0i32.to_le_bytes());
+    let mut cursor: usize = 6;
+    cursor += write_varint(&mut buf[cursor..], DatabaseHeader::SIZE as u64);
+    let header_bytes = bytemuck::bytes_of(header);
+    buf[cursor..cursor + header_bytes.len()].copy_from_slice(header_bytes);
+    cursor += header_bytes.len();
+    let slot_len = buf.len();
+    turso_assert!(
+        cursor == slot_len,
+        "serialize_header_entry_into byte-count drift (cursor={cursor}, slot_len={slot_len})"
+    );
 }
 
 /// Serialize one op into `buffer`.
@@ -2289,6 +2695,16 @@ impl StreamingLogicalLogReader {
             header_bytes[23],
         ]);
 
+        // `commit_ts == 0` is reserved as a `None` sentinel by downstream
+        // encodings (see `MvccClock` and `PackedTsOrId`); a real frame
+        // never carries it. Treat as corruption to fail fast on a tampered
+        // or partially-written log header.
+        if commit_ts == 0 {
+            self.last_valid_offset = frame_start;
+            tracing::warn!("logical log: commit_ts == 0 is reserved");
+            return Ok(ParseResult::InvalidFrame);
+        }
+
         let payload_size = match usize::try_from(payload_size_u64) {
             Ok(v) => v,
             Err(e) => {
@@ -2748,11 +3164,11 @@ mod tests {
     use super::{
         build_encrypted_chunk_aad, encrypted_chunk_blob_size, encrypted_chunk_plaintext_len,
         encrypted_payload_blob_size, encrypted_payload_chunk_count, serialize_header_entry,
-        serialize_op_entry, serialized_header_size, serialized_op_size, HeaderReadResult,
-        LogHeader, LogicalLog, ParseResult, ParsedOp, StreamingLogicalLogReader, StreamingResult,
-        ENCRYPTED_CHUNK_AAD_SIZE, ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC, FRAME_MAGIC,
-        LOG_HDR_CRC_START, LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION, STREAM_CHUNK_BYTES,
-        TX_HEADER_SIZE, TX_TRAILER_SIZE,
+        serialize_op_entry, serialized_header_size, serialized_op_size, ChunkedFrameWriter,
+        HeaderReadResult, LogHeader, LogicalLog, ParseResult, ParsedOp, StreamingLogicalLogReader,
+        StreamingResult, ENCRYPTED_CHUNK_AAD_SIZE, ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC,
+        FRAME_MAGIC, LOG_HDR_CRC_START, LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION,
+        STREAM_CHUNK_BYTES, TX_HEADER_SIZE, TX_TRAILER_SIZE,
     };
     use crate::OpenFlags;
     use crate::{turso_assert, turso_assert_less_than};
@@ -2783,8 +3199,8 @@ mod tests {
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: None,
+            begin: crate::mvcc::database::PackedTsOrId::timestamp(commit_ts),
+            end: crate::mvcc::database::PackedTsOrId::none(),
             row: row.clone(),
             btree_resident: false,
         };
@@ -2870,11 +3286,11 @@ mod tests {
         let row = generate_simple_string_row(table_id, rowid, payload_text);
         let row_version = crate::mvcc::database::RowVersion {
             id: commit_ts,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
+            begin: crate::mvcc::database::PackedTsOrId::timestamp(commit_ts),
             end: if is_delete {
-                Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
+                crate::mvcc::database::PackedTsOrId::timestamp(commit_ts)
             } else {
-                None
+                crate::mvcc::database::PackedTsOrId::none()
             },
             row,
             btree_resident,
@@ -3315,8 +3731,8 @@ mod tests {
         };
         tx1.row_versions.push(crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(10)),
-            end: None,
+            begin: crate::mvcc::database::PackedTsOrId::timestamp(10),
+            end: crate::mvcc::database::PackedTsOrId::none(),
             row: row.clone(),
             btree_resident: false,
         });
@@ -3330,8 +3746,8 @@ mod tests {
         };
         tx2.row_versions.push(crate::mvcc::database::RowVersion {
             id: 2,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(20)),
-            end: None,
+            begin: crate::mvcc::database::PackedTsOrId::timestamp(20),
+            end: crate::mvcc::database::PackedTsOrId::none(),
             row,
             btree_resident: false,
         });
@@ -3479,8 +3895,8 @@ mod tests {
             tx_timestamp: 3,
             row_versions: vec![crate::mvcc::database::RowVersion {
                 id: 3,
-                begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(3)),
-                end: None,
+                begin: crate::mvcc::database::PackedTsOrId::timestamp(3),
+                end: crate::mvcc::database::PackedTsOrId::none(),
                 row: row3,
                 btree_resident: false,
             }],
@@ -3535,8 +3951,8 @@ mod tests {
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(123)),
-            end: None,
+            begin: crate::mvcc::database::PackedTsOrId::timestamp(123),
+            end: crate::mvcc::database::PackedTsOrId::none(),
             row,
             btree_resident: false,
         };
@@ -3679,6 +4095,40 @@ mod tests {
         let bad = Arc::new(Buffer::new(0u32.to_le_bytes().to_vec()));
         let c = file
             .pwrite(LOG_HDR_SIZE as u64, bad, Completion::new_write(|_| {}))
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        reader.read_header(&io).unwrap();
+        let res = reader.next_record(&io, |_id| {
+            Err(LimboError::InternalError("no index".to_string()))
+        });
+        assert!(matches!(res.unwrap(), StreamingResult::Eof));
+    }
+
+    /// What this test checks: A frame with `commit_ts == 0` is treated as
+    /// invalid by the parser — `0` is reserved as a `None` sentinel for
+    /// downstream encodings (see `MvccClock` and `PackedTsOrId`).
+    /// Why this matters: Production never produces `commit_ts == 0` (the
+    /// clock starts at 1), so a `0` on disk indicates tampering or a
+    /// partially-written header. Failing fast at the parser keeps the
+    /// `None` sentinel unambiguous everywhere downstream.
+    #[test]
+    fn test_logical_log_commit_ts_zero_rejected() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        // Write a normal frame with commit_ts=99, then patch bytes 16..24 of
+        // the TX header (the `commit_ts` field) to zero. The check fires
+        // before the CRC chain is validated, so the patched (and now CRC-
+        // mismatched) frame still reaches the new sentinel guard first.
+        let (file, _) = write_single_table_tx(&io, "commit-ts-zero.db-log", 99);
+        let bad = Arc::new(Buffer::new(0u64.to_le_bytes().to_vec()));
+        let c = file
+            .pwrite(
+                (LOG_HDR_SIZE + 16) as u64,
+                bad,
+                Completion::new_write(|_| {}),
+            )
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -4042,8 +4492,8 @@ mod tests {
         };
         tx.row_versions.push(crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(300)),
-            end: None,
+            begin: crate::mvcc::database::PackedTsOrId::timestamp(300),
+            end: crate::mvcc::database::PackedTsOrId::none(),
             row: generate_simple_string_row((-2).into(), 42, "flip"),
             btree_resident: false,
         });
@@ -4123,10 +4573,8 @@ mod tests {
                 if is_delete {
                     tx.row_versions.push(crate::mvcc::database::RowVersion {
                         id: 0,
-                        begin: None,
-                        end: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(
-                            tx.tx_timestamp,
-                        )),
+                        begin: crate::mvcc::database::PackedTsOrId::none(),
+                        end: crate::mvcc::database::PackedTsOrId::timestamp(tx.tx_timestamp),
                         row: Row::new_table_row(
                             RowID::new((-2).into(), RowKey::Int(rowid)),
                             Vec::new(),
@@ -4144,10 +4592,8 @@ mod tests {
                     let row = generate_simple_string_row((-2).into(), rowid, &payload);
                     tx.row_versions.push(crate::mvcc::database::RowVersion {
                         id: 0,
-                        begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(
-                            tx.tx_timestamp,
-                        )),
-                        end: None,
+                        begin: crate::mvcc::database::PackedTsOrId::timestamp(tx.tx_timestamp),
+                        end: crate::mvcc::database::PackedTsOrId::none(),
                         row: row.clone(),
                         btree_resident,
                     });
@@ -4185,10 +4631,8 @@ mod tests {
                 .row_versions
                 .push(crate::mvcc::database::RowVersion {
                     id: rowid as u64,
-                    begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(
-                        large_commit_ts,
-                    )),
-                    end: None,
+                    begin: crate::mvcc::database::PackedTsOrId::timestamp(large_commit_ts),
+                    end: crate::mvcc::database::PackedTsOrId::none(),
                     row,
                     btree_resident: false,
                 });
@@ -4222,11 +4666,11 @@ mod tests {
             let row = generate_simple_string_row((-2).into(), rowid, &payload_text);
             let row_version = crate::mvcc::database::RowVersion {
                 id: commit_ts,
-                begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
+                begin: crate::mvcc::database::PackedTsOrId::timestamp(commit_ts),
                 end: if is_delete {
-                    Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
+                    crate::mvcc::database::PackedTsOrId::timestamp(commit_ts)
                 } else {
-                    None
+                    crate::mvcc::database::PackedTsOrId::none()
                 },
                 row: row.clone(),
                 btree_resident,
@@ -4337,8 +4781,8 @@ mod tests {
         row.id.table_id = (-2).into();
         let version = crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(55)),
-            end: None,
+            begin: crate::mvcc::database::PackedTsOrId::timestamp(55),
+            end: crate::mvcc::database::PackedTsOrId::none(),
             row,
             btree_resident: true,
         };
@@ -4400,8 +4844,8 @@ mod tests {
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(10)),
-            end: None,
+            begin: crate::mvcc::database::PackedTsOrId::timestamp(10),
+            end: crate::mvcc::database::PackedTsOrId::none(),
             row,
             btree_resident: false,
         };
@@ -4689,8 +5133,8 @@ mod tests {
         let row = generate_simple_string_row(table_id, rowid, value);
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: None,
+            begin: crate::mvcc::database::PackedTsOrId::timestamp(commit_ts),
+            end: crate::mvcc::database::PackedTsOrId::none(),
             row,
             btree_resident: false,
         }
@@ -4722,8 +5166,8 @@ mod tests {
         let row = Row::new_index_row(row_id, 2);
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: None,
+            begin: crate::mvcc::database::PackedTsOrId::timestamp(commit_ts),
+            end: crate::mvcc::database::PackedTsOrId::none(),
             row,
             btree_resident: false,
         }
@@ -4749,14 +5193,14 @@ mod tests {
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
             begin: if is_delete {
-                None
+                crate::mvcc::database::PackedTsOrId::none()
             } else {
-                Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
+                crate::mvcc::database::PackedTsOrId::timestamp(commit_ts)
             },
             end: if is_delete {
-                Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
+                crate::mvcc::database::PackedTsOrId::timestamp(commit_ts)
             } else {
-                None
+                crate::mvcc::database::PackedTsOrId::none()
             },
             row,
             btree_resident: false,
@@ -4776,14 +5220,14 @@ mod tests {
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
             begin: if is_delete {
-                None
+                crate::mvcc::database::PackedTsOrId::none()
             } else {
-                Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
+                crate::mvcc::database::PackedTsOrId::timestamp(commit_ts)
             },
             end: if is_delete {
-                Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
+                crate::mvcc::database::PackedTsOrId::timestamp(commit_ts)
             } else {
-                None
+                crate::mvcc::database::PackedTsOrId::none()
             },
             row,
             btree_resident: false,
@@ -5137,6 +5581,91 @@ mod tests {
             "pending_running_crc must remain None after visitor error",
         );
         assert_eq!(log.offset, 0, "offset must not advance on early error");
+    }
+
+    /// What this test checks: [`ChunkedFrameWriter::into_chunks`] truncates
+    /// the final chunk to the actually-written byte count, so `pwritev`
+    /// never writes the trailing-zero region of an under-filled chunk.
+    /// Why this matters: a 256 KiB chunk with 100 bytes written and 256K-100
+    /// trailing zeros would corrupt the next frame's `FRAME_MAGIC` parse on
+    /// recovery — the failure mode is silent until replay.
+    #[test]
+    fn test_chunked_frame_writer_truncates_trailing_zeros() {
+        let mut writer = ChunkedFrameWriter::new();
+        let payload = [0x55u8; 100];
+        writer.write(&payload);
+        let cursor = writer.cursor();
+        let chunks = writer.into_chunks();
+        assert_eq!(chunks.len(), 1, "100-byte payload must fit in one chunk");
+        assert_eq!(
+            chunks[0].as_slice().len(),
+            cursor,
+            "single-chunk frame: chunk length must equal writer cursor (no trailing zeros)"
+        );
+        assert_eq!(
+            chunks[0].as_slice(),
+            &payload,
+            "writer must round-trip its bytes exactly"
+        );
+    }
+
+    /// What this test checks: [`ChunkedFrameWriter`] correctly spills
+    /// across chunk boundaries, the last chunk is truncated, and earlier
+    /// chunks remain at full `STREAM_CHUNK_BYTES`.
+    /// Why this matters: cross-chunk arithmetic in
+    /// `crc_over_range_in_chunks` and `write_at_in_chunks` depends on
+    /// chunks reporting their actual on-disk lengths.
+    #[test]
+    fn test_chunked_frame_writer_multi_chunk_truncation() {
+        let mut writer = ChunkedFrameWriter::new();
+        // Write enough to spill into the second chunk by ~123 bytes.
+        let payload_a = vec![0xAAu8; STREAM_CHUNK_BYTES];
+        writer.write(&payload_a);
+        let payload_b = vec![0xBBu8; 123];
+        writer.write(&payload_b);
+        let cursor = writer.cursor();
+        let chunks = writer.into_chunks();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            chunks[0].as_slice().len(),
+            STREAM_CHUNK_BYTES,
+            "first full chunk keeps its full length"
+        );
+        assert_eq!(
+            chunks[1].as_slice().len(),
+            123,
+            "last chunk truncates to actually-written bytes"
+        );
+        assert_eq!(
+            chunks[0].as_slice().len() + chunks[1].as_slice().len(),
+            cursor,
+            "sum of chunk lengths must equal writer cursor"
+        );
+    }
+
+    /// What this test checks: [`ChunkedFrameWriter::reserve`] +
+    /// `write_to` round-trip — a backfilled slot reads back exactly
+    /// what was written, regardless of whether the slot straddles a
+    /// chunk boundary.
+    /// Why this matters: the plaintext streaming path uses `reserve` for
+    /// the log header and TX header, both backfilled at end-of-walk
+    /// after `payload_size` and `op_count` are known.
+    #[test]
+    fn test_chunked_frame_writer_reservation_backfill() {
+        let mut writer = ChunkedFrameWriter::new();
+        // Reserve a 24-byte slot at offset 0, write a 100-byte payload,
+        // then backfill the slot. Verify the slot region matches the
+        // backfill bytes and the payload region is untouched.
+        let token = writer.reserve::<24>();
+        writer.write(&[0xCCu8; 100]);
+        let backfill = [0x42u8; 24];
+        writer.write_to(token, &backfill);
+        let chunks = writer.into_chunks();
+        assert_eq!(chunks.len(), 1);
+        let bytes = chunks[0].as_slice();
+        assert_eq!(&bytes[..24], &backfill);
+        assert!(bytes[24..124].iter().all(|&b| b == 0xCC));
+        assert_eq!(bytes.len(), 124);
     }
 
     /// What this test checks: a frame larger than `STREAM_CHUNK_BYTES` is
