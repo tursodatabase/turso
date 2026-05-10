@@ -284,6 +284,12 @@ fn is_schema_metadata_only_rewrite(current: &RowVersion, next: Option<&RowVersio
 }
 
 impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
+    fn refresh_checkpoint_bounds(&mut self) {
+        let durable_tx_max = self.mvstore.durable_txid_max.load(Ordering::SeqCst);
+        self.durable_txid_max_old = NonZeroU64::new(durable_tx_max);
+        self.durable_txid_max_new = durable_tx_max;
+    }
+
     pub fn new(
         pager: Arc<Pager>,
         mvstore: Arc<MvStore<Clock>>,
@@ -332,7 +338,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             },
             pager,
             durable_txid_max_old,
-            durable_txid_max_new: mvstore.durable_txid_max.load(Ordering::SeqCst),
+            durable_txid_max_new: durable_tx_max,
             mvstore,
             connection,
             #[cfg(any(test, injected_yields))]
@@ -864,6 +870,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     return Err(crate::LimboError::Busy);
                 }
                 self.lock_states.blocking_checkpoint_lock_held = true;
+
+                // Checkpoint state machines can be created before they are run.
+                // Resample after serializing with other checkpoints so already-durable
+                // index deletes are not replayed.
+                self.refresh_checkpoint_bounds();
 
                 self.collect_committed_table_row_versions();
                 tracing::info!("Collected {} committed versions", self.write_set.len());
