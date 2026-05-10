@@ -341,15 +341,6 @@ pub struct LogRecord {
     pub header: Option<DatabaseHeader>,
 }
 
-impl LogRecord {
-    fn new(tx_timestamp: TxID) -> Self {
-        Self {
-            tx_timestamp,
-            row_versions: Vec::new(),
-            header: None,
-        }
-    }
-}
 
 /// A transaction timestamp or ID.
 ///
@@ -886,9 +877,17 @@ pub enum CommitState<Clock: LogicalClock> {
     WaitForDependencies {
         end_ts: u64,
     },
-    BeginCommitLogicalLog {
+    /// Acquire the pager commit lock that serializes log writes. The streaming
+    /// log walk runs only after this lock is held; this state may yield freely
+    /// on lock contention without re-running the walk.
+    AcquirePagerCommitLock {
         end_ts: u64,
-        log_record: LogRecord,
+    },
+    /// Streaming log walk + IO submission. This runs in a single non-yielding
+    /// `step()` invocation: the chain read locks acquired during the walk
+    /// (`!Send`, `parking_lot::RwLockReadGuard`) never cross a yield point.
+    WriteLogFrame {
+        end_ts: u64,
     },
     EndCommitLogicalLog {
         end_ts: u64,
@@ -1317,134 +1316,221 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         Ok(())
     }
 
-    /// Build the committed image for the logical log without mutating the
-    /// live MVCC version chains, which must stay TxID-backed until CommitEnd.
-    fn build_committed_log_record(
+    /// Resolve a write-set RowID to its canonical table id for log emission.
+    /// After checkpoint, a table's in-memory table_id (e.g. -53) may differ
+    /// from `-(root_page)` (e.g. -58). On recovery, bootstrap reconstructs the
+    /// map using `-(root_page)`, so log records must use that canonical form.
+    /// Schema rows are exempt (their id is the constant
+    /// `SQLITE_SCHEMA_MVCC_TABLE_ID`).
+    ///
+    /// IMPORTANT: this lookup must happen *before* we take the chain
+    /// `RwLock::read()` for the row, never under it — `table_id_to_rootpage`
+    /// is a `SkipMap` whose `.get()` may take shard locks that overlap with
+    /// other agents' chain locks.
+    fn canonical_table_id(
+        &self,
+        mvcc_store: &Arc<MvStore<Clock>>,
+        table_id: MVTableId,
+    ) -> MVTableId {
+        if table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+            return table_id;
+        }
+        if let Some(entry) = mvcc_store.table_id_to_rootpage.get(&table_id) {
+            if let Some(root_page) = *entry.value() {
+                return MVTableId::from(-(root_page as i64));
+            }
+        }
+        table_id
+    }
+
+    /// Stream the committing transaction's ops directly into the durable log
+    /// without materializing a `LogRecord`. Replaces `build_committed_log_record`
+    /// + `DurableStorage::log_tx` with a fused walk that emits each op into the
+    /// frame writer as soon as it is gathered.
+    ///
+    /// Returns `(completion, bytes_written)` from the underlying pwrite. The
+    /// caller advances the writer offset only after durability succeeds.
+    ///
+    /// Invariants enforced (see `MVCC_STREAMING_COMMIT_PLAN.md`):
+    /// 1. `is_delete = matches!(end, TxID(self))`. NEVER `end.is_some()`.
+    ///    A concurrent tx may stamp `TxID(other)` on our row; that delete is
+    ///    the other tx's contribution.
+    /// 2. Schema rows emit before non-schema rows (two-pass over write_set).
+    /// 3. Within one chain, versions emit in `begin`-ascending order — this is
+    ///    how `insert_version_raw` keeps the live chain, and how recovery's
+    ///    UPDATE handler relies on the prior DELETE arriving before the new
+    ///    UPSERT.
+    /// 4. `op_count` exactly matches the number of `emit` calls
+    ///    (debug-asserted in `TxFrameWriter::finish`).
+    fn stream_committed_ops(
         &mut self,
         mvcc_store: &Arc<MvStore<Clock>>,
         tx: &Transaction,
         end_ts: u64,
-    ) -> LogRecord {
-        let mut log_record = LogRecord::new(end_ts);
-        if tx.header_dirty.load(Ordering::Acquire) {
-            // Persist the transaction-local header snapshot in the same logical-log frame.
-            log_record.header = Some(*tx.header.read());
+    ) -> Result<(Completion, u64)> {
+        let header_dirty = tx.header_dirty.load(Ordering::Acquire);
+
+        // First pass: count contributing versions. Stable under
+        // `pager_commit_lock` because no other agent can stamp `TxID(self)`
+        // on anyone's begin/end — only this transaction does.
+        let op_count = self.count_committed_ops(mvcc_store, header_dirty);
+
+        // Begin streaming. The sink holds the LogicalLog write guard.
+        let mut sink = mvcc_store.storage.begin_log_tx(end_ts, op_count)?;
+
+        // Second pass (schema-first, data-second): emit each contributing op.
+        self.emit_committed_ops(mvcc_store, &mut *sink)?;
+        if header_dirty {
+            let header_snapshot = *tx.header.read();
+            sink.emit_header(&header_snapshot);
         }
 
-        // Process schema rows (sqlite_schema) before data rows so that during log
-        // replay the table_id_to_rootpage map is populated before data row inserts
-        // reference it. `self.write_set` is sorted by table_id descending (most
-        // negative first), which would otherwise place data table rows
-        // (e.g. table_id=-3) before schema rows (table_id=-1).
+        sink.finish()
+    }
 
-        // Remap a table_id to its canonical form for the log. After checkpoint,
-        // a table's in-memory table_id (e.g. -53) may differ from -(root_page)
-        // (e.g. -58). On recovery, bootstrap reconstructs the map using
-        // -(root_page), so log records must use that canonical form to be found.
-        let canonicalize_table_id = |version: &mut RowVersion| {
-            let table_id = version.row.id.table_id;
-            if table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                return;
-            }
-            if let Some(entry) = mvcc_store.table_id_to_rootpage.get(&table_id) {
-                if let Some(root_page) = *entry.value() {
-                    let canonical = MVTableId::from(-(root_page as i64));
-                    if canonical != table_id {
-                        version.row.id.table_id = canonical;
-                    }
-                }
-            }
-        };
-
-        // Returns Some(row_version) if our tx contributed to it and if we must therefore log it.
-        let our_committed_image = |row_version: &RowVersion| -> Option<RowVersion> {
-            let our_begin = matches!(
-                row_version.begin,
-                Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id
-            );
-            let our_end = matches!(
-                row_version.end,
-                Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id
-            );
-            if !our_begin && !our_end {
-                // row_version belongs to another tx
-                return None;
-            }
-            let mut committed = row_version.clone();
-            if our_begin {
-                // New version is valid STARTING FROM the committing
-                // transaction's end timestamp. See Hekaton page 299.
-                committed.begin = Some(TxTimestampOrID::Timestamp(end_ts));
-
-                if !our_end {
-                    // A version row_version we inserted may have row_version.end == tx_b.tx_id,
-                    // where tx_b is a concurrent tx. This is because when a tx transitions to
-                    // Preparing, its row_version becomes *speculatively updatable*, and a tx tx_b
-                    // is allowed to change row_version.end from None to tx_b.tx_id to delete it
-                    // (see the Hekaton paper, §3.1, heading "check updatability").
-                    //
-                    // That deletion is tx_b's contribution, and tx_b will log it on its own commit.
-                    // Our log record must capture our own contribution, but if the `end` field is
-                    // set, it will be serialized as a OP_DELETE_* in the logical log, so we unset
-                    // it so that it will be serialized as an OP_UPSERT_*. tx_b will take care of
-                    // logging the deletion.
-                    committed.end = None;
-                }
-            }
-            if our_end {
-                // Old version is valid UNTIL the committing
-                // transaction's end timestamp. See Hekaton page 299.
-                committed.end = Some(TxTimestampOrID::Timestamp(end_ts));
-            }
-            Some(committed)
-        };
-
-        let collect_versions = |id: &RowID, log_record: &mut LogRecord| {
+    /// Counting pre-pass over the write set. One predicate evaluation per
+    /// candidate version; no extra locking beyond what the emit pass already
+    /// pays.
+    fn count_committed_ops(
+        &self,
+        mvcc_store: &Arc<MvStore<Clock>>,
+        header_dirty: bool,
+    ) -> u32 {
+        let mut count: u32 = 0;
+        for id in &self.write_set {
             if let Some(row_versions) = mvcc_store.rows.get(id) {
-                let row_versions = row_versions.value().read();
-                for row_version in row_versions.iter() {
-                    if let Some(mut committed_version) = our_committed_image(row_version) {
-                        canonicalize_table_id(&mut committed_version);
-                        mvcc_store
-                            .insert_version_raw(&mut log_record.row_versions, committed_version);
+                let versions = row_versions.value().read();
+                for v in versions.iter() {
+                    if self.is_our_contribution(v) {
+                        count += 1;
                     }
                 }
             }
-
             if let Some(index) = mvcc_store.index_rows.get(&id.table_id) {
-                let index = index.value();
                 let RowKey::Record(ref index_key) = id.row_id else {
                     panic!("Index writes must have a record key");
                 };
-                if let Some(row_versions) = index.get(index_key) {
-                    let row_versions = row_versions.value().read();
-                    for row_version in row_versions.iter() {
-                        if let Some(mut committed_version) = our_committed_image(row_version) {
-                            canonicalize_table_id(&mut committed_version);
-                            mvcc_store.insert_version_raw(
-                                &mut log_record.row_versions,
-                                committed_version,
-                            );
+                if let Some(row_versions) = index.value().get(index_key) {
+                    let versions = row_versions.value().read();
+                    for v in versions.iter() {
+                        if self.is_our_contribution(v) {
+                            count += 1;
                         }
                     }
                 }
             }
-        };
+        }
+        if header_dirty {
+            count += 1;
+        }
+        count
+    }
 
-        // First pass: schema rows only (ordering matters for recovery)
+    /// Returns true iff this version was created or deleted by `self.tx_id`
+    /// and therefore must appear in our log frame.
+    #[inline]
+    fn is_our_contribution(&self, v: &RowVersion) -> bool {
+        let our_begin =
+            matches!(v.begin, Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id);
+        let our_end =
+            matches!(v.end, Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id);
+        our_begin || our_end
+    }
+
+    /// Emit ops into the streaming sink. Schema rows go first (recovery
+    /// requires `table_id_to_rootpage` to be populated before data inserts
+    /// reference it), then everything else.
+    ///
+    /// Locking discipline: per-chain read locks are held only across the
+    /// gather step (a few field reads); they are dropped before
+    /// `serialize_op_entry_view` runs and before encryption (in `finish`).
+    /// The chain's begin-ts ordering is preserved because we walk the chain
+    /// in slice order under the read lock.
+    fn emit_committed_ops(
+        &self,
+        mvcc_store: &Arc<MvStore<Clock>>,
+        sink: &mut dyn crate::mvcc::persistent_storage::logical_log::TxFrameSink,
+    ) -> Result<()> {
+        // First pass: schema rows only.
         for id in &self.write_set {
             if id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                collect_versions(id, &mut log_record);
+                self.emit_chain_ops(mvcc_store, id, sink);
             }
         }
-        // Second pass: all non-schema rows
+        // Second pass: all non-schema rows.
         for id in &self.write_set {
             if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                collect_versions(id, &mut log_record);
+                self.emit_chain_ops(mvcc_store, id, sink);
             }
         }
+        Ok(())
+    }
 
-        log_record
+    /// Walk the live row + index chains for one `RowID` and emit our ops.
+    fn emit_chain_ops(
+        &self,
+        mvcc_store: &Arc<MvStore<Clock>>,
+        id: &RowID,
+        sink: &mut dyn crate::mvcc::persistent_storage::logical_log::TxFrameSink,
+    ) {
+        // Canonicalize *before* taking any chain lock — see
+        // `canonical_table_id` doc.
+        let canonical_table_id = self.canonical_table_id(mvcc_store, id.table_id);
+
+        if let Some(row_versions) = mvcc_store.rows.get(id) {
+            let versions = row_versions.value().read();
+            for v in versions.iter() {
+                if self.is_our_contribution(v) {
+                    self.emit_one_version(canonical_table_id, v, sink);
+                }
+            }
+            // Drop the read lock before the next chain (and before any
+            // encryption that runs in `finish`).
+            drop(versions);
+        }
+
+        if let Some(index) = mvcc_store.index_rows.get(&id.table_id) {
+            let RowKey::Record(ref index_key) = id.row_id else {
+                panic!("Index writes must have a record key");
+            };
+            if let Some(row_versions) = index.value().get(index_key) {
+                let versions = row_versions.value().read();
+                for v in versions.iter() {
+                    if self.is_our_contribution(v) {
+                        self.emit_one_version(canonical_table_id, v, sink);
+                    }
+                }
+                drop(versions);
+            }
+        }
+    }
+
+    /// Build a `LogOpView` from a live `RowVersion` and emit it.
+    /// Encodes the streaming `is_delete` rule directly:
+    /// `is_delete = matches!(end, TxID(self))`.
+    #[inline]
+    fn emit_one_version(
+        &self,
+        canonical_table_id: MVTableId,
+        v: &RowVersion,
+        sink: &mut dyn crate::mvcc::persistent_storage::logical_log::TxFrameSink,
+    ) {
+        use crate::mvcc::persistent_storage::logical_log::LogOpView;
+        const OP_FLAG_BTREE_RESIDENT: u8 = 1 << 0;
+        let our_end =
+            matches!(v.end, Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id);
+        let mut flags = 0u8;
+        if v.btree_resident {
+            flags |= OP_FLAG_BTREE_RESIDENT;
+        }
+        let view = LogOpView::new(
+            &v.row.id.row_id,
+            v.row.payload(),
+            canonical_table_id,
+            flags,
+            our_end,
+        );
+        sink.emit(view);
     }
 
     /// Publish committed timestamps into the live MVCC chains after the
@@ -1798,29 +1884,27 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Ok(TransitionResult::Done(()));
                 }
 
-                // All dependencies resolved. Build the committed image for the
-                // logical log, but keep live row versions on TxID references
-                // until CommitEnd so rollback of an abandoned commit can still
-                // match them.
-                //TODO this is the first pass over all versions
-
-                // At this point, we already known op_count,
-                let log_record = self.build_committed_log_record(mvcc_store, tx, end_ts);
-                tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
-
-                if log_record.row_versions.is_empty() && log_record.header.is_none() {
+                // All dependencies resolved. Determine whether we have any
+                // ops at all (so we can short-circuit), then transition into
+                // the lock-acquisition state. The streaming walk is deferred
+                // to `WriteLogFrame` so it runs *after* the pager_commit_lock
+                // is held (and never under a yield point).
+                let has_writes = !self.write_set.is_empty();
+                let has_header = tx.header_dirty.load(Ordering::Acquire);
+                if !has_writes && !has_header {
                     // Nothing to do, just end commit.
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.unlock_commit_lock_if_held(tx);
                     }
                     self.state = CommitState::CommitEnd { end_ts };
                 } else {
-                    self.state = CommitState::BeginCommitLogicalLog { end_ts, log_record };
+                    self.state = CommitState::AcquirePagerCommitLock { end_ts };
                 }
                 inject_transition_yield!(self, CommitYieldPoint::LogRecordPrepared);
                 return Ok(TransitionResult::Continue);
             }
-            CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
+            CommitState::AcquirePagerCommitLock { end_ts } => {
+                let end_ts = *end_ts;
                 if !mvcc_store.is_exclusive_tx(&self.tx_id) {
                     // logical log needs to be serialized
                     let locked = self.commit_coordinator.pager_commit_lock.write();
@@ -1837,10 +1921,19 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .pager_commit_lock_held
                         .store(true, Ordering::Release);
                 }
-                let (c, append_bytes) = mvcc_store.storage.log_tx(log_record)?;
+                self.state = CommitState::WriteLogFrame { end_ts };
+                Ok(TransitionResult::Continue)
+            }
+            CommitState::WriteLogFrame { end_ts } => {
+                let end_ts = *end_ts;
+                let tx = mvcc_store
+                    .txs
+                    .get(&self.tx_id)
+                    .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
+                let tx = tx.value();
+                let (c, append_bytes) = self.stream_committed_ops(mvcc_store, tx, end_ts)?;
                 self.pending_log_append_bytes = Some(append_bytes);
-                self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
-                // if Completion Completed without errors we can continue
+                self.state = CommitState::SyncLogicalLog { end_ts };
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
@@ -5717,10 +5810,13 @@ impl<Clock: LogicalClock> Debug for CommitState<Clock> {
                 .debug_struct("WaitForDependencies")
                 .field("end_ts", end_ts)
                 .finish(),
-            Self::BeginCommitLogicalLog { end_ts, log_record } => f
-                .debug_struct("BeginCommitLogicalLog")
+            Self::AcquirePagerCommitLock { end_ts } => f
+                .debug_struct("AcquirePagerCommitLock")
                 .field("end_ts", end_ts)
-                .field("log_record", log_record)
+                .finish(),
+            Self::WriteLogFrame { end_ts } => f
+                .debug_struct("WriteLogFrame")
+                .field("end_ts", end_ts)
                 .finish(),
             Self::EndCommitLogicalLog { end_ts } => f
                 .debug_struct("EndCommitLogicalLog")

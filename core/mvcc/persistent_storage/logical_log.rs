@@ -227,6 +227,8 @@ use crate::{
     types::IndexInfo,
     Buffer, Completion, CompletionError, LimboError, Result,
 };
+use std::marker::PhantomData;
+use std::mem;
 
 use crate::storage::encryption::EncryptionContext;
 use crate::File;
@@ -551,20 +553,21 @@ impl LogicalLog {
         self.encryption_ctx.as_ref()
     }
 
-    /// Serializes a transaction into `write_buf`, then writes to disk.
-    /// `write_buf` retains its allocation across calls.
+    /// Setup at the start of a TX frame. Clears `write_buf`, writes the log
+    /// header if this is the first write, reserves the TX header placeholder,
+    /// and pre-sizes scratch space for `op_count * AVG_OP_BYTES` bytes. Returns
+    /// the byte position of the TX header inside `write_buf`.
     ///
-    /// `advance_offset_immediately`: when true, the writer offset advances right
-    /// after the pwrite (checkpoint path). When false, the offset stays behind
-    /// until `advance_offset_after_success` is called (MVCC commit path).
-    fn serialize_and_pwrite_tx(
-        &mut self,
-        tx: &LogRecord,
-        advance_offset_immediately: bool,
-    ) -> Result<(Completion, u64)> {
+    /// Pre-conditions enforced by `debug_assert!`:
+    /// - `pending_running_crc` is `None` (no orphaned deferred frame).
+    pub(crate) fn prepare_tx_frame(&mut self, op_count: u32) -> usize {
+        debug_assert!(
+            self.pending_running_crc.is_none(),
+            "prepare_tx_frame called while a deferred-offset frame is pending"
+        );
         self.write_buf.clear();
 
-        // 1. Serialize log header if it's first write
+        // 1. Serialize log header if it's first write.
         let is_first_write = self.offset == 0;
         if is_first_write {
             if self.header.is_none() {
@@ -576,23 +579,90 @@ impl LogicalLog {
             self.write_buf.extend_from_slice(&header_bytes);
         }
 
-        // 2. Serialize Transaction header.
-        // A header-only transaction is encoded as a single OP_UPDATE_HEADER op.
-        // payload_size is only known after serializing all ops. We reserve TX_HEADER_SIZE bytes
-        // as a placeholder and backfill all header fields in step 4.
-        let op_count = u32::try_from(tx.row_versions.len() + usize::from(tx.header.is_some()))
-            .map_err(|_| {
-                LimboError::InternalError("Logical log op_count exceeds u32".to_string())
-            })?;
-        let commit_ts = tx.tx_timestamp; //this is end_tx
+        // 2. Reserve TX header placeholder (backfilled in finalize_frame).
         let tx_header_start = self.write_buf.len();
         self.write_buf.resize(tx_header_start + TX_HEADER_SIZE, 0);
 
-        // 3. Serialize ops into write_buf (encrypted or plaintext).
-        let payload_size = self.serialize_ops_into_write_buf(tx, op_count, commit_ts)?;
+        // 3. Pre-size scratch space for ops. 64 bytes/op is OLTP-typical;
+        // bulk inserts (the friendliest case for the historical realloc cascade)
+        // get the biggest win. The figure is coarse; over-allocation is paid
+        // back the next frame because the Vec keeps its capacity.
+        const AVG_OP_BYTES: usize = 64;
+        let estimated_payload = (op_count as usize).saturating_mul(AVG_OP_BYTES);
+        if self.encryption_ctx.is_some() {
+            self.encryption_scratch_buffer.clear();
+            self.encryption_scratch_buffer.reserve(estimated_payload);
+        } else {
+            self.write_buf.reserve(estimated_payload);
+        }
+
+        tx_header_start
+    }
+
+    /// Append one op to the frame's payload buffer (plaintext or encrypted-scratch).
+    #[inline]
+    pub(crate) fn emit_op_into_frame(&mut self, view: &LogOpView<'_>) {
+        let buf = if self.encryption_ctx.is_some() {
+            &mut self.encryption_scratch_buffer
+        } else {
+            &mut self.write_buf
+        };
+        serialize_op_entry_view(buf, view);
+    }
+
+    /// Append a header op to the frame's payload buffer.
+    pub(crate) fn emit_header_into_frame(&mut self, header: &DatabaseHeader) {
+        let buf = if self.encryption_ctx.is_some() {
+            &mut self.encryption_scratch_buffer
+        } else {
+            &mut self.write_buf
+        };
+        serialize_header_entry(buf, header);
+    }
+
+    /// Begin assembling a TX frame using the inherent (non-trait) writer.
+    /// The returned writer borrows `&mut self` for the frame's lifetime.
+    pub fn begin_tx_frame(
+        &mut self,
+        commit_ts: u64,
+        op_count: u32,
+    ) -> TxFrameWriter<'_> {
+        let tx_header_start = self.prepare_tx_frame(op_count);
+        TxFrameWriter {
+            log: self,
+            tx_header_start,
+            op_count,
+            commit_ts,
+            emitted_count: 0,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Finalize the frame after ops have been emitted: backfill TX header,
+    /// run encryption (chunked) if configured, append CRC + end-magic trailer,
+    /// swap-take the bytes into an IO `Buffer`, and submit pwrite.
+    ///
+    /// `advance_offset_immediately`: when true, the writer offset advances
+    /// right after pwrite (checkpoint path). When false, offset stays behind
+    /// until `advance_offset_after_success` is called (MVCC commit path).
+    pub(crate) fn finalize_frame(
+        &mut self,
+        tx_header_start: usize,
+        op_count: u32,
+        commit_ts: u64,
+        advance_offset_immediately: bool,
+    ) -> Result<(Completion, u64)> {
+        // Run encryption (if configured) over plaintext ops in
+        // `encryption_scratch_buffer`, appending ciphertext chunks to `write_buf`.
+        let payload_size = if self.encryption_ctx.is_some() {
+            self.encrypt_scratch_into_write_buf(op_count, commit_ts)?
+        } else {
+            // Plaintext path: ops were emitted directly into write_buf.
+            (self.write_buf.len() - (tx_header_start + TX_HEADER_SIZE)) as u64
+        };
         let payload_end = self.write_buf.len();
 
-        // 4. Backfill TX HEADER: FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
+        // Backfill TX HEADER: FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
         self.write_buf[tx_header_start..tx_header_start + 4]
             .copy_from_slice(&FRAME_MAGIC.to_le_bytes());
         self.write_buf[tx_header_start + 4..tx_header_start + 12]
@@ -602,9 +672,9 @@ impl LogicalLog {
         self.write_buf[tx_header_start + 16..tx_header_start + 24]
             .copy_from_slice(&commit_ts.to_le_bytes());
 
-        // 5. TX TRAILER layout (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
-        // CRC is chained: seeded from running_crc (salt-derived, or previous frame's CRC),
-        // covers TX_HEADER (24 B) + payload (encrypted or plaintext).
+        // TX TRAILER (8 bytes): crc32c(4, le u32) | END_MAGIC(4).
+        // CRC is chained: seeded from running_crc, covers TX_HEADER + payload
+        // (encrypted or plaintext, whichever is on disk).
         let crc = crc32c::crc32c_append(
             self.running_crc,
             &self.write_buf[tx_header_start..payload_end],
@@ -612,10 +682,13 @@ impl LogicalLog {
         self.write_buf.extend_from_slice(&crc.to_le_bytes());
         self.write_buf.extend_from_slice(&END_MAGIC.to_le_bytes());
 
-        // 6. Copy write_buf into an I/O buffer and pwrite. write_buf keeps its allocation.
-        let buffer = Arc::new(Buffer::new(self.write_buf.to_vec()));
+        // Swap-take write_buf into an IO Buffer (no copy). A fresh empty Vec
+        // takes its place; the next begin_tx_frame's reserve() lands it at the
+        // right capacity in one allocation.
+        let frame_bytes = mem::take(&mut self.write_buf);
+        let buffer_len = frame_bytes.len();
+        let buffer = Arc::new(Buffer::new(frame_bytes));
         let c = Completion::new_write({
-            let buffer_len = buffer.len();
             move |res: Result<i32, CompletionError>| {
                 let Ok(bytes_written) = res else {
                     return;
@@ -627,7 +700,6 @@ impl LogicalLog {
             }
         });
 
-        let buffer_len = buffer.len();
         let c = self.file.pwrite(self.offset, buffer, c)?;
         if advance_offset_immediately {
             self.offset += buffer_len as u64;
@@ -638,98 +710,78 @@ impl LogicalLog {
         Ok((c, buffer_len as u64))
     }
 
-    /// Serializes ops into `write_buf`, encrypting if an encryption context is set.
-    /// Returns the plaintext payload size (used in the TX header's `payload_size` field).
-    ///
-    /// Encrypted on-disk payload layout: repeated
-    /// `ciphertext(chunk_plain_len + tag_size) | nonce(nonce_size)` chunks.
-    fn serialize_ops_into_write_buf(
+    /// Encrypted-path: take the plaintext ops in `encryption_scratch_buffer`,
+    /// chunk + encrypt them into `write_buf`. Returns the plaintext payload size
+    /// (used in the TX header's `payload_size` field — pre-encryption).
+    fn encrypt_scratch_into_write_buf(
         &mut self,
-        tx: &LogRecord,
         op_count: u32,
         commit_ts: u64,
     ) -> Result<u64> {
-        if let Some(enc_ctx) = &self.encryption_ctx {
-            self.encryption_scratch_buffer.clear();
-            for row_version in &tx.row_versions {
-                serialize_op_entry(&mut self.encryption_scratch_buffer, row_version)?;
-            }
-            if let Some(hdr) = tx.header {
-                serialize_header_entry(&mut self.encryption_scratch_buffer, &hdr);
-            }
-            let payload_size = self.encryption_scratch_buffer.len();
+        let enc_ctx = self
+            .encryption_ctx
+            .as_ref()
+            .expect("encrypt_scratch_into_write_buf called without encryption context");
+        let payload_size = self.encryption_scratch_buffer.len();
 
-            let salt = self
-                .header
-                .as_ref()
-                .expect("log header must be set before writing")
-                .salt;
-            let total_on_disk_size = encrypted_payload_blob_size(
-                payload_size,
-                self.encrypted_payload_chunk_size,
-                enc_ctx.tag_size(),
-                enc_ctx.nonce_size(),
-            )?;
-            let write_buf_start = self.write_buf.len();
-            self.write_buf.reserve(total_on_disk_size);
-            let chunk_count =
-                encrypted_payload_chunk_count(payload_size, self.encrypted_payload_chunk_size);
+        let salt = self
+            .header
+            .as_ref()
+            .expect("log header must be set before writing")
+            .salt;
+        let total_on_disk_size = encrypted_payload_blob_size(
+            payload_size,
+            self.encrypted_payload_chunk_size,
+            enc_ctx.tag_size(),
+            enc_ctx.nonce_size(),
+        )?;
+        let write_buf_start = self.write_buf.len();
+        self.write_buf.reserve(total_on_disk_size);
+        let chunk_count =
+            encrypted_payload_chunk_count(payload_size, self.encrypted_payload_chunk_size);
 
-            let payload_size = payload_size as u64;
-            for (chunk_index, plaintext_chunk) in self
-                .encryption_scratch_buffer
-                .chunks(self.encrypted_payload_chunk_size)
-                .enumerate()
-            {
-                let is_last_chunk = chunk_index + 1 == chunk_count;
-                let aad = build_encrypted_chunk_aad(
-                    salt,
-                    is_last_chunk.then_some(payload_size),
-                    op_count,
-                    commit_ts,
-                    u32::try_from(chunk_index).map_err(|_| {
-                        LimboError::InternalError(
-                            "encrypted payload chunk index exceeds u32".to_string(),
-                        )
-                    })?,
-                );
-
-                let (ciphertext, nonce) = enc_ctx.encrypt_chunk(plaintext_chunk, &aad)?;
-                // encrypt_chunk returns ciphertext with the auth tag appended, so its
-                // length must be exactly plaintext_len + tag_size. The read path relies
-                // on this to split each chunk back into (ciphertext+tag, nonce).
-                debug_assert_eq!(
-                    ciphertext.len(),
-                    plaintext_chunk.len() + enc_ctx.tag_size(),
-                    "encrypt_chunk output size mismatch: expected plaintext({}) + tag({}), got {}",
-                    plaintext_chunk.len(),
-                    enc_ctx.tag_size(),
-                    ciphertext.len(),
-                );
-                self.write_buf.extend_from_slice(&ciphertext);
-                self.write_buf.extend_from_slice(&nonce);
-            }
-            turso_assert!(
-                self.write_buf.len() - write_buf_start == total_on_disk_size,
-                "encrypted write_buf size mismatch"
+        let payload_size_u64 = payload_size as u64;
+        for (chunk_index, plaintext_chunk) in self
+            .encryption_scratch_buffer
+            .chunks(self.encrypted_payload_chunk_size)
+            .enumerate()
+        {
+            let is_last_chunk = chunk_index + 1 == chunk_count;
+            let aad = build_encrypted_chunk_aad(
+                salt,
+                is_last_chunk.then_some(payload_size_u64),
+                op_count,
+                commit_ts,
+                u32::try_from(chunk_index).map_err(|_| {
+                    LimboError::InternalError(
+                        "encrypted payload chunk index exceeds u32".to_string(),
+                    )
+                })?,
             );
-            Ok(payload_size)
-        } else {
-            let payload_start = self.write_buf.len();
-            for row_version in &tx.row_versions {
-                serialize_op_entry(&mut self.write_buf, row_version)?;
-            }
-            if let Some(header) = tx.header {
-                serialize_header_entry(&mut self.write_buf, &header);
-            }
-            Ok((self.write_buf.len() - payload_start) as u64)
+
+            let (ciphertext, nonce) = enc_ctx.encrypt_chunk(plaintext_chunk, &aad)?;
+            debug_assert_eq!(
+                ciphertext.len(),
+                plaintext_chunk.len() + enc_ctx.tag_size(),
+                "encrypt_chunk output size mismatch: expected plaintext({}) + tag({}), got {}",
+                plaintext_chunk.len(),
+                enc_ctx.tag_size(),
+                ciphertext.len(),
+            );
+            self.write_buf.extend_from_slice(&ciphertext);
+            self.write_buf.extend_from_slice(&nonce);
         }
+        turso_assert!(
+            self.write_buf.len() - write_buf_start == total_on_disk_size,
+            "encrypted write_buf size mismatch"
+        );
+        Ok(payload_size_u64)
     }
 
     /// Writes a transaction to the log and immediately advances the writer offset.
     /// Used for checkpoint-initiated writes where no two-phase commit is needed.
     pub fn log_tx(&mut self, tx: &LogRecord) -> Result<Completion> {
-        let (c, _) = self.serialize_and_pwrite_tx(tx, true)?;
+        let (c, _) = self.serialize_and_pwrite_tx_record(tx, true)?;
         Ok(c)
     }
 
@@ -740,7 +792,42 @@ impl LogicalLog {
         &mut self,
         tx: &LogRecord,
     ) -> Result<(Completion, u64)> {
-        self.serialize_and_pwrite_tx(tx, false)
+        self.serialize_and_pwrite_tx_record(tx, false)
+    }
+
+    /// Materializing path used by checkpoint and out-of-tree implementors.
+    /// Production MVCC commit goes through `begin_tx_frame` to avoid clones.
+    fn serialize_and_pwrite_tx_record(
+        &mut self,
+        tx: &LogRecord,
+        advance_offset_immediately: bool,
+    ) -> Result<(Completion, u64)> {
+        let op_count = u32::try_from(tx.row_versions.len() + usize::from(tx.header.is_some()))
+            .map_err(|_| {
+                LimboError::InternalError("Logical log op_count exceeds u32".to_string())
+            })?;
+        let commit_ts = tx.tx_timestamp;
+        let mut writer = self.begin_tx_frame(commit_ts, op_count);
+        for row_version in &tx.row_versions {
+            let mut flags = 0u8;
+            if row_version.btree_resident {
+                flags |= OP_FLAG_BTREE_RESIDENT;
+            }
+            // Materialized records have already been canonicalized so
+            // `end.is_some()` correctly indicates a delete.
+            let view = LogOpView::new(
+                &row_version.row.id.row_id,
+                row_version.row.payload(),
+                row_version.row.id.table_id,
+                flags,
+                row_version.end.is_some(),
+            );
+            writer.emit(view);
+        }
+        if let Some(hdr) = tx.header {
+            writer.emit_header(&hdr);
+        }
+        writer.finish(advance_offset_immediately)
     }
 
     pub fn advance_offset_after_success(&mut self, bytes: u64) {
@@ -826,23 +913,137 @@ impl LogicalLog {
     }
 }
 
-/// Serialize one op into `buffer`.
+/// Streaming writer for one TX frame. Built by `LogicalLog::begin_tx_frame`,
+/// driven by per-op `emit` calls, and finalized by `finish`.
+///
+/// The caller must emit exactly `op_count` ops before calling `finish` —
+/// the TX header bakes in `op_count` before payload emission and the CRC
+/// covers the header, so a count mismatch cannot be back-patched.
+/// `finish` enforces this with `debug_assert_eq!`.
+#[must_use = "TxFrameWriter must be finished to commit the frame"]
+pub struct TxFrameWriter<'a> {
+    log: &'a mut LogicalLog,
+    tx_header_start: usize,
+    op_count: u32,
+    commit_ts: u64,
+    emitted_count: u32,
+    _marker: PhantomData<&'a mut ()>,
+}
+
+impl<'a> TxFrameWriter<'a> {
+    /// Serialize one op into the frame's payload buffer.
+    /// Plaintext ops go into `write_buf` directly; encrypted ops go into
+    /// `encryption_scratch_buffer` and are encrypted at `finish()` time.
+    #[inline]
+    pub fn emit(&mut self, view: LogOpView<'_>) {
+        self.log.emit_op_into_frame(&view);
+        self.emitted_count += 1;
+    }
+
+    /// Serialize a header op into the payload. Mirrors the existing
+    /// `OP_UPDATE_HEADER` encoding in `serialize_header_entry`.
+    pub fn emit_header(&mut self, header: &DatabaseHeader) {
+        self.log.emit_header_into_frame(header);
+        self.emitted_count += 1;
+    }
+
+    /// Number of ops emitted so far. Used by tests/asserts.
+    pub fn emitted_count(&self) -> u32 {
+        self.emitted_count
+    }
+
+    /// Finalize the frame: backfill TX header, encrypt (if configured), append
+    /// trailer, swap-take into IO buffer, and submit pwrite. Returns
+    /// `(completion, bytes_written)`. With `advance_offset_immediately = false`
+    /// the writer offset stays behind until `advance_offset_after_success`.
+    pub fn finish(self, advance_offset_immediately: bool) -> Result<(Completion, u64)> {
+        debug_assert_eq!(
+            self.emitted_count, self.op_count,
+            "TxFrameWriter: emitted {} ops but op_count was {}",
+            self.emitted_count, self.op_count,
+        );
+        // Decompose self so we can call &mut method on `log`.
+        let TxFrameWriter {
+            log,
+            tx_header_start,
+            op_count,
+            commit_ts,
+            ..
+        } = self;
+        log.finalize_frame(
+            tx_header_start,
+            op_count,
+            commit_ts,
+            advance_offset_immediately,
+        )
+    }
+}
+
+/// Trait-object-friendly streaming sink. Used by the `DurableStorage` trait
+/// boundary so that production callers can stream ops through borrowed
+/// `LogOpView`s without first materializing a `LogRecord`.
+///
+/// `finish` consumes the sink (via `Box<Self>` for object safety) and submits
+/// the frame's pwrite. Out-of-tree storage implementations that prefer
+/// materialization can buffer ops internally inside `emit` and write at
+/// `finish` time.
+pub trait TxFrameSink {
+    fn emit(&mut self, view: LogOpView<'_>);
+    fn emit_header(&mut self, header: &DatabaseHeader);
+    fn finish(self: Box<Self>) -> Result<(Completion, u64)>;
+}
+
+/// A borrowed view of a single op to be serialized into the logical log.
+///
+/// The view carries everything `serialize_op_entry` needs without a clone of
+/// the underlying `RowVersion`. It is built fresh for each `emit` and never
+/// escapes the writer call (enforced by `PhantomData<&'a ()>`).
+#[must_use = "LogOpView must be passed to TxFrameWriter::emit"]
+pub struct LogOpView<'a> {
+    pub row_key: &'a RowKey,
+    pub payload: &'a [u8],
+    pub table_id: MVTableId,
+    /// On-disk flags byte. Currently only `OP_FLAG_BTREE_RESIDENT` is defined.
+    pub flags: u8,
+    /// Whether this op should be encoded as a DELETE (vs UPSERT). Computed by
+    /// the caller from `matches!(row_version.end, TxID(self))`. NOT
+    /// `end.is_some()` — a concurrent transaction may have stamped `TxID(other)`
+    /// on our row, and that delete is the other tx's contribution to log.
+    pub is_delete: bool,
+    _marker: PhantomData<&'a ()>,
+}
+
+impl<'a> LogOpView<'a> {
+    pub fn new(
+        row_key: &'a RowKey,
+        payload: &'a [u8],
+        table_id: MVTableId,
+        flags: u8,
+        is_delete: bool,
+    ) -> Self {
+        Self {
+            row_key,
+            payload,
+            table_id,
+            flags,
+            is_delete,
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// Serialize one op into `buffer` from a borrowed view.
 /// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
-fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<()> {
-    let is_delete = row_version.end.is_some();
-    let tag = match (&row_version.row.id.row_id, is_delete) {
+#[inline]
+fn serialize_op_entry_view(buffer: &mut Vec<u8>, view: &LogOpView<'_>) {
+    let tag = match (view.row_key, view.is_delete) {
         (RowKey::Int(_), false) => OP_UPSERT_TABLE,
         (RowKey::Int(_), true) => OP_DELETE_TABLE,
         (RowKey::Record(_), false) => OP_UPSERT_INDEX,
         (RowKey::Record(_), true) => OP_DELETE_INDEX,
     };
 
-    let mut flags = 0u8;
-    if row_version.btree_resident {
-        flags |= OP_FLAG_BTREE_RESIDENT;
-    }
-
-    let table_id_i64: i64 = row_version.row.id.table_id.into();
+    let table_id_i64: i64 = view.table_id.into();
     turso_assert!(
         table_id_i64 < 0,
         "table_id_i64 should be negative, but got {table_id_i64}"
@@ -854,24 +1055,23 @@ fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<
     let table_id_i32 = table_id_i64 as i32;
 
     buffer.push(tag);
-    buffer.push(flags);
+    buffer.push(view.flags);
     buffer.extend_from_slice(&table_id_i32.to_le_bytes());
 
     match tag {
         OP_UPSERT_TABLE => {
-            let RowKey::Int(rowid) = row_version.row.id.row_id else {
+            let RowKey::Int(rowid) = *view.row_key else {
                 unreachable!("table ops must have RowKey::Int")
             };
-            let record_bytes = row_version.row.payload();
             let rowid_u64 = rowid as u64;
             let rowid_len = varint_len(rowid_u64);
-            let payload_len = rowid_len + record_bytes.len();
+            let payload_len = rowid_len + view.payload.len();
             write_varint_to_vec(payload_len as u64, buffer);
             write_varint_to_vec(rowid_u64, buffer);
-            buffer.extend_from_slice(record_bytes);
+            buffer.extend_from_slice(view.payload);
         }
         OP_DELETE_TABLE => {
-            let RowKey::Int(rowid) = row_version.row.id.row_id else {
+            let RowKey::Int(rowid) = *view.row_key else {
                 unreachable!("table ops must have RowKey::Int")
             };
             let rowid_u64 = rowid as u64;
@@ -880,17 +1080,34 @@ fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<
             write_varint_to_vec(rowid_u64, buffer);
         }
         OP_UPSERT_INDEX | OP_DELETE_INDEX => {
-            let key_bytes = row_version.row.payload();
-            write_varint_to_vec(key_bytes.len() as u64, buffer);
-            buffer.extend_from_slice(key_bytes);
+            write_varint_to_vec(view.payload.len() as u64, buffer);
+            buffer.extend_from_slice(view.payload);
         }
-        _ => {
-            return Err(LimboError::InternalError(format!(
-                "invalid logical log op tag: {tag}"
-            )));
-        }
+        _ => unreachable!("serialize_op_entry_view tag derivation is exhaustive"),
     }
+}
 
+/// Test/back-compat wrapper: serialize one op from a `RowVersion` into a buffer.
+/// Tests use this to compute op sizes and golden bytes; production uses the
+/// streaming `TxFrameWriter::emit` instead.
+fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<()> {
+    let mut flags = 0u8;
+    if row_version.btree_resident {
+        flags |= OP_FLAG_BTREE_RESIDENT;
+    }
+    // The legacy/test wrapper preserves the historical `end.is_some()` rule:
+    // its callers feed in `LogRecord`-shaped versions where `end` has already
+    // been canonicalized to `Timestamp(end_ts)` for deletes and `None`
+    // otherwise. The streaming production path uses `LogOpView::is_delete`
+    // directly with the `matches!(end, TxID(self))` semantics.
+    let view = LogOpView::new(
+        &row_version.row.id.row_id,
+        row_version.row.payload(),
+        row_version.row.id.table_id,
+        flags,
+        row_version.end.is_some(),
+    );
+    serialize_op_entry_view(buffer, &view);
     Ok(())
 }
 

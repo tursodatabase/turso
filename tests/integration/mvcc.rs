@@ -54,6 +54,18 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         self.inner.log_tx(m)
     }
 
+    fn begin_log_tx<'a>(
+        &'a self,
+        commit_ts: u64,
+        op_count: u32,
+    ) -> turso_core::Result<
+        Box<dyn turso_core::mvcc::persistent_storage::logical_log::TxFrameSink + 'a>,
+    > {
+        self.used_log_tx
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.begin_log_tx(commit_ts, op_count)
+    }
+
     fn sync(
         &self,
         sync_type: turso_core::io::FileSyncType,

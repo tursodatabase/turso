@@ -2,17 +2,35 @@ use crate::io::FileSyncType;
 use crate::storage::encryption::EncryptionContext;
 use crate::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use crate::sync::Arc;
-use crate::sync::RwLock;
+use crate::sync::{RwLock, RwLockWriteGuard};
 use std::fmt::Debug;
 
 pub mod logical_log;
 use crate::mvcc::database::LogRecord;
-use crate::mvcc::persistent_storage::logical_log::{LogicalLog, DEFAULT_LOG_CHECKPOINT_THRESHOLD};
+use crate::mvcc::persistent_storage::logical_log::{
+    LogOpView, LogicalLog, TxFrameSink, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
+};
+use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::{CheckpointResult, Completion, File, Result};
 
 pub trait DurableStorage: Send + Sync + Debug {
     /// Write a transaction to the logical log without advancing the writer offset.
+    /// Materializing path; production MVCC commit uses `begin_log_tx` instead.
     fn log_tx(&self, m: &LogRecord) -> Result<(Completion, u64)>;
+
+    /// Begin streaming a TX frame. The caller drives the loop op-by-op via
+    /// `TxFrameSink::emit`, then finalizes via `finish`. Avoids materializing
+    /// a `LogRecord` and the per-row clones that come with it.
+    ///
+    /// The returned sink holds a write lock on the underlying log for the
+    /// frame's lifetime; callers must not invoke other write-locking methods
+    /// on `self` while it lives. Out-of-tree impls that prefer materialization
+    /// can buffer ops internally and write at `finish` time.
+    fn begin_log_tx<'a>(
+        &'a self,
+        commit_ts: u64,
+        op_count: u32,
+    ) -> Result<Box<dyn TxFrameSink + 'a>>;
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
 
@@ -92,9 +110,64 @@ impl Storage {
     }
 }
 
+/// Production sink for `Storage`: holds a write guard on `LogicalLog` and
+/// streams ops directly into its `write_buf` (or `encryption_scratch_buffer`).
+/// At `finish`, finalizes the frame, encrypts if configured, swap-takes the
+/// bytes into an IO `Buffer`, and submits pwrite. Uses deferred offset
+/// advancement so the writer offset is committed only after fsync succeeds.
+pub struct StorageStreamingSink<'a> {
+    guard: RwLockWriteGuard<'a, LogicalLog>,
+    tx_header_start: usize,
+    op_count: u32,
+    commit_ts: u64,
+    emitted_count: u32,
+}
+
+impl<'a> TxFrameSink for StorageStreamingSink<'a> {
+    #[inline]
+    fn emit(&mut self, view: LogOpView<'_>) {
+        self.guard.emit_op_into_frame(&view);
+        self.emitted_count += 1;
+    }
+    fn emit_header(&mut self, header: &DatabaseHeader) {
+        self.guard.emit_header_into_frame(header);
+        self.emitted_count += 1;
+    }
+    fn finish(self: Box<Self>) -> Result<(Completion, u64)> {
+        debug_assert_eq!(
+            self.emitted_count, self.op_count,
+            "StorageStreamingSink: emitted {} ops but op_count was {}",
+            self.emitted_count, self.op_count,
+        );
+        let mut me = *self;
+        me.guard.finalize_frame(
+            me.tx_header_start,
+            me.op_count,
+            me.commit_ts,
+            /* advance_offset_immediately */ false,
+        )
+    }
+}
+
 impl DurableStorage for Storage {
     fn log_tx(&self, m: &LogRecord) -> Result<(Completion, u64)> {
         self.logical_log.write().log_tx_deferred_offset(m)
+    }
+
+    fn begin_log_tx<'a>(
+        &'a self,
+        commit_ts: u64,
+        op_count: u32,
+    ) -> Result<Box<dyn TxFrameSink + 'a>> {
+        let mut guard = self.logical_log.write();
+        let tx_header_start = guard.prepare_tx_frame(op_count);
+        Ok(Box::new(StorageStreamingSink {
+            guard,
+            tx_header_start,
+            op_count,
+            commit_ts,
+            emitted_count: 0,
+        }))
     }
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
