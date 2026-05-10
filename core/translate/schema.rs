@@ -5,8 +5,8 @@ use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, BTreeCharacteristics, BTreeTable, ColDef,
-    Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
-    TURSO_TYPES_TABLE_NAME,
+    Column, Index, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES,
+    SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -2021,8 +2021,9 @@ pub fn translate_drop_table(
     }
 
     //  2. Destroy the indices within a loop
-    let indices = resolver.schema().get_indices(tbl_name.name.as_str());
-    for index in indices {
+    let indices: Vec<Arc<Index>> = resolver
+        .with_schema(database_id, |s| s.get_indices(tbl_name.name.as_str()).cloned().collect());
+    for index in &indices {
         if index.index_method.is_some() && !index.is_backing_btree_index() {
             // Index methods without backing btree need special destroy handling
             let cursor_id = program.alloc_cursor_index(None, index)?;
