@@ -68,6 +68,13 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
             .begin_log_tx_frame(commit_ts, op_count, payload_size)
     }
 
+    fn flush_log_tx_frame(
+        &self,
+        builder: &mut turso_core::mvcc::persistent_storage::logical_log::LogFrameBuilder,
+    ) -> turso_core::Result<Option<turso_core::Completion>> {
+        self.inner.flush_log_tx_frame(builder)
+    }
+
     fn finish_log_tx_frame(
         &self,
         builder: turso_core::mvcc::persistent_storage::logical_log::LogFrameBuilder,

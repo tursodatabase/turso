@@ -608,6 +608,21 @@ impl LogicalLog {
         )
     }
 
+    pub(crate) fn pwrite_deferred_frame_chunk(
+        &mut self,
+        builder: &mut LogFrameBuilder,
+    ) -> Result<Option<Completion>> {
+        turso_assert!(
+            self.offset == builder.base_offset,
+            "logical log offset changed while building deferred frame"
+        );
+        turso_assert!(
+            self.running_crc == builder.base_running_crc,
+            "logical log running CRC changed while building deferred frame"
+        );
+        builder.pwrite_current_chunk(&self.file)
+    }
+
     pub(crate) fn pwrite_deferred_frame(
         &mut self,
         mut builder: LogFrameBuilder,
@@ -623,29 +638,22 @@ impl LogicalLog {
         );
 
         let crc = builder.finish()?;
+        if builder.flushed_chunks > 0 && on_serialization_complete.is_some() {
+            return Err(LimboError::InternalError(
+                "serialization callback is not supported after partial logical-log frame writes"
+                    .into(),
+            ));
+        }
 
         if let Some(cb) = on_serialization_complete {
             cb(&builder.write_buf, crc)?;
         }
 
-        let buffer = Arc::new(Buffer::new(builder.write_buf));
-        let c = Completion::new_write({
-            let buffer_len = buffer.len();
-            move |res: Result<i32, CompletionError>| {
-                let Ok(bytes_written) = res else {
-                    return;
-                };
-                turso_assert!(
-                    bytes_written == buffer_len as i32,
-                    "wrote({bytes_written}) != expected({buffer_len})"
-                );
-            }
-        });
-
-        let buffer_len = buffer.len();
-        let c = self.file.pwrite(self.offset, buffer, c)?;
+        let c = builder
+            .pwrite_current_chunk(&self.file)?
+            .ok_or_else(|| LimboError::InternalError("empty logical log frame".into()))?;
         self.pending_running_crc = Some(crc);
-        Ok((c, buffer_len as u64))
+        Ok((c, builder.bytes_scheduled))
     }
 
     /// Serializes a transaction into `write_buf`, optionally calls
@@ -937,9 +945,13 @@ impl LogicalLog {
 
 pub struct LogFrameBuilder {
     write_buf: Vec<u8>,
-    tx_header_start: usize,
+    crc_start: Option<usize>,
     base_offset: u64,
     base_running_crc: u32,
+    frame_running_crc: u32,
+    next_write_offset: u64,
+    bytes_scheduled: u64,
+    flushed_chunks: u64,
     encryption_ctx: Option<EncryptionContext>,
     salt: u64,
     encrypted_payload_chunk_size: usize,
@@ -973,23 +985,24 @@ impl LogFrameBuilder {
         })?;
         let encrypted_chunk_count =
             encrypted_payload_chunk_count(payload_size_usize, encrypted_payload_chunk_size);
-        if let Some(enc_ctx) = &encryption_ctx {
-            let total_on_disk_size = encrypted_payload_blob_size(
-                payload_size_usize,
-                encrypted_payload_chunk_size,
-                enc_ctx.tag_size(),
-                enc_ctx.nonce_size(),
-            )?;
-            write_buf.reserve(total_on_disk_size);
-        } else {
-            write_buf.reserve(payload_size_usize);
-        }
+        write_buf.reserve(TX_HEADER_SIZE);
+        write_buf[tx_header_start..tx_header_start + 4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+        write_buf[tx_header_start + 4..tx_header_start + 12]
+            .copy_from_slice(&payload_size.to_le_bytes());
+        write_buf[tx_header_start + 12..tx_header_start + 16]
+            .copy_from_slice(&op_count.to_le_bytes());
+        write_buf[tx_header_start + 16..tx_header_start + 24]
+            .copy_from_slice(&commit_ts.to_le_bytes());
 
         Ok(Self {
             write_buf,
-            tx_header_start,
+            crc_start: Some(tx_header_start),
             base_offset,
             base_running_crc,
+            frame_running_crc: base_running_crc,
+            next_write_offset: base_offset,
+            bytes_scheduled: 0,
+            flushed_chunks: 0,
             encryption_ctx,
             salt,
             encrypted_payload_chunk_size,
@@ -1021,6 +1034,51 @@ impl LogFrameBuilder {
             .checked_add(1)
             .expect("logical log emitted op count overflow");
         Ok(())
+    }
+
+    fn pwrite_current_chunk(&mut self, file: &Arc<dyn File>) -> Result<Option<Completion>> {
+        if self.write_buf.is_empty() {
+            return Ok(None);
+        }
+        if let Some(crc_start) = self.crc_start {
+            self.frame_running_crc =
+                crc32c::crc32c_append(self.frame_running_crc, &self.write_buf[crc_start..]);
+        }
+
+        let write_offset = self.next_write_offset;
+        let write_buf = std::mem::take(&mut self.write_buf);
+        let buffer = Arc::new(Buffer::new(write_buf));
+        let c = Completion::new_write({
+            let buffer_len = buffer.len();
+            move |res: Result<i32, CompletionError>| {
+                let Ok(bytes_written) = res else {
+                    return;
+                };
+                turso_assert!(
+                    bytes_written == buffer_len as i32,
+                    "wrote({bytes_written}) != expected({buffer_len})"
+                );
+            }
+        });
+
+        let buffer_len = buffer.len();
+        let c = file.pwrite(write_offset, buffer, c)?;
+        let buffer_len = u64::try_from(buffer_len)
+            .map_err(|_| LimboError::InternalError("logical log chunk exceeds u64".into()))?;
+        self.next_write_offset = self
+            .next_write_offset
+            .checked_add(buffer_len)
+            .ok_or_else(|| LimboError::InternalError("logical log write offset overflow".into()))?;
+        self.bytes_scheduled = self
+            .bytes_scheduled
+            .checked_add(buffer_len)
+            .ok_or_else(|| LimboError::InternalError("logical log write size overflow".into()))?;
+        self.flushed_chunks = self
+            .flushed_chunks
+            .checked_add(1)
+            .ok_or_else(|| LimboError::InternalError("logical log chunk count overflow".into()))?;
+        self.crc_start = Some(0);
+        Ok(Some(c))
     }
 
     fn append_payload_bytes(&mut self, mut bytes: &[u8]) -> Result<()> {
@@ -1112,21 +1170,12 @@ impl LogFrameBuilder {
 
     fn finish(&mut self) -> Result<u32> {
         self.finish_payload()?;
-        let payload_end = self.write_buf.len();
-
-        self.write_buf[self.tx_header_start..self.tx_header_start + 4]
-            .copy_from_slice(&FRAME_MAGIC.to_le_bytes());
-        self.write_buf[self.tx_header_start + 4..self.tx_header_start + 12]
-            .copy_from_slice(&self.payload_size.to_le_bytes());
-        self.write_buf[self.tx_header_start + 12..self.tx_header_start + 16]
-            .copy_from_slice(&self.op_count.to_le_bytes());
-        self.write_buf[self.tx_header_start + 16..self.tx_header_start + 24]
-            .copy_from_slice(&self.commit_ts.to_le_bytes());
-
-        let crc = crc32c::crc32c_append(
-            self.base_running_crc,
-            &self.write_buf[self.tx_header_start..payload_end],
-        );
+        let crc = if let Some(crc_start) = self.crc_start.take() {
+            crc32c::crc32c_append(self.frame_running_crc, &self.write_buf[crc_start..])
+        } else {
+            self.frame_running_crc
+        };
+        self.frame_running_crc = crc;
         self.write_buf.extend_from_slice(&crc.to_le_bytes());
         self.write_buf.extend_from_slice(&END_MAGIC.to_le_bytes());
         Ok(crc)

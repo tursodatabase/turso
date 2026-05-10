@@ -35,6 +35,10 @@ pub trait DurableStorage: Send + Sync + Debug {
         payload_size: u64,
     ) -> Result<LogFrameBuilder>;
 
+    /// Write the currently buffered frame bytes and clear the builder's buffer.
+    /// The writer offset is still advanced only after commit durability succeeds.
+    fn flush_log_tx_frame(&self, builder: &mut LogFrameBuilder) -> Result<Option<Completion>>;
+
     /// Finish and write a previously-started frame without advancing the writer
     /// offset. The offset is advanced only after commit durability succeeds.
     fn finish_log_tx_frame(
@@ -141,6 +145,12 @@ impl DurableStorage for Storage {
         self.logical_log
             .write()
             .begin_deferred_frame_builder(commit_ts, op_count, payload_size)
+    }
+
+    fn flush_log_tx_frame(&self, builder: &mut LogFrameBuilder) -> Result<Option<Completion>> {
+        self.logical_log
+            .write()
+            .pwrite_deferred_frame_chunk(builder)
     }
 
     fn finish_log_tx_frame(

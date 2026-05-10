@@ -2138,6 +2138,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let outcome =
                     self.write_commit_log_batch(mvcc_store, &mut scan, &mut frame_builder)?;
                 if matches!(outcome, CommitLogScanOutcome::Yield) {
+                    let completion = mvcc_store.storage.flush_log_tx_frame(&mut frame_builder)?;
                     self.pending_log_frame_builder = Some(frame_builder);
                     self.state = CommitState::BeginCommitLogicalLog {
                         end_ts: *end_ts,
@@ -2145,9 +2146,17 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         scan,
                         stats: *stats,
                     };
-                    return Ok(TransitionResult::Io(IOCompletions::Single(
-                        Completion::new_yield(),
-                    )));
+                    return if let Some(completion) = completion {
+                        if completion.succeeded() {
+                            Ok(TransitionResult::Continue)
+                        } else {
+                            Ok(TransitionResult::Io(IOCompletions::Single(completion)))
+                        }
+                    } else {
+                        Ok(TransitionResult::Io(IOCompletions::Single(
+                            Completion::new_yield(),
+                        )))
+                    };
                 }
                 if let Some(header) = header {
                     frame_builder.append_header(header)?;

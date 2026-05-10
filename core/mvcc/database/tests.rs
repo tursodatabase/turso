@@ -7669,6 +7669,32 @@ fn test_commit_log_batch_size_yields_and_commits() {
     conn.close().unwrap();
 }
 
+#[test]
+fn test_commit_log_tiny_batch_multi_write_frame_recovers() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_commit_log_batch_size = 1")
+            .unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        for id in 1..=8 {
+            conn.execute(format!("INSERT INTO t VALUES ({id}, 'v{id}')"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT COUNT(*), SUM(id) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 8);
+    assert_eq!(rows[0][1].as_int().unwrap(), 36);
+    conn.close().unwrap();
+}
+
 fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<MvStore<MvccClock>>) {
     let lock = &mv_store.commit_coordinator.pager_commit_lock;
     assert!(lock.write(), "should acquire commit lock");
