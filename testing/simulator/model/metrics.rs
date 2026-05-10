@@ -152,6 +152,7 @@ impl InteractionStats {
             Query::DropIndex(_) => self.drop_index_count += 1,
             Query::Placeholder => {}
             Query::Pragma(_) => self.pragma_count += 1,
+            Query::Attach(_) | Query::Detach(_) => {}
         }
     }
 }

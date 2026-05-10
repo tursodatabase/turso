@@ -155,8 +155,10 @@ impl QueryDiscriminants {
             | QueryDiscriminants::Rollback
             | QueryDiscriminants::Savepoint
             | QueryDiscriminants::RollbackToSavepoint
-            | QueryDiscriminants::ReleaseSavepoint => {
-                unreachable!("transactional queries should not be generated")
+            | QueryDiscriminants::ReleaseSavepoint
+            | QueryDiscriminants::Attach
+            | QueryDiscriminants::Detach => {
+                unreachable!("transactional or explicit queries should not be generated")
             }
             QueryDiscriminants::Placeholder => {
                 unreachable!("Query Placeholders should not be generated")
@@ -183,8 +185,10 @@ impl QueryDiscriminants {
             | QueryDiscriminants::Rollback
             | QueryDiscriminants::Savepoint
             | QueryDiscriminants::RollbackToSavepoint
-            | QueryDiscriminants::ReleaseSavepoint => {
-                unreachable!("transactional queries should not be generated")
+            | QueryDiscriminants::ReleaseSavepoint
+            | QueryDiscriminants::Attach
+            | QueryDiscriminants::Detach => {
+                unreachable!("transactional or explicit queries should not be generated")
             }
             QueryDiscriminants::Placeholder => {
                 unreachable!("Query Placeholders should not be generated")

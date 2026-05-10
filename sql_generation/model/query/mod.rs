@@ -5,6 +5,8 @@ pub use drop::Drop;
 pub use drop_index::DropIndex;
 pub use insert::{Insert, OnConflict, UpdateSetItem};
 pub use select::Select;
+pub use attach::Attach;
+pub use detach::Detach;
 
 pub mod alter_table;
 pub mod create;
@@ -18,3 +20,5 @@ pub mod predicate;
 pub mod select;
 pub mod transaction;
 pub mod update;
+pub mod attach;
+pub mod detach;

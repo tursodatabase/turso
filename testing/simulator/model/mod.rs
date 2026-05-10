@@ -9,6 +9,8 @@ use sql_generation::model::{
     query::{
         Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select,
         alter_table::{AlterTable, AlterTableType},
+        attach::Attach,
+        detach::Detach,
         pragma::Pragma,
         select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
         transaction::{Begin, Commit, Rollback},
@@ -286,6 +288,8 @@ pub enum Query {
     CreateIndex(CreateIndex),
     AlterTable(AlterTable),
     DropIndex(DropIndex),
+    Attach(Attach),
+    Detach(Detach),
     Begin(Begin),
     Commit(Commit),
     Rollback(Rollback),
@@ -340,6 +344,7 @@ impl Query {
             | Query::DropIndex(DropIndex {
                 table_name: table, ..
             }) => IndexSet::from_iter([table.clone()]),
+            Query::Attach(_) | Query::Detach(_) => IndexSet::new(),
             Query::Begin(_)
             | Query::Commit(_)
             | Query::Rollback(_)
@@ -370,6 +375,7 @@ impl Query {
             | Query::DropIndex(DropIndex {
                 table_name: table, ..
             }) => vec![table.clone()],
+            Query::Attach(_) | Query::Detach(_) => vec![],
             Query::Begin(..) | Query::Commit(..) | Query::Rollback(..) => vec![],
             Query::Savepoint(..) | Query::RollbackToSavepoint(..) | Query::ReleaseSavepoint(..) => {
                 vec![]
@@ -401,6 +407,8 @@ impl Query {
                 | Self::Drop(..)
                 | Self::AlterTable(..)
                 | Self::DropIndex(..)
+                | Self::Attach(..)
+                | Self::Detach(..)
         )
     }
 
@@ -432,6 +440,8 @@ impl Display for Query {
             Self::CreateIndex(create_index) => write!(f, "{create_index}"),
             Self::AlterTable(alter_table) => write!(f, "{alter_table}"),
             Self::DropIndex(drop_index) => write!(f, "{drop_index}"),
+            Self::Attach(attach) => write!(f, "{attach}"),
+            Self::Detach(detach) => write!(f, "{detach}"),
             Self::Begin(begin) => write!(f, "{begin}"),
             Self::Commit(commit) => write!(f, "{commit}"),
             Self::Rollback(rollback) => write!(f, "{rollback}"),
@@ -461,6 +471,8 @@ impl Shadow for Query {
             Query::CreateIndex(create_index) => Ok(create_index.shadow(env)),
             Query::AlterTable(alter_table) => alter_table.shadow(env),
             Query::DropIndex(drop_index) => drop_index.shadow(env),
+            Query::Attach(attach) => attach.shadow(env),
+            Query::Detach(detach) => detach.shadow(env),
             Query::Begin(begin) => Ok(begin.shadow(env)),
             Query::Commit(commit) => Ok(commit.shadow(env)),
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
@@ -485,6 +497,8 @@ bitflags! {
         const CREATE_INDEX = 1 << 6;
         const ALTER_TABLE = 1 << 7;
         const DROP_INDEX = 1 << 8;
+        const ATTACH = 1 << 9;
+        const DETACH = 1 << 10;
     }
 }
 
@@ -515,6 +529,8 @@ impl From<QueryDiscriminants> for QueryCapabilities {
             QueryDiscriminants::CreateIndex => Self::CREATE_INDEX,
             QueryDiscriminants::AlterTable => Self::ALTER_TABLE,
             QueryDiscriminants::DropIndex => Self::DROP_INDEX,
+            QueryDiscriminants::Attach => Self::ATTACH,
+            QueryDiscriminants::Detach => Self::DETACH,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback
@@ -1313,6 +1329,22 @@ impl Shadow for DropIndex {
         table
             .indexes
             .retain(|index| index.index_name != self.index_name);
+        Ok(vec![])
+    }
+}
+
+impl Shadow for Attach {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, _tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        Ok(vec![])
+    }
+}
+
+impl Shadow for Detach {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, _tables: &mut ShadowTablesMut<'_>) -> Self::Result {
         Ok(vec![])
     }
 }
