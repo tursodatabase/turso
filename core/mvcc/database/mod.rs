@@ -341,7 +341,6 @@ pub struct LogRecord {
     pub header: Option<DatabaseHeader>,
 }
 
-
 /// A transaction timestamp or ID.
 ///
 /// Versions either track a timestamp or a transaction ID, depending on the
@@ -1391,11 +1390,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     /// Counting pre-pass over the write set. One predicate evaluation per
     /// candidate version; no extra locking beyond what the emit pass already
     /// pays.
-    fn count_committed_ops(
-        &self,
-        mvcc_store: &Arc<MvStore<Clock>>,
-        header_dirty: bool,
-    ) -> u32 {
+    fn count_committed_ops(&self, mvcc_store: &Arc<MvStore<Clock>>, header_dirty: bool) -> u32 {
         let mut count: u32 = 0;
         for id in &self.write_set {
             if let Some(row_versions) = mvcc_store.rows.get(id) {
@@ -1430,10 +1425,8 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     /// and therefore must appear in our log frame.
     #[inline]
     fn is_our_contribution(&self, v: &RowVersion) -> bool {
-        let our_begin =
-            matches!(v.begin, Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id);
-        let our_end =
-            matches!(v.end, Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id);
+        let our_begin = matches!(v.begin, Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id);
+        let our_end = matches!(v.end, Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id);
         our_begin || our_end
     }
 
@@ -1517,8 +1510,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     ) {
         use crate::mvcc::persistent_storage::logical_log::LogOpView;
         const OP_FLAG_BTREE_RESIDENT: u8 = 1 << 0;
-        let our_end =
-            matches!(v.end, Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id);
+        let our_end = matches!(v.end, Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id);
         let mut flags = 0u8;
         if v.btree_resident {
             flags |= OP_FLAG_BTREE_RESIDENT;
@@ -5208,11 +5200,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
                         panic!("Index writes must be to a record");
                     };
-                    self.insert_index_version(
-                        rowid.table_id,
-                        Arc::new(sortable_key),
-                        row_version,
-                    );
+                    self.insert_index_version(rowid.table_id, Arc::new(sortable_key), row_version);
                 }
                 StreamingResult::DeleteIndexRow {
                     row,

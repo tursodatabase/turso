@@ -622,11 +622,7 @@ impl LogicalLog {
 
     /// Begin assembling a TX frame using the inherent (non-trait) writer.
     /// The returned writer borrows `&mut self` for the frame's lifetime.
-    pub fn begin_tx_frame(
-        &mut self,
-        commit_ts: u64,
-        op_count: u32,
-    ) -> TxFrameWriter<'_> {
+    pub fn begin_tx_frame(&mut self, commit_ts: u64, op_count: u32) -> TxFrameWriter<'_> {
         let tx_header_start = self.prepare_tx_frame(op_count);
         TxFrameWriter {
             log: self,
@@ -713,11 +709,7 @@ impl LogicalLog {
     /// Encrypted-path: take the plaintext ops in `encryption_scratch_buffer`,
     /// chunk + encrypt them into `write_buf`. Returns the plaintext payload size
     /// (used in the TX header's `payload_size` field — pre-encryption).
-    fn encrypt_scratch_into_write_buf(
-        &mut self,
-        op_count: u32,
-        commit_ts: u64,
-    ) -> Result<u64> {
+    fn encrypt_scratch_into_write_buf(&mut self, op_count: u32, commit_ts: u64) -> Result<u64> {
         let enc_ctx = self
             .encryption_ctx
             .as_ref()
@@ -788,10 +780,7 @@ impl LogicalLog {
     /// Writes a transaction to the log but does NOT advance the writer offset.
     /// Returns `(completion, bytes_written)`. The caller must call
     /// `advance_offset_after_success(bytes)` after confirming the commit succeeded.
-    pub fn log_tx_deferred_offset(
-        &mut self,
-        tx: &LogRecord,
-    ) -> Result<(Completion, u64)> {
+    pub fn log_tx_deferred_offset(&mut self, tx: &LogRecord) -> Result<(Completion, u64)> {
         self.serialize_and_pwrite_tx_record(tx, false)
     }
 
