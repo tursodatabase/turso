@@ -75,13 +75,15 @@ impl Numeric {
                     | Some(StrToF64::DecimalPrefix(_)) => None,
                     Some(StrToF64::Fractional(value)) => Some(Self::Float(value)),
                     Some(StrToF64::Decimal(real)) => {
-                        let integer = str_to_i64(s).unwrap_or(0);
-
-                        Some(if real == integer as f64 {
-                            Self::Integer(integer)
-                        } else {
-                            Self::Float(real)
-                        })
+                        let optional_integer = str_to_i64(s);
+                        match optional_integer {
+                            None => Some(Self::Float(real)),
+                            Some(val) => Some(if real == val as f64 {
+                                Self::Integer(val)
+                            } else {
+                                Self::Float(real)
+                            }),
+                        }
                     }
                 }
             }
@@ -198,12 +200,16 @@ impl<T: AsRef<str>> From<T> for Numeric {
                 Self::Float(value)
             }
             Some(StrToF64::Decimal(real) | StrToF64::DecimalPrefix(real)) => {
-                let integer = str_to_i64(text).unwrap_or(0);
-
-                if real == integer as f64 {
-                    Self::Integer(integer)
-                } else {
-                    Self::Float(real)
+                let optional_integer = str_to_i64(text);
+                match optional_integer {
+                    None => Self::Float(real),
+                    Some(val) => {
+                        if real == val as f64 {
+                            Self::Integer(val)
+                        } else {
+                            Self::Float(real)
+                        }
+                    }
                 }
             }
         }
@@ -542,15 +548,15 @@ pub fn str_to_i64(input: impl AsRef<str>) -> Option<i64> {
 
     iter.next_if(|(_, ch)| matches!(ch, '+' | '-'));
     let Some((end, _)) = iter.take_while(|(_, ch)| ch.is_ascii_digit()).last() else {
-        return Some(0);
+        return None;
     };
 
     input[0..=end].parse::<i64>().map_or_else(
         |err| match err.kind() {
-            std::num::IntErrorKind::PosOverflow => Some(i64::MAX),
-            std::num::IntErrorKind::NegOverflow => Some(i64::MIN),
+            std::num::IntErrorKind::PosOverflow => None,
+            std::num::IntErrorKind::NegOverflow => None,
             std::num::IntErrorKind::Empty => unreachable!(),
-            _ => Some(0),
+            _ => None,
         },
         Some,
     )

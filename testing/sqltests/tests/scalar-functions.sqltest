@@ -2498,3 +2498,24 @@ test func7-pg-411 {
 expect {
     0.5
 }
+
+test add-zero-large-int-text {
+    SELECT typeof('9223372036854775808'+0), quote('9223372036854775808'+0);
+}
+expect {
+    real|9.22337203685477581e+18
+}
+
+test numeric-order-by-coercion {
+    CREATE TABLE t(a);
+    INSERT INTO t(rowid,a) VALUES(2,'9223372036854775807');
+    INSERT INTO t(rowid,a) VALUES(1,'9223372036854775808');
+
+    SELECT rowid, quote(a), typeof(a+0), quote(a+0) FROM t ORDER BY a+0;
+}
+expect {
+    2|'9223372036854775807'|real|9223372036854775807
+    1|'9223372036854775808'|integer|9.22337203685477581e+18
+}
+
+
