@@ -2442,6 +2442,101 @@ fn test_checkpoint_resamples_boundary_before_starting() {
     assert_eq!(&integrity[0][0].to_string(), "ok");
 }
 
+/// What this test checks: a checkpoint state machine created before another checkpoint
+/// advances the durable boundary must resample that boundary after taking the checkpoint lock.
+/// Why this matters: otherwise a delayed checkpoint can replay an already-durable unique-index
+/// delete and fail.
+#[test]
+fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE dry_floor_846 (
+            sour_sand_972 BLOB UNIQUE,
+            sour_river_140 REAL,
+            sweet_wall_518 BLOB,
+            fast_grass_379 TEXT,
+            dark_wave_139 REAL UNIQUE,
+            sad_wind_216 INTEGER UNIQUE PRIMARY KEY
+        )",
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO dry_floor_846 (
+            sour_sand_972, sour_river_140, sweet_wall_518,
+            fast_grass_379, dark_wave_139, sad_wind_216
+        ) VALUES (
+            zeroblob(16), 6.85, x'736d6172745f6c6561665f353637',
+            'wild_hill_714', 8.43, 788
+        )",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let first_boundary = mvcc_store.durable_txid_max.load(Ordering::SeqCst);
+    assert!(first_boundary > 0);
+
+    conn.execute(
+        "UPDATE dry_floor_846
+            SET sour_sand_972 = x'66756c6c5f737461725f333732',
+                sour_river_140 = 5.75,
+                sweet_wall_518 = zeroblob(32),
+                fast_grass_379 = 'old_moon_16',
+                dark_wave_139 = 2.90
+          WHERE sad_wind_216 = 788",
+    )
+    .unwrap();
+    let update_ts = mvcc_store.last_committed_tx_ts.load(Ordering::SeqCst);
+    assert!(update_ts > first_boundary);
+
+    let delayed_conn = db.connect();
+    delayed_conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CheckpointYieldPoint::BeforeAcquireLock.point(),
+    ])));
+    let mut delayed_checkpoint = delayed_conn.prepare("PRAGMA journal_mode = 'wal'").unwrap();
+    assert!(
+        matches!(delayed_checkpoint.step().unwrap(), StepResult::IO),
+        "first checkpoint should yield before acquiring the checkpoint lock"
+    );
+
+    let interleaving_conn = db.connect();
+    interleaving_conn.set_failure_injector(Some(FixedFailureInjector::new([(
+        CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
+        LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+    )])));
+    interleaving_conn
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect_err("interleaving checkpoint should fail after advancing durable boundary");
+    interleaving_conn.set_failure_injector(None);
+    assert_eq!(
+        mvcc_store.durable_txid_max.load(Ordering::SeqCst),
+        update_ts
+    );
+
+    let journal_mode_rows = delayed_checkpoint.run_collect_rows().unwrap();
+    assert_eq!(journal_mode_rows.len(), 1);
+    assert_eq!(&journal_mode_rows[0][0].to_string(), "wal");
+
+    let rows = get_rows(
+        &conn,
+        "SELECT sad_wind_216, dark_wave_139, hex(sour_sand_972)
+           FROM dry_floor_846
+          WHERE sad_wind_216 = 788",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 788);
+    assert_eq!(rows[0][1].to_string(), "2.9");
+    assert_eq!(&rows[0][2].to_string(), "66756C6C5F737461725F333732");
+
+    let integrity = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(&integrity[0][0].to_string(), "ok");
+}
+
 /// What this test checks: Replay gate uses metadata boundary and never applies frames at or below it.
 /// Why this matters: This enforces exactly-once effects at the DB-file apply boundary.
 #[test]

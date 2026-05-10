@@ -4,6 +4,9 @@ use crate::mvcc::database::{
     WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME,
     SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
+#[cfg(any(test, injected_yields))]
+use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
+use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::Index;
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
@@ -21,6 +24,8 @@ use crate::{
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
+#[cfg(any(test, injected_yields))]
+use strum::EnumCount;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointState {
@@ -59,6 +64,29 @@ pub enum CheckpointState {
     Finalize,
 }
 
+#[cfg(any(test, injected_yields))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
+#[repr(u8)]
+pub(crate) enum CheckpointYieldPoint {
+    BeforeAcquireLock,
+    AfterDurableBoundaryAdvanced,
+}
+
+#[cfg(any(test, injected_yields))]
+impl YieldPointMarker for CheckpointYieldPoint {
+    const POINT_COUNT: u8 = Self::COUNT as u8;
+
+    fn ordinal(self) -> u8 {
+        self as u8
+    }
+}
+
+#[cfg(any(test, injected_yields))]
+fn checkpoint_yield_key() -> u64 {
+    const CHECKPOINT_SELECTION_TAG: u64 = 0xC4EC_9011_C4EC_9011;
+    CHECKPOINT_SELECTION_TAG
+}
+
 /// The states of the locks held by the state machine - these are tracked for error handling so that they are
 /// released if the state machine fails.
 pub struct LockStates {
@@ -95,6 +123,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     mvstore: Arc<MvStore<Clock>>,
     /// Connection to the database
     connection: Arc<Connection>,
+    #[cfg(any(test, injected_yields))]
+    yield_instance_id: u64,
     /// Lock used to block other transactions from running during the checkpoint
     checkpoint_lock: Arc<TursoRwLock>,
     /// All committed versions to write to the B-tree.
@@ -134,6 +164,18 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     staged_checkpoint_header: Option<DatabaseHeader>,
     /// Guard to avoid restaging page 1 across CommitPagerTxn async retries.
     header_staged_for_commit: bool,
+}
+
+#[cfg(any(test, injected_yields))]
+impl<Clock: LogicalClock> ProvidesYieldContext for CheckpointStateMachine<Clock> {
+    fn yield_context(&self) -> YieldContext {
+        YieldContext::new(
+            self.connection.yield_injector(),
+            self.connection.failure_injector(),
+            self.yield_instance_id,
+            checkpoint_yield_key(),
+        )
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -279,6 +321,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         let durable_mvcc_metadata = !connection.db.is_in_memory_db() && mvcc_meta_table.is_some();
         let durable_tx_max = mvstore.durable_txid_max.load(Ordering::SeqCst);
         let durable_txid_max_old = NonZeroU64::new(durable_tx_max);
+        #[cfg(any(test, injected_yields))]
+        let yield_instance_id = connection.next_yield_instance_id();
         Self {
             state: CheckpointState::AcquireLock,
             lock_states: LockStates {
@@ -291,6 +335,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             durable_txid_max_new: mvstore.durable_txid_max.load(Ordering::SeqCst),
             mvstore,
             connection,
+            #[cfg(any(test, injected_yields))]
+            yield_instance_id,
             checkpoint_lock,
             write_set: Vec::new(),
             write_row_state_machine: None,
@@ -810,6 +856,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     fn step_inner(&mut self, _context: &()) -> Result<TransitionResult<CheckpointResult>> {
         match &self.state {
             CheckpointState::AcquireLock => {
+                inject_transition_yield!(self, CheckpointYieldPoint::BeforeAcquireLock);
+
                 tracing::info!("Acquiring blocking checkpoint lock");
                 let locked = self.checkpoint_lock.write();
                 if !locked {
@@ -1412,6 +1460,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             )
                         })?;
                         self.mvstore.global_header.write().replace(header);
+                        inject_transition_failure!(
+                            self,
+                            CheckpointYieldPoint::AfterDurableBoundaryAdvanced
+                        );
                         Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),

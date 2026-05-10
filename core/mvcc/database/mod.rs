@@ -52,6 +52,8 @@ use tracing::instrument;
 use tracing::Level;
 
 pub mod checkpoint_state_machine;
+#[cfg(any(test, injected_yields))]
+pub(crate) use checkpoint_state_machine::CheckpointYieldPoint;
 pub use checkpoint_state_machine::{CheckpointState, CheckpointStateMachine};
 
 use super::persistent_storage::logical_log::{
