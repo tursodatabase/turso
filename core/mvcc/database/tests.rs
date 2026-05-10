@@ -2316,6 +2316,132 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
     );
 }
 
+/// What this test checks: a checkpoint state machine created before another checkpoint
+/// advances the durable boundary must resample that boundary after taking the checkpoint lock.
+/// Why this matters: otherwise a delayed checkpoint can replay an already-durable unique-index
+/// delete and fail. This test uses raw APIs, check test_checkpoint_resamples_boundary_before_starting_with_yield_injection
+/// which uses only user facing APIs to simulate the same error.
+#[test]
+fn test_checkpoint_resamples_boundary_before_starting() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE dry_floor_846 (
+            sour_sand_972 BLOB UNIQUE,
+            sour_river_140 REAL,
+            sweet_wall_518 BLOB,
+            fast_grass_379 TEXT,
+            dark_wave_139 REAL UNIQUE,
+            sad_wind_216 INTEGER UNIQUE PRIMARY KEY
+        )",
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO dry_floor_846 (
+            sour_sand_972, sour_river_140, sweet_wall_518,
+            fast_grass_379, dark_wave_139, sad_wind_216
+        ) VALUES (
+            zeroblob(16), 6.85, x'736d6172745f6c6561665f353637',
+            'wild_hill_714', 8.43, 788
+        )",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let first_boundary = mvcc_store.durable_txid_max.load(Ordering::SeqCst);
+    assert!(first_boundary > 0);
+
+    conn.execute(
+        "UPDATE dry_floor_846
+            SET sour_sand_972 = x'66756c6c5f737461725f333732',
+                sour_river_140 = 5.75,
+                sweet_wall_518 = zeroblob(32),
+                fast_grass_379 = 'old_moon_16',
+                dark_wave_139 = 2.90
+          WHERE sad_wind_216 = 788",
+    )
+    .unwrap();
+    let update_ts = mvcc_store.last_committed_tx_ts.load(Ordering::SeqCst);
+    assert!(update_ts > first_boundary);
+
+    let delayed_conn = db.connect();
+    let delayed_pager = delayed_conn.pager.load().clone();
+    let mut delayed_checkpoint = CheckpointStateMachine::new(
+        delayed_pager.clone(),
+        mvcc_store.clone(),
+        delayed_conn.clone(),
+        true,
+        delayed_conn.get_sync_mode(),
+    );
+    let (old_boundary, _) = delayed_checkpoint.checkpoint_bounds_for_test();
+    assert_eq!(old_boundary, Some(first_boundary));
+
+    let interrupted_conn = db.connect();
+    let interrupted_pager = interrupted_conn.pager.load().clone();
+    let mut interrupted_checkpoint = CheckpointStateMachine::new(
+        interrupted_pager.clone(),
+        mvcc_store.clone(),
+        interrupted_conn.clone(),
+        true,
+        interrupted_conn.get_sync_mode(),
+    );
+    let mut reached_wal_checkpoint = false;
+    for _ in 0..50_000 {
+        if interrupted_checkpoint.state_for_test() == CheckpointState::CheckpointWal {
+            reached_wal_checkpoint = true;
+            break;
+        }
+        match interrupted_checkpoint.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(interrupted_pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                panic!("checkpoint finished before reaching WAL checkpoint")
+            }
+        }
+    }
+    assert!(
+        reached_wal_checkpoint,
+        "expected checkpoint to reach WAL checkpoint"
+    );
+    assert_eq!(
+        mvcc_store.durable_txid_max.load(Ordering::SeqCst),
+        update_ts
+    );
+    interrupted_checkpoint.cleanup_after_external_io_error();
+
+    let mut finished = false;
+    for _ in 0..50_000 {
+        match delayed_checkpoint.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(delayed_pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    assert!(finished, "delayed checkpoint did not finish");
+
+    let rows = get_rows(
+        &conn,
+        "SELECT sad_wind_216, dark_wave_139, hex(sour_sand_972)
+           FROM dry_floor_846
+          WHERE sad_wind_216 = 788",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 788);
+    assert_eq!(rows[0][1].to_string(), "2.9");
+    assert_eq!(&rows[0][2].to_string(), "66756C6C5F737461725F333732");
+
+    let integrity = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(&integrity[0][0].to_string(), "ok");
+}
+
 /// What this test checks: Replay gate uses metadata boundary and never applies frames at or below it.
 /// Why this matters: This enforces exactly-once effects at the DB-file apply boundary.
 #[test]
