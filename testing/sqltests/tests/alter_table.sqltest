@@ -922,6 +922,20 @@ expect {
 }
 
 @cross-check-integrity
+test alter-table-drop-column-expression-index-update-after-unreferenced-drop {
+    CREATE TABLE t(h TEXT PRIMARY KEY, r TEXT, g INTEGER NOT NULL) STRICT;
+    CREATE INDEX idx_t_expr ON t((h));
+    CREATE INDEX idx_t_combo ON t(h DESC, (h IS NOT NULL), g);
+    ALTER TABLE t DROP COLUMN r;
+    INSERT INTO t(h,g) VALUES('a',1);
+    UPDATE t SET g=2 WHERE h IN (SELECT h FROM t WHERE g <= LENGTH('x'));
+    SELECT h,g FROM t;
+}
+expect {
+    a|2
+}
+
+@cross-check-integrity
 test alter-table-rename-column-updates-unique-sets {
     CREATE TABLE t(a INTEGER, b TEXT, UNIQUE(b));
     INSERT INTO t VALUES (1, 'hello');

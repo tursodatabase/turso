@@ -6,7 +6,7 @@ use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, Schema, Table, SCHEMA_TABLE_NAME,
+    render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
     SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
@@ -12820,7 +12820,9 @@ pub fn op_drop_column(
             for index in indexes {
                 let index = Arc::get_mut(index).expect("this should be the only strong reference");
                 for index_column in index.columns.iter_mut() {
-                    if index_column.pos_in_table > *column_index {
+                    if index_column.pos_in_table != EXPR_INDEX_SENTINEL
+                        && index_column.pos_in_table > *column_index
+                    {
                         index_column.pos_in_table -= 1;
                     }
                     if let Some(ref mut expr) = index_column.expr {
