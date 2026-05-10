@@ -2987,7 +2987,7 @@ mod tests {
             let waited = unsafe { libc::waitpid(child, &mut status, 0) };
             assert_eq!(waited, child, "waitpid failed");
             assert!(libc::WIFEXITED(status), "child did not exit cleanly");
-            return child as u32;
+            child as u32
         }
 
         #[cfg(windows)]
