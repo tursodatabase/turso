@@ -187,6 +187,24 @@ fn bench_create_index(criterion: &mut Criterion) {
             _ => 10,
         };
         group.sample_size(samples);
+        // Per-iteration cost grows roughly linearly with row_count, so the
+        // default 5s measurement budget is too small for the larger sizes.
+        let (warm_up, measurement) = match row_count {
+            n if n <= 100_000 => (
+                std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(10),
+            ),
+            n if n <= 500_000 => (
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(20),
+            ),
+            _ => (
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(60),
+            ),
+        };
+        group.warm_up_time(warm_up);
+        group.measurement_time(measurement);
 
         // ---- limbo ----
         {
@@ -257,6 +275,22 @@ fn bench_create_index_commit(criterion: &mut Criterion) {
             _ => 10,
         };
         group.sample_size(samples);
+        let (warm_up, measurement) = match row_count {
+            n if n <= 100_000 => (
+                std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(10),
+            ),
+            n if n <= 500_000 => (
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(20),
+            ),
+            _ => (
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(60),
+            ),
+        };
+        group.warm_up_time(warm_up);
+        group.measurement_time(measurement);
 
         {
             let temp_dir = tempfile::tempdir().unwrap();
