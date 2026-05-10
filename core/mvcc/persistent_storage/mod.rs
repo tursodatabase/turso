@@ -7,9 +7,7 @@ use std::fmt::Debug;
 
 pub mod logical_log;
 use crate::mvcc::database::{MVTableId, RowVersion, StampedSidecar};
-use crate::mvcc::persistent_storage::logical_log::{
-    LogicalLog, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
-};
+use crate::mvcc::persistent_storage::logical_log::{LogicalLog, DEFAULT_LOG_CHECKPOINT_THRESHOLD};
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::{CheckpointResult, Completion, File, Result};
 use std::ops::ControlFlow;

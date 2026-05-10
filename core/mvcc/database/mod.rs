@@ -1398,13 +1398,7 @@ where
                 return Ok(ControlFlow::Continue(()));
             };
             let row_versions = row_versions.value().read();
-            collect_and_flush_sentinel(
-                our_tx_id,
-                mvcc_store,
-                end_ts,
-                row_versions.iter(),
-                visit,
-            )
+            collect_and_flush_sentinel(our_tx_id, mvcc_store, end_ts, row_versions.iter(), visit)
         }
         RowKey::Record(index_key) => {
             let Some(index) = mvcc_store.index_rows.get(&id.table_id) else {
@@ -1415,13 +1409,7 @@ where
                 return Ok(ControlFlow::Continue(()));
             };
             let row_versions = row_versions.value().read();
-            collect_and_flush_sentinel(
-                our_tx_id,
-                mvcc_store,
-                end_ts,
-                row_versions.iter(),
-                visit,
-            )
+            collect_and_flush_sentinel(our_tx_id, mvcc_store, end_ts, row_versions.iter(), visit)
         }
     }
 }
@@ -2788,7 +2776,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             // `core/mvcc/clock.rs` and `PackedTsOrId`).
             tx_ids: AtomicU64::new(1),
             version_id_counter: AtomicU64::new(1), // Reserve 0 for special purposes
-            next_rowid: AtomicU64::new(0), // TODO: determine this from B-Tree
+            next_rowid: AtomicU64::new(0),         // TODO: determine this from B-Tree
             next_table_id: AtomicI64::new(-2), // table id -1 / root page 1 is always sqlite_schema.
             clock,
             storage,
@@ -4448,9 +4436,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 return false;
             };
             let versions = entry.value().read();
-            return versions.iter().any(|rv| {
-                rv.begin.is_tx_id_for(tx_id) || rv.end.is_tx_id_for(tx_id)
-            });
+            return versions
+                .iter()
+                .any(|rv| rv.begin.is_tx_id_for(tx_id) || rv.end.is_tx_id_for(tx_id));
         }
 
         let RowKey::Record(ref record) = rowid.row_id else {
@@ -4463,9 +4451,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             return false;
         };
         let versions = entry.value().read();
-        versions.iter().any(|rv| {
-            rv.begin.is_tx_id_for(tx_id) || rv.end.is_tx_id_for(tx_id)
-        })
+        versions
+            .iter()
+            .any(|rv| rv.begin.is_tx_id_for(tx_id) || rv.end.is_tx_id_for(tx_id))
     }
 
     fn remove_rolled_back_rows_from_write_set(&self, tx_id: TxID, rowids: BTreeSet<RowID>) {

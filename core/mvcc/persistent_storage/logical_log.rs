@@ -1342,8 +1342,7 @@ impl ChunkedFrameWriter {
             let chunk = self.chunks.last().expect("ensure_chunk");
             let space = chunk.len() - self.current_chunk_filled;
             let take = remaining.len().min(space);
-            chunk.as_mut_slice()
-                [self.current_chunk_filled..self.current_chunk_filled + take]
+            chunk.as_mut_slice()[self.current_chunk_filled..self.current_chunk_filled + take]
                 .copy_from_slice(&remaining[..take]);
             self.current_chunk_filled += take;
             self.cursor += take;
@@ -1377,11 +1376,7 @@ impl ChunkedFrameWriter {
     /// [`Self::reserve`]. The size mismatch between the reservation and
     /// the backfill is a compile-time error.
     #[inline]
-    pub(crate) fn write_to<const N: usize>(
-        &mut self,
-        token: Reservation<N>,
-        bytes: &[u8; N],
-    ) {
+    pub(crate) fn write_to<const N: usize>(&mut self, token: Reservation<N>, bytes: &[u8; N]) {
         write_at_in_chunks(&self.chunks, token.frame_offset, bytes);
     }
 

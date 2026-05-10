@@ -52,8 +52,7 @@ pub struct StepLatency {
 impl StepLatency {
     pub fn new() -> Self {
         Self {
-            histo: Histogram::new_with_bounds(1, 60_000_000_000, 3)
-                .expect("hdrhistogram bounds"),
+            histo: Histogram::new_with_bounds(1, 60_000_000_000, 3).expect("hdrhistogram bounds"),
         }
     }
 

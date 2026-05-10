@@ -1678,8 +1678,12 @@ mod tests {
         );
         RowVersion {
             id: 1,
-            begin: begin.map(PackedTsOrId::timestamp).unwrap_or(PackedTsOrId::none()),
-            end: end.map(PackedTsOrId::timestamp).unwrap_or(PackedTsOrId::none()),
+            begin: begin
+                .map(PackedTsOrId::timestamp)
+                .unwrap_or(PackedTsOrId::none()),
+            end: end
+                .map(PackedTsOrId::timestamp)
+                .unwrap_or(PackedTsOrId::none()),
             row: Row::new_table_row(
                 RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(rowid)),
                 record.as_blob().to_vec(),

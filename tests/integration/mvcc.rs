@@ -124,16 +124,18 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
 /// user-visible regression that would surface if the gate ever read
 /// `tx.write_set.is_empty()` again.
 #[turso_macros::test(mvcc)]
-fn test_mvcc_committed_row_visible_to_other_connection(
-    tmp_db: TempDatabase,
-) -> anyhow::Result<()> {
+fn test_mvcc_committed_row_visible_to_other_connection(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn_w = tmp_db.connect_limbo();
     conn_w.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
     conn_w.execute("INSERT INTO t(id, v) VALUES (1, 'committed')")?;
 
     let conn_r = tmp_db.connect_limbo();
     let rows: Vec<(i64, String)> = conn_r.exec_rows("SELECT id, v FROM t");
-    assert_eq!(rows.len(), 1, "committed row must be visible across connections");
+    assert_eq!(
+        rows.len(),
+        1,
+        "committed row must be visible across connections"
+    );
     assert_eq!(rows[0], (1, "committed".to_string()));
 
     Ok(())

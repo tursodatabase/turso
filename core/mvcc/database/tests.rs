@@ -2761,13 +2761,19 @@ fn test_our_committed_image_for_case_table() {
         Some(TxTimestampOrID::TxID(our_tx_id)),
     );
     let s = our_committed_image_for(&rv, our_tx_id, end_ts).expect("must yield");
-    assert_eq!(s.stamped_begin.unpack(), Some(TxTimestampOrID::Timestamp(end_ts)));
+    assert_eq!(
+        s.stamped_begin.unpack(),
+        Some(TxTimestampOrID::Timestamp(end_ts))
+    );
     assert!(s.is_delete);
 
     // Row 2: our_begin && !our_end with end=None (plain insert).
     let rv = mk(Some(TxTimestampOrID::TxID(our_tx_id)), None);
     let s = our_committed_image_for(&rv, our_tx_id, end_ts).expect("must yield");
-    assert_eq!(s.stamped_begin.unpack(), Some(TxTimestampOrID::Timestamp(end_ts)));
+    assert_eq!(
+        s.stamped_begin.unpack(),
+        Some(TxTimestampOrID::Timestamp(end_ts))
+    );
     assert!(!s.is_delete);
 
     // Row 2 (speculative-end variant): our_begin && !our_end with
@@ -2779,7 +2785,10 @@ fn test_our_committed_image_for_case_table() {
         Some(TxTimestampOrID::TxID(other_tx_id)),
     );
     let s = our_committed_image_for(&rv, our_tx_id, end_ts).expect("must yield");
-    assert_eq!(s.stamped_begin.unpack(), Some(TxTimestampOrID::Timestamp(end_ts)));
+    assert_eq!(
+        s.stamped_begin.unpack(),
+        Some(TxTimestampOrID::Timestamp(end_ts))
+    );
     assert!(
         !s.is_delete,
         "speculative-end (rv.end = TxID(other)) must NOT mark our contribution as delete; \
@@ -6530,13 +6539,17 @@ fn prop_gc_retains_txid_begins(chain: ArbitraryVersionChain) -> bool {
     let txid_begins_before: usize = chain
         .versions
         .iter()
-        .filter(|rv| matches!(rv.begin.unpack(), Some(TxTimestampOrID::TxID(_))) && rv.end.is_none())
+        .filter(|rv| {
+            matches!(rv.begin.unpack(), Some(TxTimestampOrID::TxID(_))) && rv.end.is_none()
+        })
         .count();
     let mut versions = chain.versions;
     MvStore::<MvccClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
     let txid_begins_after: usize = versions
         .iter()
-        .filter(|rv| matches!(rv.begin.unpack(), Some(TxTimestampOrID::TxID(_))) && rv.end.is_none())
+        .filter(|rv| {
+            matches!(rv.begin.unpack(), Some(TxTimestampOrID::TxID(_))) && rv.end.is_none()
+        })
         .count();
     // Active uncommitted versions (begin=TxID, end=None) are never aborted garbage
     // and don't match rule 2 or 3, so they should be retained.
