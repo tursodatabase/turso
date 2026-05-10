@@ -1579,18 +1579,22 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         let mut iterations = 0;
         while ctx.cursor < write_set_len && iterations < MVCC_COMMIT_BATCH_SIZE {
             let id = &self.write_set[ctx.cursor];
-            // Inline rewrite: replace any TxID(tx_id) refs in the table-row
-            // chain and the index-row chain with Timestamp(end_ts).
             if let Some(row_versions) = mvcc_store.rows.get(id) {
                 let mut row_versions = row_versions.value().write();
                 for row_version in row_versions.iter_mut() {
-                    if let Some(TxTimestampOrID::TxID(rv_id)) = row_version.begin {
-                        if rv_id == tx_id {
+                    if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
+                        if id == tx_id {
+                            // Publish the committed begin timestamp into the live
+                            // version chain only after CommitEnd has decided the
+                            // transaction's fate.
                             row_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
                         }
                     }
-                    if let Some(TxTimestampOrID::TxID(rv_id)) = row_version.end {
-                        if rv_id == tx_id {
+                    if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
+                        if id == tx_id {
+                            // Publish the committed end timestamp into the live
+                            // version chain only after CommitEnd has decided the
+                            // transaction's fate.
                             row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
                         }
                     }
@@ -1604,13 +1608,19 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 if let Some(row_versions) = index.get(index_key) {
                     let mut row_versions = row_versions.value().write();
                     for row_version in row_versions.iter_mut() {
-                        if let Some(TxTimestampOrID::TxID(rv_id)) = row_version.begin {
-                            if rv_id == tx_id {
+                        if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
+                            if id == tx_id {
+                                // Publish the committed begin timestamp into the live
+                                // version chain only after CommitEnd has decided the
+                                // transaction's fate.
                                 row_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
                             }
                         }
-                        if let Some(TxTimestampOrID::TxID(rv_id)) = row_version.end {
-                            if rv_id == tx_id {
+                        if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
+                            if id == tx_id {
+                                // Publish the committed end timestamp into the live
+                                // version chain only after CommitEnd has decided the
+                                // transaction's fate.
                                 row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
                             }
                         }
