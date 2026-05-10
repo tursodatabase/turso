@@ -448,7 +448,7 @@ Turso core staff are not eligible.
 
 ### Is Turso Database ready for production use?
 
-Turso Database is currently under heavy development and is **not** ready for production use.
+Turso powers production apps today. That includes [Turso Cloud](https://turso.tech/signup), the [Kin AI assistant](https://mykin.ai/), and [Spice.ai](https://github.com/spiceai/spiceai). However, it is still under active development and for mission-critical applications, caution is advised. Independent backups are encouraged. Turso is extensively tested by a collection of tools including a native Deterministic Simulation Testing suite and [Antithesis](https://antithesis.com), so we are generally confident in the end result. But our bar is SQLite-level reliability, and we will still recommend caution until we are confident it meets that bar.
 
 ### How is Turso Database different from Turso's libSQL?
 
