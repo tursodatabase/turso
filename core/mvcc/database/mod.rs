@@ -1802,6 +1802,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // logical log, but keep live row versions on TxID references
                 // until CommitEnd so rollback of an abandoned commit can still
                 // match them.
+                //TODO this is the first pass over all versions
+
+                // At this point, we already known op_count,
                 let log_record = self.build_committed_log_record(mvcc_store, tx, end_ts);
                 tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
 
@@ -1834,7 +1837,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .pager_commit_lock_held
                         .store(true, Ordering::Release);
                 }
-                let (c, append_bytes) = mvcc_store.storage.log_tx(log_record, None)?;
+                let (c, append_bytes) = mvcc_store.storage.log_tx(log_record)?;
                 self.pending_log_append_bytes = Some(append_bytes);
                 self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue

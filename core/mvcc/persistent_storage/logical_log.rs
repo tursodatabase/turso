@@ -235,10 +235,6 @@ use crate::File;
 /// Default to the size of 1000 SQLite WAL frames; disable by setting a negative value.
 pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = 4120 * 1000;
 
-/// Optional callback invoked after serialization with a zero-copy reference to
-/// the serialized frame bytes and the running CRC, before the disk write.
-pub type OnSerializationComplete<'a> = Option<&'a dyn Fn(&[u8], u32) -> crate::Result<()>>;
-
 const LOG_MAGIC: u32 = 0x4C4D4C32; // "LML2" in LE
 const LOG_VERSION: u8 = 2;
 pub const LOG_HDR_SIZE: usize = 56;
@@ -555,9 +551,8 @@ impl LogicalLog {
         self.encryption_ctx.as_ref()
     }
 
-    /// Serializes a transaction into `write_buf`, optionally calls
-    /// `on_serialization_complete` with a zero-copy reference to the frame bytes,
-    /// then writes to disk. `write_buf` retains its allocation across calls.
+    /// Serializes a transaction into `write_buf`, then writes to disk.
+    /// `write_buf` retains its allocation across calls.
     ///
     /// `advance_offset_immediately`: when true, the writer offset advances right
     /// after the pwrite (checkpoint path). When false, the offset stays behind
@@ -566,7 +561,6 @@ impl LogicalLog {
         &mut self,
         tx: &LogRecord,
         advance_offset_immediately: bool,
-        on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
         self.write_buf.clear();
 
@@ -590,7 +584,7 @@ impl LogicalLog {
             .map_err(|_| {
                 LimboError::InternalError("Logical log op_count exceeds u32".to_string())
             })?;
-        let commit_ts = tx.tx_timestamp;
+        let commit_ts = tx.tx_timestamp; //this is end_tx
         let tx_header_start = self.write_buf.len();
         self.write_buf.resize(tx_header_start + TX_HEADER_SIZE, 0);
 
@@ -618,12 +612,7 @@ impl LogicalLog {
         self.write_buf.extend_from_slice(&crc.to_le_bytes());
         self.write_buf.extend_from_slice(&END_MAGIC.to_le_bytes());
 
-        // 6. Call observer before writing — zero-copy reference into write_buf.
-        if let Some(cb) = on_serialization_complete {
-            cb(&self.write_buf, crc)?;
-        }
-
-        // 7. Copy write_buf into an I/O buffer and pwrite. write_buf keeps its allocation.
+        // 6. Copy write_buf into an I/O buffer and pwrite. write_buf keeps its allocation.
         let buffer = Arc::new(Buffer::new(self.write_buf.to_vec()));
         let c = Completion::new_write({
             let buffer_len = buffer.len();
@@ -740,23 +729,18 @@ impl LogicalLog {
     /// Writes a transaction to the log and immediately advances the writer offset.
     /// Used for checkpoint-initiated writes where no two-phase commit is needed.
     pub fn log_tx(&mut self, tx: &LogRecord) -> Result<Completion> {
-        let (c, _) = self.serialize_and_pwrite_tx(tx, true, None)?;
+        let (c, _) = self.serialize_and_pwrite_tx(tx, true)?;
         Ok(c)
     }
 
     /// Writes a transaction to the log but does NOT advance the writer offset.
     /// Returns `(completion, bytes_written)`. The caller must call
     /// `advance_offset_after_success(bytes)` after confirming the commit succeeded.
-    ///
-    /// If `on_serialization_complete` is provided, it is called with a zero-copy
-    /// reference to the serialized frame bytes and the running CRC after
-    /// serialization but before the disk write.
     pub fn log_tx_deferred_offset(
         &mut self,
         tx: &LogRecord,
-        on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
-        self.serialize_and_pwrite_tx(tx, false, on_serialization_complete)
+        self.serialize_and_pwrite_tx(tx, false)
     }
 
     pub fn advance_offset_after_success(&mut self, bytes: u64) {
@@ -3074,7 +3058,7 @@ mod tests {
             }],
             header: None,
         };
-        let (c, bytes_written) = log.log_tx_deferred_offset(&tx3, None).unwrap();
+        let (c, bytes_written) = log.log_tx_deferred_offset(&tx3).unwrap();
         io.wait_for_completion(c).unwrap();
 
         assert_eq!(
