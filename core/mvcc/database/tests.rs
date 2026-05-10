@@ -7656,14 +7656,15 @@ fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
     observer.close().unwrap();
 }
 
-/// `step_build_log_record` chunks the commit's write_set into batches of
+/// Commit-log counting/writing chunks the commit's write_set into batches of
 /// `MVCC_COMMIT_BATCH_SIZE` rowids and yields between batches so that a
 /// large commit (e.g. CREATE INDEX over millions of rows) can't monopolize
 /// the executor.
 ///
 /// We bracket the chunked yields with two injected yield points:
-/// `BuildLogRecordStart` (fires once on first entry into BuildLogRecord) and
-/// `LogRecordPrepared` (fires once after both passes complete). The IOs
+/// `BuildLogRecordStart` (kept as the stable test-facing name, now fired on
+/// first entry into commit-log counting) and `LogRecordPrepared` (fires once
+/// after both counting passes complete). The IOs
 /// observed strictly between these two are the chunked yields, so the count
 /// is exact.
 ///
@@ -7740,7 +7741,7 @@ fn test_build_log_record_yields_for_large_write_set() {
                     break;
                 }
                 // Strictly between Start and Prepared: a chunked yield from
-                // `Completion::new_yield()` in step_build_log_record's loop.
+                // `Completion::new_yield()` in the commit-log scan loop.
                 chunked_io_yields += 1;
             }
             crate::StepResult::Done => break,
@@ -7750,11 +7751,11 @@ fn test_build_log_record_yields_for_large_write_set() {
 
     assert!(
         saw_start,
-        "BuildLogRecordStart yield never fired — BuildLogRecord state never reached"
+        "BuildLogRecordStart yield never fired - commit-log counting was not reached"
     );
     assert!(
         finished.load(Ordering::SeqCst),
-        "LogRecordPrepared yield never fired — BuildLogRecord did not complete"
+        "LogRecordPrepared yield never fired - commit-log counting did not complete"
     );
     // n_rows = 3 * BATCH_SIZE → 2 yields per pass × 2 passes = 4 chunked yields.
     assert_eq!(
@@ -7764,6 +7765,110 @@ fn test_build_log_record_yields_for_large_write_set() {
     );
 
     drop(stmt);
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_large_commit_log_scan_yields_and_commits() {
+    use super::MVCC_COMMIT_BATCH_SIZE;
+
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    let n_rows = MVCC_COMMIT_BATCH_SIZE + 1;
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    for i in 1..=n_rows {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+            .unwrap();
+    }
+
+    let mut stmt = conn.prepare("COMMIT").unwrap();
+    let mut yielded = false;
+    loop {
+        match stmt.step().unwrap() {
+            crate::StepResult::IO => yielded = true,
+            crate::StepResult::Done => break,
+            other => panic!("unexpected COMMIT step result: {other:?}"),
+        }
+    }
+    drop(stmt);
+    assert!(yielded, "large commit-log scan should yield");
+
+    let rows = get_rows(&conn, "SELECT COUNT(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), n_rows as i64);
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_commit_log_large_single_chain_final_image_recovers() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'seed')").unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        for i in 1..=150 {
+            conn.execute(format!("UPDATE t SET v = 'v{i}' WHERE id = 1"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT COUNT(*) FROM t WHERE id = 1 AND v = 'v150'");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_commit_log_schema_before_data_replays_after_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    {
+        let conn = db.connect();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("CREATE TABLE replayed (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO replayed VALUES (1, 'ok')")
+            .unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT COUNT(*) FROM replayed WHERE v = 'ok'");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_encrypted_large_commit_log_batches_recover() {
+    const KEY128: &str = "b1bbfda4f589dc9daaf004fe21111e00";
+    let mut db = MvccTestDbNoConn::new_encrypted_with_cipher(KEY128, "aes128gcm");
+    let payload = "x".repeat(2048);
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        for id in 1..=48 {
+            conn.execute(format!("INSERT INTO t VALUES ({id}, '{payload}')"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT COUNT(*), SUM(length(v)) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 48);
+    assert_eq!(rows[0][1].as_int().unwrap(), 48 * 2048);
     conn.close().unwrap();
 }
 

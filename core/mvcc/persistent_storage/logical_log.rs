@@ -222,7 +222,7 @@ use crate::{
     io::ReadComplete,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
     storage::sqlite3_ondisk::{
-        read_varint, read_varint_partial, varint_len, write_varint_to_vec, DatabaseHeader,
+        read_varint, read_varint_partial, varint_len, write_varint, DatabaseHeader,
     },
     types::IndexInfo,
     Buffer, Completion, CompletionError, LimboError, Result,
@@ -238,6 +238,18 @@ pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = 4120 * 1000;
 /// Optional callback invoked after serialization with a zero-copy reference to
 /// the serialized frame bytes and the running CRC, before the disk write.
 pub type OnSerializationComplete<'a> = Option<&'a dyn Fn(&[u8], u32) -> crate::Result<()>>;
+
+/// Borrowed logical-log operation used by MVCC commit serialization.
+///
+/// This projects a live row version after applying the committing
+/// transaction's timestamp rules without cloning the row payload.
+pub(crate) struct LogOpRef<'a> {
+    pub table_id: MVTableId,
+    pub row_key: &'a RowKey,
+    pub payload: &'a [u8],
+    pub is_delete: bool,
+    pub btree_resident: bool,
+}
 
 const LOG_MAGIC: u32 = 0x4C4D4C32; // "LML2" in LE
 const LOG_VERSION: u8 = 2;
@@ -555,6 +567,87 @@ impl LogicalLog {
         self.encryption_ctx.as_ref()
     }
 
+    pub(crate) fn begin_deferred_frame_builder(
+        &mut self,
+        commit_ts: u64,
+        op_count: u32,
+        payload_size: u64,
+    ) -> Result<LogFrameBuilder> {
+        let is_first_write = self.offset == 0;
+        if is_first_write && self.header.is_none() {
+            let header = LogHeader::new(&self.io);
+            self.running_crc = derive_initial_crc(header.salt);
+            self.header = Some(header);
+        }
+
+        let mut write_buf = Vec::new();
+        if is_first_write {
+            let header_bytes = self.header.as_ref().unwrap().encode();
+            write_buf.extend_from_slice(&header_bytes);
+        }
+
+        let tx_header_start = write_buf.len();
+        write_buf.resize(tx_header_start + TX_HEADER_SIZE, 0);
+
+        let salt = self
+            .header
+            .as_ref()
+            .expect("log header must be set before writing")
+            .salt;
+        LogFrameBuilder::new(
+            write_buf,
+            tx_header_start,
+            self.offset,
+            self.running_crc,
+            self.encryption_ctx.clone(),
+            salt,
+            self.encrypted_payload_chunk_size,
+            commit_ts,
+            op_count,
+            payload_size,
+        )
+    }
+
+    pub(crate) fn pwrite_deferred_frame(
+        &mut self,
+        mut builder: LogFrameBuilder,
+        on_serialization_complete: OnSerializationComplete<'_>,
+    ) -> Result<(Completion, u64)> {
+        turso_assert!(
+            self.offset == builder.base_offset,
+            "logical log offset changed while building deferred frame"
+        );
+        turso_assert!(
+            self.running_crc == builder.base_running_crc,
+            "logical log running CRC changed while building deferred frame"
+        );
+
+        let crc = builder.finish()?;
+
+        if let Some(cb) = on_serialization_complete {
+            cb(&builder.write_buf, crc)?;
+        }
+
+        let buffer = Arc::new(Buffer::new(builder.write_buf));
+        let c = Completion::new_write({
+            let buffer_len = buffer.len();
+            move |res: Result<i32, CompletionError>| {
+                let Ok(bytes_written) = res else {
+                    return;
+                };
+                turso_assert!(
+                    bytes_written == buffer_len as i32,
+                    "wrote({bytes_written}) != expected({buffer_len})"
+                );
+            }
+        });
+
+        let buffer_len = buffer.len();
+        let c = self.file.pwrite(self.offset, buffer, c)?;
+        self.pending_running_crc = Some(crc);
+        Ok((c, buffer_len as u64))
+    }
+
     /// Serializes a transaction into `write_buf`, optionally calls
     /// `on_serialization_complete` with a zero-copy reference to the frame bytes,
     /// then writes to disk. `write_buf` retains its allocation across calls.
@@ -842,23 +935,275 @@ impl LogicalLog {
     }
 }
 
+pub struct LogFrameBuilder {
+    write_buf: Vec<u8>,
+    tx_header_start: usize,
+    base_offset: u64,
+    base_running_crc: u32,
+    encryption_ctx: Option<EncryptionContext>,
+    salt: u64,
+    encrypted_payload_chunk_size: usize,
+    encrypted_plaintext_chunk: Vec<u8>,
+    encrypted_chunk_index: u32,
+    encrypted_chunk_count: usize,
+    commit_ts: u64,
+    op_count: u32,
+    payload_size: u64,
+    emitted_ops: u32,
+    emitted_payload_size: u64,
+    payload_finished: bool,
+}
+
+impl LogFrameBuilder {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        mut write_buf: Vec<u8>,
+        tx_header_start: usize,
+        base_offset: u64,
+        base_running_crc: u32,
+        encryption_ctx: Option<EncryptionContext>,
+        salt: u64,
+        encrypted_payload_chunk_size: usize,
+        commit_ts: u64,
+        op_count: u32,
+        payload_size: u64,
+    ) -> Result<Self> {
+        let payload_size_usize = usize::try_from(payload_size).map_err(|_| {
+            LimboError::InternalError("logical log payload exceeds usize".to_string())
+        })?;
+        let encrypted_chunk_count =
+            encrypted_payload_chunk_count(payload_size_usize, encrypted_payload_chunk_size);
+        if let Some(enc_ctx) = &encryption_ctx {
+            let total_on_disk_size = encrypted_payload_blob_size(
+                payload_size_usize,
+                encrypted_payload_chunk_size,
+                enc_ctx.tag_size(),
+                enc_ctx.nonce_size(),
+            )?;
+            write_buf.reserve(total_on_disk_size);
+        } else {
+            write_buf.reserve(payload_size_usize);
+        }
+
+        Ok(Self {
+            write_buf,
+            tx_header_start,
+            base_offset,
+            base_running_crc,
+            encryption_ctx,
+            salt,
+            encrypted_payload_chunk_size,
+            encrypted_plaintext_chunk: Vec::with_capacity(encrypted_payload_chunk_size),
+            encrypted_chunk_index: 0,
+            encrypted_chunk_count,
+            commit_ts,
+            op_count,
+            payload_size,
+            emitted_ops: 0,
+            emitted_payload_size: 0,
+            payload_finished: false,
+        })
+    }
+
+    pub(crate) fn append_op(&mut self, op: &LogOpRef<'_>) -> Result<()> {
+        serialize_log_op_entry_to_sink(op, &mut |bytes| self.append_payload_bytes(bytes))?;
+        self.emitted_ops = self
+            .emitted_ops
+            .checked_add(1)
+            .expect("logical log emitted op count overflow");
+        Ok(())
+    }
+
+    pub(crate) fn append_header(&mut self, header: &DatabaseHeader) -> Result<()> {
+        serialize_header_entry_to_sink(header, &mut |bytes| self.append_payload_bytes(bytes))?;
+        self.emitted_ops = self
+            .emitted_ops
+            .checked_add(1)
+            .expect("logical log emitted op count overflow");
+        Ok(())
+    }
+
+    fn append_payload_bytes(&mut self, mut bytes: &[u8]) -> Result<()> {
+        self.emitted_payload_size = self
+            .emitted_payload_size
+            .checked_add(u64::try_from(bytes.len()).map_err(|_| {
+                LimboError::InternalError("logical log payload chunk exceeds u64".to_string())
+            })?)
+            .ok_or_else(|| {
+                LimboError::InternalError("logical log payload size overflow".to_string())
+            })?;
+
+        if self.encryption_ctx.is_none() {
+            self.write_buf.extend_from_slice(bytes);
+            return Ok(());
+        }
+
+        while !bytes.is_empty() {
+            let remaining = self
+                .encrypted_payload_chunk_size
+                .checked_sub(self.encrypted_plaintext_chunk.len())
+                .expect("encrypted plaintext chunk cannot exceed configured chunk size");
+            let take = remaining.min(bytes.len());
+            self.encrypted_plaintext_chunk
+                .extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.encrypted_plaintext_chunk.len() == self.encrypted_payload_chunk_size {
+                self.flush_encrypted_chunk(false)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_encrypted_chunk(&mut self, is_last_chunk: bool) -> Result<()> {
+        let Some(enc_ctx) = &self.encryption_ctx else {
+            return Ok(());
+        };
+        if self.encrypted_plaintext_chunk.is_empty() && !is_last_chunk {
+            return Ok(());
+        }
+        let aad = build_encrypted_chunk_aad(
+            self.salt,
+            is_last_chunk.then_some(self.payload_size),
+            self.op_count,
+            self.commit_ts,
+            self.encrypted_chunk_index,
+        );
+        let (ciphertext, nonce) = enc_ctx.encrypt_chunk(&self.encrypted_plaintext_chunk, &aad)?;
+        debug_assert_eq!(
+            ciphertext.len(),
+            self.encrypted_plaintext_chunk.len() + enc_ctx.tag_size(),
+            "encrypt_chunk output size mismatch: expected plaintext({}) + tag({}), got {}",
+            self.encrypted_plaintext_chunk.len(),
+            enc_ctx.tag_size(),
+            ciphertext.len(),
+        );
+        self.write_buf.extend_from_slice(&ciphertext);
+        self.write_buf.extend_from_slice(&nonce);
+        self.encrypted_plaintext_chunk.clear();
+        self.encrypted_chunk_index = self
+            .encrypted_chunk_index
+            .checked_add(1)
+            .ok_or_else(|| LimboError::InternalError("encrypted chunk index overflow".into()))?;
+        Ok(())
+    }
+
+    fn finish_payload(&mut self) -> Result<()> {
+        if self.payload_finished {
+            return Ok(());
+        }
+        turso_assert!(
+            self.emitted_ops == self.op_count,
+            "logical log emitted op count mismatch"
+        );
+        turso_assert!(
+            self.emitted_payload_size == self.payload_size,
+            "logical log emitted payload size mismatch"
+        );
+        if self.encryption_ctx.is_some() {
+            self.flush_encrypted_chunk(true)?;
+            turso_assert!(
+                self.encrypted_chunk_index as usize == self.encrypted_chunk_count,
+                "logical log encrypted chunk count mismatch"
+            );
+        }
+        self.payload_finished = true;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<u32> {
+        self.finish_payload()?;
+        let payload_end = self.write_buf.len();
+
+        self.write_buf[self.tx_header_start..self.tx_header_start + 4]
+            .copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+        self.write_buf[self.tx_header_start + 4..self.tx_header_start + 12]
+            .copy_from_slice(&self.payload_size.to_le_bytes());
+        self.write_buf[self.tx_header_start + 12..self.tx_header_start + 16]
+            .copy_from_slice(&self.op_count.to_le_bytes());
+        self.write_buf[self.tx_header_start + 16..self.tx_header_start + 24]
+            .copy_from_slice(&self.commit_ts.to_le_bytes());
+
+        let crc = crc32c::crc32c_append(
+            self.base_running_crc,
+            &self.write_buf[self.tx_header_start..payload_end],
+        );
+        self.write_buf.extend_from_slice(&crc.to_le_bytes());
+        self.write_buf.extend_from_slice(&END_MAGIC.to_le_bytes());
+        Ok(crc)
+    }
+}
+
 /// Serialize one op into `buffer`.
 /// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
 fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<()> {
-    let is_delete = row_version.end.is_some();
-    let tag = match (&row_version.row.id.row_id, is_delete) {
+    let op = LogOpRef {
+        table_id: row_version.row.id.table_id,
+        row_key: &row_version.row.id.row_id,
+        payload: row_version.row.payload(),
+        is_delete: row_version.end.is_some(),
+        btree_resident: row_version.btree_resident,
+    };
+    serialize_log_op_entry_to_sink(&op, &mut |bytes| {
+        buffer.extend_from_slice(bytes);
+        Ok(())
+    })
+}
+
+pub(crate) fn serialized_log_op_entry_size(op: &LogOpRef<'_>) -> usize {
+    let tag = log_op_tag(op);
+    let body_len = match tag {
+        OP_UPSERT_TABLE => {
+            let RowKey::Int(rowid) = op.row_key else {
+                unreachable!("table ops must have RowKey::Int")
+            };
+            let rowid_len = varint_len(*rowid as u64);
+            let payload_len = rowid_len + op.payload.len();
+            varint_len(payload_len as u64) + rowid_len + op.payload.len()
+        }
+        OP_DELETE_TABLE => {
+            let RowKey::Int(rowid) = op.row_key else {
+                unreachable!("table ops must have RowKey::Int")
+            };
+            let rowid_len = varint_len(*rowid as u64);
+            varint_len(rowid_len as u64) + rowid_len
+        }
+        OP_UPSERT_INDEX | OP_DELETE_INDEX => varint_len(op.payload.len() as u64) + op.payload.len(),
+        _ => unreachable!("invalid logical log op tag"),
+    };
+    1 + 1 + 4 + body_len
+}
+
+pub(crate) fn serialized_header_entry_size() -> usize {
+    1 + 1 + 4 + varint_len(DatabaseHeader::SIZE as u64) + DatabaseHeader::SIZE
+}
+
+fn log_op_tag(op: &LogOpRef<'_>) -> u8 {
+    match (op.row_key, op.is_delete) {
         (RowKey::Int(_), false) => OP_UPSERT_TABLE,
         (RowKey::Int(_), true) => OP_DELETE_TABLE,
         (RowKey::Record(_), false) => OP_UPSERT_INDEX,
         (RowKey::Record(_), true) => OP_DELETE_INDEX,
-    };
+    }
+}
+
+fn write_varint_to_sink(value: u64, sink: &mut impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    let mut varint = [0; 9];
+    let n = write_varint(&mut varint, value);
+    sink(&varint[..n])
+}
+
+fn serialize_log_op_entry_to_sink(
+    op: &LogOpRef<'_>,
+    sink: &mut impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let tag = log_op_tag(op);
 
     let mut flags = 0u8;
-    if row_version.btree_resident {
+    if op.btree_resident {
         flags |= OP_FLAG_BTREE_RESIDENT;
     }
 
-    let table_id_i64: i64 = row_version.row.id.table_id.into();
+    let table_id_i64: i64 = op.table_id.into();
     turso_assert!(
         table_id_i64 < 0,
         "table_id_i64 should be negative, but got {table_id_i64}"
@@ -869,36 +1214,34 @@ fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<
     );
     let table_id_i32 = table_id_i64 as i32;
 
-    buffer.push(tag);
-    buffer.push(flags);
-    buffer.extend_from_slice(&table_id_i32.to_le_bytes());
+    sink(&[tag])?;
+    sink(&[flags])?;
+    sink(&table_id_i32.to_le_bytes())?;
 
     match tag {
         OP_UPSERT_TABLE => {
-            let RowKey::Int(rowid) = row_version.row.id.row_id else {
+            let RowKey::Int(rowid) = op.row_key else {
                 unreachable!("table ops must have RowKey::Int")
             };
-            let record_bytes = row_version.row.payload();
-            let rowid_u64 = rowid as u64;
+            let rowid_u64 = *rowid as u64;
             let rowid_len = varint_len(rowid_u64);
-            let payload_len = rowid_len + record_bytes.len();
-            write_varint_to_vec(payload_len as u64, buffer);
-            write_varint_to_vec(rowid_u64, buffer);
-            buffer.extend_from_slice(record_bytes);
+            let payload_len = rowid_len + op.payload.len();
+            write_varint_to_sink(payload_len as u64, sink)?;
+            write_varint_to_sink(rowid_u64, sink)?;
+            sink(op.payload)?;
         }
         OP_DELETE_TABLE => {
-            let RowKey::Int(rowid) = row_version.row.id.row_id else {
+            let RowKey::Int(rowid) = op.row_key else {
                 unreachable!("table ops must have RowKey::Int")
             };
-            let rowid_u64 = rowid as u64;
+            let rowid_u64 = *rowid as u64;
             let rowid_len = varint_len(rowid_u64);
-            write_varint_to_vec(rowid_len as u64, buffer);
-            write_varint_to_vec(rowid_u64, buffer);
+            write_varint_to_sink(rowid_len as u64, sink)?;
+            write_varint_to_sink(rowid_u64, sink)?;
         }
         OP_UPSERT_INDEX | OP_DELETE_INDEX => {
-            let key_bytes = row_version.row.payload();
-            write_varint_to_vec(key_bytes.len() as u64, buffer);
-            buffer.extend_from_slice(key_bytes);
+            write_varint_to_sink(op.payload.len() as u64, sink)?;
+            sink(op.payload)?;
         }
         _ => {
             return Err(LimboError::InternalError(format!(
@@ -911,12 +1254,24 @@ fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<
 }
 
 fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
+    serialize_header_entry_to_sink(header, &mut |bytes| {
+        buffer.extend_from_slice(bytes);
+        Ok(())
+    })
+    .expect("serializing header entry into Vec cannot fail");
+}
+
+fn serialize_header_entry_to_sink(
+    header: &DatabaseHeader,
+    sink: &mut impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
     // Header op uses tag-only addressing (table_id=0, flags=0) and fixed payload length.
-    buffer.push(OP_UPDATE_HEADER);
-    buffer.push(0);
-    buffer.extend_from_slice(&0i32.to_le_bytes());
-    write_varint_to_vec(DatabaseHeader::SIZE as u64, buffer);
-    buffer.extend_from_slice(bytemuck::bytes_of(header));
+    sink(&[OP_UPDATE_HEADER])?;
+    sink(&[0])?;
+    sink(&0i32.to_le_bytes())?;
+    write_varint_to_sink(DatabaseHeader::SIZE as u64, sink)?;
+    sink(bytemuck::bytes_of(header))?;
+    Ok(())
 }
 
 /// Parse all ops from a decrypted plaintext buffer.

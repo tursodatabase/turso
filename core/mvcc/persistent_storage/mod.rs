@@ -8,7 +8,7 @@ use std::fmt::Debug;
 pub mod logical_log;
 use crate::mvcc::database::LogRecord;
 use crate::mvcc::persistent_storage::logical_log::{
-    LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
+    LogFrameBuilder, LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
 };
 use crate::{CheckpointResult, Completion, File, Result};
 
@@ -23,6 +23,23 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn log_tx(
         &self,
         m: &LogRecord,
+        on_serialization_complete: OnSerializationComplete<'_>,
+    ) -> Result<(Completion, u64)>;
+
+    /// Start a bounded logical-log frame whose payload will be appended in
+    /// commit-log scan chunks.
+    fn begin_log_tx_frame(
+        &self,
+        commit_ts: u64,
+        op_count: u32,
+        payload_size: u64,
+    ) -> Result<LogFrameBuilder>;
+
+    /// Finish and write a previously-started frame without advancing the writer
+    /// offset. The offset is advanced only after commit durability succeeds.
+    fn finish_log_tx_frame(
+        &self,
+        builder: LogFrameBuilder,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)>;
 
@@ -113,6 +130,27 @@ impl DurableStorage for Storage {
         self.logical_log
             .write()
             .log_tx_deferred_offset(m, on_serialization_complete)
+    }
+
+    fn begin_log_tx_frame(
+        &self,
+        commit_ts: u64,
+        op_count: u32,
+        payload_size: u64,
+    ) -> Result<LogFrameBuilder> {
+        self.logical_log
+            .write()
+            .begin_deferred_frame_builder(commit_ts, op_count, payload_size)
+    }
+
+    fn finish_log_tx_frame(
+        &self,
+        builder: LogFrameBuilder,
+        on_serialization_complete: OnSerializationComplete<'_>,
+    ) -> Result<(Completion, u64)> {
+        self.logical_log
+            .write()
+            .pwrite_deferred_frame(builder, on_serialization_complete)
     }
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {

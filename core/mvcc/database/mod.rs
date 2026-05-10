@@ -55,7 +55,8 @@ pub mod checkpoint_state_machine;
 pub use checkpoint_state_machine::{CheckpointState, CheckpointStateMachine};
 
 use super::persistent_storage::logical_log::{
-    HeaderReadResult, StreamingLogicalLogReader, StreamingResult, LOG_HDR_SIZE,
+    serialized_header_entry_size, serialized_log_op_entry_size, HeaderReadResult, LogFrameBuilder,
+    LogOpRef, StreamingLogicalLogReader, StreamingResult, LOG_HDR_SIZE,
 };
 
 #[cfg(test)]
@@ -339,16 +340,6 @@ pub struct LogRecord {
     pub(crate) tx_timestamp: TxID,
     pub row_versions: Vec<RowVersion>,
     pub header: Option<DatabaseHeader>,
-}
-
-impl LogRecord {
-    fn new(tx_timestamp: TxID) -> Self {
-        Self {
-            tx_timestamp,
-            row_versions: Vec::new(),
-            header: None,
-        }
-    }
 }
 
 /// A transaction timestamp or ID.
@@ -886,14 +877,21 @@ pub enum CommitState<Clock: LogicalClock> {
     WaitForDependencies {
         end_ts: u64,
     },
-    /// Build the committed log record incrementally, yielding every
+    /// Count the committed logical-log frame incrementally, yielding every
     /// `MVCC_COMMIT_BATCH_SIZE` rowids so that very large write sets
     /// (e.g. CREATE INDEX on a multi-million row table) don't monopolize
     /// the executor.
-    BuildLogRecord(BuildLogRecordCtx),
+    CountCommitLog {
+        end_ts: u64,
+        header: Option<DatabaseHeader>,
+        scan: CommitLogScanState,
+        stats: CommitLogStats,
+    },
     BeginCommitLogicalLog {
         end_ts: u64,
-        log_record: LogRecord,
+        header: Option<DatabaseHeader>,
+        scan: CommitLogScanState,
+        stats: CommitLogStats,
     },
     EndCommitLogicalLog {
         end_ts: u64,
@@ -923,17 +921,53 @@ pub enum CommitState<Clock: LogicalClock> {
     },
 }
 
-/// Iteration state for the chunked `BuildLogRecord` step.
-#[derive(Debug)]
-pub struct BuildLogRecordCtx {
-    pub end_ts: u64,
-    pub log_record: LogRecord,
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CommitLogStats {
+    op_count: u32,
+    payload_size: u64,
+}
+
+/// Iteration state for chunked commit-log counting/writing.
+#[derive(Clone, Debug)]
+pub struct CommitLogScanState {
+    pass: CommitLogWriteSetPass,
     /// Index into `CommitStateMachine::write_set` for the current pass.
-    pub cursor: usize,
-    /// True while emitting schema rows (sqlite_schema), false during the
-    /// data-row pass. Schema rows are emitted first so log replay sees
-    /// CREATE TABLE before related INSERTs.
-    pub schema_process: bool,
+    write_set_index: usize,
+    accumulator: CommitLogChainAccumulator,
+}
+
+impl Default for CommitLogScanState {
+    fn default() -> Self {
+        Self {
+            pass: CommitLogWriteSetPass::Schema,
+            write_set_index: 0,
+            accumulator: CommitLogChainAccumulator::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitLogWriteSetPass {
+    Schema,
+    NonSchema,
+    Done,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CommitLogChainAccumulator {
+    own_version: Option<CommitLogProjection>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CommitLogProjection {
+    version_id: u64,
+    table_id: MVTableId,
+    is_delete: bool,
+}
+
+enum CommitLogScanOutcome {
+    Yield,
+    Done,
 }
 
 /// Iteration state for the chunked `RewriteLiveVersions` step.
@@ -944,7 +978,7 @@ pub struct RewriteLiveVersionsCtx {
     pub cursor: usize,
 }
 
-/// How many rowids `BuildLogRecord` / `RewriteLiveVersions` process before
+/// How many rowids the commit-log scans and live-version rewrite process before
 /// yielding to the executor. Picked to amortize state-machine overhead
 /// while keeping a CREATE INDEX on a 2M-row table responsive.
 const MVCC_COMMIT_BATCH_SIZE: usize = 1024;
@@ -977,9 +1011,9 @@ impl CommitCoordinator {
 pub(crate) enum CommitYieldPoint {
     CommitValidation,
     WaitForDependencies,
-    /// Fires once on the first entry into `step_build_log_record` (cursor=0,
-    /// schema_process=true), before any chunk processing. Pairs with
-    /// `LogRecordPrepared` to bracket the BuildLogRecord chunked yields.
+    /// Fires once on the first entry into commit-log counting, before any chunk
+    /// processing. Pairs with `LogRecordPrepared` to bracket chunked commit-log
+    /// scan yields.
     BuildLogRecordStart,
     LogRecordPrepared,
     /// Boundary right after `remove_tx` runs but before the connection cache
@@ -1035,6 +1069,7 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     pager: Arc<Pager>,
     /// Bytes appended to the logical log for this commit; applied to writer offset only after durability and before lock release.
     pending_log_append_bytes: Option<u64>,
+    pending_log_frame_builder: Option<LogFrameBuilder>,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
     _phantom: PhantomData<Clock>,
@@ -1120,6 +1155,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             pager,
             header,
             pending_log_append_bytes: None,
+            pending_log_frame_builder: None,
             sync_mode,
             _phantom: PhantomData,
         }
@@ -1373,183 +1409,260 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         Ok(())
     }
 
-    /// Run one chunked step of `BuildLogRecord`. Processes up to
-    /// `MVCC_COMMIT_BATCH_SIZE` rowids per call, then yields. Schema rows
-    /// (table_id == SQLITE_SCHEMA_MVCC_TABLE_ID) are emitted before data rows
-    /// in two passes so that log replay sees CREATE TABLE before INSERTs.
-    fn step_build_log_record(
-        &mut self,
+    fn acquire_commit_log_lock(
+        &self,
         mvcc_store: &Arc<MvStore<Clock>>,
-    ) -> Result<TransitionResult<()>> {
-        // First entry into BuildLogRecord (no chunk processed yet): a yield-
-        // point to bracket the chunked yields so tests can count them exactly.
-        // Must run before the `&mut self.state` re-bind below — the macro
-        // calls `self.yield_context()` which needs `&self`.
-        let is_first_entry = matches!(
-            self.state,
-            CommitState::BuildLogRecord(BuildLogRecordCtx {
-                cursor: 0,
-                schema_process: true,
-                ..
-            })
-        );
-        if is_first_entry {
-            inject_transition_yield!(self, CommitYieldPoint::BuildLogRecordStart);
+    ) -> Result<Option<IOCompletions>> {
+        if mvcc_store.is_exclusive_tx(&self.tx_id) {
+            return Ok(None);
         }
 
-        let tx_id = self.tx_id;
-        let write_set_len = self.write_set.len();
-        let CommitState::BuildLogRecord(ctx) = &mut self.state else {
-            unreachable!("step_build_log_record requires BuildLogRecord state")
-        };
-        let end_ts = ctx.end_ts;
+        let tx = mvcc_store
+            .txs
+            .get(&self.tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
+        let tx = tx.value();
+        if tx.pager_commit_lock_held.load(Ordering::Acquire) {
+            return Ok(None);
+        }
 
-        // Remap a table_id to its canonical form for the log. After checkpoint,
-        // a table's in-memory table_id (e.g. -53) may differ from -(root_page)
-        // (e.g. -58). On recovery, bootstrap reconstructs the map using
-        // -(root_page), so log records must use that canonical form to be found.
-        let canonicalize_table_id = |version: &mut RowVersion| {
-            let table_id = version.row.id.table_id;
-            if table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                return;
-            }
+        let locked = self.commit_coordinator.pager_commit_lock.write();
+        if !locked {
+            return Ok(Some(IOCompletions::Single(Completion::new_yield())));
+        }
+        tx.pager_commit_lock_held.store(true, Ordering::Release);
+        Ok(None)
+    }
+
+    fn projected_log_action(
+        &self,
+        mvcc_store: &Arc<MvStore<Clock>>,
+        row_version: &RowVersion,
+    ) -> Option<CommitLogProjection> {
+        // Return a projection only if our tx contributed to this version and
+        // must therefore log it.
+        let our_begin = matches!(
+            row_version.begin,
+            Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id
+        );
+        let our_end = matches!(
+            row_version.end,
+            Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id
+        );
+        if !our_begin && !our_end {
+            // row_version belongs to another tx.
+            return None;
+        }
+
+        let mut table_id = row_version.row.id.table_id;
+        if table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+            // Remap a table_id to its canonical form for the log. After checkpoint,
+            // a table's in-memory table_id (e.g. -53) may differ from -(root_page)
+            // (e.g. -58). On recovery, bootstrap reconstructs the map using
+            // -(root_page), so log records must use that canonical form to be found.
             if let Some(entry) = mvcc_store.table_id_to_rootpage.get(&table_id) {
                 if let Some(root_page) = *entry.value() {
-                    let canonical = MVTableId::from(-(root_page as i64));
-                    if canonical != table_id {
-                        version.row.id.table_id = canonical;
-                    }
+                    table_id = MVTableId::from(-(root_page as i64));
                 }
             }
-        };
+        }
 
-        // Returns Some(row_version) if our tx contributed to it and if we must therefore log it.
-        let our_committed_image = |row_version: &RowVersion| -> Option<RowVersion> {
-            let our_begin = matches!(
-                row_version.begin,
-                Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
-            );
-            let our_end = matches!(
-                row_version.end,
-                Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
-            );
-            if !our_begin && !our_end {
-                // row_version belongs to another tx
-                return None;
-            }
-            let mut committed = row_version.clone();
-            if our_begin {
-                // New version is valid STARTING FROM the committing
-                // transaction's end timestamp. See Hekaton page 299.
-                committed.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+        Some(CommitLogProjection {
+            version_id: row_version.id,
+            table_id,
+            is_delete: our_end,
+        })
+    }
 
-                if !our_end {
-                    // A version row_version we inserted may have row_version.end == tx_b.tx_id,
-                    // where tx_b is a concurrent tx. This is because when a tx transitions to
-                    // Preparing, its row_version becomes *speculatively updatable*, and a tx tx_b
-                    // is allowed to change row_version.end from None to tx_b.tx_id to delete it
+    fn emit_commit_log_accumulator(
+        versions: &[RowVersion],
+        accumulator: &CommitLogChainAccumulator,
+        mut emit: impl FnMut(LogOpRef<'_>) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(projection) = accumulator.own_version {
+            let Some(row_version) = versions.iter().find(|rv| rv.id == projection.version_id)
+            else {
+                return Err(LimboError::InternalError(format!(
+                    "committed log version id {} disappeared before serialization",
+                    projection.version_id
+                )));
+            };
+            let op = LogOpRef {
+                table_id: projection.table_id,
+                row_key: &row_version.row.id.row_id,
+                payload: row_version.row.payload(),
+                is_delete: projection.is_delete,
+                btree_resident: row_version.btree_resident,
+            };
+            emit(op)?;
+        }
+        Ok(())
+    }
+
+    fn process_commit_log_versions(
+        &self,
+        mvcc_store: &Arc<MvStore<Clock>>,
+        versions: &[RowVersion],
+        accumulator: &mut CommitLogChainAccumulator,
+        mut emit: impl FnMut(LogOpRef<'_>) -> Result<()>,
+    ) -> Result<()> {
+        for row_version in versions.iter() {
+            if let Some(projection) = self.projected_log_action(mvcc_store, row_version) {
+                if projection.is_delete
+                    && !matches!(
+                        row_version.begin,
+                        Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id
+                    )
+                {
+                    // Old version is valid UNTIL the committing transaction's
+                    // end timestamp. See Hekaton page 299. The frame commit_ts
+                    // supplies that end timestamp during replay.
+                    let op = LogOpRef {
+                        table_id: projection.table_id,
+                        row_key: &row_version.row.id.row_id,
+                        payload: row_version.row.payload(),
+                        is_delete: true,
+                        btree_resident: row_version.btree_resident,
+                    };
+                    emit(op)?;
+                } else {
+                    // New version is valid STARTING FROM the committing
+                    // transaction's end timestamp. See Hekaton page 299.
+                    //
+                    // A version we inserted may have row_version.end == tx_b.tx_id,
+                    // where tx_b is a concurrent tx. This is because when a tx
+                    // transitions to Preparing, its row_version becomes
+                    // *speculatively updatable*, and tx_b is allowed to change
+                    // row_version.end from None to tx_b.tx_id to delete it
                     // (see the Hekaton paper, §3.1, heading "check updatability").
                     //
-                    // That deletion is tx_b's contribution, and tx_b will log it on its own commit.
-                    // Our log record must capture our own contribution, but if the `end` field is
-                    // set, it will be serialized as a OP_DELETE_* in the logical log, so we unset
-                    // it so that it will be serialized as an OP_UPSERT_*. tx_b will take care of
-                    // logging the deletion.
-                    committed.end = None;
+                    // That deletion is tx_b's contribution, and tx_b will log it
+                    // on its own commit. Because `projection.is_delete` only tracks
+                    // our own end marker, a speculative end by tx_b leaves this as
+                    // our upsert; an end by this tx keeps the final projected delete.
+                    accumulator.own_version = Some(projection);
                 }
             }
-            if our_end {
-                // Old version is valid UNTIL the committing
-                // transaction's end timestamp. See Hekaton page 299.
-                committed.end = Some(TxTimestampOrID::Timestamp(end_ts));
-            }
-            Some(committed)
-        };
+        }
+        Self::emit_commit_log_accumulator(versions, accumulator, emit)
+    }
 
-        let collect_versions = |id: &RowID, log_record: &mut LogRecord| {
-            if let Some(row_versions) = mvcc_store.rows.get(id) {
-                let row_versions = row_versions.value().read();
-                for row_version in row_versions.iter() {
-                    if let Some(mut committed_version) = our_committed_image(row_version) {
-                        canonicalize_table_id(&mut committed_version);
-                        mvcc_store
-                            .insert_version_raw(&mut log_record.row_versions, committed_version);
-                    }
-                }
+    fn process_commit_log_scan(
+        &self,
+        mvcc_store: &Arc<MvStore<Clock>>,
+        scan: &mut CommitLogScanState,
+        mut emit: impl FnMut(LogOpRef<'_>) -> Result<()>,
+    ) -> Result<CommitLogScanOutcome> {
+        let write_set_len = self.write_set.len();
+        let mut iterations = 0usize;
+
+        loop {
+            match scan.pass {
+                CommitLogWriteSetPass::Done => return Ok(CommitLogScanOutcome::Done),
+                CommitLogWriteSetPass::Schema | CommitLogWriteSetPass::NonSchema => {}
             }
 
-            if let Some(index) = mvcc_store.index_rows.get(&id.table_id) {
-                let index = index.value();
-                let RowKey::Record(ref index_key) = id.row_id else {
-                    panic!("Index writes must have a record key");
+            if scan.write_set_index >= write_set_len {
+                scan.pass = match scan.pass {
+                    // Schema pass done; start the data pass from the top.
+                    CommitLogWriteSetPass::Schema => CommitLogWriteSetPass::NonSchema,
+                    CommitLogWriteSetPass::NonSchema => CommitLogWriteSetPass::Done,
+                    CommitLogWriteSetPass::Done => CommitLogWriteSetPass::Done,
                 };
-                if let Some(row_versions) = index.get(index_key) {
-                    let row_versions = row_versions.value().read();
-                    for row_version in row_versions.iter() {
-                        if let Some(mut committed_version) = our_committed_image(row_version) {
-                            canonicalize_table_id(&mut committed_version);
-                            mvcc_store.insert_version_raw(
-                                &mut log_record.row_versions,
-                                committed_version,
-                            );
-                        }
-                    }
-                }
+                scan.write_set_index = 0;
+                scan.accumulator = CommitLogChainAccumulator::default();
+                iterations = 0;
+                continue;
             }
-        };
 
-        let mut iterations = 0;
-        while ctx.cursor < write_set_len && iterations < MVCC_COMMIT_BATCH_SIZE {
-            let id = &self.write_set[ctx.cursor];
+            let id = &self.write_set[scan.write_set_index];
             let is_schema = id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
-            // schema_process=true: schema rows only, false: data rows only.
-            let process = if ctx.schema_process {
-                is_schema
-            } else {
-                !is_schema
+            // Schema pass emits schema rows only; data pass emits non-schema rows.
+            // Keeping schema rows first ensures log replay sees CREATE TABLE before
+            // related INSERTs.
+            let should_process = match scan.pass {
+                CommitLogWriteSetPass::Schema => is_schema,
+                CommitLogWriteSetPass::NonSchema => !is_schema,
+                CommitLogWriteSetPass::Done => false,
             };
-            if process {
-                collect_versions(id, &mut ctx.log_record);
-            }
-            ctx.cursor += 1;
-            iterations += 1;
-        }
 
-        if ctx.cursor < write_set_len {
-            // More work remains in the current pass: yield and resume.
-            return Ok(TransitionResult::Io(IOCompletions::Single(
-                Completion::new_yield(),
-            )));
-        }
-
-        if ctx.schema_process {
-            // Schema pass done; start the data pass from the top.
-            ctx.schema_process = false;
-            ctx.cursor = 0;
-            return Ok(TransitionResult::Continue);
-        }
-
-        // Both passes complete. Move the assembled log record out and
-        // transition to BeginCommitLogicalLog (or directly to CommitEnd
-        // if there is nothing to log).
-        let log_record = std::mem::replace(&mut ctx.log_record, LogRecord::new(end_ts));
-        tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
-
-        if log_record.row_versions.is_empty() && log_record.header.is_none() {
-            // Nothing to log. We still need to release the commit lock here
-            // if this is an exclusive tx, mirroring the pre-chunk path
-            // through WaitForDependencies.
-            if mvcc_store.is_exclusive_tx(&self.tx_id) {
-                if let Some(tx_entry) = mvcc_store.txs.get(&self.tx_id) {
-                    mvcc_store.unlock_commit_lock_if_held(tx_entry.value());
+            if should_process {
+                if id.row_id.is_int_key() {
+                    if let Some(row_versions) = mvcc_store.rows.get(id) {
+                        let row_versions = row_versions.value().read();
+                        self.process_commit_log_versions(
+                            mvcc_store,
+                            &row_versions,
+                            &mut scan.accumulator,
+                            &mut emit,
+                        )?;
+                    }
+                } else if let Some(index) = mvcc_store.index_rows.get(&id.table_id) {
+                    let index = index.value();
+                    let RowKey::Record(ref index_key) = id.row_id else {
+                        panic!("Index writes must have a record key");
+                    };
+                    let Some(row_versions) = index.get(index_key) else {
+                        scan.write_set_index += 1;
+                        iterations += 1;
+                        if iterations >= MVCC_COMMIT_BATCH_SIZE
+                            && scan.write_set_index < write_set_len
+                        {
+                            return Ok(CommitLogScanOutcome::Yield);
+                        }
+                        continue;
+                    };
+                    let row_versions = row_versions.value().read();
+                    self.process_commit_log_versions(
+                        mvcc_store,
+                        &row_versions,
+                        &mut scan.accumulator,
+                        &mut emit,
+                    )?;
                 }
             }
-            self.state = CommitState::CommitEnd { end_ts };
-        } else {
-            self.state = CommitState::BeginCommitLogicalLog { end_ts, log_record };
+
+            scan.write_set_index += 1;
+            scan.accumulator = CommitLogChainAccumulator::default();
+            iterations += 1;
+            if iterations >= MVCC_COMMIT_BATCH_SIZE && scan.write_set_index < write_set_len {
+                // More work remains in the current pass: yield and resume.
+                return Ok(CommitLogScanOutcome::Yield);
+            }
         }
-        inject_transition_yield!(self, CommitYieldPoint::LogRecordPrepared);
-        Ok(TransitionResult::Continue)
+    }
+
+    fn count_commit_log_batch(
+        &self,
+        mvcc_store: &Arc<MvStore<Clock>>,
+        scan: &mut CommitLogScanState,
+        stats: &mut CommitLogStats,
+    ) -> Result<CommitLogScanOutcome> {
+        self.process_commit_log_scan(mvcc_store, scan, |op| {
+            stats.op_count = stats
+                .op_count
+                .checked_add(1)
+                .ok_or_else(|| LimboError::InternalError("logical log op_count overflow".into()))?;
+            stats.payload_size =
+                stats
+                    .payload_size
+                    .checked_add(u64::try_from(serialized_log_op_entry_size(&op)).map_err(
+                        |_| LimboError::InternalError("logical log op size exceeds u64".into()),
+                    )?)
+                    .ok_or_else(|| {
+                        LimboError::InternalError("logical log payload size overflow".into())
+                    })?;
+            Ok(())
+        })
+    }
+
+    fn write_commit_log_batch(
+        &self,
+        mvcc_store: &Arc<MvStore<Clock>>,
+        scan: &mut CommitLogScanState,
+        builder: &mut LogFrameBuilder,
+    ) -> Result<CommitLogScanOutcome> {
+        self.process_commit_log_scan(mvcc_store, scan, |op| builder.append_op(&op))
     }
 
     /// Run one chunked step of `RewriteLiveVersions`. Processes up to
@@ -1924,47 +2037,123 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Ok(TransitionResult::Done(()));
                 }
 
-                // All dependencies resolved. Initialize the log record (just
-                // the header snapshot, if any) and hand off to BuildLogRecord
-                // which fills in row_versions in `MVCC_COMMIT_BATCH_SIZE`-sized
-                // chunks, yielding between chunks. Live row versions stay on
-                // TxID references until CommitEnd so rollback of an abandoned
-                // commit can still match them.
-                let mut log_record = LogRecord::new(end_ts);
-                if tx.header_dirty.load(Ordering::Acquire) {
-                    log_record.header = Some(*tx.header.read());
+                // All dependencies resolved. Count and write the committed
+                // logical-log projection in bounded scans. Live row versions
+                // stay on TxID references until CommitEnd so rollback of an
+                // abandoned commit can still match them.
+                let header = tx
+                    .header_dirty
+                    .load(Ordering::Acquire)
+                    .then(|| *tx.header.read());
+                let mut stats = CommitLogStats::default();
+                if header.is_some() {
+                    stats.op_count = 1;
+                    stats.payload_size = serialized_header_entry_size() as u64;
                 }
-                self.state = CommitState::BuildLogRecord(BuildLogRecordCtx {
+                self.state = CommitState::CountCommitLog {
                     end_ts,
-                    log_record,
-                    cursor: 0,
-                    schema_process: true,
-                });
+                    header,
+                    scan: CommitLogScanState::default(),
+                    stats,
+                };
                 return Ok(TransitionResult::Continue);
             }
-            // Chunked: yields every MVCC_COMMIT_BATCH_SIZE rowids. Pulled out
-            // to a helper because the arm body needs `&mut self` to mutate
-            // the cursor / pass / log_record inside the variant, which
-            // conflicts with the outer `&self.state` match borrow.
-            CommitState::BuildLogRecord(_) => self.step_build_log_record(mvcc_store),
-            CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
-                if !mvcc_store.is_exclusive_tx(&self.tx_id) {
-                    // logical log needs to be serialized
-                    let locked = self.commit_coordinator.pager_commit_lock.write();
-                    if !locked {
-                        return Ok(TransitionResult::Io(IOCompletions::Single(
-                            Completion::new_yield(),
-                        )));
+            CommitState::CountCommitLog {
+                end_ts,
+                header,
+                scan,
+                stats,
+            } => {
+                // First entry into commit-log counting (no chunk processed yet):
+                // a yield point to bracket the chunked yields so tests can count
+                // them exactly. Must run before the state is replaced below
+                // because the macro calls `self.yield_context()` which needs
+                // `&self`.
+                let is_first_entry = matches!(
+                    scan,
+                    CommitLogScanState {
+                        pass: CommitLogWriteSetPass::Schema,
+                        write_set_index: 0,
+                        ..
                     }
-                    let tx = mvcc_store
-                        .txs
-                        .get(&self.tx_id)
-                        .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
-                    tx.value()
-                        .pager_commit_lock_held
-                        .store(true, Ordering::Release);
+                ) && stats.op_count == u32::from(header.is_some());
+                if is_first_entry {
+                    inject_transition_yield!(self, CommitYieldPoint::BuildLogRecordStart);
                 }
-                let (c, append_bytes) = mvcc_store.storage.log_tx(log_record, None)?;
+                if let Some(io) = self.acquire_commit_log_lock(mvcc_store)? {
+                    return Ok(TransitionResult::Io(io));
+                }
+
+                let mut scan = scan.clone();
+                let mut stats = *stats;
+                let outcome = self.count_commit_log_batch(mvcc_store, &mut scan, &mut stats)?;
+                if matches!(outcome, CommitLogScanOutcome::Yield) {
+                    self.state = CommitState::CountCommitLog {
+                        end_ts: *end_ts,
+                        header: *header,
+                        scan,
+                        stats,
+                    };
+                    return Ok(TransitionResult::Io(IOCompletions::Single(
+                        Completion::new_yield(),
+                    )));
+                }
+
+                tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
+                // Both counting passes complete. Move to writing the bounded
+                // frame (or directly to CommitEnd if there is nothing to log).
+                if stats.op_count == 0 {
+                    self.state = CommitState::CommitEnd { end_ts: *end_ts };
+                } else {
+                    self.state = CommitState::BeginCommitLogicalLog {
+                        end_ts: *end_ts,
+                        header: *header,
+                        scan: CommitLogScanState::default(),
+                        stats,
+                    };
+                }
+                inject_transition_yield!(self, CommitYieldPoint::LogRecordPrepared);
+                return Ok(TransitionResult::Continue);
+            }
+            CommitState::BeginCommitLogicalLog {
+                end_ts,
+                header,
+                scan,
+                stats,
+            } => {
+                if let Some(io) = self.acquire_commit_log_lock(mvcc_store)? {
+                    return Ok(TransitionResult::Io(io));
+                }
+
+                let mut scan = scan.clone();
+                let mut frame_builder = match self.pending_log_frame_builder.take() {
+                    Some(builder) => builder,
+                    None => mvcc_store.storage.begin_log_tx_frame(
+                        *end_ts,
+                        stats.op_count,
+                        stats.payload_size,
+                    )?,
+                };
+                let outcome =
+                    self.write_commit_log_batch(mvcc_store, &mut scan, &mut frame_builder)?;
+                if matches!(outcome, CommitLogScanOutcome::Yield) {
+                    self.pending_log_frame_builder = Some(frame_builder);
+                    self.state = CommitState::BeginCommitLogicalLog {
+                        end_ts: *end_ts,
+                        header: *header,
+                        scan,
+                        stats: *stats,
+                    };
+                    return Ok(TransitionResult::Io(IOCompletions::Single(
+                        Completion::new_yield(),
+                    )));
+                }
+                if let Some(header) = header {
+                    frame_builder.append_header(header)?;
+                }
+                let (c, append_bytes) = mvcc_store
+                    .storage
+                    .finish_log_tx_frame(frame_builder, None)?;
                 self.pending_log_append_bytes = Some(append_bytes);
                 self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
@@ -2066,8 +2255,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 });
                 Ok(TransitionResult::Continue)
             }
-            // Chunked: yields every MVCC_COMMIT_BATCH_SIZE rowids. Same
-            // helper-dispatch reason as BuildLogRecord above.
+            // Chunked: yields every MVCC_COMMIT_BATCH_SIZE rowids. Keep this
+            // helper-dispatched like the commit-log scan states above.
             CommitState::RewriteLiveVersions(_) => self.step_rewrite_live_versions(mvcc_store),
             CommitState::FinalizeCommit { end_ts } => {
                 let tx = mvcc_store
@@ -5858,11 +6047,29 @@ impl<Clock: LogicalClock> Debug for CommitState<Clock> {
                 .debug_struct("WaitForDependencies")
                 .field("end_ts", end_ts)
                 .finish(),
-            Self::BuildLogRecord(ctx) => f.debug_tuple("BuildLogRecord").field(ctx).finish(),
-            Self::BeginCommitLogicalLog { end_ts, log_record } => f
+            Self::CountCommitLog {
+                end_ts,
+                header,
+                scan,
+                stats,
+            } => f
+                .debug_struct("CountCommitLog")
+                .field("end_ts", end_ts)
+                .field("header", header)
+                .field("scan", scan)
+                .field("stats", stats)
+                .finish(),
+            Self::BeginCommitLogicalLog {
+                end_ts,
+                header,
+                scan,
+                stats,
+            } => f
                 .debug_struct("BeginCommitLogicalLog")
                 .field("end_ts", end_ts)
-                .field("log_record", log_record)
+                .field("header", header)
+                .field("scan", scan)
+                .field("stats", stats)
                 .finish(),
             Self::EndCommitLogicalLog { end_ts } => f
                 .debug_struct("EndCommitLogicalLog")
