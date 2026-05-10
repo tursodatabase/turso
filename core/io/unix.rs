@@ -347,7 +347,7 @@ impl File for UnixFile {
 
         while total_written < total_size {
             let remaining_slice = &buf_slice[total_written..];
-            let write_len = remaining_slice.len().min(MAX_PWRITE_LEN as usize);
+            let write_len = remaining_slice.len().min(MAX_PWRITE_LEN);
             let result = unsafe {
                 libc::pwrite(
                     self.file.as_raw_fd(),
