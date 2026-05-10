@@ -1091,7 +1091,7 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
                 sql_over_http_requests.push(step(replay.sql, convert_to_args(replay.values)))
             }
             DatabaseRowTransformResult::Keep => {
-                let replay_info = generator.replay_info(ctx.coro, &change).await?;
+                let replay_info = generator.replay_info(ctx.coro, change).await?;
                 // for now we try to support DDL statements which "extends" the schema (CREATE INDEX, CREATE TABLE, ALTER TABLE ADD COLUMN) and they have `IF NOT EXISTS` semantic
                 // as ALTER TABLE has no such syntax - we ignore error for such statements from remote for now
                 let is_alter_add_column =
