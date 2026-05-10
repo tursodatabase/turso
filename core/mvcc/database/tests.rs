@@ -7610,6 +7610,65 @@ fn test_concurrent_commit_yield_spin() {
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
 }
 
+#[test]
+fn test_mvcc_commit_log_batch_size_pragma() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+
+    let rows = get_rows(&conn, "PRAGMA mvcc_commit_log_batch_size");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        DEFAULT_MVCC_COMMIT_LOG_BATCH_SIZE as i64
+    );
+
+    conn.execute("PRAGMA mvcc_commit_log_batch_size = 1")
+        .unwrap();
+    let rows = get_rows(&conn, "PRAGMA mvcc_commit_log_batch_size");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+
+    assert!(conn
+        .execute("PRAGMA mvcc_commit_log_batch_size = 0")
+        .is_err());
+    assert!(conn
+        .execute(format!(
+            "PRAGMA mvcc_commit_log_batch_size = {}",
+            MAX_MVCC_COMMIT_LOG_BATCH_SIZE + 1
+        ))
+        .is_err());
+}
+
+#[test]
+fn test_commit_log_batch_size_yields_and_commits() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+
+    conn.execute("PRAGMA mvcc_commit_log_batch_size = 1")
+        .unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    for id in 1..=4 {
+        conn.execute(format!("INSERT INTO t VALUES ({id}, 'v{id}')"))
+            .unwrap();
+    }
+
+    let mut stmt = conn.prepare("COMMIT").unwrap();
+    let mut yielded = false;
+    loop {
+        match stmt.step().unwrap() {
+            crate::StepResult::IO => yielded = true,
+            crate::StepResult::Done => break,
+            other => panic!("unexpected COMMIT step result: {other:?}"),
+        }
+    }
+    drop(stmt);
+    assert!(yielded, "tiny commit log batch size should force IO yields");
+
+    let rows = get_rows(&conn, "SELECT COUNT(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 4);
+    conn.close().unwrap();
+}
+
 fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<MvStore<MvccClock>>) {
     let lock = &mv_store.commit_coordinator.pager_commit_lock;
     assert!(lock.write(), "should acquire commit lock");

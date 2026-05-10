@@ -64,6 +64,9 @@ pub mod hermitage_tests;
 #[cfg(test)]
 pub mod tests;
 
+pub const DEFAULT_MVCC_COMMIT_LOG_BATCH_SIZE: u64 = 1024;
+pub const MAX_MVCC_COMMIT_LOG_BATCH_SIZE: u64 = 65_536;
+
 /// Sentinel value for `MvStore::exclusive_tx` indicating no exclusive transaction is active.
 const NO_EXCLUSIVE_TX: u64 = 0;
 
@@ -877,10 +880,9 @@ pub enum CommitState<Clock: LogicalClock> {
     WaitForDependencies {
         end_ts: u64,
     },
-    /// Count the committed logical-log frame incrementally, yielding every
-    /// `MVCC_COMMIT_BATCH_SIZE` rowids so that very large write sets
-    /// (e.g. CREATE INDEX on a multi-million row table) don't monopolize
-    /// the executor.
+    /// Count the committed logical-log frame incrementally, yielding after the
+    /// configured commit-log rowid budget so that very large write sets (e.g.
+    /// CREATE INDEX on a multi-million row table) don't monopolize the executor.
     CountCommitLog {
         end_ts: u64,
         header: Option<DatabaseHeader>,
@@ -978,10 +980,10 @@ pub struct RewriteLiveVersionsCtx {
     pub cursor: usize,
 }
 
-/// How many rowids the commit-log scans and live-version rewrite process before
-/// yielding to the executor. Picked to amortize state-machine overhead
-/// while keeping a CREATE INDEX on a 2M-row table responsive.
-const MVCC_COMMIT_BATCH_SIZE: usize = 1024;
+/// How many rowids the live-version rewrite processes before yielding to the
+/// executor. Commit-log scans use the configurable
+/// `mvcc_commit_log_batch_size` budget, whose default matches this value.
+const MVCC_COMMIT_BATCH_SIZE: usize = DEFAULT_MVCC_COMMIT_LOG_BATCH_SIZE as usize;
 
 #[derive(Debug)]
 pub enum WriteRowState {
@@ -1554,6 +1556,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         mut emit: impl FnMut(LogOpRef<'_>) -> Result<()>,
     ) -> Result<CommitLogScanOutcome> {
         let write_set_len = self.write_set.len();
+        let batch_size = mvcc_store.commit_log_batch_size() as usize;
         let mut iterations = 0usize;
 
         loop {
@@ -1605,9 +1608,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                     let Some(row_versions) = index.get(index_key) else {
                         scan.write_set_index += 1;
                         iterations += 1;
-                        if iterations >= MVCC_COMMIT_BATCH_SIZE
-                            && scan.write_set_index < write_set_len
-                        {
+                        if iterations >= batch_size && scan.write_set_index < write_set_len {
                             return Ok(CommitLogScanOutcome::Yield);
                         }
                         continue;
@@ -1625,7 +1626,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             scan.write_set_index += 1;
             scan.accumulator = CommitLogChainAccumulator::default();
             iterations += 1;
-            if iterations >= MVCC_COMMIT_BATCH_SIZE && scan.write_set_index < write_set_len {
+            if iterations >= batch_size && scan.write_set_index < write_set_len {
                 // More work remains in the current pass: yield and resume.
                 return Ok(CommitLogScanOutcome::Yield);
             }
@@ -2649,6 +2650,7 @@ pub struct MvStore<Clock: LogicalClock> {
     /// If there are two concurrent BEGIN (non-CONCURRENT) transactions, and one tries to promote
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
     last_committed_tx_ts: AtomicU64,
+    commit_log_batch_size: AtomicU64,
     table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
 }
 
@@ -2723,6 +2725,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             durable_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
+            commit_log_batch_size: AtomicU64::new(DEFAULT_MVCC_COMMIT_LOG_BATCH_SIZE),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
         }
     }
@@ -5541,6 +5544,21 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     pub fn checkpoint_threshold(&self) -> i64 {
         self.storage.checkpoint_threshold()
+    }
+
+    pub fn set_commit_log_batch_size(&self, batch_size: u64) -> Result<()> {
+        if !(1..=MAX_MVCC_COMMIT_LOG_BATCH_SIZE).contains(&batch_size) {
+            return Err(LimboError::InternalError(format!(
+                "mvcc_commit_log_batch_size must be between 1 and {MAX_MVCC_COMMIT_LOG_BATCH_SIZE}"
+            )));
+        }
+        self.commit_log_batch_size
+            .store(batch_size, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn commit_log_batch_size(&self) -> u64 {
+        self.commit_log_batch_size.load(Ordering::Relaxed)
     }
 
     pub fn get_real_table_id(&self, table_id: i64) -> i64 {

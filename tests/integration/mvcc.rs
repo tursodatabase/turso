@@ -55,6 +55,28 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         self.inner.log_tx(m, on_serialization_complete)
     }
 
+    fn begin_log_tx_frame(
+        &self,
+        commit_ts: u64,
+        op_count: u32,
+        payload_size: u64,
+    ) -> turso_core::Result<turso_core::mvcc::persistent_storage::logical_log::LogFrameBuilder>
+    {
+        self.used_log_tx
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner
+            .begin_log_tx_frame(commit_ts, op_count, payload_size)
+    }
+
+    fn finish_log_tx_frame(
+        &self,
+        builder: turso_core::mvcc::persistent_storage::logical_log::LogFrameBuilder,
+        on_serialization_complete: Option<&dyn Fn(&[u8], u32) -> turso_core::Result<()>>,
+    ) -> turso_core::Result<(turso_core::Completion, u64)> {
+        self.inner
+            .finish_log_tx_frame(builder, on_serialization_complete)
+    }
+
     fn sync(
         &self,
         sync_type: turso_core::io::FileSyncType,

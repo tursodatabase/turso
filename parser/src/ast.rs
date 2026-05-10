@@ -1841,6 +1841,8 @@ pub enum PragmaName {
     WalCheckpoint,
     /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
     MvccCheckpointThreshold,
+    /// Sets or queries how many write-set rowids MVCC commit-log preparation processes before yielding.
+    MvccCommitLogBatchSize,
     /// List all available types (built-in and custom)
     ListTypes,
     /// Deprecated no-op: control whether callback is invoked for empty result sets

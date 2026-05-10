@@ -3329,6 +3329,24 @@ impl Connection {
             None => Err(LimboError::InternalError("MVCC not enabled".into())),
         }
     }
+
+    pub(crate) fn set_mvcc_commit_log_batch_size(&self, batch_size: u64) -> Result<()> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => {
+                mv_store.set_commit_log_batch_size(batch_size)?;
+                self.bump_prepare_context_generation();
+                Ok(())
+            }
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn mvcc_commit_log_batch_size(&self) -> Result<u64> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => Ok(mv_store.commit_log_batch_size()),
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
 }
 
 pub type Row = vdbe::Row;

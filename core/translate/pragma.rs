@@ -684,6 +684,18 @@ fn update_pragma(
             connection.set_mvcc_checkpoint_threshold(threshold)?;
             Ok(TransactionMode::None)
         }
+        PragmaName::MvccCommitLogBatchSize => {
+            let max = crate::mvcc::database::MAX_MVCC_COMMIT_LOG_BATCH_SIZE as i64;
+            let batch_size = match parse_signed_number(&value)? {
+                Value::Numeric(Numeric::Integer(size)) if (1..=max).contains(&size) => size as u64,
+                _ => bail_parse_error!(
+                    "mvcc_commit_log_batch_size must be an integer between 1 and {max}"
+                ),
+            };
+
+            connection.set_mvcc_commit_log_batch_size(batch_size)?;
+            Ok(TransactionMode::None)
+        }
         PragmaName::ForeignKeys => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_foreign_keys_enabled(enabled);
@@ -1503,6 +1515,14 @@ fn query_pragma(
             let threshold = connection.mvcc_checkpoint_threshold()?;
             let register = program.alloc_register();
             program.emit_int(threshold, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::MvccCommitLogBatchSize => {
+            let batch_size = connection.mvcc_commit_log_batch_size()?;
+            let register = program.alloc_register();
+            program.emit_int(batch_size as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
