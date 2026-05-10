@@ -373,9 +373,10 @@ jobs:
       - name: Run Windows CLI multiprocess VFS regression
         run: cargo test -q -p turso_cli input::tests::experimental_win_iocp_backend_is_available_for_path_databases -- --exact
       - name: Run Windows core multiprocess regressions
-        run: cargo test -q -p turso_core --features "fs experimental_win_iocp" multiprocess_tests:: -- --nocapture
+        run: |
+          cargo test -q -p turso_core --features "fs experimental_win_iocp" multiprocess_tests:: -- --nocapture
       - name: Run Windows multiprocess startup smoke
-          run: cargo run -q -p turso_whopper -- --mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01
+        run: cargo run -q -p turso_whopper -- --mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01
 
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404
