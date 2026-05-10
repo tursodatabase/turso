@@ -927,7 +927,14 @@ fn plain_vacuum_rejects_multiprocess_wal_database() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
-    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let db = Database::open_file_with_flags(
+        io,
+        db_path_str,
+        OpenFlags::default(),
+        multiprocess_wal_db_opts().with_vacuum(true),
+        None,
+    )
+    .unwrap();
     let conn = db.connect().unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();

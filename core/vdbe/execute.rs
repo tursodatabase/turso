@@ -15338,7 +15338,7 @@ mod tests {
             io,
             "in-place-vacuum-design-b.db",
             OpenFlags::Create,
-            DatabaseOpts::new(),
+            DatabaseOpts::new().with_vacuum(true),
             None,
         )
         .unwrap();
@@ -15382,7 +15382,7 @@ mod tests {
             io,
             "in-place-vacuum-busy-before-copyback.db",
             OpenFlags::Create,
-            DatabaseOpts::new(),
+            DatabaseOpts::new().with_vacuum(true),
             None,
         )
         .unwrap();

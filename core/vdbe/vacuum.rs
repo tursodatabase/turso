@@ -2831,7 +2831,7 @@ mod tests {
             io_dyn,
             "vacuum-source.db",
             OpenFlags::Create,
-            DatabaseOpts::new(),
+            DatabaseOpts::new().with_vacuum(true),
             None,
         )?;
         let conn = db.connect()?;
@@ -2872,7 +2872,7 @@ mod tests {
             io_dyn,
             "vacuum-source-full.db",
             OpenFlags::Create,
-            DatabaseOpts::new(),
+            DatabaseOpts::new().with_vacuum(true),
             None,
         )?;
         let conn = db.connect()?;
