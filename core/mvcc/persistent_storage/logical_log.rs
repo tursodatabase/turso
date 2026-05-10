@@ -556,8 +556,7 @@ impl LogicalLog {
     }
 
     /// Serializes a transaction into `write_buf`, optionally calls
-    /// `on_serialization_complete` with a zero-copy reference to the frame bytes,
-    /// then writes to disk. `write_buf` retains its allocation across calls.
+    /// `on_serialization_complete` with a zero-copy reference to the frame bytes.
     ///
     /// `advance_offset_immediately`: when true, the writer offset advances right
     /// after the pwrite (checkpoint path). When false, the offset stays behind
