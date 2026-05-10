@@ -1,11 +1,10 @@
-use crate::sync::RwLock;
 use crate::turso_assert;
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
+    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersions, SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -282,7 +281,7 @@ pub enum MvccCursorType {
 }
 
 pub(crate) type MvccIterator<'l, T> =
-    Box<dyn Iterator<Item = Entry<'l, T, RwLock<Vec<RowVersion>>>> + Send + Sync>;
+    Box<dyn Iterator<Item = Entry<'l, T, RowVersions>> + Send + Sync>;
 
 /// Extends the lifetime of a SkipMap iterator to `'static`.
 ///
@@ -309,16 +308,8 @@ macro_rules! static_iterator_hack {
         // SAFETY: See macro documentation above.
         unsafe {
             std::mem::transmute::<
-                Box<
-                    dyn Iterator<Item = Entry<'_, $key_type, RwLock<Vec<RowVersion>>>>
-                        + Send
-                        + Sync,
-                >,
-                Box<
-                    dyn Iterator<Item = Entry<'static, $key_type, RwLock<Vec<RowVersion>>>>
-                        + Send
-                        + Sync,
-                >,
+                Box<dyn Iterator<Item = Entry<'_, $key_type, RowVersions>> + Send + Sync>,
+                Box<dyn Iterator<Item = Entry<'static, $key_type, RowVersions>> + Send + Sync>,
             >($iter)
         }
     };
