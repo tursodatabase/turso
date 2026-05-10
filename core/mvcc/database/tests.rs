@@ -4841,9 +4841,10 @@ fn transaction_display() {
     let tx_id = 42;
     let begin_ts = 20250914;
 
+    let empty_versions = || Arc::new(RwLock::new(Vec::new()));
     let write_set = Mutex::new(vec![
-        RowID::new((-2).into(), RowKey::Int(11)),
-        RowID::new((-2).into(), RowKey::Int(13)),
+        (RowID::new((-2).into(), RowKey::Int(11)), empty_versions()),
+        (RowID::new((-2).into(), RowKey::Int(13)), empty_versions()),
     ]);
 
     let read_set = SkipSet::new();
