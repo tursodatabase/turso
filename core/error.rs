@@ -99,6 +99,20 @@ pub enum LimboError {
     CheckpointFailed(String),
     #[error("Unsupported text encoding: {0}. Only UTF-8 is supported.")]
     UnsupportedEncoding(String),
+    #[error("Out of memory")]
+    OutOfMemory,
+}
+
+impl From<crate::alloc::AllocError> for LimboError {
+    fn from(_: crate::alloc::AllocError) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+impl From<crate::alloc::TryReserveError> for LimboError {
+    fn from(_: crate::alloc::TryReserveError) -> Self {
+        Self::OutOfMemory
+    }
 }
 
 #[cfg(target_family = "unix")]

@@ -1,3 +1,6 @@
+#![cfg_attr(nightly, feature(allocator_api, btreemap_alloc))]
+
+pub mod alloc;
 pub mod busy;
 #[cfg(feature = "cli_only")]
 pub mod dbpage;
