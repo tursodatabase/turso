@@ -246,6 +246,12 @@ pub fn execute_interaction_turso(
                 return Ok(ExecutionContinuation::NextInteraction);
             }
 
+            if let Query::Pragma(sql_generation::model::query::pragma::Pragma::IntegrityCheck) =
+                query
+            {
+                assert_integrity_check_result(results.as_ref().expect("checked above"))?;
+            }
+
             stack.push(results);
             // TODO: skip integrity check with mvcc
             if !env.profile.mvcc && env.rng.random_ratio(1, 10) {
@@ -321,6 +327,38 @@ pub fn execute_interaction_turso(
         )));
     }
     Ok(ExecutionContinuation::NextInteraction)
+}
+
+fn assert_integrity_check_result(rows: &[Vec<SimValue>]) -> Result<()> {
+    if rows.is_empty() {
+        return Err(LimboError::InternalError(
+            "PRAGMA integrity_check did not return a value".to_string(),
+        ));
+    }
+
+    let mut messages = Vec::new();
+    for row in rows {
+        let Some(value) = row.first() else {
+            return Err(LimboError::InternalError(
+                "PRAGMA integrity_check returned an empty row".to_string(),
+            ));
+        };
+        let Some(text) = value.0.to_text() else {
+            return Err(LimboError::InternalError(
+                "PRAGMA integrity_check returned a non-text value".to_string(),
+            ));
+        };
+        messages.push(text.to_string());
+    }
+
+    let message = messages.join("\n");
+    if message.eq_ignore_ascii_case("ok") {
+        Ok(())
+    } else {
+        Err(LimboError::InternalError(format!(
+            "Integrity Check Failed: {message}"
+        )))
+    }
 }
 
 fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
@@ -459,37 +497,9 @@ fn execute_query_rusqlite(
         );
     }
     match query {
-        Query::Select(select) => {
-            let mut stmt = connection.prepare(select.to_string().as_str())?;
-            let rows = stmt.query_map([], |row| {
-                let mut values = vec![];
-                for i in 0.. {
-                    let value = match row.get(i) {
-                        Ok(value) => value,
-                        Err(err) => match err {
-                            rusqlite::Error::InvalidColumnIndex(_) => break,
-                            _ => {
-                                tracing::error!(?err);
-                                panic!("{err}")
-                            }
-                        },
-                    };
-                    let value = match value {
-                        rusqlite::types::Value::Null => Value::Null,
-                        rusqlite::types::Value::Integer(i) => Value::from_i64(i),
-                        rusqlite::types::Value::Real(f) => Value::from_f64(f),
-                        rusqlite::types::Value::Text(s) => Value::build_text(s),
-                        rusqlite::types::Value::Blob(b) => Value::Blob(b),
-                    };
-                    values.push(SimValue(value));
-                }
-                Ok(values)
-            })?;
-            let mut result = vec![];
-            for row in rows {
-                result.push(row?);
-            }
-            Ok(result)
+        Query::Select(select) => query_rusqlite_rows(connection, &select.to_string()),
+        Query::Pragma(sql_generation::model::query::pragma::Pragma::IntegrityCheck) => {
+            query_rusqlite_rows(connection, &query.to_string())
         }
         Query::Placeholder => {
             unreachable!("simulation cannot have a placeholder Query for execution")
@@ -499,4 +509,40 @@ fn execute_query_rusqlite(
             Ok(vec![])
         }
     }
+}
+
+fn query_rusqlite_rows(
+    connection: &rusqlite::Connection,
+    query: &str,
+) -> rusqlite::Result<Vec<Vec<SimValue>>> {
+    let mut stmt = connection.prepare(query)?;
+    let rows = stmt.query_map([], |row| {
+        let mut values = vec![];
+        for i in 0.. {
+            let value = match row.get(i) {
+                Ok(value) => value,
+                Err(err) => match err {
+                    rusqlite::Error::InvalidColumnIndex(_) => break,
+                    _ => {
+                        tracing::error!(?err);
+                        panic!("{err}")
+                    }
+                },
+            };
+            let value = match value {
+                rusqlite::types::Value::Null => Value::Null,
+                rusqlite::types::Value::Integer(i) => Value::from_i64(i),
+                rusqlite::types::Value::Real(f) => Value::from_f64(f),
+                rusqlite::types::Value::Text(s) => Value::build_text(s),
+                rusqlite::types::Value::Blob(b) => Value::Blob(b),
+            };
+            values.push(SimValue(value));
+        }
+        Ok(values)
+    })?;
+    let mut result = vec![];
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
 }

@@ -177,7 +177,7 @@ impl Profile {
                 drop_table_weight: 0,
                 alter_table_weight: 0,
                 drop_index: 0,
-                pragma_weight: 0,
+                pragma_weight: 10,
                 ..Default::default()
             },
             ..Default::default()

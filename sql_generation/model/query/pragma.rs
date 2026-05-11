@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum Pragma {
     AutoVacuumMode(VacuumMode),
     ForeignKeyList(String),
+    IntegrityCheck,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +33,7 @@ impl Display for Pragma {
                 let table_name = table_name.replace('\'', "''");
                 write!(f, "PRAGMA foreign_key_list('{table_name}')")
             }
+            Pragma::IntegrityCheck => write!(f, "PRAGMA integrity_check"),
         }
     }
 }
