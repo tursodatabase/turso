@@ -11,6 +11,37 @@ expect {
     CREATE INDEX i ON t (b)
 }
 
+test alter-column-new-check-is-enforced {
+    CREATE TABLE t (a INTEGER);
+    ALTER TABLE t ALTER COLUMN a TO b INTEGER CHECK(b > 0);
+    INSERT INTO t VALUES(-1);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test alter-column-new-check-visible-to-integrity-check {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES(-1);
+    ALTER TABLE t ALTER COLUMN a TO b INTEGER CHECK(b > 0);
+    PRAGMA integrity_check;
+}
+expect {
+    CHECK constraint failed in t
+}
+
+test alter-column-replaces-old-column-check {
+    CREATE TABLE t (a INTEGER CHECK(a > 0));
+    ALTER TABLE t ALTER COLUMN a TO b INTEGER;
+    INSERT INTO t VALUES(-1);
+    SELECT b FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    -1
+    ok
+}
+
 test fail-alter-column-primary-key {
     CREATE TABLE t (a);
     ALTER TABLE t ALTER COLUMN a TO a PRIMARY KEY;

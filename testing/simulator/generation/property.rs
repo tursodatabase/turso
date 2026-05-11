@@ -19,7 +19,7 @@ use sql_generation::{
             transaction::{Begin, Commit, Rollback},
             update::{SetValue, Update},
         },
-        table::{ColumnType, SimValue, Table},
+        table::{Column, ColumnType, Name, SimValue, Table},
     },
 };
 use strum::IntoEnumIterator;
@@ -43,6 +43,14 @@ use crate::{
 
 type PropertyQueryGenFunc<'a, R, G> =
     fn(&mut R, &G, &QueryDistribution, &Property) -> Option<Query>;
+
+fn positive_column_check(column_name: &str) -> Box<ast::Expr> {
+    Box::new(ast::Expr::binary(
+        ast::Expr::Id(ast::Name::exact(column_name.to_string())),
+        ast::Operator::Greater,
+        ast::Expr::Literal(ast::Literal::Numeric("0".to_string())),
+    ))
+}
 
 impl Property {
     pub(super) fn get_extensional_query_gen_function<R, G>(&self) -> PropertyQueryGenFunc<R, G>
@@ -247,6 +255,7 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::AlterColumnCheckConstraint { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => {
                 unreachable!("No extensional queries")
@@ -989,6 +998,95 @@ impl Property {
                 .into_iter()
                 .map(InteractionBuilder::with_interaction)
                 .collect()
+            }
+            Property::AlterColumnCheckConstraint {
+                table,
+                old_column,
+                new_column,
+            } => {
+                let create = Query::Create(Create {
+                    table: Table {
+                        name: table.clone(),
+                        columns: vec![Column {
+                            name: old_column.clone(),
+                            column_type: ColumnType::Integer,
+                            constraints: vec![],
+                        }],
+                        rows: vec![],
+                        indexes: vec![],
+                    },
+                });
+
+                let alter = Query::AlterTable(AlterTable {
+                    table_name: table.clone(),
+                    alter_table_type: AlterTableType::AlterColumn {
+                        old: old_column.clone(),
+                        new: Column {
+                            name: new_column.clone(),
+                            column_type: ColumnType::Integer,
+                            constraints: vec![ast::ColumnConstraint::Check(positive_column_check(
+                                new_column,
+                            ))],
+                        },
+                    },
+                });
+
+                let invalid_insert = Query::Insert(Insert::Values {
+                    table: table.clone(),
+                    values: vec![vec![SimValue(types::Value::from_i64(-1))]],
+                    on_conflict: None,
+                });
+
+                let table_dependency = table.clone();
+                let table_name = table.clone();
+                let new_column_name = new_column.clone();
+                let assertion = InteractionType::Assertion(Assertion::new(
+                    format!(
+                        "ALTER COLUMN CHECK on {table_name}.{new_column_name} should reject invalid insert"
+                    ),
+                    move |stack: &Vec<ResultSet>, _env| {
+                        let Some(last) = stack.last() else {
+                            return Ok(Err("expected invalid INSERT result on stack".to_string()));
+                        };
+
+                        match last {
+                            Ok(rows) => Ok(Err(format!(
+                                "expected CHECK constraint failure, but INSERT succeeded with rows {rows:?}"
+                            ))),
+                            Err(LimboError::Constraint(_)) => Ok(Ok(())),
+                            Err(err)
+                                if err
+                                    .to_string()
+                                    .to_lowercase()
+                                    .contains("check constraint failed") =>
+                            {
+                                Ok(Ok(()))
+                            }
+                            Err(err) => Ok(Err(format!(
+                                "expected CHECK constraint failure, got: {err}"
+                            ))),
+                        }
+                    },
+                    vec![table_dependency],
+                ));
+
+                vec![
+                    InteractionBuilder::with_interaction(InteractionType::Query(create)),
+                    InteractionBuilder::with_interaction(InteractionType::Query(alter)),
+                    {
+                        let mut builder = InteractionBuilder::with_interaction(
+                            InteractionType::Query(invalid_insert),
+                        );
+                        builder.ignore_error(true);
+                        builder
+                    },
+                    InteractionBuilder::with_interaction(assertion),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Drop(
+                        Drop {
+                            table: table.clone(),
+                        },
+                    ))),
+                ]
             }
             Property::WhereTrueFalseNull { select, predicate } => {
                 let tables_dependencies = select.dependencies().into_iter().collect::<Vec<_>>();
@@ -1887,6 +1985,19 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_alter_column_check_constraint<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    Property::AlterColumnCheckConstraint {
+        table: Name::arbitrary(rng, ctx).0,
+        old_column: Name::arbitrary(rng, ctx).0,
+        new_column: Name::arbitrary(rng, ctx).0,
+    }
+}
+
 type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
@@ -1914,6 +2025,9 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
+            PropertyDiscriminants::AlterColumnCheckConstraint => {
+                property_alter_column_check_constraint
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
             }
@@ -2033,6 +2147,11 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::AlterColumnCheckConstraint => remaining
+                .create
+                .min(remaining.alter_table)
+                .min(remaining.insert)
+                .max(1),
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
@@ -2074,6 +2193,9 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
+            PropertyDiscriminants::AlterColumnCheckConstraint => QueryCapabilities::CREATE
+                .union(QueryCapabilities::ALTER_TABLE)
+                .union(QueryCapabilities::INSERT),
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
         }
     }

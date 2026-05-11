@@ -6,7 +6,7 @@ use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, Schema, Table, SCHEMA_TABLE_NAME,
+    render_gencol_expr_sql_with_new_names, CheckConstraint, Schema, Table, SCHEMA_TABLE_NAME,
     SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
@@ -12942,6 +12942,25 @@ pub fn op_alter_column(
     });
     let new_column = crate::schema::Column::try_from(definition.as_ref())?;
     let new_name = definition.col_name.as_str().to_owned();
+    let replacement_check_constraints: Vec<CheckConstraint> = if *rename {
+        Vec::new()
+    } else {
+        definition
+            .constraints
+            .iter()
+            .filter_map(|constraint| {
+                if let ast::ColumnConstraint::Check(expr) = &constraint.constraint {
+                    Some(CheckConstraint::new(
+                        constraint.name.as_ref(),
+                        expr,
+                        Some(&new_name),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
 
     let view_rewrites: Vec<(usize, String, RewrittenView)> = if *rename {
         let target_db_name = conn.get_database_name_by_index(*db).ok_or_else(|| {
@@ -13067,15 +13086,30 @@ pub fn op_alter_column(
             }
         }
 
-        // Update CHECK constraint expressions to reference the new column name
+        // Update CHECK constraint metadata to match the new column definition.
         let old_col_normalized = normalize_ident(&old_column_name);
-        for check in &mut btree.check_constraints {
-            rename_identifiers(&mut check.expr, &old_col_normalized, &new_name);
-            if let Some(ref mut col) = check.column {
-                if col.eq_ignore_ascii_case(&old_column_name) {
-                    col.clone_from(&new_name);
+        if *rename {
+            for check in &mut btree.check_constraints {
+                rename_identifiers(&mut check.expr, &old_col_normalized, &new_name);
+                if let Some(ref mut col) = check.column {
+                    if col.eq_ignore_ascii_case(&old_column_name) {
+                        col.clone_from(&new_name);
+                    }
                 }
             }
+        } else {
+            btree.check_constraints.retain(|check| {
+                check
+                    .column
+                    .as_ref()
+                    .is_none_or(|column| normalize_ident(column) != old_col_normalized)
+            });
+            for check in &mut btree.check_constraints {
+                rename_identifiers(&mut check.expr, &old_col_normalized, &new_name);
+            }
+            btree
+                .check_constraints
+                .extend(replacement_check_constraints.clone());
         }
 
         // Maintain rowid-alias bit after change/rename (INTEGER PRIMARY KEY)

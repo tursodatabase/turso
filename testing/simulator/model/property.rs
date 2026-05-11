@@ -182,6 +182,18 @@ pub enum Property {
     FaultyQuery {
         query: Query,
     },
+    /// AlterColumnCheckConstraint verifies that adding a column CHECK through
+    /// ALTER COLUMN updates the active connection's constraint metadata.
+    ///
+    /// Execution:
+    ///     CREATE TABLE <t>(<old> INTEGER)
+    ///     ALTER TABLE <t> ALTER COLUMN <old> TO <new> INTEGER CHECK(<new> > 0)
+    ///     INSERT INTO <t> VALUES(-1) -> Error
+    AlterColumnCheckConstraint {
+        table: String,
+        old_column: String,
+        new_column: String,
+    },
     /// SavepointRollback wraps random write interactions in a named savepoint,
     /// rolls them back, then checks that the database still matches the shadow
     /// model. This targets pager/WAL/cache-spill bugs where rolled-back page
@@ -238,6 +250,7 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::AlterColumnCheckConstraint { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => None,
         }
