@@ -2198,7 +2198,16 @@ impl Connection {
                     .map(|temp_db| temp_db.pager.clone())
                     .expect("temp database should be initialized after ensure_temp_database"))
             }
-            _ => Ok(self.attached_databases.read().get_pager_by_index(index)),
+            _ => {
+                let attached_databases = self.attached_databases.read();
+                let Some(pager) = attached_databases.get_pager_by_index(index) else {
+                    return Err(LimboError::InternalError(format!(
+                        "database {} is no longer attached",
+                        index
+                    )));
+                };
+                Ok(pager)
+            }
         }
     }
 

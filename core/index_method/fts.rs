@@ -1926,6 +1926,11 @@ impl FtsCursor {
         Err(LimboError::InternalError("no directory initialized".into()))
     }
 
+    fn pager_for_database(&self, conn: &Arc<Connection>) -> Result<Arc<Pager>> {
+        let database_id = self.database_id.unwrap_or(crate::MAIN_DB_ID);
+        conn.get_pager_from_database_index(&database_id)
+    }
+
     /// Internal helper to continue flush_writes state machine
     fn flush_writes_internal(&mut self) -> Result<IOResult<()>> {
         loop {
@@ -2443,8 +2448,6 @@ impl Drop for FtsCursor {
             }
         };
 
-        let pager = conn.pager.load().clone();
-
         // Check if we're already in a flushing state (from commit_and_flush)
         // This can happen when commit_and_flush started a flush but yielded for IO
         // and the cursor is being dropped before the flush completed
@@ -2462,6 +2465,14 @@ impl Drop for FtsCursor {
 
         if is_flushing {
             turso_assert!(conn.is_in_write_tx(), "FTS Drop: in-progress flush abandoned (transaction already committed). pre_commit should have completed the flush.");
+
+            let pager = match self.pager_for_database(&conn) {
+                Ok(pager) => pager,
+                Err(e) => {
+                    tracing::error!("FTS Drop: failed to get pager during flush: {}", e);
+                    return;
+                }
+            };
 
             tracing::debug!("FTS Drop: completing in-progress flush");
             loop {
@@ -2534,6 +2545,14 @@ impl Drop for FtsCursor {
             writes,
             write_idx: 0,
             chunk_idx: Some(0),
+        };
+
+        let pager = match self.pager_for_database(&conn) {
+            Ok(pager) => pager,
+            Err(e) => {
+                tracing::error!("FTS Drop: failed to get pager during pending flush: {}", e);
+                return;
+            }
         };
 
         // Run blocking flush
@@ -2711,7 +2730,7 @@ impl IndexMethodCursor for FtsCursor {
                         );
 
                         // Create HybridBTreeDirectory with catalog and pre-assembled hot files
-                        let pager = conn.pager.load().clone();
+                        let pager = conn.get_pager_from_database_index(&database_id)?;
                         let root_page = self.btree_root_page.ok_or_else(|| {
                             LimboError::InternalError("btree_root_page not set".into())
                         })?;

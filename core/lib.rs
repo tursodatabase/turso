@@ -2601,12 +2601,10 @@ impl DatabaseCatalog {
         }
     }
 
-    fn get_pager_by_index(&self, idx: &usize) -> Arc<Pager> {
-        let (_db, pager) = self
-            .index_to_data
+    fn get_pager_by_index(&self, idx: &usize) -> Option<Arc<Pager>> {
+        self.index_to_data
             .get(idx)
-            .expect("If we are looking up a database by index, it must exist.");
-        pager.clone()
+            .map(|(_db, pager)| pager.clone())
     }
 
     fn add(&mut self, s: &str) -> usize {
