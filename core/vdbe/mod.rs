@@ -192,6 +192,20 @@ enum CommitState {
     },
 }
 
+impl CommitState {
+    fn cleanup_mvcc_checkpoint_state(&mut self) {
+        match self {
+            CommitState::CommittingMvcc { state_machine } => {
+                state_machine.inner_mut().cleanup_mvcc_checkpoint_state()
+            }
+            CommitState::CommittingAttachedMvcc { state_machine, .. } => {
+                state_machine.inner_mut().cleanup_mvcc_checkpoint_state()
+            }
+            CommitState::Ready | CommitState::Committing | CommitState::CommittingAttached => {}
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Register {
     Value(Value),
@@ -810,7 +824,11 @@ impl ProgramState {
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
-        // Reset state machines
+        // A caller can reset or drop a statement after an MVCC auto-checkpoint
+        // has yielded I/O. Waiting for that I/O does not step the nested
+        // CheckpointStateMachine again, so release its checkpoint lock before
+        // replacing commit_state with Ready.
+        self.commit_state.cleanup_mvcc_checkpoint_state();
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
         self.current_collation = None;
@@ -2168,6 +2186,12 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        // MVCC auto-checkpoint is owned by commit_state, not by normal_step().
+        // If its yielded I/O fails, normal_step sees the error before
+        // CommitStateMachine::Checkpoint gets another step, so the checkpoint
+        // state machine cannot run its own error cleanup. abort() is the first
+        // statement cleanup path that still owns that commit_state.
+        state.commit_state.cleanup_mvcc_checkpoint_state();
 
         // VACUUM (and VACUUM INTO) state can own internal helper statements whose drop path
         // releases nested guards. Clean it before checking whether this program

@@ -440,6 +440,53 @@ fn sim_mvcc_faulted_checkpoint_does_not_block_other_connection() -> Result<()> {
     Ok(())
 }
 
+/// Regression protected:
+///
+/// `DELETE FROM t WHERE id = 1` commits its MVCC transaction and then starts an
+/// auto-checkpoint because `mvcc_checkpoint_threshold` is 0. If that checkpoint
+/// yields for WAL I/O and the I/O fails, `Program::normal_step` sees the error
+/// before `CommitStateMachine::Checkpoint` gets another step. Without explicit
+/// cleanup from `Program::abort()` or `ProgramState::reset()`, the checkpoint
+/// write lock stays held and a second connection can get `Database is busy` when
+/// it tries to insert row 2.
+#[test]
+fn sim_mvcc_faulted_auto_checkpoint_does_not_block_other_connection() -> Result<()> {
+    let seed = 211;
+    let io = make_io(seed, 100);
+    let temp_dir = tempfile::TempDir::new()?;
+    let path = temp_dir
+        .path()
+        .join(format!("sim_mvcc_auto_checkpoint_lock_cleanup_{seed}.db"));
+    let path = path.to_str().expect("temp dir path should be valid UTF-8");
+
+    let (conn1, conn2) = open_two_conns(io.clone(), path)?;
+    enable_mvcc(&conn1)?;
+    conn1.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn1.execute("INSERT INTO t VALUES (1, 'a')")?;
+    conn1.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    // Force the DELETE commit to enter CommitStateMachine::Checkpoint.
+    conn1.execute("PRAGMA mvcc_checkpoint_threshold = 0")?;
+
+    // The DELETE commits the MVCC transaction before the auto-checkpoint reports
+    // this WAL fault through ProgramState::io_completions.
+    set_fault(io.as_ref(), true, false);
+    let delete = conn1.execute("DELETE FROM t WHERE id = 1");
+    clear_faults(io.as_ref());
+    assert!(
+        delete.is_err(),
+        "auto-checkpoint should fail while WAL faults are injected"
+    );
+
+    // This insert takes the checkpoint read lock before starting its MVCC
+    // transaction. A leaked checkpoint write lock makes it return Busy.
+    conn2.execute("INSERT INTO t VALUES (2, 'from_conn2')")?;
+    assert_eq!(
+        query_rows(&conn2, io.as_ref())?,
+        vec![(2, "from_conn2".to_string())]
+    );
+    Ok(())
+}
+
 /// What this test checks: A faulted `ALTER TABLE ... RENAME` behaves atomically across restart.
 /// Why this matters: Schema changes should look all-or-nothing to users; half-renamed tables are corruption by another name.
 #[test]

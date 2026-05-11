@@ -1029,6 +1029,15 @@ pub struct DeleteRowStateMachine {
 }
 
 impl<Clock: LogicalClock> CommitStateMachine<Clock> {
+    pub(crate) fn cleanup_mvcc_checkpoint_state(&mut self) {
+        if let CommitState::Checkpoint { state_machine } = &mut self.state {
+            state_machine
+                .lock()
+                .inner_mut()
+                .cleanup_after_external_io_error();
+        }
+    }
+
     fn new(
         state: CommitState<Clock>,
         tx_id: TxID,
