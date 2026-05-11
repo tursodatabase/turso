@@ -560,7 +560,10 @@ fn execute_trigger_commands(
     // Ordinary non-main triggers need unqualified DML targets rewritten into the
     // trigger's schema. Temp-backed triggers intentionally keep unqualified names
     // unresolved so they can follow SQLite's normal temp/main lookup rules.
-    let db_name = if database_id == crate::MAIN_DB_ID || database_id == crate::TEMP_DB_ID {
+    let db_name = if trigger.temporary
+        || database_id == crate::MAIN_DB_ID
+        || database_id == crate::TEMP_DB_ID
+    {
         None
     } else {
         resolver

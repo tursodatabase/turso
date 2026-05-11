@@ -605,6 +605,25 @@ expect {
     1|gone
 }
 
+test temp-trigger-on-attached-table-body-resolves-main {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main_log (id INTEGER);
+    INSERT INTO main_log VALUES (1);
+    CREATE TABLE aux.attached_src (id INTEGER);
+    INSERT INTO aux.attached_src VALUES (10);
+    CREATE TEMP TRIGGER trg_temp_aux BEFORE DELETE ON attached_src
+    BEGIN
+        DELETE FROM main_log WHERE id = 1;
+    END;
+    DELETE FROM aux.attached_src;
+    SELECT COUNT(*) FROM main_log;
+    SELECT COUNT(*) FROM aux.attached_src;
+}
+expect {
+    0
+    0
+}
+
 # Multiple trigger commands all referencing same attached db should work
 test trigger-attached-db-multi-cmd-same-db {
     ATTACH ':memory:' AS aux;
