@@ -455,6 +455,36 @@ expect error {
     CHECK constraint failed
 }
 
+test alter-column-check-validates-existing-rows {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(-1);
+    ALTER TABLE t ALTER COLUMN a TO b INTEGER CHECK(b > 0);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test alter-column-check-enforced-current-connection {
+    CREATE TABLE t(a INTEGER);
+    ALTER TABLE t ALTER COLUMN a TO b INTEGER CHECK(b > 0);
+    INSERT INTO t VALUES(-1);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test alter-column-check-allows-valid-row {
+    CREATE TABLE t(a INTEGER);
+    ALTER TABLE t ALTER COLUMN a TO b INTEGER CHECK(b > 0);
+    INSERT INTO t VALUES(1);
+    SELECT b FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
 # Add column with a foreign key reference and verify schema SQL
 test alter-table-add-column-with-fk-updates-schema {
     CREATE TABLE t(a);

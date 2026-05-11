@@ -6,7 +6,7 @@ use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, Schema, Table, SCHEMA_TABLE_NAME,
+    render_gencol_expr_sql_with_new_names, CheckConstraint, Schema, Table, SCHEMA_TABLE_NAME,
     SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
@@ -13067,13 +13067,36 @@ pub fn op_alter_column(
             }
         }
 
-        // Update CHECK constraint expressions to reference the new column name
+        if !*rename {
+            btree.check_constraints.retain(|c| {
+                c.column
+                    .as_ref()
+                    .is_none_or(|col| !col.eq_ignore_ascii_case(&old_column_name))
+            });
+        }
+
+        // Update CHECK constraint expressions to reference the new column name.
+        // For ALTER COLUMN, this keeps table-level checks and checks attached to
+        // other columns aligned after the column rename while the replaced
+        // column-level checks are rebuilt from the new definition below.
         let old_col_normalized = normalize_ident(&old_column_name);
         for check in &mut btree.check_constraints {
             rename_identifiers(&mut check.expr, &old_col_normalized, &new_name);
             if let Some(ref mut col) = check.column {
                 if col.eq_ignore_ascii_case(&old_column_name) {
                     col.clone_from(&new_name);
+                }
+            }
+        }
+
+        if !*rename {
+            for constraint in &definition.constraints {
+                if let ast::ColumnConstraint::Check(expr) = &constraint.constraint {
+                    btree.check_constraints.push(CheckConstraint::new(
+                        constraint.name.as_ref(),
+                        expr,
+                        Some(&new_name),
+                    ));
                 }
             }
         }

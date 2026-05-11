@@ -1693,9 +1693,33 @@ pub fn translate_alter_table(
 
             let rewritten_table = if rewrites_physical_layout {
                 let mut table = btree.clone();
-                table.columns_mut()[column_index] =
-                    replacement_column.expect("replacement_column must exist for ALTER COLUMN");
+                table.columns_mut()[column_index] = replacement_column
+                    .clone()
+                    .expect("replacement_column must exist for ALTER COLUMN");
                 table.prepare_generated_columns()?;
+                Some(table)
+            } else {
+                None
+            };
+
+            let constraint_validation_table = if !rename {
+                let mut table = btree.clone();
+                table.columns_mut()[column_index] = replacement_column
+                    .clone()
+                    .expect("replacement_column must exist for ALTER COLUMN");
+                table.prepare_generated_columns()?;
+
+                let column_names: Vec<&str> = table
+                    .columns()
+                    .iter()
+                    .filter_map(|c| c.name.as_deref())
+                    .collect();
+                for constraint in &definition.constraints {
+                    if let ast::ColumnConstraint::Check(expr) = &constraint.constraint {
+                        validate_check_expr(expr, &table.name, &column_names, resolver)?;
+                    }
+                }
+
                 Some(table)
             } else {
                 None
@@ -1989,17 +2013,19 @@ pub fn translate_alter_table(
                 });
             }
 
-            if let Some(rewritten_table) = rewritten_table {
+            if let Some(validation_table) = &constraint_validation_table {
                 emit_add_virtual_column_validation(
                     program,
-                    &rewritten_table,
-                    &rewritten_table.columns()[column_index],
+                    validation_table,
+                    &validation_table.columns()[column_index],
                     &definition.constraints,
                     resolver,
                     connection,
                     database_id,
                 )?;
+            }
 
+            if let Some(rewritten_table) = rewritten_table {
                 let original_columns = original_btree.columns();
                 let source_column_by_schema_idx = rewritten_table
                     .columns()
