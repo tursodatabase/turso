@@ -1,7 +1,10 @@
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
 use crate::translate::collate::get_collseq_from_expr;
-use crate::translate::emitter::{select::emit_query, LimitCtx, Resolver, TranslateCtx};
+use crate::translate::emitter::{
+    select::{emit_materialized_build_inputs, emit_query},
+    LimitCtx, Resolver, TranslateCtx,
+};
 use crate::translate::expr::translate_expr;
 use crate::translate::order_by::{custom_type_comparator, sorter_insert};
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
@@ -305,6 +308,11 @@ fn emit_compound_select(
                 }
 
                 emit_explain!(program, true, "UNION ALL".to_owned());
+                right_most_ctx.materialized_build_inputs = emit_materialized_build_inputs(
+                    program,
+                    &right_most_ctx.resolver,
+                    &mut right_most,
+                )?;
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
                 program.pop_current_parent_explain();
                 program.preassign_label_to_next_insn(label_next_select);
@@ -355,6 +363,11 @@ fn emit_compound_select(
                 };
 
                 emit_explain!(program, true, "UNION USING TEMP B-TREE".to_owned());
+                right_most_ctx.materialized_build_inputs = emit_materialized_build_inputs(
+                    program,
+                    &right_most_ctx.resolver,
+                    &mut right_most,
+                )?;
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
                 program.pop_current_parent_explain();
 
@@ -411,6 +424,11 @@ fn emit_compound_select(
                 )?;
 
                 emit_explain!(program, true, "INTERSECT USING TEMP B-TREE".to_owned());
+                right_most_ctx.materialized_build_inputs = emit_materialized_build_inputs(
+                    program,
+                    &right_most_ctx.resolver,
+                    &mut right_most,
+                )?;
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
                 program.pop_current_parent_explain();
                 read_intersect_rows(
@@ -464,6 +482,11 @@ fn emit_compound_select(
                     is_delete: true,
                 };
                 emit_explain!(program, true, "EXCEPT USING TEMP B-TREE".to_owned());
+                right_most_ctx.materialized_build_inputs = emit_materialized_build_inputs(
+                    program,
+                    &right_most_ctx.resolver,
+                    &mut right_most,
+                )?;
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
                 program.pop_current_parent_explain();
                 if new_index {
@@ -489,6 +512,8 @@ fn emit_compound_select(
                 right_most_ctx.reg_offset = offset_reg;
             }
             emit_explain!(program, true, "LEFT-MOST SUBQUERY".to_owned());
+            right_most_ctx.materialized_build_inputs =
+                emit_materialized_build_inputs(program, &right_most_ctx.resolver, &mut right_most)?;
             emit_query(program, &mut right_most, &mut right_most_ctx)?;
             program.pop_current_parent_explain();
         }

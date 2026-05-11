@@ -1,0 +1,132 @@
+@database :memory:
+
+# Regression tests for a 3+ table hash join producing a cross product when
+# the SELECT is wrapped inside a compound (UNION/INTERSECT/EXCEPT), a CTE,
+# or a VIEW. The chained hash build needs the prior join to be materialized
+# into an ephemeral table; the compound/CTE/view emit paths previously
+# bypassed `emit_materialized_build_inputs`, so the second hash build was
+# emitted nested inside the first probe loop without preserving the
+# correlation between the outer probe row and the build it feeds.
+#
+# Without the fix, each of these queries returns rows from the un-joined
+# middle table instead of the single matching row.
+
+setup schema {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    CREATE TABLE t3(z INT);
+    INSERT INTO t1 VALUES (1),(2),(3);
+    INSERT INTO t2 VALUES (2),(3);
+    INSERT INTO t3 VALUES (3);
+}
+
+@setup schema
+test three-table-hash-join-in-union-all {
+    SELECT t1.x FROM t1 JOIN t2 ON t1.x=t2.y JOIN t3 ON t2.y=t3.z
+    UNION ALL
+    SELECT 0;
+}
+expect {
+    3
+    0
+}
+
+@setup schema
+test three-table-hash-join-in-union {
+    SELECT t1.x FROM t1 JOIN t2 ON t1.x=t2.y JOIN t3 ON t2.y=t3.z
+    UNION
+    SELECT 0
+    ORDER BY 1;
+}
+expect {
+    0
+    3
+}
+
+@setup schema
+test three-table-hash-join-in-intersect {
+    SELECT t1.x FROM t1 JOIN t2 ON t1.x=t2.y JOIN t3 ON t2.y=t3.z
+    INTERSECT
+    SELECT 3;
+}
+expect {
+    3
+}
+
+@setup schema
+test three-table-hash-join-in-except {
+    SELECT t1.x FROM t1 JOIN t2 ON t1.x=t2.y JOIN t3 ON t2.y=t3.z
+    EXCEPT
+    SELECT 1;
+}
+expect {
+    3
+}
+
+@setup schema
+test three-table-hash-join-in-cte {
+    WITH cte AS (
+        SELECT t1.x FROM t1 JOIN t2 ON t1.x=t2.y JOIN t3 ON t2.y=t3.z
+    )
+    SELECT * FROM cte;
+}
+expect {
+    3
+}
+
+@setup schema
+test three-table-hash-join-in-view {
+    CREATE VIEW v AS
+        SELECT t1.x FROM t1 JOIN t2 ON t1.x=t2.y JOIN t3 ON t2.y=t3.z;
+    SELECT * FROM v;
+}
+expect {
+    3
+}
+
+# Top-level (non-wrapped) variant for parity — already worked before the fix
+# but pin it down so a future regression in the materialization path is caught
+# both wrapped and unwrapped.
+@setup schema
+test three-table-hash-join-top-level {
+    SELECT t1.x FROM t1 JOIN t2 ON t1.x=t2.y JOIN t3 ON t2.y=t3.z;
+}
+expect {
+    3
+}
+
+# Schema with more rows on each side so a regression that emits a cross
+# product is unmistakable in the diff.
+setup schema-wide {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    CREATE TABLE t3(z INT);
+    INSERT INTO t1 VALUES (1),(2),(3),(4),(5);
+    INSERT INTO t2 VALUES (2),(3),(4),(5);
+    INSERT INTO t3 VALUES (3),(5);
+}
+
+@setup schema-wide
+test three-table-hash-join-wide-cte {
+    WITH cte AS (
+        SELECT t1.x FROM t1 JOIN t2 ON t1.x=t2.y JOIN t3 ON t2.y=t3.z
+    )
+    SELECT x FROM cte ORDER BY x;
+}
+expect {
+    3
+    5
+}
+
+@setup schema-wide
+test three-table-hash-join-wide-union-all {
+    SELECT t1.x FROM t1 JOIN t2 ON t1.x=t2.y JOIN t3 ON t2.y=t3.z
+    UNION ALL
+    SELECT 0
+    ORDER BY 1;
+}
+expect {
+    0
+    3
+    5
+}
