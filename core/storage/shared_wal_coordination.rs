@@ -3349,6 +3349,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "lifetime-lock probe assumes shared lifetime lock; Windows uses process-scoped locks"
+    )]
     fn mapped_shared_wal_coordination_last_process_probe_reacquires_shared_lifetime_lock() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coordination.tshm");
