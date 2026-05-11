@@ -11,6 +11,8 @@ use super::{
         write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
     },
 };
+#[cfg(not(feature = "omit_autovacuum"))]
+use crate::storage::pager::ptrmap::PtrmapType;
 use crate::{
     io::CompletionGroup,
     io_yield_one,
@@ -2672,6 +2674,24 @@ impl BTreeCursor {
             usable_space,
         )?;
         parent_contents.write_rightmost_ptr(new_rightmost_leaf.get().id as u32);
+        #[cfg(not(feature = "omit_autovacuum"))]
+        if self.pager.get_auto_vacuum_mode() == crate::storage::pager::AutoVacuumMode::Full {
+            let parent_id = parent.get().id as u32;
+            self.pager.io.block(|| {
+                self.pager.ptrmap_put(
+                    old_rightmost_leaf.get().id as u32,
+                    PtrmapType::BTreeNode,
+                    parent_id,
+                )
+            })?;
+            self.pager.io.block(|| {
+                self.pager.ptrmap_put(
+                    new_rightmost_leaf.get().id as u32,
+                    PtrmapType::BTreeNode,
+                    parent_id,
+                )
+            })?;
+        }
         // Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
         self.stack.pop();
 

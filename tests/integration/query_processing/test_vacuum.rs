@@ -1,6 +1,7 @@
 use crate::common::{
     compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
-    compute_dbhash_with_options_and_database_opts, do_flush, ExecRows, TempDatabase,
+    compute_dbhash_with_options_and_database_opts, do_flush, sqlite_exec_rows, ExecRows,
+    TempDatabase,
 };
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use rusqlite::Connection as SqliteConnection;
@@ -5544,6 +5545,54 @@ fn test_mvcc_plain_vacuum_preserves_full_autovacuum_after_reopen() -> anyhow::Re
     assert_eq!(scalar_i64(&reopened_conn, "PRAGMA auto_vacuum"), 1);
     assert_eq!(run_integrity_check(&reopened_conn), "ok");
     assert_eq!(scalar_i64(&reopened_conn, "SELECT COUNT(*) FROM t"), 120);
+
+    Ok(())
+}
+
+#[test]
+fn test_full_autovacuum_freelist_reuse_updates_header_at_ptrmap_boundary() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let db_path = temp_dir.path().join("ptrmap-boundary-freelist.db");
+    {
+        let sqlite_conn = SqliteConnection::open(&db_path)?;
+        sqlite_conn.execute_batch(
+            "PRAGMA page_size=512; \
+             PRAGMA auto_vacuum=full; \
+             CREATE TABLE seed(x);",
+        )?;
+    }
+
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let tmp_db = TempDatabase::new_with_existent_with_opts(&db_path, opts);
+    {
+        let conn = tmp_db.connect_limbo();
+        conn.execute(
+            "CREATE TABLE t(x);
+             BEGIN;
+             INSERT INTO t VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
+             INSERT INTO t VALUES (11),(12),(13),(14),(15),(16),(17),(18),(19),(20);
+             INSERT INTO t VALUES (21),(22),(23),(24),(25),(26),(27),(28),(29),(30);
+             INSERT INTO t VALUES (31),(32),(33),(34),(35),(36),(37),(38),(39),(40);
+             INSERT INTO t VALUES (41),(42),(43),(44),(45),(46),(47),(48),(49),(50);
+             INSERT INTO t VALUES (51),(52),(53),(54),(55),(56),(57),(58),(59),(60);
+             INSERT INTO t VALUES (61),(62),(63),(64),(65),(66),(67),(68),(69),(70);
+             INSERT INTO t VALUES (71),(72),(73),(74),(75),(76),(77),(78),(79),(80);
+             INSERT INTO t VALUES (81),(82),(83),(84),(85),(86),(87),(88),(89),(90);
+             INSERT INTO t VALUES (91),(92),(93),(94),(95),(96),(97),(98),(99),(100);
+             DELETE FROM t WHERE x IN (1,2,3);
+             INSERT INTO t VALUES (101),(102),(103),(104),(105);
+             COMMIT;",
+        )?;
+        assert_eq!(run_integrity_check(&conn), "ok");
+        do_flush(&conn, &tmp_db)?;
+    }
+
+    let sqlite_conn = SqliteConnection::open(&db_path)?;
+    assert_eq!(sqlite_scalar_i64(&sqlite_conn, "PRAGMA page_size"), 512);
+    assert_eq!(
+        sqlite_exec_rows(&sqlite_conn, "PRAGMA integrity_check"),
+        vec![vec![rusqlite::types::Value::Text("ok".to_string())]]
+    );
 
     Ok(())
 }

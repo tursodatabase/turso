@@ -1397,12 +1397,14 @@ enum AllocatePageState {
     ///   and set the next trunk page as the database's "first freelist trunk page".
     SearchAvailableFreeListLeaf {
         trunk_page: PageRef,
+        current_db_size: u32,
     },
     /// If a freelist leaf is found, reuse it for the page allocation and remove it from the trunk page.
     ReuseFreelistLeaf {
         trunk_page: PageRef,
         leaf_page: PageRef,
         number_of_freelist_leaves: u32,
+        current_db_size: u32,
     },
     /// If a suitable freelist leaf is not found, allocate an entirely new page.
     AllocateNewPage {
@@ -4826,12 +4828,18 @@ impl Pager {
                     let (trunk_page, c) = self.read_page(first_freelist_trunk_page_id as i64)?;
                     // Pin trunk_page to prevent eviction while stored in state machine
                     trunk_page.pin();
-                    *state = AllocatePageState::SearchAvailableFreeListLeaf { trunk_page };
+                    *state = AllocatePageState::SearchAvailableFreeListLeaf {
+                        trunk_page,
+                        current_db_size: new_db_size,
+                    };
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
                 }
-                AllocatePageState::SearchAvailableFreeListLeaf { trunk_page } => {
+                AllocatePageState::SearchAvailableFreeListLeaf {
+                    trunk_page,
+                    current_db_size,
+                } => {
                     turso_assert!(
                         trunk_page.is_loaded(),
                         "Freelist trunk page is not loaded",
@@ -4865,6 +4873,7 @@ impl Pager {
                             trunk_page: trunk_page.clone(),
                             leaf_page,
                             number_of_freelist_leaves,
+                            current_db_size: *current_db_size,
                         };
                         if let Some(c) = c {
                             io_yield_one!(c);
@@ -4877,6 +4886,7 @@ impl Pager {
                     // Update the database's first freelist trunk page to the next trunk page (may be 0 if there are no more trunk pages).
                     header.freelist_trunk_page = next_trunk_page_id.into();
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
+                    header.database_size = (*current_db_size).into();
                     self.add_dirty(trunk_page)?;
                     // zero out the page
                     turso_assert!(
@@ -4904,6 +4914,7 @@ impl Pager {
                     trunk_page,
                     leaf_page,
                     number_of_freelist_leaves,
+                    current_db_size,
                 } => {
                     turso_assert!(
                         leaf_page.is_loaded(),
@@ -4953,6 +4964,7 @@ impl Pager {
                     );
 
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
+                    header.database_size = (*current_db_size).into();
                     // Unpin both pages before returning - caller takes ownership of leaf_page
                     trunk_page.unpin();
                     leaf_page.unpin();
