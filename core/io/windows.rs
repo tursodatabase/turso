@@ -395,6 +395,14 @@ impl File for WindowsFile {
 
         if result == FALSE {
             let err = std::io::Error::last_os_error();
+            // ERROR_NOT_LOCKED (158): the byte-range is already unlocked.
+            // POSIX `flock`/`fcntl` treat releasing an unlocked region as a
+            // no-op; match that here so callers (notably the simulator's
+            // `Drop for SimulatorFile`) don't see a spurious error when a
+            // file is dropped without ever being locked.
+            if err.raw_os_error() == Some(158) {
+                return Ok(());
+            }
             return Err(LimboError::LockingError(format!(
                 "Failed to release file lock: {err}"
             )));

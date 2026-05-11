@@ -270,7 +270,12 @@ impl File for SimulatorFile {
 
 impl Drop for SimulatorFile {
     fn drop(&mut self) {
-        self.inner.unlock_file().expect("Failed to unlock file");
+        // Drop must never panic. Log unlock failures instead of `.expect`;
+        // the underlying lock will be released by the OS when the handle
+        // closes regardless.
+        if let Err(e) = self.inner.unlock_file() {
+            tracing::warn!("SimulatorFile drop: unlock_file failed: {e:?}");
+        }
     }
 }
 
