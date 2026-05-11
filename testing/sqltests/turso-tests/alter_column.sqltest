@@ -20,6 +20,7 @@ expect error {
     CHECK constraint failed
 }
 
+@skip-if mvcc "integrity_check does not validate newly written MVCC rows"
 test alter-column-new-check-visible-to-integrity-check {
     CREATE TABLE t (a INTEGER);
     INSERT INTO t VALUES(-1);

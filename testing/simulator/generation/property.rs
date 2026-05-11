@@ -2147,11 +2147,23 @@ impl PropertyDiscriminants {
                     0
                 }
             }
-            PropertyDiscriminants::AlterColumnCheckConstraint => remaining
-                .create
-                .min(remaining.alter_table)
-                .min(remaining.insert)
-                .max(1),
+            PropertyDiscriminants::AlterColumnCheckConstraint => {
+                if ctx.opts().query.alter_table.alter_column
+                    && remaining.create > 0
+                    && remaining.alter_table > 0
+                    && remaining.insert > 0
+                    && remaining.drop > 0
+                {
+                    remaining
+                        .create
+                        .min(remaining.alter_table)
+                        .min(remaining.insert)
+                        .min(remaining.drop)
+                        .max(1)
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
@@ -2195,7 +2207,8 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
             PropertyDiscriminants::AlterColumnCheckConstraint => QueryCapabilities::CREATE
                 .union(QueryCapabilities::ALTER_TABLE)
-                .union(QueryCapabilities::INSERT),
+                .union(QueryCapabilities::INSERT)
+                .union(QueryCapabilities::DROP),
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
         }
     }
