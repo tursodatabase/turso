@@ -2383,8 +2383,32 @@ impl Program {
                         "RaiseIgnore should be caught by op_program, not reach abort"
                     );
                 }
+                // Errors that fundamentally invalidate the transaction always
+                // force a whole-tx rollback regardless of autocommit, mirroring
+                // SQLite's BUSY_SNAPSHOT contract for MVCC. After the
+                // rollback the connection is in autocommit, so the caller's
+                // next statement runs as a fresh autocommit statement
+                // (matching `SQLITE_BUSY` post-rollback semantics).
+                Some(LimboError::WriteWriteConflict)
+                | Some(LimboError::SchemaConflict)
+                | Some(LimboError::CommitDependencyAborted) => {
+                    self.rollback_current_txn(pager);
+                    self.connection.auto_commit.store(true, Ordering::SeqCst);
+                }
                 _ => {
-                    if state.auto_txn_cleanup != TxnCleanup::None || err.is_some() {
+                    // Default: SQLite-shape statement-level rollback. The
+                    // statement's own savepoint was already rolled back above
+                    // (the `is_fail_constraint` block at the top of this
+                    // branch). The enclosing transaction stays open; the
+                    // caller decides whether to ROLLBACK explicitly or
+                    // continue. Only roll back the whole transaction when
+                    // we were already in autocommit (no explicit BEGIN to
+                    // preserve) or when a caller explicitly opted in via
+                    // `state.auto_txn_cleanup`.
+                    let was_autocommit = self.connection.get_auto_commit();
+                    if state.auto_txn_cleanup != TxnCleanup::None
+                        || (err.is_some() && was_autocommit)
+                    {
                         self.rollback_current_txn(pager);
                     }
                 }

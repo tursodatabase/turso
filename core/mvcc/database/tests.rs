@@ -10348,3 +10348,62 @@ fn fault_at_after_remove_tx_releases_exclusive_lock() {
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
     assert_eq!(rows[1][0].as_int().unwrap(), 2);
 }
+
+/// A statement-level runtime error inside an explicit `BEGIN[ CONCURRENT]`
+/// must not whole-tx-rollback the user's transaction. Today,
+/// `Program::abort`'s `_` default arm in `core/vdbe/mod.rs` calls
+/// `self.rollback_current_txn(pager)` for every unmatched error class,
+/// and `rollback_current_txn_state` then flips `auto_commit` back to
+/// true. Follow-up statements silently run in autocommit and commit
+/// durably, leaving the user in a state where `ROLLBACK` reports "no
+/// transaction is active" and the silently-committed rows survive.
+///
+/// SQLite-shape behaviour: a statement error leaves the enclosing
+/// transaction open. Subsequent statements participate in the same
+/// transaction. An explicit `ROLLBACK` rolls everything back. The
+/// cursor failure injected here is the in-test analogue of, for example,
+/// an internal/IO error raised by a btree read mid-scan — those are
+/// statement-level in SQLite, not transaction-level.
+#[test]
+fn cursor_failure_inside_begin_concurrent_keeps_transaction_open() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INT)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    conn.set_failure_injector(Some(FixedFailureInjector::new([(
+        CursorYieldPoint::NextStart.point(),
+        LimboError::InternalError("simulated cursor failure".to_string()),
+    )])));
+
+    let select_err = conn
+        .prepare("SELECT * FROM t")
+        .and_then(|mut s| s.run_collect_rows())
+        .expect_err("injected cursor failure must surface");
+    assert!(
+        matches!(select_err, LimboError::InternalError(_)),
+        "got {select_err:?}"
+    );
+    conn.set_failure_injector(None);
+
+    // SQLite-shape: the transaction is still open after the
+    // statement-level error. This INSERT runs inside the BC and its
+    // row is pending — not yet committed.
+    conn.execute("INSERT INTO t VALUES (2, 200)")
+        .expect("BC should still be open after statement-level error");
+
+    // ROLLBACK closes the BC and undoes the pending INSERT.
+    conn.execute("ROLLBACK")
+        .expect("explicit ROLLBACK must succeed; transaction must still have been open");
+
+    let rows = get_rows(&conn, "SELECT id FROM t ORDER BY id");
+    let ids: Vec<i64> = rows.iter().map(|r| r[0].as_int().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec![1],
+        "INSERT (2, 200) must have been rolled back with the rest of the BC; got ids {ids:?}"
+    );
+}

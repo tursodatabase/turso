@@ -1092,4 +1092,60 @@ mod tests {
             "cumulative metrics should include root and trigger writes"
         );
     }
+
+    /// Non-MVCC counterpart to
+    /// `cursor_failure_inside_begin_concurrent_keeps_transaction_open`. A
+    /// runtime error during a statement inside an explicit `BEGIN` must not
+    /// whole-tx-rollback the user's transaction. `abs(i64::MIN)` raises
+    /// `LimboError::IntegerOverflow`, which is not special-cased in
+    /// `Program::abort`'s match — it falls into the `_` default arm. Before
+    /// the SQLite-shape fix, that arm called `rollback_current_txn`, which
+    /// flipped `auto_commit` to true; the follow-up `INSERT` then ran in
+    /// autocommit and committed durably, and the trailing `ROLLBACK` errored
+    /// "no transaction is active". This regression exercises the WAL path
+    /// to prove the fix covers both journal modes.
+    #[test]
+    fn integer_overflow_inside_explicit_begin_keeps_transaction_open() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(x INT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+
+        // abs(i64::MIN) overflows and returns LimboError::IntegerOverflow,
+        // which the abort match in vdbe/mod.rs routes through the `_`
+        // default arm.
+        let err = conn
+            .prepare("SELECT abs(-9223372036854775808)")
+            .and_then(|mut s| s.run_collect_rows())
+            .expect_err("integer overflow must surface");
+        assert!(
+            matches!(err, crate::LimboError::IntegerOverflow),
+            "got {err:?}"
+        );
+
+        // SQLite-shape: the transaction is still open after the
+        // statement-level error. This INSERT participates in the BEGIN.
+        conn.execute("INSERT INTO t VALUES (2)")
+            .expect("BEGIN should still be open after statement-level error");
+
+        // ROLLBACK closes the BEGIN and undoes the pending INSERT.
+        conn.execute("ROLLBACK")
+            .expect("explicit ROLLBACK must succeed; transaction must still have been open");
+
+        let mut stmt = conn.prepare("SELECT x FROM t ORDER BY x").unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        let xs: Vec<i64> = rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Numeric(crate::Numeric::Integer(i)) => *i,
+                v => panic!("expected integer, got {v:?}"),
+            })
+            .collect();
+        assert_eq!(
+            xs,
+            vec![1],
+            "INSERT (2) must have been rolled back with the rest of the BEGIN; got {xs:?}"
+        );
+    }
 }
