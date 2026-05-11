@@ -1225,6 +1225,7 @@ pub fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
             columns,
             rows: vec![],
             indexes: vec![],
+            strict: false,
         };
 
         schema.push(Create { table });

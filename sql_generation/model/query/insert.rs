@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
+use turso_parser::ast::ResolveType;
 
 use crate::model::table::SimValue;
 
@@ -23,6 +24,8 @@ pub enum Insert {
     Values {
         table: String,
         values: Vec<Vec<SimValue>>,
+        #[serde(default)]
+        or_conflict: Option<ResolveType>,
         #[serde(default)]
         on_conflict: Option<OnConflict>,
     },
@@ -53,9 +56,20 @@ impl Display for Insert {
             Insert::Values {
                 table,
                 values,
+                or_conflict,
                 on_conflict,
             } => {
-                write!(f, "INSERT INTO {table} VALUES ")?;
+                write!(f, "INSERT")?;
+                if let Some(or_conflict) = or_conflict {
+                    match or_conflict {
+                        ResolveType::Rollback => write!(f, " OR ROLLBACK")?,
+                        ResolveType::Abort => write!(f, " OR ABORT")?,
+                        ResolveType::Fail => write!(f, " OR FAIL")?,
+                        ResolveType::Ignore => write!(f, " OR IGNORE")?,
+                        ResolveType::Replace => write!(f, " OR REPLACE")?,
+                    }
+                }
+                write!(f, " INTO {table} VALUES ")?;
                 for (i, row) in values.iter().enumerate() {
                     if i != 0 {
                         write!(f, ", ")?;

@@ -2001,14 +2001,19 @@ pub fn op_type_check(
                             b"REAL" if value_type == ValueType::Float => {}
                             b"BLOB" if value_type == ValueType::Blob => {}
                             b"TEXT" if value_type == ValueType::Text => {}
-                            _ => bail_constraint_error!(
-                                "cannot store {} value in {} column {}.{} ({})",
-                                value_type,
-                                ty_str,
-                                &table_reference.name,
-                                col.name.as_deref().unwrap_or(""),
-                                SQLITE_CONSTRAINT
-                            ),
+                            _ => {
+                                return Err(LimboError::Raise(
+                                    ResolveType::Abort,
+                                    format!(
+                                        "cannot store {} value in {} column {}.{} ({})",
+                                        value_type,
+                                        ty_str,
+                                        &table_reference.name,
+                                        col.name.as_deref().unwrap_or(""),
+                                        SQLITE_CONSTRAINT
+                                    ),
+                                ));
+                            }
                         });
                     }
                 });

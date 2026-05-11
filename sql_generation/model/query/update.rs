@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
+use turso_parser::ast::ResolveType;
 
 use crate::model::table::SimValue;
 
@@ -41,6 +42,8 @@ impl Display for SetValue {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Update {
+    #[serde(default)]
+    pub or_conflict: Option<ResolveType>,
     pub table: String,
     pub set_values: Vec<(String, SetValue)>, // Pair of value for set expressions => SET name=value
     pub predicate: Predicate,
@@ -54,7 +57,17 @@ impl Update {
 
 impl Display for Update {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "UPDATE {} SET ", self.table)?;
+        write!(f, "UPDATE")?;
+        if let Some(or_conflict) = self.or_conflict {
+            match or_conflict {
+                ResolveType::Rollback => write!(f, " OR ROLLBACK")?,
+                ResolveType::Abort => write!(f, " OR ABORT")?,
+                ResolveType::Fail => write!(f, " OR FAIL")?,
+                ResolveType::Ignore => write!(f, " OR IGNORE")?,
+                ResolveType::Replace => write!(f, " OR REPLACE")?,
+            }
+        }
+        write!(f, " {} SET ", self.table)?;
         for (i, (name, value)) in self.set_values.iter().enumerate() {
             if i != 0 {
                 write!(f, ", ")?;

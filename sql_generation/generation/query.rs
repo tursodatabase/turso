@@ -379,6 +379,7 @@ fn gen_insert_values<R: Rng + ?Sized, C: GenerationContext>(
     Some(Insert::Values {
         table: table.name.clone(),
         values,
+        or_conflict: None,
         on_conflict: None,
     })
 }
@@ -547,6 +548,7 @@ fn gen_insert_upsert_values<R: Rng + ?Sized, C: GenerationContext>(
     Some(Insert::Values {
         table: table.name.clone(),
         values: vec![row],
+        or_conflict: None,
         on_conflict: Some(OnConflict {
             target_column: target_col.name.clone(),
             assignments,
@@ -740,6 +742,7 @@ impl Arbitrary for Update {
         };
 
         Update {
+            or_conflict: None,
             table: table.name.clone(),
             set_values,
             predicate,

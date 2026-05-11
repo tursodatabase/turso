@@ -666,6 +666,7 @@ impl Shadow for Insert {
             Insert::Values {
                 table,
                 values,
+                or_conflict: _,
                 on_conflict,
             } => {
                 let table_name = table.clone();

@@ -50,6 +50,7 @@ impl Table {
             name,
             columns: Vec::from_iter(column_set),
             indexes: vec![],
+            strict: false,
         }
     }
 }
@@ -95,6 +96,7 @@ impl Arbitrary for Table {
                 name,
                 columns,
                 indexes: vec![],
+                strict: false,
             }
         } else {
             Table::arbitrary_with_columns(rng, context, name, vec![])

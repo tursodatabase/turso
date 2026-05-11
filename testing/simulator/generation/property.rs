@@ -19,7 +19,7 @@ use sql_generation::{
             transaction::{Begin, Commit, Rollback},
             update::{SetValue, Update},
         },
-        table::{ColumnType, SimValue, Table},
+        table::{Column, ColumnType, SimValue, Table},
     },
 };
 use strum::IntoEnumIterator;
@@ -90,6 +90,7 @@ impl Property {
                             table: t,
                             set_values: _,
                             predicate,
+                            ..
                         }) if t == &table.name && predicate.test(row, table) => {
                             // The inserted row will not be updated.
                             None
@@ -247,6 +248,7 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::StrictOrFailTypeCheckNoPartialCommit { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => {
                 unreachable!("No extensional queries")
@@ -466,6 +468,139 @@ impl Property {
                     InteractionBuilder::with_interaction(assertion),
                 ]
             }
+            Property::StrictOrFailTypeCheckNoPartialCommit {
+                create,
+                failing_insert,
+                insert,
+                update,
+                select_before,
+                select_after,
+            } => {
+                let table = update.table().to_string();
+                let create_interaction =
+                    InteractionType::Query(Query::Create(create.as_ref().clone()));
+                let failing_insert_interaction =
+                    InteractionType::Query(Query::Insert(failing_insert.as_ref().clone()));
+                let insert_interaction =
+                    InteractionType::Query(Query::Insert(insert.as_ref().clone()));
+                let select_empty_interaction =
+                    InteractionType::Query(Query::Select(select_before.as_ref().clone()));
+                let before_interaction =
+                    InteractionType::Query(Query::Select(select_before.as_ref().clone()));
+                let update_interaction =
+                    InteractionType::Query(Query::Update(update.as_ref().clone()));
+                let after_interaction =
+                    InteractionType::Query(Query::Select(select_after.as_ref().clone()));
+
+                let insert_assertion = InteractionType::Assertion(Assertion::new(
+                    format!(
+                        "STRICT datatype error does not commit partial INSERT OR FAIL on {table}"
+                    ),
+                    move |stack: &Vec<ResultSet>, _| {
+                        if stack.len() < 2 {
+                            return Err(LimboError::InternalError(
+                                "StrictOrFailTypeCheckNoPartialCommit: expected INSERT result and SELECT result on stack"
+                                    .into(),
+                            ));
+                        }
+                        let insert_result = &stack[stack.len() - 2];
+                        let after_insert = &stack[stack.len() - 1];
+
+                        if insert_result.is_ok() {
+                            return Ok(Err(
+                                "INSERT OR FAIL with STRICT datatype mismatch succeeded"
+                                    .to_string(),
+                            ));
+                        }
+
+                        match after_insert {
+                            Ok(rows) if rows.is_empty() => Ok(Ok(())),
+                            Ok(rows) => {
+                                print_diff(&[], rows, "expected empty", "after insert");
+                                Ok(Err(format!(
+                                    "STRICT datatype error committed {} row(s) from INSERT OR FAIL",
+                                    rows.len()
+                                )))
+                            }
+                            Err(e) => Err(LimboError::InternalError(format!(
+                                "SELECT failed after INSERT OR FAIL: {e}"
+                            ))),
+                        }
+                    },
+                    vec![],
+                ));
+
+                let assertion = InteractionType::Assertion(Assertion::new(
+                    format!(
+                        "STRICT datatype error does not commit partial UPDATE OR FAIL on {table}"
+                    ),
+                    move |stack: &Vec<ResultSet>, _| {
+                        if stack.len() < 3 {
+                            return Err(LimboError::InternalError(
+                                "StrictOrFailTypeCheckNoPartialCommit: expected before, UPDATE result, and after results on stack"
+                                    .into(),
+                            ));
+                        }
+                        let before = &stack[stack.len() - 3];
+                        let update_result = &stack[stack.len() - 2];
+                        let after = &stack[stack.len() - 1];
+
+                        if update_result.is_ok() {
+                            return Ok(Err(
+                                "UPDATE OR FAIL with STRICT datatype mismatch succeeded"
+                                    .to_string(),
+                            ));
+                        }
+
+                        match (before, after) {
+                            (Ok(before_rows), Ok(after_rows)) => {
+                                let rows_equal_as_multiset =
+                                    |a: &[Vec<SimValue>], b: &[Vec<SimValue>]| {
+                                        if a.len() != b.len() {
+                                            return false;
+                                        }
+                                        let count_in =
+                                            |row: &Vec<SimValue>, set: &[Vec<SimValue>]| {
+                                                set.iter().filter(|r| *r == row).count()
+                                            };
+                                        a.iter().all(|row| count_in(row, a) == count_in(row, b))
+                                    };
+                                if !rows_equal_as_multiset(before_rows, after_rows) {
+                                    print_diff(before_rows, after_rows, "before", "after");
+                                    return Ok(Err(format!(
+                                        "STRICT datatype error changed rows: {} rows before, {} after",
+                                        before_rows.len(),
+                                        after_rows.len()
+                                    )));
+                                }
+                                Ok(Ok(()))
+                            }
+                            (Err(e), _) | (_, Err(e)) => {
+                                Err(LimboError::InternalError(format!("SELECT failed: {e}")))
+                            }
+                        }
+                    },
+                    vec![],
+                ));
+
+                let mut failing_insert_builder =
+                    InteractionBuilder::with_interaction(failing_insert_interaction);
+                failing_insert_builder.ignore_error(true);
+                let mut update_builder = InteractionBuilder::with_interaction(update_interaction);
+                update_builder.ignore_error(true);
+
+                vec![
+                    InteractionBuilder::with_interaction(create_interaction),
+                    failing_insert_builder,
+                    InteractionBuilder::with_interaction(select_empty_interaction),
+                    InteractionBuilder::with_interaction(insert_assertion),
+                    InteractionBuilder::with_interaction(insert_interaction),
+                    InteractionBuilder::with_interaction(before_interaction),
+                    update_builder,
+                    InteractionBuilder::with_interaction(after_interaction),
+                    InteractionBuilder::with_interaction(assertion),
+                ]
+            }
             Property::InsertValuesSelect {
                 insert,
                 row_index,
@@ -477,6 +612,7 @@ impl Property {
                     table,
                     values,
                     on_conflict: None,
+                    ..
                 } = insert
                 {
                     (table, values)
@@ -1308,6 +1444,7 @@ fn random_main_table_insert<R: rand::Rng + ?Sized>(
     Query::Insert(Insert::Values {
         table: table.name.clone(),
         values,
+        or_conflict: None,
         on_conflict: None,
     })
 }
@@ -1360,6 +1497,7 @@ fn random_main_table_update<R: rand::Rng + ?Sized>(
         };
 
         return Query::Update(Update {
+            or_conflict: None,
             table: table.name.clone(),
             set_values: vec![
                 (marker_col.name.clone(), SetValue::Simple(marker_value)),
@@ -1393,6 +1531,7 @@ fn random_main_table_update<R: rand::Rng + ?Sized>(
     };
 
     Query::Update(Update {
+        or_conflict: None,
         table: table.name.clone(),
         set_values: vec![(column.name.clone(), SetValue::Simple(value))],
         predicate: if rng.random_bool(0.8) {
@@ -1567,6 +1706,7 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
     let insert_query = Query::Insert(Insert::Values {
         table: table.name.clone(),
         values: rows,
+        or_conflict: None,
         on_conflict: None,
     });
 
@@ -1642,6 +1782,115 @@ fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
         update,
         select_before: select.clone(),
         select_after: select,
+    }
+}
+
+fn property_strict_or_fail_type_check_no_partial_commit<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    _ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    let table_name = format!("strict_or_fail_{}", rng.random_range(0..1_000_000_000u32));
+    let table = Table {
+        name: table_name.clone(),
+        strict: true,
+        rows: vec![],
+        indexes: vec![],
+        columns: vec![
+            Column {
+                name: "id".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![ast::ColumnConstraint::PrimaryKey {
+                    order: None,
+                    conflict_clause: None,
+                    auto_increment: false,
+                }],
+            },
+            Column {
+                name: "a".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![],
+            },
+            Column {
+                name: "b".to_string(),
+                column_type: ColumnType::Text,
+                constraints: vec![],
+            },
+        ],
+    };
+
+    let create = Create { table };
+    let failing_insert = Insert::Values {
+        table: table_name.clone(),
+        values: vec![
+            vec![
+                SimValue(turso_core::Value::from_i64(1)),
+                SimValue(turso_core::Value::from_i64(1)),
+                SimValue(turso_core::Value::build_text("one")),
+            ],
+            vec![
+                SimValue(turso_core::Value::from_i64(2)),
+                SimValue(turso_core::Value::build_text("bad")),
+                SimValue(turso_core::Value::build_text("two")),
+            ],
+            vec![
+                SimValue(turso_core::Value::from_i64(3)),
+                SimValue(turso_core::Value::from_i64(3)),
+                SimValue(turso_core::Value::build_text("three")),
+            ],
+        ],
+        or_conflict: Some(ast::ResolveType::Fail),
+        on_conflict: None,
+    };
+    let insert = Insert::Values {
+        table: table_name.clone(),
+        values: vec![
+            vec![
+                SimValue(turso_core::Value::from_i64(1)),
+                SimValue(turso_core::Value::from_i64(1)),
+                SimValue(turso_core::Value::build_text("one")),
+            ],
+            vec![
+                SimValue(turso_core::Value::from_i64(2)),
+                SimValue(turso_core::Value::from_i64(2)),
+                SimValue(turso_core::Value::build_text("two")),
+            ],
+        ],
+        or_conflict: None,
+        on_conflict: None,
+    };
+    let update = Update {
+        or_conflict: Some(ast::ResolveType::Fail),
+        table: table_name.clone(),
+        set_values: vec![
+            (
+                "b".to_string(),
+                SetValue::Simple(SimValue(turso_core::Value::build_text("changed"))),
+            ),
+            (
+                "a".to_string(),
+                SetValue::CaseWhen {
+                    condition: Box::new(Predicate::eq(
+                        Predicate::column("id".to_string()),
+                        Predicate::value(SimValue(turso_core::Value::from_i64(2))),
+                    )),
+                    then_value: SimValue(turso_core::Value::build_text("bad")),
+                    else_column: "a".to_string(),
+                },
+            ),
+        ],
+        predicate: Predicate::true_(),
+    };
+    let select = Select::simple(table_name, Predicate::true_());
+
+    Property::StrictOrFailTypeCheckNoPartialCommit {
+        create: Box::new(create),
+        failing_insert: Box::new(failing_insert),
+        insert: Box::new(insert),
+        update: Box::new(update),
+        select_before: Box::new(select.clone()),
+        select_after: Box::new(select),
     }
 }
 
@@ -1898,6 +2147,9 @@ impl PropertyDiscriminants {
         match self {
             PropertyDiscriminants::InsertValuesSelect => property_insert_values_select,
             PropertyDiscriminants::ReadYourUpdatesBack => property_read_your_updates_back,
+            PropertyDiscriminants::StrictOrFailTypeCheckNoPartialCommit => {
+                property_strict_or_fail_type_check_no_partial_commit
+            }
             PropertyDiscriminants::SavepointRollback => property_savepoint_rollback,
             PropertyDiscriminants::TableHasExpectedContent => property_table_has_expected_content,
             PropertyDiscriminants::AllTableHaveExpectedContent => {
@@ -1944,6 +2196,13 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::ReadYourUpdatesBack => {
                 if remaining.select > 0 && remaining.update > 0 {
                     u32::min(remaining.select, remaining.update).max(1)
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::StrictOrFailTypeCheckNoPartialCommit => {
+                if remaining.create > 0 {
+                    100
                 } else {
                     0
                 }
@@ -2057,6 +2316,12 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::ReadYourUpdatesBack => {
                 QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
+            }
+            PropertyDiscriminants::StrictOrFailTypeCheckNoPartialCommit => {
+                QueryCapabilities::CREATE
+                    .union(QueryCapabilities::INSERT)
+                    .union(QueryCapabilities::UPDATE)
+                    .union(QueryCapabilities::SELECT)
             }
             PropertyDiscriminants::SavepointRollback => QueryCapabilities::INSERT,
             PropertyDiscriminants::TableHasExpectedContent => QueryCapabilities::SELECT,

@@ -51,6 +51,16 @@ pub enum Property {
         select_before: Select,
         select_after: Select,
     },
+    /// StrictOrFailTypeCheckNoPartialCommit verifies that STRICT datatype constraint
+    /// failures do not commit partial statement writes in autocommit mode.
+    StrictOrFailTypeCheckNoPartialCommit {
+        create: Box<Create>,
+        failing_insert: Box<Insert>,
+        insert: Box<Insert>,
+        update: Box<Update>,
+        select_before: Box<Select>,
+        select_after: Box<Select>,
+    },
     /// TableHasExpectedContent is a property in which the table
     /// must have the expected content, i.e. all the insertions and
     /// updates and deletions should have been persisted in the way
@@ -238,6 +248,7 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::StrictOrFailTypeCheckNoPartialCommit { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => None,
         }
