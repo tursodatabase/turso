@@ -212,6 +212,95 @@ pub(crate) fn mark_shared_cte_materialization_requirements(
     }
 }
 
+fn outer_query_refs_for(referenced_tables: &TableReferences) -> Vec<OuterQueryReference> {
+    referenced_tables
+        .joined_tables()
+        .iter()
+        .map(|t| {
+            // Extract cte_id from FromClauseSubquery if this is a CTE reference
+            let cte_id = match &t.table {
+                Table::FromClauseSubquery(subq) => subq.cte_id(),
+                _ => None,
+            };
+            OuterQueryReference {
+                table: t.table.clone(),
+                identifier: t.identifier.clone(),
+                internal_id: t.internal_id,
+                using_dedup_hidden_cols: t.using_dedup_hidden_cols(),
+                col_used_mask: ColumnUsedMask::default(),
+                cte_select: None,
+                cte_explicit_columns: vec![],
+                cte_id,
+                cte_definition_only: false,
+                rowid_referenced: false,
+                scope_depth: 0,
+            }
+        })
+        .chain(referenced_tables.outer_query_refs().iter().map(|t| {
+            OuterQueryReference {
+                table: t.table.clone(),
+                identifier: t.identifier.clone(),
+                internal_id: t.internal_id,
+                using_dedup_hidden_cols: t.using_dedup_hidden_cols.clone(),
+                col_used_mask: ColumnUsedMask::default(),
+                cte_select: t.cte_select.clone(),
+                cte_explicit_columns: t.cte_explicit_columns.clone(),
+                cte_id: t.cte_id, // Preserve CTE ID from outer query refs
+                cte_definition_only: t.cte_definition_only,
+                rowid_referenced: false,
+                scope_depth: t.scope_depth + 1,
+            }
+        }))
+        .collect::<Vec<_>>()
+}
+
+pub fn validate_subqueries_in_skipped_order_by(
+    program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
+    resolver: &Resolver,
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)],
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let outer_query_refs = outer_query_refs_for(referenced_tables);
+
+    for (expr, _, _) in order_by {
+        walk_expr(expr, &mut |expr| {
+            let subselect = match expr {
+                ast::Expr::Exists(select) | ast::Expr::Subquery(select) => select,
+                ast::Expr::InSelect { rhs, .. } => rhs,
+                _ => return Ok(WalkControl::Continue),
+            };
+
+            if let Err(error) = prepare_select_plan(
+                subselect.clone(),
+                resolver,
+                program,
+                &outer_query_refs,
+                QueryDestination::Unset,
+                connection,
+            ) {
+                if !is_skipped_order_by_arity_error(&error) {
+                    return Err(error);
+                }
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+
+    Ok(())
+}
+
+fn is_skipped_order_by_arity_error(error: &crate::LimboError) -> bool {
+    let crate::LimboError::ParseError(message) = error else {
+        return false;
+    };
+
+    message.starts_with("sub-select returns ")
+        || message.contains(" must return 1 value")
+        || message.contains(" must return the same number of values")
+        || message == "row value misused"
+}
+
 // Compute query plans for subqueries occurring in any position other than the FROM clause.
 // This includes the WHERE clause, HAVING clause, GROUP BY clause, ORDER BY clause, LIMIT clause, and OFFSET clause.
 /// The AST expression containing the subquery ([ast::Expr::Exists], [ast::Expr::Subquery], [ast::Expr::InSelect]) is replaced with a [ast::Expr::SubqueryResult] expression.
@@ -518,50 +607,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
     // Most subqueries can reference columns from the outer query,
     // including nested cases where a subquery inside a subquery references columns from its parent's parent
     // and so on.
-    let get_outer_query_refs = |referenced_tables: &TableReferences| {
-        referenced_tables
-            .joined_tables()
-            .iter()
-            .map(|t| {
-                // Extract cte_id from FromClauseSubquery if this is a CTE reference
-                let cte_id = match &t.table {
-                    Table::FromClauseSubquery(subq) => subq.cte_id(),
-                    _ => None,
-                };
-                OuterQueryReference {
-                    table: t.table.clone(),
-                    identifier: t.identifier.clone(),
-                    internal_id: t.internal_id,
-                    using_dedup_hidden_cols: t.using_dedup_hidden_cols(),
-                    col_used_mask: ColumnUsedMask::default(),
-                    cte_select: None,
-                    cte_explicit_columns: vec![],
-                    cte_id,
-                    cte_definition_only: false,
-                    rowid_referenced: false,
-                    scope_depth: 0,
-                }
-            })
-            .chain(
-                referenced_tables
-                    .outer_query_refs()
-                    .iter()
-                    .map(|t| OuterQueryReference {
-                        table: t.table.clone(),
-                        identifier: t.identifier.clone(),
-                        internal_id: t.internal_id,
-                        using_dedup_hidden_cols: t.using_dedup_hidden_cols.clone(),
-                        col_used_mask: ColumnUsedMask::default(),
-                        cte_select: t.cte_select.clone(),
-                        cte_explicit_columns: t.cte_explicit_columns.clone(),
-                        cte_id: t.cte_id, // Preserve CTE ID from outer query refs
-                        cte_definition_only: t.cte_definition_only,
-                        rowid_referenced: false,
-                        scope_depth: t.scope_depth + 1,
-                    }),
-            )
-            .collect::<Vec<_>>()
-    };
+    let get_outer_query_refs = outer_query_refs_for;
 
     let mut subquery_parser = get_subquery_parser(
         program,

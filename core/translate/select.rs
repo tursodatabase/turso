@@ -18,7 +18,10 @@ use crate::translate::planner::{
     parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
-use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
+use crate::translate::subquery::{
+    plan_subqueries_from_select_plan, plan_subqueries_from_values,
+    validate_subqueries_in_skipped_order_by,
+};
 use crate::translate::window::plan_windows;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::builder::ProgramBuilderOpts;
@@ -671,13 +674,21 @@ fn prepare_one_select_plan(
             plan.order_by = key;
 
             // Single-row aggregate queries (aggregates without GROUP BY and without window functions)
-            // produce exactly one row, so ORDER BY is meaningless. Clearing it here also avoids
-            // eagerly validating subqueries in ORDER BY that SQLite would skip due to optimization.
+            // produce exactly one row, so ORDER BY is meaningless. SQLite still binds subqueries
+            // inside the skipped ORDER BY for missing tables/columns, but skips arity checks that
+            // would only matter while evaluating the ORDER BY expression.
             // Note: HAVING without GROUP BY sets group_by to Some with empty exprs, still single-row.
             let is_single_row_aggregate = !plan.aggregates.is_empty()
                 && plan.group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty())
                 && windows.is_empty();
             if is_single_row_aggregate {
+                validate_subqueries_in_skipped_order_by(
+                    program,
+                    &plan.table_references,
+                    resolver,
+                    &plan.order_by,
+                    connection,
+                )?;
                 plan.order_by.clear();
             }
 

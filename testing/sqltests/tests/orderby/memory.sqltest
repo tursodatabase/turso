@@ -115,6 +115,30 @@ expect {
     2
 }
 
+test orderby_single_row_aggregate_validates_skipped_subquery_table {
+    CREATE TABLE t(a, b);
+    SELECT COUNT(a) FROM t ORDER BY EXISTS(SELECT * FROM missing);
+}
+expect error {
+    no such table: missing
+}
+
+test orderby_single_row_aggregate_validates_skipped_subquery_column {
+    CREATE TABLE t(a, b);
+    SELECT COUNT(a) FROM t ORDER BY EXISTS(SELECT missing_col FROM t);
+}
+expect error {
+    no such column: missing_col
+}
+
+test orderby_single_row_aggregate_skips_nested_subquery_arity {
+    CREATE TABLE t(a, b);
+    SELECT COUNT(a) FROM t ORDER BY EXISTS(SELECT * FROM t WHERE a IN (SELECT a, b FROM t));
+}
+expect {
+    0
+}
+
 # SQLite truncates ORDER BY after a rowid/INTEGER PRIMARY KEY column since the table is
 # stored in rowid order and a unique column means no ties. This skips validation of
 # subsequent clauses, so even invalid constructs like multi-column IN subqueries pass.
