@@ -5265,7 +5265,25 @@ impl RowidAllocator {
     /// Initialize from btree max. Called once per table, under lock.
     pub fn initialize(&self, rowid: Option<i64>) {
         tracing::trace!("initialize({rowid:?})");
-        self.max_rowid.store(rowid.unwrap_or(0), Ordering::SeqCst);
+        if let Some(rowid) = rowid {
+            loop {
+                let cur = self.max_rowid.load(Ordering::SeqCst);
+                // Preserve an explicit-rowid watermark that may already have
+                // raised the allocator, while still allowing a negative btree
+                // max to initialize an otherwise untouched allocator.
+                let next = if cur == 0 || rowid > cur { rowid } else { cur };
+                if next == cur {
+                    break;
+                }
+                if self
+                    .max_rowid
+                    .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        }
         self.initialized.store(true, Ordering::SeqCst);
     }
 

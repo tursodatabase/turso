@@ -8411,6 +8411,56 @@ fn test_three_concurrent_autoincrement_inserts() {
     );
 }
 
+/// A concurrent explicit rowid insert must raise the allocator watermark before
+/// another transaction performs auto-rowid allocation. Otherwise later auto
+/// inserts can overwrite the explicit row and leave secondary indexes stale.
+#[test]
+fn test_concurrent_explicit_rowid_preserves_auto_rowid_watermark() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn1
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, k INTEGER)")
+        .unwrap();
+    conn1.execute("CREATE INDEX t_k ON t(k)").unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("INSERT INTO t(id, v, k) VALUES (5, 'A', 999)")
+        .unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("INSERT INTO t(v, k) VALUES ('B', 100)")
+        .unwrap();
+    conn2.execute("COMMIT").unwrap();
+    conn1.execute("COMMIT").unwrap();
+
+    for (v, k) in [("p2", 200), ("p3", 300), ("p4", 400), ("p5", 500)] {
+        conn1
+            .execute(format!("INSERT INTO t(v, k) VALUES ('{v}', {k})"))
+            .unwrap();
+    }
+
+    let integrity = get_rows(&conn1, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(
+        integrity[0][0].to_string(),
+        "ok",
+        "integrity_check should not report stale secondary index entries"
+    );
+
+    let indexed = get_rows(
+        &conn1,
+        "SELECT rowid, v, k FROM t INDEXED BY t_k WHERE k = 999",
+    );
+    assert_eq!(indexed.len(), 1);
+    assert_eq!(indexed[0][0].as_int().unwrap(), 5);
+    assert_eq!(indexed[0][1].to_string(), "A");
+    assert_eq!(indexed[0][2].as_int().unwrap(), 999);
+}
+
 /// Deterministic reproduction of the sqlite_sequence pollution bug.
 ///
 /// Two concurrent transactions insert into an AUTOINCREMENT table.
