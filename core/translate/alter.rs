@@ -743,6 +743,7 @@ pub fn translate_alter_table(
             let (dropped_index, column) = btree.get_column(column_name).ok_or_else(|| {
                 LimboError::ParseError(format!("no such column: \"{column_name}\""))
             })?;
+            let dropped_column_is_virtual = column.is_virtual_generated();
 
             // Column cannot be dropped if:
             // The column is a PRIMARY KEY or part of one.
@@ -995,6 +996,9 @@ pub fn translate_alter_table(
                 connection,
                 input,
                 |program| {
+                    if dropped_column_is_virtual {
+                        return;
+                    }
                     let table_name = btree.name.clone();
                     let source_column_by_schema_idx = btree
                         .columns()
@@ -1626,6 +1630,8 @@ pub fn translate_alter_table(
                 false => {
                     let replacement_column = Column::try_from(&definition)?;
                     let old_column = &btree.columns()[column_index];
+                    let old_is_virtual = old_column.is_virtual_generated();
+                    let replacement_is_virtual = replacement_column.is_virtual_generated();
                     let becomes_generated =
                         !old_column.is_generated() && replacement_column.is_generated();
                     // Toggling the virtual-generated bit changes whether the column
@@ -1634,16 +1640,17 @@ pub fn translate_alter_table(
                     // Without rewriting, post-ALTER reads use the new schema's column
                     // indexes against rows that still hold the pre-ALTER layout, and
                     // values land in the wrong logical columns. See issue #6624.
-                    let virtuality_changed = old_column.is_virtual_generated()
-                        != replacement_column.is_virtual_generated();
+                    let virtuality_changed = old_is_virtual != replacement_is_virtual;
                     // A change of declared type can change the column's affinity, in
                     // which case existing on-disk values must be coerced to match the
                     // new affinity. Without this, the row payload retains the old
                     // serial type and SQLite's `PRAGMA integrity_check` reports the
                     // file as corrupt (e.g. "NUMERIC value in <table>.<col>" when
                     // changing NUMERIC -> TEXT). See issue #3706.
-                    let affinity_changed = old_column.affinity_with_strict(btree.is_strict)
-                        != replacement_column.affinity_with_strict(btree.is_strict);
+                    let affinity_changed = !old_is_virtual
+                        && !replacement_is_virtual
+                        && old_column.affinity_with_strict(btree.is_strict)
+                            != replacement_column.affinity_with_strict(btree.is_strict);
                     let rewrites_physical_layout =
                         becomes_generated || virtuality_changed || affinity_changed;
                     (rewrites_physical_layout, Some(replacement_column))
