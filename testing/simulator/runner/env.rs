@@ -26,6 +26,30 @@ use crate::runner::memory::io::MemorySimIO;
 const DEFAULT_CACHE_SIZE: usize = 2000;
 use super::cli::SimulatorCLI;
 
+/// Valid SQLite DB page sizes in bytes (powers of two in [512, 65536]).
+const VALID_PAGE_SIZES: [u32; 8] = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+
+/// Resolve the page size to use for this simulation run.
+///
+/// Resolution order (first non-None wins):
+/// 1. Explicit `--page-size` CLI override.
+/// 2. `--randomize-page-size` CLI flag → seed-derived random pick from VALID_PAGE_SIZES.
+/// 3. `Profile::page_size` (set by the profile file).
+/// 4. Engine default `4096` for backwards-compatible behavior.
+fn resolve_page_size<R: Rng>(cli_opts: &SimulatorCLI, profile: &Profile, rng: &mut R) -> usize {
+    if let Some(ps) = cli_opts.page_size {
+        return ps as usize;
+    }
+    if cli_opts.randomize_page_size {
+        let idx = rng.random_range(0..VALID_PAGE_SIZES.len());
+        return VALID_PAGE_SIZES[idx] as usize;
+    }
+    if let Some(ps) = profile.page_size {
+        return ps as usize;
+    }
+    4096
+}
+
 /// Pre-create attached DB files with MVCC journal mode so that journal modes
 /// are compatible when ATTACH happens later during simulation.
 fn enable_mvcc_on_attached_dbs(io: &Arc<dyn SimIO>, aux_paths: impl Iterator<Item = PathBuf>) {
@@ -1107,7 +1131,7 @@ impl SimulatorEnv {
             disable_savepoint_rollback: cli_opts.disable_savepoint_rollback,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
             disable_faulty_query: cli_opts.disable_faulty_query,
-            page_size: 4096, // TODO: randomize this too
+            page_size: resolve_page_size(cli_opts, profile, &mut rng),
             max_interactions: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
             max_time_simulation: cli_opts.maximum_time,
             disable_reopen_database: cli_opts.disable_reopen_database,
@@ -1213,6 +1237,19 @@ impl SimulatorEnv {
                 panic!("error opening simulator test file {db_path:?}: {e:?}");
             }
         };
+
+        // Apply PRAGMA page_size before any tables exist so the value lands in the
+        // database header. Skip the default 4096: emitting it would still be valid
+        // but adds a needless write on every legacy run.
+        if opts.page_size != 4096 {
+            let conn = db
+                .connect()
+                .expect("Failed to create connection for page_size setup");
+            conn.execute(format!("PRAGMA page_size = {}", opts.page_size))
+                .unwrap_or_else(|e| {
+                    panic!("Failed to set PRAGMA page_size = {}: {e:?}", opts.page_size)
+                });
+        }
 
         // Switch to MVCC mode if the profile says to use MVCC
         if profile.mvcc {

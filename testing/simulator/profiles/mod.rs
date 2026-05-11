@@ -37,6 +37,22 @@ pub struct Profile {
     pub query: QueryProfile,
     #[garde(range(min = 200, max = 2000))]
     pub cache_size_pages: Option<usize>,
+    /// DB page size in bytes. None = engine default (4096). Must be a power of 2
+    /// in [512, 65536]. The simulator's `--randomize-page-size` CLI flag overrides
+    /// this on a per-run basis.
+    #[garde(custom(validate_page_size))]
+    pub page_size: Option<u32>,
+}
+
+fn validate_page_size(value: &Option<u32>, _: &()) -> garde::Result {
+    if let Some(v) = value
+        && !matches!(*v, 512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536)
+    {
+        return Err(garde::Error::new(format!(
+            "page_size must be a power of two in [512, 65536], got {v}"
+        )));
+    }
+    Ok(())
 }
 
 impl Default for Profile {
@@ -47,6 +63,7 @@ impl Default for Profile {
             io: Default::default(),
             query: Default::default(),
             cache_size_pages: Some(2000),
+            page_size: None,
         }
     }
 }
@@ -221,6 +238,7 @@ impl Profile {
             mvcc: true,
             max_connections: 2,
             cache_size_pages: Some(2000),
+            page_size: None,
         };
         profile.validate().unwrap();
         profile

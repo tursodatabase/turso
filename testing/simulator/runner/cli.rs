@@ -167,6 +167,18 @@ pub struct SimulatorCLI {
     pub mvcc: Option<bool>,
     #[clap(
         long,
+        help = "Override DB page size in bytes (power of 2 in [512, 65536]). Conflicts with --randomize-page-size."
+    )]
+    pub page_size: Option<u32>,
+    #[clap(
+        long,
+        help = "Pick a random valid DB page size (512, 1024, 2048, 4096, 8192, 16384, 32768, 65536) per run, derived from seed.",
+        default_value_t = false,
+        conflicts_with = "page_size"
+    )]
+    pub randomize_page_size: bool,
+    #[clap(
+        long,
         help = "Keep all database and plan files",
         default_value_t = false
     )]
@@ -236,6 +248,13 @@ impl SimulatorCLI {
                 self.maximum_tests
             );
             self.minimum_tests = self.maximum_tests;
+        }
+        if let Some(ps) = self.page_size
+            && !matches!(ps, 512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536)
+        {
+            anyhow::bail!(
+                "--page-size must be a power of two in [512, 65536], got {ps}"
+            );
         }
         Ok(())
     }
