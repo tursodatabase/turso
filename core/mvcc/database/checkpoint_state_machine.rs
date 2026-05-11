@@ -357,9 +357,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         }
     }
 
-    /// Returns all checkpointable [RowVersion]s for that `table_id`
-    fn maybe_get_checkpointable_versions(
-        &self,
+    fn maybe_get_checkpointable_versions_for_boundary(
+        durable_txid_max_old: Option<NonZeroU64>,
         versions: &[RowVersion],
         table_id: MVTableId,
     ) -> smallvec::SmallVec<[RowVersion; 1]> {
@@ -368,45 +367,43 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         let mut exists_in_db_file = false;
         // Iterate versions from oldest-to-newest to determine if the row exists in the database file and whether the newest version should be checkpointed.
         for version in versions.iter() {
-            // Rows marked btree_resident existed in the DB file before MVCC tracked them.
-            // This also applies to synthetic tombstones that use begin=None.
-            if version.btree_resident {
-                exists_in_db_file = true;
-            }
             // A row is in the database file if:
             // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
             // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
             let mut begin_ts = None;
             if let Some(TxTimestampOrID::Timestamp(b)) = version.begin {
                 begin_ts = Some(b);
-                // A row exists in the DB file if it was checkpointed in a previous checkpoint.
-                // For btree_resident rows we set exists_in_db_file above, regardless of begin encoding.
-                if self
-                    .durable_txid_max_old
-                    .is_some_and(|txid_max_old| b <= u64::from(txid_max_old))
-                {
-                    exists_in_db_file = true;
-                }
             }
             let mut end_ts = None;
             if let Some(TxTimestampOrID::Timestamp(e)) = version.end {
                 end_ts = Some(e);
-                if self
-                    .durable_txid_max_old
-                    .is_some_and(|txid_max_old| e <= u64::from(txid_max_old))
-                {
-                    exists_in_db_file = false;
-                }
             }
             if begin_ts.is_none() && end_ts.is_none() {
                 continue;
+            }
+            // A version with no begin or end timestamp was skipped above. It is
+            // not proof that a key is present in the database file, even if a
+            // rollback left btree_resident=true on it.
+            if version.btree_resident {
+                exists_in_db_file = true;
+            }
+            // A row exists in the database file if it was checkpointed in a previous checkpoint.
+            if durable_txid_max_old
+                .is_some_and(|txid_max_old| begin_ts.is_some_and(|b| b <= u64::from(txid_max_old)))
+            {
+                exists_in_db_file = true;
+            }
+            if durable_txid_max_old
+                .is_some_and(|txid_max_old| end_ts.is_some_and(|e| e <= u64::from(txid_max_old)))
+            {
+                exists_in_db_file = false;
             }
             // Should checkpoint the newest version if:
             // - It is not a delete and it hasn't been checkpointed yet OR (begin_ts > max_old)
             // We need the `self.durable_txid_max_old.is_none()` check because before
             // the first checkpoint there is no persisted MVCC watermark.
             let is_uncheckpointed_insert = end_ts.is_none()
-                && self.durable_txid_max_old.is_none_or(|txid_max_old| {
+                && durable_txid_max_old.is_none_or(|txid_max_old| {
                     begin_ts.is_some_and(|b| b > u64::from(txid_max_old))
                 });
             // - It is a delete, AND some version of the row exists in the database file.
@@ -416,8 +413,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             //   tables/indexes and skip their data rows.
             let is_schema_delete = table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
                 && !exists_in_db_file
-                && self
-                    .durable_txid_max_old
+                && durable_txid_max_old
                     .is_none_or(|txid_max_old| end_ts.is_some_and(|e| e > u64::from(txid_max_old)));
             let should_checkpoint =
                 is_uncheckpointed_insert || is_delete_and_exists_in_db_file || is_schema_delete;
@@ -444,6 +440,19 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         }
 
         versions_to_checkpoint
+    }
+
+    /// Returns all checkpointable [RowVersion]s for that `table_id`
+    fn maybe_get_checkpointable_versions(
+        &self,
+        versions: &[RowVersion],
+        table_id: MVTableId,
+    ) -> smallvec::SmallVec<[RowVersion; 1]> {
+        Self::maybe_get_checkpointable_versions_for_boundary(
+            self.durable_txid_max_old,
+            versions,
+            table_id,
+        )
     }
 
     /// Collect all committed versions that need to be written to the B-tree.
@@ -1657,6 +1666,25 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
 mod tests {
     use super::*;
 
+    fn checkpoint_test_row_version(
+        id: u64,
+        begin: Option<u64>,
+        end: Option<u64>,
+        btree_resident: bool,
+    ) -> RowVersion {
+        RowVersion {
+            id,
+            begin: begin.map(TxTimestampOrID::Timestamp),
+            end: end.map(TxTimestampOrID::Timestamp),
+            row: Row::new_table_row(
+                RowID::new(MVTableId(-5), RowKey::Int(id as i64)),
+                vec![id as u8],
+                1,
+            ),
+            btree_resident,
+        }
+    }
+
     fn sqlite_schema_row_version(
         rowid: i64,
         entry_type: &'static str,
@@ -1687,6 +1715,46 @@ mod tests {
             ),
             btree_resident: false,
         }
+    }
+
+    /// A rollback can leave a dead version with no begin or end timestamp.
+    /// That dead version must not make a later delete look safe to apply to
+    /// the B-tree.
+    #[test]
+    fn timestampless_btree_resident_garbage_does_not_make_later_delete_checkpointable() {
+        let versions = vec![
+            checkpoint_test_row_version(1, None, None, true),
+            checkpoint_test_row_version(2, Some(11), Some(12), false),
+        ];
+
+        let checkpointable =
+            CheckpointStateMachine::<crate::mvcc::clock::MvccClock>::maybe_get_checkpointable_versions_for_boundary(
+                NonZeroU64::new(10),
+                &versions,
+                MVTableId(-5),
+            );
+
+        assert!(
+            checkpointable.is_empty(),
+            "timestamp-less B-tree-resident garbage must not make a later delete look physical: {checkpointable:?}"
+        );
+    }
+
+    /// A real B-tree tombstone has no begin timestamp but does have an end
+    /// timestamp. Checkpoint still has to delete that key from the B-tree.
+    #[test]
+    fn btree_resident_tombstone_remains_checkpointable() {
+        let versions = vec![checkpoint_test_row_version(1, None, Some(12), true)];
+
+        let checkpointable =
+            CheckpointStateMachine::<crate::mvcc::clock::MvccClock>::maybe_get_checkpointable_versions_for_boundary(
+                NonZeroU64::new(10),
+                &versions,
+                MVTableId(-5),
+            );
+
+        assert_eq!(checkpointable.len(), 1);
+        assert_eq!(checkpointable[0].id, 1);
     }
 
     #[test]

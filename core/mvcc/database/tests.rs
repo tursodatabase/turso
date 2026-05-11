@@ -135,6 +135,52 @@ fn mvcc_active_write_tx_blocks_vacuum_gate() {
     db.mvcc_store.release_vacuum_gate();
 }
 
+/// Updating a checkpointed row and then rolling back the transaction can leave
+/// dead row versions in memory. Those dead versions have no begin or end
+/// timestamp, so they must not keep the `btree_resident` flag.
+#[test]
+fn rollback_clears_btree_resident_on_timestampless_versions() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("UPDATE t SET v = 'b' WHERE id = 1").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let mut offenders = Vec::new();
+    for entry in mvcc_store.rows.iter() {
+        let row_id = entry.key();
+        let versions = entry.value().read();
+        for version in versions.iter() {
+            if version.begin.is_none() && version.end.is_none() && version.btree_resident {
+                offenders.push(format!("table row {row_id:?} version {}", version.id));
+            }
+        }
+    }
+    for index_entry in mvcc_store.index_rows.iter() {
+        let index_id = index_entry.key();
+        for entry in index_entry.value().iter() {
+            let versions = entry.value().read();
+            for version in versions.iter() {
+                if version.begin.is_none() && version.end.is_none() && version.btree_resident {
+                    offenders.push(format!("index {index_id:?} version {}", version.id));
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "rolled-back versions with no begin or end timestamp must not keep btree_resident=true: {}",
+        offenders.join(", ")
+    );
+}
+
 #[test]
 fn mvcc_vacuum_gate_blocks_new_read_and_write_tx() {
     let db = MvccTestDb::new();

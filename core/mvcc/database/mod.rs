@@ -5252,6 +5252,11 @@ fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) {
         // undo deletions by this transaction
         rv.end = None;
     }
+    if rv.begin.is_none() && rv.end.is_none() {
+        // A version with no begin or end timestamp is rollback garbage. It is
+        // not evidence that this key still belongs to the database file.
+        rv.btree_resident = false;
+    }
 }
 
 impl RowidAllocator {
