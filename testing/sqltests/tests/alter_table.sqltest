@@ -922,6 +922,19 @@ expect {
 }
 
 @cross-check-integrity
+test alter-table-drop-column-preserves-expression-index-sentinel {
+    CREATE TABLE t(a INTEGER, b INTEGER, c TEXT, d INTEGER);
+    CREATE INDEX i_expr ON t(a, date(c), c);
+    INSERT INTO t VALUES(1, 2, '2026-01-01', 3);
+    ALTER TABLE t DROP COLUMN b;
+    UPDATE t SET a = 5 WHERE c = '2026-01-01';
+    SELECT a, c, d FROM t;
+}
+expect {
+    5|2026-01-01|3
+}
+
+@cross-check-integrity
 test alter-table-rename-column-updates-unique-sets {
     CREATE TABLE t(a INTEGER, b TEXT, UNIQUE(b));
     INSERT INTO t VALUES (1, 'hello');
