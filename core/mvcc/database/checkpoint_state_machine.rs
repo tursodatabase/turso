@@ -862,6 +862,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     fn step_inner(&mut self, _context: &()) -> Result<TransitionResult<CheckpointResult>> {
         match &self.state {
             CheckpointState::AcquireLock => {
+                inject_transition_failure!(self, CheckpointYieldPoint::BeforeAcquireLock);
                 inject_transition_yield!(self, CheckpointYieldPoint::BeforeAcquireLock);
 
                 tracing::info!("Acquiring blocking checkpoint lock");

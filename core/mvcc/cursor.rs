@@ -8,7 +8,7 @@ use crate::mvcc::database::{
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
-use crate::mvcc::yield_points::inject_io_yield;
+use crate::mvcc::yield_points::{inject_io_failure, inject_io_yield};
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
@@ -570,6 +570,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     } else {
                         self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
                     }
+                    inject_io_failure!(self, CursorYieldPoint::AdvanceBtreeForwardProgress);
                     inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeForwardProgress);
                 }
                 Some(AdvanceBtreeState::RewindCheckBtreeKey) => {
@@ -601,6 +602,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                         return Ok(IOResult::Done(()));
                     }
                     self.btree_advance_state = Some(AdvanceBtreeState::NextCheckBtreeKey);
+                    inject_io_failure!(self, CursorYieldPoint::AdvanceBtreeForwardProgress);
                     inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeForwardProgress);
                 }
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
@@ -652,6 +654,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     } else {
                         self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
                     }
+                    inject_io_failure!(self, CursorYieldPoint::AdvanceBtreeBackwardProgress);
                     inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeBackwardProgress);
                 }
                 Some(AdvanceBtreeState::RewindCheckBtreeKey) => {
@@ -683,6 +686,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                         return Ok(IOResult::Done(()));
                     }
                     self.btree_advance_state = Some(AdvanceBtreeState::NextCheckBtreeKey);
+                    inject_io_failure!(self, CursorYieldPoint::AdvanceBtreeBackwardProgress);
                     inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeBackwardProgress);
                 }
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
@@ -795,6 +799,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                                 SeekState::SeekBtree(SeekBtreeState::AdvanceBTree),
                                 direction,
                             ));
+                            inject_io_failure!(self, CursorYieldPoint::SeekBtreeProgress);
                             inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
                         }
                         SeekResult::Found => {
@@ -802,6 +807,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                                 SeekState::SeekBtree(SeekBtreeState::CheckRow),
                                 direction,
                             ));
+                            inject_io_failure!(self, CursorYieldPoint::SeekBtreeProgress);
                             inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
                         }
                     }
@@ -819,6 +825,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                         SeekState::SeekBtree(SeekBtreeState::CheckRow),
                         direction,
                     ));
+                    inject_io_failure!(self, CursorYieldPoint::SeekBtreeProgress);
                     inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
                 }
                 SeekBtreeState::CheckRow => {
@@ -834,6 +841,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                                 SeekState::SeekBtree(SeekBtreeState::AdvanceBTree),
                                 direction,
                             ));
+                            inject_io_failure!(self, CursorYieldPoint::SeekBtreeProgress);
                             inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
                         }
                         None => {
@@ -961,10 +969,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     self.state
                         .replace(MvccLazyCursorState::Next(NextState::CheckNeedsAdvance));
                 }
+                inject_io_failure!(self, CursorYieldPoint::NextStart);
                 inject_io_yield!(self, CursorYieldPoint::NextStart);
             } else {
                 self.state
                     .replace(MvccLazyCursorState::Next(NextState::CheckNeedsAdvance));
+                inject_io_failure!(self, CursorYieldPoint::NextStart);
                 inject_io_yield!(self, CursorYieldPoint::NextStart);
             }
         }
@@ -1011,6 +1021,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             if need_advance_btree && !self.dual_peek.btree_exhausted() {
                 self.state
                     .replace(MvccLazyCursorState::Next(NextState::Advance));
+                inject_io_failure!(self, CursorYieldPoint::NextBtreeAdvance);
                 inject_io_yield!(self, CursorYieldPoint::NextBtreeAdvance);
             }
         }
@@ -1093,6 +1104,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             if need_advance_btree && !self.dual_peek.btree_exhausted() {
                 self.state
                     .replace(MvccLazyCursorState::Prev(PrevState::Advance));
+                inject_io_failure!(self, CursorYieldPoint::PrevBtreeAdvance);
                 inject_io_yield!(self, CursorYieldPoint::PrevBtreeAdvance);
             }
         }
@@ -1294,12 +1306,14 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                         SeekState::SeekBtree(SeekBtreeState::SeekBtree),
                         direction,
                     ));
+                    inject_io_failure!(self, CursorYieldPoint::SeekStart);
                     inject_io_yield!(self, CursorYieldPoint::SeekStart);
                 }
                 Some(MvccLazyCursorState::Seek(SeekState::SeekBtree(_), direction)) => {
                     return_if_io!(self.seek_btree_and_set_peek(seek_key.clone(), op));
                     self.state
                         .replace(MvccLazyCursorState::Seek(SeekState::PickWinner, direction));
+                    inject_io_failure!(self, CursorYieldPoint::SeekBtreeProgress);
                     inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
                 }
                 Some(MvccLazyCursorState::Seek(SeekState::PickWinner, direction)) => {
@@ -1582,6 +1596,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 }
                 self.state
                     .replace(MvccLazyCursorState::Exists(ExistsState::ExistsBtree));
+                inject_io_failure!(self, CursorYieldPoint::ExistsBtreeFallback);
                 inject_io_yield!(self, CursorYieldPoint::ExistsBtreeFallback);
             } else {
                 // No B-tree allocated, row doesn't exist
@@ -1651,12 +1666,14 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             match state {
                 None => {
                     self.count_state.replace(CountState::Rewind);
+                    inject_io_failure!(self, CursorYieldPoint::CountProgress);
                     inject_io_yield!(self, CursorYieldPoint::CountProgress);
                 }
                 Some(CountState::Rewind) => {
                     return_if_io!(self.rewind());
                     self.count_state
                         .replace(CountState::CheckBtreeKey { count: 0 });
+                    inject_io_failure!(self, CursorYieldPoint::CountProgress);
                     inject_io_yield!(self, CursorYieldPoint::CountProgress);
                 }
                 Some(CountState::CheckBtreeKey { count }) => {
@@ -1667,6 +1684,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     {
                         self.count_state
                             .replace(CountState::NextBtree { count: count + 1 });
+                        inject_io_failure!(self, CursorYieldPoint::CountProgress);
                         inject_io_yield!(self, CursorYieldPoint::CountProgress);
                     } else {
                         self.count_state = None;
@@ -1678,6 +1696,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     return_if_io!(self.next());
                     self.count_state
                         .replace(CountState::CheckBtreeKey { count });
+                    inject_io_failure!(self, CursorYieldPoint::CountProgress);
                     inject_io_yield!(self, CursorYieldPoint::CountProgress);
                 }
             }

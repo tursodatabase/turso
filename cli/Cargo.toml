@@ -71,7 +71,7 @@ experimental_win_iocp = ["turso_core/experimental_win_iocp"]
 tracing_release = ["turso_core/tracing_release"]
 mimalloc = ["dep:mimalloc"]
 fts = ["turso_core/fts"]
-mvcc_repl = []
+mvcc_repl = ["turso_core/test_helper"]
 stacker = ["turso_core/stacker"]
 
 [build-dependencies]

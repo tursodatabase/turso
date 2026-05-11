@@ -1720,6 +1720,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Ok(TransitionResult::Done(()));
                 }
                 self.state = CommitState::Commit { end_ts };
+                inject_transition_failure!(self, CommitYieldPoint::CommitValidation);
                 inject_transition_yield!(self, CommitYieldPoint::CommitValidation);
                 Ok(TransitionResult::Continue)
             }
@@ -1750,6 +1751,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // TxID references until CommitEnd so an abandoned commit can
                 // still be rolled back by matching on TxID(self.tx_id).
                 self.state = CommitState::WaitForDependencies { end_ts: *end_ts };
+                inject_transition_failure!(self, CommitYieldPoint::WaitForDependencies);
                 inject_transition_yield!(self, CommitYieldPoint::WaitForDependencies);
                 return Ok(TransitionResult::Continue);
             }
@@ -1821,6 +1823,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 } else {
                     self.state = CommitState::BeginCommitLogicalLog { end_ts, log_record };
                 }
+                inject_transition_failure!(self, CommitYieldPoint::LogRecordPrepared);
                 inject_transition_yield!(self, CommitYieldPoint::LogRecordPrepared);
                 return Ok(TransitionResult::Continue);
             }
