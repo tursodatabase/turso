@@ -1911,8 +1911,8 @@ impl Program {
             else {
                 unreachable!()
             };
-            match self.step_end_mvcc_txn(state_machine, mv_store)? {
-                IOResult::Done(_) => {
+            match self.step_end_mvcc_txn(state_machine, mv_store) {
+                Ok(IOResult::Done(_)) => {
                     assert!(state_machine.is_finalized());
                     conn.set_mv_tx(None);
                     conn.set_tx_state(TransactionState::None);
@@ -1920,7 +1920,32 @@ impl Program {
                     program_state.commit_state = CommitState::Ready;
                     // Fall through to attached phase
                 }
-                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                Err(err) => {
+                    // The commit state machine moved `tx.state` to `Preparing`
+                    // before the failing step ran, so the tx is half-finalized:
+                    // it must be rolled back here. `normal_step`'s caller path
+                    // returns `StepResult::Busy` without calling `abort()`, and
+                    // `abort()` itself no-ops on `LimboError::Busy`. Neither
+                    // covers an error returned from inside this state machine,
+                    // so we own the cleanup. Mirrors `rollback_current_txn_state`.
+                    if let Some(tx_id) = conn.get_mv_tx_id() {
+                        if mv_store.is_tx_rollbackable(tx_id) {
+                            mv_store.rollback_tx(
+                                tx_id,
+                                pager.clone(),
+                                &conn,
+                                crate::MAIN_DB_ID,
+                            );
+                        } else {
+                            conn.set_mv_tx(None);
+                        }
+                    }
+                    pager.end_read_tx();
+                    conn.set_tx_state(TransactionState::None);
+                    program_state.commit_state = CommitState::Ready;
+                    return Err(err);
+                }
             }
         }
 

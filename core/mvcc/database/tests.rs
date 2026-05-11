@@ -10225,3 +10225,59 @@ fn read_only_bc_survives_unrelated_ddl() {
     c2.execute("COMMIT")
         .expect("read-only BEGIN CONCURRENT must not be aborted by unrelated DDL");
 }
+
+/// Without rolling back on this error, the connection becomes unusable: the
+/// next statement panics on an internal invariant. The reason is that the
+/// failing step runs after `tx.state.store(Preparing(end_ts))` in
+/// `CommitState::Initial`, so when it returns `Err` the transaction stays
+/// in `mv_store.txs` with `state = Preparing(_)` and the connection's
+/// `mv_tx_id` still references it. The next statement on the same
+/// connection walks the version chain, reads a row whose
+/// `begin = TxID(self.tx_id)`, calls `is_begin_visible`, and panics on
+/// `core/mvcc/database/mod.rs:5591` — a transaction cannot read its own
+/// row versions while in `Preparing`.
+///
+/// The existing error-handling paths don't unwind this state because they
+/// are tuned for retryable errors:
+/// - `normal_step` returns `StepResult::Busy` to its caller without calling
+///   `abort()` so the caller can retry the statement
+///   (`core/vdbe/mod.rs` `Err(LimboError::Busy)` arm).
+/// - `abort()` no-ops on `Busy` for the same reason
+///   (`Some(LimboError::Busy) => {}` arm in `abort()`).
+///
+/// Those choices are correct for `Busy` raised by an instruction the
+/// caller can retry, but they are wrong for `Busy` raised from inside the
+/// commit state machine post-`Preparing`: the transaction is already
+/// half-finalized and cannot be retried piecemeal, so it must be rolled
+/// back as a whole here before the error bubbles up.
+#[test]
+fn busy_from_commit_post_preparing_rolls_back_transaction() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(x INT)").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    conn.set_failure_injector(Some(FixedFailureInjector::new([(
+        CommitYieldPoint::CommitValidation.point(),
+        LimboError::Busy,
+    )])));
+
+    let err = conn
+        .execute("COMMIT")
+        .expect_err("injected Busy must surface to the caller");
+    assert!(
+        matches!(err, LimboError::Busy),
+        "expected LimboError::Busy, got {err:?}"
+    );
+    conn.set_failure_injector(None);
+
+    // The half-prepared transaction must have been rolled back, so the
+    // connection is usable and the INSERT is not visible.
+    let rows = get_rows(&conn, "SELECT * FROM t");
+    assert!(
+        rows.is_empty(),
+        "tx that hit Busy mid-commit should have been rolled back; got rows: {rows:?}"
+    );
+}
