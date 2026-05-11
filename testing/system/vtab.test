@@ -109,6 +109,14 @@ do_execsql_test_on_specific_db {:memory:} insert-hidden-column {
     select comment from t where key = 'hidden';
 } {"my comment"}
 
+do_execsql_test_on_specific_db {:memory:} insert-multi-row-values {
+    create virtual table t using kv_store;
+    insert into t(key, value) values ('k1', 'v1'), ('k2', 'v2'), ('k3', 'v3');
+    select key, value from t order by key;
+} {k1|v1
+k2|v2
+k3|v3}
+
 # hidden columns should be excluded from * expansion
 do_execsql_test_on_specific_db {:memory:} select-star-hidden-column {
     create virtual table t using kv_store;
