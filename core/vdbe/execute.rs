@@ -10078,22 +10078,26 @@ pub fn op_must_be_int(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(MustBeInt { reg }, insn);
+    // MustBeInt raises SQLITE_MISMATCH, not a conflict-policy constraint.
+    // Force ABORT semantics so UPDATE/INSERT OR FAIL cannot keep partial row writes.
+    let datatype_mismatch =
+        || LimboError::Raise(ResolveType::Abort, "datatype mismatch".to_string());
     match &state.registers[*reg].get_value() {
         Value::Numeric(Numeric::Integer(_)) => {}
         Value::Numeric(Numeric::Float(f)) => match cast_real_to_integer(f64::from(*f)) {
             Ok(i) => state.registers[*reg].set_int(i),
-            Err(_) => bail_constraint_error!("datatype mismatch"),
+            Err(_) => return Err(datatype_mismatch()),
         },
         Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
             Ok(Value::Numeric(Numeric::Integer(i))) => state.registers[*reg].set_int(i),
             Ok(Value::Numeric(Numeric::Float(f))) => match cast_real_to_integer(f64::from(f)) {
                 Ok(i) => state.registers[*reg].set_int(i),
-                Err(_) => bail_constraint_error!("datatype mismatch"),
+                Err(_) => return Err(datatype_mismatch()),
             },
-            _ => bail_constraint_error!("datatype mismatch"),
+            _ => return Err(datatype_mismatch()),
         },
         _ => {
-            bail_constraint_error!("datatype mismatch");
+            return Err(datatype_mismatch());
         }
     };
     state.pc += 1;
@@ -15529,6 +15533,75 @@ mod tests {
         };
         assert!(matches!(err, LimboError::Constraint(message) if message == "datatype mismatch"));
         assert_eq!(state.pc, 0);
+    }
+
+    fn open_memory_connection() -> Arc<Connection> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        db.connect().unwrap()
+    }
+
+    fn collect_ipk_rows(conn: &Arc<Connection>) -> Vec<(i64, String)> {
+        let mut rows = Vec::new();
+        let mut stmt = conn.prepare("SELECT id, b FROM t ORDER BY id").unwrap();
+        stmt.run_with_row_callback(|row| {
+            rows.push((row.get(0)?, row.get(1)?));
+            Ok(())
+        })
+        .unwrap();
+        rows
+    }
+
+    #[test]
+    fn test_update_or_fail_rowid_datatype_mismatch_rolls_back_statement() {
+        let conn = open_memory_connection();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two')")
+            .unwrap();
+
+        let err = conn
+            .execute(
+                "UPDATE OR FAIL t \
+                 SET b = 'changed', id = CASE WHEN id = 2 THEN 'bad' ELSE id END \
+                 WHERE TRUE",
+            )
+            .expect_err("non-integer rowid assignment must fail");
+
+        assert!(
+            err.to_string().contains("datatype mismatch"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            collect_ipk_rows(&conn),
+            vec![(1, "one".to_string()), (2, "two".to_string())]
+        );
+        assert!(conn.get_auto_commit());
+    }
+
+    #[test]
+    fn test_insert_or_fail_rowid_datatype_mismatch_rolls_back_statement() {
+        let conn = open_memory_connection();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b TEXT)")
+            .unwrap();
+
+        let err = conn
+            .execute("INSERT OR FAIL INTO t(id, b) VALUES (1, 'one'), ('bad', 'bad')")
+            .expect_err("non-integer rowid assignment must fail");
+
+        assert!(
+            err.to_string().contains("datatype mismatch"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(collect_ipk_rows(&conn), Vec::<(i64, String)>::new());
+        assert!(conn.get_auto_commit());
     }
 
     #[test]
