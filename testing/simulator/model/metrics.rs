@@ -150,6 +150,7 @@ impl InteractionStats {
             Query::ReleaseSavepoint(_) => self.commit_count += 1,
             Query::AlterTable(_) => self.alter_table_count += 1,
             Query::DropIndex(_) => self.drop_index_count += 1,
+            Query::Raw { .. } => {}
             Query::Placeholder => {}
             Query::Pragma(_) => self.pragma_count += 1,
         }

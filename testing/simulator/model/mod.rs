@@ -293,6 +293,10 @@ pub enum Query {
     RollbackToSavepoint(RollbackToSavepoint),
     ReleaseSavepoint(ReleaseSavepoint),
     Pragma(Pragma),
+    Raw {
+        sql: String,
+        dependencies: Vec<String>,
+    },
     /// Placeholder query that still needs to be generated
     Placeholder,
 }
@@ -340,6 +344,7 @@ impl Query {
             | Query::DropIndex(DropIndex {
                 table_name: table, ..
             }) => IndexSet::from_iter([table.clone()]),
+            Query::Raw { dependencies, .. } => IndexSet::from_iter(dependencies.clone()),
             Query::Begin(_)
             | Query::Commit(_)
             | Query::Rollback(_)
@@ -370,6 +375,7 @@ impl Query {
             | Query::DropIndex(DropIndex {
                 table_name: table, ..
             }) => vec![table.clone()],
+            Query::Raw { dependencies, .. } => dependencies.clone(),
             Query::Begin(..) | Query::Commit(..) | Query::Rollback(..) => vec![],
             Query::Savepoint(..) | Query::RollbackToSavepoint(..) | Query::ReleaseSavepoint(..) => {
                 vec![]
@@ -438,6 +444,7 @@ impl Display for Query {
             Self::Savepoint(savepoint) => write!(f, "{savepoint}"),
             Self::RollbackToSavepoint(rollback_to) => write!(f, "{rollback_to}"),
             Self::ReleaseSavepoint(release) => write!(f, "{release}"),
+            Self::Raw { sql, .. } => write!(f, "{sql}"),
             Self::Placeholder => Ok(()),
             Query::Pragma(pragma) => write!(f, "{pragma}"),
         }
@@ -467,6 +474,7 @@ impl Shadow for Query {
             Query::Savepoint(savepoint) => Ok(savepoint.shadow(env)),
             Query::RollbackToSavepoint(rollback_to) => rollback_to.shadow(env),
             Query::ReleaseSavepoint(release) => release.shadow(env),
+            Query::Raw { .. } => Ok(vec![]),
             Query::Placeholder => Ok(vec![]),
             Query::Pragma(Pragma::AutoVacuumMode(_) | Pragma::ForeignKeyList(_)) => Ok(vec![]),
         }
@@ -526,6 +534,7 @@ impl From<QueryDiscriminants> for QueryCapabilities {
             QueryDiscriminants::Placeholder => {
                 unreachable!("QueryCapabilities do not apply to query Placeholder")
             }
+            QueryDiscriminants::Raw => QueryCapabilities::NONE,
             QueryDiscriminants::Pragma => QueryCapabilities::NONE,
         }
     }

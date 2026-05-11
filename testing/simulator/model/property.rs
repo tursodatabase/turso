@@ -191,6 +191,16 @@ pub enum Property {
         tables: Vec<String>,
         write_kinds: Vec<QueryDiscriminants>,
     },
+    /// RejectCorrelatedOrderByDelete verifies that a DELETE with a subquery
+    /// ORDER BY term referencing the outer DELETE table is rejected before it
+    /// can mutate rows.
+    RejectCorrelatedOrderByDelete {
+        outer_create: Create,
+        inner_create: Create,
+        outer_insert: Insert,
+        inner_insert: Insert,
+        delete_sql: String,
+    },
     /// Property used to subsititute a property with its queries only
     Queries {
         queries: Vec<Query>,
@@ -238,6 +248,7 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::RejectCorrelatedOrderByDelete { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => None,
         }

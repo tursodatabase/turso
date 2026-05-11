@@ -19,7 +19,7 @@ use sql_generation::{
             transaction::{Begin, Commit, Rollback},
             update::{SetValue, Update},
         },
-        table::{ColumnType, SimValue, Table},
+        table::{Column, ColumnType, Name, SimValue, Table},
     },
 };
 use strum::IntoEnumIterator;
@@ -247,6 +247,7 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::RejectCorrelatedOrderByDelete { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => {
                 unreachable!("No extensional queries")
@@ -465,6 +466,41 @@ impl Property {
                     InteractionBuilder::with_interaction(after_interaction),
                     InteractionBuilder::with_interaction(assertion),
                 ]
+            }
+            Property::RejectCorrelatedOrderByDelete {
+                outer_create,
+                inner_create,
+                outer_insert,
+                inner_insert,
+                delete_sql,
+            } => {
+                let outer_table = outer_create.table.name.clone();
+                let inner_table = inner_create.table.name.clone();
+
+                let mut invalid_delete =
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Raw {
+                        sql: delete_sql.clone(),
+                        dependencies: vec![outer_table.clone(), inner_table],
+                    }));
+                invalid_delete.ignore_error(true);
+
+                let mut interactions = vec![
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Create(
+                        outer_create.clone(),
+                    ))),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Create(
+                        inner_create.clone(),
+                    ))),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Insert(
+                        outer_insert.clone(),
+                    ))),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Insert(
+                        inner_insert.clone(),
+                    ))),
+                    invalid_delete,
+                ];
+                interactions.extend(assert_all_table_values(&[outer_table], connection_index));
+                interactions
             }
             Property::InsertValuesSelect {
                 insert,
@@ -1678,6 +1714,69 @@ fn property_savepoint_rollback<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_reject_correlated_order_by_delete<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    let outer_table = Name::arbitrary(rng, ctx).0;
+    let inner_table = Name::arbitrary(rng, ctx).0;
+
+    let outer_create = Create {
+        table: Table {
+            rows: Vec::new(),
+            name: outer_table.clone(),
+            columns: vec![
+                Column {
+                    name: "a".to_string(),
+                    column_type: ColumnType::Integer,
+                    constraints: vec![],
+                },
+                Column {
+                    name: "b".to_string(),
+                    column_type: ColumnType::Integer,
+                    constraints: vec![],
+                },
+            ],
+            indexes: vec![],
+        },
+    };
+    let inner_create = Create {
+        table: Table {
+            rows: Vec::new(),
+            name: inner_table.clone(),
+            columns: vec![Column {
+                name: "c".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![],
+            }],
+            indexes: vec![],
+        },
+    };
+
+    let outer_insert = Insert::Values {
+        table: outer_table.clone(),
+        values: vec![vec![SimValue::TRUE, SimValue(types::Value::from_i64(10))]],
+        on_conflict: None,
+    };
+    let inner_insert = Insert::Values {
+        table: inner_table.clone(),
+        values: vec![vec![SimValue::TRUE]],
+        on_conflict: None,
+    };
+
+    Property::RejectCorrelatedOrderByDelete {
+        outer_create,
+        inner_create,
+        outer_insert,
+        inner_insert,
+        delete_sql: format!(
+            "DELETE FROM {outer_table} WHERE (SELECT c FROM {inner_table} ORDER BY {outer_table}.a LIMIT 1)"
+        ),
+    }
+}
+
 fn property_table_has_expected_content<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
@@ -1899,6 +1998,9 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::InsertValuesSelect => property_insert_values_select,
             PropertyDiscriminants::ReadYourUpdatesBack => property_read_your_updates_back,
             PropertyDiscriminants::SavepointRollback => property_savepoint_rollback,
+            PropertyDiscriminants::RejectCorrelatedOrderByDelete => {
+                property_reject_correlated_order_by_delete
+            }
             PropertyDiscriminants::TableHasExpectedContent => property_table_has_expected_content,
             PropertyDiscriminants::AllTableHaveExpectedContent => {
                 property_all_tables_have_expected_content
@@ -1954,6 +2056,18 @@ impl PropertyDiscriminants {
                     && ctx.tables().iter().any(|table| !table.name.contains('.'))
                 {
                     remaining.insert + remaining.update + remaining.delete
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::RejectCorrelatedOrderByDelete => {
+                if !env.opts.disable_reject_correlated_order_by_delete && !env.profile.mvcc {
+                    remaining
+                        .create
+                        .min(remaining.insert)
+                        .min(remaining.delete)
+                        .min(remaining.select)
+                        .max(1)
                 } else {
                     0
                 }
@@ -2059,6 +2173,10 @@ impl PropertyDiscriminants {
                 QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
             }
             PropertyDiscriminants::SavepointRollback => QueryCapabilities::INSERT,
+            PropertyDiscriminants::RejectCorrelatedOrderByDelete => QueryCapabilities::CREATE
+                .union(QueryCapabilities::INSERT)
+                .union(QueryCapabilities::DELETE)
+                .union(QueryCapabilities::SELECT),
             PropertyDiscriminants::TableHasExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::AllTableHaveExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::DoubleCreateFailure => QueryCapabilities::CREATE,

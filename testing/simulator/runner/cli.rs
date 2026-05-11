@@ -151,6 +151,12 @@ pub struct SimulatorCLI {
         default_value_t = false
     )]
     pub disable_savepoint_rollback: bool,
+    #[clap(
+        long,
+        help = "disable Reject-Correlated-Order-By-Delete Property",
+        default_value_t = false
+    )]
+    pub disable_reject_correlated_order_by_delete: bool,
     #[clap(long, help = "disable FsyncNoWait Property", default_value_t = true)]
     pub disable_fsync_no_wait: bool,
     #[clap(long, help = "disable FaultyQuery Property")]

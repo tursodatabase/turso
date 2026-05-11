@@ -735,7 +735,7 @@ fn prepare_one_select_plan(
 
             {
                 trace_stack!("validate_plan");
-                validate_group_by_outer_scope_refs(&plan)?;
+                validate_group_by_and_order_by_outer_scope_refs(&plan)?;
 
                 validate_expr_correct_column_counts(&plan)?;
             }
@@ -907,17 +907,23 @@ fn validate_expr_correct_column_counts(plan: &SelectPlan) -> Result<()> {
     Ok(())
 }
 
-/// SQLite compatibility: GROUP BY expressions in a correlated subquery cannot
-/// reference columns from the outer query scope.
-fn validate_group_by_outer_scope_refs(plan: &SelectPlan) -> Result<()> {
+/// SQLite compatibility: GROUP BY and ORDER BY expressions in a correlated
+/// subquery cannot reference columns from the outer query scope.
+fn validate_group_by_and_order_by_outer_scope_refs(plan: &SelectPlan) -> Result<()> {
     if plan.table_references.outer_query_refs().is_empty() {
         return Ok(());
     }
-    let Some(group_by) = &plan.group_by else {
-        return Ok(());
-    };
-    for expr in &group_by.exprs {
-        reject_outer_query_refs_in_group_by_expr(
+    if let Some(group_by) = &plan.group_by {
+        for expr in &group_by.exprs {
+            reject_outer_query_refs_in_sort_expr(
+                expr,
+                &plan.table_references,
+                &plan.non_from_clause_subqueries,
+            )?;
+        }
+    }
+    for (expr, _, _) in &plan.order_by {
+        reject_outer_query_refs_in_sort_expr(
             expr,
             &plan.table_references,
             &plan.non_from_clause_subqueries,
@@ -926,7 +932,7 @@ fn validate_group_by_outer_scope_refs(plan: &SelectPlan) -> Result<()> {
     Ok(())
 }
 
-fn reject_outer_query_refs_in_group_by_expr(
+fn reject_outer_query_refs_in_sort_expr(
     expr: &Expr,
     table_references: &TableReferences,
     subqueries: &[super::plan::NonFromClauseSubquery],
@@ -962,12 +968,12 @@ fn reject_outer_query_refs_in_group_by_expr(
                 let subquery = subqueries
                     .iter()
                     .find(|subquery| subquery.internal_id == *subquery_id)
-                    .expect("GROUP BY SubqueryResult must reference a planned subquery");
+                    .expect("sort SubqueryResult must reference a planned subquery");
                 let super::plan::SubqueryState::Unevaluated {
                     plan: Some(subquery_plan),
                 } = &subquery.state
                 else {
-                    unreachable!("GROUP BY subquery must be in unevaluated state during planning");
+                    unreachable!("sort subquery must be in unevaluated state during planning");
                 };
                 reject_outer_scope_refs_inside_plan_tree(subquery_plan, table_references)?;
             }
