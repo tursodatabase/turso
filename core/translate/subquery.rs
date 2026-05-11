@@ -14,7 +14,8 @@ use crate::{
             emit_program_for_select_with_resolver, emit_query,
         },
         expr::{
-            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr_mut, WalkControl,
+            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr, walk_expr_mut,
+            WalkControl,
         },
         optimizer::optimize_select_plan,
         plan::{
@@ -280,6 +281,42 @@ pub fn validate_subqueries_in_skipped_order_by(
                 connection,
             ) {
                 if !is_skipped_order_by_arity_error(&error) {
+                    return Err(error);
+                }
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+
+    Ok(())
+}
+
+pub fn validate_subqueries_in_truncated_order_by(
+    program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
+    resolver: &Resolver,
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)],
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let outer_query_refs = outer_query_refs_for(referenced_tables);
+
+    for (expr, _, _) in order_by {
+        walk_expr(expr, &mut |expr| {
+            let (subselect, suppress_direct_in_arity) = match expr {
+                ast::Expr::Exists(select) | ast::Expr::Subquery(select) => (select, false),
+                ast::Expr::InSelect { rhs, .. } => (rhs, true),
+                _ => return Ok(WalkControl::Continue),
+            };
+
+            if let Err(error) = prepare_select_plan(
+                subselect.clone(),
+                resolver,
+                program,
+                &outer_query_refs,
+                QueryDestination::Unset,
+                connection,
+            ) {
+                if !(suppress_direct_in_arity && is_skipped_order_by_arity_error(&error)) {
                     return Err(error);
                 }
             }

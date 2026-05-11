@@ -164,6 +164,37 @@ expect {
     1
 }
 
+test orderby_rowid_truncation_validates_subquery_table {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    SELECT a FROM t ORDER BY a, EXISTS(SELECT * FROM missing);
+}
+expect error {
+    no such table: missing
+}
+
+test orderby_rowid_truncation_validates_nested_subquery_arity {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    SELECT a FROM t ORDER BY a, EXISTS(SELECT * FROM t WHERE b IN (SELECT a, b FROM t));
+}
+expect error {
+    sub-select returns 2 columns - expected 1
+}
+
+test orderby_rowid_truncation_validates_shadowed_cte_arity {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    CREATE TEMPORARY TABLE u(c0, c1, c2, c3, c4, c5);
+    WITH cte_0 AS (SELECT a FROM t)
+    SELECT a
+    FROM cte_0
+    ORDER BY a, EXISTS(
+        WITH cte_0(c0) AS MATERIALIZED (SELECT * FROM temp.u)
+        SELECT c0 FROM cte_0
+    );
+}
+expect error {
+    table cte_0 has
+}
+
 # Unary-plus on integer literals should still resolve as column index
 # references, matching SQLite behavior.
 # Fixes select1-4.9.2 in testing/conformance/sqlite3/all.test.
@@ -253,4 +284,3 @@ test order-by-zero {
 expect error {
     1st ORDER BY term out of range - should be between 1 and 2
 }
-
