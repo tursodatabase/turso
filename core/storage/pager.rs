@@ -5729,6 +5729,21 @@ mod checkpoint_phase_tests {
     use crate::types::IOResult;
     use crate::Database;
 
+    /// Returns an IO backend that supports shared WAL coordination on the host.
+    /// On Windows the default `PlatformIO` (`WindowsIO`) lacks the byte-locking
+    /// and mapping primitives, so the experimental IOCP backend is used when
+    /// the `experimental_win_iocp` feature is enabled.
+    fn shared_wal_test_io() -> Arc<dyn IO> {
+        #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+        {
+            Arc::new(crate::WindowsIOCP::new().unwrap())
+        }
+        #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+        {
+            Arc::new(PlatformIO::new().unwrap())
+        }
+    }
+
     fn open_checkpoint_test_database() -> (Arc<Database>, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap().keep();
         let db_path = dir.join("test.db");
@@ -5738,7 +5753,7 @@ mod checkpoint_phase_tests {
                 .pragma_update(None, "journal_mode", "wal")
                 .unwrap();
         }
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let db = Database::open_file_with_flags(
             io,
             db_path.to_str().unwrap(),

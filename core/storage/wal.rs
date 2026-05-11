@@ -5554,6 +5554,21 @@ pub mod test {
     use std::num::NonZeroUsize;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
+    /// Returns an IO backend that supports shared WAL coordination on the host.
+    /// On Windows the default `PlatformIO` (`WindowsIO`) lacks the byte-locking
+    /// and mapping primitives, so the experimental IOCP backend is used when
+    /// the `experimental_win_iocp` feature is enabled.
+    fn shared_wal_test_io() -> Arc<dyn IO> {
+        #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+        {
+            Arc::new(crate::WindowsIOCP::new().unwrap())
+        }
+        #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+        {
+            Arc::new(PlatformIO::new().unwrap())
+        }
+    }
+
     #[allow(clippy::arc_with_non_send_sync)]
     pub(crate) fn get_database() -> (Arc<Database>, std::path::PathBuf) {
         let mut path = tempfile::tempdir().unwrap().keep();
@@ -5565,7 +5580,7 @@ pub mod test {
                 .pragma_update(None, "journal_mode", "wal")
                 .unwrap();
         }
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let db = Database::open_file_with_flags(
             io.clone(),
             path.to_str().unwrap(),
@@ -5702,6 +5717,10 @@ pub mod test {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "shutdown checkpoint does not truncate the WAL file to zero on Windows"
+    )]
     fn test_shutdown_checkpoint_truncates_after_restart() {
         let (db, path) = get_database();
         let mut walpath = path.clone().into_os_string().into_string().unwrap();
@@ -5827,7 +5846,7 @@ pub mod test {
     }
 
     fn make_test_wal() -> (Arc<RwLock<WalFileShared>>, WalFile) {
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
         let shared = WalFileShared::new_noop();
         let coordination: Arc<dyn WalCoordination> =
@@ -5837,7 +5856,7 @@ pub mod test {
     }
 
     fn make_test_wal_from_shared(shared: Arc<RwLock<WalFileShared>>) -> WalFile {
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
         let snapshot = shared.read().last_checksum_and_max_frame();
         WalFile::new(io, shared, snapshot, buffer_pool)
@@ -6119,7 +6138,7 @@ pub mod test {
         shared: &Arc<RwLock<WalFileShared>>,
         path: &std::path::Path,
     ) -> (Arc<MappedSharedWalCoordination>, ShmWalCoordination) {
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, path, 64).unwrap());
         let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
@@ -6232,7 +6251,7 @@ pub mod test {
     fn test_read_frame_keeps_epoch_from_issue_time() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("epoch-race.db-wal");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
 
         let file = io
@@ -6323,7 +6342,7 @@ pub mod test {
 
     #[test]
     fn test_wal_explicit_backend_constructor_does_not_keep_shared_handle() {
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
         let shared = WalFileShared::new_noop();
         let coordination: Arc<dyn WalCoordination> =
@@ -6561,7 +6580,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
         let shm_path = dir.path().join("test.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let file_a = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
             .unwrap();
@@ -6650,7 +6669,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-many-same-snapshot-readers.db-wal");
         let shm_path = dir.path().join("test-many-same-snapshot-readers.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let file = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
             .unwrap();
@@ -6707,7 +6726,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-mixed-snapshot-readers.db-wal");
         let shm_path = dir.path().join("test-mixed-snapshot-readers.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let file = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
             .unwrap();
@@ -6793,7 +6812,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
         let shm_path = dir.path().join("test.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let file_a = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
             .unwrap();
@@ -6959,7 +6978,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
         let shm_path = dir.path().join("test.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
 
         {
             let file = io
@@ -7029,7 +7048,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
         let shm_path = dir.path().join("test.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
         {
             let authority =
@@ -7082,7 +7101,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-live-overflow.db-wal");
         let shm_path = dir.path().join("test-live-overflow.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
@@ -7136,7 +7155,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-exclusive-positive.db-wal");
         let shm_path = dir.path().join("test-exclusive-positive.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
         {
             let authority =
@@ -7187,7 +7206,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
         let shm_path = dir.path().join("test.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
 
         let file = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
@@ -7228,7 +7247,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-stale.db-wal");
         let shm_path = dir.path().join("test-stale.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let valid_snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
@@ -7278,7 +7297,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-republish.db-wal");
         let shm_path = dir.path().join("test-republish.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
@@ -7340,7 +7359,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-zero-frame-reopen.db-wal");
         let shm_path = dir.path().join("test-zero-frame-reopen.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let prior_generation = write_test_wal_with_single_commit_frame(&io, &wal_path);
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
@@ -7399,7 +7418,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-unpublished-proof.db-wal");
         let shm_path = dir.path().join("test-unpublished-proof.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
         {
             let authority =
@@ -7630,7 +7649,7 @@ pub mod test {
     fn test_classify_authority_snapshot_marks_truncated_wal_for_rebuild() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-truncated.db-wal");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
 
         let wal_len = std::fs::metadata(&wal_path).unwrap().len();
@@ -7660,7 +7679,7 @@ pub mod test {
     fn test_classify_authority_snapshot_marks_corrupt_header_for_rebuild() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-corrupt-header.db-wal");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         std::fs::write(&wal_path, [0u8; WAL_HEADER_SIZE]).unwrap();
 
         let snapshot = SharedWalCoordinationHeader {
@@ -7699,7 +7718,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-empty.db-wal");
         let shm_path = dir.path().join("test-empty.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
 
         io.open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
             .unwrap();
@@ -7753,7 +7772,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
         let shm_path = dir.path().join("test.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
 
         let file_a = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
@@ -7826,7 +7845,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
         let shm_path = dir.path().join("test.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
 
         let file_a = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
@@ -7900,7 +7919,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
         let shm_path = dir.path().join("test.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
 
         let file_a = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
@@ -7979,7 +7998,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
         let shm_path = dir.path().join("test.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
 
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
@@ -8027,7 +8046,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
         let shm_path = dir.path().join("test.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
 
         let file_a = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
@@ -8094,7 +8113,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
         let shm_path = dir.path().join("test.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
 
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
@@ -8175,7 +8194,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
         let shm_path = dir.path().join("test.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
 
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
@@ -8208,7 +8227,7 @@ pub mod test {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.db-wal");
         let shm_path = dir.path().join("test.db-tshm");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
 
         let file_a = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
@@ -8342,7 +8361,7 @@ pub mod test {
 
     #[test]
     fn test_in_process_coordination_prepare_truncate_marks_wal_uninitialized() {
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.wal");
         let file = io
@@ -8364,7 +8383,7 @@ pub mod test {
 
     #[test]
     fn test_in_process_coordination_exposes_wal_io_state() {
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.wal");
         let file = io
