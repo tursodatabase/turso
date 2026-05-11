@@ -3345,6 +3345,58 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
     }
 }
 
+/// Collect the names by which each result column of a single SELECT arm can be
+/// referenced from ORDER BY. Mirrors the set of identifiers SQLite would
+/// consider when resolving a bare ORDER BY identifier against that arm's
+/// output column list.
+pub(crate) fn output_column_aliases(one_select: &ast::OneSelect) -> Vec<String> {
+    let ast::OneSelect::Select { columns, .. } = one_select else {
+        return Vec::new();
+    };
+    columns
+        .iter()
+        .filter_map(|col| match col {
+            ast::ResultColumn::Expr(_, Some(alias)) => Some(normalize_ident(alias.name().as_str())),
+            ast::ResultColumn::Expr(expr, None) => match expr.as_ref() {
+                ast::Expr::Id(name) | ast::Expr::Name(name) => Some(normalize_ident(name.as_str())),
+                ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
+                    Some(normalize_ident(col.as_str()))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Collect ORDER BY alias-resolution targets across every arm of a SELECT,
+/// including each compound arm. SQLite resolves a compound SELECT's ORDER BY
+/// alias by searching the body and then each compound arm in order, so any of
+/// their output column aliases qualifies.
+pub(crate) fn order_by_alias_targets(select: &ast::Select) -> Vec<String> {
+    let mut aliases = output_column_aliases(&select.body.select);
+    for compound in &select.body.compounds {
+        aliases.extend(output_column_aliases(&compound.select));
+    }
+    aliases
+}
+
+/// Returns true when `expr` is a bare identifier that names the renamed column
+/// and also matches one of the SELECT's output column aliases — i.e., this is
+/// an ORDER BY alias reference, not a FROM-clause column reference.
+pub(crate) fn order_by_expr_matches_output_alias(
+    expr: &ast::Expr,
+    old_col_norm: &str,
+    aliases: &[String],
+) -> bool {
+    let name = match expr {
+        ast::Expr::Id(name) | ast::Expr::Name(name) => name.as_str(),
+        _ => return false,
+    };
+    let name_norm = normalize_ident(name);
+    name_norm == old_col_norm && aliases.iter().any(|alias| alias == &name_norm)
+}
+
 /// Scope-aware version of `rewrite_select_column_refs` that checks table qualifiers.
 fn rewrite_select_column_refs_scoped(
     select: &mut ast::Select,
@@ -3395,7 +3447,16 @@ fn rewrite_select_column_refs_scoped(
     };
     let rename_unqualified =
         !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
+    // Per SQLite's ORDER BY resolution rules, a bare identifier matching an
+    // output column alias is treated as that alias, not as a FROM-clause
+    // column reference. Such a reference must not be rewritten — the alias
+    // label is independent of the renamed table column.
+    let order_by_aliases = order_by_alias_targets(select);
+    let old_col_norm = normalize_ident(old_col);
     for col in &mut select.order_by {
+        if order_by_expr_matches_output_alias(&col.expr, &old_col_norm, &order_by_aliases) {
+            continue;
+        }
         rename_identifiers_scoped_inner(
             &mut col.expr,
             target_table,
@@ -4031,8 +4092,17 @@ fn select_still_references_renamed_column(
     let rename_unqualified =
         !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
 
+    // Bare identifiers in ORDER BY that match an output column alias are
+    // alias references, not FROM-clause column references, so they don't
+    // count as a stale reference to the renamed column.
+    let order_by_aliases = order_by_alias_targets(select);
+    let old_col_norm = normalize_ident(old_col);
+
     let mut found = false;
     for sorted_col in &select.order_by {
+        if order_by_expr_matches_output_alias(&sorted_col.expr, &old_col_norm, &order_by_aliases) {
+            continue;
+        }
         if expr_still_references_renamed_column(
             &sorted_col.expr,
             target_table,

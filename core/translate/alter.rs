@@ -3035,7 +3035,20 @@ fn apply_select_for_column_rename(
         _ => outer_target_qualifiers.to_vec(),
     };
 
+    // Per SQLite's ORDER BY resolution rules, a bare identifier that matches
+    // an output column alias refers to that alias, not to a column in the
+    // FROM clause. Such a reference must not be rewritten — its identity is
+    // the alias label, which is independent of the renamed table column.
+    let order_by_aliases = crate::util::order_by_alias_targets(select);
+
     for sorted_col in &mut select.order_by {
+        if crate::util::order_by_expr_matches_output_alias(
+            &sorted_col.expr,
+            old_col_norm,
+            &order_by_aliases,
+        ) {
+            continue;
+        }
         apply_expr_for_column_rename(
             mode,
             &mut sorted_col.expr,
@@ -5256,26 +5269,7 @@ fn collect_select_table_visible_columns_from_output(
 }
 
 fn collect_one_select_output_columns(one_select: &ast::OneSelect) -> Vec<String> {
-    match one_select {
-        ast::OneSelect::Select { columns, .. } => {
-            columns.iter().filter_map(result_column_name).collect()
-        }
-        ast::OneSelect::Values(_) => Vec::new(),
-    }
-}
-
-fn result_column_name(column: &ast::ResultColumn) -> Option<String> {
-    match column {
-        ast::ResultColumn::Expr(_, Some(alias)) => Some(normalize_ident(alias.name().as_str())),
-        ast::ResultColumn::Expr(expr, None) => match expr.as_ref() {
-            ast::Expr::Id(name) | ast::Expr::Name(name) => Some(normalize_ident(name.as_str())),
-            ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
-                Some(normalize_ident(col.as_str()))
-            }
-            _ => None,
-        },
-        _ => None,
-    }
+    crate::util::output_column_aliases(one_select)
 }
 
 /// Check a single expression node for invalid column references after a DROP COLUMN.
