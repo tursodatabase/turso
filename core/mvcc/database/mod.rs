@@ -2138,7 +2138,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let outcome =
                     self.write_commit_log_batch(mvcc_store, &mut scan, &mut frame_builder)?;
                 if matches!(outcome, CommitLogScanOutcome::Yield) {
-                    let completion = mvcc_store.storage.flush_log_tx_frame(&mut frame_builder)?;
+                    let completion = mvcc_store
+                        .storage
+                        .flush_log_tx_frame(&mut frame_builder, None)?;
                     self.pending_log_frame_builder = Some(frame_builder);
                     self.state = CommitState::BeginCommitLogicalLog {
                         end_ts: *end_ts,
@@ -2161,9 +2163,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 if let Some(header) = header {
                     frame_builder.append_header(header)?;
                 }
-                let (c, append_bytes) = mvcc_store
-                    .storage
-                    .finish_log_tx_frame(frame_builder, None)?;
+                let (c, append_bytes) =
+                    mvcc_store
+                        .storage
+                        .finish_log_tx_frame(frame_builder, None, None)?;
                 self.pending_log_append_bytes = Some(append_bytes);
                 self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue

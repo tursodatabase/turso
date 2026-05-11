@@ -71,17 +71,19 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
     fn flush_log_tx_frame(
         &self,
         builder: &mut turso_core::mvcc::persistent_storage::logical_log::LogFrameBuilder,
+        on_chunk: Option<&dyn Fn(&[u8]) -> turso_core::Result<()>>,
     ) -> turso_core::Result<Option<turso_core::Completion>> {
-        self.inner.flush_log_tx_frame(builder)
+        self.inner.flush_log_tx_frame(builder, on_chunk)
     }
 
     fn finish_log_tx_frame(
         &self,
         builder: turso_core::mvcc::persistent_storage::logical_log::LogFrameBuilder,
+        on_chunk: Option<&dyn Fn(&[u8]) -> turso_core::Result<()>>,
         on_serialization_complete: Option<&dyn Fn(&[u8], u32) -> turso_core::Result<()>>,
     ) -> turso_core::Result<(turso_core::Completion, u64)> {
         self.inner
-            .finish_log_tx_frame(builder, on_serialization_complete)
+            .finish_log_tx_frame(builder, on_chunk, on_serialization_complete)
     }
 
     fn sync(

@@ -239,6 +239,10 @@ pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = 4120 * 1000;
 /// the serialized frame bytes and the running CRC, before the disk write.
 pub type OnSerializationComplete<'a> = Option<&'a dyn Fn(&[u8], u32) -> crate::Result<()>>;
 
+/// Optional callback invoked with each serialized logical-log frame chunk before
+/// that chunk is moved into the pending write buffer.
+pub type OnLogFrameChunk<'a> = Option<&'a dyn Fn(&[u8]) -> crate::Result<()>>;
+
 /// Borrowed logical-log operation used by MVCC commit serialization.
 ///
 /// This projects a live row version after applying the committing
@@ -611,6 +615,7 @@ impl LogicalLog {
     pub(crate) fn pwrite_deferred_frame_chunk(
         &mut self,
         builder: &mut LogFrameBuilder,
+        on_chunk: OnLogFrameChunk<'_>,
     ) -> Result<Option<Completion>> {
         turso_assert!(
             self.offset == builder.base_offset,
@@ -620,12 +625,13 @@ impl LogicalLog {
             self.running_crc == builder.base_running_crc,
             "logical log running CRC changed while building deferred frame"
         );
-        builder.pwrite_current_chunk(&self.file)
+        builder.pwrite_current_chunk(&self.file, on_chunk)
     }
 
     pub(crate) fn pwrite_deferred_frame(
         &mut self,
         mut builder: LogFrameBuilder,
+        on_chunk: OnLogFrameChunk<'_>,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
         turso_assert!(
@@ -650,7 +656,7 @@ impl LogicalLog {
         }
 
         let c = builder
-            .pwrite_current_chunk(&self.file)?
+            .pwrite_current_chunk(&self.file, on_chunk)?
             .ok_or_else(|| LimboError::InternalError("empty logical log frame".into()))?;
         self.pending_running_crc = Some(crc);
         Ok((c, builder.bytes_scheduled))
@@ -1036,13 +1042,22 @@ impl LogFrameBuilder {
         Ok(())
     }
 
-    fn pwrite_current_chunk(&mut self, file: &Arc<dyn File>) -> Result<Option<Completion>> {
+    fn pwrite_current_chunk(
+        &mut self,
+        file: &Arc<dyn File>,
+        on_chunk: OnLogFrameChunk<'_>,
+    ) -> Result<Option<Completion>> {
         if self.write_buf.is_empty() {
             return Ok(None);
         }
-        if let Some(crc_start) = self.crc_start {
-            self.frame_running_crc =
-                crc32c::crc32c_append(self.frame_running_crc, &self.write_buf[crc_start..]);
+        let next_crc = self.crc_start.map(|crc_start| {
+            crc32c::crc32c_append(self.frame_running_crc, &self.write_buf[crc_start..])
+        });
+        if let Some(cb) = on_chunk {
+            cb(&self.write_buf)?;
+        }
+        if let Some(next_crc) = next_crc {
+            self.frame_running_crc = next_crc;
         }
 
         let write_offset = self.next_write_offset;
@@ -2713,6 +2728,7 @@ enum ParsedOp {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::BTreeSet;
     use std::sync::Once;
 
@@ -2741,10 +2757,11 @@ mod tests {
     use super::{
         build_encrypted_chunk_aad, encrypted_chunk_blob_size, encrypted_chunk_plaintext_len,
         encrypted_payload_blob_size, encrypted_payload_chunk_count, serialize_header_entry,
-        serialize_op_entry, HeaderReadResult, LogHeader, LogicalLog, ParseResult, ParsedOp,
-        StreamingLogicalLogReader, StreamingResult, ENCRYPTED_CHUNK_AAD_SIZE,
-        ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC, FRAME_MAGIC, LOG_HDR_CRC_START,
-        LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION, TX_HEADER_SIZE, TX_TRAILER_SIZE,
+        serialize_op_entry, serialized_log_op_entry_size, HeaderReadResult, LogHeader, LogOpRef,
+        LogicalLog, ParseResult, ParsedOp, StreamingLogicalLogReader, StreamingResult,
+        ENCRYPTED_CHUNK_AAD_SIZE, ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC, FRAME_MAGIC,
+        LOG_HDR_CRC_START, LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION, TX_HEADER_SIZE,
+        TX_TRAILER_SIZE,
     };
     use crate::OpenFlags;
     use crate::{turso_assert, turso_assert_less_than};
@@ -2846,6 +2863,89 @@ mod tests {
             }
         }
         ops
+    }
+
+    #[test]
+    fn test_deferred_frame_chunk_callback_observes_flushed_bytes() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("test.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        let row1 = generate_simple_string_row((-2).into(), 1, "one");
+        let row2 = generate_simple_string_row((-2).into(), 2, "two");
+        let op1 = LogOpRef {
+            table_id: row1.id.table_id,
+            row_key: &row1.id.row_id,
+            payload: row1.payload(),
+            is_delete: false,
+            btree_resident: false,
+        };
+        let op2 = LogOpRef {
+            table_id: row2.id.table_id,
+            row_key: &row2.id.row_id,
+            payload: row2.payload(),
+            is_delete: false,
+            btree_resident: false,
+        };
+        let payload_size =
+            (serialized_log_op_entry_size(&op1) + serialized_log_op_entry_size(&op2)) as u64;
+
+        let mut builder = log
+            .begin_deferred_frame_builder(10, 2, payload_size)
+            .unwrap();
+        let captured_chunks = RefCell::new(Vec::<Vec<u8>>::new());
+        let capture_chunk = |bytes: &[u8]| {
+            captured_chunks.borrow_mut().push(bytes.to_vec());
+            Ok(())
+        };
+
+        builder.append_op(&op1).unwrap();
+        let c = log
+            .pwrite_deferred_frame_chunk(&mut builder, Some(&capture_chunk))
+            .unwrap()
+            .expect("partial flush should write the current frame chunk");
+        io.wait_for_completion(c).unwrap();
+
+        builder.append_op(&op2).unwrap();
+        let (c, append_bytes) = log
+            .pwrite_deferred_frame(builder, Some(&capture_chunk), None)
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let captured_chunks = captured_chunks.borrow();
+        assert_eq!(captured_chunks.len(), 2);
+        assert_eq!(
+            append_bytes as usize,
+            captured_chunks
+                .iter()
+                .map(|chunk| chunk.len())
+                .sum::<usize>()
+        );
+        assert!(
+            captured_chunks[0].len() > TX_HEADER_SIZE,
+            "partial callback should observe the tx header plus first op"
+        );
+
+        let read_back = read_table_ops(file, &io);
+        assert_eq!(
+            read_back,
+            vec![
+                ExpectedTableOp::Upsert {
+                    rowid: 1,
+                    payload: row1.payload().to_vec(),
+                    commit_ts: 10,
+                    btree_resident: false,
+                },
+                ExpectedTableOp::Upsert {
+                    rowid: 2,
+                    payload: row2.payload().to_vec(),
+                    commit_ts: 10,
+                    btree_resident: false,
+                },
+            ]
+        );
     }
 
     #[allow(clippy::too_many_arguments)]

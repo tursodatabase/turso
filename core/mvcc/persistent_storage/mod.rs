@@ -8,7 +8,8 @@ use std::fmt::Debug;
 pub mod logical_log;
 use crate::mvcc::database::LogRecord;
 use crate::mvcc::persistent_storage::logical_log::{
-    LogFrameBuilder, LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
+    LogFrameBuilder, LogicalLog, OnLogFrameChunk, OnSerializationComplete,
+    DEFAULT_LOG_CHECKPOINT_THRESHOLD,
 };
 use crate::{CheckpointResult, Completion, File, Result};
 
@@ -37,13 +38,18 @@ pub trait DurableStorage: Send + Sync + Debug {
 
     /// Write the currently buffered frame bytes and clear the builder's buffer.
     /// The writer offset is still advanced only after commit durability succeeds.
-    fn flush_log_tx_frame(&self, builder: &mut LogFrameBuilder) -> Result<Option<Completion>>;
+    fn flush_log_tx_frame(
+        &self,
+        builder: &mut LogFrameBuilder,
+        on_chunk: OnLogFrameChunk<'_>,
+    ) -> Result<Option<Completion>>;
 
     /// Finish and write a previously-started frame without advancing the writer
     /// offset. The offset is advanced only after commit durability succeeds.
     fn finish_log_tx_frame(
         &self,
         builder: LogFrameBuilder,
+        on_chunk: OnLogFrameChunk<'_>,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)>;
 
@@ -147,20 +153,25 @@ impl DurableStorage for Storage {
             .begin_deferred_frame_builder(commit_ts, op_count, payload_size)
     }
 
-    fn flush_log_tx_frame(&self, builder: &mut LogFrameBuilder) -> Result<Option<Completion>> {
+    fn flush_log_tx_frame(
+        &self,
+        builder: &mut LogFrameBuilder,
+        on_chunk: OnLogFrameChunk<'_>,
+    ) -> Result<Option<Completion>> {
         self.logical_log
             .write()
-            .pwrite_deferred_frame_chunk(builder)
+            .pwrite_deferred_frame_chunk(builder, on_chunk)
     }
 
     fn finish_log_tx_frame(
         &self,
         builder: LogFrameBuilder,
+        on_chunk: OnLogFrameChunk<'_>,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
         self.logical_log
             .write()
-            .pwrite_deferred_frame(builder, on_serialization_complete)
+            .pwrite_deferred_frame(builder, on_chunk, on_serialization_complete)
     }
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
