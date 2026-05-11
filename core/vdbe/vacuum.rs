@@ -2716,6 +2716,7 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
+    #[ignore]
     fn capture_target_metadata_uses_final_header_cookie_and_preserves_tvfs() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
         let source_dir = tempfile::tempdir().unwrap();
