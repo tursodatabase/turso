@@ -1653,14 +1653,19 @@ pub fn test_mvcc_stale_snapshot_after_schema_updated() {
         .build();
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
-    // Setup: create initial table
+    // Setup: create initial tables
     conn1
         .execute("CREATE TABLE t (key TEXT PRIMARY KEY, value TEXT)")
         .unwrap();
+    conn1
+        .execute("CREATE TABLE u (key TEXT PRIMARY KEY, value TEXT)")
+        .unwrap();
     // conn1: Start a CONCURRENT transaction
     conn1.execute("BEGIN CONCURRENT").unwrap();
-    // Do something to establish the MVCC snapshot
-    conn1.execute("SELECT * FROM t").unwrap();
+    // Perform a write to establish the MVCC snapshot + get marked as write transaction internally
+    conn1
+        .execute("INSERT INTO u VALUES ('test_key', 'test_value')")
+        .unwrap();
     // conn2: Modify schema while conn1's CONCURRENT transaction is active
     conn2.execute("CREATE TABLE t2 (x)").unwrap();
     // conn1: Try to COMMIT - should fail with SchemaConflict
@@ -1673,11 +1678,9 @@ pub fn test_mvcc_stale_snapshot_after_schema_updated() {
         .unwrap();
 
     // conn1: Start a new CONCURRENT transaction
-    // BUG: This should get a fresh MVCC snapshot, but it reuses the old one
     conn1.execute("BEGIN CONCURRENT").unwrap();
 
     // conn1: SELECT should see the row inserted by conn2
-    // BUG: Due to stale snapshot, this returns empty result
     let rows: Vec<(String, String)> = conn1.exec_rows("SELECT * FROM t WHERE key = 'test_key'");
 
     assert_eq!(
