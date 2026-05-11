@@ -10281,3 +10281,70 @@ fn busy_from_commit_post_preparing_rolls_back_transaction() {
         "tx that hit Busy mid-commit should have been rolled back; got rows: {rows:?}"
     );
 }
+
+/// `commit.after_remove_tx` fires inside `CommitState::CommitEnd` between
+/// `finish_committed_tx` and `release_exclusive_tx` (`core/mvcc/database/mod.rs`
+/// ~1984-1988). At that point the transaction is already durably committed —
+/// row versions have been rewritten to timestamps, `last_committed_tx_ts` has
+/// been stored, the connection's `mv_tx_id` has been cleared, and the tx has
+/// been removed from `mv_store.txs`. The exclusive-tx lock (taken for plain
+/// `BEGIN` writers via `begin_exclusive_tx` -> `acquire_exclusive_tx`) is the
+/// next thing to release.
+///
+/// If a fault fires at this injection site, the exclusive lock is never
+/// released and `acquire_exclusive_tx` rejects every subsequent writer with
+/// `LimboError::Busy` for the rest of the process lifetime. The
+/// recovery path in `commit_txn_mvcc` (the F1 fix at
+/// `core/vdbe/mod.rs:1932-1948`) gates the rollback on `conn.get_mv_tx_id()`,
+/// which is already `None` because `finish_committed_tx` cleared it before the
+/// fault fired — so the recovery is a no-op.
+///
+/// The same ordering also skips the auto-checkpoint scheduling at
+/// `mod.rs:1990` and would skip any future fallible step at the same site.
+#[test]
+fn fault_at_after_remove_tx_releases_exclusive_lock() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(x INT)").unwrap();
+
+    // Plain `BEGIN` upgrades to `TransactionMode::Write` on the first write,
+    // which calls `begin_exclusive_tx` and takes `mvcc_store.exclusive_tx`.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.set_failure_injector(Some(FixedFailureInjector::new([(
+        CommitYieldPoint::AfterRemoveTx.point(),
+        LimboError::Busy,
+    )])));
+
+    let err = conn
+        .execute("COMMIT")
+        .expect_err("injected fault must surface to the caller");
+    assert!(matches!(err, LimboError::Busy), "expected Busy, got {err:?}");
+    conn.set_failure_injector(None);
+
+    // The transaction was already past finish_committed_tx when the fault
+    // fired, so the row is durably committed. This is the cost of injection
+    // past the point of no return; we accept it for this test.
+    let rows = get_rows(&conn, "SELECT * FROM t");
+    assert_eq!(
+        rows.len(),
+        1,
+        "row was finalized before the fault fired and must be visible"
+    );
+
+    // The actual regression: a new write transaction must be able to start.
+    // Without the fix, `exclusive_tx` is still held by the committed-but-
+    // never-released tx, and `BEGIN` -> first write hits `Busy` from
+    // `acquire_exclusive_tx`.
+    conn.execute("BEGIN")
+        .expect("a new write tx must be startable; leaked exclusive_tx would block this");
+    conn.execute("INSERT INTO t VALUES (2)")
+        .expect("first write of the new tx must succeed");
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT x FROM t ORDER BY x");
+    assert_eq!(rows.len(), 2, "both rows should be present after recovery");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+}

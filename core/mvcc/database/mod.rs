@@ -1968,6 +1968,18 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .store(*end_ts, Ordering::Release);
                 }
 
+                // Release the exclusive-tx lock before we finalize the tx. The
+                // AfterRemoveTx injection site sits between `finish_committed_tx`
+                // and the auto-checkpoint setup; if it fires, the recovery path
+                // in `commit_txn_mvcc` can no longer find the tx via
+                // `conn.get_mv_tx_id()` (the cache was cleared inside
+                // `finish_committed_tx`) and so cannot drop the exclusive lock
+                // for us. Releasing it here matches the ordering used by the
+                // two read-only fast paths above (~lines 1721-1725, 1808-1813).
+                if mvcc_store.is_exclusive_tx(&self.tx_id) {
+                    mvcc_store.release_exclusive_tx(&self.tx_id);
+                }
+
                 // We have now updated all the versions with a reference to the
                 // transaction ID to a timestamp and can, therefore, remove the
                 // transaction. Pair removal with the connection cache clear so
@@ -1975,10 +1987,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // strand `conn.mv_tx_id` referencing a tx that's gone from `txs`.
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
-
-                if mvcc_store.is_exclusive_tx(&self.tx_id) {
-                    mvcc_store.release_exclusive_tx(&self.tx_id);
-                }
                 if mvcc_store.storage.should_checkpoint() {
                     let state_machine = StateMachine::new(CheckpointStateMachine::new(
                         self.pager.clone(),
