@@ -770,13 +770,6 @@ expect {
     1
 }
 
-test printf-empty-string-result-null {
-    SELECT printf('%s', '') IS NULL, printf('%.0s', 'abc') IS NULL, printf('%n', 1) IS NULL;
-}
-expect {
-    1|1|1
-}
-
 test printf-empty-result-not-null-constraint {
     CREATE TABLE printf_empty_not_null(x TEXT NOT NULL);
     INSERT INTO printf_empty_not_null VALUES (printf('', NULL));

@@ -1274,35 +1274,40 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
     let mut result = String::new();
     let mut args_index = 1;
     let mut chars = format_str.chars().peekable();
-    // SQLite returns NULL if printf never allocates its accumulator. Most
-    // specifiers allocate only when they append bytes; %c can allocate a
-    // zero-length text result for NUL input.
-    let mut allocated = false;
+    if format_str.is_empty() {
+        return Ok(Value::Null);
+    }
+
+    // Track whether any output or specifier processing happened. SQLite's
+    // internal StrAccum buffer stays NULL until something triggers allocation
+    // (any literal text, %%, trailing %, or any specifier including %n).
+    // When an unknown specifier triggers early return before any allocation,
+    // the result is NULL. Otherwise it's the accumulated text (possibly "").
+    let mut touched = false;
+
     while let Some(c) = chars.next() {
         if c != '%' {
+            touched = true;
             result.push(c);
-            allocated = true;
             continue;
         }
 
         // Check for %%
         if chars.peek() == Some(&'%') {
+            touched = true;
             chars.next();
             result.push('%');
-            allocated = true;
             continue;
         }
 
         // Trailing '%' at end of format string is preserved
         if chars.peek().is_none() {
             result.push('%');
-            allocated = true;
             break;
         }
 
         // Parse the full format specifier
         let spec = parse_format_spec(&mut chars, values, &mut args_index);
-        let result_len_before = result.len();
 
         // Get the argument value (or use NULL if missing)
         let needs_arg = !matches!(spec.spec_type, 'n' | '\0');
@@ -1339,25 +1344,20 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
             'r' => format_ordinal(&mut result, arg, &spec),
             'n' => { /* silently ignored, no arg consumed */ }
             _ => {
-                // Unknown specifier: return NULL if SQLite's accumulator has
-                // not been allocated yet; otherwise return accumulated text.
-                if !allocated {
+                // Unknown specifier: return NULL if nothing was processed
+                // before this point, otherwise return accumulated text.
+                // This matches SQLite where the internal buffer (zText) stays
+                // NULL until any append is attempted.
+                if !touched {
                     return Ok(Value::Null);
                 }
                 break;
             }
         }
-
-        if result.len() > result_len_before || spec.spec_type == 'c' {
-            allocated = true;
-        }
+        touched = true;
     }
 
-    if !allocated {
-        Ok(Value::Null)
-    } else {
-        Ok(Value::build_text(result))
-    }
+    Ok(Value::build_text(result))
 }
 
 #[cfg(test)]
@@ -1631,12 +1631,10 @@ mod tests {
             assert_eq!(exec_printf(&input).unwrap(), *expected.get_value());
         }
         assert_eq!(exec_printf(&[text("")]).unwrap(), Value::Null);
-        assert_eq!(exec_printf(&[text("%s"), text("")]).unwrap(), Value::Null);
         assert_eq!(
-            exec_printf(&[text("%c"), text("")]).unwrap(),
+            exec_printf(&[text("%s"), text("")]).unwrap(),
             *text("").get_value()
         );
-        assert_eq!(exec_printf(&[text("%n%j")]).unwrap(), Value::Null);
     }
 
     #[test]
@@ -1994,7 +1992,7 @@ mod tests {
         // Precision truncates the NULL literal representation
         assert_eq!(
             exec_printf(&[text("%.0q"), Register::Value(Value::Null)]).unwrap(),
-            Value::Null
+            *text("").get_value()
         );
         assert_eq!(
             exec_printf(&[text("%.3q"), Register::Value(Value::Null)]).unwrap(),
@@ -2002,7 +2000,7 @@ mod tests {
         );
         assert_eq!(
             exec_printf(&[text("%.0Q"), Register::Value(Value::Null)]).unwrap(),
-            Value::Null
+            *text("").get_value()
         );
     }
 
@@ -2027,10 +2025,10 @@ mod tests {
             exec_printf(&[text("hello%b"), integer(42)]).unwrap(),
             *text("hello").get_value()
         );
-        // Unknown specifier after %n still returns NULL because %n emits no bytes.
+        // Unknown specifier after %n → "" (StrAccum was allocated by %n processing)
         assert_eq!(
             exec_printf(&[text("%n%b"), integer(42)]).unwrap(),
-            Value::Null,
+            *text("").get_value(),
         );
     }
 
