@@ -23,3 +23,15 @@ expect {
    0|0|0
    1500000
 }
+
+@backend cli
+test mvcc-drop-virtual-generated-column-large-table {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(a);
+    ALTER TABLE t ADD COLUMN b AS (a);
+    INSERT INTO t SELECT 'aaaaaaaaaaaaaaa' FROM generate_series(1, 2000000);
+    ALTER TABLE t DROP COLUMN b;
+}
+expect {
+   mvcc
+}
