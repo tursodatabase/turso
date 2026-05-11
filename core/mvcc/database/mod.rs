@@ -1584,7 +1584,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // and we proceed without losing any of the writer's work.
                 if !mvcc_store.is_exclusive_tx(&self.tx_id)
                     && mvcc_store.has_exclusive_tx()
-                    && !tx.write_set.is_empty()
+                    && !tx.write_set.lock().is_empty()
                 {
                     return Ok(TransitionResult::Io(IOCompletions::Single(
                         Completion::new_yield(),
