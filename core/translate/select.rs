@@ -20,7 +20,7 @@ use crate::translate::planner::{
 use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::{
     plan_subqueries_from_select_plan, plan_subqueries_from_values,
-    validate_subqueries_in_skipped_order_by,
+    validate_subqueries_in_skipped_order_by, validate_subqueries_in_truncated_order_by,
 };
 use crate::translate::window::plan_windows;
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -712,6 +712,13 @@ fn prepare_one_select_plan(
                     _ => false,
                 };
                 if first_is_rowid {
+                    validate_subqueries_in_truncated_order_by(
+                        program,
+                        &plan.table_references,
+                        resolver,
+                        &plan.order_by[1..],
+                        connection,
+                    )?;
                     plan.order_by.truncate(1);
                 }
             }
