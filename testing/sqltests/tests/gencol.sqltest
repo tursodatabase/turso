@@ -3126,6 +3126,18 @@ expect {
     5|100
 }
 
+setup gencol_drop_virtual_setup {
+    CREATE TABLE t (a);
+    ALTER TABLE t ADD COLUMN b AS (a);
+    INSERT INTO t (a) VALUES (1), (2), (3);
+}
+
+@setup gencol_drop_virtual_setup
+@skip-if mvcc "MVCC updates sqlite_schema using Delete then Insert, so the snapshot is slightly different"
+snapshot gencol_drop_virtual_column_no_row_rewrite {
+    ALTER TABLE t DROP COLUMN b;
+}
+
 # Only non-generated column — rejected before dependency check
 test gencol_drop_only_regular_column_error {
     CREATE TABLE t1(a INT, b AS (a * 2));

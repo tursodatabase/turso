@@ -995,29 +995,31 @@ pub fn translate_alter_table(
                 connection,
                 input,
                 |program| {
-                    let table_name = btree.name.clone();
-                    let source_column_by_schema_idx = btree
-                        .columns()
-                        .iter()
-                        .enumerate()
-                        .map(|(new_idx, column)| {
-                            if column.is_virtual_generated() {
-                                None
-                            } else if new_idx < dropped_index {
-                                Some(new_idx)
-                            } else {
-                                Some(new_idx + 1)
-                            }
-                        })
-                        .collect();
-                    emit_rewrite_table_rows(
-                        program,
-                        original_btree.clone(),
-                        &btree,
-                        source_column_by_schema_idx,
-                        connection,
-                        database_id,
-                    );
+                    if !original_btree.columns()[dropped_index].is_virtual_generated() {
+                        let source_column_by_schema_idx = btree
+                            .columns()
+                            .iter()
+                            .enumerate()
+                            .map(|(new_idx, column)| {
+                                if column.is_virtual_generated() {
+                                    None
+                                } else if new_idx < dropped_index {
+                                    Some(new_idx)
+                                } else {
+                                    Some(new_idx + 1)
+                                }
+                            })
+                            .collect();
+
+                        emit_rewrite_table_rows(
+                            program,
+                            original_btree.clone(),
+                            &btree,
+                            source_column_by_schema_idx,
+                            connection,
+                            database_id,
+                        );
+                    }
 
                     program.emit_insn(Insn::SetCookie {
                         db: database_id,
@@ -1028,7 +1030,7 @@ pub fn translate_alter_table(
 
                     program.emit_insn(Insn::DropColumn {
                         db: database_id,
-                        table: table_name,
+                        table: btree.name.clone(),
                         column_index: dropped_index,
                     })
                 },
