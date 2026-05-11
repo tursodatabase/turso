@@ -606,6 +606,10 @@ pub fn finish_read_page(page_idx: usize, buffer: Arc<Buffer>, page: PageRef) {
         // we set the wal tag only when reading page from log, or in allocate_page,
         // we clear it here for safety in case page is being re-loaded.
         page.clear_wal_tag();
+        // #4240: record the on-disk/WAL content hash so the simulator can
+        // detect any subsequent mutation that bypasses `add_dirty()`.
+        // No-op when the `simulator` feature is disabled.
+        page.update_content_hash();
     }
 }
 

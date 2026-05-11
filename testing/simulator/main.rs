@@ -35,6 +35,11 @@ mod shrink;
 
 fn main() -> anyhow::Result<()> {
     init_logger()?;
+    // Opt in to the page-modification safety property (issue #4240). The
+    // property is compiled in for every `turso_core` consumer because the
+    // `simulator` Cargo feature is unified across the workspace, so we have
+    // to opt in at runtime here for the assertion to actually fire.
+    turso_core::enable_modification_safety_checks();
     let mut cli_opts = SimulatorCLI::parse();
     cli_opts.validate()?;
 

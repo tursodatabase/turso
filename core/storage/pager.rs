@@ -126,6 +126,23 @@ pub struct PageInner {
     pub buffer: Option<Arc<Buffer>>,
     /// Overflow cells during btree operations
     pub overflow_cells: Vec<OverflowCell>,
+    /// Hash of page content when last loaded from disk/WAL or when `add_dirty()` ran.
+    /// Used by the page-modification-safety property (issue #4240) to detect pages
+    /// that were modified BEFORE being marked dirty — such modifications break
+    /// rollback safety because the subjournal captures whatever bytes are present
+    /// at the time of the first `add_dirty()` call in a statement.
+    ///
+    /// `0` means "no recorded hash yet" (and the check is skipped).
+    #[cfg(feature = "simulator")]
+    pub content_hash: AtomicU64,
+    /// Set to `true` when `add_dirty()` has recorded the dirty snapshot for this page
+    /// in the current statement; cleared on `clear_dirty()` or on page load.
+    ///
+    /// Used to skip redundant hash recomputations on every subsequent `add_dirty()`
+    /// call inside the same statement (e.g. when both `HeaderRefMut` and downstream
+    /// btree code mark page 1 dirty).
+    #[cfg(feature = "simulator")]
+    pub dirty_snapshot_taken: AtomicBool,
 }
 
 // Methods moved from PageContent - these provide btree page access
@@ -139,6 +156,10 @@ impl PageInner {
             wal_tag: AtomicU64::new(TAG_UNSET),
             buffer: Some(buffer),
             overflow_cells: Vec::new(),
+            #[cfg(feature = "simulator")]
+            content_hash: AtomicU64::new(0),
+            #[cfg(feature = "simulator")]
+            dirty_snapshot_taken: AtomicBool::new(false),
         }
     }
 
@@ -151,6 +172,10 @@ impl PageInner {
             wal_tag: AtomicU64::new(TAG_UNSET),
             buffer: Some(Arc::new(buffer)),
             overflow_cells: Vec::new(),
+            #[cfg(feature = "simulator")]
+            content_hash: AtomicU64::new(0),
+            #[cfg(feature = "simulator")]
+            dirty_snapshot_taken: AtomicBool::new(false),
         }
     }
     /// Get the page buffer as a mutable slice. Panics if buffer not loaded.
@@ -688,6 +713,71 @@ impl PageInner {
 /// Type alias for backward compatibility - PageContent is now PageInner
 pub type PageContent = PageInner;
 
+/// Compute a fast non-cryptographic hash of the page's raw buffer bytes.
+///
+/// Used by the page-modification-safety property (issue #4240) to detect when a
+/// page is mutated outside of a proper `add_dirty()` -> mutate -> `clear_dirty()`
+/// envelope. We use `rapidhash` (already a `turso_core` dependency, see
+/// `core/vdbe/bloom_filter.rs` and `core/vdbe/hash_table.rs`) because:
+///
+/// * 64-bit output is plenty: false-positive collisions are ~2^-64 per check.
+/// * Cryptographic strength is not in the threat model — modifications come from
+///   honest internal callers that simply forgot to call `add_dirty()`.
+/// * Speed is comparable to a memcpy at typical 4–8 KiB page sizes.
+///
+/// Panics if the page buffer is not loaded.
+#[cfg(feature = "simulator")]
+fn compute_page_hash(inner: &PageInner) -> u64 {
+    use std::hash::Hasher;
+    let buf = inner
+        .buffer
+        .as_ref()
+        .expect("compute_page_hash called on a page with no loaded buffer");
+    let mut hasher = rapidhash::fast::RapidHasher::default();
+    hasher.write(buf.as_slice());
+    hasher.finish()
+}
+
+/// Runtime gate for the page-modification safety property (issue #4240).
+///
+/// The `simulator` Cargo feature is unified across the Turso workspace:
+/// `testing/concurrent-simulator/Cargo.toml` (and the simulator binary) pull
+/// in `turso_core` with `features = ["simulator", ...]`, which causes a
+/// workspace-wide `cargo build` to compile the property's hash-and-assert
+/// code into *all* `turso_core` consumers — including the Go bindings, the
+/// sync engine, and the CLI. The compile-time `cfg(feature = "simulator")`
+/// gate alone is therefore not sufficient to keep the assertion from firing
+/// in non-simulator code paths.
+///
+/// We gate the actual assertion on this runtime flag so it only fires when
+/// the simulator binary explicitly opts in via
+/// [`enable_modification_safety_checks`]. The flag starts `false`, so all
+/// non-simulator workspace consumers see the property as a no-op even when
+/// the feature is compiled in.
+#[cfg(feature = "simulator")]
+static MODIFICATION_SAFETY_CHECKS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable the page-modification safety property added in issue #4240. Should
+/// be called once at process startup from the simulator binary (or any other
+/// driver that wants the assertion to fire on a page-modification ordering
+/// violation). See [`MODIFICATION_SAFETY_CHECKS_ENABLED`] for why this is a
+/// runtime opt-in rather than a pure `cfg(feature = "simulator")` gate.
+#[cfg(feature = "simulator")]
+pub fn enable_modification_safety_checks() {
+    MODIFICATION_SAFETY_CHECKS_ENABLED.store(true, Ordering::Release);
+}
+
+/// No-op fallback so callers in the simulator binary don't need their own
+/// feature gates.
+#[cfg(not(feature = "simulator"))]
+#[inline]
+pub fn enable_modification_safety_checks() {}
+
+#[cfg(feature = "simulator")]
+fn modification_safety_checks_enabled() -> bool {
+    MODIFICATION_SAFETY_CHECKS_ENABLED.load(Ordering::Acquire)
+}
+
 /// WAL tag not set
 pub const TAG_UNSET: u64 = u64::MAX;
 /// WAL write in progress, sentinel value set before starting a WAL write
@@ -750,6 +840,10 @@ impl Page {
                 wal_tag: AtomicU64::new(TAG_UNSET),
                 buffer: None,
                 overflow_cells: Vec::new(),
+                #[cfg(feature = "simulator")]
+                content_hash: AtomicU64::new(0),
+                #[cfg(feature = "simulator")]
+                dirty_snapshot_taken: AtomicBool::new(false),
             }),
         }
     }
@@ -807,6 +901,8 @@ impl Page {
         tracing::debug!("clear_dirty(page={})", self.get().id);
         self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
         self.clear_wal_tag();
+        #[cfg(feature = "simulator")]
+        self.reset_dirty_snapshot_tracking();
     }
 
     /// Clear the dirty flag without touching wal_tag.
@@ -815,7 +911,50 @@ impl Page {
     pub fn clear_dirty_keep_wal_tag(&self) {
         tracing::debug!("clear_dirty_keep_wal_tag(page={})", self.get().id);
         self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
+        #[cfg(feature = "simulator")]
+        self.reset_dirty_snapshot_tracking();
     }
+
+    /// Re-record the page hash and clear the dirty-snapshot-taken flag.
+    /// Called when transitioning the page out of the dirty state, so that the
+    /// next `add_dirty()` in a future statement re-snapshots and re-hashes.
+    /// See [`PageInner::content_hash`] / [`PageInner::dirty_snapshot_taken`].
+    #[cfg(feature = "simulator")]
+    fn reset_dirty_snapshot_tracking(&self) {
+        let inner = self.get();
+        inner.dirty_snapshot_taken.store(false, Ordering::Release);
+        if inner.buffer.is_some() {
+            let hash = compute_page_hash(inner);
+            inner.content_hash.store(hash, Ordering::Release);
+        }
+    }
+
+    /// Update the recorded content hash for this page after it has been freshly
+    /// loaded from disk/WAL, freshly allocated, or freshly initialised via
+    /// `btree_init_page` / `write_database_header`.
+    ///
+    /// Resets the "snapshot taken" flag only when the page is not currently dirty —
+    /// dirty pages may be re-keyed during a btree balance (via `upsert_page_in_cache`)
+    /// and must retain their subjournal-was-taken state across that move.
+    ///
+    /// No-op when the `simulator` feature is disabled.
+    #[cfg(feature = "simulator")]
+    pub fn update_content_hash(&self) {
+        let inner = self.get();
+        if inner.buffer.is_none() {
+            return;
+        }
+        let hash = compute_page_hash(inner);
+        inner.content_hash.store(hash, Ordering::Release);
+        if !self.is_dirty() {
+            inner.dirty_snapshot_taken.store(false, Ordering::Release);
+        }
+    }
+
+    /// No-op when the `simulator` feature is disabled.
+    #[cfg(not(feature = "simulator"))]
+    #[inline]
+    pub fn update_content_hash(&self) {}
 
     /// Returns true if the page has been spilled to WAL and is safe to evict even while dirty.
     #[inline]
@@ -2467,6 +2606,9 @@ impl Pager {
             "offset doesn't match computed offset for page"
         );
         btree_init_page(&page, page_type, offset, self.usable_space());
+        // #4240: btree_init_page() rewrites the page header; refresh the recorded
+        // hash so the next `add_dirty()` compares against the post-init bytes.
+        page.update_content_hash();
         tracing::debug!(
             "do_allocate_page(id={}, page_type={:?})",
             page.get().id,
@@ -2535,6 +2677,10 @@ impl Pager {
             DatabaseHeader::SIZE,
             (size.get() - header.reserved_space as u32) as usize,
         );
+        // #4240: record the post-init hash for the bootstrap page1 image so that
+        // when the real `allocate_page1` flow eventually touches this page, the
+        // page-modification-safety check has a baseline to compare against.
+        page.update_content_hash();
 
         self.init_page_1.store(Some(page));
         self.page_size.store(size.get(), Ordering::SeqCst);
@@ -3081,6 +3227,59 @@ impl Pager {
             "page must be loaded in add_dirty() so its contents can be subjournaled",
             { "page_id": page.get().id }
         );
+
+        // Page-modification-safety property (issue #4240): assert that the page
+        // contents have not changed since they were loaded / since the last
+        // `clear_dirty()`. If they have, some caller mutated the page bytes
+        // BEFORE calling `add_dirty()`, which means the subjournal snapshot we
+        // are about to take below will capture modified content — breaking
+        // rollback safety. This is the bug class fixed in #4231 and #4232.
+        //
+        // Compile-gated to `simulator` so production builds pay zero CPU/memory
+        // for the hashing, and runtime-gated on
+        // [`modification_safety_checks_enabled`] because workspace feature
+        // unification compiles the property into all `turso_core` consumers
+        // (Go bindings, sync engine, CLI, etc.). The simulator binary opts in
+        // explicitly via [`enable_modification_safety_checks`]. The simulator
+        // runs everything under panic catch_unwind, so a failed assert here
+        // surfaces as a `Found bug` result with the shrunk plan.
+        #[cfg(feature = "simulator")]
+        if modification_safety_checks_enabled() {
+            let inner = page.get();
+            let already_snapshotted = inner.dirty_snapshot_taken.load(Ordering::Acquire);
+            if !already_snapshotted {
+                let current_hash = compute_page_hash(inner);
+                let original_hash = inner.content_hash.load(Ordering::Acquire);
+                let hash_matches = original_hash == 0 || current_hash == original_hash;
+                if !hash_matches {
+                    // Log structured detail before the panic so the simulator's
+                    // tracing output captures the diagnostic context.
+                    tracing::error!(
+                        page_id = inner.id,
+                        is_dirty = page.is_dirty(),
+                        dirty_snapshot_taken = already_snapshotted,
+                        original_hash = format_args!("{:#018x}", original_hash),
+                        current_hash = format_args!("{:#018x}", current_hash),
+                        "page-modification-safety: hash mismatch in add_dirty()"
+                    );
+                }
+                turso_assert!(
+                    hash_matches,
+                    "page-modification-safety: page was modified BEFORE add_dirty() — \
+                     subjournal would capture modified content, breaking rollback safety \
+                     (see issue #4240, bug class fixed in #4231 / #4232)",
+                    {
+                        "page_id": inner.id,
+                        "is_dirty": page.is_dirty(),
+                        "original_hash": format!("{:#018x}", original_hash),
+                        "current_hash":  format!("{:#018x}", current_hash)
+                    }
+                );
+                inner.dirty_snapshot_taken.store(true, Ordering::Release);
+                inner.content_hash.store(current_hash, Ordering::Release);
+            }
+        }
+
         self.subjournal_page_if_required(page)?;
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id as u32);
@@ -4736,6 +4935,8 @@ impl Pager {
                     (default_header.page_size.get() - default_header.reserved_space as u32)
                         as usize,
                 );
+                // #4240: record the post-init hash for page 1.
+                page1.update_content_hash();
                 let c = begin_write_btree_page(self, &page1)?;
 
                 // Pin page1 to prevent eviction while stored in state machine
@@ -5188,6 +5389,10 @@ pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>) -> PageRef
         inner.buffer = Some(Arc::new(buffer));
         page.set_loaded();
         page.clear_wal_tag();
+        // #4240: record the freshly-allocated (typically all-zero) buffer hash
+        // so that any caller mutating the page without going through
+        // `add_dirty()` first will trip the page-modification-safety check.
+        page.update_content_hash();
     }
     page
 }
@@ -5221,6 +5426,8 @@ pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
         DatabaseHeader::SIZE, // offset of 100 bytes
         (default_header.page_size.get() - default_header.reserved_space as u32) as usize,
     );
+    // #4240: record the post-init hash for the synthetic default page1.
+    page.update_content_hash();
 
     page
 }
@@ -5715,6 +5922,81 @@ mod ptrmap_tests {
         assert_eq!(
             get_ptrmap_offset_in_page(108, 105, page_size).unwrap(),
             2 * PTRMAP_ENTRY_SIZE
+        );
+    }
+
+    /// Regression test for the page-modification-safety property (issue #4240).
+    ///
+    /// Mutates a loaded page's bytes *without* first calling `add_dirty()`, then
+    /// invokes `add_dirty()` and expects the safety assertion to fire. Reverting
+    /// the `#[cfg(feature = "simulator")]` block in `Pager::add_dirty` makes
+    /// this test fail with "add_dirty should have panicked"; with the safety
+    /// block in place it panics with
+    /// `"page-modification-safety: page was modified BEFORE add_dirty() ..."`.
+    #[cfg(feature = "simulator")]
+    #[test]
+    #[should_panic(expected = "page-modification-safety: page was modified BEFORE add_dirty()")]
+    fn test_page_modification_safety_detects_unmarked_mutation() {
+        use crate::storage::page_cache::PageCacheKey;
+        use std::sync::atomic::Ordering;
+
+        // Opt in to the runtime gate. The property is compile-gated to
+        // `simulator` AND runtime-gated to keep workspace consumers (Go
+        // bindings, sync engine, CLI) from tripping the assertion when the
+        // feature is unified across the workspace build graph.
+        super::enable_modification_safety_checks();
+
+        // 10 initial pages keeps the buffer pool above its 64 KiB minimum.
+        let pager = test_pager_setup(4096, 10);
+
+        // allocate_page1() ran inside test_pager_setup, so page 1 is loaded
+        // in the cache with `content_hash` populated and
+        // `dirty_snapshot_taken == false`.
+        let page = {
+            let mut page_cache = pager.page_cache.write();
+            let key = PageCacheKey::new(1);
+            page_cache.get(&key).unwrap().unwrap()
+        };
+
+        // The setup helper mutates page 1 (header writes, btree_create), which
+        // sets `dirty_snapshot_taken = true` on page 1. Simulate the
+        // end-of-statement boundary with `clear_dirty()` so we re-enter the
+        // "fresh statement" state where the next `add_dirty()` runs the
+        // hash-equality check.
+        page.clear_dirty();
+
+        let inner = page.get();
+        let original_hash = inner.content_hash.load(Ordering::Acquire);
+        assert_ne!(
+            original_hash, 0,
+            "page 1 should have a recorded content_hash after clear_dirty()"
+        );
+        assert!(
+            !inner.dirty_snapshot_taken.load(Ordering::Acquire),
+            "clear_dirty() should reset dirty_snapshot_taken to false"
+        );
+
+        // Mutate the page bytes BEHIND the pager's back — no add_dirty() call
+        // yet. This simulates the bug class fixed in #4231 / #4232: a caller
+        // that edits page content first and only marks the page dirty
+        // afterwards, which would cause the subjournal snapshot to capture
+        // the modified bytes instead of the originals and break rollback
+        // safety.
+        {
+            let buf = inner
+                .buffer
+                .as_ref()
+                .expect("page 1 should have a buffer after allocate_page1()");
+            buf.as_mut_slice()[100] ^= 0xff;
+        }
+
+        // Now mark the page dirty. The safety check should detect that the
+        // recorded `content_hash` no longer matches the live bytes and panic
+        // via `turso_assert!`.
+        let _ = pager.add_dirty(&page);
+        panic!(
+            "add_dirty should have panicked via the page-modification-safety \
+             assertion before reaching this line (issue #4240)"
         );
     }
 }

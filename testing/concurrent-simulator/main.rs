@@ -104,6 +104,16 @@ enum SubCmd {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    // NOTE: this binary does NOT opt in to the page-modification safety
+    // property (issue #4240) at this time. The property is gated runtime via
+    // `turso_core::enable_modification_safety_checks()` and is currently
+    // wired up only in `limbo_sim` (`testing/simulator/main.rs`). The MVCC
+    // mode under `concurrent-simulator` has a separate page lifecycle (no
+    // `finish_read_page` / `add_dirty` symmetry on MVCC-managed pages) and
+    // is explicitly out of scope for this PR — see issue #4240 thread.
+    // Future work: once the MVCC interaction is understood, this binary can
+    // opt in via `turso_core::enable_modification_safety_checks()`.
+
     // Dispatch to worker BEFORE init_logger so the worker can install its own
     // stderr-only subscriber without the coordinator's logger polluting stdout.
     if let Some(SubCmd::Worker {

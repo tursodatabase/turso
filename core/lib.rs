@@ -141,7 +141,7 @@ pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},
     encryption::{CipherMode, EncryptionContext, EncryptionKey},
-    pager::{Page, PageRef, Pager},
+    pager::{enable_modification_safety_checks, Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
 pub use translate::expr::{walk_expr_mut, WalkControl};
