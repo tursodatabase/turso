@@ -11702,3 +11702,32 @@ fn abandoned_commit_in_committed_state_should_not_block_subsequent_checkpoint() 
 
     conn_b.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 }
+
+/// A read-only `BEGIN CONCURRENT` must not be aborted at COMMIT by DDL that
+/// committed on another connection between its `BEGIN` and `COMMIT`. The
+/// reader saw a consistent pre-DDL snapshot and has no writes to invalidate,
+/// so there is nothing for the schema-conflict check to protect against.
+///
+/// Regression for `mvcc_findings/ACTION_PLAN.md` issue A1 (global schema
+/// cookie aborts unrelated transactions).
+#[test]
+fn read_only_bc_survives_unrelated_ddl() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let c1 = db.connect();
+    let c2 = db.connect();
+
+    c1.execute("CREATE TABLE t(x INT)").unwrap();
+    c1.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    c2.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(&c2, "SELECT * FROM t");
+    assert_eq!(rows.len(), 1);
+
+    // Unrelated DDL on a different table while c2 is mid-BC.
+    c1.execute("CREATE TABLE u(z INT)").unwrap();
+
+    // A read-only BC saw a consistent snapshot and has nothing to invalidate.
+    c2.execute("COMMIT")
+        .expect("read-only BEGIN CONCURRENT must not be aborted by unrelated DDL");
+}

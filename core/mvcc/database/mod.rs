@@ -1759,12 +1759,18 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     }
                 }
 
-                if mvcc_store
-                    .last_committed_schema_change_ts
-                    .load(Ordering::Acquire)
-                    > tx.begin_ts
+                // Schema changes made after a writing transaction began invalidate
+                // its planned writes against a possibly-obsolete schema and force
+                // it to abort. A read-only transaction took a consistent pre-DDL
+                // snapshot and has nothing to invalidate, so it is exempt.
+                let has_writes =
+                    !tx.write_set.lock().is_empty() || tx.header_dirty.load(Ordering::Acquire);
+                if has_writes
+                    && mvcc_store
+                        .last_committed_schema_change_ts
+                        .load(Ordering::Acquire)
+                        > tx.begin_ts
                 {
-                    // Schema changes made after the transaction began always cause a [SchemaConflict] error and the tx must abort.
                     return Err(LimboError::SchemaConflict);
                 }
 
