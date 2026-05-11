@@ -110,8 +110,12 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         self.inner.checkpoint_threshold()
     }
 
-    fn advance_logical_log_offset_after_success(&self, bytes: u64) {
+    fn advance_logical_log_offset_after_success(&self, bytes: u64) -> turso_core::Result<()> {
         self.inner.advance_logical_log_offset_after_success(bytes)
+    }
+
+    fn discard_pending_log_write(&self) -> turso_core::Result<()> {
+        self.inner.discard_pending_log_write()
     }
 
     fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32) {

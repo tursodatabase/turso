@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ops::Deref,
     sync::{Arc, Mutex},
 };
@@ -17,7 +18,7 @@ use crate::{
     database_sync_engine::{DataStats, DatabaseSyncEngineOpts},
     database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
     database_tape::{
-        run_stmt_expect_one_row, run_stmt_ignore_rows, DatabaseChangesIteratorMode,
+        run_stmt_expect_one_row, run_stmt_ignore_rows, run_stmt_once, DatabaseChangesIteratorMode,
         DatabaseChangesIteratorOpts, DatabaseReplaySession, DatabaseReplaySessionOpts,
         DatabaseTape, DatabaseWalSession,
     },
@@ -44,6 +45,22 @@ pub const WAL_HEADER: usize = 32;
 pub const WAL_FRAME_HEADER: usize = 24;
 pub const PAGE_SIZE: usize = 4096;
 pub const WAL_FRAME_SIZE: usize = WAL_FRAME_HEADER + PAGE_SIZE;
+const MVCC_LOG_MAGIC: u32 = 0x4C4D4C32;
+const MVCC_LOG_VERSION: u8 = 3;
+const MVCC_LOG_HEADER_SIZE: usize = 56;
+const MVCC_TX_FRAME_MAGIC: u32 = 0x5854564D;
+const MVCC_TX_EXT_FRAME_MAGIC: u32 = 0x5845564D;
+const MVCC_TX_END_MAGIC: u32 = 0x4554564D;
+const MVCC_TX_HEADER_SIZE: usize = 24;
+const MVCC_TX_EXT_HEADER_SIZE: usize = 40;
+const MVCC_TX_TRAILER_SIZE: usize = 8;
+const MVCC_TX_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
+const MVCC_EXTENSION_RECORD_HEADER_SIZE: usize = 8;
+const MVCC_EXTENSION_TYPE_PORTABLE_CHANGES: u16 = 1;
+const MVCC_LOG_HEADER_SALT_START: usize = 8;
+const MVCC_LOG_HEADER_SALT_END: usize = 16;
+const MVCC_LOG_HEADER_RESERVED_START: usize = 16;
+const MVCC_LOG_HEADER_CRC_START: usize = 52;
 const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
 const SQLITE_SCHEMA_TABLE: &str = "sqlite_schema";
 const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
@@ -70,12 +87,12 @@ fn pull_updates_apply_mode(header: &PullUpdatesRespProtoBody) -> Result<PullUpda
     })
 }
 
-/// Rejects logical pull streams on call paths that can only apply page streams.
+/// Rejects raw logical-log pull streams on call paths that can only apply page streams.
 fn ensure_page_stream(header: &PullUpdatesRespProtoBody, context: &str) -> Result<()> {
     match pull_updates_stream_kind(header)? {
         PullUpdatesStreamKind::Pages => Ok(()),
-        PullUpdatesStreamKind::Logical => Err(Error::DatabaseSyncEngineError(format!(
-            "{context} does not support logical pull-updates streams yet"
+        PullUpdatesStreamKind::MvccLogicalLog => Err(Error::DatabaseSyncEngineError(format!(
+            "{context} does not support raw MVCC logical-log pull-updates streams yet"
         ))),
     }
 }
@@ -262,28 +279,125 @@ fn logical_schema_kind(kind: i32) -> Result<DatabaseSchemaKind> {
     })
 }
 
+#[derive(Default)]
+struct LogicalReplayTableMap {
+    names_by_stable_id: BTreeMap<u64, String>,
+}
+
+impl LogicalReplayTableMap {
+    fn from_persisted(names_by_stable_id: BTreeMap<u64, String>) -> Self {
+        Self { names_by_stable_id }
+    }
+
+    fn into_persisted(self) -> BTreeMap<u64, String> {
+        self.names_by_stable_id
+    }
+
+    fn resolve_row_table_name(&self, op: &LogicalOp) -> Result<String> {
+        if !op.table_name.is_empty() {
+            return Ok(op.table_name.clone());
+        }
+        if op.stable_table_id == 0 {
+            return Err(Error::DatabaseSyncEngineError(
+                "logical row op must include table_name or stable_table_id".to_string(),
+            ));
+        }
+        self.names_by_stable_id
+            .get(&op.stable_table_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::DatabaseSyncEngineError(format!(
+                    "logical row op references unknown stable_table_id {}",
+                    op.stable_table_id
+                ))
+            })
+    }
+
+    fn observe_schema_op(
+        &mut self,
+        stable_table_id: u64,
+        schema_name: &str,
+        schema_kind: DatabaseSchemaKind,
+        schema_action: LogicalSchemaAction,
+    ) {
+        if stable_table_id == 0 || schema_kind != DatabaseSchemaKind::Table {
+            return;
+        }
+        match schema_action {
+            LogicalSchemaAction::Create
+            | LogicalSchemaAction::Refresh
+            | LogicalSchemaAction::Alter => {
+                self.names_by_stable_id
+                    .insert(stable_table_id, schema_name.to_string());
+            }
+            LogicalSchemaAction::Drop => {
+                self.names_by_stable_id.remove(&stable_table_id);
+            }
+        }
+    }
+}
+
 /// Converts all operations in one logical MVCC transaction to tape operations.
 ///
 /// Internal sync/CDC/SQLite objects are filtered out here so both in-memory and
 /// file-backed logical replay use the same user-data boundary.
 pub fn logical_txn_to_tape_operations(txn: &LogicalTxnData) -> Result<Vec<DatabaseTapeOperation>> {
+    let mut table_map = LogicalReplayTableMap::default();
+    logical_txn_to_tape_operations_with_table_map(txn, &mut table_map)
+}
+
+fn logical_txn_to_tape_operations_with_table_map(
+    txn: &LogicalTxnData,
+    table_map: &mut LogicalReplayTableMap,
+) -> Result<Vec<DatabaseTapeOperation>> {
     let mut operations = Vec::new();
     for op in txn.ops.iter().cloned() {
-        if matches!(
-            LogicalOpType::try_from(op.op_type),
-            Ok(LogicalOpType::UpsertRow | LogicalOpType::DeleteRow)
-        ) && !is_logically_replayable_table(&op.table_name)
-        {
-            continue;
+        let op_type = LogicalOpType::try_from(op.op_type).map_err(|_| {
+            Error::DatabaseSyncEngineError(format!("unknown logical op type: {}", op.op_type))
+        })?;
+        match op_type {
+            LogicalOpType::UpsertRow | LogicalOpType::DeleteRow => {
+                let table_name = table_map.resolve_row_table_name(&op)?;
+                if !is_logically_replayable_table(&table_name) {
+                    continue;
+                }
+                let mut op = op;
+                op.table_name = table_name;
+                operations.extend(logical_op_to_tape_operations(op, txn.commit_ts)?);
+            }
+            LogicalOpType::Schema => {
+                if !is_logically_replayable_table(&op.schema_name) {
+                    continue;
+                }
+                let schema_action =
+                    LogicalSchemaAction::try_from(op.schema_action.ok_or_else(|| {
+                        Error::DatabaseSyncEngineError(
+                            "logical schema op must include schema_action".to_string(),
+                        )
+                    })?)
+                    .map_err(|_| {
+                        Error::DatabaseSyncEngineError(format!(
+                            "unknown logical schema action: {:?}",
+                            op.schema_action
+                        ))
+                    })?;
+                let schema_kind = logical_schema_kind(op.schema_kind.ok_or_else(|| {
+                    Error::DatabaseSyncEngineError(
+                        "logical schema op must include schema_kind".to_string(),
+                    )
+                })?)?;
+                table_map.observe_schema_op(
+                    op.stable_table_id,
+                    &op.schema_name,
+                    schema_kind,
+                    schema_action,
+                );
+                operations.extend(logical_op_to_tape_operations(op, txn.commit_ts)?);
+            }
+            LogicalOpType::UpdateHeader => {
+                operations.extend(logical_op_to_tape_operations(op, txn.commit_ts)?);
+            }
         }
-        if matches!(
-            LogicalOpType::try_from(op.op_type),
-            Ok(LogicalOpType::Schema)
-        ) && !is_logically_replayable_table(&op.schema_name)
-        {
-            continue;
-        }
-        operations.extend(logical_op_to_tape_operations(op, txn.commit_ts)?);
     }
     Ok(operations)
 }
@@ -406,6 +520,7 @@ async fn replay_logical_transactions<Ctx>(
     excluded_client_id: Option<&str>,
 ) -> Result<()> {
     let mut saw_replayed_txns = false;
+    let mut table_map = LogicalReplayTableMap::default();
     for txn in txns {
         if let Some(excluded_client_id) = excluded_client_id {
             if logical_txn_acknowledges_client(txn, excluded_client_id)? {
@@ -416,7 +531,7 @@ async fn replay_logical_transactions<Ctx>(
             }
         }
         saw_replayed_txns = true;
-        for operation in logical_txn_to_tape_operations(txn)? {
+        for operation in logical_txn_to_tape_operations_with_table_map(txn, &mut table_map)? {
             replay.replay(coro, operation).await?;
         }
     }
@@ -506,11 +621,14 @@ async fn replay_logical_transactions_from_file<Ctx>(
     txns_file: &Arc<dyn turso_core::File>,
     commit_at_end: bool,
     excluded_client_id: Option<&str>,
+    table_names_by_stable_id: &mut BTreeMap<u64, String>,
 ) -> Result<()> {
     let size = txns_file.size()?;
     let mut file_offset = 0u64;
     let mut bytes = BytesMut::new();
     let mut saw_replayed_txns = false;
+    let mut table_map =
+        LogicalReplayTableMap::from_persisted(std::mem::take(table_names_by_stable_id));
     loop {
         while let Some(txn) = take_proto_message_from_bytes::<LogicalTxnData>(&mut bytes)? {
             if let Some(excluded_client_id) = excluded_client_id {
@@ -522,7 +640,7 @@ async fn replay_logical_transactions_from_file<Ctx>(
                 }
             }
             saw_replayed_txns = true;
-            for operation in logical_txn_to_tape_operations(&txn)? {
+            for operation in logical_txn_to_tape_operations_with_table_map(&txn, &mut table_map)? {
                 replay.replay(coro, operation).await?;
             }
         }
@@ -539,6 +657,7 @@ async fn replay_logical_transactions_from_file<Ctx>(
     if commit_at_end && saw_replayed_txns {
         replay.replay(coro, DatabaseTapeOperation::Commit).await?;
     }
+    *table_names_by_stable_id = table_map.into_persisted();
     Ok(())
 }
 
@@ -559,8 +678,57 @@ pub async fn apply_logical_transactions_file_without_commit_excluding_client_txn
     txns_file: &Arc<dyn turso_core::File>,
     excluded_client_id: &str,
 ) -> Result<()> {
-    replay_logical_transactions_from_file(coro, replay, txns_file, false, Some(excluded_client_id))
-        .await
+    let mut table_names_by_stable_id = BTreeMap::new();
+    replay_logical_transactions_from_file(
+        coro,
+        replay,
+        txns_file,
+        false,
+        Some(excluded_client_id),
+        &mut table_names_by_stable_id,
+    )
+    .await
+}
+
+/// Applies file-backed logical MVCC transactions without committing and updates
+/// a caller-owned stable table-id map for future nameless row operations.
+pub async fn apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map<
+    Ctx,
+>(
+    coro: &Coro<Ctx>,
+    replay: &mut DatabaseReplaySession,
+    txns_file: &Arc<dyn turso_core::File>,
+    excluded_client_id: &str,
+    table_names_by_stable_id: &mut BTreeMap<u64, String>,
+) -> Result<()> {
+    replay_logical_transactions_from_file(
+        coro,
+        replay,
+        txns_file,
+        false,
+        Some(excluded_client_id),
+        table_names_by_stable_id,
+    )
+    .await
+}
+
+/// Applies file-backed logical MVCC transactions without committing and updates
+/// a caller-owned stable table-id map for future nameless row operations.
+pub async fn apply_logical_transactions_file_without_commit_with_table_map<Ctx>(
+    coro: &Coro<Ctx>,
+    replay: &mut DatabaseReplaySession,
+    txns_file: &Arc<dyn turso_core::File>,
+    table_names_by_stable_id: &mut BTreeMap<u64, String>,
+) -> Result<()> {
+    replay_logical_transactions_from_file(
+        coro,
+        replay,
+        txns_file,
+        false,
+        None,
+        table_names_by_stable_id,
+    )
+    .await
 }
 
 /// RAII holder for a single shared temporary resource.
@@ -635,7 +803,8 @@ pub enum WalPushResult {
 /// Result shape for the V1 pull-updates endpoint.
 ///
 /// Page streams are written as raw WAL frames into the supplied scratch file.
-/// Logical streams are written as length-delimited `LogicalTxnData` messages.
+/// Raw MVCC logical-log streams are decoded into length-delimited
+/// `LogicalTxnData` messages in the supplied scratch file.
 #[derive(Debug)]
 pub enum PullUpdatesV1Result {
     Pages { replace_base: bool },
@@ -693,20 +862,370 @@ async fn append_file_bytes<Ctx>(
     Ok(())
 }
 
-/// Appends one length-delimited protobuf message to a scratch file.
-async fn append_proto_message_to_file<Ctx, T: prost::Message>(
+fn read_u32_le(buf: &[u8], offset: usize) -> Result<u32> {
+    let bytes = buf.get(offset..offset + 4).ok_or_else(|| {
+        Error::DatabaseSyncEngineError("truncated MVCC logical-log frame".to_string())
+    })?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn read_u16_le(buf: &[u8], offset: usize) -> Result<u16> {
+    let bytes = buf.get(offset..offset + 2).ok_or_else(|| {
+        Error::DatabaseSyncEngineError("truncated MVCC logical-log frame".to_string())
+    })?;
+    Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn read_u64_le(buf: &[u8], offset: usize) -> Result<u64> {
+    let bytes = buf.get(offset..offset + 8).ok_or_else(|| {
+        Error::DatabaseSyncEngineError("truncated MVCC logical-log frame".to_string())
+    })?;
+    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn find_mvcc_extension_payload(
+    extension_block: &[u8],
+    extension_record_count: u32,
+    wanted_type: u16,
+) -> Result<Vec<u8>> {
+    let mut offset = 0usize;
+    let mut payload = Vec::new();
+    for _ in 0..extension_record_count {
+        let header_end = offset
+            .checked_add(MVCC_EXTENSION_RECORD_HEADER_SIZE)
+            .ok_or_else(|| {
+                Error::DatabaseSyncEngineError(
+                    "MVCC logical-log extension record offset overflow".to_string(),
+                )
+            })?;
+        if header_end > extension_block.len() {
+            return Err(Error::DatabaseSyncEngineError(
+                "MVCC logical-log extension record header is truncated".to_string(),
+            ));
+        }
+        let extension_type = read_u16_le(extension_block, offset)?;
+        let extension_flags = read_u16_le(extension_block, offset + 2)?;
+        if extension_flags != 0 {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "unsupported MVCC logical-log extension flags for type {extension_type}: {extension_flags:#x}"
+            )));
+        }
+        let extension_len = read_u32_le(extension_block, offset + 4)? as usize;
+        let payload_start = header_end;
+        let payload_end = payload_start.checked_add(extension_len).ok_or_else(|| {
+            Error::DatabaseSyncEngineError(
+                "MVCC logical-log extension record payload offset overflow".to_string(),
+            )
+        })?;
+        if payload_end > extension_block.len() {
+            return Err(Error::DatabaseSyncEngineError(
+                "MVCC logical-log extension record payload is truncated".to_string(),
+            ));
+        }
+        if extension_type == wanted_type {
+            payload.extend_from_slice(&extension_block[payload_start..payload_end]);
+        }
+        offset = payload_end;
+    }
+    if offset != extension_block.len() {
+        return Err(Error::DatabaseSyncEngineError(
+            "MVCC logical-log extension block has trailing bytes".to_string(),
+        ));
+    }
+    Ok(payload)
+}
+
+fn validate_mvcc_log_header(buf: &[u8]) -> Result<u32> {
+    if buf.len() < MVCC_LOG_HEADER_SIZE {
+        return Err(Error::DatabaseSyncEngineError(
+            "truncated MVCC logical-log header".to_string(),
+        ));
+    }
+    let magic = read_u32_le(buf, 0)?;
+    if magic != MVCC_LOG_MAGIC {
+        return Err(Error::DatabaseSyncEngineError(
+            "invalid MVCC logical-log header magic".to_string(),
+        ));
+    }
+    if buf[4] != MVCC_LOG_VERSION {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "unsupported MVCC logical-log version {}",
+            buf[4]
+        )));
+    }
+    let flags = buf[5];
+    if flags & 0b1111_1110 != 0 {
+        return Err(Error::DatabaseSyncEngineError(
+            "invalid MVCC logical-log header flags".to_string(),
+        ));
+    }
+    let hdr_len = u16::from_le_bytes([buf[6], buf[7]]) as usize;
+    if hdr_len != MVCC_LOG_HEADER_SIZE {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "invalid MVCC logical-log header length {hdr_len}"
+        )));
+    }
+    let stored_crc = read_u32_le(buf, MVCC_LOG_HEADER_CRC_START)?;
+    let mut crc_buf = [0u8; MVCC_LOG_HEADER_SIZE];
+    crc_buf.copy_from_slice(&buf[..MVCC_LOG_HEADER_SIZE]);
+    crc_buf[MVCC_LOG_HEADER_CRC_START..MVCC_LOG_HEADER_SIZE].fill(0);
+    let expected_crc = crc32c::crc32c(&crc_buf);
+    if expected_crc != stored_crc {
+        return Err(Error::DatabaseSyncEngineError(
+            "MVCC logical-log header checksum mismatch".to_string(),
+        ));
+    }
+    if buf[MVCC_LOG_HEADER_RESERVED_START..MVCC_LOG_HEADER_CRC_START]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(Error::DatabaseSyncEngineError(
+            "MVCC logical-log header reserved bytes must be zero".to_string(),
+        ));
+    }
+    let salt = u64::from_le_bytes(
+        buf[MVCC_LOG_HEADER_SALT_START..MVCC_LOG_HEADER_SALT_END]
+            .try_into()
+            .expect("fixed-size salt slice"),
+    );
+    Ok(crc32c::crc32c(&salt.to_le_bytes()))
+}
+
+fn decode_mvcc_log_crc_seed(seed: &[u8]) -> Result<u32> {
+    if seed.len() != std::mem::size_of::<u32>() {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "invalid MVCC logical-log CRC seed length {}",
+            seed.len()
+        )));
+    }
+    Ok(u32::from_le_bytes(
+        seed.try_into().expect("validated CRC seed length"),
+    ))
+}
+
+async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
     coro: &Coro<Ctx>,
-    file: &Arc<dyn turso_core::File>,
-    offset: &mut u64,
-    message: &T,
-) -> Result<()> {
-    append_file_bytes(
-        coro,
-        file,
-        offset,
-        &message.encode_length_delimited_to_vec(),
-    )
-    .await
+    txns_file: &Arc<dyn turso_core::File>,
+    body: &[u8],
+    header: &PullUpdatesRespProtoBody,
+) -> Result<(usize, usize)> {
+    let Some(metadata) = header.mvcc_log.as_ref() else {
+        if body.is_empty() {
+            truncate_file(coro, txns_file).await?;
+            return Ok((0, 0));
+        }
+        return Err(Error::DatabaseSyncEngineError(
+            "raw MVCC logical-log stream is missing metadata".to_string(),
+        ));
+    };
+    if metadata.format != "lml3" {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "unsupported MVCC logical-log format {}",
+            metadata.format
+        )));
+    }
+    if metadata.ranges.is_empty() {
+        return Err(Error::DatabaseSyncEngineError(
+            "raw MVCC logical-log stream has no ranges".to_string(),
+        ));
+    }
+
+    truncate_file(coro, txns_file).await?;
+    let mut body_offset = 0usize;
+    let mut txns_offset = 0u64;
+    let mut txns = 0usize;
+    let mut ops = 0usize;
+    let mut running_crc: Option<u32> = None;
+    let mut previous_range_boundary: Option<(u64, u64)> = None;
+
+    for range in &metadata.ranges {
+        if previous_range_boundary != Some((range.generation, range.start_offset)) {
+            running_crc = None;
+        }
+        let range_len = usize::try_from(
+            range
+                .end_offset
+                .checked_sub(range.start_offset)
+                .ok_or_else(|| {
+                    Error::DatabaseSyncEngineError(format!(
+                        "invalid MVCC logical-log range {}..{}",
+                        range.start_offset, range.end_offset
+                    ))
+                })?,
+        )
+        .map_err(|_| {
+            Error::DatabaseSyncEngineError(
+                "MVCC logical-log range length overflows usize".to_string(),
+            )
+        })?;
+        let range_end = body_offset.checked_add(range_len).ok_or_else(|| {
+            Error::DatabaseSyncEngineError("MVCC logical-log range length overflow".to_string())
+        })?;
+        let range_body = body.get(body_offset..range_end).ok_or_else(|| {
+            Error::DatabaseSyncEngineError(format!(
+                "raw MVCC logical-log body is shorter than advertised range {}..{}",
+                range.start_offset, range.end_offset
+            ))
+        })?;
+        body_offset = range_end;
+
+        let mut pos = 0usize;
+        if range.starts_with_header {
+            running_crc = Some(validate_mvcc_log_header(range_body)?);
+            pos = MVCC_LOG_HEADER_SIZE;
+        } else if let Some(seed) = range.crc_seed.as_deref() {
+            running_crc = Some(decode_mvcc_log_crc_seed(seed)?);
+        } else if running_crc.is_none() {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "raw MVCC logical-log range {}..{} is missing CRC seed",
+                range.start_offset, range.end_offset
+            )));
+        }
+
+        while pos < range_body.len() {
+            let frame_start = pos;
+            if range_body.len() - pos < MVCC_TX_HEADER_SIZE + MVCC_TX_TRAILER_SIZE {
+                return Err(Error::DatabaseSyncEngineError(
+                    "truncated MVCC logical-log transaction frame".to_string(),
+                ));
+            }
+            let frame_magic = read_u32_le(range_body, pos)?;
+            let has_extension_header = frame_magic == MVCC_TX_EXT_FRAME_MAGIC;
+            if frame_magic != MVCC_TX_FRAME_MAGIC && !has_extension_header {
+                return Err(Error::DatabaseSyncEngineError(format!(
+                    "invalid MVCC logical-log transaction frame magic at range offset {frame_start}"
+                )));
+            }
+            let header_size = if has_extension_header {
+                if range_body.len() - pos < MVCC_TX_EXT_HEADER_SIZE + MVCC_TX_TRAILER_SIZE {
+                    return Err(Error::DatabaseSyncEngineError(
+                        "truncated MVCC logical-log transaction frame".to_string(),
+                    ));
+                }
+                MVCC_TX_EXT_HEADER_SIZE
+            } else {
+                MVCC_TX_HEADER_SIZE
+            };
+            let payload_size =
+                usize::try_from(read_u64_le(range_body, pos + 4)?).map_err(|_| {
+                    Error::DatabaseSyncEngineError(
+                        "MVCC logical-log recovery payload size overflows usize".to_string(),
+                    )
+                })?;
+            let (extension_size, extension_record_count) = if has_extension_header {
+                let extension_size =
+                    usize::try_from(read_u64_le(range_body, pos + 24)?).map_err(|_| {
+                        Error::DatabaseSyncEngineError(
+                            "MVCC logical-log extension size overflows usize".to_string(),
+                        )
+                    })?;
+                let extension_record_count = read_u32_le(range_body, pos + 32)?;
+                let frame_flags = read_u32_le(range_body, pos + 36)?;
+                if frame_flags & !MVCC_TX_FLAG_HAS_EXTENSION_BLOCK != 0 {
+                    return Err(Error::DatabaseSyncEngineError(format!(
+                        "unsupported MVCC logical-log transaction flags {frame_flags:#x}"
+                    )));
+                }
+                if extension_size == 0 && extension_record_count != 0 {
+                    return Err(Error::DatabaseSyncEngineError(
+                        "MVCC logical-log frame has extension record count without extension block"
+                            .to_string(),
+                    ));
+                }
+                if extension_size > 0 && frame_flags & MVCC_TX_FLAG_HAS_EXTENSION_BLOCK == 0 {
+                    return Err(Error::DatabaseSyncEngineError(
+                        "MVCC logical-log frame has extension block without extension flag"
+                            .to_string(),
+                    ));
+                }
+                (extension_size, extension_record_count)
+            } else {
+                (0, 0)
+            };
+
+            let extension_start = pos
+                .checked_add(header_size)
+                .and_then(|v| v.checked_add(payload_size))
+                .ok_or_else(|| {
+                    Error::DatabaseSyncEngineError(
+                        "MVCC logical-log frame offset overflow".to_string(),
+                    )
+                })?;
+            let trailer_start = extension_start.checked_add(extension_size).ok_or_else(|| {
+                Error::DatabaseSyncEngineError("MVCC logical-log frame offset overflow".to_string())
+            })?;
+            let frame_end = trailer_start
+                .checked_add(MVCC_TX_TRAILER_SIZE)
+                .ok_or_else(|| {
+                    Error::DatabaseSyncEngineError(
+                        "MVCC logical-log frame offset overflow".to_string(),
+                    )
+                })?;
+            if frame_end > range_body.len() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "truncated MVCC logical-log transaction frame".to_string(),
+                ));
+            }
+            let end_magic = read_u32_le(range_body, trailer_start + 4)?;
+            if end_magic != MVCC_TX_END_MAGIC {
+                return Err(Error::DatabaseSyncEngineError(
+                    "invalid MVCC logical-log transaction trailer magic".to_string(),
+                ));
+            }
+            if let Some(prev_crc) = running_crc {
+                let expected_crc =
+                    crc32c::crc32c_append(prev_crc, &range_body[frame_start..trailer_start]);
+                let stored_crc = read_u32_le(range_body, trailer_start)?;
+                if expected_crc != stored_crc {
+                    return Err(Error::DatabaseSyncEngineError(format!(
+                        "MVCC logical-log transaction checksum mismatch at range offset {frame_start}"
+                    )));
+                }
+                running_crc = Some(stored_crc);
+            }
+
+            if extension_size > 0 {
+                let extension_block = &range_body[extension_start..trailer_start];
+                let portable_payload = find_mvcc_extension_payload(
+                    extension_block,
+                    extension_record_count,
+                    MVCC_EXTENSION_TYPE_PORTABLE_CHANGES,
+                )?;
+                if portable_payload.is_empty() {
+                    pos = frame_end;
+                    continue;
+                }
+                let mut payload_bytes = BytesMut::from(portable_payload.as_slice());
+                let mut frame_txns = 0usize;
+                let mut frame_ops = 0usize;
+                while let Some(txn) =
+                    take_proto_message_from_bytes::<LogicalTxnData>(&mut payload_bytes)?
+                {
+                    frame_ops += txn.ops.len();
+                    frame_txns += 1;
+                }
+                if !payload_bytes.is_empty() {
+                    return Err(Error::DatabaseSyncEngineError(
+                        "MVCC logical-log portable payload has trailing partial protobuf message"
+                            .to_string(),
+                    ));
+                }
+                txns += frame_txns;
+                ops += frame_ops;
+                append_file_bytes(coro, txns_file, &mut txns_offset, &portable_payload).await?;
+            }
+            pos = frame_end;
+        }
+        previous_range_boundary = Some((range.generation, range.end_offset));
+    }
+
+    if body_offset != body.len() {
+        return Err(Error::DatabaseSyncEngineError(
+            "raw MVCC logical-log body has trailing bytes after advertised ranges".to_string(),
+        ));
+    }
+    sync_file(coro, txns_file).await?;
+    Ok((txns, ops))
 }
 
 /// Iterates all length-delimited protobuf messages stored in a file.
@@ -1050,11 +1569,11 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
     })
 }
 
-/// Pulls V1 updates as either page frames or logical MVCC transactions.
+/// Pulls V1 updates as either page frames or raw MVCC logical-log bytes.
 ///
 /// The server controls the returned stream kind. Page streams are encoded as
-/// raw WAL frames in `frames_file`; logical streams are encoded as
-/// length-delimited transactions in the same scratch file.
+/// raw WAL frames in `frames_file`; raw MVCC logical-log streams are decoded
+/// into length-delimited transactions in the same scratch file.
 pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     frames_file: &Arc<dyn turso_core::File>,
@@ -1110,14 +1629,15 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
         ));
     };
     tracing::info!(
-        "pull_updates_v1: got header: remote_url={:?} server_revision={} stream_kind={} apply_mode={} db_size={} raw_encoding={:?} zstd_encoding={:?}",
+        "pull_updates_v1: got header: remote_url={:?} server_revision={} stream_kind={} apply_mode={} db_size={} raw_encoding={:?} zstd_encoding={:?} mvcc_log={:?}",
         ctx.remote_url,
         header.server_revision,
         header.stream_kind,
         header.apply_mode,
         header.db_size,
         header.raw_encoding,
-        header.zstd_encoding
+        header.zstd_encoding,
+        header.mvcc_log
     );
 
     let next_revision = DatabasePullRevision::V1 {
@@ -1189,37 +1709,26 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
             );
             Ok((next_revision, PullUpdatesV1Result::Pages { replace_base }))
         }
-        PullUpdatesStreamKind::Logical => {
+        PullUpdatesStreamKind::MvccLogicalLog => {
             if matches!(apply_mode, PullUpdatesApplyMode::ReplaceBase) {
                 return Err(Error::DatabaseSyncEngineError(
-                    "server returned replace_base apply mode with logical pull-updates stream"
+                    "server returned replace_base apply mode with raw MVCC logical-log stream"
                         .to_string(),
                 ));
             }
             if !logical_updates {
                 return Err(Error::DatabaseSyncEngineError(
-                    "server returned a logical pull-updates stream but logical_updates was not requested".to_string(),
+                    "server returned a raw MVCC logical-log stream but logical_updates was not requested".to_string(),
                 ));
             }
-            truncate_file(ctx.coro, frames_file).await?;
-            let mut offset = 0;
-            let mut txns = 0usize;
-            let mut ops = 0usize;
-            while let Some(txn) = wait_proto_message::<Ctx, LogicalTxnData>(
-                ctx.coro,
-                &completion,
-                &ctx.io.network_stats,
-                &mut bytes,
-            )
-            .await?
-            {
-                ops += txn.ops.len();
-                txns += 1;
-                append_proto_message_to_file(ctx.coro, frames_file, &mut offset, &txn).await?;
-            }
-            sync_file(ctx.coro, frames_file).await?;
+            let mut body = bytes.split().to_vec();
+            body.extend_from_slice(
+                &wait_all_results(ctx.coro, &completion, Some(&ctx.io.network_stats)).await?,
+            );
+            let (txns, ops) =
+                decode_raw_mvcc_logical_log_to_file(ctx.coro, frames_file, &body, &header).await?;
             tracing::info!(
-                "pull_updates_v1: completed logical stream: remote_url={:?} next_revision={:?} txns={} ops={}",
+                "pull_updates_v1: completed raw MVCC logical-log stream: remote_url={:?} next_revision={:?} txns={} ops={}",
                 ctx.remote_url,
                 next_revision,
                 txns,
@@ -1563,6 +2072,40 @@ pub async fn has_table<Ctx>(
     Ok(count > 0)
 }
 
+/// Rebuilds the portable logical-replay table identity map from the current
+/// local schema. This is used after page-based apply paths, where no logical
+/// schema identity operations are decoded but future logical pulls may depend
+/// on an existing map.
+pub async fn read_logical_replay_table_map<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+) -> Result<BTreeMap<u64, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT rootpage, name FROM sqlite_schema WHERE type = 'table' AND rootpage != 0",
+    )?;
+    let mut map = BTreeMap::new();
+    while let Some(row) = run_stmt_once(coro, &mut stmt).await? {
+        let rootpage = row.get_value(0).as_int().ok_or_else(|| {
+            Error::DatabaseSyncEngineError(format!(
+                "unexpected sqlite_schema.rootpage type while rebuilding logical table map: {:?}",
+                row.get_value(0)
+            ))
+        })?;
+        let name = match row.get_value(1) {
+            Value::Text(text) => text.as_str().to_string(),
+            other => {
+                return Err(Error::DatabaseSyncEngineError(format!(
+                    "unexpected sqlite_schema.name type while rebuilding logical table map: {other:?}"
+                )));
+            }
+        };
+        if rootpage != 0 && is_logically_replayable_table(&name) {
+            map.insert(rootpage.unsigned_abs(), name);
+        }
+    }
+    Ok(map)
+}
+
 /// Counts local CDC rows newer than `change_id`.
 pub async fn count_local_changes<Ctx>(
     coro: &Coro<Ctx>,
@@ -1630,7 +2173,7 @@ pub async fn update_last_change_id<Ctx>(
         "update_last_change_id(client_id={client_id}): pull_gen={pull_gen}, change_id={change_id}"
     );
     for attempt in 0..=1 {
-        ensure_sync_last_change_id_table(conn, client_id)?;
+        ensure_sync_last_change_id_table(coro, conn, client_id).await?;
         let mut update_stmt = match conn.prepare(TURSO_SYNC_UPSERT_LAST_CHANGE_ID) {
             Ok(stmt) => stmt,
             Err(LimboError::ParseError(err)) if err.contains("no such table") && attempt == 0 => {
@@ -1681,20 +2224,57 @@ fn bind_last_change_id_upsert(
 }
 
 /// Ensures the local high-water mark table exists and publishes schema changes.
-fn ensure_sync_last_change_id_table(
+pub async fn ensure_sync_last_change_id_table<Ctx>(
+    coro: &Coro<Ctx>,
     conn: &Arc<turso_core::Connection>,
     client_id: &str,
 ) -> Result<()> {
-    match conn.execute(TURSO_SYNC_CREATE_TABLE) {
-        Ok(()) => {}
-        Err(LimboError::ParseError(err)) if err.contains("already exists") => {
-            tracing::debug!(
-                "update_last_change_id(client_id={client_id}): sync table already exists while initializing; refreshing schema"
-            );
+    for attempt in 0..=2 {
+        match conn.execute(TURSO_SYNC_CREATE_TABLE) {
+            Ok(()) => {
+                conn.publish_schema_if_newer();
+                return Ok(());
+            }
+            Err(LimboError::ParseError(err)) if err.contains("already exists") => {
+                tracing::debug!(
+                    "update_last_change_id(client_id={client_id}): sync table already exists while initializing; refreshing schema"
+                );
+                conn.publish_schema_if_newer();
+                return Ok(());
+            }
+            Err(LimboError::SchemaUpdated) => {
+                tracing::debug!(
+                    "update_last_change_id(client_id={client_id}): schema updated while initializing sync table; refreshing schema"
+                );
+                force_reparse_schema_with_retry(conn)?;
+                conn.publish_schema_after_external_restore();
+                if attempt == 2 {
+                    return Ok(());
+                }
+                match has_table(coro, conn, TURSO_SYNC_TABLE_NAME).await {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => continue,
+                    Err(Error::TursoError(LimboError::SchemaUpdated)) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(err) => return Err(err.into()),
         }
-        Err(err) => return Err(err.into()),
     }
-    conn.publish_schema_if_newer();
+    Err(Error::DatabaseSyncEngineError(format!(
+        "failed to initialize sync high-water mark table after schema refresh: client_id={client_id}"
+    )))
+}
+
+/// Forces a schema reparse with a small bounded retry for MVCC schema sentinels.
+fn force_reparse_schema_with_retry(conn: &Arc<turso_core::Connection>) -> Result<()> {
+    for attempt in 0..=2 {
+        match conn.force_reparse_schema() {
+            Ok(()) => return Ok(()),
+            Err(LimboError::SchemaUpdated) if attempt < 2 => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
     Ok(())
 }
 
@@ -1874,7 +2454,9 @@ pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
         )));
     }
     let last_change_id = resolve_logical_push_floor_change_id(
+        source_pull_gen,
         source_change_id,
+        target_pull_gen,
         target_change_id,
         source_max_change_id,
     );
@@ -1883,7 +2465,9 @@ pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
 
 /// Resolves the local CDC floor to use for logical push.
 fn resolve_logical_push_floor_change_id(
+    source_pull_gen: i64,
     source_change_id: Option<i64>,
+    target_pull_gen: i64,
     target_change_id: i64,
     source_max_change_id: Option<i64>,
 ) -> Option<i64> {
@@ -1891,10 +2475,15 @@ fn resolve_logical_push_floor_change_id(
     // offsets. A remote generation rollover must not make the next logical push
     // replay already acknowledged local changes from zero.
     //
-    // However, replace-base can reset the local CDC stream while the remote
-    // still has an acknowledgement from the old local CDC epoch. If that remote
-    // acknowledgement is beyond the current local CDC high-water mark, it cannot
-    // be a valid floor for the current source database.
+    // However, replace-base advances the local pull generation and can reset
+    // the local CDC stream while the remote still has an acknowledgement from
+    // the old local CDC epoch. An acknowledgement from an older pull generation
+    // cannot be a valid floor for new local changes in the current generation.
+    if target_pull_gen < source_pull_gen {
+        return source_change_id;
+    }
+    // If the generation matches but the acknowledgement is beyond the current
+    // local CDC high-water mark, it also belongs to an older local CDC epoch.
     if source_max_change_id.is_some_and(|max_change_id| target_change_id > max_change_id) {
         return source_change_id;
     }
@@ -1913,6 +2502,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
 ) -> Result<(i64, i64)> {
     tracing::info!("push_logical_changes: client_id={client_id}");
     let source_conn = connect_untracked(source)?;
+    let source_is_mvcc = source_journal_mode_is_mvcc(ctx.coro, &source_conn).await?;
 
     let (source_pull_gen, mut last_change_id) =
         fetch_last_change_id(ctx, &source_conn, client_id).await?;
@@ -1970,6 +2560,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                     client_id,
                     source_pull_gen,
                     last_change_id,
+                    source_is_mvcc,
                 )
                 .await?;
                 total_rows_changed += rows_changed;
@@ -2006,6 +2597,7 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
     client_id: &str,
     source_pull_gen: i64,
     mut last_change_id: Option<i64>,
+    source_is_mvcc: bool,
 ) -> Result<(i64, i64)> {
     let transform_changes = if opts.use_transform {
         batch_changes
@@ -2042,7 +2634,24 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
 
     let mut add_column_step_indices = std::collections::HashSet::new();
     let initial_last_change_id = last_change_id;
-    let mut sql_over_http_requests = vec![
+    let mut sql_over_http_requests = Vec::new();
+    if should_send_mvcc_log_meta(opts.protocol_version_hint, source_is_mvcc) {
+        sql_over_http_requests.push(BatchStep {
+            stmt: Stmt {
+                sql: Some(format!(
+                    "PRAGMA mvcc_log_meta('client', {})",
+                    quote_sql_string(client_id)
+                )),
+                sql_id: None,
+                args: Vec::new(),
+                named_args: Vec::new(),
+                want_rows: Some(false),
+                replication_index: None,
+            },
+            condition: None,
+        });
+    }
+    sql_over_http_requests.extend([
         BatchStep {
             stmt: Stmt {
                 sql: Some("BEGIN IMMEDIATE".to_string()),
@@ -2055,7 +2664,7 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
             condition: None,
         },
         step(TURSO_SYNC_CREATE_TABLE.to_string(), Vec::new()),
-    ];
+    ]);
 
     tracing::debug!(
         "push_logical_changes: client_id={client_id}, collected {} local changes in batch",
@@ -2222,6 +2831,31 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
     let _ = sql_execute_http(ctx, replay_hrana_request, &add_column_step_indices).await?;
     tracing::info!("push_logical_changes: client_id={client_id}, rows_changed={rows_changed}");
     Ok((rows_changed, last_change_id.unwrap_or(0)))
+}
+
+fn quote_sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn should_send_mvcc_log_meta(
+    protocol_version_hint: DatabaseSyncEngineProtocolVersion,
+    source_is_mvcc: bool,
+) -> bool {
+    source_is_mvcc && protocol_version_hint == DatabaseSyncEngineProtocolVersion::V1
+}
+
+async fn source_journal_mode_is_mvcc<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+) -> Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA journal_mode")?;
+    let Some(row) = run_stmt_expect_one_row(coro, &mut stmt).await? else {
+        return Ok(false);
+    };
+    let Some(turso_core::Value::Text(mode)) = row.first() else {
+        return Ok(false);
+    };
+    Ok(mode.as_str().eq_ignore_ascii_case("mvcc"))
 }
 
 /// Applies the configured row transformation hook to one batch of changes.
@@ -2447,9 +3081,9 @@ async fn pull_bootstrap_chunk_into_file<IO: SyncEngineIo, Ctx>(
                 }
             }
         }
-        PullUpdatesStreamKind::Logical => {
+        PullUpdatesStreamKind::MvccLogicalLog => {
             return Err(Error::DatabaseSyncEngineError(
-                "server returned unsupported logical bootstrap stream".to_string(),
+                "server returned unsupported raw MVCC logical-log bootstrap stream".to_string(),
             ));
         }
     }
@@ -2460,8 +3094,8 @@ async fn pull_bootstrap_chunk_into_file<IO: SyncEngineIo, Ctx>(
 /// Bootstraps a V1 database by installing a remote page base.
 ///
 /// Initial bootstrap always requests pages, even when logical MVCC pull is
-/// enabled, because logical streams require a client revision that does not
-/// exist until after bootstrap completes.
+/// enabled, because raw MVCC logical-log streams require a client revision that
+/// does not exist until after bootstrap completes.
 pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     io: &Arc<dyn turso_core::IO>,
@@ -2957,7 +3591,8 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::{
-        is_local_cdc_push_replayable_table, is_logically_replayable_table, SQLITE_SCHEMA_TABLE,
+        is_local_cdc_push_replayable_table, is_logically_replayable_table,
+        logical_txn_to_tape_operations_with_table_map, LogicalReplayTableMap, SQLITE_SCHEMA_TABLE,
         TURSO_CDC_TABLE_NAME, TURSO_CDC_VERSION_TABLE_NAME,
     };
     use crate::{
@@ -2965,23 +3600,28 @@ mod tests {
         database_sync_engine::DataStats,
         database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
         database_sync_operations::{
-            apply_logical_transactions, bootstrap_db_file_v1, for_each_proto_message_in_file,
+            apply_logical_transactions, for_each_proto_message_in_file,
             logical_txn_acknowledges_client, logical_txn_to_tape_operations, pull_updates_v1,
             read_last_change_id, resolve_logical_push_floor_change_id, update_last_change_id,
             wait_proto_message, PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx,
-            TURSO_SYNC_CREATE_TABLE, TURSO_SYNC_TABLE_NAME,
+            MVCC_EXTENSION_RECORD_HEADER_SIZE, MVCC_EXTENSION_TYPE_PORTABLE_CHANGES,
+            MVCC_LOG_HEADER_CRC_START, MVCC_LOG_HEADER_SIZE, MVCC_LOG_MAGIC, MVCC_LOG_VERSION,
+            MVCC_TX_END_MAGIC, MVCC_TX_EXT_FRAME_MAGIC, MVCC_TX_EXT_HEADER_SIZE,
+            MVCC_TX_FLAG_HAS_EXTENSION_BLOCK, MVCC_TX_TRAILER_SIZE, TURSO_SYNC_CREATE_TABLE,
+            TURSO_SYNC_TABLE_NAME,
         },
         database_tape::run_stmt_once,
         database_tape::{DatabaseReplaySessionOpts, DatabaseTape},
         errors::Error,
+        server_proto,
         server_proto::{
             LogicalOp, LogicalOpType, LogicalSchemaAction, LogicalSchemaKind, LogicalTxnData,
-            PageData, PullUpdatesApplyMode, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
-            PullUpdatesStreamKind,
+            PageData, PullUpdatesApplyMode, PullUpdatesRespProtoBody, PullUpdatesStreamKind,
         },
         types::{
             Coro, DatabasePullRevision, DatabaseRowMutation, DatabaseRowTransformResult,
-            DatabaseSchemaKind, DatabaseSchemaReplay, DatabaseTapeOperation,
+            DatabaseSchemaKind, DatabaseSchemaReplay, DatabaseSyncEngineProtocolVersion,
+            DatabaseTapeOperation, DatabaseTapeRowChange,
         },
         Result,
     };
@@ -3197,6 +3837,7 @@ mod tests {
             schema_action: Some(action as i32),
             schema_kind: Some(kind as i32),
             schema_name: name.to_string(),
+            stable_table_id: 0,
         }
     }
 
@@ -3212,6 +3853,7 @@ mod tests {
             schema_action: None,
             schema_kind: None,
             schema_name: String::new(),
+            stable_table_id: 0,
         }
     }
 
@@ -3239,6 +3881,7 @@ mod tests {
             schema_action: None,
             schema_kind: None,
             schema_name: String::new(),
+            stable_table_id: 0,
         }
     }
 
@@ -3254,7 +3897,13 @@ mod tests {
             schema_action: None,
             schema_kind: None,
             schema_name: String::new(),
+            stable_table_id: 0,
         }
+    }
+
+    fn with_stable_table_id(mut op: LogicalOp, stable_table_id: u64) -> LogicalOp {
+        op.stable_table_id = stable_table_id;
+        op
     }
 
     async fn read_logical_txns_from_file<Ctx>(
@@ -3268,23 +3917,6 @@ mod tests {
         })
         .await?;
         Ok(txns.into_inner())
-    }
-
-    #[test]
-    fn logical_header_round_trips_stream_kind() {
-        let header = PullUpdatesRespProtoBody {
-            server_revision: "rev".to_string(),
-            db_size: 0,
-            raw_encoding: Some(crate::server_proto::PageSetRawEncodingProto {}),
-            zstd_encoding: None,
-            stream_kind: PullUpdatesStreamKind::Logical as i32,
-            apply_mode: PullUpdatesApplyMode::Incremental as i32,
-        };
-        let decoded = PullUpdatesRespProtoBody::decode_length_delimited(
-            header.encode_length_delimited_to_vec().as_slice(),
-        )
-        .unwrap();
-        assert_eq!(decoded.stream_kind, PullUpdatesStreamKind::Logical as i32);
     }
 
     #[test]
@@ -3353,6 +3985,104 @@ mod tests {
     }
 
     #[test]
+    fn logical_replay_table_map_resolves_row_ops_without_names() {
+        let mut table_map = LogicalReplayTableMap::default();
+        let create_txn = LogicalTxnData {
+            end_offset: 7,
+            commit_ts: 11,
+            origin_client_id: String::new(),
+            ops: vec![with_stable_table_id(
+                schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "items",
+                    Some("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)"),
+                ),
+                42,
+            )],
+        };
+        let row_txn = LogicalTxnData {
+            end_offset: 9,
+            commit_ts: 12,
+            origin_client_id: String::new(),
+            ops: vec![with_stable_table_id(
+                upsert_row_op("", 1, record(&[text_value("one")])),
+                42,
+            )],
+        };
+
+        let schema_ops =
+            logical_txn_to_tape_operations_with_table_map(&create_txn, &mut table_map).unwrap();
+        let row_ops =
+            logical_txn_to_tape_operations_with_table_map(&row_txn, &mut table_map).unwrap();
+
+        assert_eq!(schema_ops.len(), 1);
+        assert_eq!(row_ops.len(), 1);
+        match &row_ops[0] {
+            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange { table_name, id, .. }) => {
+                assert_eq!(table_name, "items");
+                assert_eq!(*id, 1);
+            }
+            other => panic!("expected row change, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logical_replay_table_map_updates_name_on_schema_refresh() {
+        let mut table_map = LogicalReplayTableMap::default();
+        let create_txn = LogicalTxnData {
+            end_offset: 7,
+            commit_ts: 11,
+            origin_client_id: String::new(),
+            ops: vec![with_stable_table_id(
+                schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "items",
+                    Some("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)"),
+                ),
+                42,
+            )],
+        };
+        let rename_txn = LogicalTxnData {
+            end_offset: 8,
+            commit_ts: 12,
+            origin_client_id: String::new(),
+            ops: vec![with_stable_table_id(
+                schema_op(
+                    LogicalSchemaAction::Refresh,
+                    LogicalSchemaKind::Table,
+                    "things",
+                    Some("CREATE TABLE \"things\"(id INTEGER PRIMARY KEY, payload TEXT)"),
+                ),
+                42,
+            )],
+        };
+        let row_txn = LogicalTxnData {
+            end_offset: 9,
+            commit_ts: 13,
+            origin_client_id: String::new(),
+            ops: vec![with_stable_table_id(
+                upsert_row_op("", 2, record(&[text_value("two")])),
+                42,
+            )],
+        };
+
+        logical_txn_to_tape_operations_with_table_map(&create_txn, &mut table_map).unwrap();
+        logical_txn_to_tape_operations_with_table_map(&rename_txn, &mut table_map).unwrap();
+        let row_ops =
+            logical_txn_to_tape_operations_with_table_map(&row_txn, &mut table_map).unwrap();
+
+        match &row_ops[0] {
+            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange { table_name, id, .. }) => {
+                assert_eq!(table_name, "things");
+                assert_eq!(*id, 2);
+            }
+            other => panic!("expected row change, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn logical_txn_detects_client_ack_metadata_row() {
         let txn = LogicalTxnData {
             end_offset: 7,
@@ -3408,17 +4138,95 @@ mod tests {
     }
 
     #[test]
-    fn pull_updates_v1_decodes_logical_stream_and_sets_request_flag() {
-        let header = PullUpdatesRespProtoBody {
-            server_revision: "g1:o44".to_string(),
-            db_size: 0,
-            raw_encoding: None,
-            zstd_encoding: None,
-            stream_kind: PullUpdatesStreamKind::Logical as i32,
-            apply_mode: PullUpdatesApplyMode::Incremental as i32,
-        };
+    fn mvcc_log_meta_is_sent_only_for_v1_mvcc_sources() {
+        assert!(super::should_send_mvcc_log_meta(
+            DatabaseSyncEngineProtocolVersion::V1,
+            true
+        ));
+        assert!(!super::should_send_mvcc_log_meta(
+            DatabaseSyncEngineProtocolVersion::V1,
+            false
+        ));
+        assert!(!super::should_send_mvcc_log_meta(
+            DatabaseSyncEngineProtocolVersion::Legacy,
+            true
+        ));
+    }
+
+    fn raw_mvcc_log_frame(commit_ts: u64, portable_payload: &[u8]) -> Vec<u8> {
+        let mut extension_block = Vec::new();
+        extension_block.extend_from_slice(&MVCC_EXTENSION_TYPE_PORTABLE_CHANGES.to_le_bytes());
+        extension_block.extend_from_slice(&0u16.to_le_bytes());
+        extension_block.extend_from_slice(&(portable_payload.len() as u32).to_le_bytes());
+        extension_block.extend_from_slice(portable_payload);
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MVCC_TX_EXT_FRAME_MAGIC.to_le_bytes());
+        frame.extend_from_slice(&0u64.to_le_bytes());
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.extend_from_slice(&commit_ts.to_le_bytes());
+        frame.extend_from_slice(&(extension_block.len() as u64).to_le_bytes());
+        frame.extend_from_slice(&1u32.to_le_bytes());
+        frame.extend_from_slice(&MVCC_TX_FLAG_HAS_EXTENSION_BLOCK.to_le_bytes());
+        frame.extend_from_slice(&extension_block);
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.extend_from_slice(&MVCC_TX_END_MAGIC.to_le_bytes());
+        frame
+    }
+
+    fn raw_mvcc_log_header(salt: u64) -> Vec<u8> {
+        let mut header = vec![0u8; MVCC_LOG_HEADER_SIZE];
+        header[0..4].copy_from_slice(&MVCC_LOG_MAGIC.to_le_bytes());
+        header[4] = MVCC_LOG_VERSION;
+        header[6..8].copy_from_slice(&(MVCC_LOG_HEADER_SIZE as u16).to_le_bytes());
+        header[8..16].copy_from_slice(&salt.to_le_bytes());
+        let crc = crc32c::crc32c(&header);
+        header[MVCC_LOG_HEADER_CRC_START..MVCC_LOG_HEADER_SIZE].copy_from_slice(&crc.to_le_bytes());
+        header
+    }
+
+    fn raw_mvcc_log_frame_with_crc(
+        commit_ts: u64,
+        portable_payload: &[u8],
+        previous_crc: u32,
+    ) -> (Vec<u8>, u32) {
+        let mut frame = raw_mvcc_log_frame(commit_ts, portable_payload);
+        let trailer_start = frame.len() - MVCC_TX_TRAILER_SIZE;
+        let crc = crc32c::crc32c_append(previous_crc, &frame[..trailer_start]);
+        frame[trailer_start..trailer_start + 4].copy_from_slice(&crc.to_le_bytes());
+        (frame, crc)
+    }
+
+    fn decode_raw_mvcc_log_for_test(
+        header: PullUpdatesRespProtoBody,
+        body: Vec<u8>,
+    ) -> Result<Vec<LogicalTxnData>> {
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_str().unwrap();
+        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let file = core_io
+            .open_file(path, turso_core::OpenFlags::Create, false)
+            .unwrap();
+        let mut r#gen = genawaiter::sync::Gen::new({
+            let file = file.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                super::decode_raw_mvcc_logical_log_to_file(&coro, &file, &body, &header).await?;
+                read_logical_txns_from_file(&coro, &file).await
+            }
+        });
+        loop {
+            match r#gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => {}
+                genawaiter::GeneratorState::Complete(result) => return result,
+            }
+        }
+    }
+
+    #[test]
+    fn pull_updates_v1_decodes_raw_mvcc_log_stream() {
         let txn = LogicalTxnData {
-            end_offset: 44,
+            end_offset: 104,
             commit_ts: 77,
             origin_client_id: String::new(),
             ops: vec![schema_op(
@@ -3428,13 +4236,37 @@ mod tests {
                 Some("CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT)"),
             )],
         };
+        let portable_payload = txn.encode_length_delimited_to_vec();
+        let crc_seed = crc32c::crc32c(&1234u64.to_le_bytes());
+        let (raw_frame, _) = raw_mvcc_log_frame_with_crc(77, &portable_payload, crc_seed);
+        let range_start = MVCC_LOG_HEADER_SIZE as u64;
+        let range_end = range_start + raw_frame.len() as u64;
+        let header = PullUpdatesRespProtoBody {
+            server_revision: format!("g1:o{range_end}"),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: false,
+                ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset: range_start,
+                    end_offset: range_end,
+                    starts_with_header: false,
+                    crc_seed: Some(crc_seed.to_le_bytes().to_vec()),
+                }],
+            }),
+        };
         let mut response = Vec::new();
         response.extend_from_slice(&header.encode_length_delimited_to_vec());
-        response.extend_from_slice(&txn.encode_length_delimited_to_vec());
+        response.extend_from_slice(&raw_frame);
 
         let io = Arc::new(TestHttpIo {
             response,
-            chunk: 5,
+            chunk: 7,
             request: Mutex::new(None),
             headers: Mutex::new(Vec::new()),
         });
@@ -3457,27 +4289,22 @@ mod tests {
                     Some("https://example.com".to_string()),
                     None,
                 );
-                let (revision, result) = pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
+                let (revision, result) = pull_updates_v1(&ctx, &file, "g1:o56", None, true).await?;
                 let DatabasePullRevision::V1 { revision } = revision else {
                     panic!("expected V1 revision");
                 };
-                assert_eq!(revision, "g1:o44");
+                assert_eq!(revision, format!("g1:o{range_end}"));
                 match result {
                     PullUpdatesV1Result::Logical { txns, ops } => {
                         assert_eq!(txns, 1);
                         assert_eq!(ops, 1);
                     }
-                    PullUpdatesV1Result::Pages { .. } => panic!("expected logical stream"),
+                    PullUpdatesV1Result::Pages { .. } => panic!("expected logical result"),
                 }
                 assert_eq!(
                     read_logical_txns_from_file(&coro, &file).await.unwrap(),
                     vec![txn]
                 );
-                let (method, path, body) = io.request.lock().unwrap().clone().unwrap();
-                assert_eq!(method, "POST");
-                assert_eq!(path, "/pull-updates");
-                let request = PullUpdatesReqProtoBody::decode(body.as_slice()).unwrap();
-                assert!(request.logical_updates);
                 Result::Ok(())
             }
         });
@@ -3490,17 +4317,9 @@ mod tests {
     }
 
     #[test]
-    fn pull_updates_v1_rejects_logical_stream_without_request_flag() {
-        let header = PullUpdatesRespProtoBody {
-            server_revision: "g1:o44".to_string(),
-            db_size: 0,
-            raw_encoding: None,
-            zstd_encoding: None,
-            stream_kind: PullUpdatesStreamKind::Logical as i32,
-            apply_mode: PullUpdatesApplyMode::Incremental as i32,
-        };
+    fn raw_mvcc_log_decoder_requires_crc_seed_for_mid_log_range() {
         let txn = LogicalTxnData {
-            end_offset: 44,
+            end_offset: 104,
             commit_ts: 77,
             origin_client_id: String::new(),
             ops: vec![schema_op(
@@ -3510,9 +4329,130 @@ mod tests {
                 Some("CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT)"),
             )],
         };
-        let mut response = Vec::new();
-        response.extend_from_slice(&header.encode_length_delimited_to_vec());
-        response.extend_from_slice(&txn.encode_length_delimited_to_vec());
+        let portable_payload = txn.encode_length_delimited_to_vec();
+        let crc_seed = crc32c::crc32c(&1234u64.to_le_bytes());
+        let (raw_frame, _) = raw_mvcc_log_frame_with_crc(77, &portable_payload, crc_seed);
+        let range_start = MVCC_LOG_HEADER_SIZE as u64;
+        let range_end = range_start + raw_frame.len() as u64;
+        let header = PullUpdatesRespProtoBody {
+            server_revision: format!("g1:o{range_end}"),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: false,
+                ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset: range_start,
+                    end_offset: range_end,
+                    starts_with_header: false,
+                    crc_seed: None,
+                }],
+            }),
+        };
+
+        let err = decode_raw_mvcc_log_for_test(header, raw_frame).unwrap_err();
+        assert!(
+            err.to_string().contains("missing CRC seed"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn raw_mvcc_log_decoder_validates_each_checkpoint_transition_range_header() {
+        let first_txn = LogicalTxnData {
+            end_offset: 104,
+            commit_ts: 77,
+            origin_client_id: String::new(),
+            ops: vec![schema_op(
+                LogicalSchemaAction::Create,
+                LogicalSchemaKind::Table,
+                "first",
+                Some("CREATE TABLE first(x INTEGER PRIMARY KEY)"),
+            )],
+        };
+        let second_txn = LogicalTxnData {
+            end_offset: 104,
+            commit_ts: 88,
+            origin_client_id: String::new(),
+            ops: vec![schema_op(
+                LogicalSchemaAction::Create,
+                LogicalSchemaKind::Table,
+                "second",
+                Some("CREATE TABLE second(x INTEGER PRIMARY KEY)"),
+            )],
+        };
+
+        let first_header = raw_mvcc_log_header(0x1111_2222_3333_4444);
+        let first_crc = crc32c::crc32c(&0x1111_2222_3333_4444u64.to_le_bytes());
+        let (first_frame, _) =
+            raw_mvcc_log_frame_with_crc(77, &first_txn.encode_length_delimited_to_vec(), first_crc);
+        let first_end = (first_header.len() + first_frame.len()) as u64;
+
+        let second_header = raw_mvcc_log_header(0xaaaa_bbbb_cccc_ddddu64);
+        let second_crc = crc32c::crc32c(&0xaaaa_bbbb_cccc_ddddu64.to_le_bytes());
+        let (second_frame, _) = raw_mvcc_log_frame_with_crc(
+            88,
+            &second_txn.encode_length_delimited_to_vec(),
+            second_crc,
+        );
+        let second_end = (second_header.len() + second_frame.len()) as u64;
+
+        let header = PullUpdatesRespProtoBody {
+            server_revision: format!("g2:o{second_end}"),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: true,
+                ranges: vec![
+                    server_proto::MvccLogicalLogRangeProto {
+                        generation: 1,
+                        start_offset: 0,
+                        end_offset: first_end,
+                        starts_with_header: true,
+                        crc_seed: None,
+                    },
+                    server_proto::MvccLogicalLogRangeProto {
+                        generation: 2,
+                        start_offset: 0,
+                        end_offset: second_end,
+                        starts_with_header: true,
+                        crc_seed: None,
+                    },
+                ],
+            }),
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&first_header);
+        body.extend_from_slice(&first_frame);
+        body.extend_from_slice(&second_header);
+        body.extend_from_slice(&second_frame);
+
+        assert_eq!(
+            decode_raw_mvcc_log_for_test(header, body).unwrap(),
+            vec![first_txn, second_txn]
+        );
+    }
+
+    #[test]
+    fn pull_updates_v1_accepts_empty_raw_mvcc_log_noop_without_metadata() {
+        let header = PullUpdatesRespProtoBody {
+            server_revision: "g1:o56".to_string(),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: None,
+        };
+        let response = header.encode_length_delimited_to_vec();
 
         let io = Arc::new(TestHttpIo {
             response,
@@ -3539,19 +4479,19 @@ mod tests {
                     Some("https://example.com".to_string()),
                     None,
                 );
-                let err = pull_updates_v1(&ctx, &file, "g1:o40", None, false)
-                    .await
-                    .unwrap_err();
-                assert!(
-                    err.to_string()
-                        .contains("logical_updates was not requested"),
-                    "unexpected error: {err:?}"
-                );
-                let (method, path, body) = io.request.lock().unwrap().clone().unwrap();
-                assert_eq!(method, "POST");
-                assert_eq!(path, "/pull-updates");
-                let request = PullUpdatesReqProtoBody::decode(body.as_slice()).unwrap();
-                assert!(!request.logical_updates);
+                let (revision, result) = pull_updates_v1(&ctx, &file, "g1:o56", None, true).await?;
+                let DatabasePullRevision::V1 { revision } = revision else {
+                    panic!("expected V1 revision");
+                };
+                assert_eq!(revision, "g1:o56");
+                match result {
+                    PullUpdatesV1Result::Logical { txns, ops } => {
+                        assert_eq!(txns, 0);
+                        assert_eq!(ops, 0);
+                    }
+                    PullUpdatesV1Result::Pages { .. } => panic!("expected logical result"),
+                }
+                assert_eq!(file.size().unwrap(), 0);
                 Result::Ok(())
             }
         });
@@ -3561,6 +4501,152 @@ mod tests {
                 genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
             }
         }
+    }
+
+    #[test]
+    fn raw_mvcc_log_decoder_validates_header_and_frame_crc() {
+        let txn = LogicalTxnData {
+            end_offset: 104,
+            commit_ts: 77,
+            origin_client_id: String::new(),
+            ops: vec![schema_op(
+                LogicalSchemaAction::Create,
+                LogicalSchemaKind::Table,
+                "t",
+                Some("CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT)"),
+            )],
+        };
+        let portable_payload = txn.encode_length_delimited_to_vec();
+        let salt = 0x9a7b_6c5d_4e3f_2011u64;
+        let header_bytes = raw_mvcc_log_header(salt);
+        let initial_crc = crc32c::crc32c(&salt.to_le_bytes());
+        let (frame, _frame_crc) = raw_mvcc_log_frame_with_crc(77, &portable_payload, initial_crc);
+        let end_offset = (header_bytes.len() + frame.len()) as u64;
+        let header = PullUpdatesRespProtoBody {
+            server_revision: format!("g1:o{end_offset}"),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: false,
+                ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset: 0,
+                    end_offset,
+                    starts_with_header: true,
+                    crc_seed: None,
+                }],
+            }),
+        };
+        let mut body = header_bytes;
+        body.extend_from_slice(&frame);
+
+        assert_eq!(
+            decode_raw_mvcc_log_for_test(header, body).unwrap(),
+            vec![txn]
+        );
+    }
+
+    #[test]
+    fn raw_mvcc_log_decoder_rejects_bad_header_crc() {
+        let txn = LogicalTxnData {
+            end_offset: 104,
+            commit_ts: 77,
+            origin_client_id: String::new(),
+            ops: vec![schema_op(
+                LogicalSchemaAction::Create,
+                LogicalSchemaKind::Table,
+                "t",
+                Some("CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT)"),
+            )],
+        };
+        let portable_payload = txn.encode_length_delimited_to_vec();
+        let salt = 0x1020_3040_5060_7080u64;
+        let mut header_bytes = raw_mvcc_log_header(salt);
+        let initial_crc = crc32c::crc32c(&salt.to_le_bytes());
+        let (frame, _frame_crc) = raw_mvcc_log_frame_with_crc(77, &portable_payload, initial_crc);
+        header_bytes[MVCC_LOG_HEADER_CRC_START] ^= 0x01;
+        let end_offset = (header_bytes.len() + frame.len()) as u64;
+        let header = PullUpdatesRespProtoBody {
+            server_revision: format!("g1:o{end_offset}"),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: false,
+                ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset: 0,
+                    end_offset,
+                    starts_with_header: true,
+                    crc_seed: None,
+                }],
+            }),
+        };
+        let mut body = header_bytes;
+        body.extend_from_slice(&frame);
+
+        let err = decode_raw_mvcc_log_for_test(header, body).unwrap_err();
+        assert!(
+            err.to_string().contains("header checksum mismatch"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn raw_mvcc_log_decoder_rejects_bad_frame_crc() {
+        let txn = LogicalTxnData {
+            end_offset: 104,
+            commit_ts: 77,
+            origin_client_id: String::new(),
+            ops: vec![schema_op(
+                LogicalSchemaAction::Create,
+                LogicalSchemaKind::Table,
+                "t",
+                Some("CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT)"),
+            )],
+        };
+        let portable_payload = txn.encode_length_delimited_to_vec();
+        let salt = 0x0123_4567_89ab_cdefu64;
+        let header_bytes = raw_mvcc_log_header(salt);
+        let initial_crc = crc32c::crc32c(&salt.to_le_bytes());
+        let (mut frame, _frame_crc) =
+            raw_mvcc_log_frame_with_crc(77, &portable_payload, initial_crc);
+        frame[MVCC_TX_EXT_HEADER_SIZE + MVCC_EXTENSION_RECORD_HEADER_SIZE] ^= 0x01;
+        let end_offset = (header_bytes.len() + frame.len()) as u64;
+        let header = PullUpdatesRespProtoBody {
+            server_revision: format!("g1:o{end_offset}"),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: false,
+                ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset: 0,
+                    end_offset,
+                    starts_with_header: true,
+                    crc_seed: None,
+                }],
+            }),
+        };
+        let mut body = header_bytes;
+        body.extend_from_slice(&frame);
+
+        let err = decode_raw_mvcc_log_for_test(header, body).unwrap_err();
+        assert!(
+            err.to_string().contains("transaction checksum mismatch"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
@@ -3573,6 +4659,7 @@ mod tests {
             zstd_encoding: None,
             stream_kind: PullUpdatesStreamKind::Pages as i32,
             apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: None,
         };
         let page_data = PageData {
             page_id: 0,
@@ -3650,6 +4737,7 @@ mod tests {
             zstd_encoding: None,
             stream_kind: PullUpdatesStreamKind::Pages as i32,
             apply_mode: PullUpdatesApplyMode::ReplaceBase as i32,
+            mvcc_log: None,
         };
         let page_data = PageData {
             page_id: 0,
@@ -3722,8 +4810,9 @@ mod tests {
             db_size: 0,
             raw_encoding: None,
             zstd_encoding: None,
-            stream_kind: PullUpdatesStreamKind::Logical as i32,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
             apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: None,
         };
         let mut response = Vec::new();
         response.extend_from_slice(&header.encode_length_delimited_to_vec());
@@ -3804,65 +4893,6 @@ mod tests {
                 assert!(headers.iter().any(|(name, value)| {
                     name == super::ENCRYPTION_KEY_HEADER && value == "dGVzdC1lbmNyeXB0aW9uLWtleQ=="
                 }));
-                Result::Ok(())
-            }
-        });
-        loop {
-            match r#gen.resume_with(Ok(())) {
-                genawaiter::GeneratorState::Yielded(..) => {}
-                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
-            }
-        }
-    }
-
-    #[test]
-    fn bootstrap_db_file_v1_rejects_logical_stream() {
-        let header = PullUpdatesRespProtoBody {
-            server_revision: "g1:o66".to_string(),
-            db_size: 0,
-            raw_encoding: None,
-            zstd_encoding: None,
-            stream_kind: PullUpdatesStreamKind::Logical as i32,
-            apply_mode: PullUpdatesApplyMode::Incremental as i32,
-        };
-        let mut response = Vec::new();
-        response.extend_from_slice(&header.encode_length_delimited_to_vec());
-
-        let io = Arc::new(TestHttpIo {
-            response,
-            chunk: 5,
-            request: Mutex::new(None),
-            headers: Mutex::new(Vec::new()),
-        });
-        let temp = NamedTempFile::new().unwrap();
-        let path = temp.path().to_str().unwrap().to_string();
-        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-
-        let mut r#gen = genawaiter::sync::Gen::new({
-            let io = io.clone();
-            let path = path.clone();
-            let core_io = core_io.clone();
-            move |coro| async move {
-                let coro: Coro<()> = coro.into();
-                let stats = SyncEngineIoStats::new(io.clone());
-                let ctx = SyncOperationCtx::new(
-                    &coro,
-                    &stats,
-                    Some("https://example.com".to_string()),
-                    None,
-                );
-                let err = bootstrap_db_file_v1(&ctx, &core_io, &path, None, None, true)
-                    .await
-                    .unwrap_err();
-                assert!(
-                    format!("{err:#}").contains("unsupported logical bootstrap stream"),
-                    "{err:#}"
-                );
-
-                let (_, _, body) = io.request.lock().unwrap().clone().unwrap();
-                let request = PullUpdatesReqProtoBody::decode(body.as_slice()).unwrap();
-                assert!(!request.logical_updates);
-
                 Result::Ok(())
             }
         });
@@ -4842,14 +5872,20 @@ mod tests {
 
     #[test]
     fn logical_push_keeps_acknowledged_change_id_across_remote_generation_rollover() {
-        let floor = resolve_logical_push_floor_change_id(Some(7), 42, Some(100));
+        let floor = resolve_logical_push_floor_change_id(3, Some(7), 3, 42, Some(100));
         assert_eq!(floor, Some(42));
     }
 
     #[test]
     fn logical_push_ignores_remote_ack_from_old_local_cdc_epoch() {
-        let floor = resolve_logical_push_floor_change_id(Some(1), 10, Some(7));
+        let floor = resolve_logical_push_floor_change_id(3, Some(1), 3, 10, Some(7));
         assert_eq!(floor, Some(1));
+    }
+
+    #[test]
+    fn logical_push_ignores_remote_ack_from_older_pull_generation() {
+        let floor = resolve_logical_push_floor_change_id(3, Some(0), 1, 10, Some(12));
+        assert_eq!(floor, Some(0));
     }
 
     #[test]

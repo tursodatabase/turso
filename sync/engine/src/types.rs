@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
 
@@ -86,6 +86,8 @@ pub struct DbSyncStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Transport and apply semantics for a pull-updates response body.
 pub enum DbChangesStreamKind {
+    /// Legacy WAL pull page frames. These must keep the original WAL-session apply path.
+    LegacyPages,
     /// Incremental WAL page frames.
     Pages,
     /// Decoded MVCC logical transactions.
@@ -166,6 +168,11 @@ pub struct DatabaseMetadata {
     pub last_pushed_pull_gen_hint: i64,
     pub last_pushed_change_id_hint: i64,
     pub partial_bootstrap_server_revision: Option<DatabasePullRevision>,
+    /// Local identity map for portable MVCC logical replay. Keys are stable
+    /// table ids from raw logical-log schema operations; values are the current
+    /// table names to use for row replay when row ops omit repeated names.
+    #[serde(default)]
+    pub logical_table_names_by_stable_id: BTreeMap<u64, String>,
     /// optional saved configuration
     /// this will be used by sync engine if some parameters were omitted
     pub saved_configuration: Option<DatabaseSavedConfiguration>,
@@ -708,5 +715,32 @@ pub fn parse_bin_record(bin_record: impl AsRef<[u8]>) -> Result<Vec<turso_core::
         Err(err) => Err(Error::DatabaseTapeError(format!(
             "unable to parse bin record: {err}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DatabaseMetadata;
+
+    #[test]
+    fn metadata_load_defaults_missing_logical_table_map() {
+        let meta = DatabaseMetadata::load(
+            br#"{
+                "version": "v1",
+                "client_unique_id": "client-a",
+                "synced_revision": null,
+                "revert_since_wal_salt": null,
+                "revert_since_wal_watermark": 0,
+                "last_pull_unix_time": null,
+                "last_push_unix_time": null,
+                "last_pushed_pull_gen_hint": 0,
+                "last_pushed_change_id_hint": 0,
+                "partial_bootstrap_server_revision": null,
+                "saved_configuration": null
+            }"#,
+        )
+        .unwrap();
+
+        assert!(meta.logical_table_names_by_stable_id.is_empty());
     }
 }

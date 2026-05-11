@@ -25,6 +25,7 @@ use crate::types::IOResult;
 use crate::types::ImmutableRecord;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
+#[cfg(feature = "conn_raw_api")]
 use crate::types::Value;
 use crate::File;
 use crate::IOExt;
@@ -357,15 +358,22 @@ pub struct LogRecord {
     /// True once a `DatabaseHeader` op has been appended. At most one
     /// header op is allowed per transaction.
     pub has_header: bool,
-    /// Row/header images retained long enough to build the sync payload.
+    /// Row/header images retained long enough to build portable logical changes.
     ///
-    /// Recovery writes use `buf`; sync payload encoding needs the decoded
+    /// Recovery writes use `buf`; portable-change encoding needs the decoded
     /// logical row versions while the committing connection still has the
     /// matching schema context.
-    pub sync_row_versions: Vec<RowVersion>,
-    pub sync_header: Option<DatabaseHeader>,
-    pub sync_payload: Vec<u8>,
-    pub sync_op_count: u32,
+    #[cfg(feature = "conn_raw_api")]
+    pub portable_row_versions: Vec<RowVersion>,
+    #[cfg(feature = "conn_raw_api")]
+    pub portable_header: Option<DatabaseHeader>,
+    /// Portable logical-change metadata stored alongside the MVCC recovery log.
+    ///
+    /// Recovery ignores this field. It is present so raw-log consumers can
+    /// replay stable logical operations without reconstructing table/schema
+    /// identity from historical recovery records.
+    #[cfg(feature = "conn_raw_api")]
+    pub portable_changes: Vec<u8>,
 }
 
 impl LogRecord {
@@ -381,10 +389,12 @@ impl LogRecord {
             buf: vec![0u8; crate::mvcc::persistent_storage::logical_log::LOG_RECORD_PREFIX_SIZE],
             op_count: 0,
             has_header: false,
-            sync_row_versions: Vec::new(),
-            sync_header: None,
-            sync_payload: Vec::new(),
-            sync_op_count: 0,
+            #[cfg(feature = "conn_raw_api")]
+            portable_row_versions: Vec::new(),
+            #[cfg(feature = "conn_raw_api")]
+            portable_header: None,
+            #[cfg(feature = "conn_raw_api")]
+            portable_changes: Vec::new(),
         }
     }
 
@@ -429,7 +439,8 @@ impl LogRecord {
         )
         .expect("failed to serialize row version in test");
         self.op_count += 1;
-        self.sync_row_versions.push(row_version.clone());
+        #[cfg(feature = "conn_raw_api")]
+        self.portable_row_versions.push(row_version.clone());
     }
 
     /// Test-only: append a `DatabaseHeader` op to the payload buffer.
@@ -439,34 +450,51 @@ impl LogRecord {
         crate::mvcc::persistent_storage::logical_log::serialize_header_entry(&mut self.buf, header);
         self.has_header = true;
         self.op_count += 1;
-        self.sync_header = Some(*header);
+        #[cfg(feature = "conn_raw_api")]
+        {
+            self.portable_header = Some(*header);
+        }
     }
 }
 
+#[cfg(feature = "conn_raw_api")]
 const LOGICAL_OP_UPSERT_ROW: u64 = 0;
+#[cfg(feature = "conn_raw_api")]
 const LOGICAL_OP_DELETE_ROW: u64 = 1;
+#[cfg(feature = "conn_raw_api")]
 const LOGICAL_OP_SCHEMA: u64 = 2;
+#[cfg(feature = "conn_raw_api")]
 const LOGICAL_OP_UPDATE_HEADER: u64 = 3;
 
+#[cfg(feature = "conn_raw_api")]
 const LOGICAL_SCHEMA_CREATE: u64 = 0;
+#[cfg(feature = "conn_raw_api")]
 const LOGICAL_SCHEMA_DROP: u64 = 1;
+#[cfg(feature = "conn_raw_api")]
 const LOGICAL_SCHEMA_REFRESH: u64 = 2;
 
+#[cfg(feature = "conn_raw_api")]
 const LOGICAL_SCHEMA_KIND_TABLE: u64 = 0;
+#[cfg(feature = "conn_raw_api")]
 const LOGICAL_SCHEMA_KIND_INDEX: u64 = 1;
+#[cfg(feature = "conn_raw_api")]
 const LOGICAL_SCHEMA_KIND_TRIGGER: u64 = 2;
+#[cfg(feature = "conn_raw_api")]
 const LOGICAL_SCHEMA_KIND_VIEW: u64 = 3;
 
+#[cfg(feature = "conn_raw_api")]
 const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
+#[cfg(feature = "conn_raw_api")]
 const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
-const TURSO_SYNC_TABLE_NAME: &str = "turso_sync_last_change_id";
-const TURSO_LEGACY_SYNC_TABLE_NAME: &str = "turso_sync";
+#[cfg(feature = "conn_raw_api")]
 const TURSO_CDC_TABLE_NAME: &str = "turso_cdc";
+#[cfg(feature = "conn_raw_api")]
 const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
 
 // Minimal protobuf encoder for the server/client `LogicalTxnData` wire shape.
 // Keeping this local avoids making turso_core depend on the sync engine or
 // server proto crate while still writing bytes that those layers can decode.
+#[cfg(feature = "conn_raw_api")]
 fn write_proto_varint(mut value: u64, out: &mut Vec<u8>) {
     while value >= 0x80 {
         out.push((value as u8) | 0x80);
@@ -475,56 +503,63 @@ fn write_proto_varint(mut value: u64, out: &mut Vec<u8>) {
     out.push(value as u8);
 }
 
+#[cfg(feature = "conn_raw_api")]
 fn write_proto_key(field: u64, wire_type: u64, out: &mut Vec<u8>) {
     write_proto_varint((field << 3) | wire_type, out);
 }
 
+#[cfg(feature = "conn_raw_api")]
 fn write_proto_uint64(field: u64, value: u64, out: &mut Vec<u8>) {
     write_proto_key(field, 0, out);
     write_proto_varint(value, out);
 }
 
+#[cfg(feature = "conn_raw_api")]
 fn write_proto_sint64(field: u64, value: i64, out: &mut Vec<u8>) {
     let zigzag = ((value << 1) ^ (value >> 63)) as u64;
     write_proto_uint64(field, zigzag, out);
 }
 
+#[cfg(feature = "conn_raw_api")]
 fn write_proto_bytes(field: u64, value: &[u8], out: &mut Vec<u8>) {
     write_proto_key(field, 2, out);
     write_proto_varint(value.len() as u64, out);
     out.extend_from_slice(value);
 }
 
+#[cfg(feature = "conn_raw_api")]
 fn write_proto_string(field: u64, value: &str, out: &mut Vec<u8>) {
     write_proto_bytes(field, value.as_bytes(), out);
 }
 
+#[cfg(feature = "conn_raw_api")]
 fn append_logical_op(op_body: Vec<u8>, out: &mut Vec<u8>) {
     write_proto_key(3, 2, out);
     write_proto_varint(op_body.len() as u64, out);
     out.extend_from_slice(&op_body);
 }
 
-fn is_synced_logical_name(name: &str) -> bool {
+#[cfg(feature = "conn_raw_api")]
+fn is_portable_logical_name(name: &str) -> bool {
     !name.starts_with(SQLITE_INTERNAL_PREFIX)
         && !name.starts_with(TURSO_INTERNAL_PREFIX)
-        && name != TURSO_SYNC_TABLE_NAME
-        && name != TURSO_LEGACY_SYNC_TABLE_NAME
         && name != TURSO_CDC_TABLE_NAME
         && name != TURSO_CDC_VERSION_TABLE_NAME
 }
 
 /// Decoded subset of a `sqlite_schema` record needed to materialize stable
-/// sync schema operations at MVCC commit time.
+/// portable schema operations at MVCC commit time.
 #[derive(Clone, Debug)]
-struct SyncSchemaRow {
+#[cfg(feature = "conn_raw_api")]
+struct PortableSchemaRow {
     row_type: String,
     name: String,
     rootpage: i64,
     sql: Option<String>,
 }
 
-fn sync_schema_row_from_record(record_bytes: &[u8]) -> Result<SyncSchemaRow> {
+#[cfg(feature = "conn_raw_api")]
+fn portable_schema_row_from_record(record_bytes: &[u8]) -> Result<PortableSchemaRow> {
     let values = ImmutableRecord::from_bin_record(record_bytes.to_vec()).get_values_owned()?;
     if values.len() < 5 {
         return Err(LimboError::Corrupt(format!(
@@ -557,7 +592,7 @@ fn sync_schema_row_from_record(record_bytes: &[u8]) -> Result<SyncSchemaRow> {
             ))),
         }
     };
-    Ok(SyncSchemaRow {
+    Ok(PortableSchemaRow {
         row_type: text(&values[0], "sqlite_schema.type")?,
         name: text(&values[1], "sqlite_schema.name")?,
         rootpage: integer(&values[3], "sqlite_schema.rootpage")?,
@@ -565,15 +600,8 @@ fn sync_schema_row_from_record(record_bytes: &[u8]) -> Result<SyncSchemaRow> {
     })
 }
 
-fn sync_origin_client_id_from_record(record_bytes: &[u8]) -> Result<Option<String>> {
-    let values = ImmutableRecord::from_bin_record(record_bytes.to_vec()).get_values_owned()?;
-    let Some(Value::Text(client_id)) = values.first() else {
-        return Ok(None);
-    };
-    Ok(Some(client_id.as_str().to_string()))
-}
-
-fn sync_schema_kind(row_type: &str) -> Option<u64> {
+#[cfg(feature = "conn_raw_api")]
+fn portable_schema_kind(row_type: &str) -> Option<u64> {
     if row_type.eq_ignore_ascii_case("table") {
         Some(LOGICAL_SCHEMA_KIND_TABLE)
     } else if row_type.eq_ignore_ascii_case("index") {
@@ -587,7 +615,8 @@ fn sync_schema_kind(row_type: &str) -> Option<u64> {
     }
 }
 
-fn sync_table_id_from_rootpage(rootpage: i64) -> MVTableId {
+#[cfg(feature = "conn_raw_api")]
+fn portable_table_id_from_rootpage(rootpage: i64) -> MVTableId {
     if rootpage > 0 {
         MVTableId::from(-rootpage)
     } else {
@@ -595,12 +624,30 @@ fn sync_table_id_from_rootpage(rootpage: i64) -> MVTableId {
     }
 }
 
-fn encode_schema_logical_op(action: u64, row: &SyncSchemaRow, out: &mut Vec<u8>) {
-    let Some(kind) = sync_schema_kind(&row.row_type) else {
-        return;
+#[cfg(feature = "conn_raw_api")]
+fn stable_table_id_from_rootpage(rootpage: i64) -> Option<u64> {
+    (rootpage != 0).then_some(rootpage.unsigned_abs())
+}
+
+#[derive(Clone, Debug)]
+#[cfg(feature = "conn_raw_api")]
+struct PortableTableRef {
+    name: String,
+    stable_table_id: u64,
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn encode_schema_logical_op(
+    action: u64,
+    row: &PortableSchemaRow,
+    stable_table_id: Option<u64>,
+    out: &mut Vec<u8>,
+) -> bool {
+    let Some(kind) = portable_schema_kind(&row.row_type) else {
+        return false;
     };
-    if !is_synced_logical_name(&row.name) {
-        return;
+    if !is_portable_logical_name(&row.name) {
+        return false;
     }
     let mut op = Vec::new();
     write_proto_uint64(1, LOGICAL_OP_SCHEMA, &mut op);
@@ -612,29 +659,40 @@ fn encode_schema_logical_op(action: u64, row: &SyncSchemaRow, out: &mut Vec<u8>)
     write_proto_uint64(8, action, &mut op);
     write_proto_uint64(9, kind, &mut op);
     write_proto_string(10, &row.name, &mut op);
+    if let Some(stable_table_id) = stable_table_id {
+        write_proto_uint64(11, stable_table_id, &mut op);
+    }
     append_logical_op(op, out);
+    true
 }
 
+#[cfg(feature = "conn_raw_api")]
 fn encode_row_logical_op(
     op_type: u64,
     table_name: &str,
+    include_table_name: bool,
+    stable_table_id: u64,
     rowid: i64,
     record: &[u8],
     out: &mut Vec<u8>,
 ) {
-    if !is_synced_logical_name(table_name) {
+    if !is_portable_logical_name(table_name) {
         return;
     }
     let mut op = Vec::new();
     write_proto_uint64(1, op_type, &mut op);
-    write_proto_string(2, table_name, &mut op);
+    if include_table_name {
+        write_proto_string(2, table_name, &mut op);
+    }
     write_proto_sint64(3, rowid, &mut op);
+    write_proto_uint64(11, stable_table_id, &mut op);
     if op_type == LOGICAL_OP_UPSERT_ROW {
         write_proto_bytes(4, record, &mut op);
     }
     append_logical_op(op, out);
 }
 
+#[cfg(feature = "conn_raw_api")]
 fn encode_header_logical_op(header: &DatabaseHeader, out: &mut Vec<u8>) {
     let mut op = Vec::new();
     write_proto_uint64(1, LOGICAL_OP_UPDATE_HEADER, &mut op);
@@ -1493,6 +1551,11 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     fn cleanup_unfinished_commit(&mut self) {
         if !self.is_finalized {
             self.cleanup_mvcc_checkpoint_state();
+            if self.pending_log_append_bytes.take().is_some() {
+                if let Err(err) = self.mvcc_store.storage.discard_pending_log_write() {
+                    tracing::error!("failed to discard pending MVCC logical-log write: {err}");
+                }
+            }
             if !matches!(self.state, CommitState::Checkpoint { .. }) {
                 self.mvcc_store.cleanup_dropped_commit(
                     self.tx_id,
@@ -2167,7 +2230,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         // BeginCommitLogicalLog (or directly to CommitEnd if there is nothing
         // to log).
         let mut log_record = std::mem::replace(&mut ctx.log_record, LogRecord::new(end_ts));
-        self.populate_sync_payload(mvcc_store, &mut log_record);
+        self.populate_portable_changes(mvcc_store, &mut log_record);
         tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
 
         if log_record.is_empty() {
@@ -2187,189 +2250,235 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         Ok(TransitionResult::Continue)
     }
 
-    fn populate_sync_payload(&self, mvcc_store: &Arc<MvStore<Clock>>, log_record: &mut LogRecord) {
-        if !self.connection.mvcc_sync_payload_enabled() {
-            return;
-        }
-
-        let mut encoded_ops = Vec::new();
-        let mut op_count = 0u32;
-        let mut origin_client_id = None;
-
-        if let Some(header) = log_record.sync_header.as_ref() {
-            encode_header_logical_op(header, &mut encoded_ops);
-            op_count = op_count.saturating_add(1);
-        }
-
-        if log_record.sync_row_versions.is_empty() {
-            log_record.sync_payload = encoded_ops;
-            log_record.sync_op_count = op_count;
-            return;
-        }
-
-        // The sync payload is the durable, replay-ready representation of this
-        // commit. Build it while the committing connection still has the exact
-        // schema context that produced the recovery log record; the server will
-        // later copy these bytes instead of reconstructing historical schema.
-        let mut table_names_by_id = HashMap::default();
+    fn populate_portable_changes(
+        &self,
+        mvcc_store: &Arc<MvStore<Clock>>,
+        log_record: &mut LogRecord,
+    ) {
+        #[cfg(not(feature = "conn_raw_api"))]
         {
-            let schema = self.connection.schema.read();
-            for (name, table) in schema.tables.iter() {
-                let Ok(rootpage) = table.get_root_page() else {
+            let _ = mvcc_store;
+            let _ = log_record;
+            return;
+        }
+
+        #[cfg(feature = "conn_raw_api")]
+        {
+            if !self.connection.portable_logical_changes_enabled() {
+                return;
+            }
+
+            let mut encoded_ops = Vec::new();
+            let origin_client_id = self.connection.mvcc_log_meta("client");
+
+            if let Some(header) = log_record.portable_header.as_ref() {
+                encode_header_logical_op(header, &mut encoded_ops);
+            }
+
+            if log_record.portable_row_versions.is_empty() {
+                log_record.portable_changes = encoded_ops;
+                return;
+            }
+
+            // Portable changes are the durable, replay-ready representation of this
+            // commit. Build it while the committing connection still has the exact
+            // schema context that produced the recovery log record.
+            let mut table_refs_by_id = HashMap::default();
+            {
+                let schema = self.connection.schema.read();
+                for (name, table) in schema.tables.iter() {
+                    let Ok(rootpage) = table.get_root_page() else {
+                        continue;
+                    };
+                    let Some(stable_table_id) = stable_table_id_from_rootpage(rootpage) else {
+                        continue;
+                    };
+                    let table_ref = PortableTableRef {
+                        name: name.clone(),
+                        stable_table_id,
+                    };
+                    if rootpage > 0 {
+                        table_refs_by_id.insert(MVTableId::from(-rootpage), table_ref);
+                    } else if rootpage < 0 {
+                        table_refs_by_id.insert(MVTableId::from(rootpage), table_ref);
+                    }
+                }
+            }
+
+            let mut schema_upserts = HashMap::default();
+            let mut schema_deletes = HashMap::default();
+            let mut schema_rowids = Vec::new();
+            for version in &log_record.portable_row_versions {
+                if version.row.id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                    continue;
+                }
+                let rowid = version.row.id.row_id.to_int_or_panic();
+                if version.begin == Some(TxTimestampOrID::Timestamp(log_record.tx_timestamp)) {
+                    if let Ok(row) = portable_schema_row_from_record(version.row.payload()) {
+                        schema_rowids.push(rowid);
+                        schema_upserts.insert(rowid, row);
+                    }
+                }
+                if version.end == Some(TxTimestampOrID::Timestamp(log_record.tx_timestamp)) {
+                    if let Ok(row) = portable_schema_row_from_record(version.row.payload()) {
+                        schema_rowids.push(rowid);
+                        schema_deletes.insert(rowid, row);
+                    } else {
+                        tracing::debug!(
+                            "unable to encode sqlite_schema delete for portable changes: rowid={rowid}"
+                        );
+                    }
+                }
+            }
+
+            let mut emitted_schema_stable_ids = HashSet::default();
+            schema_rowids.sort_unstable();
+            schema_rowids.dedup();
+            for rowid in schema_rowids {
+                let old_row = schema_deletes.get(&rowid);
+                let new_row = schema_upserts.get(&rowid);
+                match (old_row, new_row) {
+                    (Some(old_row), Some(new_row)) => {
+                        if old_row.rootpage != 0 {
+                            let table_id = portable_table_id_from_rootpage(old_row.rootpage);
+                            table_refs_by_id.remove(&table_id);
+                        }
+                        if new_row.rootpage != 0 {
+                            let table_id = portable_table_id_from_rootpage(new_row.rootpage);
+                            if let Some(stable_table_id) =
+                                stable_table_id_from_rootpage(new_row.rootpage)
+                            {
+                                table_refs_by_id.insert(
+                                    table_id,
+                                    PortableTableRef {
+                                        name: new_row.name.clone(),
+                                        stable_table_id,
+                                    },
+                                );
+                            }
+                        }
+                        let stable_table_id = stable_table_id_from_rootpage(new_row.rootpage);
+                        if encode_schema_logical_op(
+                            LOGICAL_SCHEMA_REFRESH,
+                            new_row,
+                            stable_table_id,
+                            &mut encoded_ops,
+                        ) {
+                            if let Some(stable_table_id) = stable_table_id {
+                                emitted_schema_stable_ids.insert(stable_table_id);
+                            }
+                        }
+                    }
+                    (None, Some(new_row)) => {
+                        if new_row.rootpage != 0 {
+                            let table_id = portable_table_id_from_rootpage(new_row.rootpage);
+                            if let Some(stable_table_id) =
+                                stable_table_id_from_rootpage(new_row.rootpage)
+                            {
+                                table_refs_by_id.insert(
+                                    table_id,
+                                    PortableTableRef {
+                                        name: new_row.name.clone(),
+                                        stable_table_id,
+                                    },
+                                );
+                            }
+                        }
+                        let stable_table_id = stable_table_id_from_rootpage(new_row.rootpage);
+                        if encode_schema_logical_op(
+                            LOGICAL_SCHEMA_CREATE,
+                            new_row,
+                            stable_table_id,
+                            &mut encoded_ops,
+                        ) {
+                            if let Some(stable_table_id) = stable_table_id {
+                                emitted_schema_stable_ids.insert(stable_table_id);
+                            }
+                        }
+                    }
+                    (Some(old_row), None) => {
+                        let stable_table_id = stable_table_id_from_rootpage(old_row.rootpage);
+                        if encode_schema_logical_op(
+                            LOGICAL_SCHEMA_DROP,
+                            old_row,
+                            stable_table_id,
+                            &mut encoded_ops,
+                        ) {
+                            if let Some(stable_table_id) = stable_table_id {
+                                emitted_schema_stable_ids.insert(stable_table_id);
+                            }
+                        }
+                        if old_row.rootpage != 0 {
+                            let table_id = portable_table_id_from_rootpage(old_row.rootpage);
+                            table_refs_by_id.remove(&table_id);
+                        }
+                    }
+                    (None, None) => {}
+                }
+            }
+
+            for entry in mvcc_store.table_id_to_rootpage.iter() {
+                let table_id = *entry.key();
+                let Some(rootpage) = *entry.value() else {
                     continue;
                 };
-                if rootpage > 0 {
-                    table_names_by_id.insert(MVTableId::from(-rootpage), name.clone());
-                } else if rootpage < 0 {
-                    table_names_by_id.insert(MVTableId::from(rootpage), name.clone());
+                let root_table_id = MVTableId::from(-(rootpage as i64));
+                if let Some(table_ref) = table_refs_by_id.get(&root_table_id).cloned() {
+                    table_refs_by_id.insert(table_id, table_ref);
                 }
             }
-        }
 
-        let mut schema_upserts = HashMap::default();
-        let mut schema_deletes = HashMap::default();
-        let mut schema_rowids = Vec::new();
-        for version in &log_record.sync_row_versions {
-            if version.row.id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                continue;
-            }
-            let rowid = version.row.id.row_id.to_int_or_panic();
-            if version.begin == Some(TxTimestampOrID::Timestamp(log_record.tx_timestamp)) {
-                if let Ok(row) = sync_schema_row_from_record(version.row.payload()) {
-                    schema_rowids.push(rowid);
-                    schema_upserts.insert(rowid, row);
+            for version in &log_record.portable_row_versions {
+                let table_id = version.row.id.table_id;
+                if table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                    continue;
                 }
-            }
-            if version.end == Some(TxTimestampOrID::Timestamp(log_record.tx_timestamp)) {
-                if let Ok(row) = sync_schema_row_from_record(version.row.payload()) {
-                    schema_rowids.push(rowid);
-                    schema_deletes.insert(rowid, row);
-                } else {
+                if matches!(version.row.id.row_id, RowKey::Record(_)) {
+                    continue;
+                }
+                let Some(table_ref) = table_refs_by_id.get(&table_id) else {
                     tracing::debug!(
-                        "unable to encode sqlite_schema delete for sync payload: rowid={rowid}"
+                        "unable to encode MVCC row portable changes: table_id={table_id}"
+                    );
+                    continue;
+                };
+                let rowid = version.row.id.row_id.to_int_or_panic();
+                let include_table_name =
+                    !emitted_schema_stable_ids.contains(&table_ref.stable_table_id);
+                if version.begin == Some(TxTimestampOrID::Timestamp(log_record.tx_timestamp)) {
+                    encode_row_logical_op(
+                        LOGICAL_OP_UPSERT_ROW,
+                        &table_ref.name,
+                        include_table_name,
+                        table_ref.stable_table_id,
+                        rowid,
+                        version.row.payload(),
+                        &mut encoded_ops,
+                    );
+                }
+                if version.end == Some(TxTimestampOrID::Timestamp(log_record.tx_timestamp)) {
+                    encode_row_logical_op(
+                        LOGICAL_OP_DELETE_ROW,
+                        &table_ref.name,
+                        include_table_name,
+                        table_ref.stable_table_id,
+                        rowid,
+                        &[],
+                        &mut encoded_ops,
                     );
                 }
             }
-        }
 
-        schema_rowids.sort_unstable();
-        schema_rowids.dedup();
-        for rowid in schema_rowids {
-            let old_row = schema_deletes.get(&rowid);
-            let new_row = schema_upserts.get(&rowid);
-            match (old_row, new_row) {
-                (Some(old_row), Some(new_row)) => {
-                    if old_row.rootpage != 0 {
-                        let table_id = sync_table_id_from_rootpage(old_row.rootpage);
-                        table_names_by_id.remove(&table_id);
-                    }
-                    if new_row.rootpage != 0 {
-                        let table_id = sync_table_id_from_rootpage(new_row.rootpage);
-                        table_names_by_id.insert(table_id, new_row.name.clone());
-                    }
-                    let before = encoded_ops.len();
-                    encode_schema_logical_op(LOGICAL_SCHEMA_REFRESH, new_row, &mut encoded_ops);
-                    if encoded_ops.len() != before {
-                        op_count = op_count.saturating_add(1);
-                    }
-                }
-                (None, Some(new_row)) => {
-                    if new_row.rootpage != 0 {
-                        let table_id = sync_table_id_from_rootpage(new_row.rootpage);
-                        table_names_by_id.insert(table_id, new_row.name.clone());
-                    }
-                    let before = encoded_ops.len();
-                    encode_schema_logical_op(LOGICAL_SCHEMA_CREATE, new_row, &mut encoded_ops);
-                    if encoded_ops.len() != before {
-                        op_count = op_count.saturating_add(1);
-                    }
-                }
-                (Some(old_row), None) => {
-                    let before = encoded_ops.len();
-                    encode_schema_logical_op(LOGICAL_SCHEMA_DROP, old_row, &mut encoded_ops);
-                    if encoded_ops.len() != before {
-                        op_count = op_count.saturating_add(1);
-                    }
-                    if old_row.rootpage != 0 {
-                        let table_id = sync_table_id_from_rootpage(old_row.rootpage);
-                        table_names_by_id.remove(&table_id);
-                    }
-                }
-                (None, None) => {}
+            if let Some(client_id) = origin_client_id {
+                let mut txn_fields = Vec::new();
+                // LogicalTxnData.origin_client_id, field 4.
+                write_proto_string(4, &client_id, &mut txn_fields);
+                txn_fields.extend_from_slice(&encoded_ops);
+                encoded_ops = txn_fields;
             }
-        }
 
-        for entry in mvcc_store.table_id_to_rootpage.iter() {
-            let table_id = *entry.key();
-            let Some(rootpage) = *entry.value() else {
-                continue;
-            };
-            let root_table_id = MVTableId::from(-(rootpage as i64));
-            if let Some(name) = table_names_by_id.get(&root_table_id).cloned() {
-                table_names_by_id.insert(table_id, name);
-            }
+            log_record.portable_changes = encoded_ops;
         }
-
-        for version in &log_record.sync_row_versions {
-            let table_id = version.row.id.table_id;
-            if table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                continue;
-            }
-            if matches!(version.row.id.row_id, RowKey::Record(_)) {
-                continue;
-            }
-            let Some(table_name) = table_names_by_id.get(&table_id) else {
-                tracing::debug!("unable to encode MVCC row sync payload: table_id={table_id}");
-                continue;
-            };
-            let rowid = version.row.id.row_id.to_int_or_panic();
-            if version.begin == Some(TxTimestampOrID::Timestamp(log_record.tx_timestamp)) {
-                if table_name == TURSO_SYNC_TABLE_NAME {
-                    match sync_origin_client_id_from_record(version.row.payload()) {
-                        Ok(Some(client_id)) => origin_client_id = Some(client_id),
-                        Ok(None) => {}
-                        Err(err) => tracing::debug!(
-                            "unable to decode sync origin client_id from sync metadata row: {err}"
-                        ),
-                    }
-                }
-                let before = encoded_ops.len();
-                encode_row_logical_op(
-                    LOGICAL_OP_UPSERT_ROW,
-                    table_name,
-                    rowid,
-                    version.row.payload(),
-                    &mut encoded_ops,
-                );
-                if encoded_ops.len() != before {
-                    op_count = op_count.saturating_add(1);
-                }
-            }
-            if version.end == Some(TxTimestampOrID::Timestamp(log_record.tx_timestamp)) {
-                let before = encoded_ops.len();
-                encode_row_logical_op(
-                    LOGICAL_OP_DELETE_ROW,
-                    table_name,
-                    rowid,
-                    &[],
-                    &mut encoded_ops,
-                );
-                if encoded_ops.len() != before {
-                    op_count = op_count.saturating_add(1);
-                }
-            }
-        }
-
-        if let Some(client_id) = origin_client_id {
-            let mut txn_fields = Vec::new();
-            // LogicalTxnData.origin_client_id, field 4.
-            write_proto_string(4, &client_id, &mut txn_fields);
-            txn_fields.extend_from_slice(&encoded_ops);
-            encoded_ops = txn_fields;
-        }
-
-        log_record.sync_payload = encoded_ops;
-        log_record.sync_op_count = op_count;
     }
 
     /// Run one chunked step of `RewriteLiveVersions`. Processes up to
@@ -2822,6 +2931,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
 
             CommitState::SyncLogicalLog { end_ts } => {
+                mvcc_store.storage.on_log_write_complete()?;
                 // Skip fsync when synchronous mode is not FULL.
                 // NORMAL mode skips fsync on commit (but still fsyncs on checkpoint).
                 if self.sync_mode != SyncMode::Full {
@@ -2852,6 +2962,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .as_ref()
                         .map(|header| header.schema_cookie.get())
                         != Some(tx_header.schema_cookie.get());
+                self.did_commit_schema_change = schema_did_change;
                 if schema_did_change {
                     let schema = self.connection.schema.read().clone();
                     self.connection.db.update_schema_if_newer(schema);
@@ -2896,7 +3007,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 if let Some(append_bytes) = self.pending_log_append_bytes.take() {
                     mvcc_store
                         .storage
-                        .advance_logical_log_offset_after_success(append_bytes);
+                        .advance_logical_log_offset_after_success(append_bytes)?;
                 }
                 tx_unlocked
                     .state

@@ -6,8 +6,10 @@ use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
 use crate::mvcc::database::CommitYieldPoint;
+#[cfg(feature = "conn_raw_api")]
+use crate::mvcc::persistent_storage::logical_log::StreamingLogicalLogReader;
 use crate::mvcc::persistent_storage::logical_log::{
-    StreamingLogicalLogReader, ENCRYPTED_PAYLOAD_CHUNK_SIZE, FRAME_MAGIC, LOG_HDR_SIZE,
+    ENCRYPTED_PAYLOAD_CHUNK_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,
 };
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
@@ -29,7 +31,8 @@ use quickcheck_macros::quickcheck;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
-const TX_HEADER_SIZE: usize = 40;
+const TX_BASE_HEADER_SIZE: usize = 24;
+const TX_EXT_HEADER_SIZE: usize = 40;
 const TX_TRAILER_SIZE: usize = 8;
 
 pub(crate) struct MvccTestDbNoConn {
@@ -102,7 +105,7 @@ impl MvccTestDb {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:").unwrap();
         let conn = db.connect().unwrap();
-        conn.set_mvcc_sync_payload_enabled(true);
+        conn.set_portable_logical_changes_enabled(true);
         // Enable MVCC via PRAGMA
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         let mvcc_store = db.get_mv_store().clone().unwrap();
@@ -604,9 +607,9 @@ fn overwrite_file_with_junk(path: &std::path::Path, size: usize, byte: u8) {
         .truncate(true)
         .open(path)
         .unwrap();
-    let payload = vec![byte; size];
+    let portable_changes = vec![byte; size];
     use std::io::Write;
-    file.write_all(&payload).unwrap();
+    file.write_all(&portable_changes).unwrap();
     file.sync_all().unwrap();
 }
 
@@ -732,21 +735,21 @@ fn rewrite_table_leaf_cell_payload(page: &mut [u8], loc: TableLeafCellLoc, new_p
 
 fn tamper_table_leaf_value_serial_type(page: &mut [u8], page_no: u32, new_serial_type: u8) -> bool {
     let loc = table_leaf_first_cell_loc(page, page_no);
-    let payload = &mut page[loc.payload_offset..loc.payload_offset + loc.payload_len];
+    let portable_changes = &mut page[loc.payload_offset..loc.payload_offset + loc.payload_len];
 
-    let (header_size, hs_len) = read_varint(payload).unwrap();
+    let (header_size, hs_len) = read_varint(portable_changes).unwrap();
     let header_size = header_size as usize;
-    if header_size < hs_len + 2 || header_size > payload.len() {
+    if header_size < hs_len + 2 || header_size > portable_changes.len() {
         return false;
     }
 
     let mut idx = hs_len;
-    let (_serial_type0, n0) = read_varint(&payload[idx..header_size]).unwrap();
+    let (_serial_type0, n0) = read_varint(&portable_changes[idx..header_size]).unwrap();
     idx += n0;
     if idx >= header_size {
         return false;
     }
-    payload[idx] = new_serial_type;
+    portable_changes[idx] = new_serial_type;
     true
 }
 
@@ -6629,7 +6632,7 @@ fn test_mvcc_checkpoint_integrity_after_upsert_with_secondary_indexes() {
         "CREATE TABLE t(\
             id INTEGER PRIMARY KEY,\
             owner TEXT NOT NULL,\
-            payload TEXT NOT NULL,\
+            portable_changes TEXT NOT NULL,\
             rev INTEGER NOT NULL DEFAULT 0,\
             note TEXT,\
             bucket INTEGER NOT NULL DEFAULT 0,\
@@ -6650,12 +6653,12 @@ fn test_mvcc_checkpoint_integrity_after_upsert_with_secondary_indexes() {
 
     for id in 1..=200 {
         conn.execute(format!(
-            "INSERT INTO t(id, owner, payload, rev, note, bucket, tag, status) \
-             VALUES ({id}, 'owner-{id}', 'payload-{id}', 1, 'note-{id}', {bucket}, 'tag-{tag}', {status}) \
+            "INSERT INTO t(id, owner, portable_changes, rev, note, bucket, tag, status) \
+             VALUES ({id}, 'owner-{id}', 'portable_changes-{id}', 1, 'note-{id}', {bucket}, 'tag-{tag}', {status}) \
              ON CONFLICT(id) DO UPDATE SET \
                 id = excluded.id, \
                 owner = excluded.owner, \
-                payload = excluded.payload, \
+                portable_changes = excluded.portable_changes, \
                 rev = excluded.rev, \
                 note = excluded.note, \
                 bucket = excluded.bucket, \
@@ -6670,12 +6673,12 @@ fn test_mvcc_checkpoint_integrity_after_upsert_with_secondary_indexes() {
 
     for id in 1..=100 {
         conn.execute(format!(
-            "INSERT INTO t(id, owner, payload, rev, note, bucket, tag, status) \
-             VALUES ({id}, 'owner-{id}', 'payload-{id}-updated', 2, 'note-{id}-updated', {bucket}, 'tag-{tag}-updated', {status}) \
+            "INSERT INTO t(id, owner, portable_changes, rev, note, bucket, tag, status) \
+             VALUES ({id}, 'owner-{id}', 'portable_changes-{id}-updated', 2, 'note-{id}-updated', {bucket}, 'tag-{tag}-updated', {status}) \
              ON CONFLICT(id) DO UPDATE SET \
                 id = excluded.id, \
                 owner = excluded.owner, \
-                payload = excluded.payload, \
+                portable_changes = excluded.portable_changes, \
                 rev = excluded.rev, \
                 note = excluded.note, \
                 bucket = excluded.bucket, \
@@ -6700,12 +6703,14 @@ fn test_mvcc_cached_insert_reprepared_after_index_create() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT, rev INTEGER, payload TEXT)")
-        .unwrap();
+    conn.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT, rev INTEGER, portable_changes TEXT)",
+    )
+    .unwrap();
     let mut insert = conn
         .prepare(
-            "INSERT INTO t(id, owner, rev, payload) VALUES (1, 'a', 1, 'before') \
-             ON CONFLICT(id) DO UPDATE SET owner = excluded.owner, rev = excluded.rev, payload = excluded.payload",
+            "INSERT INTO t(id, owner, rev, portable_changes) VALUES (1, 'a', 1, 'before') \
+             ON CONFLICT(id) DO UPDATE SET owner = excluded.owner, rev = excluded.rev, portable_changes = excluded.portable_changes",
         )
         .unwrap();
     insert.run_ignore_rows().unwrap();
@@ -6715,7 +6720,7 @@ fn test_mvcc_cached_insert_reprepared_after_index_create() {
 
     insert.reset().unwrap();
     insert.run_ignore_rows().unwrap();
-    conn.execute("INSERT INTO t(id, owner, rev, payload) VALUES (2, 'b', 1, 'after')")
+    conn.execute("INSERT INTO t(id, owner, rev, portable_changes) VALUES (2, 'b', 1, 'after')")
         .unwrap();
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
@@ -6733,7 +6738,7 @@ fn test_mvcc_integrity_after_mixed_dml_create_index_transaction() {
         "CREATE TABLE t(\
             id INTEGER PRIMARY KEY,\
             owner TEXT NOT NULL,\
-            payload TEXT NOT NULL,\
+            portable_changes TEXT NOT NULL,\
             rev INTEGER NOT NULL DEFAULT 0,\
             note TEXT,\
             bucket INTEGER NOT NULL DEFAULT 0,\
@@ -6752,8 +6757,8 @@ fn test_mvcc_integrity_after_mixed_dml_create_index_transaction() {
         .unwrap();
     for id in 1..=13 {
         conn.execute(format!(
-            "INSERT INTO t(id, owner, payload, rev, note, bucket, tag, status) \
-             VALUES ({id}, 'owner-{id}', 'payload-{id}', 1, 'note-{id}', {bucket}, 'tag-{tag}', {status})",
+            "INSERT INTO t(id, owner, portable_changes, rev, note, bucket, tag, status) \
+             VALUES ({id}, 'owner-{id}', 'portable_changes-{id}', 1, 'note-{id}', {bucket}, 'tag-{tag}', {status})",
             bucket = id % 17,
             tag = id % 7,
             status = id % 9,
@@ -6763,12 +6768,12 @@ fn test_mvcc_integrity_after_mixed_dml_create_index_transaction() {
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
     conn.execute("BEGIN IMMEDIATE").unwrap();
-    conn.execute("UPDATE t SET payload = 'local-mixed-payload', rev = rev + 1 WHERE id = 1")
+    conn.execute("UPDATE t SET portable_changes = 'local-mixed-portable_changes', rev = rev + 1 WHERE id = 1")
         .unwrap();
-    conn.execute("CREATE INDEX \"t local mixed idx\" ON t(payload)")
+    conn.execute("CREATE INDEX \"t local mixed idx\" ON t(portable_changes)")
         .unwrap();
     conn.execute(
-        "INSERT INTO t(id, owner, payload, rev, note, bucket, tag, status) \
+        "INSERT INTO t(id, owner, portable_changes, rev, note, bucket, tag, status) \
          VALUES (20006, 'replica-1', 'replica-1-mixed-insert', 1, 'replica-1-note-20006', 1, 'tag-0', 1)",
     )
     .unwrap();
@@ -11107,7 +11112,7 @@ fn test_encrypted_recovery_corrupted_later_chunk_keeps_checkpointed_prefix() {
     .unwrap();
     let first_chunk_on_disk_size =
         ENCRYPTED_PAYLOAD_CHUNK_SIZE + enc_ctx.tag_size() + enc_ctx.nonce_size();
-    let corrupt_offset = LOG_HDR_SIZE + TX_HEADER_SIZE + first_chunk_on_disk_size + 1;
+    let corrupt_offset = LOG_HDR_SIZE + TX_BASE_HEADER_SIZE + first_chunk_on_disk_size + 1;
     log_bytes[corrupt_offset] ^= 0xFF;
     std::fs::write(&log_path, &log_bytes).unwrap();
 
@@ -11119,8 +11124,8 @@ fn test_encrypted_recovery_corrupted_later_chunk_keeps_checkpointed_prefix() {
     assert_eq!(rows[0][1].to_string(), "survives");
 }
 
-/// Read the raw db-log file and verify every TX frame payload can be decrypted.
-/// Panics if the file is missing, has no frames, or any payload fails to decrypt.
+/// Read the raw db-log file and verify every TX frame portable_changes can be decrypted.
+/// Panics if the file is missing, has no frames, or any portable_changes fails to decrypt.
 fn assert_log_payloads_decrypt(
     log_path: &std::path::Path,
     hex_key: &str,
@@ -11145,21 +11150,30 @@ fn assert_log_payloads_decrypt(
     let mut offset = LOG_HDR_SIZE;
     let mut frame_count = 0;
 
-    while offset + TX_HEADER_SIZE + TX_TRAILER_SIZE <= log_bytes.len() {
+    while offset + TX_BASE_HEADER_SIZE + TX_TRAILER_SIZE <= log_bytes.len() {
         // TX Header: frame_magic(4) | payload_size(8) | op_count(4) | commit_ts(8)
-        // | sync_payload_size(8) | sync_op_count(4) | frame_flags(4)
+        // | extension_size(8) | extension_record_count(4) | frame_flags(4)
         let frame_magic = u32::from_le_bytes(log_bytes[offset..offset + 4].try_into().unwrap());
-        if frame_magic != FRAME_MAGIC {
+        let (header_size, extension_size) = if frame_magic == FRAME_MAGIC {
+            (TX_BASE_HEADER_SIZE, 0)
+        } else if frame_magic == EXT_FRAME_MAGIC {
+            if offset + TX_EXT_HEADER_SIZE + TX_TRAILER_SIZE > log_bytes.len() {
+                break;
+            }
+            (
+                TX_EXT_HEADER_SIZE,
+                u64::from_le_bytes(log_bytes[offset + 24..offset + 32].try_into().unwrap())
+                    as usize,
+            )
+        } else {
             break; // not a valid frame
-        }
+        };
         let payload_size =
             u64::from_le_bytes(log_bytes[offset + 4..offset + 12].try_into().unwrap()) as usize;
         let op_count = u32::from_le_bytes(log_bytes[offset + 12..offset + 16].try_into().unwrap());
         let commit_ts = u64::from_le_bytes(log_bytes[offset + 16..offset + 24].try_into().unwrap());
-        let sync_payload_size =
-            u64::from_le_bytes(log_bytes[offset + 24..offset + 32].try_into().unwrap()) as usize;
 
-        let mut payload_offset = offset + TX_HEADER_SIZE;
+        let mut payload_offset = offset + header_size;
         let chunk_count = if payload_size == 0 {
             0
         } else {
@@ -11204,7 +11218,7 @@ fn assert_log_payloads_decrypt(
         }
 
         frame_count += 1;
-        offset = payload_offset + sync_payload_size + TX_TRAILER_SIZE; // skip sync payload and trailer
+        offset = payload_offset + extension_size + TX_TRAILER_SIZE; // skip extension block and trailer
     }
 
     assert!(
@@ -11213,7 +11227,8 @@ fn assert_log_payloads_decrypt(
     );
 }
 
-fn collect_mvcc_sync_payload_bytes(conn: &Arc<Connection>) -> Vec<u8> {
+#[cfg(feature = "conn_raw_api")]
+fn collect_mvcc_portable_change_bytes(conn: &Arc<Connection>) -> Vec<u8> {
     let mv_store = conn
         .mv_store()
         .as_ref()
@@ -11223,13 +11238,14 @@ fn collect_mvcc_sync_payload_bytes(conn: &Arc<Connection>) -> Vec<u8> {
     let mut reader = StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), None);
     reader.read_header(&io).unwrap();
 
-    let mut payload = Vec::new();
-    while let Some(frame) = reader.next_sync_payload(&io).unwrap() {
-        payload.extend_from_slice(&frame.payload);
+    let mut portable_changes = Vec::new();
+    while let Some(frame) = reader.next_portable_changes(&io).unwrap() {
+        portable_changes.extend_from_slice(&frame.payload);
     }
-    payload
+    portable_changes
 }
 
+#[cfg(feature = "conn_raw_api")]
 fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
@@ -11237,7 +11253,8 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 #[derive(Debug)]
-struct DecodedSyncOp {
+#[cfg(feature = "conn_raw_api")]
+struct DecodedPortableOp {
     op_type: u64,
     schema_action: Option<u64>,
     schema_kind: Option<u64>,
@@ -11246,8 +11263,10 @@ struct DecodedSyncOp {
     schema_name: String,
     user_version: Option<u64>,
     application_id: Option<u64>,
+    stable_table_id: Option<u64>,
 }
 
+#[cfg(feature = "conn_raw_api")]
 fn read_proto_varint(bytes: &[u8], offset: &mut usize) -> u64 {
     let mut value = 0u64;
     let mut shift = 0;
@@ -11262,6 +11281,7 @@ fn read_proto_varint(bytes: &[u8], offset: &mut usize) -> u64 {
     }
 }
 
+#[cfg(feature = "conn_raw_api")]
 fn skip_proto_field(bytes: &[u8], offset: &mut usize, wire_type: u64) {
     match wire_type {
         0 => {
@@ -11275,8 +11295,9 @@ fn skip_proto_field(bytes: &[u8], offset: &mut usize, wire_type: u64) {
     }
 }
 
-fn decode_sync_op(bytes: &[u8]) -> DecodedSyncOp {
-    let mut op = DecodedSyncOp {
+#[cfg(feature = "conn_raw_api")]
+fn decode_portable_op(bytes: &[u8]) -> DecodedPortableOp {
+    let mut op = DecodedPortableOp {
         op_type: u64::MAX,
         schema_action: None,
         schema_kind: None,
@@ -11285,6 +11306,7 @@ fn decode_sync_op(bytes: &[u8]) -> DecodedSyncOp {
         schema_name: String::new(),
         user_version: None,
         application_id: None,
+        stable_table_id: None,
     };
     let mut offset = 0usize;
     while offset < bytes.len() {
@@ -11312,19 +11334,21 @@ fn decode_sync_op(bytes: &[u8]) -> DecodedSyncOp {
                 op.schema_name = String::from_utf8(bytes[offset..offset + len].to_vec()).unwrap();
                 offset += len;
             }
+            (11, 0) => op.stable_table_id = Some(read_proto_varint(bytes, &mut offset)),
             _ => skip_proto_field(bytes, &mut offset, wire_type),
         }
     }
     op
 }
 
-fn decode_sync_payload_ops(payload: &[u8]) -> Vec<DecodedSyncOp> {
+#[cfg(feature = "conn_raw_api")]
+fn decode_portable_change_ops(portable_changes: &[u8]) -> Vec<DecodedPortableOp> {
     let mut ops = Vec::new();
     let mut offset = 0usize;
-    while offset < payload.len() {
-        let txn_len = read_proto_varint(payload, &mut offset) as usize;
+    while offset < portable_changes.len() {
+        let txn_len = read_proto_varint(portable_changes, &mut offset) as usize;
         let txn_end = offset + txn_len;
-        let txn = &payload[offset..txn_end];
+        let txn = &portable_changes[offset..txn_end];
         offset = txn_end;
 
         let mut txn_offset = 0usize;
@@ -11334,7 +11358,7 @@ fn decode_sync_payload_ops(payload: &[u8]) -> Vec<DecodedSyncOp> {
             let wire_type = key & 7;
             if field == 3 && wire_type == 2 {
                 let op_len = read_proto_varint(txn, &mut txn_offset) as usize;
-                ops.push(decode_sync_op(&txn[txn_offset..txn_offset + op_len]));
+                ops.push(decode_portable_op(&txn[txn_offset..txn_offset + op_len]));
                 txn_offset += op_len;
             } else {
                 skip_proto_field(txn, &mut txn_offset, wire_type);
@@ -11344,13 +11368,14 @@ fn decode_sync_payload_ops(payload: &[u8]) -> Vec<DecodedSyncOp> {
     ops
 }
 
-fn decode_sync_payload_origins(payload: &[u8]) -> Vec<String> {
+#[cfg(feature = "conn_raw_api")]
+fn decode_portable_change_origins(portable_changes: &[u8]) -> Vec<String> {
     let mut origins = Vec::new();
     let mut offset = 0usize;
-    while offset < payload.len() {
-        let txn_len = read_proto_varint(payload, &mut offset) as usize;
+    while offset < portable_changes.len() {
+        let txn_len = read_proto_varint(portable_changes, &mut offset) as usize;
         let txn_end = offset + txn_len;
-        let txn = &payload[offset..txn_end];
+        let txn = &portable_changes[offset..txn_end];
         offset = txn_end;
 
         let mut txn_offset = 0usize;
@@ -11371,9 +11396,10 @@ fn decode_sync_payload_origins(payload: &[u8]) -> Vec<String> {
     origins
 }
 
+#[cfg(feature = "conn_raw_api")]
 #[test]
-fn test_mvcc_sync_payload_encoder_matches_logical_op_wire_golden() {
-    let row = SyncSchemaRow {
+fn test_mvcc_portable_changes_encoder_matches_logical_op_wire_golden() {
+    let row = PortableSchemaRow {
         row_type: "view".to_string(),
         name: "v".to_string(),
         rootpage: 0,
@@ -11381,7 +11407,7 @@ fn test_mvcc_sync_payload_encoder_matches_logical_op_wire_golden() {
     };
     let mut encoded = Vec::new();
 
-    encode_schema_logical_op(LOGICAL_SCHEMA_CREATE, &row, &mut encoded);
+    encode_schema_logical_op(LOGICAL_SCHEMA_CREATE, &row, None, &mut encoded);
 
     assert_eq!(
         encoded,
@@ -11398,44 +11424,48 @@ fn test_mvcc_sync_payload_encoder_matches_logical_op_wire_golden() {
     );
 }
 
+#[cfg(feature = "conn_raw_api")]
 #[test]
-fn test_mvcc_sync_payload_disabled_by_default() {
+fn test_mvcc_portable_changes_disabled_by_default() {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:").unwrap();
     let conn = db.connect().unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
         .unwrap();
     conn.execute("INSERT INTO items VALUES (1, 'alpha')")
         .unwrap();
 
-    let payload = collect_mvcc_sync_payload_bytes(&conn);
+    let portable_changes = collect_mvcc_portable_change_bytes(&conn);
 
-    assert!(payload.is_empty());
+    assert!(portable_changes.is_empty());
 }
 
+#[cfg(feature = "conn_raw_api")]
 #[test]
 #[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_contains_user_schema_and_rows() {
     let db = MvccTestDb::new();
     db.conn
-        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
         .unwrap();
     db.conn
         .execute("INSERT INTO items VALUES (1, 'alpha')")
         .unwrap();
 
-    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
-    let ops = decode_sync_payload_ops(&payload);
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let ops = decode_portable_change_ops(&portable_changes);
 
     assert!(ops.iter().any(|op| op.op_type == 2
         && op.schema_name == "items"
-        && op.sql.contains("CREATE TABLE items")));
-    assert!(ops
-        .iter()
-        .any(|op| op.op_type == 0 && op.table_name == "items"));
+        && op.sql.contains("CREATE TABLE items")
+        && op.stable_table_id.unwrap_or_default() > 0));
+    assert!(ops.iter().any(|op| op.op_type == 0
+        && op.table_name == "items"
+        && op.stable_table_id.unwrap_or_default() > 0));
 }
 
+#[cfg(feature = "conn_raw_api")]
 #[test]
 #[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_emits_refresh_for_same_rowid_schema_update() {
@@ -11444,11 +11474,54 @@ fn test_mvcc_sync_payload_emits_refresh_for_same_rowid_schema_update() {
         .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
         .unwrap();
     db.conn
+        .execute("INSERT INTO items VALUES (1, 'before')")
+        .unwrap();
+    db.conn
+        .execute("ALTER TABLE items RENAME TO things")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO things VALUES (2, 'after')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let ops = decode_portable_change_ops(&portable_changes);
+    let before_id = ops
+        .iter()
+        .find(|op| op.op_type == 0 && op.table_name == "items")
+        .and_then(|op| op.stable_table_id)
+        .expect("create-time row should carry stable table id");
+    let after_id = ops
+        .iter()
+        .find(|op| op.op_type == 0 && op.table_name == "things")
+        .and_then(|op| op.stable_table_id)
+        .expect("post-rename row should carry stable table id");
+    let rename_id = ops
+        .iter()
+        .find(|op| {
+            op.op_type == 2
+                && op.schema_action == Some(LOGICAL_SCHEMA_REFRESH)
+                && op.schema_name == "things"
+        })
+        .and_then(|op| op.stable_table_id)
+        .expect("rename schema refresh should carry stable table id");
+
+    assert_eq!(before_id, after_id);
+    assert_eq!(before_id, rename_id);
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_emit_refresh_for_same_rowid_schema_update() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
+        .unwrap();
+    db.conn
         .execute("ALTER TABLE items ADD COLUMN note TEXT")
         .unwrap();
 
-    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
-    let ops = decode_sync_payload_ops(&payload);
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let ops = decode_portable_change_ops(&portable_changes);
 
     assert!(ops.iter().any(|op| op.op_type == 2
         && op.schema_action == Some(2)
@@ -11456,12 +11529,13 @@ fn test_mvcc_sync_payload_emits_refresh_for_same_rowid_schema_update() {
         && op.sql.contains("note TEXT")));
 }
 
+#[cfg(feature = "conn_raw_api")]
 #[test]
 #[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_emits_drop_and_create_for_drop_recreate_same_name() {
     let db = MvccTestDb::new();
     db.conn
-        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
         .unwrap();
     db.conn
         .execute("INSERT INTO items VALUES (1, 'old')")
@@ -11477,8 +11551,8 @@ fn test_mvcc_sync_payload_emits_drop_and_create_for_drop_recreate_same_name() {
         .unwrap();
     db.conn.execute("COMMIT").unwrap();
 
-    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
-    let ops = decode_sync_payload_ops(&payload);
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let ops = decode_portable_change_ops(&portable_changes);
 
     assert!(ops.iter().any(|op| op.op_type == 2
         && op.schema_action == Some(1)
@@ -11491,23 +11565,52 @@ fn test_mvcc_sync_payload_emits_drop_and_create_for_drop_recreate_same_name() {
         && op.sql.contains("note TEXT")));
     assert!(ops
         .iter()
-        .any(|op| op.op_type == 0 && op.table_name == "items"));
+        .any(|op| op.op_type == 0 && op.stable_table_id.unwrap_or_default() > 0));
 }
 
+#[cfg(feature = "conn_raw_api")]
 #[test]
 #[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_emits_index_drop_for_drop_table() {
     let db = MvccTestDb::new();
+    db.conn.execute("BEGIN").unwrap();
     db.conn
         .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
         .unwrap();
     db.conn
-        .execute("CREATE INDEX items_payload_idx ON items(payload)")
+        .execute("INSERT INTO items VALUES (1, 'alpha')")
+        .unwrap();
+    db.conn.execute("COMMIT").unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let ops = decode_portable_change_ops(&portable_changes);
+    let schema_id = ops
+        .iter()
+        .find(|op| op.op_type == 2 && op.schema_name == "items")
+        .and_then(|op| op.stable_table_id)
+        .expect("schema identity should carry stable table id");
+    let row_op = ops
+        .iter()
+        .find(|op| op.op_type == 0 && op.stable_table_id == Some(schema_id))
+        .expect("row op should carry matching stable table id");
+
+    assert!(row_op.table_name.is_empty());
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_emit_index_drop_for_drop_table() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
+        .unwrap();
+    db.conn
+        .execute("CREATE INDEX items_payload_idx ON items(portable_changes)")
         .unwrap();
     db.conn.execute("DROP TABLE items").unwrap();
 
-    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
-    let ops = decode_sync_payload_ops(&payload);
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let ops = decode_portable_change_ops(&portable_changes);
 
     assert!(ops.iter().any(|op| op.op_type == 2
         && op.schema_action == Some(1)
@@ -11519,27 +11622,28 @@ fn test_mvcc_sync_payload_emits_index_drop_for_drop_table() {
         && op.schema_name == "items_payload_idx"));
 }
 
+#[cfg(feature = "conn_raw_api")]
 #[test]
 #[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_emits_index_trigger_and_view_schema_ops() {
     let db = MvccTestDb::new();
     db.conn
-        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
         .unwrap();
     db.conn
-        .execute("CREATE INDEX items_payload_idx ON items(payload)")
+        .execute("CREATE INDEX items_payload_idx ON items(portable_changes)")
         .unwrap();
     db.conn
-        .execute("CREATE VIEW items_view AS SELECT id, payload FROM items")
+        .execute("CREATE VIEW items_view AS SELECT id, portable_changes FROM items")
         .unwrap();
     db.conn
         .execute(
-            "CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN UPDATE items SET payload = NEW.payload WHERE id = NEW.id; END",
+            "CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN UPDATE items SET portable_changes = NEW.portable_changes WHERE id = NEW.id; END",
         )
         .unwrap();
 
-    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
-    let ops = decode_sync_payload_ops(&payload);
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let ops = decode_portable_change_ops(&portable_changes);
 
     assert!(ops.iter().any(|op| op.op_type == 2
         && op.schema_action == Some(0)
@@ -11558,19 +11662,20 @@ fn test_mvcc_sync_payload_emits_index_trigger_and_view_schema_ops() {
         && op.sql.contains("CREATE TRIGGER items_ai")));
 }
 
+#[cfg(feature = "conn_raw_api")]
 #[test]
 #[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_emits_trigger_and_view_lifecycle_ops() {
     let db = MvccTestDb::new();
     db.conn
-        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
         .unwrap();
     db.conn
-        .execute("CREATE VIEW items_view AS SELECT id, payload FROM items")
+        .execute("CREATE VIEW items_view AS SELECT id, portable_changes FROM items")
         .unwrap();
     db.conn
         .execute(
-            "CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN UPDATE items SET payload = NEW.payload WHERE id = NEW.id; END",
+            "CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN UPDATE items SET portable_changes = NEW.portable_changes WHERE id = NEW.id; END",
         )
         .unwrap();
 
@@ -11585,8 +11690,8 @@ fn test_mvcc_sync_payload_emits_trigger_and_view_lifecycle_ops() {
         .unwrap();
     db.conn.execute("COMMIT").unwrap();
 
-    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
-    let ops = decode_sync_payload_ops(&payload);
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let ops = decode_portable_change_ops(&portable_changes);
 
     assert!(ops.iter().any(|op| op.op_type == 2
         && op.schema_action == Some(1)
@@ -11608,6 +11713,7 @@ fn test_mvcc_sync_payload_emits_trigger_and_view_lifecycle_ops() {
         && op.sql.contains("CREATE TRIGGER items_ai")));
 }
 
+#[cfg(feature = "conn_raw_api")]
 #[test]
 #[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_emits_header_only_commits() {
@@ -11615,8 +11721,8 @@ fn test_mvcc_sync_payload_emits_header_only_commits() {
     db.conn.execute("PRAGMA user_version = 42").unwrap();
     db.conn.execute("PRAGMA application_id = 1337").unwrap();
 
-    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
-    let ops = decode_sync_payload_ops(&payload);
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let ops = decode_portable_change_ops(&portable_changes);
     let header_ops = ops.iter().filter(|op| op.op_type == 3).collect::<Vec<_>>();
 
     assert_eq!(header_ops.len(), 2);
@@ -11630,12 +11736,32 @@ fn test_mvcc_sync_payload_emits_header_only_commits() {
 
 #[test]
 #[cfg(feature = "conn_raw_api")]
-fn test_mvcc_sync_payload_uses_checkpointed_schema_after_restart() {
+fn test_mvcc_log_meta_sets_portable_origin() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("PRAGMA mvcc_log_meta('client', 'turso-sync-client-a')")
+        .unwrap();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (1, 'alpha')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let origins = decode_portable_change_origins(&portable_changes);
+
+    assert!(origins.iter().any(|origin| origin == "turso-sync-client-a"));
+}
+
+#[test]
+#[cfg(feature = "conn_raw_api")]
+fn test_mvcc_portable_changes_use_checkpointed_schema_after_restart() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
-        conn.set_mvcc_sync_payload_enabled(true);
-        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        conn.set_portable_logical_changes_enabled(true);
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
             .unwrap();
         conn.execute("INSERT INTO items VALUES (1, 'before')")
             .unwrap();
@@ -11646,7 +11772,7 @@ fn test_mvcc_sync_payload_uses_checkpointed_schema_after_restart() {
     db.restart();
     {
         let conn = db.connect();
-        conn.set_mvcc_sync_payload_enabled(true);
+        conn.set_portable_logical_changes_enabled(true);
         conn.execute("INSERT INTO items VALUES (2, 'after')")
             .unwrap();
         conn.execute("ALTER TABLE items ADD COLUMN note TEXT")
@@ -11654,8 +11780,8 @@ fn test_mvcc_sync_payload_uses_checkpointed_schema_after_restart() {
         conn.execute("UPDATE items SET note = 'backfill' WHERE id = 2")
             .unwrap();
 
-        let payload = collect_mvcc_sync_payload_bytes(&conn);
-        let ops = decode_sync_payload_ops(&payload);
+        let portable_changes = collect_mvcc_portable_change_bytes(&conn);
+        let ops = decode_portable_change_ops(&portable_changes);
 
         assert!(ops
             .iter()
@@ -11669,12 +11795,13 @@ fn test_mvcc_sync_payload_uses_checkpointed_schema_after_restart() {
     }
 }
 
+#[cfg(feature = "conn_raw_api")]
 #[test]
 #[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_emits_ddl_and_backfill_rows_in_same_transaction() {
     let db = MvccTestDb::new();
     db.conn
-        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
         .unwrap();
     db.conn
         .execute("INSERT INTO items VALUES (1, 'alpha'), (2, 'beta')")
@@ -11689,8 +11816,8 @@ fn test_mvcc_sync_payload_emits_ddl_and_backfill_rows_in_same_transaction() {
         .unwrap();
     db.conn.execute("COMMIT").unwrap();
 
-    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
-    let ops = decode_sync_payload_ops(&payload);
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let ops = decode_portable_change_ops(&portable_changes);
 
     assert!(ops.iter().any(|op| op.op_type == 2
         && op.schema_action == Some(2)
@@ -11699,12 +11826,13 @@ fn test_mvcc_sync_payload_emits_ddl_and_backfill_rows_in_same_transaction() {
         && op.sql.contains("note TEXT")));
     assert!(
         ops.iter()
-            .filter(|op| op.op_type == 0 && op.table_name == "items")
+            .filter(|op| op.op_type == 0 && op.stable_table_id.unwrap_or_default() > 0)
             .count()
             >= 2
     );
 }
 
+#[cfg(feature = "conn_raw_api")]
 #[test]
 #[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_filters_sync_metadata_table() {
@@ -11715,7 +11843,7 @@ fn test_mvcc_sync_payload_filters_sync_metadata_table() {
         )
         .unwrap();
     db.conn
-        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
         .unwrap();
     db.conn.execute("BEGIN").unwrap();
     db.conn
@@ -11726,12 +11854,15 @@ fn test_mvcc_sync_payload_filters_sync_metadata_table() {
         .unwrap();
     db.conn.execute("COMMIT").unwrap();
 
-    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
-    let ops = decode_sync_payload_ops(&payload);
-    let origins = decode_sync_payload_origins(&payload);
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let ops = decode_portable_change_ops(&portable_changes);
+    let origins = decode_portable_change_origins(&portable_changes);
 
-    assert!(!bytes_contain(&payload, b"turso_sync_last_change_id"));
-    assert!(origins.iter().any(|origin| origin == "client-a"));
+    assert!(bytes_contain(
+        &portable_changes,
+        b"turso_sync_last_change_id"
+    ));
+    assert!(origins.is_empty());
     assert!(ops
         .iter()
         .any(|op| op.op_type == 0 && op.table_name == "items"));
@@ -11844,7 +11975,7 @@ fn test_encrypted_recovery_corrupted_ciphertext() {
         crate::storage::encryption::CipherMode::Aes256Gcm,
     );
 
-    // Corrupt the payload of the second (non-checkpointed) frame in the log file.
+    // Corrupt the portable_changes of the second (non-checkpointed) frame in the log file.
     // The log header is 56 bytes, then the TX header is 24 bytes. Flip a byte
     // in the encrypted payload area right after that.
     {
@@ -12110,7 +12241,7 @@ fn create_wide_table_like_schema(conn: &Arc<Connection>) {
             id INTEGER PRIMARY KEY,
             sheet_id INTEGER NOT NULL,
             trigger_type TEXT NOT NULL,
-            payload TEXT,
+            portable_changes TEXT,
             created_at TEXT DEFAULT (datetime('now'))
         )",
     )
@@ -12172,17 +12303,17 @@ fn insert_wide_table_like_batch(conn: &Arc<Connection>, start_row_number: i64, r
     ))
     .unwrap();
     conn.execute(
-        "INSERT INTO trigger_gate(sheet_id, trigger_type, payload, created_at)
+        "INSERT INTO trigger_gate(sheet_id, trigger_type, portable_changes, created_at)
          VALUES (1, 'ROW_INSERT', '{\"count\": 1}', datetime('now'))",
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO trigger_gate(sheet_id, trigger_type, payload, created_at)
+        "INSERT INTO trigger_gate(sheet_id, trigger_type, portable_changes, created_at)
          VALUES (1, 'RECALC', '{\"sheet_id\": 1}', datetime('now'))",
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO trigger_gate(sheet_id, trigger_type, payload, created_at)
+        "INSERT INTO trigger_gate(sheet_id, trigger_type, portable_changes, created_at)
          VALUES (1, 'WEBHOOK', '{\"event\": \"rows_added\"}', datetime('now'))",
     )
     .unwrap();
@@ -12270,7 +12401,7 @@ fn test_checkpoint_recovers_after_crash_restart_drop_recreate_index() {
         let conn = db.connect();
         conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
             .unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, payload TEXT)")
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, portable_changes TEXT)")
             .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'seed_1', hex(randomblob(16)))")
             .unwrap();
@@ -12426,7 +12557,7 @@ fn test_recovery_after_drop_checkpointed_table_with_if_not_exists_index() {
         conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
             .unwrap();
         conn.execute(format!(
-            "CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL DEFAULT 0)"
+            "CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, portable_changes TEXT NOT NULL, rev INTEGER NOT NULL DEFAULT 0)"
         ))
         .unwrap();
         conn.execute(format!(
@@ -12434,7 +12565,7 @@ fn test_recovery_after_drop_checkpointed_table_with_if_not_exists_index() {
         ))
         .unwrap();
         conn.execute(format!(
-            "INSERT INTO {table} (id, owner, payload, rev) VALUES (1, 'seed-a', 'alpha', 1)"
+            "INSERT INTO {table} (id, owner, portable_changes, rev) VALUES (1, 'seed-a', 'alpha', 1)"
         ))
         .unwrap();
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
@@ -12476,7 +12607,7 @@ fn test_recovery_after_drop_table_with_many_schema_rows() {
             .unwrap();
         }
         conn.execute(format!(
-            "CREATE TABLE IF NOT EXISTS {target} (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL DEFAULT 0)"
+            "CREATE TABLE IF NOT EXISTS {target} (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, portable_changes TEXT NOT NULL, rev INTEGER NOT NULL DEFAULT 0)"
         ))
         .unwrap();
         conn.execute(format!(
@@ -12484,7 +12615,7 @@ fn test_recovery_after_drop_table_with_many_schema_rows() {
         ))
         .unwrap();
         conn.execute(format!(
-            "INSERT INTO {target} (id, owner, payload, rev) VALUES (1, 'seed-a', 'alpha', 1)"
+            "INSERT INTO {target} (id, owner, portable_changes, rev) VALUES (1, 'seed-a', 'alpha', 1)"
         ))
         .unwrap();
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
@@ -13585,8 +13716,11 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
         fn checkpoint_threshold(&self) -> i64 {
             self.inner.checkpoint_threshold()
         }
-        fn advance_logical_log_offset_after_success(&self, b: u64) {
+        fn advance_logical_log_offset_after_success(&self, b: u64) -> Result<()> {
             self.inner.advance_logical_log_offset_after_success(b)
+        }
+        fn discard_pending_log_write(&self) -> Result<()> {
+            self.inner.discard_pending_log_write()
         }
         fn restore_logical_log_state_after_recovery(&self, o: u64, c: u32) {
             self.inner.restore_logical_log_state_after_recovery(o, c)

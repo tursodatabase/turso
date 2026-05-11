@@ -1729,7 +1729,7 @@ pub enum PragmaBody {
     /// `=`
     Equals(PragmaValue),
     /// function call
-    Call(PragmaValue),
+    Call(Vec<PragmaValue>),
 }
 
 /// `PRAGMA` value
@@ -1841,6 +1841,8 @@ pub enum PragmaName {
     WalCheckpoint,
     /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
     MvccCheckpointThreshold,
+    /// Stores connection-local metadata for portable MVCC logical-log records.
+    MvccLogMeta,
     /// List all available types (built-in and custom)
     ListTypes,
     /// Deprecated no-op: control whether callback is invoked for empty result sets

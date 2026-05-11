@@ -185,11 +185,15 @@ pub struct Connection {
     /// because rotating the WAL header invalidates their published
     /// watermarks.
     pub(super) wal_auto_actions: AtomicU8,
-    /// Whether MVCC commits should include server sync payloads in the logical log.
+    /// Whether MVCC commits should include portable logical-change metadata in
+    /// the logical log.
     ///
-    /// This is off by default because the payloads are only useful when tursodb
-    /// is used as the storage engine behind turso-server logical sync.
-    pub(super) mvcc_sync_payload_enabled: AtomicBool,
+    /// This is off by default because the metadata is only useful for raw-log
+    /// consumers such as sync clients.
+    #[cfg(feature = "conn_raw_api")]
+    pub(super) portable_logical_changes_enabled: AtomicBool,
+    #[cfg(feature = "conn_raw_api")]
+    pub(super) mvcc_log_metadata: RwLock<HashMap<String, String>>,
     pub(super) capture_data_changes: RwLock<Option<CaptureDataChangesInfo>>,
     /// CDC v2: transaction ID for grouping CDC records by transaction.
     /// -1 means unset (will be assigned on first CDC write in the transaction).
@@ -654,23 +658,24 @@ impl Connection {
         self.executing_triggers.write().pop();
     }
 
-    fn should_retry_cross_process_schema_lookup(
-        self: &Arc<Connection>,
-        err: &LimboError,
-    ) -> Result<bool> {
+    fn should_retry_stale_schema_lookup(self: &Arc<Connection>, err: &LimboError) -> Result<bool> {
         let LimboError::ParseError(msg) = err else {
             return Ok(false);
         };
-        if !msg.contains("no such table") && !msg.contains("table not found") {
+        if !msg.contains("no such table")
+            && !msg.contains("table not found")
+            && !msg.contains("no such column")
+            && !msg.contains("has no column named")
+        {
             return Ok(false);
         }
         if self.get_tx_state() != TransactionState::None {
             return Ok(false);
         }
-        if self.db.shared_wal_coordination()?.is_none() {
-            return Ok(false);
-        }
-        self.maybe_reparse_schema()?;
+        let pager = self.pager.load().clone();
+        pager.clear_page_cache(false);
+        pager.set_schema_cookie(None);
+        self.reparse_schema_from_current_pages()?;
         Ok(true)
     }
 
@@ -697,7 +702,7 @@ impl Connection {
             input,
         ) {
             Ok(program) => Ok((program, pager, mode)),
-            Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {
+            Err(err) if self.should_retry_stale_schema_lookup(&err)? => {
                 // Cold path: re-parse the SQL from scratch after schema refresh rather
                 // than cloning the original AST, which can overflow the stack
                 // on deeply nested expression trees.
@@ -1500,11 +1505,8 @@ impl Connection {
         };
 
         let mut state_machine = mv_store.commit_tx(tx_id, self, MAIN_DB_ID)?;
-        loop {
-            match state_machine.step(mv_store)? {
-                IOResult::IO(io) => io.wait(self.db.io.as_ref())?,
-                IOResult::Done(_) => break,
-            }
+        while let IOResult::IO(io) = state_machine.step(mv_store)? {
+            io.wait(self.db.io.as_ref())?;
         }
         assert!(state_machine.is_finalized());
         self.set_mv_tx(None);
@@ -1829,18 +1831,61 @@ impl Connection {
         WalAutoActions::from_bits_truncate(self.wal_auto_actions.load(Ordering::SeqCst))
     }
 
-    /// Enable or disable writing server sync payloads into MVCC logical-log frames.
-    pub fn set_mvcc_sync_payload_enabled(&self, enabled: bool) {
+    /// Enable or disable writing portable logical-change metadata into MVCC
+    /// logical-log frames.
+    pub fn set_portable_logical_changes_enabled(&self, enabled: bool) {
         #[cfg(feature = "conn_raw_api")]
         {
-            self.mvcc_sync_payload_enabled
+            self.portable_logical_changes_enabled
                 .store(enabled, Ordering::Release);
         }
         let _ = enabled;
     }
 
-    pub fn mvcc_sync_payload_enabled(&self) -> bool {
-        self.mvcc_sync_payload_enabled.load(Ordering::Acquire)
+    pub fn portable_logical_changes_enabled(&self) -> bool {
+        #[cfg(feature = "conn_raw_api")]
+        {
+            return self
+                .portable_logical_changes_enabled
+                .load(Ordering::Acquire);
+        }
+        #[cfg(not(feature = "conn_raw_api"))]
+        {
+            false
+        }
+    }
+
+    pub fn set_mvcc_log_meta(&self, key: String, value: Option<String>) {
+        #[cfg(feature = "conn_raw_api")]
+        {
+            let mut metadata = self.mvcc_log_metadata.write();
+            match value {
+                Some(value) => {
+                    metadata.insert(key, value);
+                    self.portable_logical_changes_enabled
+                        .store(true, Ordering::Release);
+                }
+                None => {
+                    metadata.remove(&key);
+                }
+            }
+        }
+        #[cfg(not(feature = "conn_raw_api"))]
+        {
+            let _ = (key, value);
+        }
+    }
+
+    pub fn mvcc_log_meta(&self, key: &str) -> Option<String> {
+        #[cfg(feature = "conn_raw_api")]
+        {
+            return self.mvcc_log_metadata.read().get(key).cloned();
+        }
+        #[cfg(not(feature = "conn_raw_api"))]
+        {
+            let _ = key;
+            None
+        }
     }
 
     #[cfg(feature = "simulator")]
@@ -3609,11 +3654,6 @@ mod tests {
         )
         .unwrap();
         db.connect().unwrap()
-    }
-
-    fn open_database(path: &std::path::Path) -> Arc<Database> {
-        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
-        Database::open_file(io, path.to_str().unwrap()).unwrap()
     }
 
     fn open_connection(path: &std::path::Path) -> Arc<Connection> {

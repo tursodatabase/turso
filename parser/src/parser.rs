@@ -3340,11 +3340,21 @@ impl<'a> Parser<'a> {
                 }
                 TK_LP => {
                     eat_assert!(self, TK_LP);
-                    let value = self.parse_pragma_value()?;
+                    let mut values = Vec::new();
+                    if !matches!(self.peek()?, Some(tok) if tok.token_type == TK_RP) {
+                        loop {
+                            values.push(self.parse_pragma_value()?);
+                            if matches!(self.peek()?, Some(tok) if tok.token_type == TK_COMMA) {
+                                eat_assert!(self, TK_COMMA);
+                                continue;
+                            }
+                            break;
+                        }
+                    }
                     eat_expect!(self, TK_RP);
                     Ok(Stmt::Pragma {
                         name,
-                        body: Some(PragmaBody::Call(value)),
+                        body: Some(PragmaBody::Call(values)),
                     })
                 }
                 _ => Ok(Stmt::Pragma { name, body: None }),

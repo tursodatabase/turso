@@ -244,7 +244,7 @@ pub fn translate_pragma(
             schema_was_explicit,
             program,
         )?,
-        Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
+        Some(ast::PragmaBody::Equals(value)) => match pragma {
             // These pragmas take a parameter but are queries, not setters
             PragmaName::IndexInfo
             | PragmaName::IndexXinfo
@@ -276,6 +276,52 @@ pub fn translate_pragma(
                 program,
             )?,
         },
+        Some(ast::PragmaBody::Call(values)) => {
+            if pragma == PragmaName::MvccLogMeta {
+                update_mvcc_log_meta(values, &connection)?;
+                TransactionMode::None
+            } else {
+                let mut values = values.into_iter();
+                let Some(value) = values.next() else {
+                    bail_parse_error!("pragma call requires an argument");
+                };
+                if values.next().is_some() {
+                    bail_parse_error!("pragma call accepts only one argument");
+                }
+                match pragma {
+                    // These pragmas take a parameter but are queries, not setters
+                    PragmaName::IndexInfo
+                    | PragmaName::IndexXinfo
+                    | PragmaName::IndexList
+                    | PragmaName::ForeignKeyList
+                    | PragmaName::TableList
+                    | PragmaName::TableInfo
+                    | PragmaName::TableXinfo
+                    | PragmaName::IntegrityCheck
+                    | PragmaName::DatabaseList
+                    | PragmaName::QuickCheck => query_pragma(
+                        pragma,
+                        resolver,
+                        Some(*value),
+                        pager,
+                        connection,
+                        database_id,
+                        schema_was_explicit,
+                        program,
+                    )?,
+                    _ => update_pragma(
+                        pragma,
+                        resolver,
+                        *value,
+                        pager,
+                        connection,
+                        database_id,
+                        schema_was_explicit,
+                        program,
+                    )?,
+                }
+            }
+        }
     };
     match mode {
         TransactionMode::None => {}
@@ -294,6 +340,28 @@ pub fn translate_pragma(
         }
     }
 
+    Ok(())
+}
+
+fn update_mvcc_log_meta(
+    values: Vec<ast::PragmaValue>,
+    connection: &Arc<crate::Connection>,
+) -> crate::Result<()> {
+    if values.len() != 2 {
+        bail_parse_error!("mvcc_log_meta requires key and value arguments");
+    }
+    let mut values = values.into_iter();
+    let key = parse_string(&values.next().unwrap())?;
+    if key.is_empty() {
+        bail_parse_error!("mvcc_log_meta key must not be empty");
+    }
+    let value = values.next().unwrap();
+    let value = if matches!(value.as_ref(), Expr::Literal(Literal::Null)) {
+        None
+    } else {
+        Some(parse_string(&value)?)
+    };
+    connection.set_mvcc_log_meta(key, value);
     Ok(())
 }
 
@@ -682,6 +750,9 @@ fn update_pragma(
 
             connection.set_mvcc_checkpoint_threshold(threshold)?;
             Ok(TransactionMode::None)
+        }
+        PragmaName::MvccLogMeta => {
+            bail_parse_error!("mvcc_log_meta requires PRAGMA mvcc_log_meta(key, value)")
         }
         PragmaName::ForeignKeys => {
             let enabled = parse_pragma_enabled(&value);
@@ -1513,6 +1584,7 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
+        PragmaName::MvccLogMeta => Ok(TransactionMode::None),
         PragmaName::ForeignKeys => {
             let enabled = connection.foreign_keys_enabled();
             let register = program.alloc_register();

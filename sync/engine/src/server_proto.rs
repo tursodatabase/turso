@@ -19,7 +19,7 @@ pub struct PullUpdatesReqProtoBody {
     /// requested encoding of the pages
     #[prost(enumeration = "PageUpdatesEncodingReq", tag = "1")]
     pub encoding: i32,
-    /// request decoded logical MVCC updates instead of raw logical-log bytes
+    /// request MVCC logical updates instead of page updates
     #[prost(bool, tag = "8")]
     pub logical_updates: bool,
     /// revision of the requested pages on server side; can be None - in which case server will pick latest revision
@@ -60,8 +60,8 @@ pub struct PageData {
 pub enum PullUpdatesStreamKind {
     /// The response body contains WAL-style page frames.
     Pages = 0,
-    /// The response body contains length-delimited [`LogicalTxnData`] messages.
-    Logical = 1,
+    /// The response body contains raw MVCC logical-log bytes.
+    MvccLogicalLog = 1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
@@ -153,10 +153,17 @@ pub struct LogicalOp {
     /// Schema object name for schema operations.
     #[prost(string, tag = "10")]
     pub schema_name: String,
+    /// Stable table/object identifier carried by portable MVCC logical changes.
+    ///
+    /// This is optional for the current replay path, which still resolves row
+    /// changes by table name. New raw-log clients can use it to maintain a
+    /// compact identity map without depending on negative MVCC table ids.
+    #[prost(uint64, tag = "11")]
+    pub stable_table_id: u64,
 }
 
 #[derive(prost::Message, Clone, PartialEq, Eq)]
-/// One committed MVCC transaction in a logical pull-updates stream.
+/// One committed MVCC transaction decoded from a portable MVCC logical-log frame.
 pub struct LogicalTxnData {
     /// Logical-log byte offset immediately after this transaction.
     #[prost(uint64, tag = "1")]
@@ -185,6 +192,40 @@ pub struct PageSetZstdEncodingProto {
     pub pages_dict: Vec<u32>,
 }
 
+#[derive(prost::Message, Clone, PartialEq, Eq)]
+/// One raw MVCC logical-log range in a pull response body.
+pub struct MvccLogicalLogRangeProto {
+    /// MVCC logical-log generation for the streamed byte range.
+    #[prost(uint64, tag = "1")]
+    pub generation: u64,
+    /// Inclusive start offset in the logical log.
+    #[prost(uint64, tag = "2")]
+    pub start_offset: u64,
+    /// Exclusive end offset in the logical log.
+    #[prost(uint64, tag = "3")]
+    pub end_offset: u64,
+    /// Whether the byte range starts with a logical-log file header.
+    #[prost(bool, tag = "4")]
+    pub starts_with_header: bool,
+    /// Optional chained-CRC seed needed to validate the range.
+    #[prost(bytes, optional, tag = "5")]
+    pub crc_seed: Option<Vec<u8>>,
+}
+
+#[derive(prost::Message, Clone, PartialEq, Eq)]
+/// Metadata describing a raw MVCC logical-log response body.
+pub struct MvccLogicalLogMetadataProto {
+    /// Logical-log format identifier, for example `lml3`.
+    #[prost(string, tag = "1")]
+    pub format: String,
+    /// Whether this range crosses a checkpoint/generation transition.
+    #[prost(bool, tag = "2")]
+    pub checkpoint_transition: bool,
+    /// Raw logical-log ranges concatenated in the response body order.
+    #[prost(message, repeated, tag = "3")]
+    pub ranges: Vec<MvccLogicalLogRangeProto>,
+}
+
 #[derive(prost::Message)]
 pub struct PullUpdatesRespProtoBody {
     #[prost(string, tag = "1")]
@@ -200,6 +241,8 @@ pub struct PullUpdatesRespProtoBody {
     pub stream_kind: i32,
     #[prost(enumeration = "PullUpdatesApplyMode", tag = "6")]
     pub apply_mode: i32,
+    #[prost(optional, message, tag = "7")]
+    pub mvcc_log: Option<MvccLogicalLogMetadataProto>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

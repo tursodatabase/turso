@@ -2166,9 +2166,9 @@ impl ToTokens for PragmaBody {
                 s.append(TK_EQ, None)?;
                 value.to_tokens(s, context)
             }
-            Self::Call(value) => {
+            Self::Call(values) => {
                 s.append(TK_LP, None)?;
-                value.to_tokens(s, context)?;
+                comma(values, s, context)?;
                 s.append(TK_RP, None)
             }
         }
