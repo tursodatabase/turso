@@ -2398,8 +2398,8 @@ mod tests {
             self.inner.step()
         }
 
-        fn drain(&self) -> Result<()> {
-            self.inner.drain()
+        fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
+            self.inner.drain_completions(completions)
         }
 
         fn cancel(&self, completions: &[Completion]) -> Result<()> {

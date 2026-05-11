@@ -381,7 +381,22 @@ pub trait IO: Clock + Send + Sync {
         Ok(())
     }
 
-    fn drain(&self) -> Result<()> {
+    /// Drive the IO backend until each completion in `completions` is
+    /// `finished()`. Used after `cancel()` (so cancelled ops actually
+    /// release their buffers before the caller returns) and after a
+    /// single `pwrite`/`pwritev`/`sync` that the caller wants to await
+    /// synchronously.
+    ///
+    /// Unlike a global "drain the ring" barrier, this only waits on the
+    /// completions the caller passes in. Other threads can keep
+    /// submitting concurrently — their work doesn't extend or interfere
+    /// with this call. `Completion::finished()` is monotonic
+    /// (`OnceLock`-backed), so the loop will terminate as soon as every
+    /// caller-owned completion has had its CQE processed.
+    fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
+        while completions.iter().any(|c| !c.finished()) {
+            self.step()?;
+        }
         Ok(())
     }
 
