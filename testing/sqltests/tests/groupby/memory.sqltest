@@ -388,3 +388,22 @@ test group-by-negative {
 expect error {
     1st GROUP BY term out of range - should be between 1 and 2
 }
+
+test group-by-large-integer-literal {
+    CREATE TABLE t_gb_large(n INT);
+    INSERT INTO t_gb_large VALUES(1),(2),(3);
+    SELECT count(*) FROM t_gb_large GROUP BY 2147483648;
+}
+expect {
+    3
+}
+
+test group-by-hex-column-number {
+    CREATE TABLE t_gb_hex(a TEXT, b TEXT);
+    INSERT INTO t_gb_hex VALUES('x','one'),('y','one'),('z','two');
+    SELECT b, count(*) FROM t_gb_hex GROUP BY 0x1 ORDER BY 1;
+}
+expect {
+    one|2
+    two|1
+}

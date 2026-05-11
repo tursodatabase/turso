@@ -1065,47 +1065,70 @@ fn add_vtab_predicates_to_where_clause(
     )
 }
 
-/// Replaces a column number in an ORDER BY or GROUP BY expression with a copy of the column expression.
-/// For example, in SELECT u.first_name, count(1) FROM users u GROUP BY 1 ORDER BY 2,
-/// the column number 1 is replaced with u.first_name and the column number 2 is replaced with count(1).
-///
-/// Per SQLite documentation, only constant integers are treated as column references.
-/// Non-integer numeric literals (floats) are treated as constant expressions.
-fn replace_column_number_with_copy_of_column_expr(
-    order_by_or_group_by_expr: &mut ast::Expr,
-    columns: &[ResultSetColumn],
-    clause_name: &str,
-) -> Result<()> {
-    // Extract the numeric literal string, handling both bare integers (e.g. `2`)
-    // and unary-plus integers (e.g. `+2`). In SQLite, `ORDER BY +2` strips the
-    // unary plus and still resolves `2` as a column index reference.
-    let num_str = match order_by_or_group_by_expr {
-        ast::Expr::Literal(ast::Literal::Numeric(num)) => Some(num.clone()),
+enum ColumnNumberReference {
+    Positive(usize),
+    Negative,
+}
+
+fn unsigned_i32_numeric_literal(num: &str) -> Option<usize> {
+    let num = if num.contains('_') {
+        Cow::Owned(num.replace('_', ""))
+    } else {
+        Cow::Borrowed(num)
+    };
+
+    let value = if num.starts_with("0x") || num.starts_with("0X") {
+        u64::from_str_radix(&num[2..], 16).ok()?
+    } else {
+        if num.contains('.') || num.contains('e') || num.contains('E') {
+            return None;
+        }
+        num.parse::<u64>().ok()?
+    };
+
+    if value <= i32::MAX as u64 {
+        Some(value as usize)
+    } else {
+        None
+    }
+}
+
+fn column_number_reference(expr: &ast::Expr) -> Option<ColumnNumberReference> {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Numeric(num)) => {
+            unsigned_i32_numeric_literal(num).map(ColumnNumberReference::Positive)
+        }
         ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
             if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
-                Some(num.clone())
+                unsigned_i32_numeric_literal(num).map(ColumnNumberReference::Positive)
             } else {
                 None
             }
         }
         ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
             if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
-                if num.parse::<usize>().is_ok() {
-                    crate::bail_parse_error!(
-                        "1st {} term out of range - should be between 1 and {}",
-                        clause_name,
-                        columns.len()
-                    );
-                }
+                unsigned_i32_numeric_literal(num).map(|_| ColumnNumberReference::Negative)
+            } else {
+                None
             }
-            None
         }
         _ => None,
-    };
-    if let Some(num) = num_str {
-        // Only treat as column reference if it parses as a positive integer.
-        // Float literals like "0.5" or "1.0" are valid constant expressions, not column references.
-        if let Ok(column_number) = num.parse::<usize>() {
+    }
+}
+
+/// Replaces a column number in an ORDER BY or GROUP BY expression with a copy of the column expression.
+/// For example, in SELECT u.first_name, count(1) FROM users u GROUP BY 1 ORDER BY 2,
+/// the column number 1 is replaced with u.first_name and the column number 2 is replaced with count(1).
+///
+/// SQLite only treats non-negative integer literals that fit in 32 bits as column references.
+/// Other numeric literals, like floats and large integers, are constant expressions.
+fn replace_column_number_with_copy_of_column_expr(
+    order_by_or_group_by_expr: &mut ast::Expr,
+    columns: &[ResultSetColumn],
+    clause_name: &str,
+) -> Result<()> {
+    match column_number_reference(order_by_or_group_by_expr) {
+        Some(ColumnNumberReference::Positive(column_number)) => {
             if column_number == 0 || column_number > columns.len() {
                 crate::bail_parse_error!(
                     "1st {} term out of range - should be between 1 and {}",
@@ -1116,7 +1139,14 @@ fn replace_column_number_with_copy_of_column_expr(
             let ResultSetColumn { expr, .. } = &columns[column_number - 1];
             *order_by_or_group_by_expr = expr.clone();
         }
-        // Otherwise, leave the expression as-is (constant expression, case 3 per SQLite docs)
+        Some(ColumnNumberReference::Negative) => {
+            crate::bail_parse_error!(
+                "1st {} term out of range - should be between 1 and {}",
+                clause_name,
+                columns.len()
+            );
+        }
+        None => {}
     }
     Ok(())
 }
@@ -1131,60 +1161,61 @@ fn resolve_compound_order_by_expr(
     term_number: usize,
 ) -> Result<usize> {
     let num_result_columns = all_plans[0].result_columns.len();
-    match expr {
-        // Case 1: Numeric column reference (e.g., ORDER BY 1)
-        ast::Expr::Literal(ast::Literal::Numeric(num)) => {
-            if let Ok(column_number) = num.parse::<usize>() {
-                if column_number == 0 || column_number > num_result_columns {
-                    crate::bail_parse_error!(
-                        "{} ORDER BY term out of range - should be between 1 and {}",
-                        column_number,
-                        num_result_columns
-                    );
+    match column_number_reference(expr) {
+        Some(ColumnNumberReference::Positive(column_number)) => {
+            if column_number == 0 || column_number > num_result_columns {
+                crate::bail_parse_error!(
+                    "{} ORDER BY term out of range - should be between 1 and {}",
+                    ordinal(term_number),
+                    num_result_columns
+                );
+            }
+            Ok(column_number - 1)
+        }
+        Some(ColumnNumberReference::Negative) => {
+            crate::bail_parse_error!(
+                "{} ORDER BY term out of range - should be between 1 and {}",
+                ordinal(term_number),
+                num_result_columns
+            );
+        }
+        None => match expr {
+            // Case 2: Name reference (e.g., ORDER BY name or ORDER BY alias)
+            ast::Expr::Id(name) => {
+                let name_normalized = normalize_ident(name.as_str());
+                // Check aliases and column names across all constituent SELECTs
+                for plan in all_plans {
+                    let result_columns = &plan.result_columns;
+                    let table_references = &plan.table_references;
+                    // Try matching against aliases
+                    for (i, rc) in result_columns.iter().enumerate() {
+                        if let Some(alias) = &rc.alias {
+                            if normalize_ident(alias) == name_normalized {
+                                return Ok(i);
+                            }
+                        }
+                    }
+                    // Try matching against column names from the table references
+                    for (i, rc) in result_columns.iter().enumerate() {
+                        if let Some(col_name) = rc.name(table_references) {
+                            if normalize_ident(col_name) == name_normalized {
+                                return Ok(i);
+                            }
+                        }
+                    }
                 }
-                Ok(column_number - 1)
-            } else {
                 crate::bail_parse_error!(
                     "{} ORDER BY term does not match any column in the result set",
                     ordinal(term_number)
                 );
             }
-        }
-        // Case 2: Name reference (e.g., ORDER BY name or ORDER BY alias)
-        ast::Expr::Id(name) => {
-            let name_normalized = normalize_ident(name.as_str());
-            // Check aliases and column names across all constituent SELECTs
-            for plan in all_plans {
-                let result_columns = &plan.result_columns;
-                let table_references = &plan.table_references;
-                // Try matching against aliases
-                for (i, rc) in result_columns.iter().enumerate() {
-                    if let Some(alias) = &rc.alias {
-                        if normalize_ident(alias) == name_normalized {
-                            return Ok(i);
-                        }
-                    }
-                }
-                // Try matching against column names from the table references
-                for (i, rc) in result_columns.iter().enumerate() {
-                    if let Some(col_name) = rc.name(table_references) {
-                        if normalize_ident(col_name) == name_normalized {
-                            return Ok(i);
-                        }
-                    }
-                }
+            _ => {
+                crate::bail_parse_error!(
+                    "{} ORDER BY term does not match any column in the result set",
+                    ordinal(term_number)
+                );
             }
-            crate::bail_parse_error!(
-                "{} ORDER BY term does not match any column in the result set",
-                ordinal(term_number)
-            );
-        }
-        _ => {
-            crate::bail_parse_error!(
-                "{} ORDER BY term does not match any column in the result set",
-                ordinal(term_number)
-            );
-        }
+        },
     }
 }
 

@@ -230,3 +230,42 @@ expect error {
     1st ORDER BY term out of range - should be between 1 and 2
 }
 
+test order-by-large-integer-literal {
+    CREATE TABLE t16(a);
+    INSERT INTO t16 VALUES(2),(1);
+    SELECT a FROM t16 ORDER BY 2147483648;
+}
+expect {
+    2
+    1
+}
+
+test order-by-large-negative-integer-literal {
+    CREATE TABLE t17(a);
+    INSERT INTO t17 VALUES(2),(1);
+    SELECT a FROM t17 ORDER BY -2147483648;
+}
+expect {
+    2
+    1
+}
+
+test order-by-hex-column-number {
+    CREATE TABLE t18(a, b);
+    INSERT INTO t18 VALUES(1,10),(2,9);
+    SELECT * FROM t18 ORDER BY 0x2;
+}
+expect {
+    2|9
+    1|10
+}
+
+test order-by-large-hex-literal {
+    CREATE TABLE t19(a);
+    INSERT INTO t19 VALUES(2),(1);
+    SELECT a FROM t19 ORDER BY 0x80000000;
+}
+expect {
+    2
+    1
+}

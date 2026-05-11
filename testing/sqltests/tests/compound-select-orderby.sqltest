@@ -897,3 +897,28 @@ test union-order-by-expr-no-match {
 expect error {
     1st ORDER BY term does not match any column in the result set
 }
+
+@setup schema
+test union-all-order-by-large-integer-literal-no-match {
+    SELECT a FROM t1 UNION ALL SELECT a FROM t2 ORDER BY 2147483648;
+}
+expect error {
+    1st ORDER BY term does not match any column in the result set
+}
+
+@setup schema
+test union-all-order-by-hex-column-number {
+    SELECT a FROM t1 UNION ALL SELECT a FROM t2 ORDER BY 0x1;
+}
+expect {
+    1
+    2
+    2
+    3
+    4
+    4
+    5
+    6
+    7
+    8
+}
