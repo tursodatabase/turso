@@ -15,5 +15,5 @@ static = []
 [dependencies]
 turso_macros = { workspace = true }
 
-getrandom = "0.3.1"
+getrandom = "0.4.2"
 chrono = { workspace = true, default-features = true }
