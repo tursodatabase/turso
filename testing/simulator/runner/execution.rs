@@ -247,8 +247,11 @@ pub fn execute_interaction_turso(
             }
 
             stack.push(results);
-            // TODO: skip integrity check with mvcc
-            if !env.profile.mvcc && env.rng.random_ratio(1, 10) {
+            // Previously this skipped integrity_check entirely under MVCC. We now run it
+            // both modes — under MVCC we throttle to 1/40 instead of 1/10 since the check
+            // is more expensive when snapshot state has to be reconciled.
+            let check_ratio = if env.profile.mvcc { 40 } else { 10 };
+            if env.rng.random_ratio(1, check_ratio) {
                 let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index]
                 else {
                     unreachable!()
@@ -309,8 +312,9 @@ pub fn execute_interaction_turso(
             stack.push(results);
             // Reset fault injection
             env.io.inject_fault(false);
-            // TODO: skip integrity check with mvcc
-            if !env.profile.mvcc && env.rng.random_ratio(1, 10) {
+            // Same MVCC-aware throttling as the regular Query path above.
+            let check_ratio = if env.profile.mvcc { 40 } else { 10 };
+            if env.rng.random_ratio(1, check_ratio) {
                 limbo_integrity_check(&conn)?;
             }
         }
