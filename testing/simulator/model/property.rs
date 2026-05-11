@@ -191,6 +191,13 @@ pub enum Property {
         tables: Vec<String>,
         write_kinds: Vec<QueryDiscriminants>,
     },
+    /// MVCC property for concurrent explicit-rowid and auto-rowid INSERTs.
+    ///
+    /// It verifies that an explicit rowid in one concurrent transaction bumps
+    /// the global rowid allocator before another transaction allocates an
+    /// automatic rowid, then checks integrity after additional auto-rowid
+    /// inserts stress the secondary index.
+    MvccExplicitRowidThenAutoRowid,
     /// Property used to subsititute a property with its queries only
     Queries {
         queries: Vec<Query>,
@@ -238,6 +245,7 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::MvccExplicitRowidThenAutoRowid
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => None,
         }

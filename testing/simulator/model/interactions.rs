@@ -494,6 +494,13 @@ impl InteractionBuilder {
         builder
     }
 
+    pub fn connection_index_if_unset(&mut self, connection_index: usize) -> &mut Self {
+        if self.connection_index.is_none() {
+            self.connection_index(connection_index);
+        }
+        self
+    }
+
     /// Checks to see if the property metadata was already set
     pub fn has_property_meta(&self) -> bool {
         self.property_meta.is_some()

@@ -12,14 +12,14 @@ use sql_generation::{
     generation::{Arbitrary, ArbitraryFrom, GenerationContext, pick, pick_index},
     model::{
         query::{
-            Create, Delete, Drop, Insert, Select,
+            Create, CreateIndex, Delete, Drop, Insert, Select,
             alter_table::{AlterTable, AlterTableType},
             predicate::Predicate,
             select::{CompoundOperator, CompoundSelect, ResultColumn, SelectBody, SelectInner},
             transaction::{Begin, Commit, Rollback},
             update::{SetValue, Update},
         },
-        table::{ColumnType, SimValue, Table},
+        table::{Column, ColumnType, Index, SimValue, Table},
     },
 };
 use strum::IntoEnumIterator;
@@ -247,6 +247,7 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::MvccExplicitRowidThenAutoRowid
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => {
                 unreachable!("No extensional queries")
@@ -1233,6 +1234,76 @@ impl Property {
                 interactions.push(assert_integrity_check(tables, connection_index));
                 interactions
             }
+            Property::MvccExplicitRowidThenAutoRowid => {
+                let table_name = format!("sim_mvcc_rowid_{}", id.get());
+                let index_name = format!("idx_{}_k", id.get());
+                let peer_connection_index = if connection_index == 0 { 1 } else { 0 };
+
+                let peer = |query| {
+                    let mut builder =
+                        InteractionBuilder::with_interaction(InteractionType::Query(query));
+                    builder.connection_index(peer_connection_index);
+                    builder
+                };
+
+                let create = Query::Create(Create {
+                    table: mvcc_rowid_table(table_name.clone()),
+                });
+                let create_index = Query::CreateIndex(CreateIndex {
+                    index: Index {
+                        table_name: table_name.clone(),
+                        index_name: index_name.clone(),
+                        columns: vec![("k".to_string(), ast::SortOrder::Asc)],
+                    },
+                });
+
+                let mut interactions = Vec::new();
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(create),
+                ));
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(create_index),
+                ));
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::Begin(Begin::Concurrent)),
+                ));
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::Insert(Insert::Values {
+                        table: table_name.clone(),
+                        values: vec![vec![sim_int(5), sim_text("A"), sim_int(999)]],
+                        on_conflict: None,
+                    })),
+                ));
+                interactions.push(peer(Query::Begin(Begin::Concurrent)));
+                interactions.push(peer(Query::Insert(Insert::Values {
+                    table: table_name.clone(),
+                    values: vec![vec![SimValue::NULL, sim_text("B"), sim_int(100)]],
+                    on_conflict: None,
+                })));
+                interactions.push(peer(Query::Commit(Commit)));
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::Commit(Commit)),
+                ));
+
+                for (value, key) in [("p2", 200), ("p3", 300), ("p4", 400), ("p5", 500)] {
+                    interactions.push(InteractionBuilder::with_interaction(
+                        InteractionType::Query(Query::Insert(Insert::Values {
+                            table: table_name.clone(),
+                            values: vec![vec![SimValue::NULL, sim_text(value), sim_int(key)]],
+                            on_conflict: None,
+                        })),
+                    ));
+                }
+
+                interactions.push(assert_integrity_check(
+                    std::slice::from_ref(&table_name),
+                    connection_index,
+                ));
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::Drop(Drop { table: table_name })),
+                ));
+                interactions
+            }
         };
 
         assert!(!interactions.is_empty());
@@ -1243,10 +1314,47 @@ impl Property {
                 if !builder.has_property_meta() {
                     builder.property_meta(PropertyMetadata::new(self, false));
                 }
-                builder.connection_index(connection_index).id(id);
+                builder.connection_index_if_unset(connection_index).id(id);
                 builder.build().unwrap()
             })
             .collect()
+    }
+}
+
+fn sim_int(value: i64) -> SimValue {
+    SimValue(types::Value::from_i64(value))
+}
+
+fn sim_text(value: &str) -> SimValue {
+    SimValue(types::Value::Text(value.to_string().into()))
+}
+
+fn mvcc_rowid_table(name: String) -> Table {
+    Table {
+        name,
+        columns: vec![
+            Column {
+                name: "id".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![ast::ColumnConstraint::PrimaryKey {
+                    order: None,
+                    conflict_clause: None,
+                    auto_increment: false,
+                }],
+            },
+            Column {
+                name: "v".to_string(),
+                column_type: ColumnType::Text,
+                constraints: vec![],
+            },
+            Column {
+                name: "k".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![],
+            },
+        ],
+        rows: vec![],
+        indexes: vec![],
     }
 }
 
@@ -1417,7 +1525,7 @@ fn random_main_table_delete<R: rand::Rng + ?Sized>(rng: &mut R, table: &Table) -
 fn assert_integrity_check(tables: &[String], connection_index: usize) -> InteractionBuilder {
     let tables = tables.to_vec();
     InteractionBuilder::with_interaction(InteractionType::Assertion(Assertion::new(
-        "PRAGMA integrity_check should be ok after savepoint rollback".to_string(),
+        "PRAGMA integrity_check should be ok".to_string(),
         move |_stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
             let result = run_integrity_check(env, connection_index)?;
             if result == "ok" {
@@ -1887,6 +1995,15 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_mvcc_explicit_rowid_then_auto_rowid<R: rand::Rng + ?Sized>(
+    _rng: &mut R,
+    _query_distr: &QueryDistribution,
+    _ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    Property::MvccExplicitRowidThenAutoRowid
+}
+
 type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
@@ -1914,6 +2031,9 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
+            PropertyDiscriminants::MvccExplicitRowidThenAutoRowid => {
+                property_mvcc_explicit_rowid_then_auto_rowid
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
             }
@@ -2033,6 +2153,13 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::MvccExplicitRowidThenAutoRowid => {
+                if env.profile.mvcc && env.profile.max_connections >= 2 {
+                    25
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
@@ -2074,6 +2201,10 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
+            PropertyDiscriminants::MvccExplicitRowidThenAutoRowid => QueryCapabilities::CREATE
+                .union(QueryCapabilities::CREATE_INDEX)
+                .union(QueryCapabilities::INSERT)
+                .union(QueryCapabilities::DROP),
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
         }
     }
