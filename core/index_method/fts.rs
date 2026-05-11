@@ -2711,7 +2711,7 @@ impl IndexMethodCursor for FtsCursor {
                         );
 
                         // Create HybridBTreeDirectory with catalog and pre-assembled hot files
-                        let pager = conn.pager.load().clone();
+                        let pager = conn.get_pager_from_database_index(&database_id)?;
                         let root_page = self.btree_root_page.ok_or_else(|| {
                             LimboError::InternalError("btree_root_page not set".into())
                         })?;
