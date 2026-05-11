@@ -456,6 +456,60 @@ struct SavepointRollbackResult {
     deferred_fk_violations: isize,
 }
 
+#[derive(Debug, Default)]
+struct WriteSet {
+    entries: Vec<(RowID, RowVersions)>,
+    /// A set of the pointer addresses of the `RowVersions`. Used to deduplicate entries.
+    ///
+    /// This is correct because instances of [RowVersions] are created once per [RowID] and then
+    /// reused by cloning the [Arc]. It would be nice to encode this in the type system, but I'm
+    /// not sure how.
+    seen: HashSet<usize>,
+}
+
+impl WriteSet {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `true` if this `RowVersions` was not already contained in the write set.
+    fn insert(&mut self, id: RowID, row_versions: RowVersions) -> bool {
+        let ptr = Arc::as_ptr(&row_versions) as usize;
+        if self.seen.insert(ptr) {
+            self.entries.push((id, row_versions));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, (RowID, RowVersions)> {
+        self.entries.iter()
+    }
+
+    /// Retain entries where `keep(rowid, row_versions)` returns true.
+    fn retain<F: FnMut(&RowID, &RowVersions) -> bool>(&mut self, mut keep: F) {
+        let seen = &mut self.seen;
+        self.entries.retain(|(rowid, rv)| {
+            if keep(rowid, rv) {
+                true
+            } else {
+                seen.remove(&(Arc::as_ptr(rv) as usize));
+                false
+            }
+        });
+    }
+
+    /// Clones the write set into a [Vec].
+    fn to_vec(&self) -> Vec<(RowID, RowVersions)> {
+        self.entries.clone()
+    }
+}
+
 /// Transaction
 #[derive(Debug)]
 pub struct Transaction {
@@ -465,11 +519,8 @@ pub struct Transaction {
     tx_id: u64,
     /// The transaction begin timestamp.
     begin_ts: u64,
-    /// The transaction write set. Single-writer (the txn's own connection),
-    /// so plain `Mutex<Vec<_>>` is enough; the previous `SkipSet` was paying
-    /// for unused concurrent-insert semantics. Duplicates are allowed —
-    /// consumers (commit, rollback) dedup as needed.
-    write_set: Mutex<Vec<(RowID, RowVersions)>>,
+    /// The transaction write set. Only writer is the [Transaction]'s own connection.
+    write_set: Mutex<WriteSet>,
     /// The transaction read set.
     read_set: SkipSet<RowID>,
     /// The transaction header.
@@ -501,7 +552,7 @@ impl Transaction {
             state: TransactionState::Active.into(),
             tx_id,
             begin_ts,
-            write_set: Mutex::new(Vec::new()),
+            write_set: Mutex::new(WriteSet::new()),
             read_set: SkipSet::new(),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
@@ -529,7 +580,7 @@ impl Transaction {
                 .newly_added_to_write_set
                 .push((id.clone(), row_versions.clone()));
         }
-        self.write_set.lock().push((id, row_versions));
+        self.write_set.lock().insert(id, row_versions);
     }
 
     /// Begin a new savepoint for statement-level tracking.
@@ -1616,17 +1667,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                  ** 2. Validate if there are no phantoms by walking the scans from scan_set
                  */
                 tracing::trace!("commit_tx(tx_id={})", self.tx_id);
-                // The transaction's write_set may contain duplicates (e.g. INSERT then UPDATE on
-                // the same row) since `insert_to_write_set` skips a `contains` check; sort makes
-                // equal RowIDs adjacent so `dedup_by` collapses them in linear time.
-                let write_set_is_empty = {
-                    let mut write_set = tx.write_set.lock();
-                    write_set.sort_by(|(a, _), (b, _)| {
-                        b.table_id.cmp(&a.table_id).then(a.row_id.cmp(&b.row_id))
-                    });
-                    write_set.dedup_by(|a, b| a.0 == b.0);
-                    write_set.is_empty()
-                };
+                let write_set_is_empty = tx.write_set.lock().is_empty();
                 // Header-only writes must not take this fast path; they need durable log records.
                 if write_set_is_empty && !tx.header_dirty.load(Ordering::Acquire) {
                     turso_assert!(
@@ -3710,7 +3751,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         // Snapshot under the lock so we can drop it before recursing into
         // `rollback_rowid` (which may take other locks).
-        let write_set_snapshot: Vec<(RowID, RowVersions)> = tx.write_set.lock().clone();
+        let write_set_snapshot: Vec<(RowID, RowVersions)> = tx.write_set.lock().to_vec();
         for (_rowid, row_versions) in &write_set_snapshot {
             for rv in row_versions.write().iter_mut() {
                 rollback_row_version(tx_id, rv);
@@ -3974,11 +4015,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = tx.value();
         // Single pass: drop entries that appear in `rowids` AND have no
         // surviving uncommitted version (parent savepoints may still pin
-        // them). Since `write_set` is now a Vec that tolerates duplicates,
-        // every matching occurrence is dropped together — equivalent to
-        // calling `remove` once per rowid against the old SkipSet.
+        // them).
         let mut write_set = tx.write_set.lock();
-        write_set.retain(|(rowid, _chain)| {
+        write_set.retain(|rowid, _rv| {
             if !rowids.contains(rowid) {
                 return true;
             }
