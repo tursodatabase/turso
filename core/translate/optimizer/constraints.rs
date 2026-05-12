@@ -1199,9 +1199,16 @@ fn can_use_partial_index(
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
     index_conjuncts.iter().all(|ic| {
-        query_where_clause
-            .iter()
-            .any(|t| exprs_are_equivalent(ic, &t.expr))
+        query_where_clause.iter().any(|t| {
+            // A LEFT JOIN ON term only filters the joined table; rows from the
+            // preserved table can still survive without matching that term.
+            if t.from_outer_join
+                .is_some_and(|outer_join_tbl| outer_join_tbl != table_reference.internal_id)
+            {
+                return false;
+            }
+            exprs_are_equivalent(ic, &t.expr)
+        })
     })
     // TODO: recognize implication beyond syntactic equivalence (e.g. `x = 5` implies
     // `x IS NOT NULL`, `x > 10` implies `x > 5`).
