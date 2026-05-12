@@ -25,7 +25,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::{Connection, Result, sync::Arc};
+use crate::{sync::Arc, Connection, Result};
 use turso_parser::ast::{ResolveType, TriggerEvent};
 
 /// Check whether any DDL-level constraint (IPK or index) uses REPLACE.

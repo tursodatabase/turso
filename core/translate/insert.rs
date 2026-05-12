@@ -2,37 +2,34 @@ use crate::schema::ColumnLayout;
 use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
 use crate::turso_debug_assert;
 use crate::{
-    CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
-        self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef,
-        SQLITE_SEQUENCE_TABLE_NAME, Table,
+        self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Table,
+        SQLITE_SEQUENCE_TABLE_NAME,
     },
     sync::Arc,
     translate::{
         emitter::{
-            OperationMode, Resolver, delete::emit_fk_child_decrement_on_delete,
-            emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
-            emit_cdc_patch_record, emit_check_constraints, emit_make_record,
-            prepare_cdc_if_necessary,
+            delete::emit_fk_child_decrement_on_delete, emit_cdc_autocommit_commit,
+            emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, emit_check_constraints,
+            emit_make_record, prepare_cdc_if_necessary, OperationMode, Resolver,
         },
         expr::{
-            BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
             bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
             process_returning_clause, restore_returning_row_image_in_cache,
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            walk_expr,
+            walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
-            ForeignKeyActions, build_index_affinity_string, emit_fk_restrict_halt,
-            emit_fk_violation, emit_guarded_fk_decrement, index_probe, open_read_index,
-            open_read_table,
+            build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
+            emit_guarded_fk_decrement, index_probe, open_read_index, open_read_table,
+            ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
             TableReferences,
         },
-        planner::{ROWID_STRS, plan_ctes_as_outer_refs},
+        planner::{plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
         stmt_journal::{any_index_or_ipk_has_replace, set_insert_stmt_journal_flags},
         subquery::{
@@ -40,20 +37,21 @@ use crate::{
             plan_subqueries_from_returning,
         },
         trigger_exec::{
-            TriggerContext, fire_trigger, get_triggers_including_temp, has_triggers_including_temp,
+            fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
         },
         upsert::{
-            ResolvedUpsertTarget, collect_set_clauses_for_upsert, emit_upsert,
-            resolve_upsert_target,
+            collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target,
+            ResolvedUpsertTarget,
         },
     },
     util::normalize_ident,
     vdbe::{
-        BranchOffset,
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts},
-        insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral, to_u16},
+        insn::{to_u16, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
+        BranchOffset,
     },
+    CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
 };
 use gencol::compute_virtual_columns;
 use std::num::NonZeroUsize;

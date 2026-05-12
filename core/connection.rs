@@ -1,36 +1,36 @@
-#[cfg(all(feature = "fs", feature = "conn_raw_api"))]
-use crate::Page;
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
-    Arc, RwLock,
     atomic::{
-        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU8, AtomicU16, AtomicU64, Ordering,
+        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8, Ordering,
     },
+    Arc, RwLock,
 };
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
+#[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+use crate::Page;
 use crate::{
-    AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
-    BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
-    Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
-    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
-    Parser, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
-    Trigger, Value, VirtualTable, WalAutoActions, ast, function,
-    io::{IO, MemoryIO},
+    ast, function,
+    io::{MemoryIO, IO},
     parse_schema_rows,
     progress::{ProgressHandler, ProgressHandlerCallback},
     refresh_analyze_stats, translate,
     util::IOExt,
-    vdbe,
+    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
+    BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
+    Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
+    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
+    Parser, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
+    Trigger, Value, VirtualTable, WalAutoActions,
 };
-use crate::{MAIN_DB_ID, TEMP_DB_ID};
 use crate::{is_memory_like, turso_assert};
+use crate::{MAIN_DB_ID, TEMP_DB_ID};
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
@@ -40,8 +40,8 @@ use std::ops::Deref;
 use std::path::Path;
 #[cfg(not(target_family = "wasm"))]
 use tempfile::TempDir;
-use tracing::{Level, instrument};
-use turso_macros::{AtomicEnum, turso_assert_ne};
+use tracing::{instrument, Level};
+use turso_macros::{turso_assert_ne, AtomicEnum};
 
 #[cfg(feature = "simulator")]
 fn db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
