@@ -59,25 +59,25 @@ fn run_to_completion(
     Ok(())
 }
 
-fn exec_limbo(conn: &Arc<turso_core::Connection>, db: &Arc<Database>, sql: &str) {
+fn exec_turso(conn: &Arc<turso_core::Connection>, db: &Arc<Database>, sql: &str) {
     let mut stmt = conn.query(sql).unwrap().unwrap();
     run_to_completion(&mut stmt, db).unwrap();
 }
 
-/// Open a fresh limbo db in MVCC mode (the production deployment target).
+/// Open a fresh turso db in MVCC mode (the production deployment target).
 /// `PRAGMA journal_mode = 'mvcc'` must be set before any other DML.
 /// Auto-checkpoint is disabled (`mvcc_checkpoint_threshold = -1`) so the
 /// timed CREATE INDEX work doesn't get interleaved with checkpoint flushes;
 /// this isolates the index-build cost from the checkpoint cost.
-fn open_limbo(temp_dir: &TempDir) -> (Arc<Database>, Arc<turso_core::Connection>) {
+fn open_turso(temp_dir: &TempDir) -> (Arc<Database>, Arc<turso_core::Connection>) {
     let db_path = temp_dir.path().join("create_index_bench.db");
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
     let conn = db.connect().unwrap();
-    exec_limbo(&conn, &db, "PRAGMA journal_mode = 'mvcc'");
-    exec_limbo(&conn, &db, "PRAGMA mvcc_checkpoint_threshold = -1");
-    exec_limbo(&conn, &db, "PRAGMA synchronous = FULL");
+    exec_turso(&conn, &db, "PRAGMA journal_mode = 'mvcc'");
+    exec_turso(&conn, &db, "PRAGMA mvcc_checkpoint_threshold = -1");
+    exec_turso(&conn, &db, "PRAGMA synchronous = FULL");
     assert!(
         db.get_mv_store().is_some(),
         "MVCC store should be initialized after PRAGMA journal_mode = 'mvcc'"
@@ -85,7 +85,7 @@ fn open_limbo(temp_dir: &TempDir) -> (Arc<Database>, Arc<turso_core::Connection>
     (db, conn)
 }
 
-/// Open a fresh rusqlite db matching the limbo configuration.
+/// Open a fresh rusqlite db matching the turso configuration.
 fn open_rusqlite(temp_dir: &TempDir) -> rusqlite::Connection {
     let db_path = temp_dir.path().join("create_index_bench.db");
     let conn = rusqlite::Connection::open(db_path).unwrap();
@@ -98,8 +98,8 @@ fn open_rusqlite(temp_dir: &TempDir) -> rusqlite::Connection {
 
 /// Build a table with `row_count` rows of `(id INTEGER PK, val INTEGER, payload TEXT)`.
 /// `val` is non-monotonic so that index sort + B-tree fill is not trivial.
-fn populate_limbo(db: &Arc<Database>, conn: &Arc<turso_core::Connection>, row_count: usize) {
-    exec_limbo(
+fn populate_turso(db: &Arc<Database>, conn: &Arc<turso_core::Connection>, row_count: usize) {
+    exec_turso(
         conn,
         db,
         "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER, payload TEXT)",
@@ -108,7 +108,7 @@ fn populate_limbo(db: &Arc<Database>, conn: &Arc<turso_core::Connection>, row_co
     // Bulk insert in batches inside a single transaction. Smaller batches
     // keep the parser/VDBE work bounded; the surrounding txn amortizes commit.
     let batch_size: usize = 1000;
-    exec_limbo(conn, db, "BEGIN");
+    exec_turso(conn, db, "BEGIN");
     let mut i = 0usize;
     while i < row_count {
         let end = (i + batch_size).min(row_count);
@@ -122,10 +122,10 @@ fn populate_limbo(db: &Arc<Database>, conn: &Arc<turso_core::Connection>, row_co
             let val = (j as i64).wrapping_mul(2654435761) & 0x7fff_ffff;
             sql.push_str(&format!("({j}, {val}, 'payload_{j}')"));
         }
-        exec_limbo(conn, db, &sql);
+        exec_turso(conn, db, &sql);
         i = end;
     }
-    exec_limbo(conn, db, "COMMIT");
+    exec_turso(conn, db, "COMMIT");
 }
 
 fn populate_rusqlite(conn: &rusqlite::Connection, row_count: usize) {
@@ -206,29 +206,49 @@ fn bench_create_index(criterion: &mut Criterion) {
         group.warm_up_time(warm_up);
         group.measurement_time(measurement);
 
-        // ---- limbo ----
+        // ---- Turso total latency ----
         {
             let temp_dir = tempfile::tempdir().unwrap();
-            let (db, conn) = open_limbo(&temp_dir);
-            populate_limbo(&db, &conn, row_count);
+            let (db, conn) = open_turso(&temp_dir);
+            populate_turso(&db, &conn, row_count);
 
-            group.bench_function(BenchmarkId::new("limbo_create_index", row_count), |b| {
+            group.bench_function(BenchmarkId::new("turso_total", row_count), |b| {
                 b.iter_custom(|iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
-                        exec_limbo(&conn, &db, "CREATE INDEX idx_val ON t(val)");
+                        exec_turso(&conn, &db, "BEGIN");
+                        exec_turso(&conn, &db, "CREATE INDEX idx_val ON t(val)");
+                        exec_turso(&conn, &db, "COMMIT");
                         total += start.elapsed();
                         // Restore the un-indexed state for the next sample.
-                        exec_limbo(&conn, &db, "DROP INDEX idx_val");
+                        exec_turso(&conn, &db, "DROP INDEX idx_val");
                     }
                     total
                 });
             });
-            // Keep temp_dir alive until after the bench runs.
-            drop(conn);
-            drop(db);
-            drop(temp_dir);
+        }
+
+        // ---- Turso commit latency ----
+        {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let (db, conn) = open_turso(&temp_dir);
+            populate_turso(&db, &conn, row_count);
+
+            group.bench_function(BenchmarkId::new("turso_commit_only", row_count), |b| {
+                b.iter_custom(|iters| {
+                    let mut total = std::time::Duration::ZERO;
+                    for _ in 0..iters {
+                        exec_turso(&conn, &db, "BEGIN");
+                        exec_turso(&conn, &db, "CREATE INDEX idx_val ON t(val)");
+                        let start = std::time::Instant::now();
+                        exec_turso(&conn, &db, "COMMIT");
+                        total += start.elapsed();
+                        exec_turso(&conn, &db, "DROP INDEX idx_val");
+                    }
+                    total
+                });
+            });
         }
 
         // ---- sqlite ----
@@ -294,21 +314,21 @@ fn bench_create_index_commit(criterion: &mut Criterion) {
 
         {
             let temp_dir = tempfile::tempdir().unwrap();
-            let (db, conn) = open_limbo(&temp_dir);
-            populate_limbo(&db, &conn, row_count);
+            let (db, conn) = open_turso(&temp_dir);
+            populate_turso(&db, &conn, row_count);
 
             group.bench_function(
-                BenchmarkId::new("limbo_create_index_commit", row_count),
+                BenchmarkId::new("turso_create_index_commit", row_count),
                 |b| {
                     b.iter_custom(|iters| {
                         let mut total = std::time::Duration::ZERO;
                         for _ in 0..iters {
                             let start = std::time::Instant::now();
-                            exec_limbo(&conn, &db, "BEGIN");
-                            exec_limbo(&conn, &db, "CREATE INDEX idx_val ON t(val)");
-                            exec_limbo(&conn, &db, "COMMIT");
+                            exec_turso(&conn, &db, "BEGIN");
+                            exec_turso(&conn, &db, "CREATE INDEX idx_val ON t(val)");
+                            exec_turso(&conn, &db, "COMMIT");
                             total += start.elapsed();
-                            exec_limbo(&conn, &db, "DROP INDEX idx_val");
+                            exec_turso(&conn, &db, "DROP INDEX idx_val");
                         }
                         total
                     });
@@ -338,8 +358,6 @@ fn bench_create_index_commit(criterion: &mut Criterion) {
                     total
                 });
             });
-            drop(conn);
-            drop(temp_dir);
         }
     }
 
