@@ -1,0 +1,41 @@
+name: Actionlint
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/**'
+      - '.github/actionlint.yaml'
+      - '.github/actionlint.yml'
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/actionlint.yaml'
+      - '.github/actionlint.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download actionlint
+        id: get_actionlint
+        run: bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+        shell: bash
+
+      # Pre-existing baseline issues are temporarily ignored so this linter can
+      # be introduced without bundling unrelated action-version bumps. Remove
+      # these `-ignore` patterns in follow-up PRs once the baseline is clean.
+      - name: Run actionlint
+        run: |
+          ${{ steps.get_actionlint.outputs.executable }} \
+            -color \
+            -ignore 'the runner of "actions/(checkout|setup-python|stale)@v[0-9]+" action is too old to run on GitHub Actions\. update the action.s version to fix this issue' \
+            -ignore 'property "update_dep" is not defined in object type'
+        shell: bash
