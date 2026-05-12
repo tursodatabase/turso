@@ -69,7 +69,7 @@ simulator covers and tests.
 | SELECT ... JOIN           | Partial | TODO                                                                              |
 | SELECT ... CROSS JOIN     | No      | SQLite CROSS JOIN means "do not reorder joins". We don't support that yet anyway. |
 | SELECT ... INNER JOIN     | Partial | TODO                                                                              |
-| SELECT ... OUTER JOIN     | No      |                                                                                   |
+| SELECT ... OUTER JOIN     | Partial | Targeted LEFT JOIN / partial-index materialization property.                      |
 | SELECT ... JOIN USING     | No      |                                                                                   |
 | SELECT ... NATURAL JOIN   | No      |                                                                                   |
 | UPDATE                    | Partial |                                                                                   |

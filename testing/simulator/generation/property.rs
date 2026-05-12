@@ -12,19 +12,22 @@ use sql_generation::{
     generation::{Arbitrary, ArbitraryFrom, GenerationContext, pick, pick_index},
     model::{
         query::{
-            Create, Delete, Drop, Insert, Select,
+            Create, CreateIndex, Delete, Drop, Insert, Select,
             alter_table::{AlterTable, AlterTableType},
             predicate::Predicate,
-            select::{CompoundOperator, CompoundSelect, ResultColumn, SelectBody, SelectInner},
+            select::{
+                CompoundOperator, CompoundSelect, FromClause, ResultColumn, SelectBody,
+                SelectInner, SelectTable,
+            },
             transaction::{Begin, Commit, Rollback},
             update::{SetValue, Update},
         },
-        table::{ColumnType, SimValue, Table},
+        table::{Column, ColumnType, Index, JoinType, JoinedTable, SimValue, Table},
     },
 };
 use strum::IntoEnumIterator;
 use turso_core::{LimboError, Numeric, types};
-use turso_parser::ast::{self, Distinctness};
+use turso_parser::ast::{self, ColumnConstraint, Distinctness, SortOrder};
 
 use crate::{
     common::print_diff,
@@ -247,6 +250,7 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::LeftJoinPartialIndex { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => {
                 unreachable!("No extensional queries")
@@ -1206,6 +1210,12 @@ impl Property {
                 .into_iter()
                 .map(|query| InteractionBuilder::with_interaction(InteractionType::Query(query)))
                 .collect(),
+            Property::LeftJoinPartialIndex {
+                src_table,
+                rhs_table,
+                dst_table,
+                index_name,
+            } => left_join_partial_index_interactions(src_table, rhs_table, dst_table, index_name),
             Property::SavepointRollback {
                 queries, tables, ..
             } => {
@@ -1248,6 +1258,206 @@ impl Property {
             })
             .collect()
     }
+}
+
+fn left_join_partial_index_interactions(
+    src_table: &str,
+    rhs_table: &str,
+    dst_table: &str,
+    index_name: &str,
+) -> Vec<InteractionBuilder> {
+    fn int_col(name: &str, constraints: Vec<ColumnConstraint>) -> Column {
+        Column {
+            name: name.to_string(),
+            column_type: ColumnType::Integer,
+            constraints,
+        }
+    }
+    fn int_lit(value: i64) -> ast::Expr {
+        ast::Expr::Literal(ast::Literal::Numeric(value.to_string()))
+    }
+    fn qualified(table: &str, col: &str) -> ast::Expr {
+        ast::Expr::Qualified(ast::Name::from_string(table), ast::Name::from_string(col))
+    }
+
+    let pk_constraint = ColumnConstraint::PrimaryKey {
+        order: None,
+        conflict_clause: None,
+        auto_increment: false,
+    };
+    let create_src = Query::Create(Create {
+        table: Table {
+            name: src_table.to_string(),
+            columns: vec![
+                int_col("id", vec![pk_constraint]),
+                int_col("c", vec![]),
+                int_col("x", vec![]),
+            ],
+            rows: vec![],
+            indexes: vec![],
+        },
+    });
+    let create_rhs = Query::Create(Create {
+        table: Table {
+            name: rhs_table.to_string(),
+            columns: vec![int_col("x", vec![])],
+            rows: vec![],
+            indexes: vec![],
+        },
+    });
+    let create_dst = Query::Create(Create {
+        table: Table {
+            name: dst_table.to_string(),
+            columns: vec![
+                int_col("id", vec![]),
+                int_col("c", vec![]),
+                int_col("x", vec![]),
+                int_col("ux", vec![]),
+            ],
+            rows: vec![],
+            indexes: vec![],
+        },
+    });
+
+    let insert_src = Query::Insert(Insert::Values {
+        table: src_table.to_string(),
+        values: vec![vec![
+            SimValue(types::Value::from_i64(1)),
+            SimValue(types::Value::from_i64(0)),
+            SimValue(types::Value::from_i64(10)),
+        ]],
+        on_conflict: None,
+    });
+
+    let partial_index = Query::CreateIndex(CreateIndex {
+        index: Index {
+            index_name: index_name.to_string(),
+            table_name: src_table.to_string(),
+            columns: vec![("x".to_string(), SortOrder::Asc)],
+            where_clause: Some(Predicate(ast::Expr::Binary(
+                Box::new(ast::Expr::Id(ast::Name::exact("c".to_string()))),
+                ast::Operator::Equals,
+                Box::new(int_lit(1)),
+            ))),
+        },
+    });
+
+    let join_on = Predicate(ast::Expr::Binary(
+        Box::new(ast::Expr::Binary(
+            Box::new(qualified(src_table, "c")),
+            ast::Operator::Equals,
+            Box::new(int_lit(1)),
+        )),
+        ast::Operator::And,
+        Box::new(ast::Expr::Binary(
+            Box::new(qualified(rhs_table, "x")),
+            ast::Operator::Equals,
+            Box::new(qualified(src_table, "x")),
+        )),
+    ));
+    let where_clause = Predicate(ast::Expr::InList {
+        lhs: Box::new(qualified(src_table, "x")),
+        not: false,
+        rhs: vec![Box::new(int_lit(10))],
+    });
+    let join_select = Select {
+        body: SelectBody {
+            select: Box::new(SelectInner {
+                distinctness: Distinctness::All,
+                columns: vec![
+                    ResultColumn::Column(format!("{src_table}.id")),
+                    ResultColumn::Column(format!("{src_table}.c")),
+                    ResultColumn::Column(format!("{src_table}.x")),
+                    ResultColumn::Column(format!("{rhs_table}.x")),
+                ],
+                from: Some(FromClause {
+                    table: SelectTable::Table(src_table.to_string()),
+                    joins: vec![JoinedTable {
+                        table: rhs_table.to_string(),
+                        join_type: JoinType::Left,
+                        on: join_on,
+                    }],
+                }),
+                where_clause,
+                order_by: None,
+            }),
+            compounds: vec![],
+        },
+        limit: None,
+    };
+    let insert_dst = Query::Insert(Insert::Select {
+        table: dst_table.to_string(),
+        select: Box::new(join_select),
+    });
+
+    let check_predicate = Predicate(ast::Expr::Binary(
+        Box::new(ast::Expr::Binary(
+            Box::new(ast::Expr::Binary(
+                Box::new(ast::Expr::Binary(
+                    Box::new(ast::Expr::Id(ast::Name::exact("id".to_string()))),
+                    ast::Operator::Equals,
+                    Box::new(int_lit(1)),
+                )),
+                ast::Operator::And,
+                Box::new(ast::Expr::Binary(
+                    Box::new(ast::Expr::Id(ast::Name::exact("c".to_string()))),
+                    ast::Operator::Equals,
+                    Box::new(int_lit(0)),
+                )),
+            )),
+            ast::Operator::And,
+            Box::new(ast::Expr::Binary(
+                Box::new(ast::Expr::Id(ast::Name::exact("x".to_string()))),
+                ast::Operator::Equals,
+                Box::new(int_lit(10)),
+            )),
+        )),
+        ast::Operator::And,
+        Box::new(ast::Expr::Binary(
+            Box::new(ast::Expr::Id(ast::Name::exact("ux".to_string()))),
+            ast::Operator::Is,
+            Box::new(ast::Expr::Literal(ast::Literal::Null)),
+        )),
+    ));
+    let check_select = Query::Select(Select::simple(dst_table.to_string(), check_predicate));
+
+    let dst_for_error = dst_table.to_string();
+    let assertion = InteractionType::Assertion(Assertion::new(
+        format!("{dst_table} should contain the unmatched LEFT JOIN preserved row"),
+        move |stack: &Vec<ResultSet>, _| {
+            let Some(rows) = stack.last() else {
+                return Err(LimboError::InternalError(
+                    "LeftJoinPartialIndex: missing check query result".to_string(),
+                ));
+            };
+            let Ok(rows) = rows else {
+                return Ok(Err(format!("check query failed: {rows:?}")));
+            };
+            if rows.len() == 1 {
+                Ok(Ok(()))
+            } else {
+                Ok(Err(format!(
+                    "expected one unmatched left row in {dst_for_error}, got {}",
+                    rows.len()
+                )))
+            }
+        },
+        vec![dst_table.to_string()],
+    ));
+
+    [
+        InteractionType::Query(create_src),
+        InteractionType::Query(create_rhs),
+        InteractionType::Query(create_dst),
+        InteractionType::Query(insert_src),
+        InteractionType::Query(partial_index),
+        InteractionType::Query(insert_dst),
+        InteractionType::Query(check_select),
+        assertion,
+    ]
+    .into_iter()
+    .map(InteractionBuilder::with_interaction)
+    .collect()
 }
 
 fn random_main_table_write<R: rand::Rng + ?Sized>(
@@ -1703,6 +1913,21 @@ fn property_all_tables_have_expected_content<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_left_join_partial_index<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    _ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    let suffix: u32 = rng.random();
+    Property::LeftJoinPartialIndex {
+        src_table: format!("sim_ljpidx_src_{suffix:x}"),
+        rhs_table: format!("sim_ljpidx_rhs_{suffix:x}"),
+        dst_table: format!("sim_ljpidx_dst_{suffix:x}"),
+        index_name: format!("sim_ljpidx_idx_{suffix:x}"),
+    }
+}
+
 fn property_select_limit<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
@@ -1903,6 +2128,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::AllTableHaveExpectedContent => {
                 property_all_tables_have_expected_content
             }
+            PropertyDiscriminants::LeftJoinPartialIndex => property_left_join_partial_index,
             PropertyDiscriminants::DoubleCreateFailure => property_double_create_failure,
             PropertyDiscriminants::SelectLimit => property_select_limit,
             PropertyDiscriminants::DeleteSelect => property_delete_select,
@@ -1954,6 +2180,13 @@ impl PropertyDiscriminants {
                     && ctx.tables().iter().any(|table| !table.name.contains('.'))
                 {
                     remaining.insert + remaining.update + remaining.delete
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::LeftJoinPartialIndex => {
+                if !env.profile.mvcc && remaining.insert > 0 && remaining.create_index > 0 {
+                    remaining.create_index.max(1)
                 } else {
                     0
                 }
@@ -2059,6 +2292,9 @@ impl PropertyDiscriminants {
                 QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
             }
             PropertyDiscriminants::SavepointRollback => QueryCapabilities::INSERT,
+            PropertyDiscriminants::LeftJoinPartialIndex => QueryCapabilities::CREATE
+                .union(QueryCapabilities::INSERT)
+                .union(QueryCapabilities::CREATE_INDEX),
             PropertyDiscriminants::TableHasExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::AllTableHaveExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::DoubleCreateFailure => QueryCapabilities::CREATE,

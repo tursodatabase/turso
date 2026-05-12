@@ -141,11 +141,14 @@ impl Display for ColumnType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Index {
     pub table_name: String,
     pub index_name: String,
     pub columns: Vec<(String, SortOrder)>,
+    /// Optional `WHERE` predicate that turns this into a partial index.
+    #[serde(default)]
+    pub where_clause: Option<Predicate>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

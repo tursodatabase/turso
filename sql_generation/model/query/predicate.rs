@@ -6,9 +6,9 @@ use turso_parser::ast::{
     fmt::{BlankContext, ToTokens},
 };
 
-use crate::model::table::{SimValue, Table, TableContext};
+use crate::model::table::{ContextColumn, SimValue, Table, TableContext};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Predicate(pub ast::Expr);
 
 impl Predicate {
@@ -108,18 +108,33 @@ pub fn expr_to_value<T: TableContext>(
     table: &T,
 ) -> Option<SimValue> {
     match expr {
-        ast::Expr::DoublyQualified(_, _, col_name)
-        | ast::Expr::Qualified(_, col_name)
-        | ast::Expr::Id(col_name) => {
+        ast::Expr::DoublyQualified(db_name, table_name, col_name) => {
             let columns = table.columns().collect::<Vec<_>>();
-            let col_name = col_name.as_str();
             assert_eq!(row.len(), columns.len());
-            columns
-                .iter()
-                .zip(row.iter())
-                .find(|(column, _)| column.column.name == col_name)
-                .map(|(_, value)| value)
-                .cloned()
+            find_column_value(
+                row,
+                &columns,
+                ColumnQualifier::DbTable {
+                    db_name: db_name.as_str(),
+                    table_name: table_name.as_str(),
+                },
+                col_name.as_str(),
+            )
+        }
+        ast::Expr::Qualified(table_name, col_name) => {
+            let columns = table.columns().collect::<Vec<_>>();
+            assert_eq!(row.len(), columns.len());
+            find_column_value(
+                row,
+                &columns,
+                ColumnQualifier::Table(table_name.as_str()),
+                col_name.as_str(),
+            )
+        }
+        ast::Expr::Id(col_name) => {
+            let columns = table.columns().collect::<Vec<_>>();
+            assert_eq!(row.len(), columns.len());
+            find_column_value(row, &columns, ColumnQualifier::Any, col_name.as_str())
         }
         ast::Expr::Literal(literal) => Some(literal.into()),
         ast::Expr::Binary(lhs, op, rhs) => {
@@ -148,12 +163,126 @@ pub fn expr_to_value<T: TableContext>(
             assert_eq!(exprs.len(), 1);
             expr_to_value(&exprs[0], row, table)
         }
+        ast::Expr::InList { lhs, not, rhs } => {
+            let lhs = expr_to_value(lhs, row, table)?;
+            let mut found = false;
+            for expr in rhs {
+                let candidate = expr_to_value(expr, row, table)?;
+                if lhs == candidate {
+                    found = true;
+                    break;
+                }
+            }
+            Some(if *not { !found } else { found }.into())
+        }
         _ => unreachable!("{:?}", expr),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ColumnQualifier<'a> {
+    Any,
+    Table(&'a str),
+    DbTable {
+        db_name: &'a str,
+        table_name: &'a str,
+    },
+}
+
+fn find_column_value(
+    row: &[SimValue],
+    columns: &[ContextColumn<'_>],
+    qualifier: ColumnQualifier<'_>,
+    col_name: &str,
+) -> Option<SimValue> {
+    columns
+        .iter()
+        .zip(row.iter())
+        .find(|(column, _)| {
+            column.column.name == col_name && column_matches_qualifier(column.table_name, qualifier)
+        })
+        .map(|(_, value)| value)
+        .cloned()
+}
+
+fn column_matches_qualifier(column_table_name: &str, qualifier: ColumnQualifier<'_>) -> bool {
+    match qualifier {
+        ColumnQualifier::Any => true,
+        ColumnQualifier::Table(table_name) => column_table_name == table_name,
+        ColumnQualifier::DbTable {
+            db_name,
+            table_name,
+        } => column_table_name
+            .split_once('.')
+            .is_some_and(|(column_db, column_table)| {
+                column_db == db_name && column_table == table_name
+            }),
     }
 }
 
 impl Display for Predicate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.displayer(&BlankContext).fmt(f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use turso_core::types;
+    use turso_parser::ast;
+
+    use crate::model::table::{Column, ColumnType, JoinTable};
+
+    use super::*;
+
+    fn int_col(name: &str) -> Column {
+        Column {
+            name: name.to_string(),
+            column_type: ColumnType::Integer,
+            constraints: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn qualified_columns_resolve_to_the_matching_table() {
+        let src = Table {
+            name: "src".to_string(),
+            columns: vec![int_col("x")],
+            rows: Vec::new(),
+            indexes: Vec::new(),
+        };
+        let rhs = Table {
+            name: "rhs".to_string(),
+            columns: vec![int_col("x")],
+            rows: Vec::new(),
+            indexes: Vec::new(),
+        };
+        let join_table = JoinTable {
+            tables: vec![src, rhs],
+            rows: vec![vec![
+                SimValue(types::Value::from_i64(10)),
+                SimValue(types::Value::from_i64(20)),
+            ]],
+        };
+        let row = &join_table.rows[0];
+
+        let src_x =
+            ast::Expr::Qualified(ast::Name::from_string("src"), ast::Name::from_string("x"));
+        let rhs_x =
+            ast::Expr::Qualified(ast::Name::from_string("rhs"), ast::Name::from_string("x"));
+        let bare_x = ast::Expr::Id(ast::Name::from_string("x"));
+
+        assert_eq!(
+            expr_to_value(&src_x, row, &join_table),
+            Some(SimValue(types::Value::from_i64(10)))
+        );
+        assert_eq!(
+            expr_to_value(&rhs_x, row, &join_table),
+            Some(SimValue(types::Value::from_i64(20)))
+        );
+        assert_eq!(
+            expr_to_value(&bare_x, row, &join_table),
+            Some(SimValue(types::Value::from_i64(10)))
+        );
     }
 }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::table::Index;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateIndex {
     pub index: Index,
 }
@@ -50,6 +50,10 @@ impl std::fmt::Display for CreateIndex {
                 .map(|(name, order)| format!("{name} {order}"))
                 .collect::<Vec<String>>()
                 .join(", ")
-        )
+        )?;
+        if let Some(where_clause) = &self.index.where_clause {
+            write!(f, " WHERE {where_clause}")?;
+        }
+        Ok(())
     }
 }

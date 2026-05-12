@@ -625,6 +625,7 @@ impl Arbitrary for CreateIndex {
                 index_name,
                 table_name: table.name.clone(),
                 columns,
+                where_clause: None,
             },
         }
     }
