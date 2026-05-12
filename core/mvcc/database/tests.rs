@@ -3708,7 +3708,7 @@ fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
         state,
         tx_id,
         begin_ts,
-        write_set: Mutex::new(Vec::new()),
+        write_set: Mutex::new(WriteSet::new()),
         read_set: SkipSet::new(),
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
@@ -5064,10 +5064,13 @@ fn transaction_display() {
     let tx_id = 42;
     let begin_ts = 20250914;
 
-    let write_set = Mutex::new(vec![
-        RowID::new((-2).into(), RowKey::Int(11)),
-        RowID::new((-2).into(), RowKey::Int(13)),
-    ]);
+    let empty_versions = || Arc::new(RwLock::new(Vec::new()));
+    let write_set = Mutex::new({
+        let mut write_set = WriteSet::new();
+        write_set.insert(RowID::new((-2).into(), RowKey::Int(11)), empty_versions());
+        write_set.insert(RowID::new((-2).into(), RowKey::Int(13)), empty_versions());
+        write_set
+    });
 
     let read_set = SkipSet::new();
     read_set.insert(RowID::new((-2).into(), RowKey::Int(17)));
