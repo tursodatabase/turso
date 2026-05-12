@@ -2249,7 +2249,7 @@ impl Clone for Schema {
     }
 }
 
-fn explicit_nulls_error(columns: &[ast::SortedColumn]) -> Option<String> {
+pub(crate) fn explicit_nulls_error(columns: &[ast::SortedColumn]) -> Option<String> {
     columns.iter().find_map(|column| {
         column.nulls.map(|nulls| {
             let nulls = match nulls {
@@ -3679,6 +3679,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let is_strict: bool;
     let mut unique_sets_columns: Vec<UniqueSet> = vec![];
     let mut unique_sets_constraints: Vec<UniqueSet> = vec![];
+    let mut autoincrement_primary_key_nulls_error = None;
     match body {
         CreateTableBody::ColumnsAndConstraints {
             columns,
@@ -3702,6 +3703,14 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             // but also, we analyze constraints first in order to check PRIMARY KEY constraint and recognize rowid alias properly
             // that's why we maintain 2 unique_set sequences and merge them together in the end
 
+            let has_column_primary_key = columns.iter().any(|column| {
+                column.constraints.iter().any(|constraint| {
+                    matches!(
+                        constraint.constraint,
+                        ast::ColumnConstraint::PrimaryKey { .. }
+                    )
+                })
+            });
             let mut table_fk_order = column_fk_count;
             for c in constraints {
                 if let ast::TableConstraint::PrimaryKey {
@@ -3710,7 +3719,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     conflict_clause,
                 } = &c.constraint
                 {
-                    if !primary_key_columns.is_empty() {
+                    if !primary_key_columns.is_empty() || has_column_primary_key {
                         crate::bail_parse_error!(
                             "table \"{}\" has more than one primary key",
                             tbl_name
@@ -3718,6 +3727,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     }
                     if *auto_increment {
                         has_autoincrement = true;
+                    }
+                    if let Some(error) = explicit_nulls_error(columns) {
+                        if *auto_increment {
+                            autoincrement_primary_key_nulls_error = Some(error);
+                        } else {
+                            crate::bail_parse_error!("{error}");
+                        }
                     }
 
                     for column in columns {
@@ -3743,6 +3759,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     conflict_clause,
                 } = &c.constraint
                 {
+                    if let Some(error) = explicit_nulls_error(columns) {
+                        crate::bail_parse_error!("{error}");
+                    }
                     let mut unique_columns = Vec::with_capacity(columns.len());
                     for column in columns {
                         match column.expr.as_ref() {
@@ -4126,6 +4145,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 crate::bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
             }
         }
+    }
+
+    if let Some(error) = autoincrement_primary_key_nulls_error {
+        crate::bail_parse_error!("{error}");
     }
 
     // concat unqiue_sets collected from column definitions and constraints in correct order

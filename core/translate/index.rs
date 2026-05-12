@@ -102,6 +102,10 @@ pub fn translate_create_index(
         panic!("translate_create_index must be called with CreateIndex AST node");
     };
 
+    if let Some(error) = crate::schema::explicit_nulls_error(&columns) {
+        crate::bail_parse_error!("{error}");
+    }
+
     let original_idx_name = idx_name;
     let database_id = if original_idx_name.db_name.is_some() {
         resolver.resolve_database_id(&original_idx_name)?
