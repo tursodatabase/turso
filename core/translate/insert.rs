@@ -164,6 +164,8 @@ pub struct InsertEmitCtx<'a> {
     pub cdc_table: Option<(usize, Arc<BTreeTable>)>,
     /// Autoincrement sequence table info
     pub autoincrement_meta: Option<AutoincMeta>,
+    /// Max rowid inserted by INSERT OR FAIL into an AUTOINCREMENT table.
+    pub autoincrement_or_fail_max_reg: Option<usize>,
     /// The database index (0 = main, 1 = temp, 2+ = attached)
     pub database_id: usize,
     /// Ephemeral table for buffering RETURNING results.
@@ -221,6 +223,7 @@ impl<'a> InsertEmitCtx<'a> {
             cdc_table,
             num_values,
             autoincrement_meta: None,
+            autoincrement_or_fail_max_reg: None,
             database_id,
             returning_buffer: None,
         })
@@ -418,6 +421,15 @@ pub fn translate_insert(
     program
         .flags
         .set_has_statement_conflict(on_conflict.is_some());
+
+    if btree_table.has_autoincrement && matches!(ctx.on_conflict, ResolveType::Fail) {
+        let max_reg = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            dest: max_reg,
+            value: 0,
+        });
+        ctx.autoincrement_or_fail_max_reg = Some(max_reg);
+    }
 
     // Open an ephemeral table for buffering RETURNING results.
     // All DML completes before any RETURNING rows are yielded to the caller.
@@ -673,7 +685,7 @@ pub fn translate_insert(
     // For AUTOINCREMENT tables with an explicit rowid, update sqlite_sequence
     // before CHECK constraints. SQLite updates sqlite_sequence even when
     // INSERT OR IGNORE skips the row due to a CHECK failure.
-    if has_user_provided_rowid {
+    if has_user_provided_rowid && ctx.autoincrement_or_fail_max_reg.is_none() {
         if let Some(AutoincMeta {
             seq_cursor_id,
             r_seq,
@@ -1007,7 +1019,12 @@ pub fn translate_insert(
         )?;
     }
 
-    if let Some(AutoincMeta {
+    if let Some(max_reg) = ctx.autoincrement_or_fail_max_reg {
+        program.emit_insn(Insn::MemMax {
+            dest_reg: max_reg,
+            src_reg: insertion.key_register(),
+        });
+    } else if let Some(AutoincMeta {
         seq_cursor_id,
         r_seq,
         r_seq_rowid,
@@ -1243,6 +1260,7 @@ fn emit_epilogue(
         });
     }
     program.preassign_label_to_next_insn(ctx.loop_labels.stmt_epilogue);
+    emit_autoincrement_or_fail_epilogue(program, resolver, ctx)?;
     if let Some((cdc_cursor_id, _)) = &ctx.cdc_table {
         emit_cdc_autocommit_commit(program, resolver, *cdc_cursor_id)?;
     }
@@ -1255,6 +1273,58 @@ fn emit_epilogue(
         emit_returning_scan_back(program, buf);
     }
     program.preassign_label_to_next_insn(ctx.halt_label);
+    Ok(())
+}
+
+fn emit_autoincrement_or_fail_epilogue(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    ctx: &InsertEmitCtx,
+) -> Result<()> {
+    let Some(max_key_reg) = ctx.autoincrement_or_fail_max_reg else {
+        return Ok(());
+    };
+    let Some(AutoincMeta {
+        seq_cursor_id,
+        r_seq,
+        r_seq_rowid,
+        table_name_reg,
+    }) = ctx.autoincrement_meta
+    else {
+        return Ok(());
+    };
+
+    reload_autoincrement_state(
+        program,
+        AutoincMeta {
+            seq_cursor_id,
+            r_seq,
+            r_seq_rowid,
+            table_name_reg,
+        },
+    );
+
+    let done_label = program.allocate_label();
+    program.emit_insn(Insn::Le {
+        lhs: max_key_reg,
+        rhs: r_seq,
+        target_pc: done_label,
+        flags: Default::default(),
+        collation: None,
+    });
+    emit_update_sqlite_sequence(
+        program,
+        resolver,
+        ctx.database_id,
+        seq_cursor_id,
+        r_seq_rowid,
+        table_name_reg,
+        max_key_reg,
+    )?;
+    program.preassign_label_to_next_insn(done_label);
+    program.emit_insn(Insn::Close {
+        cursor_id: seq_cursor_id,
+    });
     Ok(())
 }
 
@@ -1496,15 +1566,17 @@ fn emit_rowid_generation(
             value: 1,
         });
 
-        emit_update_sqlite_sequence(
-            program,
-            resolver,
-            ctx.database_id,
-            seq_cursor_id,
-            r_seq_rowid,
-            table_name_reg,
-            insertion.key_register(),
-        )?;
+        if ctx.autoincrement_or_fail_max_reg.is_none() {
+            emit_update_sqlite_sequence(
+                program,
+                resolver,
+                ctx.database_id,
+                seq_cursor_id,
+                r_seq_rowid,
+                table_name_reg,
+                insertion.key_register(),
+            )?;
+        }
     } else {
         program.emit_insn(Insn::NewRowid {
             cursor: ctx.cursor_id,

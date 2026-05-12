@@ -4609,6 +4609,55 @@ fn test_autocommit_fail_update_check_constraint(tmp_db: TempDatabase) {
     assert_eq!(ic, "ok");
 }
 
+/// INSERT OR FAIL into an AUTOINCREMENT table preserves earlier rows, but
+/// sqlite_sequence is not advanced for the failed statement.
+#[turso_macros::test]
+fn test_insert_or_fail_autoincrement_sequence_rollback(tmp_db: TempDatabase) {
+    drop(tmp_db);
+    let limbo_db = TempDatabase::builder()
+        .with_db_name("insert_or_fail_autoincrement.db")
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, x INT CHECK(x > 0))",
+        "INSERT INTO t(x) VALUES(1)",
+    ] {
+        sqlite_try_exec(&sqlite_conn, s).unwrap();
+        limbo_try_exec(&limbo_conn, s).unwrap();
+    }
+
+    let conflict_sql = "INSERT OR FAIL INTO t(x) VALUES(2),(-1),(3)";
+    assert!(sqlite_try_exec(&sqlite_conn, conflict_sql).is_err());
+    assert!(limbo_try_exec(&limbo_conn, conflict_sql).is_err());
+
+    let verify_sql = "SELECT 't', id, x FROM t \
+                      UNION ALL \
+                      SELECT 's', 0, seq FROM sqlite_sequence WHERE name = 't' \
+                      ORDER BY 1, 2";
+    let diff = compare_tables(
+        "INSERT OR FAIL AUTOINCREMENT sequence rollback",
+        &sqlite_conn,
+        &limbo_conn,
+        verify_sql,
+    );
+    assert!(diff.is_none(), "{diff:?}");
+
+    sqlite_try_exec(&sqlite_conn, "INSERT INTO t(x) VALUES(9)").unwrap();
+    limbo_try_exec(&limbo_conn, "INSERT INTO t(x) VALUES(9)").unwrap();
+    let diff = compare_tables(
+        "INSERT after failed AUTOINCREMENT OR FAIL",
+        &sqlite_conn,
+        &limbo_conn,
+        verify_sql,
+    );
+    assert!(diff.is_none(), "{diff:?}");
+
+    let ic = sqlite_integrity_check(&limbo_db.path);
+    assert_eq!(ic, "ok");
+}
+
 // ---------------------------------------------------------------------------
 // Deferred FK + REPLACE UPDATE regression
 // ---------------------------------------------------------------------------
