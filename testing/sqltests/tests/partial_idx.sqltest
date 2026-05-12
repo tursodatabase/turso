@@ -1197,3 +1197,50 @@ test partial-index-full-scan-correctness {
 expect {
     2
 }
+
+@cross-check-integrity
+test partial-index-left-join-on-preserved-table-not-implied {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c INT, x INT);
+    CREATE TABLE u(x INT);
+    CREATE TABLE dst(id INT, c INT, x INT, ux INT);
+    INSERT INTO t VALUES (1, 0, 10);
+    CREATE INDEX idx_t_x_c1 ON t(x) WHERE c = 1;
+    INSERT INTO dst
+        SELECT t.id, t.c, t.x, u.x
+        FROM t LEFT JOIN u ON t.c = 1 AND u.x = t.x
+        WHERE t.x IN (10);
+    SELECT id, c, x, ux IS NULL FROM dst;
+}
+expect {
+    1|0|10|1
+}
+
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-partial-index-left-join-preserved-where-term-still-implies-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c INT, x INT);
+    CREATE TABLE u(x INT);
+    CREATE INDEX idx_t_x_c1 ON t(x) WHERE c = 1;
+    EXPLAIN QUERY PLAN
+        SELECT t.id, u.x
+        FROM t LEFT JOIN u ON u.x = t.x
+        WHERE t.c = 1 AND t.x = 10;
+}
+expect {
+    1|0|0|HASH JOIN u
+    2|0|0|SEARCH t USING INDEX idx_t_x_c1 (x=?)
+}
+
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-partial-index-left-join-rhs-on-term-still-implies-rhs-index {
+    CREATE TABLE l(id INTEGER PRIMARY KEY, x INT);
+    CREATE TABLE r(x INT, c INT, payload TEXT);
+    CREATE INDEX idx_r_x_c1 ON r(x) WHERE c = 1;
+    EXPLAIN QUERY PLAN
+        SELECT l.id, r.payload
+        FROM l LEFT JOIN r ON r.c = 1 AND r.x = l.x
+        WHERE l.x IN (10);
+}
+expect {
+    1|0|0|SCAN l
+    2|0|0|SEARCH r USING INDEX idx_r_x_c1 (x=?) LEFT-JOIN
+}
