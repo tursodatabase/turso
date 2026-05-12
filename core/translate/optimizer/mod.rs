@@ -1016,6 +1016,22 @@ fn update_write_set_reason(
             }
         }
 
+        // Any subquery in the WHERE clause is evaluated row-by-row during the
+        // UPDATE scan. If the subquery reads a table that the UPDATE could
+        // mutate (directly via the target table, or transitively via triggers
+        // / FKs), it may observe rows already modified by earlier iterations
+        // and produce incorrect results. Detecting all such mutation paths
+        // precisely is expensive, so we conservatively materialize target
+        // rowids whenever the UPDATE has any WHERE-clause subquery.
+        // (See issue #5806.)
+        if plan
+            .non_from_clause_subqueries
+            .iter()
+            .any(|sq| sq.origin == SubqueryOrigin::DmlWhere)
+        {
+            break 'requires Some(DmlSafetyReason::SubqueryInWhere);
+        }
+
         // REPLACE mode requires ephemeral table because REPLACE deletes conflicting rows,
         // which can corrupt the iteration order when iterating via an index.
         if matches!(
