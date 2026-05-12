@@ -1137,6 +1137,34 @@ mod tests {
     }
 
     #[tokio::test]
+    pub async fn test_sync_pull_no_changes_updates_last_pull_unix_time() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
+        server.db_sql("INSERT INTO t VALUES (1)").await.unwrap();
+
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+
+        let before = db.stats().await.unwrap().last_pull_unix_time.unwrap();
+
+        // unix time has 1s resolution - wait long enough for the timestamp to advance
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // remote has no new changes since bootstrap - pull is a no-op
+        assert!(!db.pull().await.unwrap());
+
+        let after = db.stats().await.unwrap().last_pull_unix_time.unwrap();
+        assert!(
+            after > before,
+            "last_pull_unix_time must advance after a no-op pull: before={before}, after={after}"
+        );
+    }
+
+    #[tokio::test]
     pub async fn test_sync_push() {
         let _ = tracing_subscriber::fmt::try_init();
         let server = TursoServer::new().await.unwrap();
