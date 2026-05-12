@@ -1931,12 +1931,7 @@ impl Program {
                     // so we own the cleanup. Mirrors `rollback_current_txn_state`.
                     if let Some(tx_id) = conn.get_mv_tx_id() {
                         if mv_store.is_tx_rollbackable(tx_id) {
-                            mv_store.rollback_tx(
-                                tx_id,
-                                pager.clone(),
-                                &conn,
-                                crate::MAIN_DB_ID,
-                            );
+                            mv_store.rollback_tx(tx_id, pager.clone(), &conn, crate::MAIN_DB_ID);
                         } else {
                             conn.set_mv_tx(None);
                         }

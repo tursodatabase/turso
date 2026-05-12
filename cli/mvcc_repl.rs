@@ -238,7 +238,9 @@ fn handle_fault_command(
     }
 
     let mut tokens = args.split_whitespace();
-    let first = tokens.next().ok_or_else(|| anyhow!("missing connection name"))?;
+    let first = tokens
+        .next()
+        .ok_or_else(|| anyhow!("missing connection name"))?;
 
     if !is_conn_name(first) {
         return Err(anyhow!(
@@ -250,9 +252,9 @@ fn handle_fault_command(
         .next()
         .ok_or_else(|| anyhow!("missing verb (fail|yield|status|clear)"))?;
 
-    let state = connections.entry(conn_name.clone()).or_insert_with(|| {
-        ConnState::new(db.connect().expect("failed to create connection"))
-    });
+    let state = connections
+        .entry(conn_name.clone())
+        .or_insert_with(|| ConnState::new(db.connect().expect("failed to create connection")));
 
     match verb {
         "fail" => {
@@ -267,12 +269,7 @@ fn handle_fault_command(
                 None => FaultErrorKind::Internal,
             };
             state.ensure_injectors_installed();
-            state
-                .failure
-                .pending
-                .lock()
-                .unwrap()
-                .insert(point, kind);
+            state.failure.pending.lock().unwrap().insert(point, kind);
             println!(
                 "[{conn_name}] armed: fail at `{point_name}` -> {}",
                 kind.label()
@@ -408,9 +405,9 @@ fn execute_and_display(conn: &Arc<Connection>, sql: &str, conn_name: &str) -> an
             }
             Ok(())
         }
-        Err(LimboError::WriteWriteConflict) => Err(anyhow!(
-            "write-write conflict (transaction rolled back)"
-        )),
+        Err(LimboError::WriteWriteConflict) => {
+            Err(anyhow!("write-write conflict (transaction rolled back)"))
+        }
         Err(e) => Err(anyhow!("{e}")),
     }
 }

@@ -10320,7 +10320,10 @@ fn fault_at_after_remove_tx_releases_exclusive_lock() {
     let err = conn
         .execute("COMMIT")
         .expect_err("injected fault must surface to the caller");
-    assert!(matches!(err, LimboError::Busy), "expected Busy, got {err:?}");
+    assert!(
+        matches!(err, LimboError::Busy),
+        "expected Busy, got {err:?}"
+    );
     conn.set_failure_injector(None);
 
     // The transaction was already past finish_committed_tx when the fault
@@ -10369,7 +10372,8 @@ fn cursor_failure_inside_begin_concurrent_keeps_transaction_open() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INT)").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INT)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 100)").unwrap();
 
     conn.execute("BEGIN CONCURRENT").unwrap();
