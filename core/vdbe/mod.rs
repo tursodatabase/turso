@@ -2249,10 +2249,10 @@ impl Program {
                 // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
                 // and the caller is expected to handle transaction cleanup explicitly if needed.
                 Some(LimboError::SchemaUpdated) => {}
-                // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
-                // FK errors always behave like ABORT: rollback statement,
-                // rollback transaction in autocommit mode.
-                Some(LimboError::ForeignKeyConstraint(_)) => {
+                // Foreign key and rowid datatype mismatch errors are not governed
+                // by ON CONFLICT. They behave like ABORT: rollback the statement,
+                // and rollback the transaction in autocommit mode.
+                Some(LimboError::ForeignKeyConstraint(_)) | Some(LimboError::DatatypeMismatch) => {
                     if self.connection.get_auto_commit() {
                         self.rollback_current_txn(pager);
                     }

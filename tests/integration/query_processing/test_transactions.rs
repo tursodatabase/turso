@@ -1775,6 +1775,27 @@ fn test_insert_or_fail_unique_constraint(tmp_db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_insert_or_fail_rowid_datatype_mismatch_rolls_back_statement(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+
+    let result = conn.execute("INSERT OR FAIL INTO t VALUES (1, 'one'), ('bad', 'bad')");
+    assert_eq!(
+        result.expect_err("rowid mismatch should fail").to_string(),
+        "Runtime error: datatype mismatch"
+    );
+
+    let stmt = conn
+        .query("SELECT id, val FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(rows, Vec::<Vec<Value>>::new());
+}
+
+#[turso_macros::test]
 /// UPDATE OR FAIL should keep changes made by the statement before the error.
 /// Unlike ABORT (the default), FAIL does not roll back successful updates within the same statement.
 fn test_update_or_fail_keeps_prior_changes(tmp_db: TempDatabase) {
@@ -1800,6 +1821,39 @@ fn test_update_or_fail_keeps_prior_changes(tmp_db: TempDatabase) {
         vec![
             vec![Value::from_i64(1), Value::from_i64(10)],
             vec![Value::from_i64(2), Value::from_i64(20)],
+        ]
+    );
+}
+
+#[turso_macros::test]
+fn test_update_or_fail_rowid_datatype_mismatch_rolls_back_statement(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two')")
+        .unwrap();
+
+    let result = conn.execute(
+        "UPDATE OR FAIL t \
+         SET val = 'changed', id = CASE WHEN id = 2 THEN 'bad' ELSE id END \
+         WHERE TRUE",
+    );
+    assert_eq!(
+        result.expect_err("rowid mismatch should fail").to_string(),
+        "Runtime error: datatype mismatch"
+    );
+
+    let stmt = conn
+        .query("SELECT id, val FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from_i64(1), Value::Text("one".into())],
+            vec![Value::from_i64(2), Value::Text("two".into())],
         ]
     );
 }

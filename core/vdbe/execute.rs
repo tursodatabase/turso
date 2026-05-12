@@ -10082,18 +10082,18 @@ pub fn op_must_be_int(
         Value::Numeric(Numeric::Integer(_)) => {}
         Value::Numeric(Numeric::Float(f)) => match cast_real_to_integer(f64::from(*f)) {
             Ok(i) => state.registers[*reg].set_int(i),
-            Err(_) => bail_constraint_error!("datatype mismatch"),
+            Err(_) => return Err(LimboError::DatatypeMismatch),
         },
         Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
             Ok(Value::Numeric(Numeric::Integer(i))) => state.registers[*reg].set_int(i),
             Ok(Value::Numeric(Numeric::Float(f))) => match cast_real_to_integer(f64::from(f)) {
                 Ok(i) => state.registers[*reg].set_int(i),
-                Err(_) => bail_constraint_error!("datatype mismatch"),
+                Err(_) => return Err(LimboError::DatatypeMismatch),
             },
-            _ => bail_constraint_error!("datatype mismatch"),
+            _ => return Err(LimboError::DatatypeMismatch),
         },
         _ => {
-            bail_constraint_error!("datatype mismatch");
+            return Err(LimboError::DatatypeMismatch);
         }
     };
     state.pc += 1;
