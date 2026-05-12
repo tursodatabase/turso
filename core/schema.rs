@@ -1471,18 +1471,16 @@ impl Schema {
             let table = self
                 .get_btree_table(&unparsed_sql_from_index.table_name)
                 .ok_or_else(|| {
-                    LimboError::Corrupt(format!(
-                        "sqlite_schema contains index for missing table '{}': rootpage={} sql={}",
-                        unparsed_sql_from_index.table_name,
-                        unparsed_sql_from_index.root_page,
-                        unparsed_sql_from_index.sql
-                    ))
+                    malformed_schema_error(&unparsed_sql_from_index.name, "orphan index")
                 })?;
-            let index = Index::from_sql(
-                syms,
-                &unparsed_sql_from_index.sql,
-                unparsed_sql_from_index.root_page,
-                table.as_ref(),
+            let index = wrap_malformed_schema_error(
+                &unparsed_sql_from_index.name,
+                Index::from_sql(
+                    syms,
+                    &unparsed_sql_from_index.sql,
+                    unparsed_sql_from_index.root_page,
+                    table.as_ref(),
+                ),
             )?;
             if mvcc_enabled && index.index_method.is_some() {
                 crate::bail_parse_error!("Custom index modules are not supported with MVCC");
@@ -1710,17 +1708,19 @@ impl Schema {
                     let vtab = if let Some(vtab) = syms.vtabs.get(name) {
                         vtab.clone()
                     } else {
-                        let mod_name = module_name_from_sql(sql)?;
+                        let mod_name =
+                            wrap_malformed_schema_error(name, module_name_from_sql(sql))?;
                         crate::VirtualTable::table(
                             Some(name),
                             mod_name,
-                            module_args_from_sql(sql)?,
+                            wrap_malformed_schema_error(name, module_args_from_sql(sql))?,
                             syms,
                         )?
                     };
                     self.add_virtual_table(vtab)?;
                 } else {
-                    let table = BTreeTable::from_sql(sql, root_page)?;
+                    let table =
+                        wrap_malformed_schema_error(name, BTreeTable::from_sql(sql, root_page))?;
 
                     if table.has_virtual_columns && !self.generated_columns_enabled {
                         return Err(LimboError::ParseError(format!(
@@ -1768,6 +1768,7 @@ impl Schema {
                 match maybe_sql {
                     Some(sql) => {
                         from_sql_indexes.push(UnparsedFromSqlIndex {
+                            name: name.to_string(),
                             table_name: table_name.to_string(),
                             root_page,
                             sql: sql.to_string(),
@@ -1821,47 +1822,64 @@ impl Schema {
 
                 // Parse the SQL to determine if it's a regular or materialized view
                 let mut parser = Parser::new(sql.as_bytes());
-                if let Ok(Some(Cmd::Stmt(stmt))) = parser.next_cmd() {
-                    match stmt {
-                        Stmt::CreateMaterializedView { .. } => {
-                            // Store materialized view info for later creation
-                            // We'll handle reuse logic and create the actual IncrementalView
-                            // in a later pass when we have both the main root page and DBSP state root
-                            materialized_view_info
-                                .insert(view_name.clone(), (sql.to_string(), root_page));
+                let cmd = parser
+                    .next_cmd()
+                    .map_err(|error| malformed_schema_error(name, error.to_string()))?;
+                let Some(Cmd::Stmt(stmt)) = cmd else {
+                    return Err(malformed_schema_error(
+                        name,
+                        format!("invalid view sql: {sql}"),
+                    ));
+                };
+                match stmt {
+                    Stmt::CreateMaterializedView { .. } => {
+                        // Store materialized view info for later creation
+                        // We'll handle reuse logic and create the actual IncrementalView
+                        // in a later pass when we have both the main root page and DBSP state root
+                        materialized_view_info
+                            .insert(view_name.clone(), (sql.to_string(), root_page));
 
-                            // Mark the existing view for potential reuse
-                            if self.incremental_views.contains_key(&view_name) {
-                                // We'll check for reuse in the third pass
+                        // Mark the existing view for potential reuse
+                        if self.incremental_views.contains_key(&view_name) {
+                            // We'll check for reuse in the third pass
+                        }
+                    }
+                    Stmt::CreateView {
+                        view_name: _,
+                        columns: column_names,
+                        select,
+                        ..
+                    } => {
+                        wrap_malformed_schema_error(
+                            name,
+                            crate::util::validate_select_for_unsupported_features(&select),
+                        )?;
+
+                        // Extract actual columns from the SELECT statement
+                        let view_column_schema = wrap_malformed_schema_error(
+                            name,
+                            crate::util::extract_view_columns(&select, self),
+                        )?;
+
+                        // If column names were provided in CREATE VIEW (col1, col2, ...),
+                        // use them to rename the columns
+                        let mut final_columns = view_column_schema.flat_columns();
+                        for (i, indexed_col) in column_names.iter().enumerate() {
+                            if let Some(col) = final_columns.get_mut(i) {
+                                col.name = Some(indexed_col.col_name.to_string());
                             }
                         }
-                        Stmt::CreateView {
-                            view_name: _,
-                            columns: column_names,
-                            select,
-                            ..
-                        } => {
-                            crate::util::validate_select_for_unsupported_features(&select)?;
 
-                            // Extract actual columns from the SELECT statement
-                            let view_column_schema =
-                                crate::util::extract_view_columns(&select, self)?;
-
-                            // If column names were provided in CREATE VIEW (col1, col2, ...),
-                            // use them to rename the columns
-                            let mut final_columns = view_column_schema.flat_columns();
-                            for (i, indexed_col) in column_names.iter().enumerate() {
-                                if let Some(col) = final_columns.get_mut(i) {
-                                    col.name = Some(indexed_col.col_name.to_string());
-                                }
-                            }
-
-                            // Create regular view
-                            let view =
-                                View::new(name.to_string(), sql.to_string(), select, final_columns);
-                            self.add_view(view)?;
-                        }
-                        _ => {}
+                        // Create regular view
+                        let view =
+                            View::new(name.to_string(), sql.to_string(), select, final_columns);
+                        self.add_view(view)?;
+                    }
+                    _ => {
+                        return Err(malformed_schema_error(
+                            name,
+                            format!("invalid view sql: {sql}"),
+                        ))
                     }
                 }
             }
@@ -1873,7 +1891,10 @@ impl Schema {
                 let trigger_name = name.to_string();
 
                 let mut parser = Parser::new(sql.as_bytes());
-                let Ok(Some(Cmd::Stmt(Stmt::CreateTrigger {
+                let cmd = parser
+                    .next_cmd()
+                    .map_err(|error| malformed_schema_error(name, error.to_string()))?;
+                let Some(Cmd::Stmt(Stmt::CreateTrigger {
                     temporary,
                     if_not_exists: _,
                     trigger_name: _,
@@ -1883,11 +1904,12 @@ impl Schema {
                     for_each_row,
                     when_clause,
                     commands,
-                }))) = parser.next_cmd()
+                })) = cmd
                 else {
-                    return Err(crate::LimboError::ParseError(format!(
-                        "invalid trigger sql: {sql}"
-                    )));
+                    return Err(malformed_schema_error(
+                        name,
+                        format!("invalid trigger sql: {sql}"),
+                    ));
                 };
                 // Resolve the target database from the SQL qualifier:
                 // CREATE TEMP TRIGGER ... ON main.tbl → target is MAIN_DB_ID
@@ -2225,6 +2247,39 @@ impl Clone for Schema {
             generated_columns_enabled: self.generated_columns_enabled,
         }
     }
+}
+
+fn explicit_nulls_error(columns: &[ast::SortedColumn]) -> Option<String> {
+    columns.iter().find_map(|column| {
+        column.nulls.map(|nulls| {
+            let nulls = match nulls {
+                ast::NullsOrder::First => "FIRST",
+                ast::NullsOrder::Last => "LAST",
+            };
+            format!("unsupported use of NULLS {nulls}")
+        })
+    })
+}
+
+fn schema_error_message(error: LimboError) -> String {
+    match error {
+        LimboError::ParseError(message)
+        | LimboError::InvalidArgument(message)
+        | LimboError::Corrupt(message) => message,
+        LimboError::LexerError(error) => error.to_string(),
+        error => error.to_string(),
+    }
+}
+
+fn malformed_schema_error(object_name: &str, error: impl Into<String>) -> LimboError {
+    LimboError::Corrupt(format!(
+        "malformed database schema ({object_name}) - {}",
+        error.into()
+    ))
+}
+
+fn wrap_malformed_schema_error<T>(object_name: &str, result: Result<T>) -> Result<T> {
+    result.map_err(|error| malformed_schema_error(object_name, schema_error_message(error)))
 }
 
 /// Maps schema column indices to register offsets for DML operations.
@@ -4882,6 +4937,9 @@ impl Index {
                 with_clause,
                 ..
             })) => {
+                if let Some(error) = explicit_nulls_error(&columns) {
+                    crate::bail_parse_error!("{error}");
+                }
                 let index_name = normalize_ident(idx_name.name.as_str());
                 let index_columns = resolve_sorted_columns(table, &columns)?;
                 if let Some(using) = using {
@@ -5930,6 +5988,105 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("generated columns"));
+    }
+
+    #[test]
+    fn test_schema_loading_rejects_table_nulls_order_as_malformed() {
+        let mut schema = Schema::new();
+
+        let err = schema
+            .handle_schema_row(
+                "table",
+                "t1",
+                "t1",
+                2,
+                Some("CREATE TABLE t1(a, UNIQUE(a NULLS LAST))"),
+                &SymbolTable::default(),
+                &mut Vec::new(),
+                &mut HashMap::default(),
+                &mut HashMap::default(),
+                &mut HashMap::default(),
+                &mut HashMap::default(),
+                &|_| None,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("malformed database schema (t1) - unsupported use of NULLS LAST"));
+    }
+
+    #[test]
+    fn test_schema_loading_rejects_index_nulls_order_as_malformed() -> Result<()> {
+        let mut schema = Schema::new();
+        schema.handle_schema_row(
+            "table",
+            "t1",
+            "t1",
+            2,
+            Some("CREATE TABLE t1(a)"),
+            &SymbolTable::default(),
+            &mut Vec::new(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &|_| None,
+        )?;
+
+        let err = schema
+            .populate_indices(
+                &SymbolTable::default(),
+                vec![UnparsedFromSqlIndex {
+                    name: "i".to_string(),
+                    table_name: "t1".to_string(),
+                    root_page: 3,
+                    sql: "CREATE INDEX i ON t1(a NULLS LAST)".to_string(),
+                }],
+                HashMap::default(),
+                false,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("malformed database schema (i) - unsupported use of NULLS LAST"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_schema_loading_wraps_unparseable_index_sql_as_malformed() -> Result<()> {
+        let mut schema = Schema::new();
+        schema.handle_schema_row(
+            "table",
+            "t1",
+            "t1",
+            2,
+            Some("CREATE TABLE t1(a)"),
+            &SymbolTable::default(),
+            &mut Vec::new(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &|_| None,
+        )?;
+
+        let err = schema
+            .populate_indices(
+                &SymbolTable::default(),
+                vec![UnparsedFromSqlIndex {
+                    name: "i".to_string(),
+                    table_name: "t1".to_string(),
+                    root_page: 3,
+                    sql: "CREATE INDEX i ON t1(".to_string(),
+                }],
+                HashMap::default(),
+                false,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("malformed database schema (i) - incomplete input"));
+        Ok(())
     }
 
     fn indices(mask: &ColumnMask) -> Vec<usize> {

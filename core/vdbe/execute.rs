@@ -11119,21 +11119,33 @@ fn op_parse_schema_step(
                     .parse_schema()
                     .take()
                     .expect("parse schema state should exist");
-                let schema = Arc::make_mut(&mut schema_arc);
                 let mv_store = stmt.mv_store();
                 let syms = conn.syms.read();
 
-                let res1 = schema.populate_indices(
-                    &syms,
-                    from_sql_indexes,
-                    automatic_indices,
-                    mv_store.is_some(),
-                );
-                let res2 = schema.populate_materialized_views(
-                    materialized_view_info,
-                    dbsp_state_roots,
-                    dbsp_state_index_roots,
-                );
+                let schema_result = {
+                    let schema = Arc::make_mut(&mut schema_arc);
+                    schema
+                        .populate_indices(
+                            &syms,
+                            from_sql_indexes,
+                            automatic_indices,
+                            mv_store.is_some(),
+                        )
+                        .and_then(|_| {
+                            schema.populate_materialized_views(
+                                materialized_view_info,
+                                dbsp_state_roots,
+                                dbsp_state_index_roots,
+                            )
+                        })
+                };
+                if let Err(error) = schema_result {
+                    drop(stmt);
+                    conn.auto_commit
+                        .store(previous_auto_commit, Ordering::SeqCst);
+                    state.active_op_state.clear();
+                    return Err(error);
+                }
 
                 // Store the modified schema back
                 if db == crate::TEMP_DB_ID {
@@ -11149,7 +11161,7 @@ fn op_parse_schema_step(
                     // that wipes in-flight dirty pages.
                     if let Some(temp_db) = conn.temp.database.read().as_ref() {
                         if let Some(cookie) = temp_db.pager.get_schema_cookie_cached() {
-                            schema.schema_version = cookie;
+                            Arc::make_mut(&mut schema_arc).schema_version = cookie;
                         }
                         *temp_db.db.schema.lock() = schema_arc;
                     }
@@ -11161,7 +11173,6 @@ fn op_parse_schema_step(
                 drop(stmt);
                 conn.auto_commit
                     .store(previous_auto_commit, Ordering::SeqCst);
-                let _ = (res1?, res2?);
 
                 state.pc += 1;
                 state.active_op_state.clear();

@@ -150,6 +150,7 @@ pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 ///
 /// CREATE INDEX idx ON table_name(sql)
 pub struct UnparsedFromSqlIndex {
+    pub name: String,
     pub table_name: String,
     pub root_page: i64,
     pub sql: String,
