@@ -289,3 +289,11 @@ test create-index-sqlite-source-id {
 }
 expect error {
 }
+
+@cross-check-integrity
+test create-index-nulls-last-rejected {
+    CREATE TABLE t(a);
+    CREATE INDEX i ON t(a NULLS LAST);
+}
+expect error {
+}
