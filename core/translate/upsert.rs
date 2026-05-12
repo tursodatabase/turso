@@ -934,8 +934,27 @@ pub fn emit_upsert(
         }
     }
 
-    // Index rebuild (DELETE old, INSERT new), honoring partial-index WHEREs
+    // Index rebuild, honoring partial-index WHEREs.
+    //
+    // Evaluate predicates, build NEW keys, and check uniqueness before mutating
+    // any index. The DO UPDATE arm always uses ABORT semantics, but statement
+    // OR FAIL still sets the top-level program resolve type. Keeping all
+    // fallible expression evaluation ahead of IdxDelete prevents an expression
+    // error from preserving partial index maintenance as FAIL.
     if let Some(before) = before_start {
+        struct UpsertIndexUpdateCtx {
+            idx_meta: Arc<Index>,
+            idx_cursor_id: usize,
+            record_reg: usize,
+            idx_start_reg: usize,
+            num_cols: usize,
+            old_satisfies_where: Option<usize>,
+            new_satisfies_where: Option<usize>,
+        }
+
+        let mut idx_phase_ctxs = Vec::new();
+
+        // Phase 1: evaluate predicates, build NEW keys, and check unique constraints.
         for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
             let idx_meta = resolver
                 .with_schema(ctx.database_id, |s| {
@@ -962,67 +981,6 @@ pub fn emit_upsert(
                 program, table, &idx_meta, new_start, new_rowid, resolver, &layout,
             );
 
-            // Skip delete if BEFORE predicate false/NULL
-            let maybe_skip_del = before_pred_reg.map(|r| {
-                let lbl = program.allocate_label();
-                program.emit_insn(Insn::IfNot {
-                    reg: r,
-                    target_pc: lbl,
-                    jump_if_null: true,
-                });
-                lbl
-            });
-
-            // DELETE old key
-            let del = program.alloc_registers(k + 1);
-            for (i, ic) in idx_meta.columns.iter().enumerate() {
-                if ic.expr.is_some() {
-                    emit_upsert_expr_index_value(
-                        program,
-                        resolver,
-                        table,
-                        ic,
-                        before,
-                        ctx.conflict_rowid_reg,
-                        del + i,
-                        &layout,
-                    )?;
-                } else {
-                    let (ci, _) = table.get_column_by_name(&ic.name).unwrap();
-                    program.emit_insn(Insn::Copy {
-                        src_reg: layout.to_register(before, ci),
-                        dst_reg: del + i,
-                        extra_amount: 0,
-                    });
-                }
-            }
-            program.emit_insn(Insn::Copy {
-                src_reg: ctx.conflict_rowid_reg,
-                dst_reg: del + k,
-                extra_amount: 0,
-            });
-            program.emit_insn(Insn::IdxDelete {
-                start_reg: del,
-                num_regs: k + 1,
-                cursor_id: *idx_cid,
-                raise_error_if_no_matching_entry: false,
-            });
-            if let Some(label) = maybe_skip_del {
-                program.preassign_label_to_next_insn(label);
-            }
-
-            // Skip insert if NEW predicate false/NULL
-            let maybe_skip_ins = new_pred_reg.map(|r| {
-                let lbl = program.allocate_label();
-                program.emit_insn(Insn::IfNot {
-                    reg: r,
-                    target_pc: lbl,
-                    jump_if_null: true,
-                });
-                lbl
-            });
-
-            // INSERT new key (use NEW rowid if present)
             let ins = program.alloc_registers(k + 1);
             for (i, ic) in idx_meta.columns.iter().enumerate() {
                 if ic.expr.is_some() {
@@ -1063,6 +1021,13 @@ pub fn emit_upsert(
             if idx_meta.unique {
                 // Affinity on the key columns for the NoConflict probe
                 let ok = program.allocate_label();
+                if let Some(new_pred_reg) = new_pred_reg {
+                    program.emit_insn(Insn::IfNot {
+                        reg: new_pred_reg,
+                        target_pc: ok,
+                        jump_if_null: true,
+                    });
+                }
                 let aff: String = idx_meta
                     .columns
                     .iter()
@@ -1100,32 +1065,109 @@ pub fn emit_upsert(
                     dest: hit,
                 });
                 program.emit_insn(Insn::Eq {
-                    lhs: new_rowid,
+                    lhs: ctx.conflict_rowid_reg,
                     rhs: hit,
                     target_pc: ok,
                     flags: CmpInsFlags::default(),
                     collation: program.curr_collation(),
                 });
-                let description = format_unique_violation_desc(table.get_name(), &idx_meta);
+                let description = format!(
+                    "UNIQUE constraint failed: {} (19)",
+                    format_unique_violation_desc(table.get_name(), &idx_meta)
+                );
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description,
-                    on_error: None,
+                    on_error: Some(ast::ResolveType::Abort),
                     description_reg: None,
                 });
                 program.preassign_label_to_next_insn(ok);
             }
 
-            program.emit_insn(Insn::IdxInsert {
-                cursor_id: *idx_cid,
+            idx_phase_ctxs.push(UpsertIndexUpdateCtx {
+                idx_meta,
+                idx_cursor_id: *idx_cid,
                 record_reg: rec,
-                unpacked_start: Some(ins),
-                unpacked_count: Some((k + 1) as u16),
+                idx_start_reg: ins,
+                num_cols: k,
+                old_satisfies_where: before_pred_reg,
+                new_satisfies_where: new_pred_reg,
+            });
+        }
+
+        // Phase 2: delete OLD keys after every fallible NEW-key build/check passed.
+        for idx_ctx in &idx_phase_ctxs {
+            let maybe_skip_del = idx_ctx.old_satisfies_where.map(|r| {
+                let lbl = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: r,
+                    target_pc: lbl,
+                    jump_if_null: true,
+                });
+                lbl
+            });
+
+            let del = program.alloc_registers(idx_ctx.num_cols + 1);
+            for (i, ic) in idx_ctx.idx_meta.columns.iter().enumerate() {
+                if ic.expr.is_some() {
+                    emit_upsert_expr_index_value(
+                        program,
+                        resolver,
+                        table,
+                        ic,
+                        before,
+                        ctx.conflict_rowid_reg,
+                        del + i,
+                        &layout,
+                    )?;
+                } else {
+                    let (ci, _) = table.get_column_by_name(&ic.name).unwrap();
+                    program.emit_insn(Insn::Copy {
+                        src_reg: layout.to_register(before, ci),
+                        dst_reg: del + i,
+                        extra_amount: 0,
+                    });
+                }
+            }
+            program.emit_insn(Insn::Copy {
+                src_reg: ctx.conflict_rowid_reg,
+                dst_reg: del + idx_ctx.num_cols,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::IdxDelete {
+                start_reg: del,
+                num_regs: idx_ctx.num_cols + 1,
+                cursor_id: idx_ctx.idx_cursor_id,
+                raise_error_if_no_matching_entry: false,
+            });
+
+            if let Some(label) = maybe_skip_del {
+                program.preassign_label_to_next_insn(label);
+            }
+        }
+
+        // Phase 3: insert NEW keys.
+        for idx_ctx in &idx_phase_ctxs {
+            let maybe_skip_ins = idx_ctx.new_satisfies_where.map(|r| {
+                let lbl = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: r,
+                    target_pc: lbl,
+                    jump_if_null: true,
+                });
+                lbl
+            });
+
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id: idx_ctx.idx_cursor_id,
+                record_reg: idx_ctx.record_reg,
+                unpacked_start: Some(idx_ctx.idx_start_reg),
+                unpacked_count: Some((idx_ctx.num_cols + 1) as u16),
                 flags: IdxInsertFlags::new().nchange(true),
             });
 
-            if let Some(lbl) = maybe_skip_ins {
-                program.preassign_label_to_next_insn(lbl);
+            if let Some(label) = maybe_skip_ins {
+                program.preassign_label_to_next_insn(label);
             }
         }
     }
@@ -1162,7 +1204,7 @@ pub fn emit_upsert(
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
             description: format!(
-                "{}.{}",
+                "UNIQUE constraint failed: {}.{} (19)",
                 table.get_name(),
                 table
                     .columns()
@@ -1171,7 +1213,7 @@ pub fn emit_upsert(
                     .and_then(|c| c.name.as_deref())
                     .unwrap_or("rowid")
             ),
-            on_error: None,
+            on_error: Some(ast::ResolveType::Abort),
             description_reg: None,
         });
         program.preassign_label_to_next_insn(ok);

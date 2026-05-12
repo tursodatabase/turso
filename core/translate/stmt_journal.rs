@@ -131,7 +131,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     inserting_multiple_rows: bool,
     has_triggers: bool,
     has_fks: bool,
-    has_upsert: bool,
+    has_upsert_do_update: bool,
     has_autoincrement: bool,
     notnull_col_exists: bool,
     has_unique: bool,
@@ -157,7 +157,8 @@ pub(crate) fn set_insert_stmt_journal_flags(
     // inserts do not need this because there is no prior row in the
     // outer-tx write_set to roll back.
     let autoinc_may_abort_multi_row = has_autoincrement && inserting_multiple_rows;
-    let may_abort = has_triggers
+    let may_abort = has_upsert_do_update
+        || has_triggers
         || has_fks
         || autoinc_may_abort_multi_row
         || constraint_may_abort(
@@ -175,7 +176,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     if !inserting_multiple_rows
         && !has_triggers
         && !any_replace
-        && !has_upsert
+        && !has_upsert_do_update
         && !has_autoincrement
     {
         program.set_multi_write(false);
