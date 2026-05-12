@@ -1848,6 +1848,23 @@ expect {
     CHECK constraint failed in t
 }
 
+# Regression for SQLite xfer optimization bypassing CHECK(rowid=...)
+# validation during INSERT INTO ... SELECT.
+# https://sqlite.org/forum/forumpost/6dcc95e3ca750dbc
+@skip-if sqlite "SQLite xfer optimization bug; fixed on trunk for 3.54, not in released 3.53"
+test check_constraint_insert_select_validates_destination_rowid {
+    CREATE TABLE s(a CHECK(rowid=1));
+    CREATE TABLE d(a CHECK(rowid=1));
+
+    INSERT INTO s(rowid,a) VALUES(1,'src-ok');
+    INSERT INTO d(rowid,a) VALUES(1,'dst-ok');
+
+    PRAGMA integrity_check;
+    INSERT INTO d SELECT * FROM s;
+}
+expect error {
+    CHECK constraint failed.*rowid
+}
 
 @cross-check-integrity
 test check_constraint_text_affinity_coercion_pass {
