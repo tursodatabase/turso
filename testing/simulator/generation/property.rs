@@ -19,7 +19,7 @@ use sql_generation::{
             transaction::{Begin, Commit, Rollback},
             update::{SetValue, Update},
         },
-        table::{ColumnType, SimValue, Table},
+        table::{Column, ColumnType, SimValue, Table},
     },
 };
 use strum::IntoEnumIterator;
@@ -239,7 +239,9 @@ impl Property {
             Property::Queries { .. } => {
                 unreachable!("No extensional querie generation for `Property::Queries`")
             }
-            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => {
+            Property::FsyncNoWait { .. }
+            | Property::FaultyQuery { .. }
+            | Property::DeleteRollbackOnExprError { .. } => {
                 unreachable!("No extensional queries")
             }
             Property::SelectLimit { .. }
@@ -989,6 +991,67 @@ impl Property {
                 .into_iter()
                 .map(InteractionBuilder::with_interaction)
                 .collect()
+            }
+            Property::DeleteRollbackOnExprError {
+                setup,
+                table,
+                delete,
+            } => {
+                // Build a sequence that:
+                //   1. Runs the setup queries (CREATE TABLE + INSERTs) — these update the
+                //      shadow normally via `InteractionType::Query`.
+                //   2. Opens an explicit BEGIN.
+                //   3. Runs the fallible DELETE as a `FaultyQuery` so the per-interaction
+                //      shadow update is skipped on error (Delete::shadow would otherwise
+                //      ignore ESCAPE and incorrectly delete the rows from the shadow,
+                //      hiding the divergence we want to expose).
+                //   4. Asserts the DELETE errored, and rolls back the shadow transaction
+                //      so the planner-appended `AllTableHaveExpectedContent` sees the
+                //      pre-DELETE state.
+                //   5. COMMITs. SQLite-compatible behavior commits an empty transaction
+                //      here; the buggy Turso path commits the partial deletes that
+                //      leaked past the aborted statement.
+                let delete_clone = delete.clone();
+                let assert = Assertion::new(
+                    "DELETE with row-dependent expression error must abort cleanly".to_string(),
+                    move |stack, env: &mut SimulatorEnv| {
+                        let last = stack.last().unwrap();
+                        match last {
+                            Ok(_) => Ok(Err(format!(
+                                "DELETE was expected to error from row-dependent \
+                                 expression (LIKE ESCAPE on multi-character column \
+                                 value), but it succeeded: {delete_clone}"
+                            ))),
+                            Err(err) => {
+                                tracing::debug!(
+                                    "DeleteRollbackOnExprError got expected error: {err}"
+                                );
+                                env.rollback_conn(connection_index);
+                                Ok(Ok(()))
+                            }
+                        }
+                    },
+                    delete.dependencies().into_iter().collect(),
+                );
+
+                let mut interactions: Vec<InteractionType> = Vec::with_capacity(setup.len() + 5);
+                for q in setup {
+                    interactions.push(InteractionType::Query(q.clone()));
+                }
+                interactions.push(InteractionType::Query(Query::Begin(Begin::Deferred)));
+                interactions.push(InteractionType::FaultyQuery(delete.clone()));
+                interactions.push(InteractionType::Assertion(assert));
+                interactions.push(InteractionType::Query(Query::Commit(Commit)));
+                let _ = table; // table is owned by Property; the auto-appended
+                // AllTableHaveExpectedContent check uses the tables list
+                // captured at plan-generation time and verifies that the
+                // post-COMMIT contents of every shadowed table — including this
+                // property's freshly created one — match the simulator's shadow.
+
+                interactions
+                    .into_iter()
+                    .map(InteractionBuilder::with_interaction)
+                    .collect()
             }
             Property::WhereTrueFalseNull { select, predicate } => {
                 let tables_dependencies = select.dependencies().into_iter().collect::<Vec<_>>();
@@ -1887,6 +1950,92 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
     }
 }
 
+/// Builds a property whose plan creates a small dedicated table, inserts rows
+/// with a mixed-length TEXT column, and then runs a DELETE whose WHERE clause
+/// is `'a' LIKE 'a' ESCAPE esc`. The escape column has both single-character
+/// and multi-character values, so Turso's per-row evaluation matches some rows
+/// and errors on others — exposing the partial-DELETE leak from #6879 for the
+/// DELETE path. A globally unique table name avoids cross-property collisions.
+fn property_delete_rollback_on_expr_error<R: rand::Rng + ?Sized>(
+    _rng: &mut R,
+    _query_distr: &QueryDistribution,
+    _ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static UNIQUE: AtomicUsize = AtomicUsize::new(0);
+    let idx = UNIQUE.fetch_add(1, Ordering::Relaxed);
+    let table_name = format!("delete_expr_err_t_{idx}");
+
+    let table = Table {
+        rows: Vec::new(),
+        name: table_name.clone(),
+        columns: vec![Column {
+            name: "id".to_string(),
+            column_type: ColumnType::Integer,
+            constraints: vec![ast::ColumnConstraint::PrimaryKey {
+                order: None,
+                conflict_clause: None,
+                auto_increment: false,
+            }],
+        }],
+        indexes: vec![],
+    };
+    let create = Query::Create(Create { table });
+
+    let int_val = |n: i64| SimValue(turso_core::types::Value::Numeric(Numeric::Integer(n)));
+    let insert = Query::Insert(Insert::Values {
+        table: table_name.clone(),
+        values: vec![vec![int_val(1)], vec![int_val(2)], vec![int_val(3)]],
+        on_conflict: None,
+    });
+
+    // Build the predicate
+    //   (CASE WHEN id=1 THEN 1
+    //         WHEN id=2 THEN ('a' LIKE 'a' ESCAPE 'bb')
+    //         ELSE 0 END)
+    // The branches without ESCAPE evaluate normally per row; the row with
+    // id=2 evaluates a multi-character ESCAPE that Turso correctly rejects
+    // with a runtime error. The CASE arms ensure earlier rows have already
+    // been matched and deleted by the time the error fires — which is what
+    // makes the statement-journal hole observable.
+    let id_eq = |val: i64| {
+        ast::Expr::Binary(
+            Box::new(ast::Expr::Id(ast::Name::exact("id".to_string()))),
+            ast::Operator::Equals,
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric(val.to_string()))),
+        )
+    };
+    let num_lit = |n: i64| ast::Expr::Literal(ast::Literal::Numeric(n.to_string()));
+    let str_lit = |s: &str| ast::Expr::Literal(ast::Literal::String(format!("'{s}'")));
+    let like_escape_multi = ast::Expr::Like {
+        lhs: Box::new(str_lit("a")),
+        not: false,
+        op: ast::LikeOperator::Like,
+        rhs: Box::new(str_lit("a")),
+        escape: Some(Box::new(str_lit("bb"))),
+    };
+    let case = ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![
+            (Box::new(id_eq(1)), Box::new(num_lit(1))),
+            (Box::new(id_eq(2)), Box::new(like_escape_multi)),
+        ],
+        else_expr: Some(Box::new(num_lit(0))),
+    };
+    let predicate = Predicate(ast::Expr::Parenthesized(vec![Box::new(case)]));
+    let delete = Query::Delete(Delete {
+        table: table_name.clone(),
+        predicate,
+    });
+
+    Property::DeleteRollbackOnExprError {
+        setup: vec![create, insert],
+        table: table_name,
+        delete,
+    }
+}
+
 type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
@@ -1914,6 +2063,9 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
+            PropertyDiscriminants::DeleteRollbackOnExprError => {
+                property_delete_rollback_on_expr_error
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
             }
@@ -2033,6 +2185,16 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::DeleteRollbackOnExprError => {
+                // The property opens its own BEGIN/COMMIT around the fallible DELETE.
+                // Skip in MVCC mode (which has a different transaction model) and when
+                // the bug-targeted property has been explicitly disabled via CLI.
+                if !env.profile.mvcc && !env.opts.disable_delete_rollback_on_expr_error {
+                    10
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
@@ -2074,6 +2236,8 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
+            // Self-contained: builds its own table/inserts/delete inline.
+            PropertyDiscriminants::DeleteRollbackOnExprError => QueryCapabilities::all(),
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
         }
     }

@@ -182,6 +182,29 @@ pub enum Property {
     FaultyQuery {
         query: Query,
     },
+    /// `DeleteRollbackOnExprError` targets the partial-DML leak described in
+    /// #6879 for the DELETE path. The simulator generates a fresh table with
+    /// rows whose TEXT column holds a *mix of single-character and
+    /// multi-character* escape strings, wraps a DELETE in an explicit
+    /// transaction, and uses `'a' LIKE 'a' ESCAPE <esc_col>` as the WHERE
+    /// predicate. Turso evaluates the predicate per row: rows whose escape
+    /// column is single-character match (so they get deleted), and rows whose
+    /// escape column is multi-character raise a runtime error mid-statement.
+    /// If the statement journal is correctly opened, the already-deleted rows
+    /// must roll back; if it isn't (the previous DELETE elide bug), they leak
+    /// past the abort and survive the surrounding COMMIT, which the
+    /// auto-appended `AllTableHaveExpectedContent` then catches as a shadow
+    /// vs. database divergence.
+    DeleteRollbackOnExprError {
+        /// Setup queries: create the table and populate it with rows whose
+        /// `esc` column mixes single- and multi-character TEXT values.
+        setup: Vec<Query>,
+        /// Table name the DELETE targets.
+        table: String,
+        /// The DELETE statement whose WHERE clause raises a row-dependent
+        /// expression error (`'a' LIKE 'a' ESCAPE esc`).
+        delete: Query,
+    },
     /// SavepointRollback wraps random write interactions in a named savepoint,
     /// rolls them back, then checks that the database still matches the shadow
     /// model. This targets pager/WAL/cache-spill bugs where rolled-back page
@@ -208,7 +231,9 @@ impl Property {
     pub fn check_tables(&self) -> bool {
         matches!(
             self,
-            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. }
+            Property::FsyncNoWait { .. }
+                | Property::FaultyQuery { .. }
+                | Property::DeleteRollbackOnExprError { .. }
         )
     }
 
@@ -232,7 +257,9 @@ impl Property {
             | Property::DropSelect { queries, .. }
             | Property::SavepointRollback { queries, .. }
             | Property::Queries { queries } => Some(queries),
-            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => None,
+            Property::FsyncNoWait { .. }
+            | Property::FaultyQuery { .. }
+            | Property::DeleteRollbackOnExprError { .. } => None,
             Property::SelectLimit { .. }
             | Property::SelectSelectOptimizer { .. }
             | Property::WhereTrueFalseNull { .. }
