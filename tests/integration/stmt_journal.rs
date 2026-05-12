@@ -289,6 +289,76 @@ fn update_composite_unique_partial_cols(tmp_db: TempDatabase) -> anyhow::Result<
     Ok(())
 }
 
+#[turso_macros::test]
+fn update_runtime_expression_error_rolls_back_prior_rows(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = WAL")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x INT)")?;
+    conn.execute("INSERT INTO t VALUES(1,10),(2,20)")?;
+
+    let update = "UPDATE t SET x = CASE WHEN id=1 THEN 11 ELSE (char(120) LIKE char(120) ESCAPE (char(121)||char(121))) END";
+    assert!(
+        needs_stmt_journal(&conn, update),
+        "row-dependent runtime expression failures need statement rollback"
+    );
+
+    conn.execute("BEGIN")?;
+    let result = conn.execute(update);
+    assert!(result.is_err(), "UPDATE should fail on invalid ESCAPE");
+
+    let rows = query_rows(&conn, "SELECT id,x FROM t ORDER BY id");
+    assert_eq!(
+        rows,
+        vec!["1|10", "2|20"],
+        "failed UPDATE must roll back rows written before the expression error"
+    );
+
+    conn.execute("COMMIT")?;
+    let rows = query_rows(&conn, "SELECT id,x FROM t ORDER BY id");
+    assert_eq!(rows, vec!["1|10", "2|20"]);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn update_partial_index_expression_error_rolls_back_prior_rows(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = WAL")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT)")?;
+    conn.execute("INSERT INTO t VALUES(1,1,1),(2,2,1),(3,3,1)")?;
+    conn.execute(
+        "CREATE INDEX idx ON t(a) WHERE CASE WHEN b=2 THEN 'x' LIKE 'x' ESCAPE 'yy' ELSE 1 END",
+    )?;
+
+    let update = "UPDATE t SET b=CASE WHEN id=2 THEN 2 ELSE b+10 END";
+    assert!(
+        needs_stmt_journal(&conn, update),
+        "partial-index predicate errors need statement rollback"
+    );
+
+    conn.execute("BEGIN")?;
+    let result = conn.execute(update);
+    assert!(
+        result.is_err(),
+        "UPDATE should fail while maintaining the partial index"
+    );
+
+    let rows = query_rows(&conn, "SELECT id,a,b FROM t ORDER BY id");
+    assert_eq!(
+        rows,
+        vec!["1|1|1", "2|2|1", "3|3|1"],
+        "failed partial-index UPDATE must roll back earlier row writes"
+    );
+
+    let ic = query_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(ic, vec!["ok"], "integrity_check failed after UPDATE abort");
+    conn.execute("COMMIT")?;
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────
 // DELETE
 // ──────────────────────────────────────────────────────────
@@ -314,6 +384,36 @@ fn delete_by_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
 fn delete_by_unique_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     assert!(!needs_stmt_journal(&conn, "DELETE FROM t WHERE b = 5"));
+    Ok(())
+}
+
+#[turso_macros::test]
+fn delete_runtime_expression_error_rolls_back_prior_rows(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = WAL")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x INT)")?;
+    conn.execute("INSERT INTO t VALUES(1,10),(2,20)")?;
+
+    let delete = "DELETE FROM t WHERE CASE WHEN id=2 THEN (char(120) LIKE char(120) ESCAPE (char(121)||char(121))) ELSE 1 END";
+    assert!(
+        needs_stmt_journal(&conn, delete),
+        "row-dependent runtime expression failures need statement rollback"
+    );
+
+    conn.execute("BEGIN")?;
+    let result = conn.execute(delete);
+    assert!(result.is_err(), "DELETE should fail on invalid ESCAPE");
+
+    let rows = query_rows(&conn, "SELECT id,x FROM t ORDER BY id");
+    assert_eq!(
+        rows,
+        vec!["1|10", "2|20"],
+        "failed DELETE must roll back rows deleted before the expression error"
+    );
+
+    conn.execute("COMMIT")?;
     Ok(())
 }
 

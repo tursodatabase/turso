@@ -26,7 +26,7 @@ use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::{sync::Arc, Connection, Result};
-use turso_parser::ast::{ResolveType, TriggerEvent};
+use turso_parser::ast::{Expr, ResolveType, TriggerEvent};
 
 /// Check whether any DDL-level constraint (IPK or index) uses REPLACE.
 pub(crate) fn any_index_or_ipk_has_replace(
@@ -113,6 +113,111 @@ pub(crate) fn constraint_may_abort(
     // Default ABORT applies to NOT NULL and CHECK (they aren't per-index).
     let default_aborts = has_notnull || has_check;
     pk_aborts || idx_aborts || default_aborts
+}
+
+fn expr_may_abort_at_runtime(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { .. }
+        | Expr::FunctionCallStar { .. }
+        | Expr::Raise(_, _)
+        | Expr::Exists(_)
+        | Expr::Subquery(_)
+        | Expr::SubqueryResult { .. }
+        | Expr::InSelect { .. }
+        | Expr::InTable { .. } => true,
+        Expr::Like {
+            lhs, rhs, escape, ..
+        } => escape.is_some() || expr_may_abort_at_runtime(lhs) || expr_may_abort_at_runtime(rhs),
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            expr_may_abort_at_runtime(lhs)
+                || expr_may_abort_at_runtime(start)
+                || expr_may_abort_at_runtime(end)
+        }
+        Expr::Binary(lhs, _, rhs) => {
+            expr_may_abort_at_runtime(lhs) || expr_may_abort_at_runtime(rhs)
+        }
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            base.as_deref().is_some_and(expr_may_abort_at_runtime)
+                || when_then_pairs.iter().any(|(when_expr, then_expr)| {
+                    expr_may_abort_at_runtime(when_expr) || expr_may_abort_at_runtime(then_expr)
+                })
+                || else_expr.as_deref().is_some_and(expr_may_abort_at_runtime)
+        }
+        Expr::Cast { expr, .. }
+        | Expr::Collate(expr, _)
+        | Expr::IsNull(expr)
+        | Expr::NotNull(expr)
+        | Expr::Unary(_, expr)
+        | Expr::FieldAccess { base: expr, .. } => expr_may_abort_at_runtime(expr),
+        Expr::InList { lhs, rhs, .. } => {
+            expr_may_abort_at_runtime(lhs) || rhs.iter().any(|expr| expr_may_abort_at_runtime(expr))
+        }
+        Expr::Parenthesized(exprs) => exprs.iter().any(|expr| expr_may_abort_at_runtime(expr)),
+        Expr::Array { .. } | Expr::Subscript { .. } => true,
+        Expr::Id(_)
+        | Expr::Column { .. }
+        | Expr::RowId { .. }
+        | Expr::Literal(_)
+        | Expr::DoublyQualified(..)
+        | Expr::Name(_)
+        | Expr::Qualified(..)
+        | Expr::Variable(_)
+        | Expr::Register(_)
+        | Expr::Default => false,
+    }
+}
+
+fn update_expr_may_abort(plan: &UpdatePlan) -> bool {
+    plan.set_clauses
+        .iter()
+        .any(|set_clause| expr_may_abort_at_runtime(set_clause.emitted_expr()))
+        || plan
+            .where_clause
+            .iter()
+            .any(|term| expr_may_abort_at_runtime(&term.expr))
+        || plan.returning.as_ref().is_some_and(|columns| {
+            columns
+                .iter()
+                .any(|column| expr_may_abort_at_runtime(&column.expr))
+        })
+        || plan.indexes_to_update.iter().any(|index| {
+            index
+                .where_clause
+                .as_deref()
+                .is_some_and(expr_may_abort_at_runtime)
+                || index
+                    .columns
+                    .iter()
+                    .filter_map(|column| column.expr.as_deref())
+                    .any(expr_may_abort_at_runtime)
+        })
+}
+
+fn delete_expr_may_abort(plan: &DeletePlan) -> bool {
+    plan.where_clause
+        .iter()
+        .any(|term| expr_may_abort_at_runtime(&term.expr))
+        || plan
+            .result_columns
+            .iter()
+            .any(|column| expr_may_abort_at_runtime(&column.expr))
+        || plan.indexes.iter().any(|index| {
+            index
+                .where_clause
+                .as_deref()
+                .is_some_and(expr_may_abort_at_runtime)
+                || index
+                    .columns
+                    .iter()
+                    .filter_map(|column| column.expr.as_deref())
+                    .any(expr_may_abort_at_runtime)
+        })
 }
 
 /// Set multi_write / may_abort for INSERT statements.
@@ -233,6 +338,7 @@ pub(crate) fn set_update_stmt_journal_flags(
 
     let may_abort = has_triggers
         || has_fks
+        || update_expr_may_abort(plan)
         || constraint_may_abort(
             has_statement_conflict,
             or_conflict,
@@ -274,9 +380,8 @@ pub(crate) fn set_delete_stmt_journal_flags(
     }
 
     // DELETE has no ON CONFLICT clause, so NOT NULL/CHECK/UNIQUE don't apply —
-    // only triggers (RAISE(ABORT)) or FK violations can abort.
-    if !has_triggers && !has_fks {
-        program.set_may_abort(false);
-    }
+    // Triggers, FKs, and row-dependent runtime expressions can still abort
+    // after earlier rows in the statement have been deleted.
+    program.set_may_abort(has_triggers || has_fks || delete_expr_may_abort(plan));
     Ok(())
 }
