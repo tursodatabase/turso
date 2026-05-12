@@ -205,45 +205,28 @@ impl CommitState {
         }
     }
 
-    /// Release `pager_commit_lock` + `exclusive_tx` and roll back the MVCC tx
-    /// for an abandoned commit state machine (Statement dropped mid-IO yield,
-    /// `log_tx` returned Busy, etc.). No-op for finalized SMs and non-MVCC
-    /// commit states.
     fn cleanup_abandoned_mvcc_commit(&mut self, connection: &Connection) {
         match self {
-            CommitState::CommittingMvcc { state_machine } => {
-                if let Some(mv_store) = connection.mv_store().as_ref() {
-                    if state_machine.inner_mut().cleanup_abandoned_commit(mv_store) {
-                        connection.rollback_attached_mvcc_txs(true);
-                        connection.rollback_attached_wal_txns();
-                    }
-                }
-            }
             CommitState::CommittingAttachedMvcc {
                 state_machine,
-                db_id,
-                mv_store,
+                db_id: attached_db_id,
                 ..
-            } => {
-                if state_machine.inner_mut().cleanup_abandoned_commit(mv_store) {
-                    connection
-                        .get_pager_from_database_index(&*db_id)
-                        .expect("attached MVCC transaction should always have a pager")
-                        .end_read_tx();
-                    if connection
-                        .database_schemas()
-                        .write()
-                        .remove(db_id)
-                        .is_some()
-                    {
-                        connection.bump_prepare_context_generation();
-                    }
-                    connection.rollback_attached_mvcc_txs(true);
-                    connection.rollback_attached_wal_txns();
+            } if !state_machine.is_finalized() => {
+                if connection
+                    .database_schemas()
+                    .write()
+                    .remove(attached_db_id)
+                    .is_some()
+                {
+                    connection.bump_prepare_context_generation();
                 }
             }
-            CommitState::Ready | CommitState::Committing | CommitState::CommittingAttached => {}
-        }
+            CommitState::CommittingMvcc { state_machine } if !state_machine.is_finalized() => {}
+            _ => return, // no-op for already-finalized state machines and non-MVCC commit states
+        };
+
+        connection.rollback_attached_mvcc_txs(true);
+        connection.rollback_attached_wal_txns();
     }
 }
 
