@@ -21,6 +21,7 @@ pub struct Remaining {
     pub drop: u32,
     pub alter_table: u32,
     pub drop_index: u32,
+    pub analyze: u32,
     pub pragma_count: u32,
 }
 
@@ -43,6 +44,7 @@ impl Remaining {
         let total_drop = (max_interactions * opts.drop_table_weight) / total_weight;
         let total_alter_table = (max_interactions * opts.alter_table_weight) / total_weight;
         let total_drop_index = (max_interactions * opts.drop_index) / total_weight;
+        let total_analyze = (max_interactions * opts.analyze_weight) / total_weight;
         let total_pragma = (max_interactions * opts.pragma_weight) / total_weight;
 
         let remaining_select = total_select
@@ -73,7 +75,10 @@ impl Remaining {
             .unwrap_or_default();
 
         let mut remaining_drop_index = total_drop_index
-            .checked_sub(stats.alter_table_count)
+            .checked_sub(stats.drop_index_count)
+            .unwrap_or_default();
+        let remaining_analyze = total_analyze
+            .checked_sub(stats.analyze_count)
             .unwrap_or_default();
 
         if mvcc {
@@ -101,6 +106,7 @@ impl Remaining {
             update: remaining_update,
             alter_table: remaining_alter_table,
             drop_index: remaining_drop_index,
+            analyze: remaining_analyze,
             pragma_count: remaining_pragma,
         }
     }
@@ -120,6 +126,7 @@ pub(crate) struct InteractionStats {
     pub rollback_count: u32,
     pub alter_table_count: u32,
     pub drop_index_count: u32,
+    pub analyze_count: u32,
     pub pragma_count: u32,
 }
 
@@ -150,6 +157,7 @@ impl InteractionStats {
             Query::ReleaseSavepoint(_) => self.commit_count += 1,
             Query::AlterTable(_) => self.alter_table_count += 1,
             Query::DropIndex(_) => self.drop_index_count += 1,
+            Query::Analyze(_) => self.analyze_count += 1,
             Query::Placeholder => {}
             Query::Pragma(_) => self.pragma_count += 1,
         }
@@ -160,7 +168,7 @@ impl Display for InteractionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}",
+            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}, Analyze: {}",
             self.select_count,
             self.insert_count,
             self.delete_count,
@@ -173,6 +181,114 @@ impl Display for InteractionStats {
             self.rollback_count,
             self.alter_table_count,
             self.drop_index_count,
+            self.analyze_count,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sql_generation::{
+        generation::{GenerationContext, Opts},
+        model::table::{Index, Table},
+    };
+
+    use super::*;
+
+    #[derive(Default)]
+    struct TestContext {
+        opts: Opts,
+        tables: Vec<Table>,
+    }
+
+    impl GenerationContext for TestContext {
+        fn tables(&self) -> &Vec<Table> {
+            &self.tables
+        }
+
+        fn opts(&self) -> &Opts {
+            &self.opts
+        }
+    }
+
+    #[test]
+    fn drop_index_remaining_uses_drop_index_weight_and_count() {
+        let profile = QueryProfile {
+            select_weight: 0,
+            create_table_weight: 0,
+            create_index_weight: 0,
+            insert_weight: 0,
+            update_weight: 0,
+            delete_weight: 0,
+            drop_table_weight: 0,
+            alter_table_weight: 0,
+            drop_index: 10,
+            analyze_weight: 0,
+            pragma_weight: 0,
+            ..Default::default()
+        };
+        assert_eq!(profile.total_weight(), profile.drop_index);
+
+        let context = TestContext {
+            tables: vec![Table {
+                name: "t".to_string(),
+                columns: vec![],
+                rows: vec![],
+                indexes: vec![Index {
+                    table_name: "t".to_string(),
+                    index_name: "idx_t".to_string(),
+                    columns: vec![],
+                }],
+            }],
+            ..Default::default()
+        };
+
+        let remaining = Remaining::new(
+            100,
+            &profile,
+            &InteractionStats {
+                drop_index_count: 2,
+                alter_table_count: 999,
+                ..Default::default()
+            },
+            false,
+            &context,
+        );
+
+        assert_eq!(remaining.drop_index, 98);
+    }
+
+    #[test]
+    fn analyze_remaining_uses_analyze_weight_and_count() {
+        let profile = QueryProfile {
+            select_weight: 0,
+            create_table_weight: 0,
+            create_index_weight: 0,
+            insert_weight: 0,
+            update_weight: 0,
+            delete_weight: 0,
+            drop_table_weight: 0,
+            alter_table_weight: 0,
+            drop_index: 0,
+            analyze_weight: 10,
+            pragma_weight: 0,
+            ..Default::default()
+        };
+        assert_eq!(profile.total_weight(), profile.analyze_weight);
+
+        let remaining = Remaining::new(
+            100,
+            &profile,
+            &InteractionStats {
+                analyze_count: 2,
+                alter_table_count: 999,
+                drop_index_count: 999,
+                ..Default::default()
+            },
+            false,
+            &TestContext::default(),
+        );
+
+        assert_eq!(remaining.analyze, 98);
     }
 }

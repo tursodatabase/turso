@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sql_generation::model::query::select::SelectTable;
 use sql_generation::model::{
     query::{
-        Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select,
+        Analyze, AnalyzeTarget, Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select,
         alter_table::{AlterTable, AlterTableType},
         pragma::Pragma,
         select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
@@ -286,6 +286,7 @@ pub enum Query {
     CreateIndex(CreateIndex),
     AlterTable(AlterTable),
     DropIndex(DropIndex),
+    Analyze(Analyze),
     Begin(Begin),
     Commit(Commit),
     Rollback(Rollback),
@@ -339,6 +340,13 @@ impl Query {
             })
             | Query::DropIndex(DropIndex {
                 table_name: table, ..
+            })
+            | Query::Analyze(Analyze {
+                target:
+                    AnalyzeTarget::Table { table_name: table }
+                    | AnalyzeTarget::Index {
+                        table_name: table, ..
+                    },
             }) => IndexSet::from_iter([table.clone()]),
             Query::Begin(_)
             | Query::Commit(_)
@@ -347,7 +355,10 @@ impl Query {
             | Query::RollbackToSavepoint(_)
             | Query::ReleaseSavepoint(_)
             | Query::Placeholder
-            | Query::Pragma(_) => IndexSet::new(),
+            | Query::Pragma(_)
+            | Query::Analyze(Analyze {
+                target: AnalyzeTarget::All,
+            }) => IndexSet::new(),
         }
     }
     pub fn uses(&self) -> Vec<String> {
@@ -369,6 +380,13 @@ impl Query {
             })
             | Query::DropIndex(DropIndex {
                 table_name: table, ..
+            })
+            | Query::Analyze(Analyze {
+                target:
+                    AnalyzeTarget::Table { table_name: table }
+                    | AnalyzeTarget::Index {
+                        table_name: table, ..
+                    },
             }) => vec![table.clone()],
             Query::Begin(..) | Query::Commit(..) | Query::Rollback(..) => vec![],
             Query::Savepoint(..) | Query::RollbackToSavepoint(..) | Query::ReleaseSavepoint(..) => {
@@ -376,6 +394,9 @@ impl Query {
             }
             Query::Placeholder => vec![],
             Query::Pragma(_) => vec![],
+            Query::Analyze(Analyze {
+                target: AnalyzeTarget::All,
+            }) => vec![],
         }
     }
 
@@ -401,6 +422,7 @@ impl Query {
                 | Self::Drop(..)
                 | Self::AlterTable(..)
                 | Self::DropIndex(..)
+                | Self::Analyze(..)
         )
     }
 
@@ -432,6 +454,7 @@ impl Display for Query {
             Self::CreateIndex(create_index) => write!(f, "{create_index}"),
             Self::AlterTable(alter_table) => write!(f, "{alter_table}"),
             Self::DropIndex(drop_index) => write!(f, "{drop_index}"),
+            Self::Analyze(analyze) => write!(f, "{analyze}"),
             Self::Begin(begin) => write!(f, "{begin}"),
             Self::Commit(commit) => write!(f, "{commit}"),
             Self::Rollback(rollback) => write!(f, "{rollback}"),
@@ -461,6 +484,7 @@ impl Shadow for Query {
             Query::CreateIndex(create_index) => Ok(create_index.shadow(env)),
             Query::AlterTable(alter_table) => alter_table.shadow(env),
             Query::DropIndex(drop_index) => drop_index.shadow(env),
+            Query::Analyze(_) => Ok(vec![]),
             Query::Begin(begin) => Ok(begin.shadow(env)),
             Query::Commit(commit) => Ok(commit.shadow(env)),
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
@@ -485,6 +509,7 @@ bitflags! {
         const CREATE_INDEX = 1 << 6;
         const ALTER_TABLE = 1 << 7;
         const DROP_INDEX = 1 << 8;
+        const ANALYZE = 1 << 9;
     }
 }
 
@@ -515,6 +540,7 @@ impl From<QueryDiscriminants> for QueryCapabilities {
             QueryDiscriminants::CreateIndex => Self::CREATE_INDEX,
             QueryDiscriminants::AlterTable => Self::ALTER_TABLE,
             QueryDiscriminants::DropIndex => Self::DROP_INDEX,
+            QueryDiscriminants::Analyze => Self::ANALYZE,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback
@@ -542,6 +568,7 @@ impl QueryDiscriminants {
         QueryDiscriminants::CreateIndex,
         QueryDiscriminants::AlterTable,
         QueryDiscriminants::DropIndex,
+        QueryDiscriminants::Analyze,
         QueryDiscriminants::Pragma,
     ];
 }

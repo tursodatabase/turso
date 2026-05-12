@@ -1,3 +1,4 @@
+pub use analyze::{Analyze, AnalyzeTarget};
 pub use create::Create;
 pub use create_index::CreateIndex;
 pub use delete::Delete;
@@ -7,6 +8,7 @@ pub use insert::{Insert, OnConflict, UpdateSetItem};
 pub use select::Select;
 
 pub mod alter_table;
+pub mod analyze;
 pub mod create;
 pub mod create_index;
 pub mod delete;

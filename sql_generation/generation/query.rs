@@ -10,7 +10,8 @@ use crate::model::query::select::{
 };
 use crate::model::query::update::{SetValue, Update};
 use crate::model::query::{
-    Create, CreateIndex, Delete, Drop, DropIndex, Insert, OnConflict, Select, UpdateSetItem,
+    Analyze, AnalyzeTarget, Create, CreateIndex, Delete, Drop, DropIndex, Insert, OnConflict,
+    Select, UpdateSetItem,
 };
 use crate::model::table::{
     Column, ColumnType, Index, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
@@ -570,6 +571,61 @@ impl Arbitrary for Drop {
         Self {
             table: table.name.clone(),
         }
+    }
+}
+
+type AnalyzeChoice<'a, R> = (usize, Box<dyn Fn(&mut R) -> Option<Analyze> + 'a>);
+
+impl Arbitrary for Analyze {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
+        let has_tables = !env.tables().is_empty();
+        let has_indexes = env.tables().iter().any(|table| !table.indexes.is_empty());
+
+        let mut choices: Vec<AnalyzeChoice<'_, R>> = vec![(
+            4,
+            Box::new(|_| {
+                Some(Analyze {
+                    target: AnalyzeTarget::All,
+                })
+            }),
+        )];
+
+        if has_tables {
+            choices.push((
+                4,
+                Box::new(|rng| {
+                    let table = pick(env.tables(), rng);
+                    Some(Analyze {
+                        target: AnalyzeTarget::Table {
+                            table_name: table.name.clone(),
+                        },
+                    })
+                }),
+            ));
+        }
+
+        if has_indexes {
+            choices.push((
+                2,
+                Box::new(|rng| {
+                    let tables_with_indexes = env
+                        .tables()
+                        .iter()
+                        .filter(|table| !table.indexes.is_empty())
+                        .collect::<Vec<_>>();
+                    let table = pick(&tables_with_indexes, rng);
+                    let index = pick(&table.indexes, rng);
+                    Some(Analyze {
+                        target: AnalyzeTarget::Index {
+                            table_name: table.name.clone(),
+                            index_name: index.index_name.clone(),
+                        },
+                    })
+                }),
+            ));
+        }
+
+        backtrack(choices, rng).expect("analyze should always have at least the all-database form")
     }
 }
 

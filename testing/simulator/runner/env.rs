@@ -1163,6 +1163,9 @@ impl SimulatorEnv {
         if let Some(min_tick) = cli_opts.min_tick {
             profile.io.latency.min_tick = min_tick;
         }
+        if cli_opts.disable_analyze {
+            profile.query.analyze_weight = 0;
+        }
         if cli_opts.differential {
             // Disable faults when running against sqlite as we cannot control faults on it
             profile.io.enable = false;

@@ -109,6 +109,8 @@ pub struct SimulatorCLI {
     pub disable_create_index: bool,
     #[clap(long, help = "disable DROP Statement")]
     pub disable_drop: bool,
+    #[clap(long, help = "disable ANALYZE Statement")]
+    pub disable_analyze: bool,
     #[clap(
         long,
         help = "disable Insert-Values-Select Property",

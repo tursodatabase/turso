@@ -31,7 +31,7 @@ simulator covers and tests.
 | Statement                 | Status  | Comment                                                                           |
 | ------------------------- | ------- | --------------------------------------------------------------------------------- |
 | ALTER TABLE               | Partial | TODO                                                                              |
-| ANALYZE                   | No      |                                                                                   |
+| ANALYZE                   | Partial | Generates `ANALYZE`, `ANALYZE <table>`, and `ANALYZE <index>`; `sqlite_stat1` is not shadow-modeled. |
 | ATTACH DATABASE           | No      |                                                                                   |
 | BEGIN TRANSACTION         | Partial | TODO                                                                              |
 | COMMIT TRANSACTION        | Partial | TODO                                                                              |
