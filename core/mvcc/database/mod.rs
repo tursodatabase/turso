@@ -456,6 +456,60 @@ struct SavepointRollbackResult {
     deferred_fk_violations: isize,
 }
 
+#[derive(Debug, Default)]
+struct WriteSet {
+    entries: Vec<(RowID, RowVersions)>,
+    /// A set of the pointer addresses of the `RowVersions`. Used to deduplicate entries.
+    ///
+    /// This is correct because instances of [RowVersions] are created once per [RowID] and then
+    /// reused by cloning the [Arc]. It would be nice to encode this in the type system, but I'm
+    /// not sure how.
+    seen: HashSet<usize>,
+}
+
+impl WriteSet {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `true` if this `RowVersions` was not already contained in the write set.
+    fn insert(&mut self, id: RowID, row_versions: RowVersions) -> bool {
+        let ptr = Arc::as_ptr(&row_versions) as usize;
+        if self.seen.insert(ptr) {
+            self.entries.push((id, row_versions));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, (RowID, RowVersions)> {
+        self.entries.iter()
+    }
+
+    /// Retain entries where `keep(rowid, row_versions)` returns true.
+    fn retain<F: FnMut(&RowID, &RowVersions) -> bool>(&mut self, mut keep: F) {
+        let seen = &mut self.seen;
+        self.entries.retain(|(rowid, rv)| {
+            if keep(rowid, rv) {
+                true
+            } else {
+                seen.remove(&(Arc::as_ptr(rv) as usize));
+                false
+            }
+        });
+    }
+
+    /// Clones the write set into a [Vec].
+    fn to_vec(&self) -> Vec<(RowID, RowVersions)> {
+        self.entries.clone()
+    }
+}
+
 /// Transaction
 #[derive(Debug)]
 pub struct Transaction {
@@ -465,11 +519,8 @@ pub struct Transaction {
     tx_id: u64,
     /// The transaction begin timestamp.
     begin_ts: u64,
-    /// The transaction write set. Single-writer (the txn's own connection),
-    /// so plain `Mutex<Vec<_>>` is enough; the previous `SkipSet` was paying
-    /// for unused concurrent-insert semantics. Duplicates are allowed —
-    /// consumers (commit, rollback) dedup as needed.
-    write_set: Mutex<Vec<(RowID, RowVersions)>>,
+    /// The transaction write set. Only writer is the [Transaction]'s own connection.
+    write_set: Mutex<WriteSet>,
     /// The transaction read set.
     read_set: SkipSet<RowID>,
     /// The transaction header.
@@ -501,7 +552,7 @@ impl Transaction {
             state: TransactionState::Active.into(),
             tx_id,
             begin_ts,
-            write_set: Mutex::new(Vec::new()),
+            write_set: Mutex::new(WriteSet::new()),
             read_set: SkipSet::new(),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
@@ -529,7 +580,7 @@ impl Transaction {
                 .newly_added_to_write_set
                 .push((id.clone(), row_versions.clone()));
         }
-        self.write_set.lock().push((id, row_versions));
+        self.write_set.lock().insert(id, row_versions);
     }
 
     /// Begin a new savepoint for statement-level tracking.
@@ -986,9 +1037,6 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     /// Threaded through so that `finish_committed_tx` can clear the matching
     /// connection-level mv_tx slot atomically with `remove_tx`.
     db_id: usize,
-    /// Write set (rowids) sorted by table id and row id, along with a reference to the
-    /// corresponding versions.
-    write_set: Vec<(RowID, RowVersions)>,
     commit_coordinator: Arc<CommitCoordinator>,
     header: Arc<RwLock<Option<DatabaseHeader>>>,
     pager: Arc<Pager>,
@@ -1065,7 +1113,6 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             tx_id,
             connection,
             db_id,
-            write_set: Vec::new(),
             commit_coordinator,
             pager,
             header,
@@ -1339,7 +1386,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
 
         // Process schema rows (sqlite_schema) before data rows so that during log
         // replay the table_id_to_rootpage map is populated before data row inserts
-        // reference it. `self.write_set` is sorted by table_id descending (most
+        // reference it. `tx.write_set` is sorted by table_id descending (most
         // negative first), which would otherwise place data table rows
         // (e.g. table_id=-3) before schema rows (table_id=-1).
 
@@ -1415,19 +1462,21 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             }
         };
 
-        // First pass: schema rows only (ordering matters for recovery)
-        for (id, row_versions) in &self.write_set {
-            if id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                collect_versions(row_versions, &mut log_record);
+        {
+            let ws = tx.write_set.lock();
+            // First pass: schema rows only (ordering matters for recovery)
+            for (id, row_versions) in ws.iter() {
+                if id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                    collect_versions(row_versions, &mut log_record);
+                }
+            }
+            // Second pass: all non-schema rows
+            for (id, row_versions) in ws.iter() {
+                if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                    collect_versions(row_versions, &mut log_record);
+                }
             }
         }
-        // Second pass: all non-schema rows
-        for (id, row_versions) in &self.write_set {
-            if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                collect_versions(row_versions, &mut log_record);
-            }
-        }
-
         log_record
     }
 
@@ -1435,16 +1484,16 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     /// transaction has been finalized as Committed(end_ts).
     /// This must run as postprocessing step i.e. the txn is written to log and is durable
     fn rewrite_live_versions_to_timestamps(&self, mvcc_store: &Arc<MvStore<Clock>>, end_ts: u64) {
-        let tx_state = mvcc_store
-            .txs
-            .get(&self.tx_id)
-            .map(|entry| entry.value().state.load());
+        let tx_entry = mvcc_store.txs.get(&self.tx_id);
+        let tx = tx_entry.as_ref().map(|entry| entry.value());
         turso_assert!(
-            matches!(tx_state, Some(TransactionState::Committed(ts)) if ts == end_ts),
+            matches!(tx.map(|t| t.state.load()), Some(TransactionState::Committed(ts)) if ts == end_ts),
             "rewrite_live_versions_to_timestamps requires a committed transaction state"
         );
+        let Some(tx) = tx else { return };
 
-        for (_id, row_versions) in &self.write_set {
+        let ws = tx.write_set.lock();
+        for (_id, row_versions) in ws.iter() {
             let mut row_versions = row_versions.write();
             for row_version in row_versions.iter_mut() {
                 if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
@@ -1618,20 +1667,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                  ** 2. Validate if there are no phantoms by walking the scans from scan_set
                  */
                 tracing::trace!("commit_tx(tx_id={})", self.tx_id);
-                self.write_set
-                    .extend_from_slice(tx.write_set.lock().as_slice());
-                self.write_set.sort_by(|(a, _), (b, _)| {
-                    // table ids are negative, and sqlite_schema has id -1 so we want to sort in descending order of table id
-                    b.table_id.cmp(&a.table_id).then(a.row_id.cmp(&b.row_id))
-                });
-                // The transaction's write_set may now contain duplicates
-                // (e.g. INSERT then UPDATE on the same row), since
-                // `insert_to_write_set` no longer pays for a `contains`
-                // check. After the sort, equal RowIDs are adjacent, so
-                // `dedup_by_key` collapses them in linear time.
-                self.write_set.dedup_by(|a, b| a.0 == b.0);
+                let write_set_is_empty = tx.write_set.lock().is_empty();
                 // Header-only writes must not take this fast path; they need durable log records.
-                if self.write_set.is_empty() && !tx.header_dirty.load(Ordering::Acquire) {
+                if write_set_is_empty && !tx.header_dirty.load(Ordering::Acquire) {
                     turso_assert!(
                         tx.commit_dep_set.lock().is_empty(),
                         "MVCC read only transaction should not have commit dependencies on other txns"
@@ -1684,7 +1722,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .ok_or(LimboError::TxTerminated)?;
                 let tx = tx.value();
 
-                for (id, _chain) in &self.write_set {
+                for (id, _chain) in tx.write_set.lock().iter() {
                     if id.row_id.is_int_key() {
                         self.check_rowid_for_conflicts(id, *end_ts, tx, mvcc_store)?;
                     } else {
@@ -1736,7 +1774,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // going through CommitEnd. CommitEnd updates last_committed_tx_ts
                 // which would make a read-only transaction look like a write,
                 // causing spurious Busy errors from acquire_exclusive_tx.
-                if self.write_set.is_empty() && !tx.header_dirty.load(Ordering::Acquire) {
+                if tx.write_set.lock().is_empty() && !tx.header_dirty.load(Ordering::Acquire) {
                     turso_assert!(
                         tx.commit_dep_set.lock().is_empty(),
                         "MVCC read-only transaction should not have other transactions depending on it"
@@ -3713,7 +3751,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         // Snapshot under the lock so we can drop it before recursing into
         // `rollback_rowid` (which may take other locks).
-        let write_set_snapshot: Vec<(RowID, RowVersions)> = tx.write_set.lock().clone();
+        let write_set_snapshot: Vec<(RowID, RowVersions)> = tx.write_set.lock().to_vec();
         for (_rowid, row_versions) in &write_set_snapshot {
             for rv in row_versions.write().iter_mut() {
                 rollback_row_version(tx_id, rv);
@@ -3977,11 +4015,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = tx.value();
         // Single pass: drop entries that appear in `rowids` AND have no
         // surviving uncommitted version (parent savepoints may still pin
-        // them). Since `write_set` is now a Vec that tolerates duplicates,
-        // every matching occurrence is dropped together — equivalent to
-        // calling `remove` once per rowid against the old SkipSet.
+        // them).
         let mut write_set = tx.write_set.lock();
-        write_set.retain(|(rowid, _chain)| {
+        write_set.retain(|rowid, _rv| {
             if !rowids.contains(rowid) {
                 return true;
             }
