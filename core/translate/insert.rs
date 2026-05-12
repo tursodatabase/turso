@@ -1166,6 +1166,7 @@ pub fn translate_insert(
             btree_table.has_autoincrement,
             notnull_col_exists,
             has_unique,
+            !result_columns.is_empty(),
         );
     }
 

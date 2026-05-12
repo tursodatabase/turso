@@ -11,8 +11,10 @@
 //! unnecessary. The condition is: `usesStmtJournal = isMultiWrite && mayAbort`.
 //!
 //! - **isMultiWrite**: the statement may modify more than one row (or more than
-//!   one table, e.g. FK counter + data table). A single-row write is atomic —
-//!   either all writes happen or none do — so no partial state to roll back.
+//!   one table, e.g. FK counter + data table). A single-row write is normally
+//!   atomic — either all writes happen or none do — so no partial state to roll
+//!   back. Post-write RETURNING evaluation is the exception: it can abort after
+//!   the row write has already happened.
 //!
 //! - **mayAbort**: the statement may fail mid-execution with an ABORT (e.g.
 //!   constraint violation, FK violation, RAISE(ABORT) in a trigger). If a
@@ -135,6 +137,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     has_autoincrement: bool,
     notnull_col_exists: bool,
     has_unique: bool,
+    has_returning: bool,
 ) {
     let index_modes: Vec<(Option<ResolveType>, bool)> = resolver.with_schema(database_id, |s| {
         s.get_indices(&table.name)
@@ -150,6 +153,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     let has_check = !table.check_constraints.is_empty();
     let may_abort = has_triggers
         || has_fks
+        || has_returning
         || constraint_may_abort(
             has_statement_conflict,
             statement_conflict,
@@ -162,11 +166,13 @@ pub(crate) fn set_insert_stmt_journal_flags(
 
     // UPSERT is multi-write because DO UPDATE modifies an existing row.
     // AUTOINCREMENT is multi-write because sqlite_sequence is updated before constraint checks.
+    // RETURNING can abort after the physical row write, even for a single-row INSERT.
     if !inserting_multiple_rows
         && !has_triggers
         && !any_replace
         && !has_upsert
         && !has_autoincrement
+        && !has_returning
     {
         program.set_multi_write(false);
     }
@@ -199,6 +205,7 @@ pub(crate) fn set_update_stmt_journal_flags(
         &btree_table,
     );
     let has_fks = table_has_fks(connection, resolver, database_id, btree_table.name.as_str());
+    let has_returning = plan.returning.as_ref().is_some_and(|r| !r.is_empty());
 
     let or_conflict = plan.or_conflict.unwrap_or(ResolveType::Abort);
     let has_statement_conflict = plan.or_conflict.is_some();
@@ -212,9 +219,10 @@ pub(crate) fn set_update_stmt_journal_flags(
 
     // Ephemeral tables (used for key mutation / Halloween protection) always scan all
     // collected rows, so affects_max_1_row() returns false — multi_write stays true.
+    // RETURNING can abort after the physical row write, even for a single-row UPDATE.
     let is_single_row =
         plan.limit.is_none() && plan.offset.is_none() && target_table.op.affects_max_1_row();
-    if is_single_row && !has_triggers && !any_replace && !has_fks {
+    if is_single_row && !has_triggers && !any_replace && !has_fks && !has_returning {
         program.set_multi_write(false);
     }
 
@@ -233,6 +241,7 @@ pub(crate) fn set_update_stmt_journal_flags(
 
     let may_abort = has_triggers
         || has_fks
+        || has_returning
         || constraint_may_abort(
             has_statement_conflict,
             or_conflict,
@@ -264,18 +273,20 @@ pub(crate) fn set_delete_stmt_journal_flags(
     };
     let has_triggers = plan.safety.reasons.contains(&DmlSafetyReason::Trigger);
     let has_fks = table_has_fks(connection, resolver, database_id, btree_table.name.as_str());
+    let has_returning = !plan.result_columns.is_empty();
 
     // After rowset rewriting (for triggers/safety), the target table op is reset to a
     // Scan, so affects_max_1_row correctly returns false — no false optimization.
+    // RETURNING can abort after the physical row write, even for a single-row DELETE.
     let is_single_row =
         plan.limit.is_none() && plan.offset.is_none() && target_table.op.affects_max_1_row();
-    if is_single_row && !has_triggers && !has_fks {
+    if is_single_row && !has_triggers && !has_fks && !has_returning {
         program.set_multi_write(false);
     }
 
-    // DELETE has no ON CONFLICT clause, so NOT NULL/CHECK/UNIQUE don't apply —
-    // only triggers (RAISE(ABORT)) or FK violations can abort.
-    if !has_triggers && !has_fks {
+    // DELETE has no ON CONFLICT clause, so NOT NULL/CHECK/UNIQUE don't apply.
+    // RETURNING runs after each physical write and can still abort the statement.
+    if !has_triggers && !has_fks && !has_returning {
         program.set_may_abort(false);
     }
     Ok(())
