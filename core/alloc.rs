@@ -333,6 +333,55 @@ pub trait TursoIteratorExt: Iterator + Sized {
     }
 }
 
+impl<T, C> TursoFromIterator<Option<T>> for Option<C>
+where
+    C: TursoFromIterator<T>,
+{
+    fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
+    where
+        I: IntoIterator<Item = Option<T>>,
+    {
+        let mut saw_none = false;
+        let values = C::try_from_iter(iter.into_iter().scan((), |(), item| match item {
+            Some(value) => Some(value),
+            None => {
+                saw_none = true;
+                None
+            }
+        }))?;
+        if saw_none {
+            Ok(None)
+        } else {
+            Ok(Some(values))
+        }
+    }
+}
+
+impl<T, E, F, C> TursoFromIterator<Result<T, E>> for Result<C, F>
+where
+    C: TursoFromIterator<T>,
+    F: From<E>,
+{
+    fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
+    where
+        I: IntoIterator<Item = Result<T, E>>,
+    {
+        let mut error = None;
+        let values = C::try_from_iter(iter.into_iter().scan((), |(), item| match item {
+            Ok(value) => Some(value),
+            Err(err) => {
+                error = Some(F::from(err));
+                None
+            }
+        }))?;
+        if let Some(error) = error {
+            Ok(Err(error))
+        } else {
+            Ok(Ok(values))
+        }
+    }
+}
+
 impl<T> TursoAllocExt for Vec<T> {
     fn new() -> Self {
         vec()
@@ -969,6 +1018,71 @@ mod tests {
         assert_eq!(map.get("one"), Some(&1));
         assert!(set.contains(&3));
         assert_eq!(heap.peek(), Some(&3));
+    }
+
+    #[test]
+    fn iterator_try_collect_builds_option_collection() {
+        let values: Option<Vec<_>> = [Some(1), Some(2), Some(3)]
+            .into_iter()
+            .try_collect()
+            .unwrap();
+        let none: Option<Vec<_>> = [Some(1), None, Some(3)].into_iter().try_collect().unwrap();
+
+        assert_eq!(values.unwrap().as_slice(), &[1, 2, 3]);
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn iterator_try_collect_builds_result_collection() {
+        let values: Result<Vec<_>, &str> = [Ok(1), Ok(2), Ok(3)].into_iter().try_collect().unwrap();
+        let error: Result<Vec<_>, &str> = [Ok(1), Err("bad"), Ok(3)]
+            .into_iter()
+            .try_collect()
+            .unwrap();
+
+        assert_eq!(values.unwrap().as_slice(), &[1, 2, 3]);
+        assert_eq!(error, Err("bad"));
+    }
+
+    #[test]
+    fn iterator_try_collect_converts_result_error() {
+        #[derive(Debug, PartialEq)]
+        struct Converted(&'static str);
+
+        impl From<&'static str> for Converted {
+            fn from(value: &'static str) -> Self {
+                Self(value)
+            }
+        }
+
+        let values: Result<Vec<_>, Converted> = [
+            Ok::<_, &'static str>(1),
+            Ok::<_, &'static str>(2),
+            Ok::<_, &'static str>(3),
+        ]
+        .into_iter()
+        .try_collect::<Result<Vec<_>, Converted>>()
+        .unwrap();
+        let error: Result<Vec<_>, Converted> = [Ok(1), Err("bad"), Ok(3)]
+            .into_iter()
+            .try_collect::<Result<Vec<_>, Converted>>()
+            .unwrap();
+
+        assert_eq!(values.unwrap().as_slice(), &[1, 2, 3]);
+        assert_eq!(error, Err(Converted("bad")));
+    }
+
+    #[test]
+    fn iterator_try_collect_accepts_try_vec_results() {
+        let values: crate::Result<Vec<_>> = [1usize, 2]
+            .into_iter()
+            .map(|count| try_vec![false; count])
+            .try_collect::<crate::Result<Vec<_>>>()
+            .unwrap();
+        let values = values.unwrap();
+
+        assert_eq!(values[0].as_slice(), &[false]);
+        assert_eq!(values[1].as_slice(), &[false, false]);
     }
 
     #[test]
