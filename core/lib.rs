@@ -1,4 +1,4 @@
-#![cfg_attr(nightly, feature(allocator_api, btreemap_alloc))]
+#![cfg_attr(nightly, feature(allocator_api, btreemap_alloc, try_with_capacity))]
 
 pub mod alloc;
 pub mod busy;

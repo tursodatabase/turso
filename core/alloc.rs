@@ -66,7 +66,7 @@ pub type Vec<T> = allocator_api2::vec::Vec<T, TursoAllocator>;
 #[cfg(nightly)]
 pub type Vec<T> = std::vec::Vec<T, TursoAllocator>;
 
-pub use crate::__turso_alloc_vec as vec;
+pub use crate::{__turso_alloc_try_vec as try_vec, __turso_alloc_vec as vec};
 
 #[doc(hidden)]
 #[macro_export]
@@ -99,6 +99,37 @@ macro_rules! __turso_alloc_vec {
             );
         $(values.push($element);)+
         values
+    }};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __turso_alloc_try_vec {
+    () => {
+        Ok::<_, $crate::alloc::TryReserveError>(
+            <$crate::alloc::Vec<_> as $crate::alloc::TursoAllocExt>::new(),
+        )
+    };
+    ($element:expr; $count:expr) => {{
+        (|| {
+            let count = $count;
+            let mut values =
+                <$crate::alloc::Vec<_> as $crate::alloc::TursoTryWithCapacityExt>::try_with_capacity(
+                    count,
+                )?;
+            values.resize(count, $element);
+            Ok::<_, $crate::alloc::TryReserveError>(values)
+        })()
+    }};
+    ($($element:expr),+ $(,)?) => {{
+        (|| {
+            let mut values =
+                <$crate::alloc::Vec<_> as $crate::alloc::TursoTryWithCapacityExt>::try_with_capacity(
+                    $crate::__turso_alloc_vec_count!($($element),+),
+                )?;
+            $(values.try_push($element)?;)+
+            Ok::<_, $crate::alloc::TryReserveError>(values)
+        })()
     }};
 }
 
@@ -234,6 +265,10 @@ pub trait TursoAllocExt {
     fn new() -> Self;
 }
 
+pub trait TursoTryWithCapacityExt: Sized {
+    fn try_with_capacity(capacity: usize) -> Result<Self, TryReserveError>;
+}
+
 pub trait TursoNewExt<T> {
     fn new(value: T) -> Self;
 }
@@ -283,6 +318,21 @@ pub trait TursoBinaryHeapExt<T>: Sized {
         I: IntoIterator<Item = T>;
 }
 
+pub trait TursoFromIterator<T>: Sized {
+    fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
+    where
+        I: IntoIterator<Item = T>;
+}
+
+pub trait TursoIteratorExt: Iterator + Sized {
+    fn try_collect<C>(self) -> Result<C, TryReserveError>
+    where
+        C: TursoFromIterator<Self::Item>,
+    {
+        C::try_from_iter(self)
+    }
+}
+
 impl<T> TursoAllocExt for Vec<T> {
     fn new() -> Self {
         vec()
@@ -312,6 +362,40 @@ impl<T> TursoVecExt<T> for Vec<T> {
             self.try_push(value)?;
         }
         Ok(())
+    }
+}
+
+impl<T> TursoTryWithCapacityExt for Vec<T> {
+    fn try_with_capacity(capacity: usize) -> Result<Self, TryReserveError> {
+        #[cfg(not(nightly))]
+        {
+            let mut values = vec();
+            values
+                .try_reserve(capacity)
+                .map_err(TryReserveError::from)?;
+            Ok(values)
+        }
+        #[cfg(nightly)]
+        {
+            std::vec::Vec::try_with_capacity_in(capacity, TursoAllocator)
+                .map_err(TryReserveError::from)
+        }
+    }
+}
+
+impl<T> TursoFromIterator<T> for Vec<T> {
+    fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let iter = iter.into_iter();
+        let (lower, upper) = iter.size_hint();
+        let capacity = upper.unwrap_or(lower);
+        let mut values = <Self as TursoTryWithCapacityExt>::try_with_capacity(capacity)?;
+        for value in iter {
+            values.try_push(value)?;
+        }
+        Ok(values)
     }
 }
 
@@ -383,6 +467,40 @@ where
     }
 }
 
+impl<K, V, S> TursoTryWithCapacityExt for HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher + Default,
+{
+    fn try_with_capacity(capacity: usize) -> Result<Self, TryReserveError> {
+        let mut values = <Self as TursoAllocExt>::new();
+        values
+            .try_reserve(capacity)
+            .map_err(TryReserveError::from)?;
+        Ok(values)
+    }
+}
+
+impl<K, V, S> TursoFromIterator<(K, V)> for HashMap<K, V, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher + Default,
+{
+    fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+    {
+        let iter = iter.into_iter();
+        let (lower, upper) = iter.size_hint();
+        let capacity = upper.unwrap_or(lower);
+        let mut values = <Self as TursoTryWithCapacityExt>::try_with_capacity(capacity)?;
+        for (key, value) in iter {
+            TursoHashMapExt::try_insert(&mut values, key, value)?;
+        }
+        Ok(values)
+    }
+}
+
 impl<T, S> TursoHashSetExt<T> for HashSet<T, S>
 where
     T: Eq + Hash,
@@ -405,6 +523,40 @@ where
             TursoHashSetExt::try_insert(self, value)?;
         }
         Ok(())
+    }
+}
+
+impl<T, S> TursoTryWithCapacityExt for HashSet<T, S>
+where
+    T: Eq + Hash,
+    S: BuildHasher + Default,
+{
+    fn try_with_capacity(capacity: usize) -> Result<Self, TryReserveError> {
+        let mut values = <Self as TursoAllocExt>::new();
+        values
+            .try_reserve(capacity)
+            .map_err(TryReserveError::from)?;
+        Ok(values)
+    }
+}
+
+impl<T, S> TursoFromIterator<T> for HashSet<T, S>
+where
+    T: Eq + Hash,
+    S: BuildHasher + Default,
+{
+    fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let iter = iter.into_iter();
+        let (lower, upper) = iter.size_hint();
+        let capacity = upper.unwrap_or(lower);
+        let mut values = <Self as TursoTryWithCapacityExt>::try_with_capacity(capacity)?;
+        for value in iter {
+            TursoHashSetExt::try_insert(&mut values, value)?;
+        }
+        Ok(values)
     }
 }
 
@@ -500,6 +652,32 @@ impl<T> TursoVecDequeExt<T> for VecDeque<T> {
     }
 }
 
+impl<T> TursoTryWithCapacityExt for VecDeque<T> {
+    fn try_with_capacity(capacity: usize) -> Result<Self, TryReserveError> {
+        let mut values = <Self as TursoAllocExt>::new();
+        values
+            .try_reserve(capacity)
+            .map_err(TryReserveError::from)?;
+        Ok(values)
+    }
+}
+
+impl<T> TursoFromIterator<T> for VecDeque<T> {
+    fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let iter = iter.into_iter();
+        let (lower, upper) = iter.size_hint();
+        let capacity = upper.unwrap_or(lower);
+        let mut values = <Self as TursoTryWithCapacityExt>::try_with_capacity(capacity)?;
+        for value in iter {
+            values.try_push_back(value)?;
+        }
+        Ok(values)
+    }
+}
+
 #[cfg(not(nightly))]
 fn binary_heap<T: Ord>() -> BinaryHeap<T> {
     std::collections::BinaryHeap::new()
@@ -545,6 +723,34 @@ impl<T: Ord> TursoBinaryHeapExt<T> for BinaryHeap<T> {
         Ok(())
     }
 }
+
+impl<T: Ord> TursoTryWithCapacityExt for BinaryHeap<T> {
+    fn try_with_capacity(capacity: usize) -> Result<Self, TryReserveError> {
+        let mut values = <Self as TursoAllocExt>::new();
+        values
+            .try_reserve(capacity)
+            .map_err(TryReserveError::from)?;
+        Ok(values)
+    }
+}
+
+impl<T: Ord> TursoFromIterator<T> for BinaryHeap<T> {
+    fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let iter = iter.into_iter();
+        let (lower, upper) = iter.size_hint();
+        let capacity = upper.unwrap_or(lower);
+        let mut values = <Self as TursoTryWithCapacityExt>::try_with_capacity(capacity)?;
+        for value in iter {
+            values.try_push(value)?;
+        }
+        Ok(values)
+    }
+}
+
+impl<I: Iterator> TursoIteratorExt for I {}
 
 #[cfg(not(nightly))]
 fn linked_list<T>() -> LinkedList<T> {
@@ -734,5 +940,49 @@ mod tests {
         assert_eq!(values.pop(), Some(2));
         assert_eq!(values.pop(), Some(1));
         assert_eq!(values.pop(), None);
+    }
+
+    #[test]
+    fn iterator_try_collect_builds_turso_vec() {
+        let values: Vec<_> = [1, 2, 3].into_iter().try_collect().unwrap();
+
+        assert_eq!(values.as_slice(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn try_vec_macro_builds_turso_vecs() {
+        let empty: Vec<usize> = try_vec![].unwrap();
+        let repeated: Vec<_> = try_vec![7; 3].unwrap();
+        let listed: Vec<_> = try_vec![1, 2, 3].unwrap();
+
+        assert!(empty.is_empty());
+        assert_eq!(repeated.as_slice(), &[7, 7, 7]);
+        assert_eq!(listed.as_slice(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn iterator_try_collect_builds_turso_collections() {
+        let map: HashMap<_, _> = [("one", 1), ("two", 2)].into_iter().try_collect().unwrap();
+        let set: HashSet<_> = [1, 2, 3].into_iter().try_collect().unwrap();
+        let heap: BinaryHeap<_> = [1, 3, 2].into_iter().try_collect().unwrap();
+
+        assert_eq!(map.get("one"), Some(&1));
+        assert!(set.contains(&3));
+        assert_eq!(heap.peek(), Some(&3));
+    }
+
+    #[test]
+    fn try_with_capacity_builds_turso_collections() {
+        let values: Vec<usize> = TursoTryWithCapacityExt::try_with_capacity(3).unwrap();
+        let map: HashMap<usize, usize> = TursoTryWithCapacityExt::try_with_capacity(3).unwrap();
+        let set: HashSet<usize> = TursoTryWithCapacityExt::try_with_capacity(3).unwrap();
+        let queue: VecDeque<usize> = TursoTryWithCapacityExt::try_with_capacity(3).unwrap();
+        let heap: BinaryHeap<usize> = TursoTryWithCapacityExt::try_with_capacity(3).unwrap();
+
+        assert!(values.capacity() >= 3);
+        assert!(map.capacity() >= 3);
+        assert!(set.capacity() >= 3);
+        assert!(queue.capacity() >= 3);
+        assert!(heap.capacity() >= 3);
     }
 }

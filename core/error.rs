@@ -115,6 +115,31 @@ impl From<crate::alloc::TryReserveError> for LimboError {
     }
 }
 
+#[cfg(not(nightly))]
+impl From<allocator_api2::collections::TryReserveError> for LimboError {
+    fn from(_: allocator_api2::collections::TryReserveError) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+impl From<std::collections::TryReserveError> for LimboError {
+    fn from(_: std::collections::TryReserveError) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+impl From<bumpalo::AllocErr> for LimboError {
+    fn from(_: bumpalo::AllocErr) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+impl From<bumpalo::collections::CollectionAllocErr> for LimboError {
+    fn from(_: bumpalo::collections::CollectionAllocErr) -> Self {
+        Self::OutOfMemory
+    }
+}
+
 #[cfg(target_family = "unix")]
 impl From<rustix::io::Errno> for LimboError {
     fn from(value: rustix::io::Errno) -> Self {
