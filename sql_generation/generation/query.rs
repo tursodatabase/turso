@@ -780,6 +780,21 @@ fn get_column_diff(table: &Table) -> IndexSet<&str> {
         .flat_map(|idx| idx.columns.iter().map(|(name, _)| name.as_str()))
         .collect();
 
+    // The engine rejects `DROP COLUMN c` with
+    // `ParseError("cannot drop column \"c\": indexed")` when `c` appears in any
+    // partial-index `WHERE` clause (see `core/translate/alter.rs`). Mirror that
+    // here so the generator never picks such a column.
+    for idx in &table.indexes {
+        let Some(pred) = idx.where_clause.as_ref() else {
+            continue;
+        };
+        for name in pred.referenced_column_names() {
+            if let Some(col) = table.columns.iter().find(|c| c.name == name) {
+                undropable.insert(col.name.as_str());
+            }
+        }
+    }
+
     undropable.extend(
         table
             .columns
