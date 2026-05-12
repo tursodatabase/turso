@@ -31,4 +31,4 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           registry-api-key: ${{ secrets.FOSSIER_REGISTRY_API_KEY }}
-          contact-url: "https://discord.gg/mNUkCHs2R"
+          contact-url: "https://discord.gg/CnXmpukt4"
