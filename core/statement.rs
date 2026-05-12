@@ -290,15 +290,19 @@ impl Statement {
                 .fetch_add(1, Ordering::SeqCst);
             self.counted_as_active_root = true;
         }
-        if matches!(self.state.execution_state, ProgramExecutionState::Init)
-            && !self
+        if matches!(self.state.execution_state, ProgramExecutionState::Init) {
+            if self.program.connection.mvcc_enabled() {
+                self.program.connection.maybe_update_schema();
+            }
+            if !self
                 .program
                 .prepare_context
                 .matches_connection(&self.program.connection)
-        {
-            if let Err(err) = self.reprepare() {
-                self.release_active_root_if_counted();
-                return Err(err);
+            {
+                if let Err(err) = self.reprepare() {
+                    self.release_active_root_if_counted();
+                    return Err(err);
+                }
             }
         }
 

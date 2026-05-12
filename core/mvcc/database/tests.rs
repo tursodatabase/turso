@@ -2344,8 +2344,10 @@ fn test_prepared_index_lookup_reprepares_after_checkpoint_root_publish() {
     assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 1);
 }
 
-/// What this test checks: the public statement API can yield in auto-checkpoint and then surface a post-durable-boundary checkpoint failure without losing committed root-page state.
-/// Why this matters: checkpoint roots are visible through WAL at this boundary, so error cleanup must keep integrity_check and reads coherent.
+/// Runs an auto-checkpoint, forces it to yield, then injects an error after the
+/// pager commit has made the new root pages visible. Even though later checkpoint
+/// cleanup fails, prepared integrity_check statements must use the committed root
+/// pages and report a clean database.
 #[test]
 fn test_integrity_check_after_checkpoint_io_yield_then_post_durable_failure_uses_user_apis() {
     let db = MvccTestDbNoConn::new_with_random_db();

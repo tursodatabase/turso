@@ -732,9 +732,31 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         }
     }
 
-    fn publish_checkpointed_schema_roots(&mut self) -> Result<()> {
+    fn has_unpublished_schema_changes(&self) -> bool {
+        let schema = self.connection.db.schema.lock();
+        !schema.dropped_root_pages.is_empty()
+            || schema
+                .tables
+                .values()
+                .any(|table| table.btree().is_some_and(|btree| btree.root_page < 0))
+            || schema
+                .indexes
+                .values()
+                .flatten()
+                .any(|index| index.root_page < 0)
+    }
+
+    fn has_pending_root_publication(&self) -> bool {
+        !self.created_btrees.is_empty() || self.has_unpublished_schema_changes()
+    }
+
+    fn publish_checkpointed_schema_roots(&mut self) {
+        if !self.has_pending_root_publication() {
+            return;
+        }
+
         // Patch sqlite_schema in MV Store to contain positive rootpages instead of negative ones
-        // for tables and indexes that were flushed to the physical database
+        // for tables and indexes that were flushed to the physical database.
         for (sqlite_schema_rowid, (_, row_version)) in self.created_btrees.drain() {
             let key = RowID {
                 table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
@@ -763,60 +785,58 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
         }
 
-        // Patch in-memory schema to do the same
-        self.connection.db.with_schema_mut(|schema| {
-            for table in schema.tables.values_mut() {
-                let table = Arc::get_mut(table).expect("this should be the only reference");
-                let Some(btree_table) = table.btree_mut() else {
-                    continue;
-                };
-                let btree_table = Arc::make_mut(btree_table);
-                if btree_table.root_page < 0 {
-                    let table_id = MVTableId::from(btree_table.root_page);
+        if !self.has_unpublished_schema_changes() {
+            return;
+        }
+
+        // Patch in-memory schema to do the same. This must happen as soon as the
+        // pager commit succeeds because the committed root pages are then visible
+        // through WAL even if the later WAL checkpoint/log truncation is busy.
+        let mut schema_ref = self.connection.db.schema.lock();
+        let schema = Arc::make_mut(&mut *schema_ref);
+        for table in schema.tables.values_mut() {
+            let table = Arc::get_mut(table).expect("this should be the only reference");
+            let Some(btree_table) = table.btree_mut() else {
+                continue;
+            };
+            let btree_table = Arc::make_mut(btree_table);
+            if btree_table.root_page < 0 {
+                let table_id = MVTableId::from(btree_table.root_page);
+                let entry = self
+                    .mvstore
+                    .table_id_to_rootpage
+                    .get(&table_id)
+                    .expect("we should have checkpointed table with table_id {table_id:?}");
+                let value = entry
+                    .value()
+                    .expect("table with id {table_id:?} should have a mapping");
+                btree_table.root_page = value as i64;
+            }
+        }
+        for table_index_list in schema.indexes.values_mut() {
+            for index in table_index_list.iter_mut() {
+                if index.root_page < 0 {
+                    let table_id = MVTableId::from(index.root_page);
                     let entry = self
                         .mvstore
                         .table_id_to_rootpage
                         .get(&table_id)
-                        .expect("we should have checkpointed table with table_id {table_id:?}");
+                        .expect("we should have checkpointed index with table_id {table_id:?}");
                     let value = entry
                         .value()
-                        .expect("table with id {table_id:?} should have a mapping");
-                    btree_table.root_page = value as i64;
+                        .expect("index with id {table_id:?} should have a mapping");
+                    let index = Arc::make_mut(index);
+                    index.root_page = value as i64;
                 }
             }
-            for table_index_list in schema.indexes.values_mut() {
-                for index in table_index_list.iter_mut() {
-                    if index.root_page < 0 {
-                        let table_id = MVTableId::from(index.root_page);
-                        let entry =
-                            self.mvstore.table_id_to_rootpage.get(&table_id).expect(
-                                "we should have checkpointed index with table_id {table_id:?}",
-                            );
-                        let value = entry
-                            .value()
-                            .expect("index with id {table_id:?} should have a mapping");
-                        let index = Arc::make_mut(index);
-                        index.root_page = value as i64;
-                    }
-                }
-            }
+        }
 
-            schema.schema_version += 1;
-            // Clear dropped root pages now that the checkpoint has completed.
-            // The btree pages for dropped tables have been freed, so integrity_check
-            // no longer needs to track them.
-            schema.dropped_root_pages.clear();
-            let _ = self.pager.io.block(|| {
-                self.pager.with_header_mut(|header| {
-                    header.schema_cookie = schema.schema_version.into();
-                    self.mvstore.global_header.write().replace(*header);
-                    IOResult::Done(())
-                })
-            })?;
-            Ok(())
-        })?;
-
-        Ok(())
+        // Clear dropped root pages now that the pager commit contains the btree frees.
+        // integrity_check should now follow the committed freelist state instead.
+        schema.dropped_root_pages.clear();
+        drop(schema_ref);
+        *self.connection.schema.write() = self.connection.db.clone_schema();
+        self.connection.bump_prepare_context_generation();
     }
 
     /// Garbage-collect row versions for rows that were just checkpointed.
@@ -1558,7 +1578,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             )
                         })?;
                         self.mvstore.global_header.write().replace(header);
+                        self.publish_checkpointed_schema_roots();
                         inject_transition_failure!(
+                            self,
+                            CheckpointYieldPoint::AfterDurableBoundaryAdvanced
+                        );
+                        inject_transition_yield!(
                             self,
                             CheckpointYieldPoint::AfterDurableBoundaryAdvanced
                         );
@@ -1668,7 +1693,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             CheckpointState::Finalize => {
                 tracing::debug!("Releasing blocking checkpoint lock");
-                self.publish_checkpointed_schema_roots()?;
+                turso_assert!(
+                    !self.has_pending_root_publication(),
+                    "checkpoint finalized after pager writes without publishing schema changes"
+                );
 
                 self.mvstore
                     .durable_txid_max
