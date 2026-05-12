@@ -26,7 +26,7 @@ use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::{sync::Arc, Connection, Result};
-use turso_parser::ast::{ResolveType, TriggerEvent};
+use turso_parser::ast::{Expr, LikeOperator, ResolveType, TriggerEvent};
 
 /// Check whether any DDL-level constraint (IPK or index) uses REPLACE.
 pub(crate) fn any_index_or_ipk_has_replace(
@@ -64,6 +64,173 @@ fn table_has_fks(
     connection.foreign_keys_enabled()
         && (resolver.with_schema(database_id, |s| s.has_child_fks(table_name))
             || resolver.with_schema(database_id, |s| s.any_resolved_fks_referencing(table_name)))
+}
+
+fn expr_depends_on_row(expr: &Expr) -> bool {
+    match expr {
+        // Planned DML expressions are usually bound to Column/RowId. Schema-stored
+        // index expressions still contain identifiers, and here they only appear
+        // after the index was selected for maintenance.
+        Expr::Column { .. }
+        | Expr::DoublyQualified(_, _, _)
+        | Expr::Id(_)
+        | Expr::Name(_)
+        | Expr::Qualified(_, _)
+        | Expr::RowId { .. }
+        | Expr::Register(_)
+        | Expr::SubqueryResult { .. } => true,
+        Expr::Exists(_) | Expr::Subquery(_) | Expr::InSelect { .. } => true,
+        Expr::Between {
+            lhs, start, end, ..
+        } => expr_depends_on_row(lhs) || expr_depends_on_row(start) || expr_depends_on_row(end),
+        Expr::Binary(lhs, _, rhs) => expr_depends_on_row(lhs) || expr_depends_on_row(rhs),
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            base.as_ref().is_some_and(|expr| expr_depends_on_row(expr))
+                || when_then_pairs
+                    .iter()
+                    .any(|(when, then)| expr_depends_on_row(when) || expr_depends_on_row(then))
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|expr| expr_depends_on_row(expr))
+        }
+        Expr::Cast { expr, .. }
+        | Expr::Collate(expr, _)
+        | Expr::IsNull(expr)
+        | Expr::NotNull(expr)
+        | Expr::Unary(_, expr)
+        | Expr::FieldAccess { base: expr, .. } => expr_depends_on_row(expr),
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter_over,
+            ..
+        } => {
+            args.iter().any(|expr| expr_depends_on_row(expr))
+                || order_by.iter().any(|col| expr_depends_on_row(&col.expr))
+                || filter_over
+                    .filter_clause
+                    .as_ref()
+                    .is_some_and(|expr| expr_depends_on_row(expr))
+        }
+        Expr::FunctionCallStar { filter_over, .. } => filter_over
+            .filter_clause
+            .as_ref()
+            .is_some_and(|expr| expr_depends_on_row(expr)),
+        Expr::InList { lhs, rhs, .. } => {
+            expr_depends_on_row(lhs) || rhs.iter().any(|expr| expr_depends_on_row(expr))
+        }
+        Expr::InTable { lhs, args, .. } => {
+            expr_depends_on_row(lhs) || args.iter().any(|expr| expr_depends_on_row(expr))
+        }
+        Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            expr_depends_on_row(lhs)
+                || expr_depends_on_row(rhs)
+                || escape
+                    .as_ref()
+                    .is_some_and(|expr| expr_depends_on_row(expr))
+        }
+        Expr::Parenthesized(exprs) => exprs.iter().any(|expr| expr_depends_on_row(expr)),
+        Expr::Raise(_, expr) => expr.as_ref().is_some_and(|expr| expr_depends_on_row(expr)),
+        Expr::Array { elements } => elements.iter().any(|expr| expr_depends_on_row(expr)),
+        Expr::Subscript { base, index } => expr_depends_on_row(base) || expr_depends_on_row(index),
+        Expr::Literal(_) | Expr::Variable(_) | Expr::Default => false,
+    }
+}
+
+fn expr_has_runtime_abort_source(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { .. }
+        | Expr::FunctionCallStar { .. }
+        | Expr::Raise(_, _)
+        | Expr::Exists(_)
+        | Expr::Subquery(_)
+        | Expr::SubqueryResult { .. }
+        | Expr::InSelect { .. }
+        | Expr::InTable { .. }
+        | Expr::FieldAccess { .. }
+        | Expr::Subscript { .. } => true,
+        Expr::Like {
+            lhs,
+            op,
+            rhs,
+            escape,
+            ..
+        } => {
+            escape.is_some()
+                || matches!(op, LikeOperator::Match | LikeOperator::Regexp)
+                || expr_has_runtime_abort_source(lhs)
+                || expr_has_runtime_abort_source(rhs)
+        }
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            expr_has_runtime_abort_source(lhs)
+                || expr_has_runtime_abort_source(start)
+                || expr_has_runtime_abort_source(end)
+        }
+        Expr::Binary(lhs, _, rhs) => {
+            expr_has_runtime_abort_source(lhs) || expr_has_runtime_abort_source(rhs)
+        }
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            base.as_ref()
+                .is_some_and(|expr| expr_has_runtime_abort_source(expr))
+                || when_then_pairs.iter().any(|(when, then)| {
+                    expr_has_runtime_abort_source(when) || expr_has_runtime_abort_source(then)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|expr| expr_has_runtime_abort_source(expr))
+        }
+        Expr::Cast { expr, .. }
+        | Expr::Collate(expr, _)
+        | Expr::IsNull(expr)
+        | Expr::NotNull(expr)
+        | Expr::Unary(_, expr) => expr_has_runtime_abort_source(expr),
+        Expr::InList { lhs, rhs, .. } => {
+            expr_has_runtime_abort_source(lhs)
+                || rhs.iter().any(|expr| expr_has_runtime_abort_source(expr))
+        }
+        Expr::Parenthesized(exprs) => exprs.iter().any(|expr| expr_has_runtime_abort_source(expr)),
+        Expr::Array { elements } => elements
+            .iter()
+            .any(|expr| expr_has_runtime_abort_source(expr)),
+        Expr::Column { .. }
+        | Expr::Register(_)
+        | Expr::DoublyQualified(_, _, _)
+        | Expr::Id(_)
+        | Expr::Literal(_)
+        | Expr::Name(_)
+        | Expr::Qualified(_, _)
+        | Expr::RowId { .. }
+        | Expr::Variable(_)
+        | Expr::Default => false,
+    }
+}
+
+fn expr_may_abort_after_write(expr: &Expr) -> bool {
+    expr_depends_on_row(expr) && expr_has_runtime_abort_source(expr)
+}
+
+fn index_expr_may_abort_after_write(index: &crate::schema::Index) -> bool {
+    index
+        .columns
+        .iter()
+        .filter_map(|column| column.expr.as_deref())
+        .any(expr_may_abort_after_write)
+        || index
+            .where_clause
+            .as_deref()
+            .is_some_and(expr_may_abort_after_write)
 }
 
 /// Determine whether any constraint's effective resolution can trigger an
@@ -230,9 +397,22 @@ pub(crate) fn set_update_stmt_journal_flags(
     let has_check = !btree_table.check_constraints.is_empty();
     let has_unique =
         !btree_table.unique_sets.is_empty() || plan.indexes_to_update.iter().any(|idx| idx.unique);
+    let row_expr_may_abort = plan
+        .where_clause
+        .iter()
+        .any(|term| expr_may_abort_after_write(&term.expr))
+        || plan
+            .set_clauses
+            .iter()
+            .any(|set_clause| expr_may_abort_after_write(&set_clause.expr))
+        || plan
+            .indexes_to_update
+            .iter()
+            .any(|index| index_expr_may_abort_after_write(index));
 
     let may_abort = has_triggers
         || has_fks
+        || row_expr_may_abort
         || constraint_may_abort(
             has_statement_conflict,
             or_conflict,
@@ -275,7 +455,15 @@ pub(crate) fn set_delete_stmt_journal_flags(
 
     // DELETE has no ON CONFLICT clause, so NOT NULL/CHECK/UNIQUE don't apply —
     // only triggers (RAISE(ABORT)) or FK violations can abort.
-    if !has_triggers && !has_fks {
+    let row_expr_may_abort = plan
+        .where_clause
+        .iter()
+        .any(|term| expr_may_abort_after_write(&term.expr))
+        || plan
+            .indexes
+            .iter()
+            .any(|index| index_expr_may_abort_after_write(index));
+    if !has_triggers && !has_fks && !row_expr_may_abort {
         program.set_may_abort(false);
     }
     Ok(())

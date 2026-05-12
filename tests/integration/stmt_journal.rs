@@ -289,6 +289,88 @@ fn update_composite_unique_partial_cols(tmp_db: TempDatabase) -> anyhow::Result<
     Ok(())
 }
 
+/// A row-dependent runtime expression error can happen after earlier rows were
+/// already updated, so multi-row UPDATE needs a statement journal even without
+/// schema constraints.
+#[turso_macros::test]
+fn update_runtime_expr_error_rolls_back_statement(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = WAL")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x INT)")?;
+    conn.execute("INSERT INTO t VALUES(1,10),(2,20)")?;
+
+    assert!(needs_stmt_journal(
+        &conn,
+        "UPDATE t SET x = CASE
+            WHEN id=1 THEN 11
+            ELSE (char(120) LIKE char(120) ESCAPE (char(121)||char(121)))
+        END"
+    ));
+
+    conn.execute("BEGIN")?;
+    let result = conn.execute(
+        "UPDATE t SET x = CASE
+            WHEN id=1 THEN 11
+            ELSE (char(120) LIKE char(120) ESCAPE (char(121)||char(121)))
+        END",
+    );
+    assert!(result.is_err(), "UPDATE should fail on invalid ESCAPE");
+
+    let rows = query_rows(&conn, "SELECT id,x FROM t ORDER BY id");
+    assert_eq!(
+        rows,
+        vec!["1|10", "2|20"],
+        "failed UPDATE should roll back all row changes"
+    );
+
+    conn.execute("COMMIT")?;
+    let rows = query_rows(&conn, "SELECT id,x FROM t ORDER BY id");
+    assert_eq!(rows, vec!["1|10", "2|20"]);
+    Ok(())
+}
+
+/// Partial-index predicates are evaluated while maintaining indexes for each
+/// updated row. If one aborts, previous row updates must be undone.
+#[turso_macros::test]
+fn update_partial_index_expr_error_rolls_back_statement(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = WAL")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT)")?;
+    conn.execute("INSERT INTO t VALUES(1,1,1),(2,2,1),(3,3,1)")?;
+    conn.execute(
+        "CREATE INDEX idx ON t(a)
+         WHERE CASE
+           WHEN b=2 THEN 'x' LIKE 'x' ESCAPE 'yy'
+           ELSE 1
+         END",
+    )?;
+
+    assert!(needs_stmt_journal(
+        &conn,
+        "UPDATE t SET a=a, b=CASE WHEN id=2 THEN 2 ELSE b+10 END"
+    ));
+
+    conn.execute("BEGIN")?;
+    let result = conn.execute("UPDATE t SET a=a, b=CASE WHEN id=2 THEN 2 ELSE b+10 END");
+    assert!(
+        result.is_err(),
+        "UPDATE should fail while evaluating partial index predicate"
+    );
+
+    let rows = query_rows(&conn, "SELECT id,a,b FROM t ORDER BY id");
+    assert_eq!(
+        rows,
+        vec!["1|1|1", "2|2|1", "3|3|1"],
+        "failed UPDATE should roll back all row changes"
+    );
+    let ic = query_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(ic, vec!["ok"]);
+    conn.execute("COMMIT")?;
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────
 // DELETE
 // ──────────────────────────────────────────────────────────
@@ -339,6 +421,43 @@ fn delete_by_rowid_with_fk(tmp_db: TempDatabase) -> anyhow::Result<()> {
     // FK constraint checks modify deferred violation counter before the statement can abort,
     // so multi_write stays true. needs_stmt = true && true = true.
     assert!(needs_stmt_journal(&conn, "DELETE FROM parent WHERE id = 5"));
+    Ok(())
+}
+
+/// DELETE predicates can also abort after earlier rows were removed.
+#[turso_macros::test]
+fn delete_runtime_expr_error_rolls_back_statement(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = WAL")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x INT)")?;
+    conn.execute("INSERT INTO t VALUES(1,10),(2,20)")?;
+
+    assert!(needs_stmt_journal(
+        &conn,
+        "DELETE FROM t
+         WHERE CASE
+           WHEN id=1 THEN 1
+           ELSE 'x' LIKE 'x' ESCAPE 'yy'
+         END"
+    ));
+
+    conn.execute("BEGIN")?;
+    let result = conn.execute(
+        "DELETE FROM t
+         WHERE CASE
+           WHEN id=1 THEN 1
+           ELSE 'x' LIKE 'x' ESCAPE 'yy'
+         END",
+    );
+    assert!(result.is_err(), "DELETE should fail on invalid ESCAPE");
+
+    let rows = query_rows(&conn, "SELECT id,x FROM t ORDER BY id");
+    assert_eq!(
+        rows,
+        vec!["1|10", "2|20"],
+        "failed DELETE should roll back all row changes"
+    );
+    conn.execute("COMMIT")?;
     Ok(())
 }
 
