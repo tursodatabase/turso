@@ -1526,8 +1526,9 @@ impl Database {
         }
 
         // Determine if we should open in MVCC mode based on the database header version
-        // MVCC is controlled only by the database header (set via PRAGMA journal_mode)
-        let open_mv_store = matches!(read_version, Version::Mvcc);
+        // or the presence of a logical log file (MVCC databases store WAL version in header
+        // for SQLite compatibility, so we also check for the log file).
+        let open_mv_store = matches!(read_version, Version::Mvcc) || log_exists;
 
         // Now check the Header Version to see which mode the DB file really is on
         // Track if header was modified so we can write it to disk
@@ -1547,7 +1548,18 @@ impl Database {
                 }
             }
             Version::Wal => false,
-            Version::Mvcc => false,
+            // MVCC version byte (0xFF) is written to header when PRAGMA journal_mode=mvcc is set.
+            // Rewrite to WAL (0x02) for SQLite on-disk format compatibility — MVCC mode is
+            // detected via the logical log file presence, not the header byte.
+            Version::Mvcc => {
+                if is_readonly {
+                    false
+                } else {
+                    header_mut.read_version = RawVersion::from(Version::Wal);
+                    header_mut.write_version = RawVersion::from(Version::Wal);
+                    true
+                }
+            }
         };
 
         // In WAL mode, a logical log is always unexpected.

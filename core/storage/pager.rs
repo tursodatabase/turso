@@ -2547,7 +2547,14 @@ impl Pager {
     /// Set the initial journal version in page 1 before the database is initialized.
     pub fn set_initial_journal_version(&self, version: sqlite3_ondisk::Version) -> Result<()> {
         turso_assert!(!self.db_initialized());
-        let raw_version = sqlite3_ondisk::RawVersion::from(version);
+        // MVCC mode uses 0xFF internally, but writing 0xFF to the on-disk SQLite header makes
+        // the file unreadable by standard SQLite ("file is not a database"). Store WAL (0x02)
+        // instead — MVCC mode is identified at open time via the logical log file presence.
+        let on_disk_version = match version {
+            sqlite3_ondisk::Version::Mvcc => sqlite3_ondisk::Version::Wal,
+            other => other,
+        };
+        let raw_version = sqlite3_ondisk::RawVersion::from(on_disk_version);
         let IOResult::Done(_) = self.with_header_mut(|header| {
             header.read_version = raw_version;
             header.write_version = raw_version;
