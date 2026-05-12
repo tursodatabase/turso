@@ -289,6 +289,86 @@ fn update_composite_unique_partial_cols(tmp_db: TempDatabase) -> anyhow::Result<
     Ok(())
 }
 
+#[turso_macros::test]
+fn update_fallible_set_expr_rolls_back_prior_rows(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA journal_mode=WAL")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x INT)")?;
+    conn.execute("INSERT INTO t VALUES(1, 10), (2, 20)")?;
+
+    let update_sql = "
+        UPDATE t
+        SET x = CASE
+            WHEN id=1 THEN 11
+            ELSE ('x' LIKE 'x' ESCAPE 'yy')
+        END
+    ";
+    assert!(
+        needs_stmt_journal(&conn, update_sql),
+        "fallible row-dependent SET expressions need statement rollback"
+    );
+
+    conn.execute("BEGIN")?;
+    let result = conn.execute(update_sql);
+    assert!(result.is_err(), "UPDATE should fail on invalid ESCAPE");
+
+    let rows = query_rows(&conn, "SELECT id, x FROM t ORDER BY id");
+    assert_eq!(
+        rows,
+        vec!["1|10", "2|20"],
+        "failed UPDATE must roll back rows written before the expression error"
+    );
+    conn.execute("COMMIT")?;
+
+    let rows = query_rows(&conn, "SELECT id, x FROM t ORDER BY id");
+    assert_eq!(rows, vec!["1|10", "2|20"]);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn update_fallible_partial_index_expr_rolls_back_prior_rows(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA journal_mode=WAL")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT)")?;
+    conn.execute("INSERT INTO t VALUES(1, 1, 1), (2, 2, 1), (3, 3, 1)")?;
+    conn.execute(
+        "
+        CREATE INDEX idx ON t(a)
+        WHERE CASE
+            WHEN b=2 THEN 'x' LIKE 'x' ESCAPE 'yy'
+            ELSE 1
+        END
+        ",
+    )?;
+
+    let update_sql = "UPDATE t SET b=CASE WHEN id=2 THEN 2 ELSE b+10 END";
+    assert!(
+        needs_stmt_journal(&conn, update_sql),
+        "fallible partial index predicates need statement rollback"
+    );
+
+    conn.execute("BEGIN")?;
+    let result = conn.execute(update_sql);
+    assert!(
+        result.is_err(),
+        "UPDATE should fail when the new partial-index predicate errors"
+    );
+
+    let rows = query_rows(&conn, "SELECT id, a, b FROM t ORDER BY id");
+    assert_eq!(
+        rows,
+        vec!["1|1|1", "2|2|1", "3|3|1"],
+        "failed UPDATE must roll back rows written before the partial-index error"
+    );
+
+    let ic = query_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(ic, vec!["ok"]);
+    conn.execute("COMMIT")?;
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────
 // DELETE
 // ──────────────────────────────────────────────────────────

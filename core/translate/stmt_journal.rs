@@ -26,7 +26,7 @@ use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::{sync::Arc, Connection, Result};
-use turso_parser::ast::{ResolveType, TriggerEvent};
+use turso_parser::ast::{Expr, ResolveType, TriggerEvent};
 
 /// Check whether any DDL-level constraint (IPK or index) uses REPLACE.
 pub(crate) fn any_index_or_ipk_has_replace(
@@ -173,6 +173,81 @@ pub(crate) fn set_insert_stmt_journal_flags(
     program.set_may_abort(may_abort);
 }
 
+/// Return true when an expression may throw while an UPDATE is already in its
+/// row-write loop. Multi-row UPDATE statements need statement rollback when one
+/// of these expressions can abort after earlier rows were written.
+fn expr_may_abort_during_update(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { .. }
+        | Expr::FunctionCallStar { .. }
+        | Expr::InSelect { .. }
+        | Expr::InTable { .. }
+        | Expr::Like { .. }
+        | Expr::Raise(..)
+        | Expr::Subquery(..)
+        | Expr::Exists(..)
+        | Expr::SubqueryResult { .. } => true,
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            expr_may_abort_during_update(lhs)
+                || expr_may_abort_during_update(start)
+                || expr_may_abort_during_update(end)
+        }
+        Expr::Binary(lhs, _, rhs) => {
+            expr_may_abort_during_update(lhs) || expr_may_abort_during_update(rhs)
+        }
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            base.as_deref().is_some_and(expr_may_abort_during_update)
+                || when_then_pairs.iter().any(|(when_expr, then_expr)| {
+                    expr_may_abort_during_update(when_expr)
+                        || expr_may_abort_during_update(then_expr)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(expr_may_abort_during_update)
+        }
+        Expr::Cast { expr, .. }
+        | Expr::Collate(expr, _)
+        | Expr::FieldAccess { base: expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::NotNull(expr)
+        | Expr::Unary(_, expr) => expr_may_abort_during_update(expr),
+        Expr::InList { lhs, rhs, .. } => {
+            expr_may_abort_during_update(lhs)
+                || rhs.iter().any(|expr| expr_may_abort_during_update(expr))
+        }
+        Expr::Parenthesized(exprs) => exprs.iter().any(|expr| expr_may_abort_during_update(expr)),
+        Expr::Array { .. } | Expr::Subscript { .. } => true,
+        Expr::Id(_)
+        | Expr::Column { .. }
+        | Expr::RowId { .. }
+        | Expr::Literal(_)
+        | Expr::DoublyQualified(..)
+        | Expr::Name(_)
+        | Expr::Qualified(..)
+        | Expr::Variable(_)
+        | Expr::Register(_)
+        | Expr::Default => false,
+    }
+}
+
+fn index_expr_may_abort_during_update(index: &crate::schema::Index) -> bool {
+    index
+        .where_clause
+        .as_deref()
+        .is_some_and(expr_may_abort_during_update)
+        || index.columns.iter().any(|col| {
+            col.expr
+                .as_deref()
+                .is_some_and(expr_may_abort_during_update)
+        })
+}
+
 /// Set multi_write / may_abort for UPDATE statements.
 pub(crate) fn set_update_stmt_journal_flags(
     program: &mut ProgramBuilder,
@@ -230,9 +305,19 @@ pub(crate) fn set_update_stmt_journal_flags(
     let has_check = !btree_table.check_constraints.is_empty();
     let has_unique =
         !btree_table.unique_sets.is_empty() || plan.indexes_to_update.iter().any(|idx| idx.unique);
+    let update_expr_may_abort = plan
+        .set_clauses
+        .iter()
+        .any(|set_clause| expr_may_abort_during_update(set_clause.emitted_expr()));
+    let index_expr_may_abort = plan
+        .indexes_to_update
+        .iter()
+        .any(|idx| index_expr_may_abort_during_update(idx));
 
     let may_abort = has_triggers
         || has_fks
+        || update_expr_may_abort
+        || index_expr_may_abort
         || constraint_may_abort(
             has_statement_conflict,
             or_conflict,
