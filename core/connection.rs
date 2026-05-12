@@ -1,36 +1,36 @@
+#[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+use crate::Page;
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
-    atomic::{
-        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8, Ordering,
-    },
     Arc, RwLock,
+    atomic::{
+        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU8, AtomicU16, AtomicU64, Ordering,
+    },
 };
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
-#[cfg(all(feature = "fs", feature = "conn_raw_api"))]
-use crate::Page;
 use crate::{
-    ast, function,
-    io::{MemoryIO, IO},
-    parse_schema_rows,
-    progress::{ProgressHandler, ProgressHandlerCallback},
-    refresh_analyze_stats, translate,
-    util::IOExt,
-    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
+    AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
     BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
     Parser, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
-    Trigger, Value, VirtualTable, WalAutoActions,
+    Trigger, Value, VirtualTable, WalAutoActions, ast, function,
+    io::{IO, MemoryIO},
+    parse_schema_rows,
+    progress::{ProgressHandler, ProgressHandlerCallback},
+    refresh_analyze_stats, translate,
+    util::IOExt,
+    vdbe,
 };
-use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
+use crate::{is_memory_like, turso_assert};
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
@@ -40,8 +40,8 @@ use std::ops::Deref;
 use std::path::Path;
 #[cfg(not(target_family = "wasm"))]
 use tempfile::TempDir;
-use tracing::{instrument, Level};
-use turso_macros::{turso_assert_ne, AtomicEnum};
+use tracing::{Level, instrument};
+use turso_macros::{AtomicEnum, turso_assert_ne};
 
 #[cfg(feature = "simulator")]
 fn db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
@@ -3441,6 +3441,82 @@ mod tests {
             Value::Text(text) => text.as_str(),
             other => panic!("expected text value, got {other:?}"),
         }
+    }
+
+    fn query_i64_rows(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<i64>> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push((0..row.len()).map(|i| row.get::<i64>(i).unwrap()).collect());
+            Ok(())
+        })
+        .unwrap();
+        rows
+    }
+
+    #[test]
+    fn test_delete_returning_error_rolls_back_statement_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("delete-returning-rollback.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE t(a INT);
+             INSERT INTO t VALUES(1),(2);
+             BEGIN;",
+        )
+        .unwrap();
+        let err = conn
+            .execute(
+                "DELETE FROM t
+                 WHERE a=1
+                 RETURNING 'x' LIKE 'x' ESCAPE 'yy';",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ESCAPE expression must be a single character"),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(
+            query_i64_rows(&conn, "SELECT a FROM t ORDER BY a"),
+            vec![vec![1], vec![2]]
+        );
+        conn.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn test_insert_or_replace_returning_error_preserves_conflicting_row() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("replace-returning-rollback.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE r(a INT UNIQUE, b INT);
+             INSERT INTO r VALUES(1,10);
+             BEGIN;",
+        )
+        .unwrap();
+        let err = conn
+            .execute(
+                "INSERT OR REPLACE INTO r VALUES(1,20)
+                 RETURNING 'x' LIKE 'x' ESCAPE 'yy';",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ESCAPE expression must be a single character"),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(
+            query_i64_rows(&conn, "SELECT rowid,a,b FROM r"),
+            vec![vec![1, 1, 10]]
+        );
+        conn.execute("COMMIT").unwrap();
     }
 
     // given a attached 'alias', return the Database and Pager for that attached database

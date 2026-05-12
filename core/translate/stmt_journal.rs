@@ -25,7 +25,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::{sync::Arc, Connection, Result};
+use crate::{Connection, Result, sync::Arc};
 use turso_parser::ast::{ResolveType, TriggerEvent};
 
 /// Check whether any DDL-level constraint (IPK or index) uses REPLACE.
@@ -135,6 +135,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     has_autoincrement: bool,
     notnull_col_exists: bool,
     has_unique: bool,
+    has_returning: bool,
 ) {
     let index_modes: Vec<(Option<ResolveType>, bool)> = resolver.with_schema(database_id, |s| {
         s.get_indices(&table.name)
@@ -148,7 +149,8 @@ pub(crate) fn set_insert_stmt_journal_flags(
         index_modes.iter().map(|(oc, _)| *oc),
     );
     let has_check = !table.check_constraints.is_empty();
-    let may_abort = has_triggers
+    let may_abort = has_returning
+        || has_triggers
         || has_fks
         || constraint_may_abort(
             has_statement_conflict,
@@ -231,7 +233,8 @@ pub(crate) fn set_update_stmt_journal_flags(
     let has_unique =
         !btree_table.unique_sets.is_empty() || plan.indexes_to_update.iter().any(|idx| idx.unique);
 
-    let may_abort = has_triggers
+    let may_abort = plan.returning.is_some()
+        || has_triggers
         || has_fks
         || constraint_may_abort(
             has_statement_conflict,
@@ -275,7 +278,7 @@ pub(crate) fn set_delete_stmt_journal_flags(
 
     // DELETE has no ON CONFLICT clause, so NOT NULL/CHECK/UNIQUE don't apply —
     // only triggers (RAISE(ABORT)) or FK violations can abort.
-    if !has_triggers && !has_fks {
+    if !has_triggers && !has_fks && plan.result_columns.is_empty() {
         program.set_may_abort(false);
     }
     Ok(())
