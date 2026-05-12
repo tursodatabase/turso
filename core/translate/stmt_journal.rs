@@ -273,9 +273,17 @@ pub(crate) fn set_delete_stmt_journal_flags(
         program.set_multi_write(false);
     }
 
-    // DELETE has no ON CONFLICT clause, so NOT NULL/CHECK/UNIQUE don't apply —
-    // only triggers (RAISE(ABORT)) or FK violations can abort.
-    if !has_triggers && !has_fks {
+    // DELETE has no ON CONFLICT clause, but the WHERE clause can still abort the
+    // statement via row-dependent expression errors (e.g., LIKE ESCAPE with a
+    // multi-character escape). Without statement journaling, earlier rows that
+    // were already deleted leak past the abort and survive into the outer
+    // transaction's commit — silently dropping data. We therefore only elide
+    // may_abort when (a) there is no WHERE clause to evaluate per row, or (b)
+    // the statement can affect at most one row (no partial state possible); and
+    // in either case there must be no triggers/FKs to worry about.
+    let has_where_predicate = !plan.where_clause.is_empty();
+    let safe_to_elide = (!has_where_predicate || is_single_row) && !has_triggers && !has_fks;
+    if safe_to_elide {
         program.set_may_abort(false);
     }
     Ok(())

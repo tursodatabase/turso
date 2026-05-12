@@ -342,6 +342,53 @@ fn delete_by_rowid_with_fk(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Multi-row DELETE with a WHERE clause containing fallible expressions
+/// (e.g., LIKE ESCAPE that can error per row) must keep statement journaling
+/// even without triggers/FKs. Without this, an error on a later row leaves
+/// earlier rows already deleted, leaking past the abort into the outer
+/// transaction. See regression test below for the runtime correctness check.
+#[turso_macros::test(init_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, x INT);")]
+fn delete_multi_row_where_needs_journal(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    // Multi-row scan with a WHERE predicate that can evaluate fallible
+    // expressions per row → needs statement journaling.
+    assert!(needs_stmt_journal(&conn, "DELETE FROM t WHERE x > 5"));
+    Ok(())
+}
+
+/// Regression: a DELETE whose WHERE clause errors mid-statement (after at
+/// least one row was already deleted) must not leak those deletions past
+/// the abort. Reproduces the partial-DML leak described in #6879 for the
+/// DELETE path specifically: `set_delete_stmt_journal_flags` previously
+/// elided `may_abort` whenever there were no triggers/FKs, so multi-row
+/// DELETE statements never opened a statement subtransaction. The
+/// expression error from `LIKE 'a' ESCAPE 'bb'` then aborted the statement
+/// while the earlier delete remained committed.
+#[turso_macros::test(init_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, x INT);")]
+fn delete_partial_rollback_on_row_dependent_expr_error(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")?;
+    conn.execute("BEGIN")?;
+    // The CASE returns 1 for id=1, errors on id=2 (multi-character ESCAPE),
+    // and returns 0 otherwise. SQLite aborts the entire DELETE; without the
+    // fix, Turso would commit the id=1 delete and leak it past the error.
+    let res = conn.execute(
+        "DELETE FROM t WHERE (CASE WHEN id=1 THEN 1 \
+                                   WHEN id=2 THEN ('a' LIKE 'a' ESCAPE 'bb') \
+                                   ELSE 0 END)",
+    );
+    assert!(res.is_err(), "DELETE with bad ESCAPE must error");
+    conn.execute("COMMIT")?;
+
+    let rows = query_rows(&conn, "SELECT id, x FROM t ORDER BY id");
+    assert_eq!(
+        rows,
+        vec!["1|10".to_string(), "2|20".to_string(), "3|30".to_string()],
+        "all three rows must remain after the aborted DELETE"
+    );
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────
 // SELECT (read-only) — never needs stmt journal
 // ──────────────────────────────────────────────────────────
