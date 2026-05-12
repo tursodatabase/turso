@@ -2716,7 +2716,6 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    #[ignore]
     fn capture_target_metadata_uses_final_header_cookie_and_preserves_tvfs() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
         let source_dir = tempfile::tempdir().unwrap();
@@ -2730,7 +2729,15 @@ mod tests {
             None,
         )?;
         let source_conn = source_db.connect()?;
-        let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, 0)?;
+        // Source is uninitialized so its header reserved_space isn't usable.
+        // Derive from the IOContext to keep reserved_space and the auto-
+        // installed checksum context consistent under `feature = "checksum"`.
+        let reserved_space = source_conn
+            .get_pager()
+            .io_ctx
+            .read()
+            .get_reserved_space_bytes();
+        let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, reserved_space)?;
 
         temp.conn.execute("BEGIN IMMEDIATE")?;
         temp.conn
