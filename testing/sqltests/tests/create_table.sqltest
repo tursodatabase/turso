@@ -116,6 +116,34 @@ test create_table_duplicate_column_names_quoted {
 expect error {
 }
 
+# https://github.com/tursodatabase/turso/issues/5730
+@cross-check-integrity
+test create_table_non_ascii_case_distinct {
+    CREATE TABLE é(a);
+    CREATE TABLE É(a);
+    INSERT INTO é VALUES (1);
+    INSERT INTO É VALUES (2);
+    SELECT * FROM é;
+    SELECT * FROM É;
+}
+expect {
+    1
+    2
+}
+
+# https://github.com/tursodatabase/turso/issues/5730
+@cross-check-integrity
+test create_view_non_ascii_case_distinct {
+    CREATE VIEW é AS SELECT 1;
+    CREATE VIEW É AS SELECT 2;
+    SELECT * FROM é;
+    SELECT * FROM É;
+}
+expect {
+    1
+    2
+}
+
 @cross-check-integrity
 test create_table_view_collision-1 {
     CREATE VIEW v_same AS SELECT 1;

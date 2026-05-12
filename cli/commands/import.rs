@@ -273,5 +273,7 @@ pub fn normalize_ident(identifier: &str) -> String {
     } else {
         identifier
     }
-    .to_lowercase()
+    // SQLite's default case-insensitive identifier matching folds ASCII only.
+    // See https://sqlite.org/faq.html#q18.
+    .to_ascii_lowercase()
 }
