@@ -69,10 +69,7 @@ impl IO for TestIo {
     fn cancel(&self, c: &[turso_core::Completion]) -> turso_core::Result<()> {
         self.io.cancel(c)
     }
-    fn drain_completions(
-        &self,
-        completions: &[turso_core::Completion],
-    ) -> turso_core::Result<()> {
+    fn drain_completions(&self, completions: &[turso_core::Completion]) -> turso_core::Result<()> {
         self.io.drain_completions(completions)
     }
     fn fill_bytes(&self, dest: &mut [u8]) {
