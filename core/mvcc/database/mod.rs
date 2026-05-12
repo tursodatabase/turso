@@ -2502,6 +2502,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.finalized_tx_states.is_empty(),
             "MVCC VACUUM reset requires finalized transaction cache to be cleared"
         );
+        // Drop empty buckets left by checkpoint GC: their table_ids reference
+        // pre-VACUUM root pages and can alias new objects after root-page
+        // reuse, corrupting `index_rows` lookups and SkipMap ordering.
+        self.rows.clear();
+        self.index_rows.clear();
         let root_pages = schema
             .tables
             .values()
@@ -2523,14 +2528,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 "post-VACUUM B-tree root page must be positive"
             );
         }
-        let keys = self
-            .table_id_to_rootpage
-            .iter()
-            .map(|entry| *entry.key())
-            .collect::<Vec<_>>();
-        for key in keys {
-            self.table_id_to_rootpage.remove(&key);
-        }
+        self.table_id_to_rootpage.clear();
         self.table_id_to_last_rowid.write().clear();
         self.insert_table_id_to_rootpage(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1));
         for root_page in root_pages {
