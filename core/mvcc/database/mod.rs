@@ -1044,6 +1044,16 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     pending_log_append_bytes: Option<u64>,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
+    /// SM-side mirror of `Transaction::pager_commit_lock_held`. Set immediately
+    /// after `pager_commit_lock.write()` succeeds, cleared on every release
+    /// site, and consulted by `Drop` so a state machine abandoned mid-commit
+    /// (e.g. statement reset or dropped without rollback) cannot leak the
+    /// commit lock.
+    pager_commit_lock_held: bool,
+    /// Held so `Drop` can reach the per-tx flag to unlock atomically (the
+    /// per-tx flag is the cross-path synchronization point shared with
+    /// `rollback_tx` and prevents double-unlock).
+    mvstore: Arc<MvStore<Clock>>,
     _phantom: PhantomData<Clock>,
 }
 
@@ -1092,6 +1102,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         state: CommitState<Clock>,
         tx_id: TxID,
@@ -1100,6 +1111,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         commit_coordinator: Arc<CommitCoordinator>,
         header: Arc<RwLock<Option<DatabaseHeader>>>,
         sync_mode: SyncMode,
+        mvstore: Arc<MvStore<Clock>>,
     ) -> Self {
         let pager = connection.pager.load().clone();
         // Use the connection's tx-level schema_did_change flag as the
@@ -1127,6 +1139,8 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             header,
             pending_log_append_bytes: None,
             sync_mode,
+            pager_commit_lock_held: false,
+            mvstore,
             _phantom: PhantomData,
         }
     }
@@ -1708,6 +1722,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                     }
                     mvcc_store.unlock_commit_lock_if_held(tx);
+                    self.pager_commit_lock_held = false;
                     mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
@@ -1791,7 +1806,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     tx.state.store(TransactionState::Committed(end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
-                        self.commit_coordinator.pager_commit_lock.unlock();
                     }
                     mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
@@ -1807,10 +1821,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
 
                 if log_record.row_versions.is_empty() && log_record.header.is_none() {
-                    if mvcc_store.is_exclusive_tx(&self.tx_id) {
-                        mvcc_store.unlock_commit_lock_if_held(tx);
-                    }
-                    // Nothing to do, just end commit.
+                    // Nothing to do, just end commit. Exclusive txs no longer
+                    // hold `pager_commit_lock` at this point (they acquire it
+                    // in `BeginCommitLogicalLog` like any other tx), so there
+                    // is nothing to unlock here.
                     self.state = CommitState::CommitEnd { end_ts };
                 } else {
                     self.state = CommitState::BeginCommitLogicalLog { end_ts, log_record };
@@ -1819,22 +1833,32 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 return Ok(TransitionResult::Continue);
             }
             CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
-                if !mvcc_store.is_exclusive_tx(&self.tx_id) {
-                    // logical log needs to be serialized
-                    let locked = self.commit_coordinator.pager_commit_lock.write();
-                    if !locked {
-                        return Ok(TransitionResult::Io(IOCompletions::Single(
-                            Completion::new_yield(),
-                        )));
-                    }
-                    let tx = mvcc_store
-                        .txs
-                        .get(&self.tx_id)
-                        .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
-                    tx.value()
-                        .pager_commit_lock_held
-                        .store(true, Ordering::Release);
+                // Resolve the tx entry BEFORE acquiring the lock. The per-tx
+                // `pager_commit_lock_held` flag is the only handle the
+                // rollback path uses to know whether to unlock, so the
+                // flag-set must follow the lock-acquire with no fallible
+                // step in between — otherwise an error here would leak the
+                // lock until process exit.
+                //
+                // Both concurrent and exclusive transactions acquire the lock
+                // here; exclusive txs no longer pre-acquire it at BEGIN time
+                // (exclusivity is enforced by `MvStore::exclusive_tx` and the
+                // `WriteWriteConflict` check in `CommitState::Commit`).
+                let tx = mvcc_store
+                    .txs
+                    .get(&self.tx_id)
+                    .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
+                // logical log needs to be serialized
+                let locked = self.commit_coordinator.pager_commit_lock.write();
+                if !locked {
+                    return Ok(TransitionResult::Io(IOCompletions::Single(
+                        Completion::new_yield(),
+                    )));
                 }
+                self.pager_commit_lock_held = true;
+                tx.value()
+                    .pager_commit_lock_held
+                    .store(true, Ordering::Release);
                 let (c, append_bytes) = mvcc_store.storage.log_tx(log_record, None)?;
                 self.pending_log_append_bytes = Some(append_bytes);
                 self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
@@ -1944,6 +1968,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 }
 
                 mvcc_store.unlock_commit_lock_if_held(tx_unlocked);
+                self.pager_commit_lock_held = false;
 
                 mvcc_store
                     .global_header
@@ -2016,6 +2041,34 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
     fn is_finalized(&self) -> bool {
         self.is_finalized
+    }
+}
+
+/// Defense-in-depth cleanup: a `CommitStateMachine` that took
+/// `pager_commit_lock` in `BeginCommitLogicalLog` and is dropped before
+/// reaching the unlock site at `CommitEnd` (e.g. statement reset by the
+/// simulator's reopen path, or any caller that drops the wrapping
+/// `StateMachine` without driving it to completion) would otherwise hang
+/// the next committer forever.
+///
+/// `unlock_commit_lock_if_held` swaps the per-tx flag, so this is safe
+/// regardless of whether `rollback_tx` ran first — at most one of the two
+/// paths will see the flag set and unlock.
+impl<Clock: LogicalClock> Drop for CommitStateMachine<Clock> {
+    fn drop(&mut self) {
+        if !self.pager_commit_lock_held {
+            return;
+        }
+        if let Some(tx) = self.mvstore.txs.get(&self.tx_id) {
+            self.mvstore.unlock_commit_lock_if_held(tx.value());
+        } else {
+            // The tx was removed without going through the unlock path
+            // (`finish_committed_tx` is always preceded by unlock in
+            // `CommitEnd`, and `rollback_tx` unlocks before removing). If we
+            // get here, some path bypassed both — release the lock directly
+            // so the next committer can make progress.
+            self.commit_coordinator.pager_commit_lock.unlock();
+        }
     }
 }
 
@@ -3452,35 +3505,29 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 .inspect_err(|_| unlock_checkpoint_guard())?;
         }
 
-        let already_holds_commit_lock = maybe_existing_tx_id
-            .and_then(|existing_tx_id| self.txs.get(&existing_tx_id))
-            .is_some_and(|tx| tx.value().pager_commit_lock_held.load(Ordering::Acquire));
+        // Exclusivity is enforced by the `exclusive_tx` atomic taken above —
+        // concurrent committers see `has_exclusive_tx()` in `CommitState::Commit`
+        // and abort with `WriteWriteConflict` before they ever reach
+        // `pager_commit_lock`, and a second exclusive begin fails in
+        // `acquire_exclusive_tx`. Holding `pager_commit_lock` for the whole
+        // exclusive transaction (its previous behavior) was load-bearing only
+        // for that exclusion, but it serialized the lock against any sibling
+        // committer for the entire tx lifetime. In a cooperative scheduler
+        // where an exclusive tx can sit between statements without yielding
+        // execution back to the engine, that long-lived hold deadlocks any
+        // other committer that yields on `pager_commit_lock`. The exclusive
+        // tx's own commit takes the lock in `CommitState::BeginCommitLogicalLog`
+        // just like any other tx.
+        let header = self.get_new_transaction_database_header(&pager);
 
-        if !already_holds_commit_lock {
-            let locked = self.commit_coordinator.pager_commit_lock.write();
-            if !locked {
-                tracing::debug!(
-                    "begin_exclusive_tx: tx_id={} failed with Busy on pager_commit_lock",
-                    tx_id
-                );
+        if let Some(existing_tx_id) = maybe_existing_tx_id {
+            let tx = self.txs.get(&existing_tx_id).ok_or_else(|| {
                 if !already_exclusive {
                     self.release_exclusive_tx(&tx_id);
                 }
                 unlock_checkpoint_guard();
-                return Err(LimboError::Busy);
-            }
-        }
-
-        let header = self.get_new_transaction_database_header(&pager);
-
-        if let Some(existing_tx_id) = maybe_existing_tx_id {
-            let tx = self
-                .txs
-                .get(&existing_tx_id)
-                .ok_or_else(|| LimboError::NoSuchTransactionID(existing_tx_id.to_string()))?;
-            tx.value()
-                .pager_commit_lock_held
-                .store(true, Ordering::Release);
+                LimboError::NoSuchTransactionID(existing_tx_id.to_string())
+            })?;
             *tx.value().header.write() = header;
             tracing::trace!(
                 "begin_exclusive_tx(tx_id={}, begin_ts={}) - upgraded existing transaction",
@@ -3492,7 +3539,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
 
         let tx = Transaction::new(tx_id, begin_ts, header);
-        tx.pager_commit_lock_held.store(true, Ordering::Release);
         tracing::trace!(
             "begin_exclusive_tx(tx_id={}, begin_ts={}) - exclusive write logical log transaction",
             tx_id,
@@ -3684,7 +3730,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ///
     /// * `tx_id` - The ID of the transaction to commit.
     pub fn commit_tx(
-        &self,
+        self: &Arc<Self>,
         tx_id: TxID,
         connection: &Arc<Connection>,
         db_id: usize,
@@ -3697,6 +3743,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.commit_coordinator.clone(),
             self.global_header.clone(),
             connection.get_sync_mode(),
+            Arc::clone(self),
         ));
         let state_machine = StateMachine::new(state);
         Ok(state_machine)
