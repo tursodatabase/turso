@@ -2503,6 +2503,27 @@ fn test_update_or_ignore_fk_not_suppressed(tmp_db: TempDatabase) -> anyhow::Resu
     Ok(())
 }
 
+/// INSERT OR FAIL does NOT preserve earlier rows when the failure is a FK violation.
+/// ON CONFLICT algorithms do not apply to foreign keys, so this behaves like ABORT.
+#[turso_macros::test]
+fn test_insert_or_fail_fk_violation_rolls_back_statement(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+    run_fk_constraint_case(
+        "insert_or_fail_fk_violation_rollback",
+        &[
+            "CREATE TABLE parent(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id), val TEXT)",
+            "CREATE INDEX child_val_idx ON child(val)",
+        ],
+        &["INSERT INTO parent VALUES(1)"],
+        "INSERT OR FAIL INTO child VALUES(1, 1, 'ok'), (2, 99, 'bad')",
+        "SELECT * FROM child ORDER BY id",
+    );
+    Ok(())
+}
+
 /// UPDATE OR REPLACE does NOT suppress FK violations.
 #[turso_macros::test]
 fn test_update_or_replace_fk_not_suppressed(tmp_db: TempDatabase) -> anyhow::Result<()> {

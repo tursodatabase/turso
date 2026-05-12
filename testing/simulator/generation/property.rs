@@ -243,6 +243,7 @@ impl Property {
                 unreachable!("No extensional queries")
             }
             Property::SelectLimit { .. }
+            | Property::ForeignKeyConflictRollback { .. }
             | Property::SelectSelectOptimizer { .. }
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
@@ -989,6 +990,67 @@ impl Property {
                 .into_iter()
                 .map(InteractionBuilder::with_interaction)
                 .collect()
+            }
+            Property::ForeignKeyConflictRollback {
+                parent_table,
+                child_table,
+            } => {
+                let select_children = InteractionType::Query(Query::RawSql(format!(
+                    "SELECT id, pid, val FROM {child_table} ORDER BY id"
+                )));
+                let assertion = InteractionType::Assertion(Assertion::new(
+                    format!(
+                        "INSERT OR FAIL foreign-key violation should roll back all rows in {child_table}"
+                    ),
+                    move |stack: &Vec<ResultSet>, _| {
+                        let rows = stack.last().unwrap();
+                        match rows {
+                            Ok(rows) if rows.is_empty() => Ok(Ok(())),
+                            Ok(rows) => Ok(Err(format!(
+                                "expected no child rows after FK violation, got {} rows: {}",
+                                rows.len(),
+                                rows.iter()
+                                    .map(|r| print_row(r))
+                                    .collect::<Vec<String>>()
+                                    .join(", ")
+                            ))),
+                            Err(err) => Err(LimboError::InternalError(format!(
+                                "failed to read child table after FK violation: {err}"
+                            ))),
+                        }
+                    },
+                    vec![],
+                ));
+
+                let mut failing_insert = InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::RawSql(format!(
+                        "INSERT OR FAIL INTO {child_table} VALUES (1, 1, 'ok'), (2, 99, 'bad')"
+                    ))),
+                );
+                failing_insert.ignore_error(true);
+
+                vec![
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::RawSql(
+                        "PRAGMA foreign_keys=ON".to_string(),
+                    ))),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::RawSql(
+                        format!("CREATE TABLE {parent_table}(id INTEGER PRIMARY KEY)"),
+                    ))),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::RawSql(
+                        format!(
+                            "CREATE TABLE {child_table}(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES {parent_table}(id), val TEXT)"
+                        ),
+                    ))),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::RawSql(
+                        format!("CREATE INDEX {child_table}_val_idx ON {child_table}(val)"),
+                    ))),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::RawSql(
+                        format!("INSERT INTO {parent_table} VALUES(1)"),
+                    ))),
+                    failing_insert,
+                    InteractionBuilder::with_interaction(select_children),
+                    InteractionBuilder::with_interaction(assertion),
+                ]
             }
             Property::WhereTrueFalseNull { select, predicate } => {
                 let tables_dependencies = select.dependencies().into_iter().collect::<Vec<_>>();
@@ -1887,6 +1949,19 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_foreign_key_conflict_rollback<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    _ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    let suffix = rng.random_range(1_000_000u32..=9_999_999u32);
+    Property::ForeignKeyConflictRollback {
+        parent_table: format!("fk_parent_{suffix}"),
+        child_table: format!("fk_child_{suffix}"),
+    }
+}
+
 type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
@@ -1914,6 +1989,9 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
+            PropertyDiscriminants::ForeignKeyConflictRollback => {
+                property_foreign_key_conflict_rollback
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
             }
@@ -2033,6 +2111,13 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::ForeignKeyConflictRollback => {
+                if !env.profile.mvcc {
+                    1
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
@@ -2074,6 +2159,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
+            PropertyDiscriminants::ForeignKeyConflictRollback => QueryCapabilities::NONE,
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
         }
     }

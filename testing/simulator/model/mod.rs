@@ -293,6 +293,7 @@ pub enum Query {
     RollbackToSavepoint(RollbackToSavepoint),
     ReleaseSavepoint(ReleaseSavepoint),
     Pragma(Pragma),
+    RawSql(String),
     /// Placeholder query that still needs to be generated
     Placeholder,
 }
@@ -346,6 +347,7 @@ impl Query {
             | Query::Savepoint(_)
             | Query::RollbackToSavepoint(_)
             | Query::ReleaseSavepoint(_)
+            | Query::RawSql(_)
             | Query::Placeholder
             | Query::Pragma(_) => IndexSet::new(),
         }
@@ -374,6 +376,7 @@ impl Query {
             Query::Savepoint(..) | Query::RollbackToSavepoint(..) | Query::ReleaseSavepoint(..) => {
                 vec![]
             }
+            Query::RawSql(_) => vec![],
             Query::Placeholder => vec![],
             Query::Pragma(_) => vec![],
         }
@@ -438,6 +441,7 @@ impl Display for Query {
             Self::Savepoint(savepoint) => write!(f, "{savepoint}"),
             Self::RollbackToSavepoint(rollback_to) => write!(f, "{rollback_to}"),
             Self::ReleaseSavepoint(release) => write!(f, "{release}"),
+            Self::RawSql(sql) => write!(f, "{sql}"),
             Self::Placeholder => Ok(()),
             Query::Pragma(pragma) => write!(f, "{pragma}"),
         }
@@ -467,6 +471,7 @@ impl Shadow for Query {
             Query::Savepoint(savepoint) => Ok(savepoint.shadow(env)),
             Query::RollbackToSavepoint(rollback_to) => rollback_to.shadow(env),
             Query::ReleaseSavepoint(release) => release.shadow(env),
+            Query::RawSql(_) => Ok(vec![]),
             Query::Placeholder => Ok(vec![]),
             Query::Pragma(Pragma::AutoVacuumMode(_) | Pragma::ForeignKeyList(_)) => Ok(vec![]),
         }
@@ -523,6 +528,7 @@ impl From<QueryDiscriminants> for QueryCapabilities {
             | QueryDiscriminants::ReleaseSavepoint => {
                 unreachable!("QueryCapabilities do not apply to transaction queries")
             }
+            QueryDiscriminants::RawSql => Self::NONE,
             QueryDiscriminants::Placeholder => {
                 unreachable!("QueryCapabilities do not apply to query Placeholder")
             }

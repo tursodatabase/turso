@@ -459,6 +459,7 @@ fn execute_query_rusqlite(
         );
     }
     match query {
+        Query::RawSql(sql) => execute_raw_sql_rusqlite(connection, sql),
         Query::Select(select) => {
             let mut stmt = connection.prepare(select.to_string().as_str())?;
             let rows = stmt.query_map([], |row| {
@@ -499,4 +500,47 @@ fn execute_query_rusqlite(
             Ok(vec![])
         }
     }
+}
+
+fn execute_raw_sql_rusqlite(
+    connection: &rusqlite::Connection,
+    sql: &str,
+) -> rusqlite::Result<Vec<Vec<SimValue>>> {
+    let mut stmt = connection.prepare(sql)?;
+    if stmt.column_count() == 0 {
+        drop(stmt);
+        connection.execute(sql, ())?;
+        return Ok(vec![]);
+    }
+
+    let rows = stmt.query_map([], |row| {
+        let mut values = vec![];
+        for i in 0.. {
+            let value = match row.get(i) {
+                Ok(value) => value,
+                Err(err) => match err {
+                    rusqlite::Error::InvalidColumnIndex(_) => break,
+                    _ => {
+                        tracing::error!(?err);
+                        panic!("{err}")
+                    }
+                },
+            };
+            let value = match value {
+                rusqlite::types::Value::Null => Value::Null,
+                rusqlite::types::Value::Integer(i) => Value::from_i64(i),
+                rusqlite::types::Value::Real(f) => Value::from_f64(f),
+                rusqlite::types::Value::Text(s) => Value::build_text(s),
+                rusqlite::types::Value::Blob(b) => Value::Blob(b),
+            };
+            values.push(SimValue(value));
+        }
+        Ok(values)
+    })?;
+
+    let mut result = vec![];
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
 }

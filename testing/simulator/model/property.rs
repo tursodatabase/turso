@@ -191,6 +191,12 @@ pub enum Property {
         tables: Vec<String>,
         write_kinds: Vec<QueryDiscriminants>,
     },
+    /// ForeignKeyConflictRollback verifies that ON CONFLICT FAIL does not
+    /// preserve earlier rows when the error is a foreign-key violation.
+    ForeignKeyConflictRollback {
+        parent_table: String,
+        child_table: String,
+    },
     /// Property used to subsititute a property with its queries only
     Queries {
         queries: Vec<Query>,
@@ -234,6 +240,7 @@ impl Property {
             | Property::Queries { queries } => Some(queries),
             Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => None,
             Property::SelectLimit { .. }
+            | Property::ForeignKeyConflictRollback { .. }
             | Property::SelectSelectOptimizer { .. }
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }

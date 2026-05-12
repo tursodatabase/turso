@@ -155,7 +155,8 @@ impl QueryDiscriminants {
             | QueryDiscriminants::Rollback
             | QueryDiscriminants::Savepoint
             | QueryDiscriminants::RollbackToSavepoint
-            | QueryDiscriminants::ReleaseSavepoint => {
+            | QueryDiscriminants::ReleaseSavepoint
+            | QueryDiscriminants::RawSql => {
                 unreachable!("transactional queries should not be generated")
             }
             QueryDiscriminants::Placeholder => {
@@ -183,7 +184,8 @@ impl QueryDiscriminants {
             | QueryDiscriminants::Rollback
             | QueryDiscriminants::Savepoint
             | QueryDiscriminants::RollbackToSavepoint
-            | QueryDiscriminants::ReleaseSavepoint => {
+            | QueryDiscriminants::ReleaseSavepoint
+            | QueryDiscriminants::RawSql => {
                 unreachable!("transactional queries should not be generated")
             }
             QueryDiscriminants::Placeholder => {
