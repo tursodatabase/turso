@@ -263,7 +263,6 @@ fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
 }
 
 #[test]
-#[ignore]
 fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
     let db = MvccTestDb::new();
     db.conn
