@@ -1,7 +1,7 @@
 use crate::common::{
-    self, compute_dbhash, limbo_exec_rows, maybe_setup_tracing, rusqlite_integrity_check, ExecRows,
+    self, ExecRows, compute_dbhash, limbo_exec_rows, maybe_setup_tracing, rusqlite_integrity_check,
 };
-use crate::common::{compare_string, do_flush, TempDatabase};
+use crate::common::{TempDatabase, compare_string, do_flush};
 use log::debug;
 use rusqlite::types::Value as RValue;
 use std::io::{Read, Seek, Write};
@@ -196,7 +196,7 @@ fn test_regression_multi_row_insert(tmp_db: TempDatabase) -> anyhow::Result<()> 
     })?;
 
     assert_eq!(current_read_index, 4); // Verify we read all rows
-                                       // sort ids
+    // sort ids
     actual_ids.sort();
     assert_eq!(actual_ids, expected_ids);
     Ok(())
@@ -1324,6 +1324,112 @@ pub fn test_conflict_inside_txn(limbo: TempDatabase) {
             ]
         ],
         limbo_exec_rows(&conn2, "SELECT * FROM t")
+    );
+}
+
+#[turso_macros::test]
+pub fn test_update_expression_error_rolls_back_statement_inside_txn(limbo: TempDatabase) {
+    let conn = limbo.db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x INT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(1, 10), (2, 20)")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    assert!(
+        conn.execute(
+            "UPDATE t
+                SET x = CASE
+                    WHEN id = 1 THEN 11
+                    ELSE (char(120) LIKE char(120) ESCAPE (char(121) || char(121)))
+                END"
+        )
+        .is_err()
+    );
+
+    assert_eq!(
+        vec![
+            vec![RValue::Integer(1), RValue::Integer(10)],
+            vec![RValue::Integer(2), RValue::Integer(20)],
+        ],
+        limbo_exec_rows(&conn, "SELECT id, x FROM t ORDER BY id")
+    );
+
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        vec![
+            vec![RValue::Integer(1), RValue::Integer(10)],
+            vec![RValue::Integer(2), RValue::Integer(20)],
+        ],
+        limbo_exec_rows(&conn, "SELECT id, x FROM t ORDER BY id")
+    );
+}
+
+#[turso_macros::test]
+pub fn test_delete_expression_error_rolls_back_statement_inside_txn(limbo: TempDatabase) {
+    let conn = limbo.db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(1), (2)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    assert!(
+        conn.execute(
+            "DELETE FROM t
+              WHERE CASE
+                    WHEN id = 1 THEN 1
+                    ELSE (char(120) LIKE char(120) ESCAPE (char(121) || char(121)))
+                END"
+        )
+        .is_err()
+    );
+
+    assert_eq!(
+        vec![vec![RValue::Integer(1)], vec![RValue::Integer(2)]],
+        limbo_exec_rows(&conn, "SELECT id FROM t ORDER BY id")
+    );
+
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        vec![vec![RValue::Integer(1)], vec![RValue::Integer(2)]],
+        limbo_exec_rows(&conn, "SELECT id FROM t ORDER BY id")
+    );
+}
+
+#[turso_macros::test]
+pub fn test_insert_expression_error_rolls_back_statement_inside_txn(limbo: TempDatabase) {
+    let conn = limbo.db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    conn.execute("CREATE TABLE t(x INT)").unwrap();
+    conn.execute("CREATE TABLE src(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO src VALUES(1), (2)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    assert!(
+        conn.execute(
+            "INSERT INTO t
+                SELECT CASE
+                    WHEN id = 1 THEN 10
+                    ELSE (char(120) LIKE char(120) ESCAPE (char(121) || char(121)))
+                END
+                FROM src
+                ORDER BY id"
+        )
+        .is_err()
+    );
+
+    assert_eq!(
+        Vec::<Vec<RValue>>::new(),
+        limbo_exec_rows(&conn, "SELECT x FROM t ORDER BY x")
+    );
+
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        Vec::<Vec<RValue>>::new(),
+        limbo_exec_rows(&conn, "SELECT x FROM t ORDER BY x")
     );
 }
 

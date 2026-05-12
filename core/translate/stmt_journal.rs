@@ -25,7 +25,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::{sync::Arc, Connection, Result};
+use crate::{Connection, Result, sync::Arc};
 use turso_parser::ast::{ResolveType, TriggerEvent};
 
 /// Check whether any DDL-level constraint (IPK or index) uses REPLACE.
@@ -148,7 +148,12 @@ pub(crate) fn set_insert_stmt_journal_flags(
         index_modes.iter().map(|(oc, _)| *oc),
     );
     let has_check = !table.check_constraints.is_empty();
-    let may_abort = has_triggers
+    // Multi-row INSERT can evaluate row-dependent SELECT/VALUES expressions
+    // while writes are already in progress. Those expressions are not captured
+    // by constraint analysis, so keep the statement savepoint unless the insert
+    // is proven single-row.
+    let may_abort = inserting_multiple_rows
+        || has_triggers
         || has_fks
         || constraint_may_abort(
             has_statement_conflict,
@@ -231,7 +236,12 @@ pub(crate) fn set_update_stmt_journal_flags(
     let has_unique =
         !btree_table.unique_sets.is_empty() || plan.indexes_to_update.iter().any(|idx| idx.unique);
 
-    let may_abort = has_triggers
+    // Row-dependent expressions in SET, WHERE, or index maintenance can fail
+    // after earlier rows have already been written. Unless this UPDATE is
+    // proven single-row, keep the statement savepoint available even when the
+    // schema has no aborting constraints.
+    let may_abort = !is_single_row
+        || has_triggers
         || has_fks
         || constraint_may_abort(
             has_statement_conflict,
@@ -273,9 +283,11 @@ pub(crate) fn set_delete_stmt_journal_flags(
         program.set_multi_write(false);
     }
 
-    // DELETE has no ON CONFLICT clause, so NOT NULL/CHECK/UNIQUE don't apply —
-    // only triggers (RAISE(ABORT)) or FK violations can abort.
-    if !has_triggers && !has_fks {
+    // DELETE has no ON CONFLICT clause, so NOT NULL/CHECK/UNIQUE don't apply.
+    // Multi-row DELETE still evaluates row-dependent WHERE/RETURNING
+    // expressions while writes are in progress, so only a proven single-row
+    // delete can disable the statement savepoint here.
+    if is_single_row && !has_triggers && !has_fks {
         program.set_may_abort(false);
     }
     Ok(())
