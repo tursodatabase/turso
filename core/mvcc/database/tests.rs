@@ -18,7 +18,9 @@ use crate::storage::sqlite3_ondisk::{
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
-use crate::{Buffer, Completion, DatabaseOpts, EncryptionKey, LimboError, OpenFlags};
+use crate::{
+    Buffer, Completion, DatabaseOpts, EncryptionKey, LimboError, OpenFlags, StatementStatusCounter,
+};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use rand::{Rng, SeedableRng};
@@ -52,6 +54,10 @@ impl FixedYieldInjector {
             remaining: Mutex::new(points.into_iter().collect()),
         })
     }
+
+    fn is_empty(&self) -> bool {
+        self.remaining.lock().is_empty()
+    }
 }
 
 impl YieldInjector for FixedYieldInjector {
@@ -70,6 +76,10 @@ impl FixedFailureInjector {
         Arc::new(Self {
             remaining: Mutex::new(points.into_iter().collect()),
         })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remaining.lock().is_empty()
     }
 }
 
@@ -2256,6 +2266,179 @@ fn test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit() {
         meta[0][0].as_int().unwrap() >= 1,
         "expected metadata boundary to persist with pager commit"
     );
+}
+
+/// What this test checks: ordinary prepared reads recompile when checkpoint publishes a table root page.
+/// Why this matters: root publication invalidates compiled bytecode generally, not only PRAGMA integrity_check.
+#[test]
+fn test_prepared_select_reprepares_after_checkpoint_root_publish() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    let mut stmt = conn.prepare("SELECT id, v FROM t ORDER BY id").unwrap();
+    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 0);
+
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(&rows[0][1].to_string(), "a");
+    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 1);
+}
+
+/// What this test checks: data-only MVCC checkpoints do not invalidate already-prepared statements.
+/// Why this matters: only root/drop publication should force reprepare; ordinary row checkpointing should leave prepared bytecode reusable.
+#[test]
+fn test_prepared_select_does_not_reprepare_after_data_only_checkpoint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mut stmt = conn.prepare("SELECT id, v FROM t ORDER BY id").unwrap();
+    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 0);
+
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(&rows[0][1].to_string(), "a");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(&rows[1][1].to_string(), "b");
+    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 0);
+}
+
+/// What this test checks: prepared index lookups recompile when checkpoint publishes an index root page.
+/// Why this matters: table and index roots are published independently, and stale index bytecode must not survive checkpoint.
+#[test]
+fn test_prepared_index_lookup_reprepares_after_checkpoint_root_publish() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, payload TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT id, payload FROM t INDEXED BY idx_t_v WHERE v = 'b'")
+        .unwrap();
+    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 0);
+
+    conn.execute("INSERT INTO t VALUES (1, 'a', 'one')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'b', 'two')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    assert_eq!(&rows[0][1].to_string(), "two");
+    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 1);
+}
+
+/// What this test checks: the public statement API can yield in auto-checkpoint and then surface a post-durable-boundary checkpoint failure without losing committed root-page state.
+/// Why this matters: checkpoint roots are visible through WAL at this boundary, so error cleanup must keep integrity_check and reads coherent.
+#[test]
+fn test_integrity_check_after_checkpoint_io_yield_then_post_durable_failure_uses_user_apis() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    let stale_schema_conn = db.connect();
+    let mut stale_integrity_check = stale_schema_conn.prepare("PRAGMA integrity_check").unwrap();
+    let schema_version = get_rows(&conn, "PRAGMA schema_version");
+    assert_eq!(schema_version.len(), 1);
+    let schema_version_before_checkpoint = schema_version[0][0].as_int().unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforeAcquireLock.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let failure_injector = FixedFailureInjector::new([(
+        CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
+        LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+    )]);
+    conn.set_failure_injector(Some(failure_injector.clone()));
+
+    let mut same_conn_stale_integrity_check = conn.prepare("PRAGMA integrity_check").unwrap();
+    let mut insert_stmt = conn.prepare("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let mut yielded_before_checkpoint_lock = false;
+    for _ in 0..10_000 {
+        match insert_stmt.step().unwrap() {
+            crate::StepResult::IO if injector.is_empty() => {
+                yielded_before_checkpoint_lock = true;
+                break;
+            }
+            crate::StepResult::IO => {}
+            crate::StepResult::Done => {
+                panic!("INSERT completed before checkpoint acquire-lock yield fired")
+            }
+            other => panic!("unexpected INSERT step result before yield: {other:?}"),
+        }
+    }
+    assert!(
+        yielded_before_checkpoint_lock,
+        "expected INSERT auto-checkpoint to yield before acquiring the checkpoint lock"
+    );
+
+    let mut completed_after_durable_boundary_failure = false;
+    for _ in 0..10_000 {
+        match insert_stmt.step() {
+            Ok(crate::StepResult::Done) if failure_injector.is_empty() => {
+                completed_after_durable_boundary_failure = true;
+                break;
+            }
+            Ok(crate::StepResult::Done) => {
+                panic!("INSERT completed before checkpoint durable-boundary failure fired")
+            }
+            Err(err) => panic!("unexpected INSERT error after yield: {err:?}"),
+            Ok(crate::StepResult::IO) => {}
+            Ok(other) => panic!("unexpected INSERT step result after yield: {other:?}"),
+        }
+    }
+    assert!(
+        completed_after_durable_boundary_failure,
+        "expected INSERT auto-checkpoint to observe durable-boundary failure and finish"
+    );
+
+    conn.set_yield_injector(None);
+    conn.set_failure_injector(None);
+
+    let schema_version = get_rows(&conn, "PRAGMA schema_version");
+    assert_eq!(schema_version.len(), 1);
+    assert_eq!(
+        schema_version[0][0].as_int().unwrap(),
+        schema_version_before_checkpoint
+    );
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    let rows = same_conn_stale_integrity_check.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    let rows = stale_integrity_check.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    let rows = get_rows(&stale_schema_conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(&rows[0][1].to_string(), "a");
 }
 
 /// What this test checks: Auto-checkpoint post-commit failure does not invalidate committed transaction visibility on restart.
