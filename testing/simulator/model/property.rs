@@ -191,6 +191,15 @@ pub enum Property {
         tables: Vec<String>,
         write_kinds: Vec<QueryDiscriminants>,
     },
+    /// Ensures LEFT JOIN ON terms that reference the preserved table do not
+    /// imply a partial index on that preserved table. The unmatched left row
+    /// must still be materialized with NULL right-side columns.
+    LeftJoinPartialIndex {
+        src_table: String,
+        rhs_table: String,
+        dst_table: String,
+        index_name: String,
+    },
     /// Property used to subsititute a property with its queries only
     Queries {
         queries: Vec<Query>,
@@ -238,6 +247,7 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::LeftJoinPartialIndex { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => None,
         }

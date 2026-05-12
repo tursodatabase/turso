@@ -89,7 +89,7 @@ pub enum TxOperation {
     },
     CreateIndex {
         table_name: String,
-        index: sql_generation::model::table::Index,
+        index: Box<sql_generation::model::table::Index>,
     },
     DropIndex {
         table_name: String,
@@ -237,7 +237,10 @@ impl TransactionTables {
     ) {
         self.expect_snapshot_mut()
             .operations
-            .push(TxOperation::CreateIndex { table_name, index });
+            .push(TxOperation::CreateIndex {
+                table_name,
+                index: Box::new(index),
+            });
     }
 
     pub fn record_drop_index(&mut self, table_name: String, index_name: String) {
@@ -639,7 +642,7 @@ where
                             .iter_mut()
                             .find(|t| &t.name == table_name)
                             .expect("Table should exist in committed tables");
-                        committed.indexes.push(index.clone());
+                        committed.indexes.push((**index).clone());
                     }
                     TxOperation::DropIndex {
                         table_name,

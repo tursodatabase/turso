@@ -1165,6 +1165,7 @@ pub fn create_initial_indexes(rng: &mut ChaCha8Rng, tables: &[Table]) -> Vec<Cre
                             index_name,
                             table_name: table.name.clone(),
                             columns: selected_columns,
+                            where_clause: None,
                         },
                     };
                     indexes.push(create_index);

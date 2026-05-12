@@ -911,6 +911,32 @@ impl Shadow for FromClause {
                     }
                     join_table.rows = new_rows;
                 }
+                JoinType::Left => {
+                    let prev_rows = std::mem::take(&mut join_table.rows);
+                    let null_rhs: Vec<SimValue> =
+                        vec![SimValue(Value::Null); joined_table.columns.len()];
+                    let mut new_rows = Vec::new();
+                    for row1 in prev_rows.into_iter() {
+                        let mut matched = false;
+                        for row2 in joined_table.rows.iter() {
+                            let combined_row =
+                                row1.iter().chain(row2.iter()).cloned().collect::<Vec<_>>();
+                            if join.on.test(&combined_row, &join_table) {
+                                new_rows.push(combined_row);
+                                matched = true;
+                            }
+                        }
+                        if !matched {
+                            new_rows.push(
+                                row1.iter()
+                                    .chain(null_rhs.iter())
+                                    .cloned()
+                                    .collect::<Vec<_>>(),
+                            );
+                        }
+                    }
+                    join_table.rows = new_rows;
+                }
                 _ => todo!(),
             }
         }
