@@ -2375,6 +2375,25 @@ expect {
     10|999
 }
 
+@cross-check-integrity
+test fk-pragma-change-inside-transaction-is-noop {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(10,1);
+    BEGIN;
+    PRAGMA foreign_keys=ON;
+    DELETE FROM p WHERE id=1;
+    COMMIT;
+    SELECT 'p', count(*) FROM p;
+    SELECT 'c', count(*) FROM c;
+}
+expect {
+    p|0
+    c|1
+}
+
 # DROP parent should succeed with multiple orphaned FK values
 @cross-check-integrity
 test fk-drop-parent-ok-with-multiple-orphaned-fks {
