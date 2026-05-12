@@ -22,6 +22,7 @@
 //! into this module to set them to `false` when safe.
 
 use crate::translate::emitter::Resolver;
+use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::ProgramBuilder;
@@ -67,154 +68,80 @@ fn table_has_fks(
 }
 
 fn expr_depends_on_row(expr: &Expr) -> bool {
-    match expr {
-        // Planned DML expressions are usually bound to Column/RowId. Schema-stored
-        // index expressions still contain identifiers, and here they only appear
-        // after the index was selected for maintenance.
-        Expr::Column { .. }
-        | Expr::DoublyQualified(_, _, _)
-        | Expr::Id(_)
-        | Expr::Name(_)
-        | Expr::Qualified(_, _)
-        | Expr::RowId { .. }
-        | Expr::Register(_)
-        | Expr::SubqueryResult { .. } => true,
-        Expr::Exists(_) | Expr::Subquery(_) | Expr::InSelect { .. } => true,
-        Expr::Between {
-            lhs, start, end, ..
-        } => expr_depends_on_row(lhs) || expr_depends_on_row(start) || expr_depends_on_row(end),
-        Expr::Binary(lhs, _, rhs) => expr_depends_on_row(lhs) || expr_depends_on_row(rhs),
-        Expr::Case {
-            base,
-            when_then_pairs,
-            else_expr,
-        } => {
-            base.as_ref().is_some_and(|expr| expr_depends_on_row(expr))
-                || when_then_pairs
-                    .iter()
-                    .any(|(when, then)| expr_depends_on_row(when) || expr_depends_on_row(then))
-                || else_expr
-                    .as_ref()
-                    .is_some_and(|expr| expr_depends_on_row(expr))
+    let mut depends_on_row = false;
+    // Planned DML expressions are usually bound to Column/RowId. Schema-stored
+    // index expressions still contain identifiers, and here they only appear
+    // after the index was selected for maintenance.
+    let _ = walk_expr(expr, &mut |expr| -> Result<WalkControl> {
+        match expr {
+            Expr::Column { .. }
+            | Expr::DoublyQualified(_, _, _)
+            | Expr::Id(_)
+            | Expr::Name(_)
+            | Expr::Qualified(_, _)
+            | Expr::RowId { .. }
+            | Expr::Register(_)
+            | Expr::SubqueryResult { .. }
+            | Expr::Exists(_)
+            | Expr::Subquery(_)
+            | Expr::InSelect { .. } => {
+                depends_on_row = true;
+                Ok(WalkControl::SkipChildren)
+            }
+            Expr::Array { elements } => {
+                if elements.iter().any(|expr| expr_depends_on_row(expr)) {
+                    depends_on_row = true;
+                }
+                Ok(WalkControl::SkipChildren)
+            }
+            Expr::Subscript { base, index } => {
+                if expr_depends_on_row(base) || expr_depends_on_row(index) {
+                    depends_on_row = true;
+                }
+                Ok(WalkControl::SkipChildren)
+            }
+            _ => Ok(WalkControl::Continue),
         }
-        Expr::Cast { expr, .. }
-        | Expr::Collate(expr, _)
-        | Expr::IsNull(expr)
-        | Expr::NotNull(expr)
-        | Expr::Unary(_, expr)
-        | Expr::FieldAccess { base: expr, .. } => expr_depends_on_row(expr),
-        Expr::FunctionCall {
-            args,
-            order_by,
-            filter_over,
-            ..
-        } => {
-            args.iter().any(|expr| expr_depends_on_row(expr))
-                || order_by.iter().any(|col| expr_depends_on_row(&col.expr))
-                || filter_over
-                    .filter_clause
-                    .as_ref()
-                    .is_some_and(|expr| expr_depends_on_row(expr))
-        }
-        Expr::FunctionCallStar { filter_over, .. } => filter_over
-            .filter_clause
-            .as_ref()
-            .is_some_and(|expr| expr_depends_on_row(expr)),
-        Expr::InList { lhs, rhs, .. } => {
-            expr_depends_on_row(lhs) || rhs.iter().any(|expr| expr_depends_on_row(expr))
-        }
-        Expr::InTable { lhs, args, .. } => {
-            expr_depends_on_row(lhs) || args.iter().any(|expr| expr_depends_on_row(expr))
-        }
-        Expr::Like {
-            lhs, rhs, escape, ..
-        } => {
-            expr_depends_on_row(lhs)
-                || expr_depends_on_row(rhs)
-                || escape
-                    .as_ref()
-                    .is_some_and(|expr| expr_depends_on_row(expr))
-        }
-        Expr::Parenthesized(exprs) => exprs.iter().any(|expr| expr_depends_on_row(expr)),
-        Expr::Raise(_, expr) => expr.as_ref().is_some_and(|expr| expr_depends_on_row(expr)),
-        Expr::Array { elements } => elements.iter().any(|expr| expr_depends_on_row(expr)),
-        Expr::Subscript { base, index } => expr_depends_on_row(base) || expr_depends_on_row(index),
-        Expr::Literal(_) | Expr::Variable(_) | Expr::Default => false,
-    }
+    });
+    depends_on_row
 }
 
 fn expr_has_runtime_abort_source(expr: &Expr) -> bool {
-    match expr {
-        Expr::FunctionCall { .. }
-        | Expr::FunctionCallStar { .. }
-        | Expr::Raise(_, _)
-        | Expr::Exists(_)
-        | Expr::Subquery(_)
-        | Expr::SubqueryResult { .. }
-        | Expr::InSelect { .. }
-        | Expr::InTable { .. }
-        | Expr::FieldAccess { .. }
-        | Expr::Subscript { .. } => true,
-        Expr::Like {
-            lhs,
-            op,
-            rhs,
-            escape,
-            ..
-        } => {
-            escape.is_some()
-                || matches!(op, LikeOperator::Match | LikeOperator::Regexp)
-                || expr_has_runtime_abort_source(lhs)
-                || expr_has_runtime_abort_source(rhs)
+    let mut has_runtime_abort_source = false;
+    let _ = walk_expr(expr, &mut |expr| -> Result<WalkControl> {
+        match expr {
+            Expr::FunctionCall { .. }
+            | Expr::FunctionCallStar { .. }
+            | Expr::Raise(_, _)
+            | Expr::Exists(_)
+            | Expr::Subquery(_)
+            | Expr::SubqueryResult { .. }
+            | Expr::InSelect { .. }
+            | Expr::InTable { .. }
+            | Expr::FieldAccess { .. }
+            | Expr::Subscript { .. } => {
+                has_runtime_abort_source = true;
+                Ok(WalkControl::SkipChildren)
+            }
+            Expr::Like { op, escape, .. }
+                if escape.is_some() || matches!(op, LikeOperator::Match | LikeOperator::Regexp) =>
+            {
+                has_runtime_abort_source = true;
+                Ok(WalkControl::SkipChildren)
+            }
+            Expr::Array { elements } => {
+                if elements
+                    .iter()
+                    .any(|expr| expr_has_runtime_abort_source(expr))
+                {
+                    has_runtime_abort_source = true;
+                }
+                Ok(WalkControl::SkipChildren)
+            }
+            _ => Ok(WalkControl::Continue),
         }
-        Expr::Between {
-            lhs, start, end, ..
-        } => {
-            expr_has_runtime_abort_source(lhs)
-                || expr_has_runtime_abort_source(start)
-                || expr_has_runtime_abort_source(end)
-        }
-        Expr::Binary(lhs, _, rhs) => {
-            expr_has_runtime_abort_source(lhs) || expr_has_runtime_abort_source(rhs)
-        }
-        Expr::Case {
-            base,
-            when_then_pairs,
-            else_expr,
-        } => {
-            base.as_ref()
-                .is_some_and(|expr| expr_has_runtime_abort_source(expr))
-                || when_then_pairs.iter().any(|(when, then)| {
-                    expr_has_runtime_abort_source(when) || expr_has_runtime_abort_source(then)
-                })
-                || else_expr
-                    .as_ref()
-                    .is_some_and(|expr| expr_has_runtime_abort_source(expr))
-        }
-        Expr::Cast { expr, .. }
-        | Expr::Collate(expr, _)
-        | Expr::IsNull(expr)
-        | Expr::NotNull(expr)
-        | Expr::Unary(_, expr) => expr_has_runtime_abort_source(expr),
-        Expr::InList { lhs, rhs, .. } => {
-            expr_has_runtime_abort_source(lhs)
-                || rhs.iter().any(|expr| expr_has_runtime_abort_source(expr))
-        }
-        Expr::Parenthesized(exprs) => exprs.iter().any(|expr| expr_has_runtime_abort_source(expr)),
-        Expr::Array { elements } => elements
-            .iter()
-            .any(|expr| expr_has_runtime_abort_source(expr)),
-        Expr::Column { .. }
-        | Expr::Register(_)
-        | Expr::DoublyQualified(_, _, _)
-        | Expr::Id(_)
-        | Expr::Literal(_)
-        | Expr::Name(_)
-        | Expr::Qualified(_, _)
-        | Expr::RowId { .. }
-        | Expr::Variable(_)
-        | Expr::Default => false,
-    }
+    });
+    has_runtime_abort_source
 }
 
 fn expr_may_abort_after_write(expr: &Expr) -> bool {
