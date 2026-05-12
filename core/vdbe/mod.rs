@@ -39,6 +39,7 @@ pub use crate::translate::collate::CollationSeq;
 use crate::{
     error::LimboError,
     function::{AggFunc, FuncCtx},
+    incremental::view::AllViewsTxStateSnapshot,
     mvcc::{database::CommitStateMachine, MvccClock},
     numeric::Numeric,
     return_if_io,
@@ -668,6 +669,7 @@ pub struct ProgramState {
     pub(crate) is_active_write: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
+    view_transaction_states_when_stmt_started: Option<AllViewsTxStateSnapshot>,
     pub n_change: AtomicI64,
 }
 
@@ -725,6 +727,7 @@ impl ProgramState {
             uses_subjournal: false,
             is_active_write: false,
             has_stmt_transaction: false,
+            view_transaction_states_when_stmt_started: None,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
             explain_state: RwLock::new(ExplainState::default()),
@@ -952,6 +955,8 @@ impl ProgramState {
         }
 
         self.has_stmt_transaction = true;
+        self.view_transaction_states_when_stmt_started =
+            Some(connection.view_transaction_states.snapshot());
 
         // Store the deferred foreign key violations counter at the start of the statement.
         // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
@@ -987,6 +992,8 @@ impl ProgramState {
             return Ok(());
         }
         self.has_stmt_transaction = false;
+        let view_transaction_states_when_stmt_started =
+            self.view_transaction_states_when_stmt_started.take();
 
         // Drain attached pagers upfront so we can clean them up regardless of path.
         let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
@@ -1062,6 +1069,10 @@ impl ProgramState {
                 // Always restore FK violation counters on statement rollback,
                 // regardless of whether a pager savepoint was opened.
                 // Mirrors SQLite's vdbeCloseStatement (vdbeaux.c:3243-3246).
+                if let Some(snapshot) = view_transaction_states_when_stmt_started {
+                    connection.view_transaction_states.restore(snapshot);
+                }
+
                 connection.fk_deferred_violations.store(
                     self.fk_deferred_violations_when_stmt_started
                         .load(Ordering::Acquire),

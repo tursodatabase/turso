@@ -138,6 +138,8 @@ pub struct AllViewsTxState {
     states: Rc<RefCell<HashMap<String, Arc<ViewTransactionState>>>>,
 }
 
+pub(crate) type AllViewsTxStateSnapshot = Vec<(String, ViewTransactionState)>;
+
 // SAFETY: This needs to be audited for thread safety.
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for AllViewsTxState {}
@@ -173,6 +175,27 @@ impl AllViewsTxState {
     /// Clear all transaction states
     pub fn clear(&self) {
         self.states.borrow_mut().clear();
+    }
+
+    /// Capture the current transaction deltas so statement rollback can discard
+    /// only the deltas produced by the failed statement.
+    pub(crate) fn snapshot(&self) -> AllViewsTxStateSnapshot {
+        self.states
+            .borrow()
+            .iter()
+            .map(|(view_name, tx_state)| (view_name.clone(), tx_state.as_ref().clone()))
+            .collect()
+    }
+
+    /// Restore a previously captured transaction-delta snapshot.
+    pub(crate) fn restore(&self, snapshot: AllViewsTxStateSnapshot) {
+        let mut states = self.states.borrow_mut();
+        states.clear();
+        states.extend(
+            snapshot
+                .into_iter()
+                .map(|(view_name, tx_state)| (view_name, Arc::new(tx_state))),
+        );
     }
 
     /// Check if there are no transaction states

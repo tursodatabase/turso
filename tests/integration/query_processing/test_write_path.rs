@@ -1768,6 +1768,73 @@ fn test_matview_row_loss_during_btree_split(tmp_db: TempDatabase) -> anyhow::Res
     Ok(())
 }
 
+#[turso_macros::test(views)]
+fn test_aborted_insert_does_not_leave_stale_materialized_view_delta(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")?;
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT v, COUNT(*) AS cnt FROM t GROUP BY v")?;
+    conn.execute("INSERT INTO t VALUES (1, 10)")?;
+    conn.execute("INSERT INTO t VALUES (2, 20)")?;
+
+    let err = conn
+        .execute("INSERT INTO t SELECT 3 AS id, 30 AS v UNION ALL SELECT 1, 99")
+        .unwrap_err();
+    assert!(matches!(err, LimboError::Constraint(_)));
+
+    conn.execute("INSERT INTO t VALUES (4, 40)")?;
+
+    let mv_rows = limbo_exec_rows(&conn, "SELECT v, cnt FROM mv ORDER BY v");
+    assert_eq!(
+        mv_rows,
+        vec![
+            vec![RValue::Integer(10), RValue::Integer(1)],
+            vec![RValue::Integer(20), RValue::Integer(1)],
+            vec![RValue::Integer(40), RValue::Integer(1)],
+        ]
+    );
+
+    let table_rows = limbo_exec_rows(&conn, "SELECT v, COUNT(*) FROM t GROUP BY v ORDER BY v");
+    assert_eq!(mv_rows, table_rows);
+
+    Ok(())
+}
+
+#[turso_macros::test(views)]
+fn test_statement_rollback_preserves_prior_materialized_view_deltas(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")?;
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT v, COUNT(*) AS cnt FROM t GROUP BY v")?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (1, 10)")?;
+    let err = conn
+        .execute("INSERT INTO t SELECT 2 AS id, 20 AS v UNION ALL SELECT 1, 99")
+        .unwrap_err();
+    assert!(matches!(err, LimboError::Constraint(_)));
+    conn.execute("INSERT INTO t VALUES (3, 30)")?;
+    conn.execute("COMMIT")?;
+
+    let mv_rows = limbo_exec_rows(&conn, "SELECT v, cnt FROM mv ORDER BY v");
+    assert_eq!(
+        mv_rows,
+        vec![
+            vec![RValue::Integer(10), RValue::Integer(1)],
+            vec![RValue::Integer(30), RValue::Integer(1)],
+        ]
+    );
+
+    let table_rows = limbo_exec_rows(&conn, "SELECT v, COUNT(*) FROM t GROUP BY v ORDER BY v");
+    assert_eq!(mv_rows, table_rows);
+
+    Ok(())
+}
+
 /// Regression test for simulator seed 867: UPDATE on an attached database table
 /// that changes the primary key (rowid) while a UNIQUE index exists would use
 /// the wrong database_id (0 instead of the attached db) for OpenWrite cursors,
