@@ -3487,12 +3487,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // Check if any CONCURRENT writer is in Preparing state. If there is one,
         // we must wait for it to complete before proceeding. Otherwise, we can
         // have concurrent txn deadlock trying to acquire pager_commit_lock.
-        let any_concurrent_in_preparing = self.txs.iter().any(|entry| {
-            let other_tx_id = *entry.key();
-            if other_tx_id == tx_id {
-                return false;
-            }
-            matches!(entry.value().state.load(), TransactionState::Preparing(_))
+        //
+        // The scan runs under the clock mutex (via `get_commit_timestamp`)
+        // so it serializes with `prepare_tx`'s `Preparing(end_ts)` publish,
+        // which already takes the same mutex. This closes the TOCTOU
+        // window where another transaction stores `Preparing` between
+        // our scan and the lock acquisition below. The timestamp is
+        // discarded; only the lock acquisition matters.
+        let mut any_concurrent_in_preparing = false;
+        self.clock.get_timestamp(|_ts| {
+            any_concurrent_in_preparing = self.txs.iter().any(|entry| {
+                let other_tx_id = *entry.key();
+                if other_tx_id == tx_id {
+                    return false;
+                }
+                matches!(entry.value().state.load(), TransactionState::Preparing(_))
+            });
         });
         if any_concurrent_in_preparing {
             tracing::debug!(
