@@ -1600,6 +1600,156 @@ expect {
     500
 }
 
+# https://github.com/tursodatabase/turso/issues/6332
+# Per SQLite's ORDER BY resolution rules, a bare identifier that matches
+# an output column alias refers to that alias, not to a FROM column. So
+# renaming src.b -> src.c must leave the trigger's `ORDER BY b` alone,
+# keeping the result ordered by the alias for src.a.
+test alter-table-rename-column-trigger-order-by-alias {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    INSERT INTO src VALUES (2, 100), (1, 200);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT a AS b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1);
+    SELECT group_concat(v, '|') FROM log;
+}
+expect {
+    1|2
+}
+
+# The stored trigger SQL must also preserve the alias name `b` in ORDER BY
+# (not rewrite it to `c`), since the alias-resolution rule means it never
+# referred to the renamed table column to begin with.
+test alter-table-rename-column-trigger-order-by-alias-stored-sql {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT a AS b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig';
+}
+expect pattern {
+    CREATE TRIGGER trig AFTER INSERT ON dst\s+BEGIN\s+INSERT INTO log SELECT a AS b FROM src ORDER BY b;?\s+END
+}
+
+# Compound SELECT: SQLite resolves a compound's ORDER BY alias by searching
+# every arm in order, so `ORDER BY b` matches the alias introduced in the
+# second arm and must be preserved across a column rename — even though the
+# first arm has no `b` alias.
+test alter-table-rename-column-trigger-order-by-alias-compound {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT a FROM src UNION ALL SELECT a AS b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig';
+}
+expect pattern {
+    CREATE TRIGGER trig AFTER INSERT ON dst\s+BEGIN\s+INSERT INTO log SELECT a FROM src UNION ALL SELECT a AS b FROM src ORDER BY b;?\s+END
+}
+
+# Counter-case: when the ORDER BY bare identifier does not match an output
+# column alias, it is a normal FROM-clause column reference and must be
+# rewritten consistently with the column rename.
+test alter-table-rename-column-trigger-order-by-not-alias {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    INSERT INTO src VALUES (2, 100), (1, 200);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT a FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1);
+    SELECT group_concat(v, '|') FROM log;
+}
+expect {
+    2|1
+}
+
+# Bare-column result column (no explicit AS) carries an implicit column-name
+# alias in the AST. That implicit alias is NOT a user-provided alias — it
+# tracks the original expression text. SQLite rewrites both the result column
+# and the ORDER BY ref consistently in this case, and so must we. Only an
+# explicit `AS x` (or its elided form) blocks the ORDER BY rewrite.
+test alter-table-rename-column-trigger-order-by-implicit-alias {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    INSERT INTO src VALUES (10, 1), (20, 2);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1);
+    SELECT group_concat(v, '|') FROM log;
+}
+expect {
+    1|2
+}
+
+# Stored SQL form of the implicit-alias case: both the result column and the
+# ORDER BY identifier must be rewritten from `b` to `c`.
+test alter-table-rename-column-trigger-order-by-implicit-alias-stored-sql {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig';
+}
+expect pattern {
+    CREATE TRIGGER trig AFTER INSERT ON dst\s+BEGIN\s+INSERT INTO log SELECT c FROM src ORDER BY c;?\s+END
+}
+
+# Qualified result column whose column-half matches the renamed column. The
+# ORDER BY bare identifier does not refer to a user-provided alias and must
+# be rewritten alongside both the result column and the FROM-clause column.
+test alter-table-rename-column-trigger-order-by-qualified-result-col {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT src.b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig';
+}
+expect pattern {
+    CREATE TRIGGER trig AFTER INSERT ON dst\s+BEGIN\s+INSERT INTO log SELECT src\.c FROM src ORDER BY c;?\s+END
+}
+
 # Round-trip rename: renaming away and back must restore the original column
 # name in the stored trigger SQL (issue #6625). Previously the in-memory
 # trigger.sql was not refreshed after a column rename, so the second rename
