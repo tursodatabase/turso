@@ -732,6 +732,93 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         }
     }
 
+    fn publish_checkpointed_schema_roots(&mut self) -> Result<()> {
+        // Patch sqlite_schema in MV Store to contain positive rootpages instead of negative ones
+        // for tables and indexes that were flushed to the physical database
+        for (sqlite_schema_rowid, (_, row_version)) in self.created_btrees.drain() {
+            let key = RowID {
+                table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
+                row_id: RowKey::Int(sqlite_schema_rowid),
+            };
+            let sqlite_schema_row = self
+                .mvstore
+                .rows
+                .get(&key)
+                .expect("sqlite_schema row not found");
+            let mut row_versions = sqlite_schema_row.value().write();
+            // row_version is a clone of the original with only the root
+            // page column patched, so it shares the same version id. We
+            // must replace the original in-place rather than append,
+            // otherwise the version chain ends up with two entries that
+            // have identical (id, begin, end). A later DELETE only marks
+            // one of them as ended (it returns after the first match),
+            // leaving the other as a phantom current version that causes
+            // spurious write-write conflicts at commit time.
+            let vid = row_version.id;
+            if let Some(existing) = row_versions.iter_mut().find(|rv| rv.id == vid) {
+                *existing = row_version;
+            } else {
+                self.mvstore
+                    .insert_version_raw(&mut row_versions, row_version);
+            }
+        }
+
+        // Patch in-memory schema to do the same
+        self.connection.db.with_schema_mut(|schema| {
+            for table in schema.tables.values_mut() {
+                let table = Arc::get_mut(table).expect("this should be the only reference");
+                let Some(btree_table) = table.btree_mut() else {
+                    continue;
+                };
+                let btree_table = Arc::make_mut(btree_table);
+                if btree_table.root_page < 0 {
+                    let table_id = MVTableId::from(btree_table.root_page);
+                    let entry = self
+                        .mvstore
+                        .table_id_to_rootpage
+                        .get(&table_id)
+                        .expect("we should have checkpointed table with table_id {table_id:?}");
+                    let value = entry
+                        .value()
+                        .expect("table with id {table_id:?} should have a mapping");
+                    btree_table.root_page = value as i64;
+                }
+            }
+            for table_index_list in schema.indexes.values_mut() {
+                for index in table_index_list.iter_mut() {
+                    if index.root_page < 0 {
+                        let table_id = MVTableId::from(index.root_page);
+                        let entry =
+                            self.mvstore.table_id_to_rootpage.get(&table_id).expect(
+                                "we should have checkpointed index with table_id {table_id:?}",
+                            );
+                        let value = entry
+                            .value()
+                            .expect("index with id {table_id:?} should have a mapping");
+                        let index = Arc::make_mut(index);
+                        index.root_page = value as i64;
+                    }
+                }
+            }
+
+            schema.schema_version += 1;
+            // Clear dropped root pages now that the checkpoint has completed.
+            // The btree pages for dropped tables have been freed, so integrity_check
+            // no longer needs to track them.
+            schema.dropped_root_pages.clear();
+            let _ = self.pager.io.block(|| {
+                self.pager.with_header_mut(|header| {
+                    header.schema_cookie = schema.schema_version.into();
+                    self.mvstore.global_header.write().replace(*header);
+                    IOResult::Done(())
+                })
+            })?;
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
     /// Garbage-collect row versions for rows that were just checkpointed.
     /// Must be called AFTER durable_txid_max is updated and BEFORE the
     /// checkpoint lock is released (no concurrent writers under blocking lock).
@@ -1581,89 +1668,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             CheckpointState::Finalize => {
                 tracing::debug!("Releasing blocking checkpoint lock");
-                // Patch sqlite_schema in MV Store to contain positive rootpages instead of negative ones
-                // for tables and indexes that were flushed to the physical database
-                for (sqlite_schema_rowid, (_, row_version)) in self.created_btrees.drain() {
-                    let key = RowID {
-                        table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
-                        row_id: RowKey::Int(sqlite_schema_rowid),
-                    };
-                    let sqlite_schema_row = self
-                        .mvstore
-                        .rows
-                        .get(&key)
-                        .expect("sqlite_schema row not found");
-                    let mut row_versions = sqlite_schema_row.value().write();
-                    // row_version is a clone of the original with only the root
-                    // page column patched, so it shares the same version id. We
-                    // must replace the original in-place rather than append,
-                    // otherwise the version chain ends up with two entries that
-                    // have identical (id, begin, end). A later DELETE only marks
-                    // one of them as ended (it returns after the first match),
-                    // leaving the other as a phantom current version that causes
-                    // spurious write-write conflicts at commit time.
-                    let vid = row_version.id;
-                    if let Some(existing) = row_versions.iter_mut().find(|rv| rv.id == vid) {
-                        *existing = row_version;
-                    } else {
-                        self.mvstore
-                            .insert_version_raw(&mut row_versions, row_version);
-                    }
-                }
-
-                // Patch in-memory schema to do the same
-                self.connection.db.with_schema_mut(|schema| {
-                    for table in schema.tables.values_mut() {
-                        let table = Arc::get_mut(table).expect("this should be the only reference");
-                        let Some(btree_table) = table.btree_mut() else {
-                            continue;
-                        };
-                        let btree_table = Arc::make_mut(btree_table);
-                        if btree_table.root_page < 0 {
-                            let table_id = MVTableId::from(btree_table.root_page);
-                            let entry = self.mvstore.table_id_to_rootpage.get(&table_id).expect(
-                                "we should have checkpointed table with table_id {table_id:?}",
-                            );
-                            let value = entry
-                                .value()
-                                .expect("table with id {table_id:?} should have a mapping");
-                            btree_table.root_page = value as i64;
-                        }
-                    }
-                    for table_index_list in schema.indexes.values_mut() {
-                        for index in table_index_list.iter_mut() {
-                            if index.root_page < 0 {
-                                let table_id = MVTableId::from(index.root_page);
-                                let entry = self
-                                    .mvstore
-                                    .table_id_to_rootpage
-                                    .get(&table_id)
-                                    .expect(
-                                    "we should have checkpointed index with table_id {table_id:?}",
-                                );
-                                let value = entry
-                                    .value()
-                                    .expect("index with id {table_id:?} should have a mapping");
-                                let index = Arc::make_mut(index);
-                                index.root_page = value as i64;
-                            }
-                        }
-                    }
-
-                    schema.schema_version += 1;
-                    // Clear dropped root pages now that the checkpoint has completed.
-                    // The btree pages for dropped tables have been freed, so integrity_check
-                    // no longer needs to track them.
-                    schema.dropped_root_pages.clear();
-                    let _ = self.pager.io.block(|| {
-                        self.pager.with_header_mut(|header| {
-                            header.schema_cookie = schema.schema_version.into();
-                            self.mvstore.global_header.write().replace(*header);
-                            IOResult::Done(())
-                        })
-                    })?;
-                    Ok(())
-                })?;
+                self.publish_checkpointed_schema_roots()?;
 
                 self.mvstore
                     .durable_txid_max
