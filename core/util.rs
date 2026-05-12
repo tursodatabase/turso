@@ -3369,32 +3369,48 @@ pub(crate) fn output_column_aliases(one_select: &ast::OneSelect) -> Vec<String> 
         .collect()
 }
 
-/// Collect ORDER BY alias-resolution targets across every arm of a SELECT,
-/// including each compound arm. SQLite resolves a compound SELECT's ORDER BY
-/// alias by searching the body and then each compound arm in order, so any of
-/// their output column aliases qualifies.
-pub(crate) fn order_by_alias_targets(select: &ast::Select) -> Vec<String> {
-    let mut aliases = output_column_aliases(&select.body.select);
-    for compound in &select.body.compounds {
-        aliases.extend(output_column_aliases(&compound.select));
-    }
-    aliases
-}
-
 /// Returns true when `expr` is a bare identifier that names the renamed column
-/// and also matches one of the SELECT's output column aliases — i.e., this is
-/// an ORDER BY alias reference, not a FROM-clause column reference.
-pub(crate) fn order_by_expr_matches_output_alias(
+/// and resolves to one of the SELECT's output column aliases (in the body or
+/// any compound arm). Per SQLite's ORDER BY resolution rules, such a reference
+/// is to the alias label, not to a FROM-clause column, so a column rename
+/// must leave it alone.
+///
+/// Cheap in the common case: short-circuits before scanning aliases when the
+/// expr is not a bare identifier or does not match `old_col`.
+pub(crate) fn is_order_by_alias_ref(
+    body: &ast::SelectBody,
     expr: &ast::Expr,
-    old_col_norm: &str,
-    aliases: &[String],
+    old_col: &str,
 ) -> bool {
     let name = match expr {
-        ast::Expr::Id(name) | ast::Expr::Name(name) => name.as_str(),
+        ast::Expr::Id(n) | ast::Expr::Name(n) => n.as_str(),
         _ => return false,
     };
-    let name_norm = normalize_ident(name);
-    name_norm == old_col_norm && aliases.iter().any(|alias| alias == &name_norm)
+    if !name.eq_ignore_ascii_case(old_col) {
+        return false;
+    }
+    one_select_has_explicit_alias(&body.select, name)
+        || body
+            .compounds
+            .iter()
+            .any(|c| one_select_has_explicit_alias(&c.select, name))
+}
+
+// Only user-provided aliases (`AS x` or elided form) block ORDER BY rewriting.
+// `As::ImplicitColumnName` is synthesized by the parser from the original
+// expression text to label unaliased columns and is decoupled from the
+// underlying expression — it must not be treated as an alias for rename
+// purposes, since SQLite rewrites such ORDER BY refs along with the column.
+fn one_select_has_explicit_alias(one_select: &ast::OneSelect, name: &str) -> bool {
+    let ast::OneSelect::Select { columns, .. } = one_select else {
+        return false;
+    };
+    columns.iter().any(|col| match col {
+        ast::ResultColumn::Expr(_, Some(alias)) if alias.is_explicit() => {
+            alias.name().as_str().eq_ignore_ascii_case(name)
+        }
+        _ => false,
+    })
 }
 
 /// Scope-aware version of `rewrite_select_column_refs` that checks table qualifiers.
@@ -3451,10 +3467,9 @@ fn rewrite_select_column_refs_scoped(
     // output column alias is treated as that alias, not as a FROM-clause
     // column reference. Such a reference must not be rewritten — the alias
     // label is independent of the renamed table column.
-    let order_by_aliases = order_by_alias_targets(select);
-    let old_col_norm = normalize_ident(old_col);
+    let body = &select.body;
     for col in &mut select.order_by {
-        if order_by_expr_matches_output_alias(&col.expr, &old_col_norm, &order_by_aliases) {
+        if is_order_by_alias_ref(body, &col.expr, old_col) {
             continue;
         }
         rename_identifiers_scoped_inner(
@@ -4095,12 +4110,11 @@ fn select_still_references_renamed_column(
     // Bare identifiers in ORDER BY that match an output column alias are
     // alias references, not FROM-clause column references, so they don't
     // count as a stale reference to the renamed column.
-    let order_by_aliases = order_by_alias_targets(select);
-    let old_col_norm = normalize_ident(old_col);
+    let body = &select.body;
 
     let mut found = false;
     for sorted_col in &select.order_by {
-        if order_by_expr_matches_output_alias(&sorted_col.expr, &old_col_norm, &order_by_aliases) {
+        if is_order_by_alias_ref(body, &sorted_col.expr, old_col) {
             continue;
         }
         if expr_still_references_renamed_column(

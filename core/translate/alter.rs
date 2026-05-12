@@ -3039,14 +3039,9 @@ fn apply_select_for_column_rename(
     // an output column alias refers to that alias, not to a column in the
     // FROM clause. Such a reference must not be rewritten — its identity is
     // the alias label, which is independent of the renamed table column.
-    let order_by_aliases = crate::util::order_by_alias_targets(select);
-
+    let body = &select.body;
     for sorted_col in &mut select.order_by {
-        if crate::util::order_by_expr_matches_output_alias(
-            &sorted_col.expr,
-            old_col_norm,
-            &order_by_aliases,
-        ) {
+        if crate::util::is_order_by_alias_ref(body, &sorted_col.expr, old_col_norm) {
             continue;
         }
         apply_expr_for_column_rename(

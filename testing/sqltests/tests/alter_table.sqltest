@@ -1687,6 +1687,69 @@ expect {
     2|1
 }
 
+# Bare-column result column (no explicit AS) carries an implicit column-name
+# alias in the AST. That implicit alias is NOT a user-provided alias — it
+# tracks the original expression text. SQLite rewrites both the result column
+# and the ORDER BY ref consistently in this case, and so must we. Only an
+# explicit `AS x` (or its elided form) blocks the ORDER BY rewrite.
+test alter-table-rename-column-trigger-order-by-implicit-alias {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    INSERT INTO src VALUES (10, 1), (20, 2);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1);
+    SELECT group_concat(v, '|') FROM log;
+}
+expect {
+    1|2
+}
+
+# Stored SQL form of the implicit-alias case: both the result column and the
+# ORDER BY identifier must be rewritten from `b` to `c`.
+test alter-table-rename-column-trigger-order-by-implicit-alias-stored-sql {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig';
+}
+expect pattern {
+    CREATE TRIGGER trig AFTER INSERT ON dst\s+BEGIN\s+INSERT INTO log SELECT c FROM src ORDER BY c;?\s+END
+}
+
+# Qualified result column whose column-half matches the renamed column. The
+# ORDER BY bare identifier does not refer to a user-provided alias and must
+# be rewritten alongside both the result column and the FROM-clause column.
+test alter-table-rename-column-trigger-order-by-qualified-result-col {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT src.b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig';
+}
+expect pattern {
+    CREATE TRIGGER trig AFTER INSERT ON dst\s+BEGIN\s+INSERT INTO log SELECT src\.c FROM src ORDER BY c;?\s+END
+}
+
 # Round-trip rename: renaming away and back must restore the original column
 # name in the stored trigger SQL (issue #6625). Previously the in-memory
 # trigger.sql was not refreshed after a column rename, so the second rename
