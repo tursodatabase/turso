@@ -96,9 +96,8 @@ class Database {
    *
    * @param {string} sql - The SQL statement string to prepare.
    */
-  prepare(sql: string): Promise<Statement> {
+  async prepare(sql: string): Promise<Statement> {
     // Only throw if we connected before but now the database is closed
-    // Allow implicit connection if not connected yet
     if (this.connected && !this.open) {
       throw new TypeError("The database connection is not open");
     }
@@ -108,9 +107,10 @@ class Database {
 
     try {
       if (this.connected) {
-        return new Statement(maybeValue(this.db.prepare(sql)), this.db, this.execLock, this.ioStep) as unknown as Promise<Statement>;
+        return new Statement(maybeValue(this.db.prepare(sql)), this.db, this.execLock, this.ioStep);
       } else {
-        return new Statement(maybePromise(() => this.connect().then(() => this.db.prepare(sql))), this.db, this.execLock, this.ioStep) as unknown as Promise<Statement>;
+        await this.connect();
+        return new Statement(maybeValue(this.db.prepare(sql)), this.db, this.execLock, this.ioStep);
       }
     } catch (err) {
       throw convertError(err);
