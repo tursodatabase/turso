@@ -906,6 +906,7 @@ pub fn translate_insert(
     }
 
     resolver.register_affinities.clear();
+    resolver.register_collations.clear();
 
     let mut insert_flags = InsertFlags::new();
 
@@ -2356,6 +2357,10 @@ impl<'a> Insertion<'a> {
     /// Return the register that contains the record built using the MakeRecord instruction.
     pub fn record_register(&self) -> usize {
         self.record_reg
+    }
+
+    pub fn col_mappings(&self) -> &[ColMapping<'a>] {
+        &self.col_mappings
     }
 
     fn has_virtual_columns(&self) -> bool {

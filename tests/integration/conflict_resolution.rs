@@ -4702,3 +4702,85 @@ fn test_update_replace_deferred_fk_multiple_children(tmp_db: TempDatabase) {
         "SELECT * FROM parent ORDER BY id",
     );
 }
+
+#[turso_macros::test]
+fn test_upsert_do_update_where_uses_target_column_affinity(tmp_db: TempDatabase) {
+    drop(tmp_db);
+    let limbo_db = TempDatabase::builder()
+        .with_db_name("upsert_where_affinity.db")
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for sql in [
+        "PRAGMA journal_mode=WAL",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, x INT)",
+        "CREATE INDEX idx_x ON t(x)",
+        "INSERT INTO t VALUES(1,10,100)",
+        "INSERT INTO t VALUES(2,20,200)",
+        "BEGIN",
+    ] {
+        sqlite_try_exec(&sqlite_conn, sql).unwrap();
+        limbo_try_exec(&limbo_conn, sql).unwrap();
+    }
+
+    let upsert = "INSERT OR FAIL INTO t(id,a,x) VALUES(1,99,999) \
+                  ON CONFLICT(id) DO UPDATE SET id=2 WHERE a < '2'";
+    sqlite_try_exec(&sqlite_conn, upsert).unwrap();
+    limbo_try_exec(&limbo_conn, upsert).unwrap();
+
+    for sql in ["COMMIT", "PRAGMA integrity_check"] {
+        sqlite_try_exec(&sqlite_conn, sql).unwrap();
+        limbo_try_exec(&limbo_conn, sql).unwrap();
+    }
+
+    let diff = compare_tables(
+        "upsert where target column affinity",
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT id,a,x FROM t ORDER BY id",
+    );
+    assert!(diff.is_none(), "{diff:?}");
+    assert_eq!(sqlite_integrity_check(&limbo_db.path), "ok");
+}
+
+#[turso_macros::test]
+fn test_upsert_do_update_where_uses_target_column_collation(tmp_db: TempDatabase) {
+    drop(tmp_db);
+    let limbo_db = TempDatabase::builder()
+        .with_db_name("upsert_where_collation.db")
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for sql in [
+        "PRAGMA journal_mode=WAL",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT COLLATE NOCASE, x INT)",
+        "CREATE INDEX idx_x ON t(x)",
+        "INSERT INTO t VALUES(1,'A',100)",
+        "INSERT INTO t VALUES(2,'B',200)",
+        "BEGIN",
+    ] {
+        sqlite_try_exec(&sqlite_conn, sql).unwrap();
+        limbo_try_exec(&limbo_conn, sql).unwrap();
+    }
+
+    let upsert = "INSERT OR FAIL INTO t(id,a,x) VALUES(1,'Z',999) \
+                  ON CONFLICT(id) DO UPDATE SET id=2 WHERE a != 'a'";
+    sqlite_try_exec(&sqlite_conn, upsert).unwrap();
+    limbo_try_exec(&limbo_conn, upsert).unwrap();
+
+    for sql in ["COMMIT", "PRAGMA integrity_check"] {
+        sqlite_try_exec(&sqlite_conn, sql).unwrap();
+        limbo_try_exec(&limbo_conn, sql).unwrap();
+    }
+
+    let diff = compare_tables(
+        "upsert where target column collation",
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT id,a,x FROM t ORDER BY id",
+    );
+    assert!(diff.is_none(), "{diff:?}");
+    assert_eq!(sqlite_integrity_check(&limbo_db.path), "ok");
+}

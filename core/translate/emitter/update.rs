@@ -1543,6 +1543,10 @@ fn emit_update_insns<'a>(
                 .resolver
                 .register_affinities
                 .insert(layout.to_register(start, idx), col.affinity());
+            t_ctx
+                .resolver
+                .register_collations
+                .insert(layout.to_register(start, idx), col.collation());
         }
         t_ctx
             .resolver
@@ -2568,5 +2572,6 @@ fn emit_update_insns<'a>(
     program.preassign_label_to_next_insn(trigger_ignore_jump_label);
 
     t_ctx.resolver.register_affinities.clear();
+    t_ctx.resolver.register_collations.clear();
     Ok(())
 }

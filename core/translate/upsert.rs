@@ -180,6 +180,47 @@ fn collect_changed_cols(
     (cols_changed, rowid_changed)
 }
 
+fn populate_row_register_metadata(
+    resolver: &mut Resolver,
+    table: &Table,
+    row_start: usize,
+    rowid_reg: usize,
+    layout: &ColumnLayout,
+) {
+    let is_strict = table.btree().is_some_and(|bt| bt.is_strict);
+    for (idx, col) in table.columns().iter().enumerate() {
+        let reg = if col.is_rowid_alias() {
+            rowid_reg
+        } else {
+            layout.to_register(row_start, idx)
+        };
+        let affinity = if col.is_rowid_alias() {
+            Affinity::Integer
+        } else {
+            col.affinity_with_strict(is_strict)
+        };
+        resolver.register_affinities.insert(reg, affinity);
+        resolver.register_collations.insert(reg, col.collation());
+    }
+    resolver
+        .register_affinities
+        .insert(rowid_reg, Affinity::Integer);
+}
+
+fn populate_insertion_register_metadata(resolver: &mut Resolver, insertion: &Insertion) {
+    for cm in insertion.col_mappings() {
+        resolver
+            .register_affinities
+            .insert(cm.register, cm.column.affinity());
+        resolver
+            .register_collations
+            .insert(cm.register, cm.column.collation());
+    }
+    resolver
+        .register_affinities
+        .insert(insertion.key_register(), Affinity::Integer);
+}
+
 #[inline]
 fn upsert_index_is_affected(
     table: &Table,
@@ -515,6 +556,14 @@ pub fn emit_upsert(
     // For WHERE and SET, use decoded_current_start if available (STRICT with custom types),
     // otherwise fall back to current_start (already decoded or non-custom-type).
     let expr_current_start = decoded_current_start.unwrap_or(current_start);
+    populate_row_register_metadata(
+        resolver,
+        table,
+        expr_current_start,
+        ctx.conflict_rowid_reg,
+        &layout,
+    );
+    populate_insertion_register_metadata(resolver, insertion);
 
     // WHERE on target row
     if let Some(pred) = where_clause.as_mut() {
@@ -682,6 +731,13 @@ pub fn emit_upsert(
     }
 
     let (directly_changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
+    populate_row_register_metadata(
+        resolver,
+        table,
+        new_start,
+        new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+        &layout,
+    );
 
     // Fire BEFORE UPDATE triggers
     let upsert_database_id = ctx.database_id;

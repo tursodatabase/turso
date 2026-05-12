@@ -3063,6 +3063,9 @@ pub fn translate_expr(
         }
         ast::Expr::Register(src_reg) => {
             // For DBSP expression compilation: copy from source register to target
+            if let Some(collation) = resolver.register_collations.get(src_reg) {
+                program.set_collation(Some((*collation, false)));
+            }
             program.emit_insn(Insn::Copy {
                 src_reg: *src_reg,
                 dst_reg: target_register,
