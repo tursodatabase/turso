@@ -941,24 +941,26 @@ impl Value {
         // string Y in string X. The BINARY collating sequence is used for comparisons. If Y is an empty string
         // then return X unchanged. If Z is not initially a string, it is cast to a UTF-8 string prior to processing.
 
-        // If any of the arguments is NULL, the result is NULL.
-        if matches!(source, Value::Null)
-            || matches!(pattern, Value::Null)
-            || matches!(replacement, Value::Null)
-        {
+        if matches!(source, Value::Null) || matches!(pattern, Value::Null) {
             return Value::Null;
         }
 
         let source = source.exec_cast("TEXT");
         let pattern = pattern.exec_cast("TEXT");
-        let replacement = replacement.exec_cast("TEXT");
 
-        // If any of the casts failed, panic as text casting is not expected to fail.
-        match (&source, &pattern, &replacement) {
-            (Value::Text(source), Value::Text(pattern), Value::Text(replacement)) => {
+        match (&source, &pattern) {
+            (Value::Text(source), Value::Text(pattern)) => {
                 if pattern.as_str().is_empty() || pattern.as_str().starts_with('\0') {
                     return Value::Text(source.clone());
                 }
+
+                if matches!(replacement, Value::Null) {
+                    return Value::Null;
+                }
+                let replacement = replacement.exec_cast("TEXT");
+                let Value::Text(replacement) = &replacement else {
+                    unreachable!("text cast should never fail");
+                };
 
                 let result = source
                     .as_str()
@@ -3080,6 +3082,15 @@ mod tests {
         let input_str = Value::build_text("bob");
         let pattern_str = Value::build_text("");
         let replace_str = Value::build_text("a");
+        let expected_str = Value::build_text("bob");
+        assert_eq!(
+            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            expected_str
+        );
+
+        let input_str = Value::build_text("bob");
+        let pattern_str = Value::build_text("");
+        let replace_str = Value::Null;
         let expected_str = Value::build_text("bob");
         assert_eq!(
             Value::exec_replace(&input_str, &pattern_str, &replace_str),

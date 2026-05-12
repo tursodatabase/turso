@@ -293,6 +293,13 @@ test replace-null {
 expect {
 }
 
+test replace-empty-pattern-null-replacement {
+    select replace('test', '', null), typeof(replace('test', '', null))
+}
+expect {
+    test|text
+}
+
 test replace-wrong-arg-count-0 {
     select replace()
 }
