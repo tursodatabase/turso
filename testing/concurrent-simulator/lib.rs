@@ -1001,8 +1001,27 @@ impl Whopper {
         );
 
         let fibers = &mut self.context.fibers;
-        // Run all active statements to completion
+        // Drain active statements, counting each iteration against the
+        // simulator's step budget. Without this, a leaked lock (e.g. a sibling
+        // fiber holding pager_commit_lock with no statement left for us to
+        // step) keeps the loop spinning past max_steps. If we exhaust the
+        // budget while statements are still live, fail loudly: silent
+        // fall-through would let the outer `run` loop exit with status 0 and
+        // mask a hang as a passing CI run.
         while fibers.iter().any(|f| f.statement.borrow().is_some()) {
+            if self.current_step >= self.max_steps {
+                let stuck: Vec<usize> = fibers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, f)| f.statement.borrow().is_some().then_some(i))
+                    .collect();
+                anyhow::bail!(
+                    "reopen drain exhausted max_steps ({}) with statements still live on fibers {:?}; \
+                     likely a leaked lock or other deadlock in the engine",
+                    self.max_steps,
+                    stuck,
+                );
+            }
             for (fiber_idx, fiber) in fibers.iter_mut().enumerate() {
                 if fiber.statement.borrow().is_some() {
                     let done = {
@@ -1056,6 +1075,7 @@ impl Whopper {
                 }
             }
             self.io.step().unwrap();
+            self.current_step += 1;
         }
 
         // Close and drop all fiber connections to release database Arc references
