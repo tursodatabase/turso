@@ -1,6 +1,6 @@
 use clap::{
     Arg, Command, Error, Parser, ValueEnum,
-    builder::{PossibleValue, TypedValueParser, ValueParserFactory},
+    builder::{TypedValueParser, ValueParserFactory},
     command,
     error::{ContextKind, ContextValue, ErrorKind},
 };
@@ -282,22 +282,6 @@ impl TypedValueParser for ProfileTypeParser {
         })
     }
 
-    fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
-        use strum::VariantNames;
-        Some(Box::new(
-            Self::Value::VARIANTS
-                .iter()
-                .map(|variant| {
-                    // Custom variant should be listed as a Custom path
-                    if variant.eq_ignore_ascii_case("custom") {
-                        "CUSTOM_PATH"
-                    } else {
-                        variant
-                    }
-                })
-                .map(PossibleValue::new),
-        ))
-    }
 }
 
 impl ValueParserFactory for ProfileType {

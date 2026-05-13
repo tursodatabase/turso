@@ -63,6 +63,7 @@ impl QueryProfile {
             + self.delete_weight
             + self.drop_table_weight
             + self.alter_table_weight
+            + self.drop_index
             + self.pragma_weight
     }
 }
@@ -75,4 +76,28 @@ pub enum QueryTypes {
     Update,
     Delete,
     DropTable,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QueryProfile;
+
+    #[test]
+    fn total_weight_includes_drop_index() {
+        let profile = QueryProfile::default();
+
+        assert_eq!(
+            profile.total_weight(),
+            profile.select_weight
+                + profile.create_table_weight
+                + profile.create_index_weight
+                + profile.insert_weight
+                + profile.update_weight
+                + profile.delete_weight
+                + profile.drop_table_weight
+                + profile.alter_table_weight
+                + profile.drop_index
+                + profile.pragma_weight
+        );
+    }
 }

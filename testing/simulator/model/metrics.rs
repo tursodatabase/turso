@@ -73,7 +73,7 @@ impl Remaining {
             .unwrap_or_default();
 
         let mut remaining_drop_index = total_drop_index
-            .checked_sub(stats.alter_table_count)
+            .checked_sub(stats.drop_index_count)
             .unwrap_or_default();
 
         if mvcc {
@@ -174,5 +174,71 @@ impl Display for InteractionStats {
             self.alter_table_count,
             self.drop_index_count,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sql_generation::{
+        generation::{GenerationContext, Opts},
+        model::table::{Index, Table},
+    };
+
+    use super::{InteractionStats, Remaining};
+    use crate::profiles::query::QueryProfile;
+
+    #[derive(Default)]
+    struct TestContext {
+        opts: Opts,
+        tables: Vec<Table>,
+    }
+
+    impl GenerationContext for TestContext {
+        fn tables(&self) -> &Vec<Table> {
+            &self.tables
+        }
+
+        fn opts(&self) -> &Opts {
+            &self.opts
+        }
+    }
+
+    #[test]
+    fn drop_index_remaining_uses_drop_index_count() {
+        let query_profile = QueryProfile {
+            select_weight: 0,
+            create_table_weight: 0,
+            create_index_weight: 0,
+            insert_weight: 0,
+            update_weight: 0,
+            delete_weight: 0,
+            drop_table_weight: 0,
+            alter_table_weight: 0,
+            drop_index: 10,
+            pragma_weight: 0,
+            ..Default::default()
+        };
+        let stats = InteractionStats {
+            alter_table_count: 7,
+            drop_index_count: 4,
+            ..Default::default()
+        };
+        let context = TestContext {
+            tables: vec![Table {
+                name: "t".to_string(),
+                columns: vec![],
+                rows: vec![],
+                indexes: vec![Index {
+                    table_name: "t".to_string(),
+                    index_name: "idx_t".to_string(),
+                    columns: vec![],
+                }],
+            }],
+            ..Default::default()
+        };
+
+        let remaining = Remaining::new(10, &query_profile, &stats, false, &context);
+
+        assert_eq!(remaining.drop_index, 6);
     }
 }
