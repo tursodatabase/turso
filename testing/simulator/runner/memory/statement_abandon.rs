@@ -140,6 +140,25 @@ fn sim_abandon_after_first_returning_row_commits() -> Result<()> {
 }
 
 #[test]
+fn sim_returning_error_rolls_back_single_row_dml() -> Result<()> {
+    let (conn, io) = make_conn(9)?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'old'), (2, 'keep')")?;
+
+    conn.execute("BEGIN")?;
+    let result =
+        conn.execute("UPDATE t SET v = 'new' WHERE id = 1 RETURNING 'x' LIKE 'x' ESCAPE 'yy'");
+    assert!(result.is_err(), "UPDATE RETURNING should fail");
+    conn.execute("COMMIT")?;
+
+    assert_eq!(
+        query_rows(&conn, io.as_ref())?,
+        vec![(1, "old".to_string()), (2, "keep".to_string())]
+    );
+    Ok(())
+}
+
+#[test]
 fn sim_reset_error_does_not_hold_locks() -> Result<()> {
     let (conn, io) = make_conn(3)?;
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;

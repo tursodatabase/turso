@@ -133,6 +133,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     has_fks: bool,
     has_upsert: bool,
     has_autoincrement: bool,
+    has_returning: bool,
     notnull_col_exists: bool,
     has_unique: bool,
 ) {
@@ -150,6 +151,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     let has_check = !table.check_constraints.is_empty();
     let may_abort = has_triggers
         || has_fks
+        || has_returning
         || constraint_may_abort(
             has_statement_conflict,
             statement_conflict,
@@ -167,6 +169,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
         && !any_replace
         && !has_upsert
         && !has_autoincrement
+        && !has_returning
     {
         program.set_multi_write(false);
     }
@@ -209,12 +212,13 @@ pub(crate) fn set_update_stmt_journal_flags(
         btree_table.rowid_alias_conflict_clause,
         plan.indexes_to_update.iter().map(|idx| idx.on_conflict),
     );
+    let has_returning = plan.returning.as_ref().is_some_and(|r| !r.is_empty());
 
     // Ephemeral tables (used for key mutation / Halloween protection) always scan all
     // collected rows, so affects_max_1_row() returns false — multi_write stays true.
     let is_single_row =
         plan.limit.is_none() && plan.offset.is_none() && target_table.op.affects_max_1_row();
-    if is_single_row && !has_triggers && !any_replace && !has_fks {
+    if is_single_row && !has_triggers && !any_replace && !has_fks && !has_returning {
         program.set_multi_write(false);
     }
 
@@ -233,6 +237,7 @@ pub(crate) fn set_update_stmt_journal_flags(
 
     let may_abort = has_triggers
         || has_fks
+        || has_returning
         || constraint_may_abort(
             has_statement_conflict,
             or_conflict,
@@ -264,18 +269,19 @@ pub(crate) fn set_delete_stmt_journal_flags(
     };
     let has_triggers = plan.safety.reasons.contains(&DmlSafetyReason::Trigger);
     let has_fks = table_has_fks(connection, resolver, database_id, btree_table.name.as_str());
+    let has_returning = !plan.result_columns.is_empty();
 
     // After rowset rewriting (for triggers/safety), the target table op is reset to a
     // Scan, so affects_max_1_row correctly returns false — no false optimization.
     let is_single_row =
         plan.limit.is_none() && plan.offset.is_none() && target_table.op.affects_max_1_row();
-    if is_single_row && !has_triggers && !has_fks {
+    if is_single_row && !has_triggers && !has_fks && !has_returning {
         program.set_multi_write(false);
     }
 
     // DELETE has no ON CONFLICT clause, so NOT NULL/CHECK/UNIQUE don't apply —
     // only triggers (RAISE(ABORT)) or FK violations can abort.
-    if !has_triggers && !has_fks {
+    if !has_triggers && !has_fks && !has_returning {
         program.set_may_abort(false);
     }
     Ok(())

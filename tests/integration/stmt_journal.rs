@@ -138,6 +138,58 @@ fn insert_select_source(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// RETURNING expressions are evaluated after the write. Even a single-row
+/// INSERT must keep a statement journal if a RETURNING expression can abort.
+#[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER PRIMARY KEY, b);")]
+fn insert_single_row_returning_needs_stmt_journal(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    assert!(needs_stmt_journal(
+        &conn,
+        "INSERT INTO t VALUES (1, 10) RETURNING 'x' LIKE 'x' ESCAPE 'yy'"
+    ));
+    Ok(())
+}
+
+#[turso_macros::test]
+fn insert_returning_error_in_tx_rolls_back_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b)")?;
+    conn.execute("BEGIN")?;
+
+    let result = conn.execute("INSERT INTO t VALUES (1, 10) RETURNING 'x' LIKE 'x' ESCAPE 'yy'");
+    assert!(result.is_err(), "INSERT RETURNING should fail");
+    conn.execute("COMMIT")?;
+
+    let rows = query_rows(&conn, "SELECT a, b FROM t ORDER BY a");
+    assert!(rows.is_empty(), "failed INSERT RETURNING must not persist");
+    assert_eq!(query_rows(&conn, "PRAGMA integrity_check"), vec!["ok"]);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn insert_replace_returning_error_preserves_replaced_row(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'old')")?;
+    conn.execute("BEGIN")?;
+
+    let result = conn
+        .execute("INSERT OR REPLACE INTO t VALUES (1, 'new') RETURNING 'x' LIKE 'x' ESCAPE 'yy'");
+    assert!(result.is_err(), "INSERT OR REPLACE RETURNING should fail");
+    conn.execute("COMMIT")?;
+
+    let rows = query_rows(&conn, "SELECT a, b FROM t ORDER BY a");
+    assert_eq!(
+        rows,
+        vec!["1|old"],
+        "failed REPLACE RETURNING must preserve the original row"
+    );
+    assert_eq!(query_rows(&conn, "PRAGMA integrity_check"), vec!["ok"]);
+    Ok(())
+}
+
 /// Single-row INSERT with immediate FK constraints does NOT need a statement journal.
 /// Immediate FK violations emit a direct Halt before any writes (matching SQLite's
 /// usesStmtJournal=0 for this case), so there's nothing to roll back.
@@ -230,6 +282,40 @@ fn update_by_rowid_alias(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Single-row UPDATE normally skips the statement journal, but RETURNING can
+/// abort after the row has been rewritten.
+#[turso_macros::test(init_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, a);")]
+fn update_by_rowid_returning_needs_stmt_journal(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    assert!(needs_stmt_journal(
+        &conn,
+        "UPDATE t SET a = 1 WHERE id = 5 RETURNING 'x' LIKE 'x' ESCAPE 'yy'"
+    ));
+    Ok(())
+}
+
+#[turso_macros::test]
+fn update_returning_error_in_tx_rolls_back_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a)")?;
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")?;
+    conn.execute("BEGIN")?;
+
+    let result =
+        conn.execute("UPDATE t SET a = 11 WHERE id = 1 RETURNING 'x' LIKE 'x' ESCAPE 'yy'");
+    assert!(result.is_err(), "UPDATE RETURNING should fail");
+    conn.execute("COMMIT")?;
+
+    let rows = query_rows(&conn, "SELECT id, a FROM t ORDER BY id");
+    assert_eq!(
+        rows,
+        vec!["1|10", "2|20"],
+        "failed UPDATE RETURNING must not persist"
+    );
+    assert_eq!(query_rows(&conn, "PRAGMA integrity_check"), vec!["ok"]);
+    Ok(())
+}
+
 /// UPDATE WHERE unique_col = ? → single-row (unique index equality seek).
 #[turso_macros::test(init_sql = "CREATE TABLE t (a NOT NULL, b UNIQUE);")]
 fn update_by_unique_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -314,6 +400,39 @@ fn delete_by_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
 fn delete_by_unique_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     assert!(!needs_stmt_journal(&conn, "DELETE FROM t WHERE b = 5"));
+    Ok(())
+}
+
+/// Single-row DELETE normally skips the statement journal, but RETURNING can
+/// abort after the row has already been deleted.
+#[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER PRIMARY KEY, b);")]
+fn delete_by_rowid_returning_needs_stmt_journal(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    assert!(needs_stmt_journal(
+        &conn,
+        "DELETE FROM t WHERE a = 1 RETURNING 'x' LIKE 'x' ESCAPE 'yy'"
+    ));
+    Ok(())
+}
+
+#[turso_macros::test]
+fn delete_returning_error_in_tx_rolls_back_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b)")?;
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")?;
+    conn.execute("BEGIN")?;
+
+    let result = conn.execute("DELETE FROM t WHERE a = 1 RETURNING 'x' LIKE 'x' ESCAPE 'yy'");
+    assert!(result.is_err(), "DELETE RETURNING should fail");
+    conn.execute("COMMIT")?;
+
+    let rows = query_rows(&conn, "SELECT a, b FROM t ORDER BY a");
+    assert_eq!(
+        rows,
+        vec!["1|10", "2|20"],
+        "failed DELETE RETURNING must not persist"
+    );
+    assert_eq!(query_rows(&conn, "PRAGMA integrity_check"), vec!["ok"]);
     Ok(())
 }
 
