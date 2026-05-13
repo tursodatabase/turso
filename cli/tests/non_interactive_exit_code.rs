@@ -84,6 +84,93 @@ fn sql_argument_runtime_error_stops_execution() {
     assert_eq!(output.status.code(), Some(1));
 }
 
+#[test]
+fn sql_argument_deep_expression_returns_error_instead_of_aborting() {
+    let sql = format!("select {};", vec!["1"; 1502].join("+"));
+    let output = Command::new(env!("CARGO_BIN_EXE_tursodb"))
+        .arg(":memory:")
+        .arg(sql)
+        .output()
+        .expect("failed to run tursodb");
+
+    let output_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "output: {output_text}");
+    assert!(
+        output_text.contains("Expression tree is too large (maximum depth 1000)"),
+        "expected expression-depth error, got: {output_text}"
+    );
+}
+
+#[test]
+fn sql_argument_deep_schema_expression_returns_error_instead_of_aborting() {
+    let sql = format!("create table t(x check({}));", vec!["1"; 1502].join("+"));
+    let output = Command::new(env!("CARGO_BIN_EXE_tursodb"))
+        .arg(":memory:")
+        .arg(sql)
+        .output()
+        .expect("failed to run tursodb");
+
+    let output_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "output: {output_text}");
+    assert!(
+        output_text.contains("Expression tree is too large (maximum depth 1000)"),
+        "expected expression-depth error, got: {output_text}"
+    );
+}
+
+#[test]
+fn sql_argument_deep_valid_expression_executes() {
+    let sql = format!("select {};", vec!["1"; 1000].join("+"));
+    let output = Command::new(env!("CARGO_BIN_EXE_tursodb"))
+        .arg(":memory:")
+        .arg(sql)
+        .output()
+        .expect("failed to run tursodb");
+
+    let output_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(0), "output: {output_text}");
+    assert!(
+        output_text.contains("1000"),
+        "expected expression result, got: {output_text}"
+    );
+}
+
+#[test]
+fn sql_argument_deep_where_conjunction_executes() {
+    let where_clause = vec!["1=1"; 1502].join(" and ");
+    let sql = format!(
+        "create table t(x); insert into t values(1); select x from t where {where_clause};"
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_tursodb"))
+        .arg(":memory:")
+        .arg(sql)
+        .output()
+        .expect("failed to run tursodb");
+
+    let output_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(0), "output: {output_text}");
+    assert!(
+        output_text.contains("1"),
+        "expected query result, got: {output_text}"
+    );
+}
+
 /// A6: Syntax error returns non-zero
 #[test]
 fn sql_argument_syntax_error_returns_nonzero() {

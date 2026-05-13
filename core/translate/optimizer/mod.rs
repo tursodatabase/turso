@@ -2944,96 +2944,113 @@ impl Optimizable for ast::Expr {
     }
     /// Returns true if the expression is a constant i.e. does not depend on columns and can be evaluated only once during the execution
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool {
-        match self {
-            Expr::SubqueryResult { .. } => false,
-            Expr::Between {
-                lhs, start, end, ..
-            } => {
-                lhs.is_constant(resolver)
-                    && start.is_constant(resolver)
-                    && end.is_constant(resolver)
-            }
-            Expr::Binary(expr, _, expr1) => {
-                expr.is_constant(resolver) && expr1.is_constant(resolver)
-            }
-            Expr::Case {
-                base,
-                when_then_pairs,
-                else_expr,
-            } => {
-                base.as_ref().is_none_or(|base| base.is_constant(resolver))
-                    && when_then_pairs.iter().all(|(when, then)| {
-                        when.is_constant(resolver) && then.is_constant(resolver)
-                    })
-                    && else_expr
-                        .as_ref()
-                        .is_none_or(|else_expr| else_expr.is_constant(resolver))
-            }
-            Expr::Cast { expr, .. } => expr.is_constant(resolver),
-            Expr::Collate(expr, _) => expr.is_constant(resolver),
-            // Not constant. Normally rewritten to Expr::Column by the optimizer,
-            // but CHECK constraints bypass the rewrite pass and legitimately
-            // contain DoublyQualified nodes.
-            Expr::DoublyQualified(_, _, _) => false,
-            Expr::Exists(_) => false,
-            Expr::FunctionCall {
-                args,
-                name,
-                filter_over,
-                ..
-            } => {
-                if filter_over.over_clause.is_some() {
-                    return false;
+        let mut stack = vec![self];
+
+        while let Some(expr) = stack.pop() {
+            match expr {
+                Expr::SubqueryResult { .. }
+                | Expr::Column { .. }
+                | Expr::RowId { .. }
+                | Expr::InSelect { .. }
+                | Expr::InTable { .. }
+                | Expr::Name(_)
+                | Expr::Qualified(_, _)
+                | Expr::FieldAccess { .. }
+                | Expr::Subquery(_)
+                | Expr::Register(_) => return false,
+                Expr::Between {
+                    lhs, start, end, ..
+                } => {
+                    stack.push(end);
+                    stack.push(start);
+                    stack.push(lhs);
                 }
-                let Some(func) = resolver
-                    .resolve_function(name.as_str(), args.len())
-                    .ok()
-                    .flatten()
-                else {
-                    return false;
-                };
-                func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
-            }
-            Expr::FunctionCallStar { .. } => false,
-            Expr::Id(_) => true,
-            Expr::Column { .. } => false,
-            Expr::RowId { .. } => false,
-            Expr::InList { lhs, rhs, .. } => {
-                lhs.is_constant(resolver)
-                    && (rhs.is_empty() || rhs.iter().all(|v| v.is_constant(resolver)))
-            }
-            Expr::InSelect { .. } => {
-                false // might be constant, too annoying to check subqueries etc. implement later
-            }
-            Expr::InTable { .. } => false,
-            Expr::IsNull(expr) => expr.is_constant(resolver),
-            Expr::Like {
-                lhs, rhs, escape, ..
-            } => {
-                lhs.is_constant(resolver)
-                    && rhs.is_constant(resolver)
-                    && escape
-                        .as_ref()
-                        .is_none_or(|escape| escape.is_constant(resolver))
-            }
-            Expr::Literal(_) => true,
-            Expr::Name(_) => false,
-            Expr::NotNull(expr) => expr.is_constant(resolver),
-            Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_constant(resolver)),
-            // Not constant. Normally rewritten to Expr::Column by the optimizer,
-            // but CHECK constraints bypass the rewrite pass and legitimately
-            // contain Qualified nodes.
-            Expr::Qualified(_, _) | Expr::FieldAccess { .. } => false,
-            Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
-            Expr::Subquery(_) => false,
-            Expr::Unary(_, expr) => expr.is_constant(resolver),
-            Expr::Variable(_) => true,
-            Expr::Register(_) => false,
-            Expr::Default => true,
-            Expr::Array { .. } | Expr::Subscript { .. } => {
-                unreachable!("Array and Subscript are desugared into function calls by the parser")
+                Expr::Binary(expr, _, expr1) => {
+                    stack.push(expr1);
+                    stack.push(expr);
+                }
+                Expr::Case {
+                    base,
+                    when_then_pairs,
+                    else_expr,
+                } => {
+                    if let Some(else_expr) = else_expr.as_ref() {
+                        stack.push(else_expr);
+                    }
+                    for (when, then) in when_then_pairs.iter().rev() {
+                        stack.push(then);
+                        stack.push(when);
+                    }
+                    if let Some(base) = base.as_ref() {
+                        stack.push(base);
+                    }
+                }
+                Expr::Cast { expr, .. }
+                | Expr::Collate(expr, _)
+                | Expr::IsNull(expr)
+                | Expr::NotNull(expr)
+                | Expr::Unary(_, expr) => stack.push(expr),
+                Expr::DoublyQualified(_, _, _) => return false,
+                Expr::Exists(_) => return false,
+                Expr::FunctionCall {
+                    args,
+                    name,
+                    filter_over,
+                    ..
+                } => {
+                    if filter_over.over_clause.is_some() {
+                        return false;
+                    }
+                    let Some(func) = resolver
+                        .resolve_function(name.as_str(), args.len())
+                        .ok()
+                        .flatten()
+                    else {
+                        return false;
+                    };
+                    if !func.is_deterministic() {
+                        return false;
+                    }
+                    for arg in args.iter().rev() {
+                        stack.push(arg);
+                    }
+                }
+                Expr::FunctionCallStar { .. } => return false,
+                Expr::InList { lhs, rhs, .. } => {
+                    for expr in rhs.iter().rev() {
+                        stack.push(expr);
+                    }
+                    stack.push(lhs);
+                }
+                Expr::Like {
+                    lhs, rhs, escape, ..
+                } => {
+                    if let Some(escape) = escape.as_ref() {
+                        stack.push(escape);
+                    }
+                    stack.push(rhs);
+                    stack.push(lhs);
+                }
+                Expr::Parenthesized(exprs) => {
+                    for expr in exprs.iter().rev() {
+                        stack.push(expr);
+                    }
+                }
+                Expr::Raise(_, expr) => {
+                    if let Some(expr) = expr.as_ref() {
+                        stack.push(expr);
+                    }
+                }
+                Expr::Id(_) | Expr::Literal(_) | Expr::Variable(_) | Expr::Default => {}
+                Expr::Array { .. } | Expr::Subscript { .. } => {
+                    unreachable!(
+                        "Array and Subscript are desugared into function calls by the parser"
+                    )
+                }
             }
         }
+
+        true
     }
     /// Returns true if the expression is a constant expression that, when evaluated as a condition, is always true or false
     fn check_always_true_or_false(&self) -> Result<Option<AlwaysTrueOrFalse>> {

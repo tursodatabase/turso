@@ -68,8 +68,10 @@ pub(crate) fn trace_stack_attribute(attr: TokenStream, input: TokenStream) -> To
         let guard = trace_guard(&args, &function.sig.ident);
         let body = &function.block;
         function.block = syn::parse_quote!({
-            #guard
-            #body
+            crate::stack::maybe_grow(|| {
+                #guard
+                #body
+            })
         });
         return quote!(#function).into();
     }
@@ -78,8 +80,10 @@ pub(crate) fn trace_stack_attribute(attr: TokenStream, input: TokenStream) -> To
         let guard = trace_guard(&args, &function.sig.ident);
         let body = &function.block;
         function.block = syn::parse_quote!({
-            #guard
-            #body
+            crate::stack::maybe_grow(|| {
+                #guard
+                #body
+            })
         });
         return quote!(#function).into();
     }

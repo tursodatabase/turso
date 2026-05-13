@@ -111,3 +111,8 @@ pub use walk::{
     expr_references_any_subquery, expr_references_subquery_id, walk_expr, walk_expr_mut,
     WalkControl,
 };
+pub(crate) use walk::{
+    validate_condition_expr_depth, validate_expr_depth, validate_from_clause_expr_depth,
+    validate_limit_expr_depth, validate_result_columns_expr_depth, validate_select_expr_depth,
+    validate_sorted_columns_expr_depth,
+};
