@@ -73,7 +73,7 @@ impl Remaining {
             .unwrap_or_default();
 
         let mut remaining_drop_index = total_drop_index
-            .checked_sub(stats.alter_table_count)
+            .checked_sub(stats.drop_index_count)
             .unwrap_or_default();
 
         if mvcc {
@@ -174,5 +174,93 @@ impl Display for InteractionStats {
             self.alter_table_count,
             self.drop_index_count,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sql_generation::{
+        generation::{GenerationContext, Opts},
+        model::table::{Index, Table},
+    };
+    use turso_parser::ast::SortOrder;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct TestContext {
+        opts: Opts,
+        tables: Vec<Table>,
+    }
+
+    impl GenerationContext for TestContext {
+        fn tables(&self) -> &Vec<Table> {
+            &self.tables
+        }
+
+        fn opts(&self) -> &Opts {
+            &self.opts
+        }
+    }
+
+    fn table_with_index() -> Table {
+        Table {
+            name: "t".to_string(),
+            columns: vec![],
+            rows: vec![],
+            indexes: vec![Index {
+                table_name: "t".to_string(),
+                index_name: "idx_t".to_string(),
+                columns: vec![("a".to_string(), SortOrder::Asc)],
+            }],
+        }
+    }
+
+    #[test]
+    fn total_weight_includes_drop_index_weight() {
+        let profile = QueryProfile::default();
+
+        let expected = profile.select_weight
+            + profile.create_table_weight
+            + profile.create_index_weight
+            + profile.insert_weight
+            + profile.update_weight
+            + profile.delete_weight
+            + profile.drop_table_weight
+            + profile.alter_table_weight
+            + profile.drop_index
+            + profile.pragma_weight;
+
+        assert_eq!(profile.total_weight(), expected);
+    }
+
+    #[test]
+    fn remaining_drop_index_uses_drop_index_stats() {
+        let profile = QueryProfile {
+            select_weight: 90,
+            create_table_weight: 0,
+            create_index_weight: 0,
+            insert_weight: 0,
+            update_weight: 0,
+            delete_weight: 0,
+            drop_table_weight: 0,
+            alter_table_weight: 0,
+            drop_index: 10,
+            pragma_weight: 0,
+            ..Default::default()
+        };
+        let stats = InteractionStats {
+            drop_index_count: 4,
+            alter_table_count: 0,
+            ..Default::default()
+        };
+        let ctx = TestContext {
+            tables: vec![table_with_index()],
+            ..Default::default()
+        };
+
+        let remaining = Remaining::new(100, &profile, &stats, false, &ctx);
+
+        assert_eq!(remaining.drop_index, 6);
     }
 }
