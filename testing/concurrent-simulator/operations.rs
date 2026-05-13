@@ -86,6 +86,8 @@ pub enum Operation {
     },
     /// Drop an index
     DropIndex { sql: String, index_name: String },
+    /// Drop a table
+    DropTable { sql: String, table_name: String },
     /// Create Elle list table for consistency checking
     CreateElleTable { table_name: String },
     /// Append value to an Elle list key
@@ -146,6 +148,7 @@ impl Operation {
             Operation::Delete { sql } => sql.clone(),
             Operation::CreateIndex { sql, .. } => sql.clone(),
             Operation::DropIndex { sql, .. } => sql.clone(),
+            Operation::DropTable { sql, .. } => sql.clone(),
             Operation::CreateElleTable { table_name } => {
                 // Store values as comma-separated integers (e.g., "1,2,3")
                 // This avoids JSON function complexity while still being parseable
@@ -254,6 +257,12 @@ impl Operation {
             Operation::DropIndex { index_name, .. } => {
                 sim_state.indexes.remove(index_name);
             }
+            Operation::DropTable { table_name, .. } => {
+                sim_state.tables.remove(table_name);
+                sim_state
+                    .indexes
+                    .remove_where(|_, indexed_table| indexed_table == table_name);
+            }
             Operation::CreateElleTable { table_name } => {
                 sim_state.elle_tables.insert(table_name.clone(), ());
             }
@@ -265,5 +274,56 @@ impl Operation {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+    use sql_generation::model::table::{Column, ColumnType, Table};
+    use turso_parser::ast::ColumnConstraint;
+
+    use super::*;
+
+    fn table(name: &str) -> Table {
+        Table {
+            name: name.to_string(),
+            columns: vec![Column {
+                name: "id".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![ColumnConstraint::PrimaryKey {
+                    order: None,
+                    conflict_clause: None,
+                    auto_increment: false,
+                }],
+            }],
+            rows: vec![],
+            indexes: vec![],
+        }
+    }
+
+    #[test]
+    fn drop_table_state_removes_table_and_indexes_for_that_table() {
+        let mut state = SimulatorState::new(
+            vec![table("dropped"), table("kept")],
+            vec![
+                ("dropped".to_string(), "idx_dropped".to_string()),
+                ("kept".to_string(), "idx_kept".to_string()),
+            ],
+        );
+        let mut stats = Stats::default();
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+
+        Operation::DropTable {
+            sql: "DROP TABLE dropped".to_string(),
+            table_name: "dropped".to_string(),
+        }
+        .apply_state_changes(&mut state, &mut stats, &mut rng, &Ok(vec![]));
+
+        assert!(!state.tables.contains_key(&"dropped".to_string()));
+        assert!(!state.indexes.contains_key(&"idx_dropped".to_string()));
+        assert!(state.tables.contains_key(&"kept".to_string()));
+        assert!(state.indexes.contains_key(&"idx_kept".to_string()));
     }
 }

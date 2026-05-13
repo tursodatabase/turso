@@ -356,6 +356,7 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             (15, Box::new(DeleteWorkload)),
             (2, Box::new(CreateIndexWorkload)),
             (2, Box::new(DropIndexWorkload)),
+            (1, Box::new(DropTableWorkload)),
             (30, Box::new(BeginWorkload)),
             (10, Box::new(CommitWorkload)),
             (10, Box::new(RollbackWorkload)),

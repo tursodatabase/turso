@@ -1,15 +1,18 @@
 #![cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 
+use rand::Rng;
 use std::path::Path;
 use std::sync::Arc;
 use turso_core::{Connection, Database, DatabaseOpts, IO, LimboError, OpenFlags};
 use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
 use turso_whopper::{
-    multiprocess_platform_io,
+    Whopper, WhopperOpts, multiprocess_platform_io,
+    properties::{IntegrityCheckProperty, SimpleKeysDoNotDisappear},
     workloads::{
         BeginWorkload, CommitWorkload, CreateIndexWorkload, CreateSimpleTableWorkload,
-        DeleteWorkload, DropIndexWorkload, IntegrityCheckWorkload, RollbackWorkload,
-        SimpleInsertWorkload, SimpleSelectWorkload, UpdateWorkload, WalCheckpointWorkload,
+        DeleteWorkload, DropIndexWorkload, DropTableWorkload, IntegrityCheckWorkload,
+        RollbackWorkload, SimpleInsertWorkload, SimpleSelectWorkload, UpdateWorkload,
+        WalCheckpointWorkload, Workload,
     },
 };
 
@@ -128,6 +131,60 @@ fn create_multiprocess_whopper_with_shape_and_keep(
         keep_files,
     })
     .expect("create multiprocess whopper")
+}
+
+fn run_drop_table_simulation(seed: u64, max_steps: usize) {
+    let mut whopper = Whopper::new(
+        WhopperOpts::fast()
+            .with_seed(seed)
+            .with_max_steps(max_steps)
+            .with_max_connections(4)
+            .with_workloads(drop_table_workloads())
+            .with_properties(vec![
+                Box::new(IntegrityCheckProperty),
+                Box::new(SimpleKeysDoNotDisappear::new()),
+            ]),
+    )
+    .expect("create whopper");
+
+    while !whopper.is_done() {
+        if whopper.rng.random_bool(0.03) {
+            whopper.reopen().expect("reopen database");
+        }
+        whopper.step().expect("step whopper");
+    }
+
+    whopper
+        .finalize_properties()
+        .expect("finalize simulator properties");
+}
+
+fn drop_table_workloads() -> Vec<(u32, Box<dyn Workload>)> {
+    vec![
+        (10, Box::new(IntegrityCheckWorkload)),
+        (5, Box::new(WalCheckpointWorkload)),
+        (10, Box::new(CreateSimpleTableWorkload)),
+        (20, Box::new(SimpleSelectWorkload)),
+        (20, Box::new(SimpleInsertWorkload)),
+        (15, Box::new(UpdateWorkload)),
+        (15, Box::new(DeleteWorkload)),
+        (2, Box::new(CreateIndexWorkload)),
+        (2, Box::new(DropIndexWorkload)),
+        (1, Box::new(DropTableWorkload)),
+        (30, Box::new(BeginWorkload)),
+        (10, Box::new(CommitWorkload)),
+        (10, Box::new(RollbackWorkload)),
+    ]
+}
+
+#[test]
+fn drop_table_invalidates_overlapping_prepared_statement_without_aborting_simulation() {
+    run_drop_table_simulation(1396198911938941063, 3200);
+}
+
+#[test]
+fn drop_table_missing_table_parse_error_does_not_abort_simulation() {
+    run_drop_table_simulation(13310883444243772729, 20000);
 }
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]

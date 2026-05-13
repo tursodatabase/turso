@@ -77,6 +77,27 @@ fn step_stmt_with_injected_yield(
     stmt.step()
 }
 
+fn is_recoverable_operation_error(error: &turso_core::LimboError) -> bool {
+    match error {
+        turso_core::LimboError::SchemaUpdated
+        | turso_core::LimboError::SchemaConflict
+        | turso_core::LimboError::TableLocked
+        | turso_core::LimboError::Busy
+        | turso_core::LimboError::BusySnapshot
+        | turso_core::LimboError::WriteWriteConflict
+        | turso_core::LimboError::CommitDependencyAborted
+        | turso_core::LimboError::InvalidArgument(..) => true,
+        turso_core::LimboError::ParseError(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("no such table")
+                || message.contains("no such index")
+                || (message.contains("does not exist")
+                    && (message.contains("table") || message.contains("index")))
+        }
+        _ => false,
+    }
+}
+
 /// A bounded container for sampling values with reservoir sampling.
 #[derive(Debug, Clone)]
 pub struct SamplesContainer<T> {
@@ -229,6 +250,23 @@ impl<K: Ord + Clone, V: Clone> MergableMap<K, V> {
     /// Compact the map by removing tombstones.
     pub fn compact(&mut self) {
         self.data.retain(|_, v| v.is_some());
+    }
+
+    /// Remove all live entries matching a predicate.
+    pub fn remove_where(&mut self, mut predicate: impl FnMut(&K, &V) -> bool) {
+        let keys_to_remove = self
+            .data
+            .iter()
+            .filter_map(|(key, value)| {
+                value
+                    .as_ref()
+                    .filter(|live_value| predicate(key, live_value))
+                    .map(|_| key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in keys_to_remove {
+            self.remove(&key);
+        }
     }
 }
 
@@ -798,23 +836,15 @@ impl Whopper {
             }
 
             if let Err(error) = op_result {
-                match error {
+                if is_recoverable_operation_error(&error) {
                     // initiate rollback in case of some errors for fiber within transaction
-                    turso_core::LimboError::SchemaUpdated
-                    | turso_core::LimboError::SchemaConflict
-                    | turso_core::LimboError::TableLocked
-                    | turso_core::LimboError::Busy
-                    | turso_core::LimboError::BusySnapshot
-                    | turso_core::LimboError::WriteWriteConflict
-                    | turso_core::LimboError::CommitDependencyAborted
-                    | turso_core::LimboError::InvalidArgument(..) => {
-                        if ctx.fiber.state.is_in_tx() && !ctx.fiber.connection.get_auto_commit() {
-                            ctx.fiber.current_op = Some(Operation::Rollback);
-                        } else {
-                            ctx.fiber.txn_id = None;
-                        }
+                    if ctx.fiber.state.is_in_tx() && !ctx.fiber.connection.get_auto_commit() {
+                        ctx.fiber.current_op = Some(Operation::Rollback);
+                    } else {
+                        ctx.fiber.txn_id = None;
                     }
-                    _ => return Err(error.into()),
+                } else {
+                    return Err(error.into());
                 }
             }
         }

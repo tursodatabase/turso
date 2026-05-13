@@ -6,7 +6,7 @@ use sql_generation::{
     generation::{Arbitrary, GenerationContext, Opts},
     model::{
         query::{
-            create_index::CreateIndex, delete::Delete, drop_index::DropIndex, insert::Insert,
+            Drop, create_index::CreateIndex, delete::Delete, drop_index::DropIndex, insert::Insert,
             select::Select, update::Update,
         },
         table::Table,
@@ -231,6 +231,24 @@ impl Workload for DropIndexWorkload {
         };
         let sql = drop_index.to_string();
         Some(Operation::DropIndex { sql, index_name })
+    }
+}
+
+/// Drop an existing generated table outside transactions.
+pub struct DropTableWorkload;
+
+impl Workload for DropTableWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if *ctx.fiber_state != FiberState::Idle || ctx.tables_vec.len() <= 1 {
+            return None;
+        }
+
+        let drop_table = Drop::arbitrary(rng, ctx);
+        let table_name = drop_table.table.clone();
+        Some(Operation::DropTable {
+            sql: drop_table.to_string(),
+            table_name,
+        })
     }
 }
 
