@@ -806,6 +806,7 @@ pub fn translate_alter_table(
                             identifier: table_name.to_string(),
                             internal_id: TableInternalId::from(0),
                             table: Table::BTree(Arc::new(btree.clone())),
+                            database_id,
                             using_dedup_hidden_cols: ColumnMask::default(),
                             col_used_mask: ColumnUsedMask::default(),
                             cte_select: None,

@@ -1117,6 +1117,8 @@ pub struct OuterQueryReference {
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
+    /// The index of the database that contains this table reference. "main" is always zero.
+    pub database_id: usize,
     /// Columns hidden by USING/NATURAL deduplication in the outer scope.
     pub using_dedup_hidden_cols: ColumnMask,
     /// Bitmask of columns that are referenced in the query.
@@ -1409,6 +1411,30 @@ impl TableReferences {
                 self.outer_query_refs
                     .iter()
                     .find(|t| t.identifier == identifier && !t.cte_definition_only)
+                    .map(|t| (t.internal_id, &t.table))
+            })
+    }
+
+    /// Returns `(internal_id, &Table)` for the table with the given identifier
+    /// in the given database. Searches `joined_tables` first, then visible
+    /// `outer_query_refs` (excluding CTE-definition-only entries).
+    pub fn find_table_and_internal_id_by_database_and_identifier(
+        &self,
+        database_id: usize,
+        identifier: &str,
+    ) -> Option<(TableInternalId, &Table)> {
+        self.joined_tables
+            .iter()
+            .find(|t| t.database_id == database_id && t.identifier == identifier)
+            .map(|t| (t.internal_id, &t.table))
+            .or_else(|| {
+                self.outer_query_refs
+                    .iter()
+                    .find(|t| {
+                        t.database_id == database_id
+                            && t.identifier == identifier
+                            && !t.cte_definition_only
+                    })
                     .map(|t| (t.internal_id, &t.table))
             })
     }

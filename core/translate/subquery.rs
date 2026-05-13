@@ -530,6 +530,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                 };
                 OuterQueryReference {
                     table: t.table.clone(),
+                    database_id: t.database_id,
                     identifier: t.identifier.clone(),
                     internal_id: t.internal_id,
                     using_dedup_hidden_cols: t.using_dedup_hidden_cols(),
@@ -548,6 +549,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                     .iter()
                     .map(|t| OuterQueryReference {
                         table: t.table.clone(),
+                        database_id: t.database_id,
                         identifier: t.identifier.clone(),
                         internal_id: t.internal_id,
                         using_dedup_hidden_cols: t.using_dedup_hidden_cols.clone(),

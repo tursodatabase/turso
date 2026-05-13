@@ -1,0 +1,35 @@
+@database :memory:
+@skip-file-if mvcc "attach is not supported for mvcc"
+
+# A fully-qualified outer reference must not bind to a same-named table in the
+# subquery's own FROM clause.
+test correlated-subquery-respects-database-qualifier {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    CREATE TABLE main.t1 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO main.t1 VALUES (2, 'x');
+
+    SELECT id, val FROM aux.t1 WHERE EXISTS (
+        SELECT 1 FROM main.t1 WHERE main.t1.id = aux.t1.id
+    ) ORDER BY id;
+}
+expect {
+    2|b
+}
+
+test correlated-not-exists-respects-database-qualifier {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t2 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t2 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    CREATE TABLE main.t2 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO main.t2 VALUES (2, 'x');
+
+    SELECT id, val FROM aux.t2 WHERE NOT EXISTS (
+        SELECT 1 FROM main.t2 WHERE main.t2.id = aux.t2.id
+    ) ORDER BY id;
+}
+expect {
+    1|a
+    3|c
+}
