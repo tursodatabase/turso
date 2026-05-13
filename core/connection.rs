@@ -1332,8 +1332,10 @@ impl Connection {
         if matches!(self.get_tx_state(), TransactionState::None)
             && self.get_mv_tx().is_none()
             && self.next_attached_mv_tx().is_none()
-            // MVCC checkpoint can publish root-page and dropped-root updates
-            // without changing SQLite's user-visible schema cookie.
+            // In MVCC, checkpoint root publication can replace Database::schema
+            // without changing SQLite's schema cookie. If this connection
+            // still holds an older Schema snapshot, prepared statements must be
+            // invalidated and recompiled against the current roots.
             && (current_schema.schema_version != schema.schema_version
                 || (self.mvcc_enabled() && !Arc::ptr_eq(&current_schema, &schema)))
         {

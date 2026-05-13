@@ -292,6 +292,8 @@ impl Statement {
         }
         if matches!(self.state.execution_state, ProgramExecutionState::Init) {
             if self.program.connection.mvcc_enabled() {
+                // MVCC checkpoints can publish internal schema roots without changing
+                // SQLite's schema cookie, so refresh before deciding whether to reprepare.
                 self.program.connection.maybe_update_schema();
             }
             if !self
