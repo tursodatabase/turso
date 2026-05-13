@@ -4327,6 +4327,110 @@ fn test_trigger_before_update_changes_value_unique_conflict(tmp_db: TempDatabase
     assert_eq!(ic, "ok");
 }
 
+/// UPSERT DO UPDATE must refresh non-SET columns after BEFORE UPDATE triggers.
+///
+/// SQLite keeps changes made by the BEFORE trigger for columns that the outer
+/// UPDATE did not set. If UPSERT writes the stale pre-trigger image instead,
+/// the table payload and unique index diverge.
+#[turso_macros::test]
+fn test_upsert_before_update_trigger_refreshes_non_set_indexed_columns(tmp_db: TempDatabase) {
+    drop(tmp_db);
+    let limbo_db = TempDatabase::builder()
+        .with_db_name("upsert_before_trigger_refresh.db")
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for sql in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT UNIQUE, v TEXT)",
+        "INSERT INTO t VALUES(1, 'a', 'old')",
+        "CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN UPDATE t SET k = 'mid' WHERE id = OLD.id; END",
+    ] {
+        sqlite_try_exec(&sqlite_conn, sql).unwrap();
+        limbo_try_exec(&limbo_conn, sql).unwrap();
+    }
+
+    let upsert = "INSERT INTO t VALUES(1, 'ignored', 'new') \
+                  ON CONFLICT(id) DO UPDATE SET v = excluded.v";
+    sqlite_try_exec(&sqlite_conn, upsert).unwrap();
+    limbo_try_exec(&limbo_conn, upsert).unwrap();
+
+    let diff = compare_tables(
+        "upsert before trigger refresh",
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT id, k, v FROM t ORDER BY id",
+    );
+    assert!(diff.is_none(), "{diff:?}");
+
+    let sqlite_index_rows = sqlite_exec_rows(
+        &sqlite_conn,
+        "SELECT id, k, v FROM t INDEXED BY sqlite_autoindex_t_1 WHERE k = 'mid'",
+    );
+    let limbo_index_rows = limbo_exec_rows(
+        &limbo_conn,
+        "SELECT id, k, v FROM t INDEXED BY sqlite_autoindex_t_1 WHERE k = 'mid'",
+    );
+    assert_eq!(limbo_index_rows, sqlite_index_rows);
+
+    let db_path = limbo_db.path.clone();
+    drop(limbo_conn);
+    drop(limbo_db);
+    let ic = sqlite_integrity_check(&db_path);
+    assert_eq!(ic, "ok");
+}
+
+/// If a BEFORE UPDATE trigger changes one indexed column and UPSERT changes
+/// another column in the same index, the old index key to delete is the
+/// post-trigger key currently in the table, not the pre-trigger snapshot.
+#[turso_macros::test]
+fn test_upsert_before_update_trigger_deletes_post_trigger_index_key(tmp_db: TempDatabase) {
+    drop(tmp_db);
+    let limbo_db = TempDatabase::builder()
+        .with_db_name("upsert_before_trigger_composite_index.db")
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for sql in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT, v TEXT, UNIQUE(k, v))",
+        "INSERT INTO t VALUES(1, 'a', 'old')",
+        "CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN UPDATE t SET k = 'mid' WHERE id = OLD.id; END",
+    ] {
+        sqlite_try_exec(&sqlite_conn, sql).unwrap();
+        limbo_try_exec(&limbo_conn, sql).unwrap();
+    }
+
+    let upsert = "INSERT INTO t VALUES(1, 'ignored', 'ignored') \
+                  ON CONFLICT(id) DO UPDATE SET v = 'new'";
+    sqlite_try_exec(&sqlite_conn, upsert).unwrap();
+    limbo_try_exec(&limbo_conn, upsert).unwrap();
+
+    let diff = compare_tables(
+        "upsert before trigger composite index",
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT id, k, v FROM t ORDER BY id",
+    );
+    assert!(diff.is_none(), "{diff:?}");
+
+    let sqlite_index_rows = sqlite_exec_rows(
+        &sqlite_conn,
+        "SELECT id, k, v FROM t INDEXED BY sqlite_autoindex_t_1 WHERE k = 'mid' AND v = 'new'",
+    );
+    let limbo_index_rows = limbo_exec_rows(
+        &limbo_conn,
+        "SELECT id, k, v FROM t INDEXED BY sqlite_autoindex_t_1 WHERE k = 'mid' AND v = 'new'",
+    );
+    assert_eq!(limbo_index_rows, sqlite_index_rows);
+
+    let db_path = limbo_db.path.clone();
+    drop(limbo_conn);
+    drop(limbo_db);
+    let ic = sqlite_integrity_check(&db_path);
+    assert_eq!(ic, "ok");
+}
+
 // ---------------------------------------------------------------------------
 // Gap 5: Autocommit FAIL semantics with partial row changes
 // ---------------------------------------------------------------------------

@@ -7,7 +7,9 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use super::emitter::gencol::compute_virtual_columns;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL};
-use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
+use crate::translate::emitter::{
+    emit_check_constraints, emit_index_column_value_old_image, emit_make_record, UpdateRowSource,
+};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
     emit_fk_child_update_counters, emit_fk_update_parent_actions, fire_fk_update_actions,
@@ -685,6 +687,7 @@ pub fn emit_upsert(
 
     // Fire BEFORE UPDATE triggers
     let upsert_database_id = ctx.database_id;
+    let mut has_before_update_triggers = false;
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table.btree() {
         let updated_column_indices: ColumnMask =
             set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
@@ -702,6 +705,7 @@ pub fn emit_upsert(
             .chain(std::iter::once(ctx.conflict_rowid_reg))
             .collect();
         if !relevant_before_update_triggers.is_empty() {
+            has_before_update_triggers = true;
             // NEW row values are in new_start registers. At this point they are
             // encoded (post-encode for STRICT custom types). Mark new_encoded=true
             // so fire_trigger's decode_trigger_registers will decode them.
@@ -783,6 +787,70 @@ pub fn emit_upsert(
     } else {
         None
     };
+
+    if has_before_update_triggers {
+        let updated_column_indices: ColumnMask =
+            set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
+        for (idx, col) in table.columns().iter().enumerate() {
+            if updated_column_indices.get(idx) || col.is_virtual_generated() {
+                continue;
+            }
+            let target_reg = layout.to_register(new_start, idx);
+            emit_table_column(
+                program,
+                ctx.cursor_id,
+                table_ref_id,
+                table_references,
+                col,
+                idx,
+                target_reg,
+                resolver,
+            )?;
+            if col.notnull() && !col.is_rowid_alias() {
+                program.emit_insn(Insn::HaltIfNull {
+                    target_reg,
+                    err_code: SQLITE_CONSTRAINT_NOTNULL,
+                    description: String::from(table.get_name())
+                        + "."
+                        + col.name.as_ref().map_or("", |name| name),
+                });
+            }
+        }
+
+        if ctx.table.has_virtual_columns() {
+            let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+            let dml_ctx =
+                DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
+            compute_virtual_columns(
+                program,
+                &ctx.table.columns_topo_sort()?,
+                &dml_ctx,
+                resolver,
+                ctx.table,
+            )?;
+        }
+
+        if let Some(bt) = table.btree() {
+            if !bt.check_constraints.is_empty() {
+                emit_check_constraints(
+                    program,
+                    &bt.check_constraints,
+                    resolver,
+                    &bt.name,
+                    new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+                    bt.columns().iter().enumerate().filter_map(|(idx, col)| {
+                        col.name
+                            .as_deref()
+                            .map(|n| (n, layout.to_register(new_start, idx)))
+                    }),
+                    connection,
+                    ast::ResolveType::Abort,
+                    ctx.loop_labels.row_done,
+                    Some(table_references),
+                )?;
+            }
+        }
+    }
     let rowid_alias_idx = table.columns().iter().position(|c| c.is_rowid_alias());
     let has_direct_rowid_update = set_pairs
         .iter()
@@ -860,15 +928,19 @@ pub fn emit_upsert(
             }
             let k = idx_meta.columns.len();
 
-            let before_pred_reg = eval_partial_pred_for_row_image(
-                program,
-                table,
-                &idx_meta,
-                before,
-                ctx.conflict_rowid_reg,
-                resolver,
-                &layout,
-            );
+            let before_pred_reg = if has_before_update_triggers {
+                None
+            } else {
+                eval_partial_pred_for_row_image(
+                    program,
+                    table,
+                    &idx_meta,
+                    before,
+                    ctx.conflict_rowid_reg,
+                    resolver,
+                    &layout,
+                )
+            };
             let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
             let new_pred_reg = eval_partial_pred_for_row_image(
                 program, table, &idx_meta, new_start, new_rowid, resolver, &layout,
@@ -888,7 +960,17 @@ pub fn emit_upsert(
             // DELETE old key
             let del = program.alloc_registers(k + 1);
             for (i, ic) in idx_meta.columns.iter().enumerate() {
-                if ic.expr.is_some() {
+                if has_before_update_triggers {
+                    emit_index_column_value_old_image(
+                        program,
+                        resolver,
+                        table_references,
+                        ctx.cursor_id,
+                        table_ref_id,
+                        ic,
+                        del + i,
+                    )?;
+                } else if ic.expr.is_some() {
                     emit_upsert_expr_index_value(
                         program,
                         resolver,
@@ -908,11 +990,18 @@ pub fn emit_upsert(
                     });
                 }
             }
-            program.emit_insn(Insn::Copy {
-                src_reg: ctx.conflict_rowid_reg,
-                dst_reg: del + k,
-                extra_amount: 0,
-            });
+            if has_before_update_triggers {
+                program.emit_insn(Insn::RowId {
+                    cursor_id: ctx.cursor_id,
+                    dest: del + k,
+                });
+            } else {
+                program.emit_insn(Insn::Copy {
+                    src_reg: ctx.conflict_rowid_reg,
+                    dst_reg: del + k,
+                    extra_amount: 0,
+                });
+            }
             program.emit_insn(Insn::IdxDelete {
                 start_reg: del,
                 num_regs: k + 1,
