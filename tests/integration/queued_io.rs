@@ -79,6 +79,7 @@ impl QueuedIo {
         });
     }
 
+    #[allow(dead_code)]
     pub fn fail_any_after_successes(&self, allowed_successes: usize) {
         *self.state.fault.lock().unwrap() = Some(QueuedIoFault {
             path_suffix: None,

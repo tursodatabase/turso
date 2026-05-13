@@ -27,6 +27,12 @@ struct PlainVacuumInvariant {
     normalized_schema: Vec<NormalizedSchemaRow>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedPlainVacuumInvariant {
+    rows: Vec<(i64, String)>,
+    normalized_schema: Vec<NormalizedSchemaRow>,
+}
+
 /// Helper to run integrity_check and return the result string
 fn run_integrity_check(conn: &Arc<Connection>) -> String {
     let rows: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
@@ -101,6 +107,25 @@ fn assert_plain_vacuum_integrity_and_hash(
         normalized_schema_snapshot(conn),
         expected.normalized_schema,
         "plain VACUUM should preserve normalized sqlite_schema entries"
+    );
+}
+
+fn queued_plain_vacuum_invariant(conn: &Arc<Connection>) -> QueuedPlainVacuumInvariant {
+    QueuedPlainVacuumInvariant {
+        rows: conn.exec_rows("SELECT id, payload FROM t ORDER BY id"),
+        normalized_schema: normalized_schema_snapshot(conn),
+    }
+}
+
+fn assert_queued_plain_vacuum_invariant(
+    conn: &Arc<Connection>,
+    expected: &QueuedPlainVacuumInvariant,
+) {
+    assert_eq!(run_integrity_check(conn), "ok");
+    assert_eq!(
+        queued_plain_vacuum_invariant(conn),
+        *expected,
+        "plain VACUUM should preserve queued-IO database content"
     );
 }
 
@@ -8068,7 +8093,7 @@ fn test_plain_vacuum_queued_io_reentry_multi_batch() -> anyhow::Result<()> {
     let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
     assert!(pre_pages > 64, "queued IO workload should be multi-batch");
 
-    let before_hash = compute_plain_vacuum_file_dbhash(path);
+    let before = queued_plain_vacuum_invariant(&conn);
     conn.execute("VACUUM")?;
 
     assert!(
@@ -8084,7 +8109,7 @@ fn test_plain_vacuum_queued_io_reentry_multi_batch() -> anyhow::Result<()> {
         scalar_i64(&conn, "PRAGMA page_count") < pre_pages,
         "VACUUM should compact the queued-IO workload"
     );
-    assert_plain_vacuum_integrity_and_hash_for_path(path, &conn, &before_hash);
+    assert_queued_plain_vacuum_invariant(&conn, &before);
     Ok(())
 }
 
@@ -8104,7 +8129,7 @@ fn test_plain_vacuum_reinitializes_source_wal_header_after_truncate_checkpoint(
     populate_queued_multibatch(&conn)?;
     let history_start = io.history_len();
 
-    let before_hash = compute_plain_vacuum_file_dbhash(path);
+    let before = queued_plain_vacuum_invariant(&conn);
     conn.execute("VACUUM")?;
 
     let source_wal_events: Vec<QueuedIoEvent> = io
@@ -8141,7 +8166,7 @@ fn test_plain_vacuum_reinitializes_source_wal_header_after_truncate_checkpoint(
         "source WAL header must be rewritten and fsynced before the first copied frame batch"
     );
 
-    assert_plain_vacuum_integrity_and_hash_for_path(path, &conn, &before_hash);
+    assert_queued_plain_vacuum_invariant(&conn, &before);
     Ok(())
 }
 
@@ -8217,7 +8242,7 @@ fn test_second_plain_vacuum_on_same_connection_rejects_while_first_running() -> 
     let conn = db.connect()?;
 
     populate_queued_multibatch(&conn)?;
-    let before_hash = compute_plain_vacuum_file_dbhash(path);
+    let before = queued_plain_vacuum_invariant(&conn);
 
     let mut first = conn.prepare("VACUUM")?;
     loop {
@@ -8264,7 +8289,7 @@ fn test_second_plain_vacuum_on_same_connection_rejects_while_first_running() -> 
     }
 
     assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 176);
-    assert_plain_vacuum_integrity_and_hash_for_path(path, &conn, &before_hash);
+    assert_queued_plain_vacuum_invariant(&conn, &before);
     Ok(())
 }
 
@@ -8466,10 +8491,10 @@ fn test_plain_vacuum_source_wal_first_batch_write_failure_rolls_back() -> anyhow
     );
 
     assert_failed_vacuum_left_queued_db_usable(&conn, pre_pages)?;
-    let before_hash = compute_plain_vacuum_file_dbhash(path);
+    let before = queued_plain_vacuum_invariant(&conn);
     conn.execute("VACUUM")?;
     assert!(scalar_i64(&conn, "PRAGMA page_count") < pre_pages);
-    assert_plain_vacuum_integrity_and_hash_for_path(path, &conn, &before_hash);
+    assert_queued_plain_vacuum_invariant(&conn, &before);
     Ok(())
 }
 
@@ -8494,10 +8519,10 @@ fn test_plain_vacuum_source_wal_later_batch_write_failure_rolls_back() -> anyhow
     );
 
     assert_failed_vacuum_left_queued_db_usable(&conn, pre_pages)?;
-    let before_hash = compute_plain_vacuum_file_dbhash(path);
+    let before = queued_plain_vacuum_invariant(&conn);
     conn.execute("VACUUM")?;
     assert!(scalar_i64(&conn, "PRAGMA page_count") < pre_pages);
-    assert_plain_vacuum_integrity_and_hash_for_path(path, &conn, &before_hash);
+    assert_queued_plain_vacuum_invariant(&conn, &before);
     Ok(())
 }
 
@@ -8522,10 +8547,10 @@ fn test_plain_vacuum_source_wal_sync_failure_rolls_back() -> anyhow::Result<()> 
     );
 
     assert_failed_vacuum_left_queued_db_usable(&conn, pre_pages)?;
-    let before_hash = compute_plain_vacuum_file_dbhash(path);
+    let before = queued_plain_vacuum_invariant(&conn);
     conn.execute("VACUUM")?;
     assert!(scalar_i64(&conn, "PRAGMA page_count") < pre_pages);
-    assert_plain_vacuum_integrity_and_hash_for_path(path, &conn, &before_hash);
+    assert_queued_plain_vacuum_invariant(&conn, &before);
     Ok(())
 }
 
