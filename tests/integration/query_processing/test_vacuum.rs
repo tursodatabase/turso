@@ -2546,6 +2546,15 @@ fn test_vacuum_into_preserves_mvcc_after_reopen(tmp_db: TempDatabase) -> anyhow:
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)")?;
     conn.execute("INSERT INTO t VALUES (1, 'hello')")?;
     conn.execute("INSERT INTO t VALUES (2, 'world')")?;
+    let source_log_path = tmp_db.path.with_extension("db-log");
+    assert!(
+        source_log_path.exists(),
+        "source MVCC log file should exist before VACUUM INTO"
+    );
+    assert!(
+        mvcc_log_file_size(&tmp_db) > 0,
+        "source MVCC log file should contain uncheckpointed changes before VACUUM INTO"
+    );
     let hash_opts = turso_dbhash::DbHashOptions {
         table_filter: Some("t".to_string()),
         ..Default::default()
