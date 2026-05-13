@@ -10727,3 +10727,197 @@ fn dropped_exclusive_commit_releases_locks() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0].as_int().unwrap(), 2);
 }
+
+/// Regression for abandoned COMMIT cleanup with attached MVCC databases.
+/// Dropping the COMMIT while the main-db CommitStateMachine is paused must
+/// also roll back attached MVCC txs opened by the same SQL transaction.
+#[test]
+fn dropped_main_commit_rolls_back_attached_mvcc_txs() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir.path().join("aux.db");
+
+    let conn = db.connect();
+    conn.attach_database(aux_path.to_str().unwrap(), "aux")
+        .unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE aux.u (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'main')").unwrap();
+    conn.execute("INSERT INTO aux.u VALUES (1, 'aux')").unwrap();
+
+    let aux_db_id = conn.get_database_id_by_name("aux").unwrap();
+    let aux_mv_store = conn
+        .mv_store_for_db(aux_db_id)
+        .expect("attached aux database must be MVCC");
+    let aux_pager = conn.get_pager_from_database_index(&aux_db_id).unwrap();
+    let aux_tx_id = conn
+        .get_mv_tx_id_for_db(aux_db_id)
+        .expect("attached MVCC tx must be open after INSERT");
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            crate::StepResult::IO => {}
+            other => panic!("expected IO yield at LogRecordPrepared; got {other:?}"),
+        }
+    }
+    conn.set_yield_injector(None);
+
+    assert!(
+        conn.get_mv_tx_id_for_db(aux_db_id).is_none(),
+        "attached MVCC tx slot must be cleared when abandoned COMMIT is rolled back"
+    );
+    assert!(
+        !aux_mv_store.txs.contains_key(&aux_tx_id),
+        "attached MVCC tx must be removed from txs"
+    );
+    assert!(
+        !aux_pager.holds_read_lock(),
+        "attached pager read lock must be released"
+    );
+
+    let rows = get_rows(&conn, "SELECT id FROM aux.u ORDER BY id");
+    assert!(
+        rows.is_empty(),
+        "abandoned attached INSERT must not become visible"
+    );
+}
+
+/// Regression for abandoning COMMIT after it has advanced from the main
+/// MVCC phase into an attached MVCC CommitStateMachine.
+#[test]
+fn dropped_attached_commit_releases_attached_read_lock() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir.path().join("aux.db");
+
+    let conn = db.connect();
+    conn.attach_database(aux_path.to_str().unwrap(), "aux")
+        .unwrap();
+    conn.execute("CREATE TABLE aux.u (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO aux.u VALUES (1, 'aux')").unwrap();
+
+    let aux_db_id = conn.get_database_id_by_name("aux").unwrap();
+    let aux_mv_store = conn
+        .mv_store_for_db(aux_db_id)
+        .expect("attached aux database must be MVCC");
+    let aux_pager = conn.get_pager_from_database_index(&aux_db_id).unwrap();
+    let aux_tx_id = conn
+        .get_mv_tx_id_for_db(aux_db_id)
+        .expect("attached MVCC tx must be open after INSERT");
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            crate::StepResult::IO => {}
+            other => panic!("expected IO yield at attached LogRecordPrepared; got {other:?}"),
+        }
+    }
+    conn.set_yield_injector(None);
+
+    assert!(
+        conn.get_mv_tx_id_for_db(aux_db_id).is_none(),
+        "attached MVCC tx slot must be cleared"
+    );
+    assert!(
+        !aux_mv_store.txs.contains_key(&aux_tx_id),
+        "attached MVCC tx must be removed from txs"
+    );
+    assert!(
+        !aux_pager.holds_read_lock(),
+        "attached pager read lock must be released"
+    );
+}
+
+/// Regression for abandoning COMMIT while one attached MVCC database is
+/// paused mid-commit and another attached MVCC transaction is still pending.
+#[test]
+fn dropped_attached_commit_rolls_back_remaining_attached_mvcc_txs() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux1_path = aux_dir.path().join("aux1.db");
+    let aux2_path = aux_dir.path().join("aux2.db");
+
+    let conn = db.connect();
+    conn.attach_database(aux1_path.to_str().unwrap(), "aux1")
+        .unwrap();
+    conn.attach_database(aux2_path.to_str().unwrap(), "aux2")
+        .unwrap();
+    conn.execute("CREATE TABLE aux1.u (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE aux2.v (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO aux1.u VALUES (1, 'aux1')")
+        .unwrap();
+    conn.execute("INSERT INTO aux2.v VALUES (1, 'aux2')")
+        .unwrap();
+
+    let aux1_db_id = conn.get_database_id_by_name("aux1").unwrap();
+    let aux2_db_id = conn.get_database_id_by_name("aux2").unwrap();
+    let aux1_mv_store = conn
+        .mv_store_for_db(aux1_db_id)
+        .expect("attached aux1 database must be MVCC");
+    let aux2_mv_store = conn
+        .mv_store_for_db(aux2_db_id)
+        .expect("attached aux2 database must be MVCC");
+    let aux1_pager = conn.get_pager_from_database_index(&aux1_db_id).unwrap();
+    let aux2_pager = conn.get_pager_from_database_index(&aux2_db_id).unwrap();
+    let aux1_tx_id = conn
+        .get_mv_tx_id_for_db(aux1_db_id)
+        .expect("attached aux1 MVCC tx must be open after INSERT");
+    let aux2_tx_id = conn
+        .get_mv_tx_id_for_db(aux2_db_id)
+        .expect("attached aux2 MVCC tx must be open after INSERT");
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            crate::StepResult::IO => {}
+            other => panic!("expected IO yield at attached LogRecordPrepared; got {other:?}"),
+        }
+    }
+    conn.set_yield_injector(None);
+
+    assert!(
+        conn.get_mv_tx_id_for_db(aux1_db_id).is_none(),
+        "attached aux1 MVCC tx slot must be cleared"
+    );
+    assert!(
+        conn.get_mv_tx_id_for_db(aux2_db_id).is_none(),
+        "attached aux2 MVCC tx slot must be cleared"
+    );
+    assert!(
+        !aux1_mv_store.txs.contains_key(&aux1_tx_id),
+        "attached aux1 MVCC tx must be removed from txs"
+    );
+    assert!(
+        !aux2_mv_store.txs.contains_key(&aux2_tx_id),
+        "attached aux2 MVCC tx must be removed from txs"
+    );
+    assert!(
+        !aux1_pager.holds_read_lock(),
+        "attached aux1 pager read lock must be released"
+    );
+    assert!(
+        !aux2_pager.holds_read_lock(),
+        "attached aux2 pager read lock must be released"
+    );
+}

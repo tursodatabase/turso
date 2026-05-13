@@ -1110,9 +1110,12 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     /// would do. Without this, the next `op_transaction` either skips
     /// `begin_read_tx` (stale `Write` state) or panics in `wal.begin_read_tx`
     /// (pre-existing read lock not released).
-    pub(crate) fn cleanup_abandoned_commit(&mut self, mv_store: &MvStore<Clock>) {
+    ///
+    /// Returns true when cleanup actually ran, false if the state machine was
+    /// already finalized.
+    pub(crate) fn cleanup_abandoned_commit(&mut self, mv_store: &MvStore<Clock>) -> bool {
         if self.is_finalized {
-            return;
+            return false;
         }
         self.is_finalized = true;
         if mv_store.is_tx_rollbackable(self.tx_id) {
@@ -1125,6 +1128,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             self.connection
                 .set_tx_state(crate::connection::TransactionState::None);
         }
+        true
     }
 
     fn new(

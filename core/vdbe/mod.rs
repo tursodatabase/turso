@@ -213,15 +213,34 @@ impl CommitState {
         match self {
             CommitState::CommittingMvcc { state_machine } => {
                 if let Some(mv_store) = connection.mv_store().as_ref() {
-                    state_machine.inner_mut().cleanup_abandoned_commit(mv_store);
+                    if state_machine.inner_mut().cleanup_abandoned_commit(mv_store) {
+                        connection.rollback_attached_mvcc_txs(true);
+                        connection.rollback_attached_wal_txns();
+                    }
                 }
             }
             CommitState::CommittingAttachedMvcc {
                 state_machine,
+                db_id,
                 mv_store,
                 ..
             } => {
-                state_machine.inner_mut().cleanup_abandoned_commit(mv_store);
+                if state_machine.inner_mut().cleanup_abandoned_commit(mv_store) {
+                    connection
+                        .get_pager_from_database_index(&*db_id)
+                        .expect("attached MVCC transaction should always have a pager")
+                        .end_read_tx();
+                    if connection
+                        .database_schemas()
+                        .write()
+                        .remove(db_id)
+                        .is_some()
+                    {
+                        connection.bump_prepare_context_generation();
+                    }
+                    connection.rollback_attached_mvcc_txs(true);
+                    connection.rollback_attached_wal_txns();
+                }
             }
             CommitState::Ready | CommitState::Committing | CommitState::CommittingAttached => {}
         }
