@@ -1,0 +1,35 @@
+name: YAML Lint
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/**"
+  pull_request:
+    paths:
+      - ".github/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download actionlint
+        run: bash <(curl -s https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+
+      - name: Run actionlint
+        run: |
+          ./actionlint -no-color -oneline \
+            -ignore 'the runner of "actions/(checkout|setup-python|stale)@v[0-9]+" action is too old' \
+            -ignore 'property "update_dep" is not defined in object type' \
+            -ignore 'avoid using deprecated input "save-always"'
