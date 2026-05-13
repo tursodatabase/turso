@@ -2765,7 +2765,7 @@ impl Pager {
                         Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                         Ok(IOResult::Done(_)) => complete_commit(),
                         Err(err) => {
-                            tracing::info!("auto-checkpoint failed: {err}");
+                            tracing::debug!("auto-checkpoint failed: {err}");
                             complete_commit();
                             self.cleanup_after_auto_checkpoint_failure();
                         }
