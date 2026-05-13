@@ -1964,12 +1964,16 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // transaction. Pair removal with the connection cache clear so
                 // an IO yield + abandon during the upcoming checkpoint cannot
                 // strand `conn.mv_tx_id` referencing a tx that's gone from `txs`.
-                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
-                inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
-
+                //
+                // Release `exclusive_tx` BEFORE `finish_committed_tx` /
+                // `inject_transition_failure!` so an Err at `AfterRemoveTx`
+                // cannot strand the atomic — matches the ordering at the
+                // two fast-path CommitEnd sites.
                 if mvcc_store.is_exclusive_tx(&self.tx_id) {
                     mvcc_store.release_exclusive_tx(&self.tx_id);
                 }
+                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
+                inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                 if mvcc_store.storage.should_checkpoint() {
                     let state_machine = StateMachine::new(CheckpointStateMachine::new(
                         self.pager.clone(),

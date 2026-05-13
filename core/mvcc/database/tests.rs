@@ -10542,3 +10542,69 @@ fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
         }
     }
 }
+
+/// Regression for #6752: `release_exclusive_tx` ran AFTER
+/// `inject_transition_failure!(AfterRemoveTx)` in the CommitEnd full-path,
+/// so a synthetic Err at that point stranded the `exclusive_tx` atomic and
+/// any subsequent CONCURRENT writer parked at the `has_exclusive_tx()`
+/// gate. With the reorder, `exclusive_tx` is released first.
+#[test]
+fn exclusive_commit_failure_at_after_remove_tx_does_not_strand_exclusive_atom() {
+    use std::time::{Duration, Instant};
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    conn_a
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    let mv_store = db.get_mvcc_store();
+
+    conn_a.execute("BEGIN IMMEDIATE").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let tx_a = conn_a
+        .get_mv_tx_id()
+        .expect("tx_a must be open after INSERT");
+    assert!(
+        mv_store.is_exclusive_tx(&tx_a),
+        "stage 1 invariant: tx_a must own the exclusive flag"
+    );
+
+    conn_a.set_failure_injector(Some(FixedFailureInjector::new([(
+        CommitYieldPoint::AfterRemoveTx.point(),
+        LimboError::TxError("synthetic AfterRemoveTx failure".to_string()),
+    )])));
+
+    let commit_err = conn_a
+        .execute("COMMIT")
+        .expect_err("COMMIT must surface the injected TxError");
+    drop(commit_err);
+    conn_a.set_failure_injector(None);
+
+    // `finish_committed_tx` ran (releases were reordered to before the
+    // failure injection point), so `exclusive_tx` must no longer point at
+    // tx_a.
+    assert!(
+        !mv_store.is_exclusive_tx(&tx_a),
+        "exclusive_tx must be released even when AfterRemoveTx fires"
+    );
+
+    // A fresh CONCURRENT writer must be able to COMMIT within budget.
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+
+    let mut commit_b = conn_b.prepare("COMMIT").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if Instant::now() >= deadline {
+            panic!("conn_b COMMIT did not complete within 5s — exclusive_tx stranded");
+        }
+        match commit_b.step().unwrap() {
+            crate::StepResult::Done => break,
+            crate::StepResult::IO => continue,
+            other => panic!("unexpected step result on conn_b COMMIT: {other:?}"),
+        }
+    }
+}
