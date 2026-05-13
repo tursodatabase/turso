@@ -803,7 +803,7 @@ mod tests {
     use turso_sync_sdk_kit::rsapi::PartialBootstrapStrategy;
 
     use crate::sync::PartialSyncOpts;
-    use crate::{Rows, Value};
+    use crate::{Connection, Rows, Value};
 
     const ADMIN_URL: &str = "http://localhost:8081";
     const USER_URL: &str = "http://localhost:8080";
@@ -982,6 +982,19 @@ mod tests {
             result.push(row.values.into_iter().map(|x| x.into()).collect());
         }
         Ok(result)
+    }
+
+    async fn query_all_rows_retry_busy(conn: &Connection, sql: &str) -> Vec<Vec<Value>> {
+        for _ in 0..50 {
+            match conn.query(sql, ()).await {
+                Ok(rows) => return all_rows(rows).await.unwrap(),
+                Err(crate::Error::Busy(_)) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("query failed: {e:?}"),
+            }
+        }
+        panic!("query stayed busy after retries: {sql}");
     }
 
     #[tokio::test]
@@ -1912,9 +1925,7 @@ mod tests {
 
             let _ = db.checkpoint().await;
 
-            let rows = all_rows(conn.query("SELECT count(*) FROM t", ()).await.unwrap())
-                .await
-                .unwrap();
+            let rows = query_all_rows_retry_busy(&conn, "SELECT count(*) FROM t").await;
             assert_eq!(rows, vec![vec![Value::Integer(total)]]);
         }
 
