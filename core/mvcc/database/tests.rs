@@ -2538,6 +2538,111 @@ fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
     assert_eq!(&integrity[0][0].to_string(), "ok");
 }
 
+/// What this test checks: if one checkpoint makes a unique-index delete durable in the B-tree
+/// but fails before MVCC cleanup finishes, a later checkpoint retry must not try to delete that
+/// same unique key again.
+///
+/// Steps:
+/// 1. Disable automatic checkpoints.
+/// 2. Insert `(75, 'blue_river_906')`.
+/// 3. Checkpoint it so the blue key is durable in the B-tree.
+/// 4. Start and roll back a concurrent delete to leave stale MVCC state behind.
+/// 5. Update row `75` to `old_path_352`.
+/// 6. Run a checkpoint that commits pager changes and then fails after advancing the durable boundary.
+/// 7. Update row `75` again to `empty_path_27`, then to `shy_cloud_434`.
+/// 8. Retry checkpoint. Before the fix, this retried the old blue-key delete and hit
+///    `Corrupt("MVCC delete ... not found")`.
+#[test]
+fn test_checkpoint_retry_does_not_replay_checkpointed_btree_resident_unique_delete() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX idx_t_v ON t(v)").unwrap();
+    conn.execute("INSERT INTO t VALUES (75, 'blue_river_906')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 75").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("UPDATE t SET v = 'old_path_352' WHERE id = 75")
+        .unwrap();
+
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 'blue_river_906'");
+    assert!(
+        rows.is_empty(),
+        "old unique key should no longer be visible"
+    );
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 'old_path_352'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 75);
+
+    let ckpt = db.connect();
+    ckpt.set_failure_injector(Some(FixedFailureInjector::new([(
+        CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
+        LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+    )])));
+    let err = ckpt
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect_err("checkpoint should fail");
+    assert!(
+        matches!(err, LimboError::TxError(_)),
+        "expected injected checkpoint failure, got: {err:?}"
+    );
+
+    conn.execute("UPDATE t SET v = 'empty_path_27' WHERE id = 75")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("UPDATE t SET v = 'shy_cloud_434' WHERE id = 75")
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 'empty_path_27'");
+    assert!(
+        rows.is_empty(),
+        "intermediate unique key should not remain visible"
+    );
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 'shy_cloud_434'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 75);
+
+    let retry_conn = db.connect();
+    retry_conn
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("retry checkpoint should not replay the already-durable blue delete");
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t WHERE id = 75");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 75);
+    assert_eq!(rows[0][1].cast_text().unwrap(), "shy_cloud_434");
+
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 'blue_river_906'");
+    assert!(
+        rows.is_empty(),
+        "blue key should stay absent after checkpoint retry"
+    );
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 'old_path_352'");
+    assert!(
+        rows.is_empty(),
+        "old_path key should stay absent after checkpoint retry"
+    );
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 'empty_path_27'");
+    assert!(
+        rows.is_empty(),
+        "empty_path key should stay absent after checkpoint retry"
+    );
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 'shy_cloud_434'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 75);
+
+    let integrity = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(&integrity[0][0].to_string(), "ok");
+}
+
 /// What this test checks: Replay gate uses metadata boundary and never applies frames at or below it.
 /// Why this matters: This enforces exactly-once effects at the DB-file apply boundary.
 #[test]
