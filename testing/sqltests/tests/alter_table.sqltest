@@ -922,6 +922,19 @@ expect {
 }
 
 @cross-check-integrity
+test alter-table-drop-column-keeps-expr-index-sentinel {
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER, c INTEGER);
+    CREATE INDEX i_expr ON t(a, (b IS NOT NULL));
+    INSERT INTO t VALUES('x', 1, 2);
+    ALTER TABLE t DROP COLUMN c;
+    UPDATE t SET b = b;
+    SELECT a, b FROM t;
+}
+expect {
+    x|1
+}
+
+@cross-check-integrity
 test alter-table-rename-column-updates-unique-sets {
     CREATE TABLE t(a INTEGER, b TEXT, UNIQUE(b));
     INSERT INTO t VALUES (1, 'hello');
