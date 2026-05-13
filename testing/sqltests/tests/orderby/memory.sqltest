@@ -140,6 +140,29 @@ expect {
     1
 }
 
+test orderby_rowid_truncation_tail_scalar_subquery_missing_column {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    SELECT a FROM t ORDER BY a DESC, (SELECT c0);
+}
+expect error {
+    no such column: c0
+}
+
+test orderby_rowid_truncation_tail_in_subquery_missing_column {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    SELECT a FROM t ORDER BY a DESC, b IN (SELECT c0 FROM t);
+}
+expect error {
+    no such column: c0
+}
+
+test orderby_rowid_truncation_tail_scalar_subquery_column_count {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    SELECT a FROM t ORDER BY a DESC, (SELECT a, b FROM t);
+}
+expect error {
+}
+
 # Unary-plus on integer literals should still resolve as column index
 # references, matching SQLite behavior.
 # Fixes select1-4.9.2 in testing/conformance/sqlite3/all.test.

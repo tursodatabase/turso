@@ -18,7 +18,10 @@ use crate::translate::planner::{
     parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
-use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
+use crate::translate::subquery::{
+    plan_subqueries_from_select_plan, plan_subqueries_from_values,
+    validate_truncated_order_by_subqueries,
+};
 use crate::translate::window::plan_windows;
 use crate::types::Value;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_signed_number};
@@ -702,6 +705,26 @@ fn prepare_one_select_plan(
                     _ => false,
                 };
                 if first_is_rowid {
+                    let mut truncated_order_by_exprs = plan.order_by[1..]
+                        .iter()
+                        .map(|(expr, _, _)| expr.as_ref().clone())
+                        .collect::<Vec<_>>();
+                    validate_truncated_order_by_subqueries(
+                        program,
+                        &mut plan.table_references,
+                        resolver,
+                        truncated_order_by_exprs.iter_mut(),
+                        connection,
+                    )?;
+                    for expr in &truncated_order_by_exprs {
+                        let vec_size = expr_vector_size(expr)?;
+                        if vec_size != 1 {
+                            crate::bail_parse_error!(
+                                "order by expression must return 1 value, got {}",
+                                vec_size
+                            );
+                        }
+                    }
                     plan.order_by.truncate(1);
                 }
             }

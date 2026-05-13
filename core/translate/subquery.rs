@@ -60,6 +60,12 @@ enum FromClauseSubqueryExecutionMode {
     DirectMaterializedIndex(DirectMaterializedSubquery),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InSelectArityCheck {
+    Enforce,
+    Skip,
+}
+
 pub(crate) fn materialized_from_clause_subquery_storage(
     subquery: &crate::schema::FromClauseSubquery,
 ) -> Option<MaterializedFromClauseSubqueryStorage> {
@@ -321,6 +327,7 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryPosition::LimitOffset,
             SubqueryOrigin::SelectLimitOffset,
             false,
+            InSelectArityCheck::Enforce,
         );
         // Limit
         if let Some(limit) = &mut plan.limit {
@@ -357,6 +364,34 @@ pub fn plan_subqueries_from_select_plan(
         &mut plan.non_from_clause_subqueries,
     )?;
     Ok(())
+}
+
+/// Validate subqueries in ORDER BY terms that SQLite later discards because a
+/// leading rowid/INTEGER PRIMARY KEY term makes the remaining terms redundant.
+///
+/// SQLite still resolves the SELECT bodies in those discarded terms, so missing
+/// columns inside subqueries are errors. It does not, however, enforce the
+/// parent IN-expression column-count check for discarded terms.
+pub(crate) fn validate_truncated_order_by_subqueries<'a>(
+    program: &mut ProgramBuilder,
+    referenced_tables: &mut TableReferences,
+    resolver: &Resolver,
+    exprs: impl Iterator<Item = &'a mut ast::Expr>,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let mut ignored_subqueries = Vec::new();
+    plan_subqueries_with_outer_query_access_inner(
+        program,
+        &mut ignored_subqueries,
+        referenced_tables,
+        resolver,
+        exprs,
+        connection,
+        SubqueryPosition::OrderBy,
+        SubqueryOrigin::SelectOrderBy,
+        SubqueryPosition::OrderBy.allow_correlated(),
+        InSelectArityCheck::Skip,
+    )
 }
 
 /// Compute query plans for subqueries in a DML statement's WHERE clause.
@@ -516,6 +551,34 @@ fn plan_subqueries_with_outer_query_access<'a>(
     origin: SubqueryOrigin,
     allow_correlated: bool,
 ) -> Result<()> {
+    plan_subqueries_with_outer_query_access_inner(
+        program,
+        out_subqueries,
+        referenced_tables,
+        resolver,
+        exprs,
+        connection,
+        position,
+        origin,
+        allow_correlated,
+        InSelectArityCheck::Enforce,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
+fn plan_subqueries_with_outer_query_access_inner<'a>(
+    program: &mut ProgramBuilder,
+    out_subqueries: &mut Vec<NonFromClauseSubquery>,
+    referenced_tables: &mut TableReferences,
+    resolver: &Resolver,
+    exprs: impl Iterator<Item = &'a mut ast::Expr>,
+    connection: &Arc<Connection>,
+    position: SubqueryPosition,
+    origin: SubqueryOrigin,
+    allow_correlated: bool,
+    in_select_arity_check: InSelectArityCheck,
+) -> Result<()> {
     // Most subqueries can reference columns from the outer query,
     // including nested cases where a subquery inside a subquery references columns from its parent's parent
     // and so on.
@@ -574,6 +637,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
         position,
         origin,
         allow_correlated,
+        in_select_arity_check,
     );
     for expr in exprs {
         walk_expr_mut(expr, &mut subquery_parser)?;
@@ -594,6 +658,7 @@ fn get_subquery_parser<'a>(
     position: SubqueryPosition,
     origin: SubqueryOrigin,
     allow_correlated: bool,
+    in_select_arity_check: InSelectArityCheck,
 ) -> impl FnMut(&mut ast::Expr) -> Result<WalkControl> + 'a {
     let handle_unsupported_correlation =
         |correlated: bool, position: SubqueryPosition, allow_correlated: bool| -> Result<()> {
@@ -818,6 +883,22 @@ fn get_subquery_parser<'a>(
                 };
                 let result_columns = plan.select_result_columns();
                 let table_references = plan.select_table_references();
+                let correlated = plan_has_outer_scope_dependency(&plan);
+                handle_unsupported_correlation(correlated, position, allow_correlated)?;
+
+                if in_select_arity_check == InSelectArityCheck::Skip {
+                    *expr = ast::Expr::SubqueryResult {
+                        subquery_id,
+                        lhs: Some(lhs),
+                        not_in: not,
+                        query_type: SubqueryType::In {
+                            cursor_id: 0,
+                            affinity_str: Arc::new(String::new()),
+                        },
+                    };
+                    return Ok(WalkControl::Continue);
+                }
+
                 // e.g. (x,y) IN (SELECT ...)
                 // or x IN (SELECT ...)
                 let lhs_columns = match unwrap_parens(lhs.as_ref())? {
@@ -904,9 +985,6 @@ fn get_subquery_parser<'a>(
                         affinity_str: in_affinity_str.clone(),
                     },
                 };
-
-                let correlated = plan_has_outer_scope_dependency(&plan);
-                handle_unsupported_correlation(correlated, position, allow_correlated)?;
 
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
