@@ -237,3 +237,26 @@ fn try_clone_builds_independent_alloc_collections() {
     assert_eq!(cloned.pop(), Some(2));
     assert_eq!(cloned.pop(), Some(1));
 }
+
+#[test]
+fn try_clone_builds_independent_hash_collections() {
+    let map: HashMap<_, _> = [
+        ("one".to_string(), try_vec![1].unwrap()),
+        ("two".to_string(), try_vec![2].unwrap()),
+    ]
+    .into_iter()
+    .try_collect()
+    .unwrap();
+    let set: HashSet<_> = ["one".to_string(), "two".to_string()]
+        .into_iter()
+        .try_collect()
+        .unwrap();
+
+    let cloned_map = map.try_clone().unwrap();
+    let cloned_set = set.try_clone().unwrap();
+
+    assert_eq!(cloned_map.get("one").unwrap().as_slice(), &[1]);
+    assert_eq!(cloned_map.get("two").unwrap().as_slice(), &[2]);
+    assert!(cloned_set.contains("one"));
+    assert!(cloned_set.contains("two"));
+}

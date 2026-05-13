@@ -10,16 +10,14 @@ use std::fmt;
 mod api;
 mod backend;
 mod collections;
-mod try_clone;
 
 pub use api::{AllocError, Layout};
 pub use backend::{set_allocator, SetAllocatorError, TursoAllocBackend};
 pub use collections::{
-    TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt, TursoFromIterator, TursoHashMapExt,
+    TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt, TursoFromIterator, TursoHashMapExt,
     TursoHashSetExt, TursoIteratorExt, TursoNewExt, TursoTryNewExt, TursoTryWithCapacityExt,
     TursoVecDequeExt, TursoVecExt,
 };
-pub use try_clone::TryClone;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TryReserveError;

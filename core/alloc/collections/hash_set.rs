@@ -1,6 +1,6 @@
 use std::hash::{BuildHasher, Hash};
 
-use super::{TursoAllocExt, TursoFromIterator, TursoHashSetExt, TursoTryWithCapacityExt};
+use super::{TryClone, TursoAllocExt, TursoFromIterator, TursoHashSetExt, TursoTryWithCapacityExt};
 use crate::alloc::{HashSet, TryReserveError};
 
 fn hash_set_with_hasher<T, S>(hasher: S) -> HashSet<T, S> {
@@ -72,5 +72,22 @@ where
             TursoHashSetExt::try_insert(&mut values, value)?;
         }
         Ok(values)
+    }
+}
+
+impl<T, S> TryClone for HashSet<T, S>
+where
+    T: Clone + Eq + Hash,
+    S: BuildHasher + Clone,
+{
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        let mut cloned = Self::with_hasher(self.hasher().clone());
+        cloned
+            .try_reserve(self.len())
+            .map_err(TryReserveError::from)?;
+        cloned.extend(self.iter().cloned());
+        Ok(cloned)
     }
 }

@@ -71,3 +71,9 @@ pub trait TursoIteratorExt: Iterator + Sized {
         C::try_from_iter(self)
     }
 }
+
+pub trait TryClone: Sized {
+    type Error;
+
+    fn try_clone(&self) -> Result<Self, Self::Error>;
+}

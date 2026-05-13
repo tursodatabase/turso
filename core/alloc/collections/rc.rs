@@ -19,6 +19,16 @@ impl<T> TursoNewExt<T> for Rc<T> {
 }
 
 #[cfg(nightly)]
+impl<T: Clone> super::TryClone for Rc<T> {
+    type Error = crate::alloc::AllocError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        let alloc = Self::allocator(self).clone();
+        Self::try_clone_from_ref_in(self, alloc)
+    }
+}
+
+#[cfg(nightly)]
 impl<T> TursoNewExt<T> for Rc<T> {
     fn new(value: T) -> Self {
         rc(value)

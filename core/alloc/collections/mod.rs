@@ -13,7 +13,7 @@ mod vec;
 mod vec_deque;
 
 pub use traits::{
-    TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt, TursoFromIterator, TursoHashMapExt,
+    TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt, TursoFromIterator, TursoHashMapExt,
     TursoHashSetExt, TursoIteratorExt, TursoNewExt, TursoTryNewExt, TursoTryWithCapacityExt,
     TursoVecDequeExt, TursoVecExt,
 };

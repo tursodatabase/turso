@@ -1,4 +1,6 @@
-use super::{TursoAllocExt, TursoBinaryHeapExt, TursoFromIterator, TursoTryWithCapacityExt};
+use super::{
+    TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoFromIterator, TursoTryWithCapacityExt,
+};
 use crate::alloc::{BinaryHeap, TryReserveError};
 
 #[cfg(not(nightly))]
@@ -70,5 +72,24 @@ impl<T: Ord> TursoFromIterator<T> for BinaryHeap<T> {
             values.try_push(value)?;
         }
         Ok(values)
+    }
+}
+
+impl<T: Clone + Ord> TryClone for BinaryHeap<T> {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        #[cfg(not(nightly))]
+        let mut cloned = <Self as TursoTryWithCapacityExt>::try_with_capacity(self.len())?;
+        #[cfg(nightly)]
+        let mut cloned = {
+            let alloc = self.allocator().clone();
+            Self::new_in(alloc)
+        };
+        cloned
+            .try_reserve(self.len())
+            .map_err(TryReserveError::from)?;
+        cloned.extend(self.iter().cloned());
+        Ok(cloned)
     }
 }
