@@ -10608,3 +10608,122 @@ fn exclusive_commit_failure_at_after_remove_tx_does_not_strand_exclusive_atom() 
         }
     }
 }
+
+/// Regression for #6757: a Statement driving a CONCURRENT `COMMIT` that
+/// yields at `LogRecordPrepared` and is then dropped used to leave the tx
+/// in `Preparing`. The next statement on that connection would trip a
+/// `turso_assert_eq!(Active)` in `read_from_table_or_index` (process
+/// panic). The abort-side `cleanup_abandoned_mvcc_commit` hook now rolls
+/// back the orphan tx so a follow-up INSERT works against a fresh tx.
+#[test]
+fn dropped_concurrent_commit_does_not_strand_connection() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let conn = db.connect();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    let mv_store = db.get_mvcc_store();
+    let tx_id = conn
+        .get_mv_tx_id()
+        .expect("tx must be open after INSERT inside BEGIN CONCURRENT");
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            crate::StepResult::IO => {}
+            other => panic!("expected IO yield at LogRecordPrepared; got {other:?}"),
+        }
+    }
+    conn.set_yield_injector(None);
+
+    // Abort hook ran cleanup_abandoned_mvcc_commit → rollback_tx → tx is
+    // gone from `txs`, connection's mv_tx slot is cleared, AND
+    // transaction_state is reset to None so the next op_transaction takes
+    // the fresh-tx path instead of inheriting stale Write state.
+    assert!(
+        !mv_store.txs.contains_key(&tx_id),
+        "orphan tx must be rolled back by abort-side cleanup"
+    );
+    assert!(
+        conn.get_mv_tx_id().is_none(),
+        "connection's mv_tx slot must be cleared"
+    );
+    assert_eq!(
+        conn.get_tx_state(),
+        crate::connection::TransactionState::None,
+        "transaction_state must be reset after abort-side rollback"
+    );
+
+    // The next op must not panic on the would-be-Preparing tx — it should
+    // start a fresh autocommit tx instead.
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    let rows = get_rows(&conn, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+/// Regression for #6755: dropping a Statement driving an EXCLUSIVE
+/// (BEGIN IMMEDIATE) COMMIT at `LogRecordPrepared` used to leak both
+/// `pager_commit_lock` and the `exclusive_tx` atomic. With abort-side
+/// `cleanup_abandoned_mvcc_commit` calling `rollback_tx`, both are
+/// released and a second connection's BEGIN IMMEDIATE makes progress.
+#[test]
+fn dropped_exclusive_commit_releases_locks() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    conn_a.execute("BEGIN IMMEDIATE").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    let mv_store = db.get_mvcc_store();
+    let tx_a = conn_a
+        .get_mv_tx_id()
+        .expect("EXCLUSIVE tx_a must be open after INSERT");
+    assert!(
+        mv_store.is_exclusive_tx(&tx_a),
+        "EXCLUSIVE tx_a must own the exclusive_tx atomic"
+    );
+
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    {
+        let mut commit = conn_a.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            crate::StepResult::IO => {}
+            other => panic!("expected IO yield at LogRecordPrepared; got {other:?}"),
+        }
+    }
+    conn_a.set_yield_injector(None);
+
+    // After abort, exclusive_tx must be released.
+    assert!(
+        !mv_store.is_exclusive_tx(&tx_a),
+        "exclusive_tx must be released by abort-side cleanup"
+    );
+
+    // conn_b must be able to take the exclusive lock.
+    conn_b.execute("BEGIN IMMEDIATE").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    conn_b.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn_b, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
