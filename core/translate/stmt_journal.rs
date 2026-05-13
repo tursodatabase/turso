@@ -11,8 +11,9 @@
 //! unnecessary. The condition is: `usesStmtJournal = isMultiWrite && mayAbort`.
 //!
 //! - **isMultiWrite**: the statement may modify more than one row (or more than
-//!   one table, e.g. FK counter + data table). A single-row write is atomic —
-//!   either all writes happen or none do — so no partial state to roll back.
+//!   one table, e.g. FK counter + data table). A single-row write is normally
+//!   atomic, but DML RETURNING is evaluated after the physical write and can
+//!   still abort; keep statement-journal protection for that path.
 //!
 //! - **mayAbort**: the statement may fail mid-execution with an ABORT (e.g.
 //!   constraint violation, FK violation, RAISE(ABORT) in a trigger). If a
@@ -135,6 +136,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     has_autoincrement: bool,
     notnull_col_exists: bool,
     has_unique: bool,
+    has_returning: bool,
 ) {
     let index_modes: Vec<(Option<ResolveType>, bool)> = resolver.with_schema(database_id, |s| {
         s.get_indices(&table.name)
@@ -150,6 +152,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     let has_check = !table.check_constraints.is_empty();
     let may_abort = has_triggers
         || has_fks
+        || has_returning
         || constraint_may_abort(
             has_statement_conflict,
             statement_conflict,
@@ -167,6 +170,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
         && !any_replace
         && !has_upsert
         && !has_autoincrement
+        && !has_returning
     {
         program.set_multi_write(false);
     }
@@ -215,7 +219,9 @@ pub(crate) fn set_update_stmt_journal_flags(
     let is_single_row =
         plan.limit.is_none() && plan.offset.is_none() && target_table.op.affects_max_1_row();
     if is_single_row && !has_triggers && !any_replace && !has_fks {
-        program.set_multi_write(false);
+        if !plan.returning.as_ref().is_some_and(|r| !r.is_empty()) {
+            program.set_multi_write(false);
+        }
     }
 
     let has_notnull_cols = plan.set_clauses.iter().any(|set_clause| {
@@ -233,6 +239,7 @@ pub(crate) fn set_update_stmt_journal_flags(
 
     let may_abort = has_triggers
         || has_fks
+        || plan.returning.as_ref().is_some_and(|r| !r.is_empty())
         || constraint_may_abort(
             has_statement_conflict,
             or_conflict,
@@ -269,13 +276,14 @@ pub(crate) fn set_delete_stmt_journal_flags(
     // Scan, so affects_max_1_row correctly returns false — no false optimization.
     let is_single_row =
         plan.limit.is_none() && plan.offset.is_none() && target_table.op.affects_max_1_row();
-    if is_single_row && !has_triggers && !has_fks {
+    let has_returning = !plan.result_columns.is_empty();
+    if is_single_row && !has_triggers && !has_fks && !has_returning {
         program.set_multi_write(false);
     }
 
     // DELETE has no ON CONFLICT clause, so NOT NULL/CHECK/UNIQUE don't apply —
     // only triggers (RAISE(ABORT)) or FK violations can abort.
-    if !has_triggers && !has_fks {
+    if !has_triggers && !has_fks && !has_returning {
         program.set_may_abort(false);
     }
     Ok(())

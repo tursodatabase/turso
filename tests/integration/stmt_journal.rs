@@ -129,6 +129,56 @@ fn insert_autoincrement_notnull(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// RETURNING expressions run after the physical insert and can abort at runtime,
+/// so even single-row INSERT needs statement-journal protection.
+#[turso_macros::test(init_sql = "CREATE TABLE t (a);")]
+fn insert_returning_needs_stmt_journal(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    assert!(needs_stmt_journal(
+        &conn,
+        "INSERT INTO t VALUES (1) RETURNING a"
+    ));
+    Ok(())
+}
+
+/// Regression: a RETURNING runtime error after a single-row INSERT must roll
+/// back the inserted row inside an explicit transaction.
+#[turso_macros::test]
+fn insert_returning_error_in_tx_rolls_back_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(a)")?;
+    conn.execute("BEGIN")?;
+
+    let result = conn.execute("INSERT INTO t VALUES(1) RETURNING 'x' LIKE 'x' ESCAPE 'yy'");
+    assert!(result.is_err(), "INSERT RETURNING should fail");
+
+    let rows = query_rows(&conn, "SELECT * FROM t");
+    assert!(rows.is_empty(), "failed INSERT must not leave a row");
+    conn.execute("COMMIT")?;
+    Ok(())
+}
+
+/// Regression: INSERT OR REPLACE deletes the conflicting row before RETURNING.
+/// If RETURNING aborts, the replacement must be undone and the old row restored.
+#[turso_macros::test]
+fn insert_or_replace_returning_error_in_tx_rolls_back_replace(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(a INT UNIQUE, b INT)")?;
+    conn.execute("INSERT INTO t VALUES(1,10)")?;
+    conn.execute("BEGIN")?;
+
+    let result =
+        conn.execute("INSERT OR REPLACE INTO t VALUES(1,20) RETURNING 'x' LIKE 'x' ESCAPE 'yy'");
+    assert!(result.is_err(), "INSERT OR REPLACE RETURNING should fail");
+
+    let rows = query_rows(&conn, "SELECT rowid, a, b FROM t");
+    assert_eq!(rows, vec!["1|1|10"]);
+    conn.execute("COMMIT")?;
+    Ok(())
+}
+
 /// INSERT with SELECT as source is multi-row.
 #[turso_macros::test(init_sql = "CREATE TABLE t (a NOT NULL);")]
 fn insert_select_source(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -289,6 +339,37 @@ fn update_composite_unique_partial_cols(tmp_db: TempDatabase) -> anyhow::Result<
     Ok(())
 }
 
+/// RETURNING expressions run after the physical update and can abort at runtime,
+/// so even a rowid-targeted UPDATE needs statement-journal protection.
+#[turso_macros::test(init_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, a);")]
+fn update_returning_needs_stmt_journal(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    assert!(needs_stmt_journal(
+        &conn,
+        "UPDATE t SET a = 1 WHERE id = 5 RETURNING a"
+    ));
+    Ok(())
+}
+
+/// Regression: a RETURNING runtime error after a single-row UPDATE must roll
+/// back the updated row inside an explicit transaction.
+#[turso_macros::test]
+fn update_returning_error_in_tx_rolls_back_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT)")?;
+    conn.execute("INSERT INTO t VALUES(1, 'old')")?;
+    conn.execute("BEGIN")?;
+
+    let result =
+        conn.execute("UPDATE t SET a = 'new' WHERE id = 1 RETURNING 'x' LIKE 'x' ESCAPE 'yy'");
+    assert!(result.is_err(), "UPDATE RETURNING should fail");
+
+    let rows = query_rows(&conn, "SELECT id, a FROM t");
+    assert_eq!(rows, vec!["1|old"]);
+    conn.execute("COMMIT")?;
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────
 // DELETE
 // ──────────────────────────────────────────────────────────
@@ -339,6 +420,36 @@ fn delete_by_rowid_with_fk(tmp_db: TempDatabase) -> anyhow::Result<()> {
     // FK constraint checks modify deferred violation counter before the statement can abort,
     // so multi_write stays true. needs_stmt = true && true = true.
     assert!(needs_stmt_journal(&conn, "DELETE FROM parent WHERE id = 5"));
+    Ok(())
+}
+
+/// RETURNING expressions run after the physical delete and can abort at runtime,
+/// so even a rowid-targeted DELETE needs statement-journal protection.
+#[turso_macros::test(init_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, a);")]
+fn delete_returning_needs_stmt_journal(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    assert!(needs_stmt_journal(
+        &conn,
+        "DELETE FROM t WHERE id = 5 RETURNING a"
+    ));
+    Ok(())
+}
+
+/// Regression: a RETURNING runtime error after DELETE must roll back already
+/// deleted rows inside an explicit transaction.
+#[turso_macros::test]
+fn delete_returning_error_in_tx_rolls_back_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(a INT)")?;
+    conn.execute("INSERT INTO t VALUES(1),(2)")?;
+    conn.execute("BEGIN")?;
+
+    let result = conn.execute("DELETE FROM t WHERE a = 1 RETURNING 'x' LIKE 'x' ESCAPE 'yy'");
+    assert!(result.is_err(), "DELETE RETURNING should fail");
+
+    let rows = query_rows(&conn, "SELECT * FROM t ORDER BY a");
+    assert_eq!(rows, vec!["1", "2"]);
+    conn.execute("COMMIT")?;
     Ok(())
 }
 
