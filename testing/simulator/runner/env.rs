@@ -1104,6 +1104,8 @@ impl SimulatorEnv {
             disable_where_true_false_null: cli_opts.disable_where_true_false_null,
             disable_union_all_preserves_cardinality: cli_opts
                 .disable_union_all_preserves_cardinality,
+            disable_in_subquery_ungrouped_aggregate: cli_opts
+                .disable_in_subquery_ungrouped_aggregate,
             disable_savepoint_rollback: cli_opts.disable_savepoint_rollback,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
             disable_faulty_query: cli_opts.disable_faulty_query,
@@ -1442,6 +1444,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_drop_select: bool,
     pub(crate) disable_where_true_false_null: bool,
     pub(crate) disable_union_all_preserves_cardinality: bool,
+    pub(crate) disable_in_subquery_ungrouped_aggregate: bool,
     pub(crate) disable_savepoint_rollback: bool,
     pub(crate) disable_fsync_no_wait: bool,
     pub(crate) disable_faulty_query: bool,

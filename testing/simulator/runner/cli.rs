@@ -147,6 +147,12 @@ pub struct SimulatorCLI {
     pub disable_union_all_preserves_cardinality: bool,
     #[clap(
         long,
+        help = "disable IN-subquery ungrouped aggregate Property",
+        default_value_t = false
+    )]
+    pub disable_in_subquery_ungrouped_aggregate: bool,
+    #[clap(
+        long,
         help = "disable Savepoint-Rollback Property",
         default_value_t = false
     )]

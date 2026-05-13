@@ -19,7 +19,7 @@ use sql_generation::{
             transaction::{Begin, Commit, Rollback},
             update::{SetValue, Update},
         },
-        table::{ColumnType, SimValue, Table},
+        table::{Column, ColumnType, SimValue, Table},
     },
 };
 use strum::IntoEnumIterator;
@@ -38,7 +38,7 @@ use crate::{
         metrics::Remaining,
         property::{InteractiveQueryInfo, Property, PropertyDiscriminants},
     },
-    runner::env::SimulatorEnv,
+    runner::env::{SimConnection, SimulatorEnv},
 };
 
 type PropertyQueryGenFunc<'a, R, G> =
@@ -246,6 +246,7 @@ impl Property {
             | Property::SelectSelectOptimizer { .. }
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
+            | Property::InSubqueryUngroupedAggregate { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => {
@@ -1201,6 +1202,53 @@ impl Property {
                 ),
                 ].into_iter().map(InteractionBuilder::with_interaction).collect()
             }
+            Property::InSubqueryUngroupedAggregate { table } => {
+                let create = InteractionType::Query(Query::Create(Create {
+                    table: in_subquery_aggregate_table(table),
+                }));
+                let insert = InteractionType::Query(Query::Insert(Insert::Values {
+                    table: table.clone(),
+                    values: vec![vec![
+                        SimValue::NULL,
+                        SimValue(types::Value::from_f64(1.5)),
+                        SimValue::NULL,
+                    ]],
+                    on_conflict: None,
+                }));
+
+                let sql = in_subquery_aggregate_sql(table);
+                let table_dependency = table.clone();
+                let assertion = InteractionType::Assertion(Assertion::new(
+                    format!("IN(subquery) aggregate over empty rows should return NULL: {sql}"),
+                    move |_stack: &Vec<ResultSet>, env| {
+                        let rows = execute_raw_select(env, connection_index, &sql)?;
+                        let expected = vec![vec![SimValue::NULL, SimValue::NULL]];
+                        if rows == expected {
+                            return Ok(Ok(()));
+                        }
+                        print_diff(&expected, &rows, "expected", "database");
+                        Ok(Err(format!(
+                            "expected [{}], got [{}]",
+                            expected
+                                .iter()
+                                .map(|row| print_row(row))
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                            rows.iter()
+                                .map(|row| print_row(row))
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        )))
+                    },
+                    vec![table_dependency],
+                ));
+
+                vec![
+                    InteractionBuilder::with_interaction(create),
+                    InteractionBuilder::with_interaction(insert),
+                    InteractionBuilder::with_interaction(assertion),
+                ]
+            }
             Property::Queries { queries } => queries
                 .clone()
                 .into_iter()
@@ -1535,6 +1583,110 @@ fn assert_all_table_values(
     })
 }
 
+fn in_subquery_aggregate_table(table: &str) -> Table {
+    Table {
+        name: table.to_string(),
+        columns: vec![
+            Column {
+                name: "a".to_string(),
+                column_type: ColumnType::Text,
+                constraints: vec![ast::ColumnConstraint::PrimaryKey {
+                    order: None,
+                    conflict_clause: None,
+                    auto_increment: false,
+                }],
+            },
+            Column {
+                name: "val".to_string(),
+                column_type: ColumnType::Float,
+                constraints: vec![ast::ColumnConstraint::NotNull {
+                    nullable: false,
+                    conflict_clause: None,
+                }],
+            },
+            Column {
+                name: "flag".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![],
+            },
+        ],
+        rows: Vec::new(),
+        indexes: Vec::new(),
+    }
+}
+
+fn in_subquery_aggregate_sql(table: &str) -> String {
+    format!("SELECT val IN (SELECT a FROM {table}), AVG(1) FROM {table} WHERE flag >= 99")
+}
+
+fn execute_raw_select(
+    env: &mut SimulatorEnv,
+    connection_index: usize,
+    sql: &str,
+) -> turso_core::Result<Vec<Vec<SimValue>>> {
+    match &mut env.connections[connection_index] {
+        SimConnection::LimboConnection(conn) => {
+            let mut rows = conn.query(sql)?.ok_or_else(|| {
+                LimboError::InternalError(format!("query returned no rows object: {sql}"))
+            })?;
+            let mut out = Vec::new();
+            rows.run_with_row_callback(|row| {
+                let mut result_row = Vec::new();
+                for value in row.get_values() {
+                    result_row.push(value.into());
+                }
+                out.push(result_row);
+                Ok(())
+            })?;
+            Ok(out)
+        }
+        SimConnection::SQLiteConnection(conn) => {
+            let mut stmt = conn
+                .prepare(sql)
+                .map_err(|err| LimboError::InternalError(err.to_string()))?;
+            let column_count = stmt.column_count();
+            let rows = stmt
+                .query_map([], |row| {
+                    let mut values = Vec::with_capacity(column_count);
+                    for idx in 0..column_count {
+                        let value: rusqlite::types::Value = row.get(idx)?;
+                        let value = match value {
+                            rusqlite::types::Value::Null => types::Value::Null,
+                            rusqlite::types::Value::Integer(i) => types::Value::from_i64(i),
+                            rusqlite::types::Value::Real(f) => types::Value::from_f64(f),
+                            rusqlite::types::Value::Text(s) => types::Value::build_text(s),
+                            rusqlite::types::Value::Blob(b) => types::Value::Blob(b),
+                        };
+                        values.push(SimValue(value));
+                    }
+                    Ok(values)
+                })
+                .map_err(|err| LimboError::InternalError(err.to_string()))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|err| LimboError::InternalError(err.to_string()))?);
+            }
+            Ok(out)
+        }
+        SimConnection::Disconnected => Err(LimboError::InternalError(
+            "connection is disconnected during raw select assertion".into(),
+        )),
+    }
+}
+
+fn unique_property_table_name<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    ctx: &impl GenerationContext,
+    prefix: &str,
+) -> String {
+    loop {
+        let name = format!("{prefix}_{}", rng.random::<u64>());
+        if ctx.tables().iter().all(|table| table.name != name) {
+            return name;
+        }
+    }
+}
+
 fn property_insert_values_select<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
@@ -1865,6 +2017,17 @@ fn property_union_all_preserves_cardinality<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_in_subquery_ungrouped_aggregate<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    Property::InSubqueryUngroupedAggregate {
+        table: unique_property_table_name(rng, ctx, "in_subquery_agg"),
+    }
+}
+
 fn property_fsync_no_wait<R: rand::Rng + ?Sized>(
     rng: &mut R,
     query_distr: &QueryDistribution,
@@ -1911,6 +2074,9 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::WhereTrueFalseNull => property_where_true_false_null,
             PropertyDiscriminants::UnionAllPreservesCardinality => {
                 property_union_all_preserves_cardinality
+            }
+            PropertyDiscriminants::InSubqueryUngroupedAggregate => {
+                property_in_subquery_ungrouped_aggregate
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
@@ -2016,6 +2182,17 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::InSubqueryUngroupedAggregate => {
+                if !env.opts.disable_in_subquery_ungrouped_aggregate
+                    && remaining.create > 0
+                    && remaining.insert > 0
+                    && remaining.select > 0
+                {
+                    remaining.create.min(remaining.insert).min(remaining.select)
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::FsyncNoWait => {
                 if env.profile.io.enable && !env.opts.disable_fsync_no_wait {
                     50 // Freestyle number
@@ -2072,6 +2249,9 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::SelectSelectOptimizer => QueryCapabilities::SELECT,
             PropertyDiscriminants::WhereTrueFalseNull => QueryCapabilities::SELECT,
             PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
+            PropertyDiscriminants::InSubqueryUngroupedAggregate => QueryCapabilities::CREATE
+                .union(QueryCapabilities::INSERT)
+                .union(QueryCapabilities::SELECT),
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),

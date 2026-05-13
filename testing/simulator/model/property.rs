@@ -168,6 +168,12 @@ pub enum Property {
         select: Select,
         where_clause: Predicate,
     },
+    /// InSubqueryUngroupedAggregate verifies that a bare `IN (subquery)` expression
+    /// in an ungrouped aggregate over zero input rows evaluates to NULL, not stale
+    /// cursor data.
+    InSubqueryUngroupedAggregate {
+        table: String,
+    },
     /// FsyncNoWait is a property which tests if we do not loose any data after not waiting for fsync.
     ///
     /// # Interactions
@@ -237,6 +243,7 @@ impl Property {
             | Property::SelectSelectOptimizer { .. }
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
+            | Property::InSubqueryUngroupedAggregate { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => None,
