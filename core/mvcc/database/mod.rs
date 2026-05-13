@@ -1122,6 +1122,14 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             mv_store.rollback_tx(self.tx_id, self.pager.clone(), &self.connection, self.db_id);
         } else if mv_store.is_exclusive_tx(&self.tx_id) {
             mv_store.release_exclusive_tx(&self.tx_id);
+            self.commit_coordinator.pager_commit_lock.unlock();
+            let tx = mv_store.txs.get(&self.tx_id).expect(&format!(
+                "tx id {} not found in cleanup_abandoned_commit",
+                self.tx_id
+            ));
+            if tx.value().pager_commit_lock_held.load(Ordering::Acquire) {
+                self.commit_coordinator.pager_commit_lock.unlock();
+            }
         }
         if self.db_id == crate::MAIN_DB_ID {
             self.pager.end_read_tx();
