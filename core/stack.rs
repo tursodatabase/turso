@@ -12,6 +12,21 @@ macro_rules! trace_stack {
 pub(crate) use trace_stack;
 
 #[cfg(feature = "stacker")]
+#[inline]
+pub(crate) fn maybe_grow<R>(f: impl FnOnce() -> R) -> R {
+    const RED_ZONE: usize = 8 * 1024 * 1024;
+    const STACK_SIZE: usize = 64 * 1024 * 1024;
+
+    stacker::maybe_grow(RED_ZONE, STACK_SIZE, f)
+}
+
+#[cfg(not(feature = "stacker"))]
+#[inline]
+pub(crate) fn maybe_grow<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
+#[cfg(feature = "stacker")]
 pub(crate) struct TraceGuard {
     label: &'static str,
     detail: Option<&'static str>,

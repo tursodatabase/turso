@@ -22,7 +22,7 @@ path = "custom_types_fuzzer.rs"
 path = "lib.rs"
 
 [dependencies]
-turso_core = { workspace = true, features = ["simulator"] }
+turso_core = { workspace = true, features = ["simulator", "stacker"] }
 sql_gen_prop = { path = "../sql_gen_prop" }
 sql_gen = { path = "../sql_gen", features = ["serde"] }
 rusqlite.workspace = true

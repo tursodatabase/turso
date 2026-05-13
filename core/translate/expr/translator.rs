@@ -1,4 +1,32 @@
 use super::*;
+use std::cell::Cell;
+
+thread_local! {
+    static TRANSLATE_EXPR_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+struct TranslateExprDepthGuard;
+
+impl Drop for TranslateExprDepthGuard {
+    fn drop(&mut self) {
+        TRANSLATE_EXPR_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+        });
+    }
+}
+
+fn enter_translate_expr(expr: &ast::Expr) -> Result<TranslateExprDepthGuard> {
+    let needs_validation = TRANSLATE_EXPR_DEPTH.with(|depth| depth.get() == 0);
+    if needs_validation {
+        validate_expr_depth(expr)?;
+    }
+
+    TRANSLATE_EXPR_DEPTH.with(|depth| {
+        depth.set(depth.get() + 1);
+    });
+
+    Ok(TranslateExprDepthGuard)
+}
 
 /// Reason why [translate_expr_no_constant_opt()] was called.
 #[derive(Debug)]
@@ -98,6 +126,21 @@ pub fn translate_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
+    crate::stack::maybe_grow(|| {
+        translate_expr_impl(program, referenced_tables, expr, target_register, resolver)
+    })
+}
+
+#[inline(never)]
+fn translate_expr_impl(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let _expr_depth_guard = enter_translate_expr(expr)?;
+
     let constant_span = if expr.is_constant(resolver) {
         if !program.constant_span_is_open() {
             Some(program.constant_span_start())

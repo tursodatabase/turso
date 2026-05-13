@@ -79,6 +79,8 @@ pub fn translate(
     input: &str,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
+    validate_stmt_expr_depth(&stmt)?;
+
     let change_cnt_on = matches!(
         stmt,
         ast::Stmt::CreateIndex { .. }
@@ -124,6 +126,326 @@ pub fn translate(
     program.epilogue(schema);
 
     program.build(connection, change_cnt_on, input)
+}
+
+fn validate_stmt_expr_depth(stmt: &ast::Stmt) -> Result<()> {
+    match stmt {
+        ast::Stmt::AlterTable(alter) => validate_alter_table_expr_depth(alter),
+        ast::Stmt::Attach { expr, db_name, key } => {
+            expr::validate_expr_depth(expr)?;
+            expr::validate_expr_depth(db_name)?;
+            if let Some(key) = key.as_deref() {
+                expr::validate_expr_depth(key)?;
+            }
+            Ok(())
+        }
+        ast::Stmt::CreateIndex {
+            columns,
+            with_clause,
+            where_clause,
+            ..
+        } => {
+            expr::validate_sorted_columns_expr_depth(columns)?;
+            for (_, expr) in with_clause {
+                expr::validate_expr_depth(expr)?;
+            }
+            if let Some(where_clause) = where_clause.as_deref() {
+                expr::validate_expr_depth(where_clause)?;
+            }
+            Ok(())
+        }
+        ast::Stmt::CreateTable { body, .. } => validate_create_table_body_expr_depth(body),
+        ast::Stmt::CreateTrigger {
+            when_clause,
+            commands,
+            ..
+        } => {
+            if let Some(when_clause) = when_clause.as_deref() {
+                expr::validate_expr_depth(when_clause)?;
+            }
+            for command in commands {
+                validate_trigger_command_expr_depth(command)?;
+            }
+            Ok(())
+        }
+        ast::Stmt::CreateView { select, .. }
+        | ast::Stmt::CreateMaterializedView { select, .. }
+        | ast::Stmt::Select(select) => expr::validate_select_expr_depth(select),
+        ast::Stmt::CreateType { body, .. } => validate_create_type_body_expr_depth(body),
+        ast::Stmt::CreateDomain {
+            default,
+            constraints,
+            ..
+        } => {
+            if let Some(default) = default.as_deref() {
+                expr::validate_expr_depth(default)?;
+            }
+            for constraint in constraints {
+                expr::validate_expr_depth(&constraint.check)?;
+            }
+            Ok(())
+        }
+        ast::Stmt::Delete {
+            with,
+            where_clause,
+            returning,
+            order_by,
+            limit,
+            ..
+        } => {
+            validate_with_expr_depth(with.as_ref())?;
+            if let Some(where_clause) = where_clause.as_deref() {
+                expr::validate_expr_depth(where_clause)?;
+            }
+            expr::validate_result_columns_expr_depth(returning)?;
+            expr::validate_sorted_columns_expr_depth(order_by)?;
+            if let Some(limit) = limit {
+                expr::validate_limit_expr_depth(limit)?;
+            }
+            Ok(())
+        }
+        ast::Stmt::Detach { name } => expr::validate_expr_depth(name),
+        ast::Stmt::Insert {
+            with,
+            body,
+            returning,
+            ..
+        } => {
+            validate_with_expr_depth(with.as_ref())?;
+            validate_insert_body_expr_depth(body)?;
+            expr::validate_result_columns_expr_depth(returning)
+        }
+        ast::Stmt::Pragma { body, .. } => {
+            if let Some(body) = body {
+                validate_pragma_body_expr_depth(body)?;
+            }
+            Ok(())
+        }
+        ast::Stmt::Update(update) => validate_update_expr_depth(update),
+        ast::Stmt::Vacuum { into, .. } => {
+            if let Some(into) = into.as_deref() {
+                expr::validate_expr_depth(into)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_alter_table_expr_depth(alter: &ast::AlterTable) -> Result<()> {
+    match &alter.body {
+        ast::AlterTableBody::AddColumn(column)
+        | ast::AlterTableBody::AlterColumn { new: column, .. } => {
+            validate_column_definition_expr_depth(column)
+        }
+        ast::AlterTableBody::RenameTo(_)
+        | ast::AlterTableBody::RenameColumn { .. }
+        | ast::AlterTableBody::DropColumn(_) => Ok(()),
+    }
+}
+
+fn validate_create_table_body_expr_depth(body: &ast::CreateTableBody) -> Result<()> {
+    match body {
+        ast::CreateTableBody::ColumnsAndConstraints {
+            columns,
+            constraints,
+            ..
+        } => {
+            for column in columns {
+                validate_column_definition_expr_depth(column)?;
+            }
+            for constraint in constraints {
+                validate_table_constraint_expr_depth(&constraint.constraint)?;
+            }
+            Ok(())
+        }
+        ast::CreateTableBody::AsSelect(select) => expr::validate_select_expr_depth(select),
+    }
+}
+
+fn validate_column_definition_expr_depth(column: &ast::ColumnDefinition) -> Result<()> {
+    if let Some(ty) = &column.col_type {
+        validate_type_expr_depth(ty)?;
+    }
+    for constraint in &column.constraints {
+        validate_column_constraint_expr_depth(&constraint.constraint)?;
+    }
+    Ok(())
+}
+
+fn validate_column_constraint_expr_depth(constraint: &ast::ColumnConstraint) -> Result<()> {
+    match constraint {
+        ast::ColumnConstraint::Check(expr)
+        | ast::ColumnConstraint::Default(expr)
+        | ast::ColumnConstraint::Generated { expr, .. } => expr::validate_expr_depth(expr),
+        ast::ColumnConstraint::PrimaryKey { .. }
+        | ast::ColumnConstraint::NotNull { .. }
+        | ast::ColumnConstraint::Unique(_)
+        | ast::ColumnConstraint::Collate { .. }
+        | ast::ColumnConstraint::ForeignKey { .. } => Ok(()),
+    }
+}
+
+fn validate_table_constraint_expr_depth(constraint: &ast::TableConstraint) -> Result<()> {
+    match constraint {
+        ast::TableConstraint::PrimaryKey { columns, .. }
+        | ast::TableConstraint::Unique { columns, .. } => {
+            expr::validate_sorted_columns_expr_depth(columns)
+        }
+        ast::TableConstraint::Check(expr) => expr::validate_expr_depth(expr),
+        ast::TableConstraint::ForeignKey { .. } => Ok(()),
+    }
+}
+
+fn validate_create_type_body_expr_depth(body: &ast::CreateTypeBody) -> Result<()> {
+    match body {
+        ast::CreateTypeBody::CustomType {
+            encode,
+            decode,
+            default,
+            ..
+        } => {
+            for custom_expr in [encode.as_deref(), decode.as_deref(), default.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                expr::validate_expr_depth(custom_expr)?;
+            }
+            Ok(())
+        }
+        ast::CreateTypeBody::Struct(fields) | ast::CreateTypeBody::Union(fields) => {
+            for field in fields {
+                validate_type_expr_depth(&field.field_type)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_type_expr_depth(ty: &ast::Type) -> Result<()> {
+    match &ty.size {
+        Some(ast::TypeSize::MaxSize(expr)) => expr::validate_expr_depth(expr),
+        Some(ast::TypeSize::TypeSize(lhs, rhs)) => {
+            expr::validate_expr_depth(lhs)?;
+            expr::validate_expr_depth(rhs)
+        }
+        None => Ok(()),
+    }
+}
+
+fn validate_insert_body_expr_depth(body: &ast::InsertBody) -> Result<()> {
+    match body {
+        ast::InsertBody::Select(select, upsert) => {
+            expr::validate_select_expr_depth(select)?;
+            if let Some(upsert) = upsert.as_deref() {
+                validate_upsert_expr_depth(upsert)?;
+            }
+            Ok(())
+        }
+        ast::InsertBody::DefaultValues => Ok(()),
+    }
+}
+
+fn validate_update_expr_depth(update: &ast::Update) -> Result<()> {
+    validate_with_expr_depth(update.with.as_ref())?;
+    for set in &update.sets {
+        expr::validate_expr_depth(&set.expr)?;
+    }
+    if let Some(from) = &update.from {
+        expr::validate_from_clause_expr_depth(from, &mut Vec::new())?;
+    }
+    if let Some(where_clause) = update.where_clause.as_deref() {
+        expr::validate_expr_depth(where_clause)?;
+    }
+    expr::validate_result_columns_expr_depth(&update.returning)?;
+    expr::validate_sorted_columns_expr_depth(&update.order_by)?;
+    if let Some(limit) = &update.limit {
+        expr::validate_limit_expr_depth(limit)?;
+    }
+    Ok(())
+}
+
+fn validate_with_expr_depth(with: Option<&ast::With>) -> Result<()> {
+    if let Some(with) = with {
+        for cte in &with.ctes {
+            expr::validate_select_expr_depth(&cte.select)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_upsert_expr_depth(upsert: &ast::Upsert) -> Result<()> {
+    let mut upsert = Some(upsert);
+    while let Some(current) = upsert {
+        if let Some(index) = &current.index {
+            expr::validate_sorted_columns_expr_depth(&index.targets)?;
+            if let Some(where_clause) = index.where_clause.as_deref() {
+                expr::validate_expr_depth(where_clause)?;
+            }
+        }
+        match &current.do_clause {
+            ast::UpsertDo::Set { sets, where_clause } => {
+                for set in sets {
+                    expr::validate_expr_depth(&set.expr)?;
+                }
+                if let Some(where_clause) = where_clause.as_deref() {
+                    expr::validate_expr_depth(where_clause)?;
+                }
+            }
+            ast::UpsertDo::Nothing => {}
+        }
+        upsert = current.next.as_deref();
+    }
+    Ok(())
+}
+
+fn validate_pragma_body_expr_depth(body: &ast::PragmaBody) -> Result<()> {
+    match body {
+        ast::PragmaBody::Equals(expr) | ast::PragmaBody::Call(expr) => {
+            expr::validate_expr_depth(expr)
+        }
+    }
+}
+
+fn validate_trigger_command_expr_depth(command: &ast::TriggerCmd) -> Result<()> {
+    match command {
+        ast::TriggerCmd::Update {
+            sets,
+            from,
+            where_clause,
+            ..
+        } => {
+            for set in sets {
+                expr::validate_expr_depth(&set.expr)?;
+            }
+            if let Some(from) = from {
+                expr::validate_from_clause_expr_depth(from, &mut Vec::new())?;
+            }
+            if let Some(where_clause) = where_clause.as_deref() {
+                expr::validate_expr_depth(where_clause)?;
+            }
+            Ok(())
+        }
+        ast::TriggerCmd::Insert {
+            select,
+            upsert,
+            returning,
+            ..
+        } => {
+            expr::validate_select_expr_depth(select)?;
+            if let Some(upsert) = upsert.as_deref() {
+                validate_upsert_expr_depth(upsert)?;
+            }
+            expr::validate_result_columns_expr_depth(returning)
+        }
+        ast::TriggerCmd::Delete { where_clause, .. } => {
+            if let Some(where_clause) = where_clause.as_deref() {
+                expr::validate_expr_depth(where_clause)?;
+            }
+            Ok(())
+        }
+        ast::TriggerCmd::Select(select) => expr::validate_select_expr_depth(select),
+    }
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
