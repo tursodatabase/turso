@@ -2839,14 +2839,14 @@ mod tests {
     #[test]
     fn program_state_reset_clears_in_place_vacuum_state() {
         let mut state = ProgramState::new(0, 0);
-        state.op_vacuum_in_place = Some(Box::new(
+        state.op_vacuum_state = VacuumOpState::InPlace(Box::new(
             crate::vdbe::vacuum::VacuumInPlaceOpContext::new(crate::MAIN_DB_ID),
         ));
 
         state.reset(None, None);
 
         assert!(
-            state.op_vacuum_in_place.is_none(),
+            matches!(&state.op_vacuum_state, VacuumOpState::None),
             "ProgramState::reset must clear in-place VACUUM state"
         );
     }

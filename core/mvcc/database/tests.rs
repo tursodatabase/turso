@@ -291,9 +291,10 @@ fn mvcc_reset_after_vacuum_clears_stale_empty_version_buckets() {
     let stale_row_id = RowID::new(stale_table_id, RowKey::Int(999));
     let stale_index_id = MVTableId::from(-1000_i64);
 
-    db.mvcc_store
-        .rows
-        .insert(stale_row_id.clone(), parking_lot::RwLock::new(Vec::new()));
+    db.mvcc_store.rows.insert(
+        stale_row_id.clone(),
+        Arc::new(parking_lot::RwLock::new(Vec::new())),
+    );
     db.mvcc_store
         .index_rows
         .insert(stale_index_id, crossbeam_skiplist::SkipMap::new());

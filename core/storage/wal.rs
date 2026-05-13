@@ -6432,9 +6432,7 @@ pub mod test {
         assert!(authority_b.try_acquire_checkpoint(authority_b.owner_record()));
 
         let err = coordination_a
-            .acquire_checkpoint_guard_from_held_lock(CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            })
+            .acquire_vacuum_checkpoint_guard_from_held_lock()
             .unwrap_err();
         assert!(matches!(err, LimboError::Busy));
 
@@ -6476,9 +6474,7 @@ pub mod test {
         assert!(authority_b.try_acquire_writer(authority_b.owner_record()));
 
         let err = coordination_a
-            .acquire_checkpoint_guard_from_held_lock(CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            })
+            .acquire_vacuum_checkpoint_guard_from_held_lock()
             .unwrap_err();
         assert!(matches!(err, LimboError::Busy));
 
@@ -6520,9 +6516,7 @@ pub mod test {
         assert!(coordination.fallback.try_read_mark_shared(0));
 
         let err = coordination
-            .acquire_checkpoint_guard_from_held_lock(CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            })
+            .acquire_vacuum_checkpoint_guard_from_held_lock()
             .unwrap_err();
         assert!(matches!(err, LimboError::Busy));
 
@@ -6564,9 +6558,7 @@ pub mod test {
         assert!(coordination.fallback.try_write_lock());
 
         let err = coordination
-            .acquire_checkpoint_guard_from_held_lock(CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            })
+            .acquire_vacuum_checkpoint_guard_from_held_lock()
             .unwrap_err();
         assert!(matches!(err, LimboError::Busy));
 
@@ -8901,8 +8893,8 @@ pub mod test {
     fn test_release_vacuum_lock_requires_end_write_tx_first() {
         let (_shared, vacuum_wal) = make_test_wal();
 
-        vacuum_wal.try_begin_checkpoint_lock().unwrap();
-        vacuum_wal.begin_exclusive_tx().unwrap();
+        vacuum_wal.try_begin_vacuum_checkpoint_lock().unwrap();
+        vacuum_wal.begin_vacuum_blocking_tx().unwrap();
 
         vacuum_wal.release_vacuum_lock();
     }
