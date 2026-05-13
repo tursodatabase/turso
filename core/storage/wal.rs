@@ -3156,7 +3156,7 @@ impl Wal for WalFile {
                 // Return BusySnapshot instead of Busy so the caller knows it must
                 // restart the read transaction to get a fresh snapshot.
                 // Retrying with busy_timeout will NEVER HELP.
-                tracing::info!(
+                tracing::debug!(
                     "unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}",
                     self.max_frame.load(Ordering::Acquire),
                     self.load_coordination_snapshot().max_frame
@@ -3699,7 +3699,7 @@ impl Wal for WalFile {
     ) -> Result<IOResult<CheckpointResult>> {
         self.checkpoint_inner(pager, mode, CheckpointLockSource::Acquire)
             .inspect_err(|e| {
-                tracing::info!("Wal Checkpoint failed: {e}");
+                tracing::debug!("WAL checkpoint failed: {e}");
                 let _ = self.checkpoint_guard.write().take();
                 self.ongoing_checkpoint.write().state = CheckpointState::Start;
             })
@@ -3717,7 +3717,7 @@ impl Wal for WalFile {
             CheckpointLockSource::HeldByCaller,
         )
         .inspect_err(|e| {
-            tracing::info!("Wal Checkpoint failed: {e}");
+            tracing::debug!("WAL checkpoint failed: {e}");
             let _ = self.checkpoint_guard.write().take();
             self.ongoing_checkpoint.write().state = CheckpointState::Start;
         })
@@ -3749,7 +3749,7 @@ impl Wal for WalFile {
         let completion = Completion::new_sync(move |result| {
             tracing::debug!("wal_sync finish");
             if let Err(err) = result {
-                tracing::info!("wal_sync failed: {err}");
+                tracing::debug!("wal_sync failed: {err}");
             }
             syncing.store(false, Ordering::Release);
         });
@@ -4412,7 +4412,7 @@ impl WalFile {
 
     fn increment_checkpoint_epoch(&self) {
         let prev = self.coordination.bump_checkpoint_epoch();
-        tracing::info!("increment checkpoint epoch: prev={}", prev);
+        tracing::debug!("increment checkpoint epoch: prev={}", prev);
     }
 
     fn complete_append_frame(&self, page_id: u64, frame_id: u64, checksums: (u32, u32)) {
@@ -4456,7 +4456,7 @@ impl WalFile {
                     let snapshot = self.load_coordination_snapshot();
                     let max_frame = snapshot.max_frame;
                     let nbackfills = snapshot.nbackfills;
-                    tracing::info!("shared_wal: max_frame={max_frame}, nbackfills={nbackfills}");
+                    tracing::debug!("shared_wal: max_frame={max_frame}, nbackfills={nbackfills}");
                     let needs_backfill = max_frame > nbackfills;
                     if matches!(lock_source, CheckpointLockSource::HeldByCaller) {
                         turso_assert!(
@@ -4481,7 +4481,7 @@ impl WalFile {
                     } = mode
                     {
                         if max_frame > upper_bound {
-                            tracing::info!(
+                            tracing::debug!(
                                 "abort checkpoint because latest frame in WAL is greater than upper_bound in TRUNCATE mode: {max_frame} != {upper_bound}"
                             );
                             return Err(LimboError::Busy);
@@ -4510,7 +4510,7 @@ impl WalFile {
                             ..self.load_coordination_snapshot()
                         },
                     )?;
-                    tracing::info!(
+                    tracing::debug!(
                         "checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}"
                     );
                     let mut to_checkpoint = self
@@ -4667,7 +4667,7 @@ impl WalFile {
                         wal_total_backfilled,
                         wal_checkpoint_backfilled,
                     );
-                    tracing::info!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
+                    tracing::debug!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
                         return Err(LimboError::Busy);
                     }
@@ -4709,7 +4709,7 @@ impl WalFile {
                     // increment wal epoch to ensure no stale pages are used for backfilling
                     self.increment_checkpoint_epoch();
 
-                    tracing::info!("checkpoint_result={:?}", checkpoint_result);
+                    tracing::debug!("checkpoint_result={:?}", checkpoint_result);
                     // we cannot truncate the db file here because we are currently inside a
                     // mut borrow of pager.wal, and accessing the header will attempt a borrow
                     // during 'read_page', so the caller will use the result to determine if:
@@ -4823,7 +4823,7 @@ impl WalFile {
     }
 
     fn restart_log(&self) -> Result<()> {
-        tracing::info!("restart_log");
+        tracing::debug!("restart_log");
         let snapshot = self.coordination.begin_restart(self.io.as_ref())?;
         self.apply_restart_snapshot(snapshot);
         Ok(())
@@ -4841,7 +4841,7 @@ impl WalFile {
             let c = Completion::new_trunc({
                 move |res| {
                     if let Err(err) = res {
-                        tracing::info!("WAL truncate failed: {err}")
+                        tracing::debug!("WAL truncate failed: {err}")
                     } else {
                         tracing::trace!("WAL file truncated to 0 B");
                     }
@@ -4857,7 +4857,7 @@ impl WalFile {
             let c = file.sync(
                 Completion::new_sync(move |res| {
                     if let Err(err) = res {
-                        tracing::info!("WAL sync failed: {err}")
+                        tracing::debug!("WAL sync failed: {err}")
                     } else {
                         tracing::trace!("WAL file synced after truncation");
                     }
@@ -5702,7 +5702,7 @@ pub mod test {
 
         assert_eq!(pager.wal_state().unwrap().max_frame, 0);
 
-        tracing::info!("wal filepath: {walpath:?}, size: {}", stat.len());
+        tracing::debug!("wal filepath: {walpath:?}, size: {}", stat.len());
         let meta_after = std::fs::metadata(&walpath).unwrap();
         let bytes_after = meta_after.len();
         assert_ne!(
