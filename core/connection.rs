@@ -1327,14 +1327,20 @@ impl Connection {
         if self.schema_reparse_in_progress() {
             return;
         }
-        let current_schema_version = self.schema.read().schema_version;
+        let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
         if matches!(self.get_tx_state(), TransactionState::None)
             && self.get_mv_tx().is_none()
             && self.next_attached_mv_tx().is_none()
-            && current_schema_version != schema.schema_version
+            // In MVCC, checkpoint root publication can replace Database::schema
+            // without changing SQLite's schema cookie. If this connection
+            // still holds an older Schema snapshot, prepared statements must be
+            // invalidated and recompiled against the current roots.
+            && (current_schema.schema_version != schema.schema_version
+                || (self.mvcc_enabled() && !Arc::ptr_eq(&current_schema, &schema)))
         {
             *self.schema.write() = schema.clone();
+            self.bump_prepare_context_generation();
         }
     }
 
