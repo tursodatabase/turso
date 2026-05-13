@@ -451,6 +451,19 @@ expect {
 }
 
 @cross-check-integrity
+test filter-having-in-subquery {
+    CREATE TABLE t(a, d);
+    INSERT INTO t VALUES (1, 1);
+    SELECT COUNT(*)
+      FROM t
+      GROUP BY a
+      HAVING COUNT(*) FILTER (WHERE a IN (SELECT d FROM t)) != -1;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
 test filter-with-like {
     CREATE TABLE t(name TEXT, val INTEGER);
     INSERT INTO t VALUES ('apple', 1), ('banana', 2), ('avocado', 3), ('berry', 4);
