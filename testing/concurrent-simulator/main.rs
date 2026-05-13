@@ -47,6 +47,12 @@ struct Args {
     /// Max steps
     #[arg(long)]
     max_steps: Option<usize>,
+    /// Max iterations the reopen drain loop runs before declaring an
+    /// engine-side infinite loop. Drain iterations do not count against
+    /// `--max-steps` — legitimate IO-heavy operations like
+    /// `PRAGMA integrity_check` can use thousands of yields per page.
+    #[arg(long)]
+    max_drain_steps: Option<usize>,
     /// Keep files on disk after run
     #[arg(long)]
     keep: bool,
@@ -380,6 +386,9 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
 
     if let Some(max_steps) = args.max_steps {
         base_opts = base_opts.with_max_steps(max_steps);
+    }
+    if let Some(max_drain_steps) = args.max_drain_steps {
+        base_opts = base_opts.with_max_drain_steps(max_drain_steps);
     }
 
     let (workloads, properties, elle_tables, chaotic_profiles) =
