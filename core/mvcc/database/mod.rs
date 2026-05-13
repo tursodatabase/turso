@@ -338,22 +338,106 @@ pub enum RowVersionState {
 }
 pub type TxID = u64;
 
-/// A log record contains all durable effects of a committed transaction.
-/// Besides row/index version deltas, this can include a header-only mutation.
+/// A log record contains all durable effects of a committed transaction,
+/// pre-serialized into a frame buffer that the logical-log flush path
+/// finalizes (backfills the TX header, appends the CRC trailer, optionally
+/// chunk-encrypts the payload) and writes to disk.
+///
+/// `buf` is laid out from construction with a `LOG_HDR_SIZE + TX_HEADER_SIZE`
+/// zero prefix so ops can be appended directly at the right offset. The
+/// flush path backfills the prefix in place and never shifts the payload:
+/// - First-write commits fill the log header slot and write the whole buffer.
+/// - Non-first-write commits leave the log header slot as zeros and wrap the
+///   buffer with `Buffer::new_with_start(..., LOG_HDR_SIZE)`, so the I/O
+///   layer simply skips the 56 unused bytes without a memmove.
+///
+/// The buffer is populated incrementally during commit via
+/// [`DurableStorage::serialize_row_version`] and
+/// [`DurableStorage::serialize_database_header`], so the committing
+/// transaction never materializes a `Vec<RowVersion>`-sized intermediate.
 #[derive(Clone, Debug)]
 pub struct LogRecord {
     pub(crate) tx_timestamp: TxID,
-    pub row_versions: Vec<RowVersion>,
-    pub header: Option<DatabaseHeader>,
+    /// Frame buffer that grows in place into the on-disk representation.
+    /// The first `LOG_HDR_SIZE + TX_HEADER_SIZE` bytes are pre-reserved
+    /// (zeros) so that op-entry appends land at the correct on-disk
+    /// offset; the flush path backfills the framing prefix and appends
+    /// the trailer.
+    pub buf: Vec<u8>,
+    /// Number of op entries appended to `buf`. Includes any header op.
+    pub op_count: u32,
+    /// True once a `DatabaseHeader` op has been appended. At most one
+    /// header op is allowed per transaction.
+    pub has_header: bool,
 }
 
 impl LogRecord {
-    fn new(tx_timestamp: TxID) -> Self {
+    pub(crate) fn new(tx_timestamp: TxID) -> Self {
         Self {
             tx_timestamp,
-            row_versions: Vec::new(),
-            header: None,
+            // Pre-reserve the framing prefix at the front of buf:
+            //   [LOG_HDR slot (56B) | TX_HEADER slot (24B) | <ops here>]
+            // The log-header slot is only filled on the very first write to
+            // a log file; otherwise it stays zero and the flush path wraps
+            // the buf with `Buffer::new_with_start(..., LOG_HDR_SIZE)` so
+            // those 56 bytes never reach disk.
+            buf: vec![0u8; crate::mvcc::persistent_storage::logical_log::LOG_RECORD_PREFIX_SIZE],
+            op_count: 0,
+            has_header: false,
         }
+    }
+
+    /// Plaintext payload size: bytes contributed by serialized ops, excluding
+    /// the pre-reserved framing prefix at the front of `buf`.
+    pub(crate) fn payload_size(&self) -> usize {
+        self.buf.len() - crate::mvcc::persistent_storage::logical_log::LOG_RECORD_PREFIX_SIZE
+    }
+
+    /// True iff no ops (row versions or header) have been appended.
+    pub fn is_empty(&self) -> bool {
+        self.op_count == 0
+    }
+
+    /// Test-only constructor that eagerly serializes a list of row versions
+    /// and an optional `DatabaseHeader` into the payload buffer using the
+    /// production wire format. Production code uses
+    /// [`DurableStorage::serialize_row_version`] and
+    /// [`DurableStorage::serialize_database_header`] instead so the bytes are
+    /// appended one op at a time.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        tx_timestamp: TxID,
+        row_versions: &[RowVersion],
+        header: Option<DatabaseHeader>,
+    ) -> Self {
+        let mut record = Self::new(tx_timestamp);
+        for rv in row_versions {
+            record.push_row_version_for_test(rv);
+        }
+        if let Some(hdr) = header {
+            record.set_header_for_test(&hdr);
+        }
+        record
+    }
+
+    /// Test-only: append one row-version op to the payload buffer.
+    #[cfg(test)]
+    pub(crate) fn push_row_version_for_test(&mut self, row_version: &RowVersion) {
+        crate::mvcc::persistent_storage::logical_log::serialize_op_entry(
+            &mut self.buf,
+            row_version,
+        )
+        .expect("failed to serialize row version in test");
+        self.op_count += 1;
+    }
+
+    /// Test-only: append a `DatabaseHeader` op to the payload buffer.
+    #[cfg(test)]
+    pub(crate) fn set_header_for_test(&mut self, header: &DatabaseHeader) {
+        assert!(!self.has_header, "header op appended twice in test");
+        crate::mvcc::persistent_storage::logical_log::serialize_header_entry(&mut self.buf, header);
+        self.has_header = true;
+        self.op_count += 1;
     }
 }
 
@@ -993,6 +1077,11 @@ pub struct BuildLogRecordCtx {
     /// data-row pass. Schema rows are emitted first so log replay sees
     /// CREATE TABLE before related INSERTs.
     pub schema_process: bool,
+    /// Snapshot of `tx.header` taken when `header_dirty` was observed
+    /// at the start of BuildLogRecord. Appended as an `OP_UPDATE_HEADER`
+    /// op after both row-version passes complete (preserves on-disk
+    /// order: ops first, header last).
+    pub pending_header: Option<DatabaseHeader>,
 }
 
 /// Iteration state for the chunked `RewriteLiveVersions` step.
@@ -1637,7 +1726,8 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         };
 
         let collect_versions = |row_versions: &Arc<RwLock<Vec<RowVersion>>>,
-                                log_record: &mut LogRecord| {
+                                log_record: &mut LogRecord|
+         -> Result<()> {
             // `log_record.row_versions` is the logical transaction log. Recovery
             // replays it in this order. `insert_version_raw` is for the versions
             // of one MVCC entry: one table row, one sqlite_schema row, or one
@@ -1697,7 +1787,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             // - append those versions to `log_record.row_versions` without sorting
             //   them against versions from other write-set entries.
 
-            let entry_start = log_record.row_versions.len();
+            let mut entry_versions: Vec<RowVersion> = Vec::new();
             let row_versions = row_versions.read();
 
             // A tombstone over a row that was already in the B-tree before this
@@ -1783,8 +1873,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                     continue;
                 };
                 canonicalize_table_id(&mut committed_version);
-                let entry_slice = &log_record.row_versions[entry_start..];
-                let replaces_last = entry_slice.last().is_some_and(|last| {
+                let replaces_last = entry_versions.last().is_some_and(|last| {
                     last.row.id == committed_version.row.id
                         && matches!(
                             (&last.begin, &committed_version.begin),
@@ -1795,8 +1884,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                         )
                 });
                 if replaces_last {
-                    *log_record
-                        .row_versions
+                    *entry_versions
                         .last_mut()
                         .expect("last version checked above") = committed_version;
                     continue;
@@ -1814,14 +1902,18 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                             )
                     };
                     turso_assert!(
-                        !log_record.row_versions[entry_start..]
-                            .iter()
-                            .any(same_row_and_begin),
+                        !entry_versions.iter().any(same_row_and_begin),
                         "one write-set entry produced non-adjacent log versions with the same row id and commit timestamp"
                     );
                 }
-                log_record.row_versions.push(committed_version);
+                entry_versions.push(committed_version);
             }
+            for committed_version in &entry_versions {
+                mvcc_store
+                    .storage
+                    .serialize_row_version(log_record, committed_version)?;
+            }
+            Ok(())
         };
 
         // Process schema rows (sqlite_schema) before data/index rows so that
@@ -1841,7 +1933,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 !is_schema
             };
             if process {
-                collect_versions(row_versions, &mut ctx.log_record);
+                collect_versions(row_versions, &mut ctx.log_record)?;
             }
             ctx.cursor += 1;
             iterations += 1;
@@ -1861,13 +1953,24 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             return Ok(TransitionResult::Continue);
         }
 
-        // Both passes complete. Move the assembled log record out and
-        // transition to BeginCommitLogicalLog (or directly to CommitEnd
-        // if there is nothing to log).
+        // Both row-version passes complete. Append the captured DatabaseHeader
+        // op (if any) at the tail of the payload — this preserves the on-disk
+        // order: row-version ops first, header op last. (Order matches the
+        // previous implementation where `serialize_ops_into_write_buf` walked
+        // `row_versions` then optionally serialized `header`.)
+        if let Some(header) = ctx.pending_header.take() {
+            mvcc_store
+                .storage
+                .serialize_database_header(&mut ctx.log_record, &header)?;
+        }
+
+        // Move the assembled log record out and transition to
+        // BeginCommitLogicalLog (or directly to CommitEnd if there is nothing
+        // to log).
         let log_record = std::mem::replace(&mut ctx.log_record, LogRecord::new(end_ts));
         tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
 
-        if log_record.row_versions.is_empty() && log_record.header.is_none() {
+        if log_record.is_empty() {
             // Nothing to log. We still need to release the commit lock here
             // if this is an exclusive tx, mirroring the pre-chunk path
             // through WaitForDependencies.
@@ -2274,21 +2377,22 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Ok(TransitionResult::Done(()));
                 }
 
-                // All dependencies resolved. Initialize the log record (just
-                // the header snapshot, if any) and hand off to BuildLogRecord
-                // which fills in row_versions in `MVCC_COMMIT_BATCH_SIZE`-sized
-                // chunks, yielding between chunks. Live row versions stay on
-                // TxID references until CommitEnd so rollback of an abandoned
-                // commit can still match them.
-                let mut log_record = LogRecord::new(end_ts);
-                if tx.header_dirty.load(Ordering::Acquire) {
-                    log_record.header = Some(*tx.header.read());
-                }
+                // All dependencies resolved. Initialize an empty log record
+                // (`buf` is grown incrementally during BuildLogRecord) and
+                // snapshot the dirty header for the tail of the payload.
+                // Live row versions stay on TxID references until CommitEnd
+                // so rollback of an abandoned commit can still match them.
+                let pending_header = if tx.header_dirty.load(Ordering::Acquire) {
+                    Some(*tx.header.read())
+                } else {
+                    None
+                };
                 self.state = CommitState::BuildLogRecord(BuildLogRecordCtx {
                     end_ts,
-                    log_record,
+                    log_record: LogRecord::new(end_ts),
                     cursor: 0,
                     schema_process: true,
+                    pending_header,
                 });
                 return Ok(TransitionResult::Continue);
             }
@@ -2297,7 +2401,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             // the cursor / pass / log_record inside the variant, which
             // conflicts with the outer `&self.state` match borrow.
             CommitState::BuildLogRecord(_) => self.step_build_log_record(mvcc_store),
-            CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
+            CommitState::BeginCommitLogicalLog { end_ts, .. } => {
                 if !mvcc_store.is_exclusive_tx(&self.tx_id) {
                     // logical log needs to be serialized.
                     let tx = mvcc_store
@@ -2314,9 +2418,25 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .pager_commit_lock_held
                         .store(true, Ordering::Release);
                 }
-                let (c, append_bytes) = mvcc_store.storage.log_tx(log_record, None)?;
+                let end_ts = *end_ts;
+                // The pattern binding `end_ts: &u64` is no longer used after
+                // the copy above, so NLL drops the shared borrow on
+                // `self.state` and lets us swap it mutably here. We swap
+                // ahead of `log_tx` because `log_tx` consumes the LogRecord's
+                // buffer in place (it becomes the on-disk frame buffer
+                // handed to pwrite); on error the LogRecord is partially
+                // framed and not usable for retry — which matches the
+                // pre-existing semantics where a log_tx failure aborts the
+                // commit.
+                let mut log_record = match std::mem::replace(
+                    &mut self.state,
+                    CommitState::SyncLogicalLog { end_ts },
+                ) {
+                    CommitState::BeginCommitLogicalLog { log_record, .. } => log_record,
+                    _ => unreachable!(),
+                };
+                let (c, append_bytes) = mvcc_store.storage.log_tx(&mut log_record, None)?;
                 self.pending_log_append_bytes = Some(append_bytes);
-                self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)

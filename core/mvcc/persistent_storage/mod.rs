@@ -1,28 +1,58 @@
 use crate::io::FileSyncType;
 use crate::storage::encryption::EncryptionContext;
+use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use crate::sync::Arc;
 use crate::sync::RwLock;
+use crate::turso_assert;
 use std::fmt::Debug;
 
 pub mod logical_log;
-use crate::mvcc::database::LogRecord;
+use crate::mvcc::database::{LogRecord, RowVersion};
 use crate::mvcc::persistent_storage::logical_log::{
-    LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
+    serialize_header_entry, serialize_op_entry, LogicalLog, OnSerializationComplete,
+    DEFAULT_LOG_CHECKPOINT_THRESHOLD,
 };
-use crate::{CheckpointResult, Completion, File, Result};
+use crate::{CheckpointResult, Completion, File, LimboError, Result};
 
 pub trait DurableStorage: Send + Sync + Debug {
+    /// Append one row-version op to `log_record`'s payload buffer, in the
+    /// on-disk wire format used by the logical log. Updates `op_count`.
+    ///
+    /// Called incrementally during `BuildLogRecord` so the committing
+    /// transaction can stream bytes into the log record without first
+    /// collecting a `Vec<RowVersion>` intermediate.
+    fn serialize_row_version(
+        &self,
+        log_record: &mut LogRecord,
+        row_version: &RowVersion,
+    ) -> Result<()>;
+
+    /// Append a `DatabaseHeader` op to `log_record`'s payload buffer.
+    /// Asserts that no header op has already been appended. Updates
+    /// `op_count` and sets `has_header`.
+    fn serialize_database_header(
+        &self,
+        log_record: &mut LogRecord,
+        header: &DatabaseHeader,
+    ) -> Result<()>;
+
     /// Write a transaction to the logical log without advancing the writer offset.
     ///
+    /// `m.buf` is the plaintext payload built incrementally via
+    /// [`serialize_row_version`] and [`serialize_database_header`]. The
+    /// implementation reuses `m.buf` as the on-disk frame buffer (wrapping it
+    /// with the TX header, optional chunked encryption, and the trailer), then
+    /// hands the same allocation to the I/O layer — no separate framing buffer
+    /// is kept alive across calls. On return, `m.buf` is emptied.
+    ///
     /// If `on_serialization_complete` is provided, it is called with a zero-copy
-    /// reference to the serialized frame bytes and the running CRC after
-    /// serialization but before the disk write. The callback runs while the
-    /// internal write lock is held, so it should be fast (e.g. memcpy to a side
-    /// buffer).
+    /// reference to the framed bytes and the running CRC after framing but
+    /// before the disk write. The callback runs while the internal write lock
+    /// is held, so it should be fast (e.g. memcpy to a side buffer).
     fn log_tx(
         &self,
-        m: &LogRecord,
+        m: &mut LogRecord,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)>;
 
@@ -105,9 +135,38 @@ impl Storage {
 }
 
 impl DurableStorage for Storage {
+    fn serialize_row_version(
+        &self,
+        log_record: &mut LogRecord,
+        row_version: &RowVersion,
+    ) -> Result<()> {
+        serialize_op_entry(&mut log_record.buf, row_version)?;
+        log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
+            LimboError::InternalError("logical log op_count exceeds u32".to_string())
+        })?;
+        Ok(())
+    }
+
+    fn serialize_database_header(
+        &self,
+        log_record: &mut LogRecord,
+        header: &DatabaseHeader,
+    ) -> Result<()> {
+        turso_assert!(
+            !log_record.has_header,
+            "DatabaseHeader op appended more than once to a single LogRecord"
+        );
+        serialize_header_entry(&mut log_record.buf, header);
+        log_record.has_header = true;
+        log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
+            LimboError::InternalError("logical log op_count exceeds u32".to_string())
+        })?;
+        Ok(())
+    }
+
     fn log_tx(
         &self,
-        m: &LogRecord,
+        m: &mut LogRecord,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
         self.logical_log

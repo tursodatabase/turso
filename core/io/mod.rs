@@ -521,6 +521,13 @@ pub type BufferData = Pin<Box<[u8]>>;
 
 pub enum Buffer {
     Heap(BufferData),
+    /// A heap buffer with a logical start offset: only `data[start..]` is
+    /// exposed via [`Buffer::as_slice`] / [`Buffer::len`]. Used to skip a
+    /// pre-allocated prefix without shifting bytes in memory before I/O.
+    HeapView {
+        data: BufferData,
+        start: usize,
+    },
     Pooled(ArenaBuffer),
 }
 
@@ -529,20 +536,39 @@ impl Debug for Buffer {
         match self {
             Self::Pooled(p) => write!(f, "Pooled(len={})", p.logical_len()),
             Self::Heap(buf) => write!(f, "{buf:?}: {}", buf.len()),
+            Self::HeapView { data, start } => {
+                write!(
+                    f,
+                    "HeapView({start}..{}, view_len={})",
+                    data.len(),
+                    data.len() - start
+                )
+            }
         }
     }
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        let len = self.len();
-        if let Self::Heap(buf) = self {
-            TEMP_BUFFER_CACHE.with(|cache| {
-                let mut cache = cache.borrow_mut();
-                // take ownership of the buffer by swapping it with a dummy
-                let buffer = std::mem::replace(buf, Pin::new(vec![].into_boxed_slice()));
-                cache.return_buffer(buffer, len);
-            });
+        match self {
+            Self::Heap(buf) => {
+                let underlying_len = buf.len();
+                TEMP_BUFFER_CACHE.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    // take ownership of the buffer by swapping it with a dummy
+                    let buffer = std::mem::replace(buf, Pin::new(vec![].into_boxed_slice()));
+                    cache.return_buffer(buffer, underlying_len);
+                });
+            }
+            Self::HeapView { data, .. } => {
+                let underlying_len = data.len();
+                TEMP_BUFFER_CACHE.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    let buffer = std::mem::replace(data, Pin::new(vec![].into_boxed_slice()));
+                    cache.return_buffer(buffer, underlying_len);
+                });
+            }
+            Self::Pooled(_) => {}
         }
     }
 }
@@ -553,11 +579,28 @@ impl Buffer {
         Self::Heap(Pin::new(data.into_boxed_slice()))
     }
 
+    /// Wraps `data` so that only bytes `[start..]` are visible via
+    /// [`Buffer::as_slice`] / [`Buffer::len`]. The skipped prefix lives in
+    /// memory but is never read by the I/O layer — useful when a caller
+    /// has pre-allocated optional framing room at the front of a buffer
+    /// and wants to elide it on a particular write without a memmove.
+    pub fn new_with_start(data: Vec<u8>, start: usize) -> Self {
+        assert!(
+            start <= data.len(),
+            "Buffer::new_with_start: start ({start}) > data.len() ({})",
+            data.len()
+        );
+        Self::HeapView {
+            data: Pin::new(data.into_boxed_slice()),
+            start,
+        }
+    }
+
     /// Returns the index of the underlying `Arena` if it was registered with
     /// io_uring. Only for use with `UringIO` backend.
     pub fn fixed_id(&self) -> Option<u32> {
         match self {
-            Self::Heap { .. } => None,
+            Self::Heap(..) | Self::HeapView { .. } => None,
             Self::Pooled(buf) => buf.fixed_id(),
         }
     }
@@ -579,6 +622,7 @@ impl Buffer {
     pub fn len(&self) -> usize {
         match self {
             Self::Heap(buf) => buf.len(),
+            Self::HeapView { data, start } => data.len() - *start,
             Self::Pooled(buf) => buf.logical_len(),
         }
     }
@@ -593,6 +637,13 @@ impl Buffer {
                 // SAFETY: The buffer is guaranteed to be valid for the lifetime of the slice
                 unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) }
             }
+            Self::HeapView { data, start } => {
+                // SAFETY: `start` was bounds-checked at construction; the buffer
+                // is valid for the lifetime of the returned slice.
+                unsafe {
+                    std::slice::from_raw_parts(data.as_ptr().add(*start), data.len() - *start)
+                }
+            }
             Self::Pooled(buf) => buf,
         }
     }
@@ -605,6 +656,7 @@ impl Buffer {
     pub fn as_ptr(&self) -> *const u8 {
         match self {
             Self::Heap(buf) => buf.as_ptr(),
+            Self::HeapView { data, start } => unsafe { data.as_ptr().add(*start) },
             Self::Pooled(buf) => buf.as_ptr(),
         }
     }
@@ -612,6 +664,7 @@ impl Buffer {
     pub fn as_mut_ptr(&self) -> *mut u8 {
         match self {
             Self::Heap(buf) => buf.as_ptr() as *mut u8,
+            Self::HeapView { data, start } => unsafe { (data.as_ptr() as *mut u8).add(*start) },
             Self::Pooled(buf) => buf.as_ptr() as *mut u8,
         }
     }
@@ -623,7 +676,7 @@ impl Buffer {
 
     #[inline]
     pub fn is_heap(&self) -> bool {
-        matches!(self, Self::Heap(..))
+        matches!(self, Self::Heap(..) | Self::HeapView { .. })
     }
 }
 
