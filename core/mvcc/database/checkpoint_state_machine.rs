@@ -420,38 +420,42 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         let mut exists_in_db_file = false;
         // Iterate versions from oldest-to-newest to determine if the row exists in the database file and whether the newest version should be checkpointed.
         for version in versions.iter() {
-            // Rows marked btree_resident existed in the DB file before MVCC tracked them.
-            // This also applies to synthetic tombstones that use begin=None.
-            if version.btree_resident {
-                exists_in_db_file = true;
-            }
             // A row is in the database file if:
             // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
             // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
             let mut begin_ts = None;
             if let Some(TxTimestampOrID::Timestamp(b)) = version.begin {
                 begin_ts = Some(b);
-                // A row exists in the DB file if it was checkpointed in a previous checkpoint.
-                // For btree_resident rows we set exists_in_db_file above, regardless of begin encoding.
-                if self
-                    .durable_txid_max_old
-                    .is_some_and(|txid_max_old| b <= u64::from(txid_max_old))
-                {
-                    exists_in_db_file = true;
-                }
             }
             let mut end_ts = None;
             if let Some(TxTimestampOrID::Timestamp(e)) = version.end {
                 end_ts = Some(e);
-                if self
-                    .durable_txid_max_old
-                    .is_some_and(|txid_max_old| e <= u64::from(txid_max_old))
-                {
-                    exists_in_db_file = false;
-                }
             }
             if begin_ts.is_none() && end_ts.is_none() {
+                // Rolled-back garbage and active TxID-only placeholders are not part of
+                // the durable row history, so they must not influence DB-file existence.
                 continue;
+            }
+            // Rows marked btree_resident existed in the DB file before MVCC tracked them.
+            // This also applies to synthetic tombstones that use begin=None.
+            if version.btree_resident {
+                exists_in_db_file = true;
+            }
+            // A row exists in the DB file if it was checkpointed in a previous checkpoint.
+            // For btree_resident rows we seed exists_in_db_file above, regardless of begin encoding.
+            // These timestamp-derived transitions must run after the btree_resident seed so a
+            // checkpointed tombstone can clear DB-file existence on a retry checkpoint.
+            if self
+                .durable_txid_max_old
+                .is_some_and(|txid_max_old| begin_ts.is_some_and(|b| b <= u64::from(txid_max_old)))
+            {
+                exists_in_db_file = true;
+            }
+            if self
+                .durable_txid_max_old
+                .is_some_and(|txid_max_old| end_ts.is_some_and(|e| e <= u64::from(txid_max_old)))
+            {
+                exists_in_db_file = false;
             }
             // Should checkpoint the newest version if:
             // - It is not a delete and it hasn't been checkpointed yet OR (begin_ts > max_old)
