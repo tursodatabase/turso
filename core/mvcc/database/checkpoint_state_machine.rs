@@ -420,38 +420,42 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         let mut exists_in_db_file = false;
         // Iterate versions from oldest-to-newest to determine if the row exists in the database file and whether the newest version should be checkpointed.
         for version in versions.iter() {
-            // Rows marked btree_resident existed in the DB file before MVCC tracked them.
-            // This also applies to synthetic tombstones that use begin=None.
-            if version.btree_resident {
-                exists_in_db_file = true;
-            }
             // A row is in the database file if:
             // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
             // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
             let mut begin_ts = None;
             if let Some(TxTimestampOrID::Timestamp(b)) = version.begin {
                 begin_ts = Some(b);
-                // A row exists in the DB file if it was checkpointed in a previous checkpoint.
-                // For btree_resident rows we set exists_in_db_file above, regardless of begin encoding.
-                if self
-                    .durable_txid_max_old
-                    .is_some_and(|txid_max_old| b <= u64::from(txid_max_old))
-                {
-                    exists_in_db_file = true;
-                }
             }
             let mut end_ts = None;
             if let Some(TxTimestampOrID::Timestamp(e)) = version.end {
                 end_ts = Some(e);
-                if self
-                    .durable_txid_max_old
-                    .is_some_and(|txid_max_old| e <= u64::from(txid_max_old))
-                {
-                    exists_in_db_file = false;
-                }
             }
             if begin_ts.is_none() && end_ts.is_none() {
+                // Rolled-back garbage and active TxID-only placeholders are not part of
+                // the durable row history, so they must not influence DB-file existence.
                 continue;
+            }
+            // Rows marked btree_resident existed in the DB file before MVCC tracked them.
+            // This also applies to synthetic tombstones that use begin=None.
+            if version.btree_resident {
+                exists_in_db_file = true;
+            }
+            // A row exists in the DB file if it was checkpointed in a previous checkpoint.
+            // For btree_resident rows we seed exists_in_db_file above, regardless of begin encoding.
+            // These timestamp-derived transitions must run after the btree_resident seed so a
+            // checkpointed tombstone can clear DB-file existence on a retry checkpoint.
+            if self
+                .durable_txid_max_old
+                .is_some_and(|txid_max_old| begin_ts.is_some_and(|b| b <= u64::from(txid_max_old)))
+            {
+                exists_in_db_file = true;
+            }
+            if self
+                .durable_txid_max_old
+                .is_some_and(|txid_max_old| end_ts.is_some_and(|e| e <= u64::from(txid_max_old)))
+            {
+                exists_in_db_file = false;
             }
             // Should checkpoint the newest version if:
             // - It is not a delete and it hasn't been checkpointed yet OR (begin_ts > max_old)
@@ -1752,6 +1756,11 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mvcc::database::tests::MvccTestDbNoConn;
+    use crate::mvcc::database::SortableIndexKey;
+    use crate::translate::collate::CollationSeq;
+    use crate::types::{IndexInfo, KeyInfo};
+    use turso_parser::ast::SortOrder;
 
     fn sqlite_schema_row_version(
         rowid: i64,
@@ -1859,5 +1868,94 @@ mod tests {
 
         assert_eq!(sqlite_schema_btree_identity(&tombstone), None);
         assert!(!is_schema_metadata_only_rewrite(&tombstone, None));
+    }
+
+    fn index_row_version(
+        index_id: MVTableId,
+        key_text: &str,
+        rowid: i64,
+        version_id: u64,
+        begin: Option<u64>,
+        end: Option<u64>,
+        btree_resident: bool,
+    ) -> (Arc<SortableIndexKey>, RowVersion) {
+        let index_info = Arc::new(IndexInfo {
+            key_info: vec![
+                KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation: CollationSeq::Binary,
+                    nulls_order: None,
+                },
+                KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation: CollationSeq::Binary,
+                    nulls_order: None,
+                },
+            ],
+            has_rowid: true,
+            num_cols: 2,
+            is_unique: true,
+        });
+        let key_record = ImmutableRecord::from_values(
+            &[
+                Value::Text(crate::types::Text::new(key_text.to_string())),
+                Value::from_i64(rowid),
+            ],
+            2,
+        );
+        let sortable_key = SortableIndexKey::new_from_record(key_record, index_info);
+        let key_arc = Arc::new(sortable_key.clone());
+        let row = Row::new_index_row(RowID::new(index_id, RowKey::Record(sortable_key)), 2);
+        let row_version = RowVersion {
+            id: version_id,
+            begin: begin.map(TxTimestampOrID::Timestamp),
+            end: end.map(TxTimestampOrID::Timestamp),
+            row,
+            btree_resident,
+        };
+        (key_arc, row_version)
+    }
+
+    #[test]
+    fn checkpoint_retry_does_not_replay_checkpointed_btree_resident_delete() {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        let mvstore = db.get_mvcc_store();
+        let pager = conn.pager.load().clone();
+        let mut checkpoint = CheckpointStateMachine::new(
+            pager,
+            mvstore.clone(),
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+        );
+        checkpoint.durable_txid_max_old = std::num::NonZeroU64::new(10);
+        checkpoint.durable_txid_max_new = 10;
+
+        let index_id = MVTableId::from(-42);
+        let (garbage_key, garbage_version) =
+            index_row_version(index_id, "blue_river_906", 75, 1, None, None, true);
+        let (_, tombstone_version) =
+            index_row_version(index_id, "blue_river_906", 75, 2, None, Some(10), true);
+
+        mvstore.insert_index_version(index_id, garbage_key, garbage_version);
+        let entry = mvstore
+            .index_rows
+            .get(&index_id)
+            .expect("index entry should exist after first insert");
+        let tombstone_key = entry
+            .value()
+            .front()
+            .expect("key bucket should exist after first insert")
+            .key()
+            .clone();
+        mvstore.insert_index_version(index_id, tombstone_key, tombstone_version);
+
+        checkpoint.collect_committed_index_row_versions();
+
+        assert!(
+            checkpoint.index_write_set.is_empty(),
+            "a retry checkpoint must not replay a delete whose btree_resident tombstone was already made durable"
+        );
     }
 }
