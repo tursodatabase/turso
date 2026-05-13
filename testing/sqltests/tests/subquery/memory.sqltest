@@ -235,6 +235,60 @@ expect {
     3|jacket|75
 }
 
+@cross-check-integrity
+test subquery-select-list-skipped-by-constant-false-where {
+    create table t(x integer);
+    insert into t values(-7539467530972710854),(-7539467530972710854);
+    select (select sum(x) from t) from t where 0;
+}
+expect {
+}
+
+@cross-check-integrity
+test subquery-order-by-skipped-by-constant-false-where {
+    create table t(x integer);
+    insert into t values(-7539467530972710854),(-7539467530972710854);
+    select x from t where 0 order by (select sum(x) from t);
+}
+expect {
+}
+
+@cross-check-integrity
+test subquery-where-skipped-by-constant-false-where {
+    create table t(x integer);
+    insert into t values(-7539467530972710854),(-7539467530972710854);
+    select x from t where (select sum(x) from t) is null and 0;
+}
+expect {
+}
+
+@cross-check-integrity
+test subquery-from-clause-skipped-by-constant-false-where {
+    create table t(x integer);
+    insert into t values(-7539467530972710854),(-7539467530972710854);
+    select * from (select sum(x) from t) where 0;
+}
+expect {
+}
+
+@cross-check-integrity
+test subquery-limit-still-evaluated-with-constant-false-where {
+    create table t(x integer);
+    insert into t values(-7539467530972710854),(-7539467530972710854);
+    select x from t where 0 limit (select sum(x) from t);
+}
+expect error {
+}
+
+@cross-check-integrity
+test subquery-order-by-skipped-after-runtime-empty-where {
+    create table t(x integer);
+    insert into t values(-7539467530972710854),(-7539467530972710854);
+    select x from t where x < null order by (select sum(x) from t);
+}
+expect {
+}
+
 # Get users with the highest score
 @cross-check-integrity
 test subquery-scalar-max {

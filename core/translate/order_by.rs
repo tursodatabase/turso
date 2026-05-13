@@ -8,7 +8,8 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         group_by::is_orderby_agg_or_const,
-        plan::Aggregate,
+        plan::{Aggregate, EvalAt, SelectPlan, SubqueryEvalPhase, SubqueryOrigin, TableReferences},
+        subquery::emit_non_from_clause_subqueries_for_eval_at,
     },
     util::exprs_are_equivalent,
     vdbe::{
@@ -21,7 +22,7 @@ use crate::{
 use super::{
     emitter::TranslateCtx,
     expr::translate_expr,
-    plan::{Distinctness, ResultSetColumn, SelectPlan, TableReferences},
+    plan::{Distinctness, ResultSetColumn},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
@@ -148,6 +149,54 @@ pub struct SortMetadata {
     pub use_heap_sort: bool,
 }
 pub struct EmitOrderBy;
+
+fn emit_order_by_subqueries(
+    program: &mut ProgramBuilder,
+    t_ctx: &TranslateCtx,
+    plan: &SelectPlan,
+) -> Result<()> {
+    // ORDER BY expressions are only needed for rows that survive the main loop.
+    // Emitting their subqueries here preserves SQLite's lazy evaluation while
+    // keeping the original plan available to the rest of SELECT emission.
+    let mut subqueries: Vec<_> = plan
+        .non_from_clause_subqueries
+        .iter()
+        .filter(|subquery| {
+            !subquery.has_been_evaluated()
+                && matches!(subquery.origin, SubqueryOrigin::SelectOrderBy)
+                && matches!(subquery.eval_phase, SubqueryEvalPhase::BeforeLoop)
+        })
+        .cloned()
+        .collect();
+
+    if subqueries.is_empty() {
+        return Ok(());
+    }
+
+    emit_non_from_clause_subqueries_for_eval_at(
+        program,
+        &t_ctx.resolver,
+        &mut subqueries,
+        &plan.join_order,
+        Some(&plan.table_references),
+        EvalAt::BeforeLoop,
+        |_| true,
+    )?;
+
+    for loop_idx in 0..plan.join_order.len() {
+        emit_non_from_clause_subqueries_for_eval_at(
+            program,
+            &t_ctx.resolver,
+            &mut subqueries,
+            &plan.join_order,
+            Some(&plan.table_references),
+            EvalAt::Loop(loop_idx),
+            |_| true,
+        )?;
+    }
+
+    Ok(())
+}
 
 impl EmitOrderBy {
     /// Initialize resources needed for ORDER BY processing
@@ -463,6 +512,8 @@ impl EmitOrderBy {
         t_ctx: &TranslateCtx,
         plan: &SelectPlan,
     ) -> Result<()> {
+        emit_order_by_subqueries(program, t_ctx, plan)?;
+
         let resolver = &t_ctx.resolver;
         let sort_metadata = t_ctx.meta_sort.as_ref().expect("sort metadata must exist");
         let order_by = &plan.order_by;

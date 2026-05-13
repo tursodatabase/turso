@@ -2,7 +2,7 @@ use super::*;
 use crate::translate::main_loop::{conditions::LoopConditionEmitter, hash::HashProbeSetupEmitter};
 use crate::translate::{
     main_loop::close::AutoIndexBuild,
-    plan::{self, SubqueryEvalPhase},
+    plan::{self, SubqueryEvalPhase, SubqueryOrigin},
     subquery::{materialized_from_clause_subquery_storage, MaterializedFromClauseSubqueryStorage},
 };
 
@@ -685,8 +685,12 @@ impl OpenLoop {
             }
         }
 
+        // ORDER BY subqueries are emitted lazily while inserting rows into the
+        // sorter, so they may still be unevaluated when the table loops open.
         if subqueries.iter().any(|s| {
-            !s.has_been_evaluated() && matches!(s.eval_phase, SubqueryEvalPhase::BeforeLoop)
+            !s.has_been_evaluated()
+                && matches!(s.eval_phase, SubqueryEvalPhase::BeforeLoop)
+                && !matches!(s.origin, SubqueryOrigin::SelectOrderBy)
         }) {
             crate::bail_parse_error!(
                 "all before-loop subqueries should have already been emitted, but found {} unevaluated subqueries",
@@ -695,6 +699,7 @@ impl OpenLoop {
                     .filter(|s| {
                         !s.has_been_evaluated()
                             && matches!(s.eval_phase, SubqueryEvalPhase::BeforeLoop)
+                            && !matches!(s.origin, SubqueryOrigin::SelectOrderBy)
                     })
                     .count()
             );

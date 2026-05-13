@@ -15,7 +15,7 @@ use crate::{
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
             Operation, QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
-            SimpleAggregate,
+            SimpleAggregate, SubqueryOrigin,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -89,6 +89,13 @@ pub fn emit_query<'a>(
         program.register_variable(variable);
     }
 
+    let has_group_by_exprs = plan
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| !gb.exprs.is_empty());
+    let constant_false_returns_no_rows = plan.contains_constant_false_condition
+        && (has_group_by_exprs || (plan.aggregates.is_empty() && plan.window.is_none()));
+
     // Evaluate uncorrelated subqueries as early as possible, because even LIMIT can reference a subquery.
     // This must happen before VALUES emission since VALUES expressions may contain scalar subqueries.
     emit_non_from_clause_subqueries_for_eval_at(
@@ -98,7 +105,11 @@ pub fn emit_query<'a>(
         &plan.join_order,
         Some(&plan.table_references),
         EvalAt::BeforeLoop,
-        |_| true,
+        |subquery| {
+            (!constant_false_returns_no_rows
+                || matches!(subquery.origin, SubqueryOrigin::SelectLimitOffset))
+                && !matches!(subquery.origin, SubqueryOrigin::SelectOrderBy)
+        },
     )?;
 
     // Handle VALUES clause - emit values after subqueries are prepared
@@ -130,6 +141,12 @@ pub fn emit_query<'a>(
         program.reg_result_cols_start = t_ctx.reg_result_cols_start
     }
 
+    if constant_false_returns_no_rows {
+        init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
+        program.preassign_label_to_next_insn(after_main_loop_label);
+        return Ok(t_ctx.reg_result_cols_start.unwrap());
+    }
+
     // For ungrouped aggregates with non-aggregate columns, initialize EXISTS subquery
     // result_regs to 0. EXISTS returns 0 (not NULL) when the subquery is never evaluated
     // (correlated EXISTS in empty loop). Non-aggregate columns themselves are evaluated
@@ -142,11 +159,6 @@ pub fn emit_query<'a>(
             }
         }
     }
-
-    let has_group_by_exprs = plan
-        .group_by
-        .as_ref()
-        .is_some_and(|gb| !gb.exprs.is_empty());
 
     // Initialize cursors and other resources needed for query execution
     if !plan.order_by.is_empty() {
