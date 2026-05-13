@@ -240,6 +240,14 @@ pub struct WhopperOpts {
     pub max_connections: usize,
     /// Maximum number of simulation steps to run.
     pub max_steps: usize,
+    /// Maximum iterations the reopen drain loop runs before declaring an
+    /// engine-level infinite loop. Drain iterations do not count against
+    /// `max_steps`: legitimate IO-heavy operations (e.g.
+    /// `PRAGMA integrity_check`) can use thousands of yields per page and
+    /// would routinely exhaust the main budget during a reopen near the end
+    /// of a run. Exceeding `max_drain_steps` within a single reopen surfaces
+    /// as an error.
+    pub max_drain_steps: usize,
     /// Probability of cosmic ray bit flip on each step (0.0-1.0).
     pub cosmic_ray_probability: f64,
     /// Keep mmap I/O files on disk after run.
@@ -266,6 +274,7 @@ impl Default for WhopperOpts {
             seed: None,
             max_connections: 4,
             max_steps: 100_000,
+            max_drain_steps: 1_000_000,
             cosmic_ray_probability: 0.0,
             keep_files: false,
             enable_mvcc: false,
@@ -316,6 +325,11 @@ impl WhopperOpts {
 
     pub fn with_max_steps(mut self, max_steps: usize) -> Self {
         self.max_steps = max_steps;
+        self
+    }
+
+    pub fn with_max_drain_steps(mut self, max_drain_steps: usize) -> Self {
+        self.max_drain_steps = max_drain_steps;
         self
     }
 
@@ -480,6 +494,7 @@ pub struct Whopper {
     pub rng: ChaCha8Rng,
     pub current_step: usize,
     pub max_steps: usize,
+    pub max_drain_steps: usize,
     pub seed: u64,
     pub stats: Stats,
     /// Chaotic workload profiles: (probability, name, profile).
@@ -606,6 +621,7 @@ impl Whopper {
             opts: Opts::default(),
             current_step: 0,
             max_steps: opts.max_steps,
+            max_drain_steps: opts.max_drain_steps,
             seed,
             stats: Stats::default(),
             chaotic_profiles: opts.chaotic_profiles,
@@ -1001,24 +1017,27 @@ impl Whopper {
         );
 
         let fibers = &mut self.context.fibers;
-        // Drain active statements, counting each iteration against the
-        // simulator's step budget. Without this, a leaked lock (e.g. a sibling
-        // fiber holding pager_commit_lock with no statement left for us to
-        // step) keeps the loop spinning past max_steps. If we exhaust the
-        // budget while statements are still live, fail loudly: silent
-        // fall-through would let the outer `run` loop exit with status 0 and
-        // mask a hang as a passing CI run.
+        // Drain active statements with a per-reopen budget independent of
+        // `max_steps`. The main loop's step budget governs how long the
+        // simulator runs overall; drain is a finalization phase that runs
+        // until either every fiber's in-flight statement has terminated
+        // (Done/Busy/Err) or `max_drain_steps` iterations elapse. The latter
+        // catches genuine engine-side infinite loops (leaked lock,
+        // unresolvable IO yield). Legitimate IO-heavy operations like
+        // `PRAGMA integrity_check` can run for thousands of yields per page,
+        // so the cap needs to comfortably exceed that.
+        let mut drain_iterations = 0usize;
         while fibers.iter().any(|f| f.statement.borrow().is_some()) {
-            if self.current_step >= self.max_steps {
+            if drain_iterations >= self.max_drain_steps {
                 let stuck: Vec<usize> = fibers
                     .iter()
                     .enumerate()
                     .filter_map(|(i, f)| f.statement.borrow().is_some().then_some(i))
                     .collect();
                 anyhow::bail!(
-                    "reopen drain exhausted max_steps ({}) with statements still live on fibers {:?}; \
-                     likely a leaked lock or other deadlock in the engine",
-                    self.max_steps,
+                    "reopen drain exceeded max_drain_steps ({}) with statements still live on \
+                     fibers {:?}; likely a leaked lock or other infinite loop in the engine",
+                    self.max_drain_steps,
                     stuck,
                 );
             }
@@ -1075,7 +1094,7 @@ impl Whopper {
                 }
             }
             self.io.step().unwrap();
-            self.current_step += 1;
+            drain_iterations += 1;
         }
 
         // Close and drop all fiber connections to release database Arc references
