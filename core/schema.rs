@@ -5210,6 +5210,20 @@ mod tests {
     }
 
     #[test]
+    pub fn test_column_is_rowid_alias_quoted_integer() -> Result<()> {
+        for sql in [
+            r#"CREATE TABLE t1 (a "INTEGER" PRIMARY KEY, b TEXT);"#,
+            r#"CREATE TABLE t1 (a 'INTEGER' PRIMARY KEY, b TEXT);"#,
+            r#"CREATE TABLE t1 (a `INTEGER` PRIMARY KEY, b TEXT);"#,
+        ] {
+            let table = BTreeTable::from_sql(sql, 0)?;
+            let column = table.get_column("a").unwrap().1;
+            assert!(column.is_rowid_alias(), "{sql}");
+        }
+        Ok(())
+    }
+
+    #[test]
     pub fn test_column_is_rowid_alias_single_integer_separate_primary_key_definition() -> Result<()>
     {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a));"#;

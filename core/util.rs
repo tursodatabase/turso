@@ -867,7 +867,8 @@ pub(crate) fn expr_contains_null(expr: &ast::Expr) -> bool {
 // this function returns the affinity type and whether the type name was exactly "INTEGER"
 // https://www.sqlite.org/datatype3.html
 pub(crate) fn type_from_name(type_name: &str) -> (Type, bool) {
-    let type_name = type_name.as_bytes();
+    let type_name = type_name.trim();
+    let type_name = strip_outer_type_quotes(type_name).as_bytes();
     if type_name.is_empty() {
         return (Type::Blob, false);
     }
@@ -892,6 +893,21 @@ pub(crate) fn type_from_name(type_name: &str) -> (Type, bool) {
     }
 
     (Type::Numeric, false)
+}
+
+fn strip_outer_type_quotes(type_name: &str) -> &str {
+    let Some(first) = type_name.as_bytes().first() else {
+        return type_name;
+    };
+    let quote = match first {
+        b'\'' | b'"' | b'`' => *first,
+        _ => return type_name,
+    };
+    if type_name.as_bytes().last() == Some(&quote) && type_name.len() >= 2 {
+        &type_name[1..type_name.len() - 1]
+    } else {
+        type_name
+    }
 }
 
 pub fn columns_from_create_table_body(
@@ -6339,7 +6355,11 @@ pub mod tests {
         let tc = vec![
             ("", (SchemaValueType::Blob, false)),
             ("INTEGER", (SchemaValueType::Integer, true)),
+            (r#""INTEGER""#, (SchemaValueType::Integer, true)),
+            ("'INTEGER'", (SchemaValueType::Integer, true)),
+            ("`INTEGER`", (SchemaValueType::Integer, true)),
             ("INT", (SchemaValueType::Integer, false)),
+            (r#""INT""#, (SchemaValueType::Integer, false)),
             ("CHAR", (SchemaValueType::Text, false)),
             ("CLOB", (SchemaValueType::Text, false)),
             ("TEXT", (SchemaValueType::Text, false)),
