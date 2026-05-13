@@ -15374,6 +15374,35 @@ mod tests {
     }
 
     #[test]
+    fn test_in_place_vacuum_after_empty_auto_vacuum_pragma_initializes_page_one() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            "in-place-vacuum-empty-autovacuum.db",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_autovacuum(true).with_vacuum(true),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("PRAGMA auto_vacuum=FULL").unwrap();
+        conn.execute("VACUUM").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'value-1')").unwrap();
+
+        let mut stmt = conn.prepare("PRAGMA integrity_check").unwrap();
+        let mut integrity = String::new();
+        stmt.run_with_row_callback(|row| {
+            integrity = row.get(0)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[test]
     fn test_in_place_vacuum_busy_before_copyback_restores_source_txn() {
         use std::sync::atomic::{AtomicBool, Ordering};
 

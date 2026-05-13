@@ -2704,6 +2704,7 @@ impl Pager {
     /// VACUUM runs on an existing database, so page 1 must already be allocated
     /// and a WAL must be present.
     pub fn begin_vacuum_blocking_tx(&self) -> Result<IOResult<()>> {
+        return_if_io!(self.maybe_allocate_page1());
         if !self.db_initialized() {
             return Err(LimboError::InternalError(
                 "begin_vacuum_blocking_tx can be done on an initialized database (page 1 must already be allocated)".into(),
