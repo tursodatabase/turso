@@ -875,6 +875,15 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 }
 
+impl<Clock: LogicalClock + 'static> Drop for MvccLazyCursor<Clock> {
+    fn drop(&mut self) {
+        // Release the per-table RowidAllocator lock if a Statement was dropped
+        // while paused at an op_new_rowid IO yield. end_new_rowid is a no-op
+        // when creating_new_rowid is false, so this is safe in every case.
+        self.end_new_rowid();
+    }
+}
+
 impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     fn last(&mut self) -> Result<IOResult<()>> {
         // A cursor may be NullRow'd during outer-join unmatched emission.

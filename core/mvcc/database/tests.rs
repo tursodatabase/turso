@@ -10485,3 +10485,60 @@ fn test_read_lock_leak_deferred_then_concurrent() {
     let rows = get_rows(&conn1, "SELECT * FROM t1");
     assert_eq!(rows.len(), 1);
 }
+
+/// Regression for #6754: dropping a Statement that paused mid-IO inside
+/// op_new_rowid leaks the per-table RowidAllocator lock. With the Drop
+/// impl on MvccLazyCursor, end_new_rowid runs on cursor teardown so the
+/// next INSERT into the same table from any connection makes progress.
+#[test]
+fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
+    use std::time::{Duration, Instant};
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let leaker = db.connect();
+    let victim = db.connect();
+
+    // Force the seek that runs from inside op_new_rowid's SeekingToLast
+    // to yield IO at SeekStart. At that moment the rowid allocator lock
+    // is held.
+    leaker.set_yield_injector(Some(FixedYieldInjector::new([
+        CursorYieldPoint::SeekStart.point()
+    ])));
+
+    let mut leak_stmt = leaker
+        .prepare("INSERT INTO t VALUES (NULL, 'leaker')")
+        .unwrap();
+    match leak_stmt.step().unwrap() {
+        crate::StepResult::IO => {}
+        other => panic!("expected IO yield from injected seek_start; got {other:?}"),
+    }
+
+    // Drop the statement without advancing past the yield. The Drop impl
+    // on MvccLazyCursor must release the rowid allocator lock.
+    drop(leak_stmt);
+    leaker.set_yield_injector(None);
+
+    // A different connection must now be able to INSERT into the same
+    // table within a small budget.
+    let mut victim_stmt = victim
+        .prepare("INSERT INTO t VALUES (NULL, 'victim')")
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if Instant::now() >= deadline {
+            panic!("victim INSERT did not complete within 5s — rowid allocator lock leaked");
+        }
+        match victim_stmt.step().unwrap() {
+            crate::StepResult::Done => break,
+            crate::StepResult::IO => continue,
+            other => panic!("unexpected step result on victim INSERT: {other:?}"),
+        }
+    }
+}
