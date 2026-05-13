@@ -77,6 +77,20 @@ fn step_stmt_with_injected_yield(
     stmt.step()
 }
 
+fn rollback_open_transaction_before_restart(
+    fiber_idx: usize,
+    fiber: &mut SimulatorFiber,
+) -> anyhow::Result<()> {
+    if !fiber.connection.get_auto_commit() {
+        debug!(
+            "fiber {}: rolling back open transaction before restart",
+            fiber_idx
+        );
+        fiber.connection.execute("ROLLBACK")?;
+    }
+    Ok(())
+}
+
 /// A bounded container for sampling values with reservoir sampling.
 #[derive(Debug, Clone)]
 pub struct SamplesContainer<T> {
@@ -1017,6 +1031,11 @@ impl Whopper {
         );
 
         let fibers = &mut self.context.fibers;
+        for (fiber_idx, fiber) in fibers.iter_mut().enumerate() {
+            if fiber.statement.borrow().is_none() {
+                rollback_open_transaction_before_restart(fiber_idx, fiber)?;
+            }
+        }
         // Drain active statements with a per-reopen budget independent of
         // `max_steps`. The main loop's step budget governs how long the
         // simulator runs overall; drain is a finalization phase that runs
@@ -1090,6 +1109,7 @@ impl Whopper {
                             .reset()
                             .expect("statement reset should succeed before restart");
                         fiber.rows.clear();
+                        rollback_open_transaction_before_restart(fiber_idx, fiber)?;
                     }
                 }
             }
@@ -1304,4 +1324,46 @@ fn file_size_soft_limit_exceeded(
         sizes.get(wal_path).cloned().unwrap_or(0)
     };
     wal_size > FILE_SIZE_SOFT_LIMIT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reopen_rolls_back_idle_transactions_that_block_active_statements() -> anyhow::Result<()> {
+        let opts = WhopperOpts {
+            seed: Some(42),
+            max_connections: 2,
+            max_steps: 0,
+            max_drain_steps: 32,
+            enable_mvcc: true,
+            ..Default::default()
+        };
+        let mut whopper = Whopper::new(opts)?;
+        let waiter = whopper.context.fibers[0].connection.clone();
+        let holder = whopper.context.fibers[1].connection.clone();
+
+        waiter.execute(
+            "CREATE TABLE IF NOT EXISTS reopen_lock_test (key INTEGER PRIMARY KEY, value TEXT)",
+        )?;
+
+        holder.execute("BEGIN DEFERRED")?;
+        holder.execute("INSERT INTO reopen_lock_test VALUES (1, 'holder')")?;
+
+        waiter.execute("BEGIN CONCURRENT")?;
+        waiter.execute("INSERT INTO reopen_lock_test VALUES (2, 'waiter')")?;
+        let mut commit_stmt = waiter.prepare("COMMIT")?;
+        let commit_step = step_stmt_with_injected_yield(
+            &waiter,
+            whopper.context.fibers[0].yield_injector.clone(),
+            &mut commit_stmt,
+        )?;
+        assert!(matches!(commit_step, turso_core::StepResult::IO));
+        whopper.context.fibers[0]
+            .statement
+            .replace(Some(commit_stmt));
+
+        whopper.reopen()
+    }
 }
