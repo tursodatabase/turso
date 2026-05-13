@@ -14,7 +14,8 @@ use crate::{
             emit_program_for_select_with_resolver, emit_query,
         },
         expr::{
-            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr_mut, WalkControl,
+            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr, walk_expr_mut,
+            WalkControl,
         },
         optimizer::optimize_select_plan,
         plan::{
@@ -345,7 +346,7 @@ pub fn plan_subqueries_from_select_plan(
         recollect_aggregates(plan, resolver)?;
     }
 
-    assign_select_subquery_eval_phases(plan);
+    assign_select_subquery_eval_phases(plan)?;
     mark_shared_cte_materialization_requirements(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
@@ -1969,18 +1970,44 @@ pub fn emit_non_from_clause_subqueries_for_eval_at(
     )
 }
 
-fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
+fn collect_subquery_result_ids(
+    expr: &ast::Expr,
+    ids: &mut Vec<ast::TableInternalId>,
+) -> Result<()> {
+    walk_expr(expr, &mut |expr| {
+        if let ast::Expr::SubqueryResult { subquery_id, .. } = expr {
+            ids.push(*subquery_id);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) -> Result<()> {
     let has_grouped_output = plan
         .group_by
         .as_ref()
         .is_some_and(|group_by| !group_by.exprs.is_empty());
 
+    let mut aggregate_input_subqueries = Vec::new();
+    for aggregate in &plan.aggregates {
+        for arg in &aggregate.args {
+            collect_subquery_result_ids(arg, &mut aggregate_input_subqueries)?;
+        }
+        if let Some(filter_expr) = &aggregate.filter_expr {
+            collect_subquery_result_ids(filter_expr, &mut aggregate_input_subqueries)?;
+        }
+    }
+
     for subquery in plan.non_from_clause_subqueries.iter_mut() {
-        subquery.eval_phase = match subquery.origin {
-            SubqueryOrigin::SelectHaving | SubqueryOrigin::SelectOrderBy if has_grouped_output => {
+        let is_aggregate_input = aggregate_input_subqueries.contains(&subquery.internal_id);
+        subquery.eval_phase = match (subquery.origin, has_grouped_output, is_aggregate_input) {
+            (SubqueryOrigin::SelectHaving | SubqueryOrigin::SelectOrderBy, true, false) => {
                 SubqueryEvalPhase::GroupedOutput
             }
             _ => subquery.origin.phase_floor(),
         };
     }
+
+    Ok(())
 }

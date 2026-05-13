@@ -46,6 +46,26 @@ fn checkpoint_attached_database(
 }
 
 #[turso_macros::test]
+fn test_in_subquery_inside_aggregate_filter_is_ready_before_aggregate_step(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+    let aux_path = db.path.with_extension("attach_aggregate_filter.db");
+
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    conn.execute("CREATE TABLE aux.u(x INTEGER PRIMARY KEY)")?;
+    conn.execute("INSERT INTO aux.u VALUES (1)")?;
+
+    let rows = limbo_exec_rows(&conn, "SELECT * FROM aux.u WHERE EXISTS (SELECT 1 FROM aux.u GROUP BY x HAVING count(x) FILTER (WHERE 1 IN (SELECT a FROM t LIMIT 1)) <= 1)");
+    assert_eq!(rows.len(), 1);
+
+    Ok(())
+}
+
+#[turso_macros::test]
 fn test_attached_schema_refreshes_after_other_connection_create(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
