@@ -5044,6 +5044,79 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
     mvcc_store.release_exclusive_tx(&exclusive_tx_id);
 }
 
+#[test]
+fn test_exclusive_tx_does_not_deadlock_behind_preparing_concurrent_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    conn_a
+        .execute("CREATE TABLE t (key TEXT PRIMARY KEY, value BLOB)")
+        .unwrap();
+
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a
+        .execute("INSERT INTO t VALUES ('a', zeroblob(16))")
+        .unwrap();
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(commit_a.step().unwrap(), StepResult::IO),
+        "first commit must pause after publishing Preparing and before taking the log lock",
+    );
+
+    let conn_b = db.connect();
+    let mut insert_b = conn_b
+        .prepare("INSERT INTO t VALUES ('b', zeroblob(16))")
+        .unwrap();
+    let mut saw_busy = false;
+    for _ in 0..64 {
+        match insert_b.step() {
+            Ok(StepResult::IO) => continue,
+            Ok(StepResult::Busy) | Err(LimboError::Busy) => {
+                saw_busy = true;
+                break;
+            }
+            Ok(StepResult::Done) => {
+                panic!("exclusive insert started while another tx was Preparing")
+            }
+            Ok(other) => panic!("unexpected insert step result: {other:?}"),
+            Err(err) => panic!("unexpected insert error: {err:?}"),
+        }
+    }
+    assert!(
+        saw_busy,
+        "exclusive insert should return Busy instead of waiting while holding the log lock",
+    );
+    insert_b.reset().unwrap();
+
+    let mut committed = false;
+    for _ in 0..1024 {
+        match commit_a.step().unwrap() {
+            StepResult::Done => {
+                committed = true;
+                break;
+            }
+            StepResult::IO => {}
+            other => panic!("unexpected commit step result: {other:?}"),
+        }
+    }
+    assert!(
+        committed,
+        "paused concurrent commit should finish after Busy"
+    );
+
+    conn_a.set_yield_injector(None);
+
+    let rows = get_rows(&conn_a, "SELECT key FROM t ORDER BY key");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_text().unwrap(), "a");
+
+    conn_a.close().unwrap();
+    conn_b.close().unwrap();
+}
+
 /// Insert a synthetic table and a single row via the MVCC store, then commit.
 /// Used by restart / recovery tests to seed durable state before a restart cycle.
 fn write_synthetic_row(db: &MvccTestDbNoConn, value: &str) {

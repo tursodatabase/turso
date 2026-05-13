@@ -1123,10 +1123,9 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         } else if mv_store.is_exclusive_tx(&self.tx_id) {
             mv_store.release_exclusive_tx(&self.tx_id);
             self.commit_coordinator.pager_commit_lock.unlock();
-            let tx = mv_store.txs.get(&self.tx_id).expect(&format!(
-                "tx id {} not found in cleanup_abandoned_commit",
-                self.tx_id
-            ));
+            let tx = mv_store.txs.get(&self.tx_id).unwrap_or_else(|| {
+                panic!("tx id {} not found in cleanup_abandoned_commit", self.tx_id)
+            });
             if tx.value().pager_commit_lock_held.load(Ordering::Acquire) {
                 self.commit_coordinator.pager_commit_lock.unlock();
             }
@@ -4130,11 +4129,21 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.exclusive_tx.load(Ordering::Acquire) != NO_EXCLUSIVE_TX
     }
 
+    fn has_preparing_tx_other_than(&self, tx_id: TxID) -> bool {
+        self.txs.iter().any(|entry| {
+            *entry.key() != tx_id
+                && matches!(entry.value().state.load(), TransactionState::Preparing(_))
+        })
+    }
+
     /// Acquires the exclusive transaction lock to the given transaction ID.
     fn acquire_exclusive_tx(&self, tx_id: &TxID) -> Result<()> {
         if self.exclusive_tx.load(Ordering::Acquire) == *tx_id {
             // Re-entrant upgrade attempt for the same transaction.
             return Ok(());
+        }
+        if self.has_preparing_tx_other_than(*tx_id) {
+            return Err(LimboError::Busy);
         }
         if let Some(tx) = self.txs.get(tx_id) {
             let tx = tx.value();
@@ -4150,7 +4159,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if self.has_preparing_tx_other_than(*tx_id) {
+                    self.release_exclusive_tx(tx_id);
+                    return Err(LimboError::Busy);
+                }
+                Ok(())
+            }
             Err(_) => {
                 // Another transaction already holds the exclusive lock
                 Err(LimboError::Busy)
