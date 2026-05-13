@@ -135,6 +135,9 @@ test outer-column-aggregate-in-scalar-subquery {
 expect {
     6.0|5
 }
+expect @js {
+    6|5
+}
 
 @cross-check-integrity
 test case-when-aggregate-returns-column-value {
