@@ -611,7 +611,11 @@ impl PageCache {
 
         let target_len = self.capacity - n;
         while self.len() > target_len {
-            self.evict_one()?;
+            match self.evict_one() {
+                Ok(()) => {}
+                Err(CacheError::Full) if !self.spill_enabled => return Ok(()),
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }
@@ -1093,6 +1097,27 @@ mod tests {
 
         assert_eq!(result, Err(CacheError::Full));
         assert_eq!(cache.len(), 2);
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_insert_can_exceed_capacity_when_spilling_is_disabled() {
+        let mut cache = PageCache::new_with_spill(2, false);
+        let key2 = insert_page(&mut cache, 2);
+        let key3 = insert_page(&mut cache, 3);
+
+        for key in [key2, key3] {
+            cache.notify_page_dirty(key);
+            cache.peek(&key, false).unwrap().set_dirty();
+        }
+
+        let key4 = create_key(4);
+        cache.insert(key4, page_with_content(4)).unwrap();
+
+        assert_eq!(cache.len(), 3);
+        assert!(cache.contains_key(&key2));
+        assert!(cache.contains_key(&key3));
+        assert!(cache.contains_key(&key4));
         cache.verify_cache_integrity();
     }
 

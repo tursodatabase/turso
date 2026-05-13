@@ -110,6 +110,68 @@ fn test_savepoint_rollback_after_cache_spill_preserves_wal_pages(
     Ok(())
 }
 
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_cache_spill_off_large_update_does_not_partially_commit(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA page_size=512;")?;
+    conn.execute("PRAGMA journal_mode=WAL;")?;
+    conn.execute("PRAGMA temp_store=MEMORY;")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT NOT NULL, pad BLOB NOT NULL);")?;
+    conn.execute("CREATE INDEX idx_k ON t(k);")?;
+    conn.execute(
+        "WITH d(x) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9)),
+         nums(i) AS (
+             SELECT a.x + 10*b.x + 100*c.x + 1
+             FROM d a, d b, d c
+             WHERE (a.x + 10*b.x + 100*c.x) < 800
+         )
+         INSERT INTO t(id,k,pad)
+         SELECT i, 'k'||i, zeroblob(380) FROM nums ORDER BY i;",
+    )?;
+
+    conn.execute("PRAGMA cache_size=200;")?;
+    conn.execute("PRAGMA cache_spill=OFF;")?;
+
+    conn.execute("BEGIN;")?;
+    conn.execute("INSERT INTO t(id,k,pad) VALUES(1001,'k1001',zeroblob(380));")?;
+    conn.execute("INSERT INTO t(id,k,pad) VALUES(1002,'k1002',zeroblob(380));")?;
+    conn.execute(
+        "UPDATE t
+         SET k='u'||k, pad=zeroblob(381)
+         WHERE id BETWEEN 1 AND 800;",
+    )?;
+    conn.execute("COMMIT;")?;
+
+    assert_eq!(
+        execute_and_get_ints(&conn, "SELECT count(*), sum(length(pad)), sum(id) FROM t;",)?,
+        vec![802, 305560, 322403]
+    );
+    assert_eq!(
+        execute_and_get_ints(&conn, "SELECT count(*) FROM t WHERE id IN (1001,1002);")?,
+        vec![2]
+    );
+    assert_eq!(
+        execute_and_get_ints(&conn, "SELECT count(*) FROM t WHERE length(pad)=381;")?,
+        vec![800]
+    );
+    assert_eq!(
+        execute_and_get_ints(
+            &conn,
+            "SELECT count(*) FROM t WHERE k >= 'uk' AND k < 'ul';"
+        )?,
+        vec![800]
+    );
+    assert_eq!(
+        execute_and_get_strings(&conn, "PRAGMA integrity_check;")?,
+        vec!["ok"]
+    );
+
+    Ok(())
+}
+
 #[test]
 #[ignore = "ignored for now because it's flaky"]
 fn test_wal_1_writer_1_reader() -> Result<()> {
