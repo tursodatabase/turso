@@ -14,7 +14,8 @@ use crate::{
             emit_program_for_select_with_resolver, emit_query,
         },
         expr::{
-            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr_mut, WalkControl,
+            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr, walk_expr_mut,
+            WalkControl,
         },
         optimizer::optimize_select_plan,
         plan::{
@@ -1969,15 +1970,39 @@ pub fn emit_non_from_clause_subqueries_for_eval_at(
     )
 }
 
+fn aggregate_filter_subquery_ids(plan: &SelectPlan) -> Vec<ast::TableInternalId> {
+    let mut ids = Vec::new();
+    for aggregate in &plan.aggregates {
+        let Some(filter_expr) = &aggregate.filter_expr else {
+            continue;
+        };
+        let _ = walk_expr(
+            filter_expr,
+            &mut |expr: &ast::Expr| -> Result<WalkControl> {
+                if let ast::Expr::SubqueryResult { subquery_id, .. } = expr {
+                    ids.push(*subquery_id);
+                    return Ok(WalkControl::SkipChildren);
+                }
+                Ok(WalkControl::Continue)
+            },
+        );
+    }
+    ids
+}
+
 fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
     let has_grouped_output = plan
         .group_by
         .as_ref()
         .is_some_and(|group_by| !group_by.exprs.is_empty());
+    let filter_subquery_ids = aggregate_filter_subquery_ids(plan);
 
     for subquery in plan.non_from_clause_subqueries.iter_mut() {
+        let is_aggregate_filter_subquery = filter_subquery_ids.contains(&subquery.internal_id);
         subquery.eval_phase = match subquery.origin {
-            SubqueryOrigin::SelectHaving | SubqueryOrigin::SelectOrderBy if has_grouped_output => {
+            SubqueryOrigin::SelectHaving | SubqueryOrigin::SelectOrderBy
+                if has_grouped_output && !is_aggregate_filter_subquery =>
+            {
                 SubqueryEvalPhase::GroupedOutput
             }
             _ => subquery.origin.phase_floor(),

@@ -3442,6 +3442,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn aggregate_filter_subquery_in_having_does_not_panic() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("aggregate-filter-having.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute("CREATE TABLE t(b INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES(1)").unwrap();
+
+        let row = query_single_i64(
+            &conn,
+            "SELECT b FROM t GROUP BY b HAVING COUNT(b) FILTER (WHERE 1 IN (SELECT b FROM t))",
+        );
+        assert_eq!(row, 1);
+    }
+
+    #[test]
+    fn aggregate_filter_subquery_in_order_by_does_not_panic() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("aggregate-filter-order-by.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute("CREATE TABLE t(b INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES(1)").unwrap();
+
+        let row = query_single_i64(
+            &conn,
+            "SELECT b FROM t GROUP BY b ORDER BY COUNT(b) FILTER (WHERE 1 IN (SELECT b FROM t))",
+        );
+        assert_eq!(row, 1);
+    }
+
     fn text_value(value: &Value) -> &str {
         match value {
             Value::Text(text) => text.as_str(),
