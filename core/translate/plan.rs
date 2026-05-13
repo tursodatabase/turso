@@ -3113,6 +3113,7 @@ pub struct NonFromClauseSubquery {
     pub correlated: bool,
     pub origin: SubqueryOrigin,
     pub eval_phase: SubqueryEvalPhase,
+    pub contains_outer_aggregates: bool,
 }
 
 impl NonFromClauseSubquery {

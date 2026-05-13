@@ -17,8 +17,11 @@ use super::{
         resolve_expr, translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
         ConditionMetadata, NoConstantOptReason,
     },
-    plan::{Aggregate, Distinctness, SelectPlan, TableReferences},
+    plan::{
+        Aggregate, Distinctness, SelectPlan, SubqueryEvalPhase, SubqueryOrigin, TableReferences,
+    },
     result_row::emit_select_result,
+    subquery::emit_non_from_clause_subqueries_for_phase,
 };
 
 /// Emits the bytecode for processing an aggregate without a GROUP BY clause.
@@ -88,6 +91,27 @@ pub fn emit_ungrouped_aggregation<'a>(
             target_pc: end_label,
             decrement_by: 0,
         });
+    }
+
+    let mut grouped_output_subqueries = plan
+        .non_from_clause_subqueries
+        .iter()
+        .filter(|subquery| {
+            matches!(subquery.origin, SubqueryOrigin::SelectList)
+                && subquery.contains_outer_aggregates
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !grouped_output_subqueries.is_empty() {
+        emit_non_from_clause_subqueries_for_phase(
+            program,
+            &t_ctx.resolver,
+            &mut grouped_output_subqueries,
+            &plan.join_order,
+            Some(&plan.table_references),
+            SubqueryEvalPhase::GroupedOutput,
+            |_| true,
+        )?;
     }
 
     // If the loop never ran (once-flag is still 0), we need to evaluate non-aggregate columns now.

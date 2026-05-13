@@ -27,7 +27,7 @@ use crate::{
         select::prepare_select_plan,
     },
     types::Value,
-    util::parse_signed_number,
+    util::{exprs_are_equivalent, parse_signed_number},
     vdbe::{
         builder::{CursorKey, CursorType, MaterializedCteInfo, ProgramBuilder},
         insn::Insn,
@@ -352,6 +352,7 @@ pub fn plan_subqueries_from_select_plan(
     if !plan.aggregates.is_empty() {
         recollect_aggregates(plan, resolver)?;
     }
+    hoist_select_list_outer_aggregates(plan)?;
 
     assign_select_subquery_eval_phases(plan)?;
     mark_shared_cte_materialization_requirements(
@@ -720,6 +721,7 @@ fn get_subquery_parser<'a>(
                     correlated,
                     origin,
                     eval_phase: origin.phase_floor(),
+                    contains_outer_aggregates: false,
                 });
                 Ok(WalkControl::Continue)
             }
@@ -831,6 +833,7 @@ fn get_subquery_parser<'a>(
                     correlated,
                     origin,
                     eval_phase: origin.phase_floor(),
+                    contains_outer_aggregates: false,
                 });
                 Ok(WalkControl::Continue)
             }
@@ -998,12 +1001,188 @@ fn get_subquery_parser<'a>(
                     correlated,
                     origin,
                     eval_phase: origin.phase_floor(),
+                    contains_outer_aggregates: false,
                 });
                 Ok(WalkControl::Continue)
             }
             _ => Ok(WalkControl::Continue),
         }
     }
+}
+
+#[derive(Default)]
+struct AggregateScopeRefs {
+    local: bool,
+    immediate_outer: bool,
+    deeper_outer: bool,
+    nested_subquery: bool,
+}
+
+fn aggregate_scope_refs(
+    expr: &ast::Expr,
+    table_references: &TableReferences,
+) -> Result<AggregateScopeRefs> {
+    let mut refs = AggregateScopeRefs::default();
+    walk_expr(expr, &mut |expr| {
+        match expr {
+            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
+                if table_references
+                    .joined_tables()
+                    .iter()
+                    .any(|joined| joined.internal_id == *table)
+                {
+                    refs.local = true;
+                } else if let Some(outer_ref) = table_references
+                    .outer_query_refs()
+                    .iter()
+                    .find(|outer_ref| outer_ref.internal_id == *table)
+                {
+                    if outer_ref.scope_depth == 0 {
+                        refs.immediate_outer = true;
+                    } else {
+                        refs.deeper_outer = true;
+                    }
+                }
+            }
+            ast::Expr::Exists(_)
+            | ast::Expr::Subquery(_)
+            | ast::Expr::InSelect { .. }
+            | ast::Expr::SubqueryResult { .. } => {
+                refs.nested_subquery = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(refs)
+}
+
+fn aggregate_belongs_to_immediate_outer_scope(
+    aggregate: &Aggregate,
+    table_references: &TableReferences,
+) -> Result<bool> {
+    let mut saw_immediate_outer = false;
+    for expr in aggregate.args.iter().chain(aggregate.filter_expr.iter()) {
+        let refs = aggregate_scope_refs(expr, table_references)?;
+        if refs.local || refs.deeper_outer || refs.nested_subquery {
+            return Ok(false);
+        }
+        saw_immediate_outer |= refs.immediate_outer;
+    }
+    Ok(saw_immediate_outer)
+}
+
+fn expr_contains_aggregate(expr: &ast::Expr, aggregates: &[Aggregate]) -> Result<bool> {
+    let mut contains = false;
+    walk_expr(expr, &mut |expr| {
+        if aggregates
+            .iter()
+            .any(|aggregate| exprs_are_equivalent(&aggregate.original_expr, expr))
+        {
+            contains = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(contains)
+}
+
+fn expr_contains_subquery_id(expr: &ast::Expr, subquery_id: ast::TableInternalId) -> Result<bool> {
+    let mut contains = false;
+    walk_expr(expr, &mut |expr| {
+        if let ast::Expr::SubqueryResult {
+            subquery_id: id, ..
+        } = expr
+        {
+            if *id == subquery_id {
+                contains = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(contains)
+}
+
+fn hoist_outer_aggregates_from_child_select(plan: &mut SelectPlan) -> Result<Vec<Aggregate>> {
+    let mut hoisted = Vec::new();
+    let mut retained = Vec::new();
+
+    for aggregate in std::mem::take(&mut plan.aggregates) {
+        if aggregate_belongs_to_immediate_outer_scope(&aggregate, &plan.table_references)? {
+            hoisted.push(aggregate);
+        } else {
+            retained.push(aggregate);
+        }
+    }
+
+    plan.aggregates = retained;
+    if !hoisted.is_empty() {
+        for result_column in &mut plan.result_columns {
+            result_column.contains_aggregates =
+                expr_contains_aggregate(&result_column.expr, &plan.aggregates)?;
+        }
+    }
+
+    Ok(hoisted)
+}
+
+fn hoist_outer_aggregates_from_plan(plan: &mut Plan) -> Result<Vec<Aggregate>> {
+    match plan {
+        Plan::Select(select_plan) => hoist_outer_aggregates_from_child_select(select_plan),
+        Plan::CompoundSelect { .. } | Plan::Delete(_) | Plan::Update(_) => Ok(Vec::new()),
+    }
+}
+
+fn hoist_select_list_outer_aggregates(plan: &mut SelectPlan) -> Result<()> {
+    let mut hoisted_subquery_ids = Vec::new();
+    let mut hoisted_aggregates = Vec::new();
+
+    for subquery in &mut plan.non_from_clause_subqueries {
+        if !matches!(subquery.origin, SubqueryOrigin::SelectList) {
+            continue;
+        }
+        let SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &mut subquery.state
+        else {
+            continue;
+        };
+
+        let hoisted = hoist_outer_aggregates_from_plan(subquery_plan)?;
+        if hoisted.is_empty() {
+            continue;
+        }
+
+        subquery.contains_outer_aggregates = true;
+        hoisted_subquery_ids.push(subquery.internal_id);
+        hoisted_aggregates.extend(hoisted);
+    }
+
+    if hoisted_aggregates.is_empty() {
+        return Ok(());
+    }
+
+    for aggregate in hoisted_aggregates {
+        if !plan.aggregates.contains(&aggregate) {
+            plan.aggregates.push(aggregate);
+        }
+    }
+
+    for result_column in &mut plan.result_columns {
+        if result_column.contains_aggregates {
+            continue;
+        }
+        for subquery_id in &hoisted_subquery_ids {
+            if expr_contains_subquery_id(&result_column.expr, *subquery_id)? {
+                result_column.contains_aggregates = true;
+                break;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Recollect all aggregates after subquery planning.
@@ -2083,6 +2262,7 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) -> Result<()> {
 
     for subquery in plan.non_from_clause_subqueries.iter_mut() {
         subquery.eval_phase = match subquery.origin {
+            _ if subquery.contains_outer_aggregates => SubqueryEvalPhase::GroupedOutput,
             SubqueryOrigin::SelectHaving | SubqueryOrigin::SelectOrderBy
                 if has_grouped_output
                     && !aggregate_subquery_ids.contains(&subquery.internal_id) =>

@@ -676,12 +676,26 @@ fn prepare_one_select_plan(
 
             // Single-row aggregate queries (aggregates without GROUP BY and without window functions)
             // produce exactly one row, so ORDER BY is meaningless. Clearing it here also avoids
-            // eagerly validating subqueries in ORDER BY that SQLite would skip due to optimization.
+            // emitting subqueries in ORDER BY that cannot affect the output.
+            // SQLite still resolves those subqueries before discarding the ORDER BY, so validate
+            // their SELECT bodies for errors such as missing columns.
             // Note: HAVING without GROUP BY sets group_by to Some with empty exprs, still single-row.
             let is_single_row_aggregate = !plan.aggregates.is_empty()
                 && plan.group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty())
                 && windows.is_empty();
             if is_single_row_aggregate {
+                let mut ignored_order_by_exprs = plan
+                    .order_by
+                    .iter()
+                    .map(|(expr, _, _)| expr.as_ref().clone())
+                    .collect::<Vec<_>>();
+                validate_truncated_order_by_subqueries(
+                    program,
+                    &mut plan.table_references,
+                    resolver,
+                    ignored_order_by_exprs.iter_mut(),
+                    connection,
+                )?;
                 plan.order_by.clear();
             }
 

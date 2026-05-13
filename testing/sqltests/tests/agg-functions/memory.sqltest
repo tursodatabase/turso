@@ -114,6 +114,29 @@ expect {
 }
 
 @cross-check-integrity
+test ungrouped-agg-order-by-subquery-missing-column {
+    CREATE TABLE agg_order_outer(a);
+    CREATE TABLE agg_order_inner(x);
+    SELECT COUNT(*) FROM agg_order_outer
+    ORDER BY (SELECT missing_col FROM agg_order_inner);
+}
+expect error {
+    no such column: missing_col
+}
+
+@cross-check-integrity
+test outer-column-aggregate-in-scalar-subquery {
+    CREATE TABLE outer_agg_outer(x INTEGER);
+    CREATE TABLE outer_agg_inner(y INTEGER);
+    INSERT INTO outer_agg_outer VALUES (5), (7);
+    INSERT INTO outer_agg_inner VALUES (10), (20);
+    SELECT (SELECT AVG(x) FROM outer_agg_inner), x FROM outer_agg_outer;
+}
+expect {
+    6.0|5
+}
+
+@cross-check-integrity
 test case-when-aggregate-returns-column-value {
     CREATE TABLE t1(a INTEGER, b TEXT);
     INSERT INTO t1 VALUES (42, 'hello');
