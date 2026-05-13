@@ -20,10 +20,11 @@ use crate::translate::planner::{
 use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
 use crate::translate::window::plan_windows;
-use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::types::Value;
+use crate::util::{exprs_are_equivalent, normalize_ident, parse_signed_number};
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
-use crate::{vdbe::builder::ProgramBuilder, Result};
+use crate::{vdbe::builder::ProgramBuilder, Numeric, Result};
 use std::borrow::Cow;
 use turso_parser::ast::ResultColumn;
 use turso_parser::ast::{self, CompoundSelect, Expr};
@@ -1071,52 +1072,38 @@ fn add_vtab_predicates_to_where_clause(
 ///
 /// Per SQLite documentation, only constant integers are treated as column references.
 /// Non-integer numeric literals (floats) are treated as constant expressions.
+fn column_number_from_sqlite_integer_constant(expr: &ast::Expr) -> Option<i64> {
+    let Ok(Value::Numeric(Numeric::Integer(value))) = parse_signed_number(expr) else {
+        return None;
+    };
+
+    // SQLite's ORDER BY/GROUP BY column-number path only recognizes integer
+    // constants in this narrow range. Larger numeric literals are ordinary
+    // constant expressions.
+    if value > i32::MIN as i64 && value <= i32::MAX as i64 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
 fn replace_column_number_with_copy_of_column_expr(
     order_by_or_group_by_expr: &mut ast::Expr,
     columns: &[ResultSetColumn],
     clause_name: &str,
 ) -> Result<()> {
-    // Extract the numeric literal string, handling both bare integers (e.g. `2`)
-    // and unary-plus integers (e.g. `+2`). In SQLite, `ORDER BY +2` strips the
-    // unary plus and still resolves `2` as a column index reference.
-    let num_str = match order_by_or_group_by_expr {
-        ast::Expr::Literal(ast::Literal::Numeric(num)) => Some(num.clone()),
-        ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
-            if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
-                Some(num.clone())
-            } else {
-                None
-            }
+    if let Some(column_number) =
+        column_number_from_sqlite_integer_constant(order_by_or_group_by_expr)
+    {
+        if column_number <= 0 || column_number as usize > columns.len() {
+            crate::bail_parse_error!(
+                "1st {} term out of range - should be between 1 and {}",
+                clause_name,
+                columns.len()
+            );
         }
-        ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
-            if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
-                if num.parse::<usize>().is_ok() {
-                    crate::bail_parse_error!(
-                        "1st {} term out of range - should be between 1 and {}",
-                        clause_name,
-                        columns.len()
-                    );
-                }
-            }
-            None
-        }
-        _ => None,
-    };
-    if let Some(num) = num_str {
-        // Only treat as column reference if it parses as a positive integer.
-        // Float literals like "0.5" or "1.0" are valid constant expressions, not column references.
-        if let Ok(column_number) = num.parse::<usize>() {
-            if column_number == 0 || column_number > columns.len() {
-                crate::bail_parse_error!(
-                    "1st {} term out of range - should be between 1 and {}",
-                    clause_name,
-                    columns.len()
-                );
-            }
-            let ResultSetColumn { expr, .. } = &columns[column_number - 1];
-            *order_by_or_group_by_expr = expr.clone();
-        }
-        // Otherwise, leave the expression as-is (constant expression, case 3 per SQLite docs)
+        let ResultSetColumn { expr, .. } = &columns[column_number as usize - 1];
+        *order_by_or_group_by_expr = expr.clone();
     }
     Ok(())
 }

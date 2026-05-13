@@ -230,3 +230,20 @@ expect error {
     1st ORDER BY term out of range - should be between 1 and 2
 }
 
+test order-by-large-integer-literal {
+    CREATE TABLE t16(a, b);
+    INSERT INTO t16 VALUES(1,10);
+    SELECT * FROM t16 ORDER BY 2147483648;
+}
+expect {
+    1|10
+}
+
+test group-by-large-integer-literal {
+    CREATE TABLE t17(a, b);
+    INSERT INTO t17 VALUES(1,10),(2,20);
+    SELECT count(*) FROM t17 GROUP BY 2147483648;
+}
+expect {
+    2
+}
