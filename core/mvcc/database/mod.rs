@@ -1952,11 +1952,11 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 mvcc_store
                     .last_committed_tx_ts
-                    .store(*end_ts, Ordering::Release);
+                    .fetch_max(*end_ts, Ordering::AcqRel);
                 if self.did_commit_schema_change {
                     mvcc_store
                         .last_committed_schema_change_ts
-                        .store(*end_ts, Ordering::Release);
+                        .fetch_max(*end_ts, Ordering::AcqRel);
                 }
 
                 // We have now updated all the versions with a reference to the
