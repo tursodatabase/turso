@@ -2828,7 +2828,6 @@ fn test_checkpoint_retry_does_not_replay_checkpointed_btree_resident_unique_dele
 }
 
 /// What this test checks: user-facing SQL plus a commit yield can produce out-of-order commit completion without lowering checkpoint metadata.
-/// Why this matters: this reproduces the Antithesis `MVCC delete ... not found` path without mutating MVCC internals.
 #[test]
 fn test_checkpoint_stale_unique_index_delete_with_out_of_order_commit_yield() {
     let db = MvccTestDbNoConn::new_with_random_db();
