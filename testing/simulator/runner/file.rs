@@ -9,11 +9,16 @@ use rand_chacha::ChaCha8Rng;
 use tracing::{Level, instrument};
 use turso_core::{File, Result};
 
-use crate::runner::{FAULT_ERROR_MSG, clock::SimulatorClock};
+use crate::runner::{DISK_FULL_ERROR_MSG, FAULT_ERROR_MSG, clock::SimulatorClock};
 pub(crate) struct SimulatorFile {
     pub path: String,
     pub(crate) inner: Arc<dyn File>,
     pub(crate) fault: Cell<bool>,
+    /// When set, `pwrite` and `sync` fail as if the filesystem ran out of
+    /// space. Reads continue to succeed because the data they need is already
+    /// allocated. Cleared by a subsequent `inject_disk_full(false)`.
+    pub(crate) disk_full: Cell<bool>,
+    pub(crate) nr_disk_full_faults: Cell<usize>,
 
     /// Number of `pread` function calls (both success and failures).
     pub(crate) nr_pread_calls: Cell<usize>,
@@ -65,6 +70,10 @@ unsafe impl Sync for SimulatorFile {}
 impl SimulatorFile {
     pub(crate) fn inject_fault(&self, fault: bool) {
         self.fault.replace(fault);
+    }
+
+    pub(crate) fn inject_disk_full(&self, full: bool) {
+        self.disk_full.replace(full);
     }
 
     pub(crate) fn stats_table(&self) -> String {
@@ -172,6 +181,14 @@ impl File for SimulatorFile {
                 FAULT_ERROR_MSG.into(),
             ));
         }
+        if self.disk_full.get() {
+            tracing::debug!("pwrite disk-full fault");
+            self.nr_disk_full_faults
+                .set(self.nr_disk_full_faults.get() + 1);
+            return Err(turso_core::LimboError::InternalError(
+                DISK_FULL_ERROR_MSG.into(),
+            ));
+        }
         if let Some(latency) = self.generate_latency_duration() {
             let cloned_c = c.clone();
             let op = Box::new(move |file: &SimulatorFile| file.inner.pwrite(pos, buffer, cloned_c));
@@ -228,6 +245,14 @@ impl File for SimulatorFile {
             self.nr_pwrite_faults.set(self.nr_pwrite_faults.get() + 1);
             return Err(turso_core::LimboError::InternalError(
                 FAULT_ERROR_MSG.into(),
+            ));
+        }
+        if self.disk_full.get() {
+            tracing::debug!("pwritev disk-full fault");
+            self.nr_disk_full_faults
+                .set(self.nr_disk_full_faults.get() + 1);
+            return Err(turso_core::LimboError::InternalError(
+                DISK_FULL_ERROR_MSG.into(),
             ));
         }
         if let Some(latency) = self.generate_latency_duration() {

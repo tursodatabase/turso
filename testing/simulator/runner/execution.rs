@@ -19,6 +19,13 @@ fn error_causes_rollback(err: &LimboError) -> bool {
     matches!(err, LimboError::WriteWriteConflict)
 }
 
+/// Returns true if the error was produced by an injected `Fault::DiskFull`.
+/// These are expected: a pwrite failed because we asked it to. Subsequent
+/// interactions should continue against the same database state.
+fn is_injected_disk_full_error(err: &LimboError) -> bool {
+    matches!(err, LimboError::InternalError(msg) if msg == crate::runner::DISK_FULL_ERROR_MSG)
+}
+
 use crate::{
     generation::Shadow as _,
     model::{
@@ -221,6 +228,17 @@ pub fn execute_interaction_turso(
                 let continuation = match err {
                     err if is_recoverable_tx_error(err) => {
                         if error_causes_rollback(err) && env.conn_in_transaction(connection_index) {
+                            env.rollback_conn(connection_index);
+                        }
+                        ExecutionContinuation::NextInteractionOutsideThisProperty
+                    }
+                    err if is_injected_disk_full_error(err) => {
+                        // A pwrite failed because we injected ENOSPC. Treat
+                        // the transaction as aborted (Turso cannot durably
+                        // land the write) and continue with the next
+                        // interaction. The fault remains active until a
+                        // `Fault::DiskFreed` interaction clears it.
+                        if env.conn_in_transaction(connection_index) {
                             env.rollback_conn(connection_index);
                         }
                         ExecutionContinuation::NextInteractionOutsideThisProperty

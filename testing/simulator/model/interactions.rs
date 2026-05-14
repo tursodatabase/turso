@@ -435,6 +435,11 @@ impl Assertion {
 pub enum Fault {
     Disconnect,
     ReopenDatabase,
+    /// Simulate the host running out of disk space: subsequent `pwrite` and
+    /// `sync` calls fail with an ENOSPC-like error until the disk is "freed".
+    DiskFull,
+    /// Clear the disk-full state set by an earlier `DiskFull` fault.
+    DiskFreed,
 }
 
 impl Display for Fault {
@@ -442,6 +447,8 @@ impl Display for Fault {
         match self {
             Fault::Disconnect => write!(f, "DISCONNECT"),
             Fault::ReopenDatabase => write!(f, "REOPEN_DATABASE"),
+            Fault::DiskFull => write!(f, "DISK_FULL"),
+            Fault::DiskFreed => write!(f, "DISK_FREED"),
         }
     }
 }
@@ -704,6 +711,12 @@ impl InteractionType {
                     }
                     Fault::ReopenDatabase => {
                         reopen_database(env);
+                    }
+                    Fault::DiskFull => {
+                        env.io.inject_disk_full(true);
+                    }
+                    Fault::DiskFreed => {
+                        env.io.inject_disk_full(false);
                     }
                 }
                 Ok(())

@@ -68,6 +68,16 @@ impl SimIO for SimulatorIO {
         }
     }
 
+    fn inject_disk_full(&self, full: bool) {
+        for file in self.files.borrow().iter() {
+            file.inject_disk_full(full);
+        }
+    }
+
+    fn is_disk_full(&self) -> bool {
+        self.files.borrow().iter().any(|file| file.disk_full.get())
+    }
+
     fn inject_fault_selective(&self, faults: &[(&str, bool)]) {
         for file in self.files.borrow().iter() {
             for (stem, fault) in faults {
@@ -133,9 +143,11 @@ impl IO for SimulatorIO {
             path: path.to_string(),
             inner,
             fault: Cell::new(false),
+            disk_full: Cell::new(false),
             nr_pread_faults: Cell::new(0),
             nr_pwrite_faults: Cell::new(0),
             nr_sync_faults: Cell::new(0),
+            nr_disk_full_faults: Cell::new(0),
             nr_pread_calls: Cell::new(0),
             nr_pwrite_calls: Cell::new(0),
             nr_sync_calls: Cell::new(0),

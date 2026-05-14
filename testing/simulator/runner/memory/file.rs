@@ -55,6 +55,10 @@ pub struct MemorySimFile {
     pub latency_probability: u8,
     clock: Arc<SimulatorClock>,
     fault: Cell<bool>,
+    /// Mimics filesystem ENOSPC: while set, queued writes complete in
+    /// aborted form so the simulator exercises write-failure recovery paths
+    /// without affecting reads.
+    disk_full: Cell<bool>,
 }
 
 unsafe impl Send for MemorySimFile {}
@@ -78,11 +82,20 @@ impl MemorySimFile {
             latency_probability,
             clock,
             fault: Cell::new(false),
+            disk_full: Cell::new(false),
         }
     }
 
     pub fn inject_fault(&self, fault: bool) {
         self.fault.set(fault);
+    }
+
+    pub fn inject_disk_full(&self, full: bool) {
+        self.disk_full.set(full);
+    }
+
+    pub fn is_disk_full(&self) -> bool {
+        self.disk_full.get()
     }
 
     pub fn stats_table(&self) -> String {
@@ -132,7 +145,13 @@ impl MemorySimFile {
 
     fn insert_op(&self, op: OperationType) {
         // FIXME: currently avoid any fsync faults until we correctly define the expected behaviour in the simulator
-        let fault = self.fault.get() && !matches!(op, OperationType::Sync { .. });
+        let is_write = matches!(
+            op,
+            OperationType::Write { .. } | OperationType::WriteV { .. }
+        );
+        let disk_full_fault = self.disk_full.get() && is_write;
+        let fault =
+            (self.fault.get() && !matches!(op, OperationType::Sync { .. })) || disk_full_fault;
         if fault {
             let mut io_tracker = self.io_tracker.borrow_mut();
             match &op {

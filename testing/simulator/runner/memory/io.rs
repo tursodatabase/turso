@@ -178,6 +178,19 @@ impl SimIO for MemorySimIO {
         }
     }
 
+    fn inject_disk_full(&self, full: bool) {
+        for file in self.files.borrow().values() {
+            file.inject_disk_full(full);
+        }
+        if full {
+            tracing::debug!("disk-full fault injected");
+        }
+    }
+
+    fn is_disk_full(&self) -> bool {
+        self.files.borrow().values().any(|file| file.is_disk_full())
+    }
+
     fn inject_fault_selective(&self, faults: &[(&str, bool)]) {
         for (path, file) in self.files.borrow().iter() {
             for (stem, fault) in faults {

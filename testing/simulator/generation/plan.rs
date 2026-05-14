@@ -340,11 +340,21 @@ fn random_fault<R: rand::Rng + ?Sized>(
     env: &SimulatorEnv,
     conn_index: usize,
 ) -> Interactions {
-    let faults = if env.opts.disable_reopen_database {
+    // DiskFull / DiskFreed are paired: if the disk is already full, we
+    // generate the "freed" recovery fault, otherwise we can either trigger a
+    // disconnect, reopen, or fill the disk. This keeps the simulator from
+    // entering an unrecoverable state where every write would fail forever.
+    let disk_already_full = env.io.is_disk_full();
+    let mut faults = if env.opts.disable_reopen_database {
         vec![Fault::Disconnect]
     } else {
         vec![Fault::Disconnect, Fault::ReopenDatabase]
     };
+    if disk_already_full {
+        faults.push(Fault::DiskFreed);
+    } else {
+        faults.push(Fault::DiskFull);
+    }
     let fault = faults[rng.random_range(0..faults.len())];
     Interactions::new(conn_index, InteractionsType::Fault(fault))
 }
