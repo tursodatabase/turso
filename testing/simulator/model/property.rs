@@ -191,6 +191,14 @@ pub enum Property {
         tables: Vec<String>,
         write_kinds: Vec<QueryDiscriminants>,
     },
+    /// CheckpointStress forces WAL checkpointing after random write traffic,
+    /// then verifies that the database still matches the simulator model.
+    CheckpointStress {
+        queries: Vec<Query>,
+        checkpoint: Query,
+        tables: Vec<String>,
+        write_kinds: Vec<QueryDiscriminants>,
+    },
     /// Property used to subsititute a property with its queries only
     Queries {
         queries: Vec<Query>,
@@ -220,6 +228,7 @@ impl Property {
                 | Property::DeleteSelect { .. }
                 | Property::DropSelect { .. }
                 | Property::SavepointRollback { .. }
+                | Property::CheckpointStress { .. }
                 | Property::Queries { .. }
         )
     }
@@ -231,6 +240,7 @@ impl Property {
             | Property::DeleteSelect { queries, .. }
             | Property::DropSelect { queries, .. }
             | Property::SavepointRollback { queries, .. }
+            | Property::CheckpointStress { queries, .. }
             | Property::Queries { queries } => Some(queries),
             Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => None,
             Property::SelectLimit { .. }

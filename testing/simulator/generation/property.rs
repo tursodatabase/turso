@@ -14,6 +14,7 @@ use sql_generation::{
         query::{
             Create, Delete, Drop, Insert, Select,
             alter_table::{AlterTable, AlterTableType},
+            pragma::{Pragma, WalCheckpointMode},
             predicate::Predicate,
             select::{CompoundOperator, CompoundSelect, ResultColumn, SelectBody, SelectInner},
             transaction::{Begin, Commit, Rollback},
@@ -231,6 +232,14 @@ impl Property {
             Property::SavepointRollback { .. } => {
                 |rng: &mut R, ctx: &G, _query_distr: &QueryDistribution, property: &Property| {
                     let Property::SavepointRollback { write_kinds, .. } = property else {
+                        unreachable!()
+                    };
+                    random_main_table_write(rng, ctx, write_kinds)
+                }
+            }
+            Property::CheckpointStress { .. } => {
+                |rng: &mut R, ctx: &G, _query_distr: &QueryDistribution, property: &Property| {
+                    let Property::CheckpointStress { write_kinds, .. } = property else {
                         unreachable!()
                     };
                     random_main_table_write(rng, ctx, write_kinds)
@@ -1233,6 +1242,23 @@ impl Property {
                 interactions.push(assert_integrity_check(tables, connection_index));
                 interactions
             }
+            Property::CheckpointStress {
+                queries,
+                checkpoint,
+                tables,
+                ..
+            } => {
+                let mut interactions = Vec::with_capacity(queries.len() + 2 + tables.len() * 2);
+                interactions.extend(queries.clone().into_iter().map(|query| {
+                    InteractionBuilder::with_interaction(InteractionType::Query(query))
+                }));
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(checkpoint.clone()),
+                ));
+                interactions.extend(assert_all_table_values(tables, connection_index));
+                interactions.push(assert_integrity_check(tables, connection_index));
+                interactions
+            }
         };
 
         assert!(!interactions.is_empty());
@@ -1417,7 +1443,7 @@ fn random_main_table_delete<R: rand::Rng + ?Sized>(rng: &mut R, table: &Table) -
 fn assert_integrity_check(tables: &[String], connection_index: usize) -> InteractionBuilder {
     let tables = tables.to_vec();
     InteractionBuilder::with_interaction(InteractionType::Assertion(Assertion::new(
-        "PRAGMA integrity_check should be ok after savepoint rollback".to_string(),
+        "PRAGMA integrity_check should be ok".to_string(),
         move |_stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
             let result = run_integrity_check(env, connection_index)?;
             if result == "ok" {
@@ -1678,6 +1704,49 @@ fn property_savepoint_rollback<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_checkpoint_stress<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    let tables = ctx
+        .tables()
+        .iter()
+        .filter(|table| !table.name.contains('.'))
+        .map(|table| table.name.clone())
+        .collect::<Vec<_>>();
+    assert!(!tables.is_empty());
+    let write_kinds = query_distr
+        .positive_items()
+        .filter(|query| {
+            matches!(
+                query,
+                QueryDiscriminants::Insert
+                    | QueryDiscriminants::Update
+                    | QueryDiscriminants::Delete
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(!write_kinds.is_empty());
+
+    let modes = [
+        WalCheckpointMode::Passive,
+        WalCheckpointMode::Full,
+        WalCheckpointMode::Restart,
+        WalCheckpointMode::Truncate,
+    ];
+    let mode = pick(&modes, rng).clone();
+    let amount = rng.random_range(1..=5);
+
+    Property::CheckpointStress {
+        queries: std::iter::repeat_n(Query::Placeholder, amount).collect(),
+        checkpoint: Query::Pragma(Pragma::WalCheckpoint(mode)),
+        tables,
+        write_kinds,
+    }
+}
+
 fn property_table_has_expected_content<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
@@ -1899,6 +1968,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::InsertValuesSelect => property_insert_values_select,
             PropertyDiscriminants::ReadYourUpdatesBack => property_read_your_updates_back,
             PropertyDiscriminants::SavepointRollback => property_savepoint_rollback,
+            PropertyDiscriminants::CheckpointStress => property_checkpoint_stress,
             PropertyDiscriminants::TableHasExpectedContent => property_table_has_expected_content,
             PropertyDiscriminants::AllTableHaveExpectedContent => {
                 property_all_tables_have_expected_content
@@ -1950,6 +2020,16 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::SavepointRollback => {
                 if !env.opts.disable_savepoint_rollback
+                    && !env.profile.mvcc
+                    && ctx.tables().iter().any(|table| !table.name.contains('.'))
+                {
+                    remaining.insert + remaining.update + remaining.delete
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::CheckpointStress => {
+                if !env.opts.differential
                     && !env.profile.mvcc
                     && ctx.tables().iter().any(|table| !table.name.contains('.'))
                 {
@@ -2059,6 +2139,7 @@ impl PropertyDiscriminants {
                 QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
             }
             PropertyDiscriminants::SavepointRollback => QueryCapabilities::INSERT,
+            PropertyDiscriminants::CheckpointStress => QueryCapabilities::INSERT,
             PropertyDiscriminants::TableHasExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::AllTableHaveExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::DoubleCreateFailure => QueryCapabilities::CREATE,

@@ -1107,6 +1107,7 @@ impl SimulatorEnv {
             disable_savepoint_rollback: cli_opts.disable_savepoint_rollback,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
             disable_faulty_query: cli_opts.disable_faulty_query,
+            differential: cli_opts.differential,
             page_size: 4096, // TODO: randomize this too
             max_interactions: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
             max_time_simulation: cli_opts.maximum_time,
@@ -1445,6 +1446,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_savepoint_rollback: bool,
     pub(crate) disable_fsync_no_wait: bool,
     pub(crate) disable_faulty_query: bool,
+    pub(crate) differential: bool,
     pub(crate) disable_reopen_database: bool,
     pub(crate) disable_integrity_check: bool,
 
