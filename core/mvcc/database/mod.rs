@@ -1092,6 +1092,52 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         }
     }
 
+    /// Release `pager_commit_lock` / `exclusive_tx` and roll back the in-flight
+    /// MVCC tx when the commit state machine has been abandoned mid-flight —
+    /// either because the wrapping Statement was dropped during an IO yield
+    /// (issues #6757 / #6755) or because a fallible helper like `log_tx`
+    /// returned an error and the VDBE abort handler's no-rollback list would
+    /// otherwise skip rollback (issue #6753).
+    ///
+    /// Gates `rollback_tx` on `is_tx_rollbackable` rather than bare `contains_key`:
+    /// `rollback_tx` asserts the tx state is `Active | Preparing(_)`, so we
+    /// must skip it if the tx already reached `Committed` in `CommitEnd` but
+    /// has not yet been removed from `txs`. The else-arm covers the narrow
+    /// window after `release_exclusive_tx` but before `finish_committed_tx`.
+    ///
+    /// For main-DB cleanups, also end the pager read tx and reset
+    /// `transaction_state` — matching what `Connection::rollback_current_txn_state`
+    /// would do. Without this, the next `op_transaction` either skips
+    /// `begin_read_tx` (stale `Write` state) or panics in `wal.begin_read_tx`
+    /// (pre-existing read lock not released).
+    ///
+    /// Returns true when cleanup actually ran, false if the state machine was
+    /// already finalized.
+    pub(crate) fn cleanup_abandoned_commit(&mut self, mv_store: &MvStore<Clock>) -> bool {
+        if self.is_finalized {
+            return false;
+        }
+        self.is_finalized = true;
+        if mv_store.is_tx_rollbackable(self.tx_id) {
+            mv_store.rollback_tx(self.tx_id, self.pager.clone(), &self.connection, self.db_id);
+        } else if mv_store.is_exclusive_tx(&self.tx_id) {
+            mv_store.release_exclusive_tx(&self.tx_id);
+            self.commit_coordinator.pager_commit_lock.unlock();
+            let tx = mv_store.txs.get(&self.tx_id).unwrap_or_else(|| {
+                panic!("tx id {} not found in cleanup_abandoned_commit", self.tx_id)
+            });
+            if tx.value().pager_commit_lock_held.load(Ordering::Acquire) {
+                self.commit_coordinator.pager_commit_lock.unlock();
+            }
+        }
+        if self.db_id == crate::MAIN_DB_ID {
+            self.pager.end_read_tx();
+            self.connection
+                .set_tx_state(crate::connection::TransactionState::None);
+        }
+        true
+    }
+
     fn new(
         state: CommitState<Clock>,
         tx_id: TxID,
@@ -1820,17 +1866,24 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
             CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
                 if !mvcc_store.is_exclusive_tx(&self.tx_id) {
-                    // logical log needs to be serialized
+                    // logical log needs to be serialized.
+                    //
+                    // Look up the tx BEFORE acquiring `pager_commit_lock` so
+                    // an `?` on a vanished tx cannot strand the lock. With
+                    // the previous order (acquire → fallible txs.get → set
+                    // flag) any Err between acquire and flag-set would leave
+                    // the lock held with no per-tx flag to signal release
+                    // (#6905).
+                    let tx = mvcc_store
+                        .txs
+                        .get(&self.tx_id)
+                        .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                     let locked = self.commit_coordinator.pager_commit_lock.write();
                     if !locked {
                         return Ok(TransitionResult::Io(IOCompletions::Single(
                             Completion::new_yield(),
                         )));
                     }
-                    let tx = mvcc_store
-                        .txs
-                        .get(&self.tx_id)
-                        .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                     tx.value()
                         .pager_commit_lock_held
                         .store(true, Ordering::Release);
@@ -1964,12 +2017,16 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // transaction. Pair removal with the connection cache clear so
                 // an IO yield + abandon during the upcoming checkpoint cannot
                 // strand `conn.mv_tx_id` referencing a tx that's gone from `txs`.
-                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
-                inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
-
+                //
+                // Release `exclusive_tx` BEFORE `finish_committed_tx` /
+                // `inject_transition_failure!` so an Err at `AfterRemoveTx`
+                // cannot strand the atomic — matches the ordering at the
+                // two fast-path CommitEnd sites.
                 if mvcc_store.is_exclusive_tx(&self.tx_id) {
                     mvcc_store.release_exclusive_tx(&self.tx_id);
                 }
+                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
+                inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                 if mvcc_store.storage.should_checkpoint() {
                     let state_machine = StateMachine::new(CheckpointStateMachine::new(
                         self.pager.clone(),
@@ -3452,9 +3509,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 .inspect_err(|_| unlock_checkpoint_guard())?;
         }
 
-        let already_holds_commit_lock = maybe_existing_tx_id
-            .and_then(|existing_tx_id| self.txs.get(&existing_tx_id))
-            .is_some_and(|tx| tx.value().pager_commit_lock_held.load(Ordering::Acquire));
+        // Hoist: validate the existing tx still exists and snapshot the
+        // `pager_commit_lock_held` flag BEFORE acquiring `pager_commit_lock`,
+        // so a vanished tx cannot strand the lock (#6905).
+        let already_holds_commit_lock = match maybe_existing_tx_id {
+            Some(existing_tx_id) => {
+                let tx = self.txs.get(&existing_tx_id).ok_or_else(|| {
+                    if !already_exclusive {
+                        self.release_exclusive_tx(&tx_id);
+                    }
+                    unlock_checkpoint_guard();
+                    LimboError::NoSuchTransactionID(existing_tx_id.to_string())
+                })?;
+                tx.value().pager_commit_lock_held.load(Ordering::Acquire)
+            }
+            None => false,
+        };
 
         if !already_holds_commit_lock {
             let locked = self.commit_coordinator.pager_commit_lock.write();
@@ -3474,10 +3544,20 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let header = self.get_new_transaction_database_header(&pager);
 
         if let Some(existing_tx_id) = maybe_existing_tx_id {
-            let tx = self
-                .txs
-                .get(&existing_tx_id)
-                .ok_or_else(|| LimboError::NoSuchTransactionID(existing_tx_id.to_string()))?;
+            // Re-fetch the Ref now that all blocking I/O is done. If the tx
+            // vanished between the earlier validation and now (extraordinarily
+            // narrow window — only checkpoint can remove a tx and it cannot
+            // race a commit-lock holder), release what we acquired and bail.
+            let tx = self.txs.get(&existing_tx_id).ok_or_else(|| {
+                if !already_holds_commit_lock {
+                    self.commit_coordinator.pager_commit_lock.unlock();
+                }
+                if !already_exclusive {
+                    self.release_exclusive_tx(&tx_id);
+                }
+                unlock_checkpoint_guard();
+                LimboError::NoSuchTransactionID(existing_tx_id.to_string())
+            })?;
             tx.value()
                 .pager_commit_lock_held
                 .store(true, Ordering::Release);
@@ -4044,11 +4124,21 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.exclusive_tx.load(Ordering::Acquire) != NO_EXCLUSIVE_TX
     }
 
+    fn has_preparing_tx_other_than(&self, tx_id: TxID) -> bool {
+        self.txs.iter().any(|entry| {
+            *entry.key() != tx_id
+                && matches!(entry.value().state.load(), TransactionState::Preparing(_))
+        })
+    }
+
     /// Acquires the exclusive transaction lock to the given transaction ID.
     fn acquire_exclusive_tx(&self, tx_id: &TxID) -> Result<()> {
         if self.exclusive_tx.load(Ordering::Acquire) == *tx_id {
             // Re-entrant upgrade attempt for the same transaction.
             return Ok(());
+        }
+        if self.has_preparing_tx_other_than(*tx_id) {
+            return Err(LimboError::Busy);
         }
         if let Some(tx) = self.txs.get(tx_id) {
             let tx = tx.value();
@@ -4064,7 +4154,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if self.has_preparing_tx_other_than(*tx_id) {
+                    self.release_exclusive_tx(tx_id);
+                    return Err(LimboError::Busy);
+                }
+                Ok(())
+            }
             Err(_) => {
                 // Another transaction already holds the exclusive lock
                 Err(LimboError::Busy)
