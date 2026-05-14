@@ -2003,13 +2003,18 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .write()
                     .replace(*tx_unlocked.header.read());
 
+                // Since we assign a commit timestamp and then we drive the commit to completion,
+                // it is totally possible for so an older transaction can finish after a newer one.
+                // In such case, we should not let older commit to set lower value than previous.
+                // This value is used in checkpointing as a watermark boundary, and an incorrect
+                // lower value can cause data loss / corruption.
                 mvcc_store
                     .last_committed_tx_ts
-                    .store(*end_ts, Ordering::Release);
+                    .fetch_max(*end_ts, Ordering::AcqRel);
                 if self.did_commit_schema_change {
                     mvcc_store
                         .last_committed_schema_change_ts
-                        .store(*end_ts, Ordering::Release);
+                        .fetch_max(*end_ts, Ordering::AcqRel);
                 }
 
                 // We have now updated all the versions with a reference to the

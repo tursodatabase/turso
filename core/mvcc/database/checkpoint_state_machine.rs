@@ -689,6 +689,34 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         }
     }
 
+    #[cfg(any(test, debug_assertions))]
+    fn max_collected_version_timestamp(&self) -> u64 {
+        fn max_version_timestamp(version: &RowVersion) -> u64 {
+            [version.begin.as_ref(), version.end.as_ref()]
+                .into_iter()
+                .filter_map(|ts| match ts {
+                    Some(TxTimestampOrID::Timestamp(ts)) => Some(*ts),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or_default()
+        }
+
+        let table_max = self
+            .write_set
+            .iter()
+            .map(|(version, _)| max_version_timestamp(version))
+            .max()
+            .unwrap_or_default();
+        let index_max = self
+            .index_write_set
+            .iter()
+            .map(|(_, version, _)| max_version_timestamp(version))
+            .max()
+            .unwrap_or_default();
+        table_max.max(index_max)
+    }
+
     /// Get the current row version to write to the B-tree
     fn get_current_row_version(
         &self,
@@ -997,6 +1025,15 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // row/index commits and header-only commits.
                 let durable_old = self.durable_txid_max_old.map(u64::from).unwrap_or_default();
                 let committed_max = self.mvstore.last_committed_tx_ts.load(Ordering::Acquire);
+                #[cfg(any(test, debug_assertions))]
+                {
+                    let collected_max = self.max_collected_version_timestamp();
+                    turso_assert!(
+                        committed_max >= collected_max,
+                        "MVCC checkpoint collected version timestamp above committed watermark",
+                        { "collected_max": collected_max, "committed_max": committed_max }
+                    );
+                }
                 self.durable_txid_max_new = durable_old.max(committed_max);
                 self.maybe_stage_mvcc_metadata_write()?;
 
