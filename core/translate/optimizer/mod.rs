@@ -65,7 +65,9 @@ use rustc_hash::FxHashMap as HashMap;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::RefAct;
-use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TableInternalId, TriggerEvent};
+use turso_parser::ast::{
+    self, Expr, ResolveType, SortOrder, SubqueryType, TableInternalId, TriggerEvent,
+};
 
 pub(crate) mod access_method;
 pub(crate) mod constraints;
@@ -929,6 +931,33 @@ fn optimize_update_plan(
         .expect("UPDATE must optimize exactly one target table")
         .clone();
 
+    if matches!(
+        plan.or_conflict,
+        Some(ResolveType::Fail | ResolveType::Ignore)
+    ) {
+        // FAIL/IGNORE can expose row visitation order through partial writes.
+        // Avoid a secondary index chosen only as a covering full scan; keep
+        // NOT NULL index scans, which SQLite also routes through that index.
+        if let Operation::Scan(Scan::BTreeTable {
+            index: Some(index), ..
+        }) = &plan.target_table.op
+        {
+            let keep_index_scan = plan.where_clause.iter().any(|term| {
+                is_not_null_check_on_index(
+                    &term.expr,
+                    plan.target_table.internal_id,
+                    index.as_ref(),
+                )
+            });
+            if !keep_index_scan {
+                plan.target_table.op = Operation::Scan(Scan::BTreeTable {
+                    iter_dir: IterationDirection::Forwards,
+                    index: None,
+                });
+            }
+        }
+    }
+
     if let Some(reason) = update_write_set_reason(plan, resolver)? {
         plan.safety.require(reason);
     }
@@ -948,6 +977,31 @@ fn optimize_update_plan(
         .select
         .join_order = join_order;
     Ok(())
+}
+
+fn is_not_null_check_on_index(expr: &ast::Expr, table_id: TableInternalId, index: &Index) -> bool {
+    let expr_is_index_column = |expr: &ast::Expr| {
+        matches!(
+            expr,
+            ast::Expr::Column { table, column, .. }
+                if *table == table_id && index.column_table_pos_to_index_pos(*column).is_some()
+        )
+    };
+
+    match expr {
+        ast::Expr::NotNull(inner) => expr_is_index_column(inner),
+        ast::Expr::Binary(lhs, ast::Operator::IsNot, rhs)
+            if matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+        {
+            expr_is_index_column(lhs)
+        }
+        ast::Expr::Binary(lhs, ast::Operator::IsNot, rhs)
+            if matches!(lhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+        {
+            expr_is_index_column(rhs)
+        }
+        _ => false,
+    }
 }
 
 fn update_write_set_reason(

@@ -4443,6 +4443,39 @@ fn test_autocommit_fail_update_partial_committed(tmp_db: TempDatabase) {
     assert_eq!(ic, "ok");
 }
 
+/// UPDATE OR FAIL partial effects must follow the same scan order as SQLite when
+/// a later row hits a UNIQUE conflict.
+#[turso_macros::test]
+fn test_autocommit_fail_update_partial_secondary_index_order(tmp_db: TempDatabase) {
+    drop(tmp_db);
+    let limbo_db = TempDatabase::builder()
+        .with_db_name("autocommit_fail_update_index_order.db")
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in [
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB UNIQUE, c TEXT UNIQUE) STRICT",
+        "INSERT INTO t VALUES(-1, X'7A', 'p')",
+        "INSERT INTO t VALUES(2, X'64', '4')",
+    ] {
+        sqlite_try_exec(&sqlite_conn, s).unwrap();
+        limbo_try_exec(&limbo_conn, s).unwrap();
+    }
+
+    let conflict_sql = "UPDATE OR FAIL t SET b = X'2B' WHERE c OR a";
+    assert!(sqlite_try_exec(&sqlite_conn, conflict_sql).is_err());
+    assert!(limbo_try_exec(&limbo_conn, conflict_sql).is_err());
+    let diff = compare_tables(
+        "autocommit FAIL UPDATE secondary index order",
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT a, hex(b), c FROM t ORDER BY a",
+    );
+    assert!(diff.is_none(), "{diff:?}");
+    let ic = sqlite_integrity_check(&limbo_db.path);
+    assert_eq!(ic, "ok");
+}
+
 /// UPDATE OR FAIL in explicit transaction: partial updates survive, transaction can commit.
 #[turso_macros::test]
 fn test_explicit_txn_fail_update_partial_in_txn(tmp_db: TempDatabase) {
