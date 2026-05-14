@@ -1105,6 +1105,7 @@ impl SimulatorEnv {
             disable_union_all_preserves_cardinality: cli_opts
                 .disable_union_all_preserves_cardinality,
             disable_savepoint_rollback: cli_opts.disable_savepoint_rollback,
+            disable_nested_savepoint_consistency: cli_opts.disable_nested_savepoint_consistency,
             disable_overflow_chain_integrity: cli_opts.disable_overflow_chain_integrity,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
             disable_faulty_query: cli_opts.disable_faulty_query,
@@ -1444,6 +1445,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_where_true_false_null: bool,
     pub(crate) disable_union_all_preserves_cardinality: bool,
     pub(crate) disable_savepoint_rollback: bool,
+    pub(crate) disable_nested_savepoint_consistency: bool,
     pub(crate) disable_overflow_chain_integrity: bool,
     pub(crate) disable_fsync_no_wait: bool,
     pub(crate) disable_faulty_query: bool,

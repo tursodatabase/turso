@@ -3,6 +3,13 @@ use sql_generation::model::query::{Create, Insert, Select, predicate::Predicate,
 
 use crate::model::{Query, QueryDiscriminants};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CloseAction {
+    Release,
+    RollbackTo,
+    RollbackToThenRelease,
+}
+
 /// Properties are representations of executable specifications
 /// about the database behavior.
 #[derive(Debug, Clone, Serialize, Deserialize, strum::EnumDiscriminants, strum::IntoStaticStr)]
@@ -191,6 +198,20 @@ pub enum Property {
         tables: Vec<String>,
         write_kinds: Vec<QueryDiscriminants>,
     },
+    /// NestedSavepointConsistency stress-tests the engine's nested savepoint
+    /// state-restoration logic. It opens 2-4 nested SAVEPOINTs with random writes
+    /// interleaved between levels, then closes them innermost-first with a
+    /// randomized mix of RELEASE / ROLLBACK TO actions. After the close sequence,
+    /// the property asserts shadow-model parity and PRAGMA integrity_check on the
+    /// target table. Targets bugs in subjournal coalescing, partial unwinding,
+    /// and page-cache restoration across nested levels.
+    NestedSavepointConsistency {
+        table: String,
+        savepoint_names: Vec<String>,
+        queries: Vec<Query>,
+        level_sizes: Vec<usize>,
+        close_actions: Vec<CloseAction>,
+    },
     /// OverflowChainIntegrity exercises the B-tree overflow page chain allocator.
     /// It inserts a row with an \>8 KiB TEXT/BLOB payload (well above the 4 KiB
     /// page max-local threshold), then mutates the payload across the
@@ -232,6 +253,7 @@ impl Property {
                 | Property::DeleteSelect { .. }
                 | Property::DropSelect { .. }
                 | Property::SavepointRollback { .. }
+                | Property::NestedSavepointConsistency { .. }
                 | Property::OverflowChainIntegrity { .. }
                 | Property::Queries { .. }
         )
@@ -244,6 +266,7 @@ impl Property {
             | Property::DeleteSelect { queries, .. }
             | Property::DropSelect { queries, .. }
             | Property::SavepointRollback { queries, .. }
+            | Property::NestedSavepointConsistency { queries, .. }
             | Property::OverflowChainIntegrity { queries, .. }
             | Property::Queries { queries } => Some(queries),
             Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => None,

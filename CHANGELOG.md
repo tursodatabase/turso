@@ -5,6 +5,7 @@
 ### Added
 * sql_generation: bucketed `gen_random_text` distribution (95% short / 4% medium / 1% overflow up to ~16 KiB) so simulator-driven workloads can exercise B-tree overflow page allocation.
 * simulator: add `OverflowChainIntegrity` DST property that drives the B-tree overflow page chain allocator with >8 KiB payloads across the in-page/overflow boundary. Enabled by default; gated by `--disable-overflow-chain-integrity`.
+* simulator: add `NestedSavepointConsistency` DST property that drives 2–4 level nested `SAVEPOINT`s with random writes between levels and randomized `RELEASE`/`ROLLBACK TO` close patterns. Enabled by default; gated by `--disable-nested-savepoint-consistency`.
 
 ## 0.5.0 -- 2026-03-04
 

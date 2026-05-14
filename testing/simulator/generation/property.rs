@@ -36,7 +36,7 @@ use crate::{
             Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
         },
         metrics::Remaining,
-        property::{InteractiveQueryInfo, Property, PropertyDiscriminants},
+        property::{CloseAction, InteractiveQueryInfo, Property, PropertyDiscriminants},
     },
     runner::env::SimulatorEnv,
 };
@@ -234,6 +234,16 @@ impl Property {
                         unreachable!()
                     };
                     random_main_table_write(rng, ctx, write_kinds)
+                }
+            }
+            Property::NestedSavepointConsistency { .. } => {
+                |rng: &mut R, ctx: &G, _query_distr: &QueryDistribution, _property: &Property| {
+                    const WRITE_KINDS: &[QueryDiscriminants] = &[
+                        QueryDiscriminants::Insert,
+                        QueryDiscriminants::Update,
+                        QueryDiscriminants::Delete,
+                    ];
+                    random_main_table_write(rng, ctx, WRITE_KINDS)
                 }
             }
             Property::OverflowChainIntegrity { .. } => {
@@ -1268,6 +1278,76 @@ impl Property {
                 interactions.push(assert_integrity_check(tables, connection_index));
                 interactions
             }
+            Property::NestedSavepointConsistency {
+                table,
+                savepoint_names,
+                queries,
+                level_sizes,
+                close_actions,
+            } => {
+                let depth = savepoint_names.len();
+                assert!((2..=4).contains(&depth));
+                assert_eq!(level_sizes.len(), depth);
+                assert_eq!(close_actions.len(), depth);
+                assert_eq!(level_sizes.iter().sum::<usize>(), queries.len());
+
+                let mut query_chunks = Vec::with_capacity(depth);
+                let mut offset = 0usize;
+                for size in level_sizes {
+                    let end = offset + *size;
+                    query_chunks.push(queries[offset..end].to_vec());
+                    offset = end;
+                }
+
+                let mut interactions = Vec::new();
+                for i in 0..depth {
+                    interactions.push(InteractionBuilder::with_interaction(
+                        InteractionType::Query(Query::Savepoint(Savepoint {
+                            name: savepoint_names[i].clone(),
+                        })),
+                    ));
+                    interactions.extend(query_chunks[i].iter().cloned().map(|query| {
+                        InteractionBuilder::with_interaction(InteractionType::Query(query))
+                    }));
+                }
+
+                for i in (0..depth).rev() {
+                    let savepoint_name = savepoint_names[i].clone();
+                    match close_actions[i] {
+                        CloseAction::Release => {
+                            interactions.push(InteractionBuilder::with_interaction(
+                                InteractionType::Query(Query::ReleaseSavepoint(ReleaseSavepoint {
+                                    name: savepoint_name,
+                                })),
+                            ));
+                        }
+                        CloseAction::RollbackTo | CloseAction::RollbackToThenRelease => {
+                            interactions.push(InteractionBuilder::with_interaction(
+                                InteractionType::Query(Query::RollbackToSavepoint(
+                                    RollbackToSavepoint {
+                                        name: savepoint_name.clone(),
+                                    },
+                                )),
+                            ));
+                            interactions.push(InteractionBuilder::with_interaction(
+                                InteractionType::Query(Query::ReleaseSavepoint(ReleaseSavepoint {
+                                    name: savepoint_name,
+                                })),
+                            ));
+                        }
+                    }
+                }
+
+                interactions.extend(assert_all_table_values(
+                    std::slice::from_ref(table),
+                    connection_index,
+                ));
+                interactions.push(assert_integrity_check(
+                    std::slice::from_ref(table),
+                    connection_index,
+                ));
+                interactions
+            }
             Property::OverflowChainIntegrity {
                 table,
                 column,
@@ -1830,6 +1910,53 @@ fn property_savepoint_rollback<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_nested_savepoint_consistency<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    let candidates = ctx
+        .tables()
+        .iter()
+        .filter(|t| !t.name.contains('.'))
+        .collect::<Vec<_>>();
+    let Some(table) = (if candidates.is_empty() {
+        ctx.tables().first()
+    } else {
+        Some(*pick(&candidates, rng))
+    }) else {
+        return Property::Queries {
+            queries: Vec::new(),
+        };
+    };
+
+    let table = table.name.clone();
+    let depth = rng.random_range(2..=4);
+    let savepoint_names = (0..depth)
+        .map(|i| format!("sim_nested_{}_{}", rng.random::<u32>(), i))
+        .collect::<Vec<_>>();
+    let level_sizes = (0..depth)
+        .map(|_| rng.random_range(1..=3))
+        .collect::<Vec<_>>();
+    let queries = std::iter::repeat_n(Query::Placeholder, level_sizes.iter().sum()).collect();
+    let close_actions = (0..depth)
+        .map(|_| match rng.random_range(0..3) {
+            0 => CloseAction::Release,
+            1 => CloseAction::RollbackTo,
+            _ => CloseAction::RollbackToThenRelease,
+        })
+        .collect::<Vec<_>>();
+
+    Property::NestedSavepointConsistency {
+        table,
+        savepoint_names,
+        queries,
+        level_sizes,
+        close_actions,
+    }
+}
+
 fn overflow_large_value_a() -> String {
     format!("{}{}", "overflow_a_", "x".repeat(8192))
 }
@@ -2103,6 +2230,9 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::InsertValuesSelect => property_insert_values_select,
             PropertyDiscriminants::ReadYourUpdatesBack => property_read_your_updates_back,
             PropertyDiscriminants::SavepointRollback => property_savepoint_rollback,
+            PropertyDiscriminants::NestedSavepointConsistency => {
+                property_nested_savepoint_consistency
+            }
             PropertyDiscriminants::OverflowChainIntegrity => property_overflow_chain_integrity,
             PropertyDiscriminants::TableHasExpectedContent => property_table_has_expected_content,
             PropertyDiscriminants::AllTableHaveExpectedContent => {
@@ -2159,6 +2289,16 @@ impl PropertyDiscriminants {
                     && ctx.tables().iter().any(|table| !table.name.contains('.'))
                 {
                     remaining.insert + remaining.update + remaining.delete
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::NestedSavepointConsistency => {
+                if !env.opts.disable_nested_savepoint_consistency
+                    && !env.profile.mvcc
+                    && ctx.tables().iter().any(|table| !table.name.contains('.'))
+                {
+                    u32::min(remaining.insert, remaining.update).max(1)
                 } else {
                     0
                 }
@@ -2271,6 +2411,9 @@ impl PropertyDiscriminants {
                 QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
             }
             PropertyDiscriminants::SavepointRollback => QueryCapabilities::INSERT,
+            PropertyDiscriminants::NestedSavepointConsistency => QueryCapabilities::INSERT
+                .union(QueryCapabilities::UPDATE)
+                .union(QueryCapabilities::DELETE),
             PropertyDiscriminants::OverflowChainIntegrity => QueryCapabilities::INSERT
                 .union(QueryCapabilities::UPDATE)
                 .union(QueryCapabilities::DELETE)

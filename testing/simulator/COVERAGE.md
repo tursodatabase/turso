@@ -59,6 +59,7 @@ simulator covers and tests.
 | ROLLBACK TRANSACTION      | Partial | TODO                                                                              |
 | ROLLBACK TO SAVEPOINT     | Partial | Covered by SavepointRollback property.                                            |
 | SAVEPOINT                 | Partial | Covered by SavepointRollback property.                                            |
+| Nested savepoints         | Partial | Covered by NestedSavepointConsistency property (2-4 levels, mixed close actions). |
 | SELECT                    | Partial | TODO                                                                              |
 | SELECT ... WHERE          | Partial | TODO                                                                              |
 | SELECT ... WHERE ... LIKE | No      |                                                                                   |

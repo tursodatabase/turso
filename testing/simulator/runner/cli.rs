@@ -153,6 +153,12 @@ pub struct SimulatorCLI {
     pub disable_savepoint_rollback: bool,
     #[clap(
         long,
+        help = "disable Nested-Savepoint-Consistency Property",
+        default_value_t = false
+    )]
+    pub disable_nested_savepoint_consistency: bool,
+    #[clap(
+        long,
         help = "disable Overflow-Chain-Integrity Property",
         default_value_t = false
     )]
