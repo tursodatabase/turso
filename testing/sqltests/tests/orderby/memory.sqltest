@@ -53,6 +53,42 @@ expect {
 }
 
 @cross-check-integrity
+test orderby_correlated_subquery_allows_result_alias_outer_ref {
+    CREATE TABLE outer_t(a, b, c);
+    CREATE TABLE inner_t(x);
+    INSERT INTO outer_t VALUES (1, 2, 3);
+    INSERT INTO inner_t VALUES (9);
+    SELECT EXISTS(SELECT c AS y FROM inner_t ORDER BY y) FROM outer_t;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test orderby_correlated_subquery_rejects_direct_outer_ref {
+    CREATE TABLE outer_t(a, b, c);
+    CREATE TABLE inner_t(x);
+    INSERT INTO outer_t VALUES (1, 2, 3);
+    INSERT INTO inner_t VALUES (9);
+    SELECT EXISTS(SELECT 1 FROM inner_t ORDER BY c) FROM outer_t;
+}
+expect error {
+    no such column: c
+}
+
+@cross-check-integrity
+test orderby_delete_subquery_rejects_direct_outer_ref {
+    CREATE TABLE outer_t(a, b, c);
+    CREATE TABLE inner_t(x);
+    INSERT INTO outer_t VALUES (1, 2, 3);
+    INSERT INTO inner_t VALUES (9);
+    DELETE FROM outer_t WHERE EXISTS(SELECT 1 FROM inner_t ORDER BY c);
+}
+expect error {
+    no such column: c
+}
+
+@cross-check-integrity
 test order_by_ambiguous_column {
     CREATE TABLE a(id INT, value INT);
     INSERT INTO a VALUES (1, 10), (2, 20);
@@ -229,4 +265,3 @@ test order-by-zero {
 expect error {
     1st ORDER BY term out of range - should be between 1 and 2
 }
-

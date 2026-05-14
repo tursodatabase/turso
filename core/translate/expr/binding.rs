@@ -5,12 +5,31 @@ use super::*;
 pub enum BindingBehavior {
     /// `TryResultColumnsFirst` means that result columns (e.g. SELECT x AS y, ...) take precedence over canonical columns (e.g. SELECT x, y AS z, ...). This is the default behavior.
     TryResultColumnsFirst,
+    /// Like `TryResultColumnsFirst`, but unresolved identifiers must not fall back to outer query references. SQLite applies this to ORDER BY in subqueries.
+    TryResultColumnsFirstNoOuterReferences,
     /// `TryCanonicalColumnsFirst` means that canonical columns take precedence over result columns. This is used for e.g. WHERE clauses.
     TryCanonicalColumnsFirst,
     /// `ResultColumnsNotAllowed` means that referring to result columns is not allowed. This is used e.g. for DML statements.
     ResultColumnsNotAllowed,
     /// `AllowUnboundIdentifiers` means that unbound identifiers are allowed. This is used for INSERT ... ON CONFLICT DO UPDATE SET ... where binding is handled later than this phase.
     AllowUnboundIdentifiers,
+}
+
+impl BindingBehavior {
+    fn tries_result_columns_first(&self) -> bool {
+        matches!(
+            self,
+            BindingBehavior::TryResultColumnsFirst
+                | BindingBehavior::TryResultColumnsFirstNoOuterReferences
+        )
+    }
+
+    fn allows_outer_query_refs(&self) -> bool {
+        !matches!(
+            self,
+            BindingBehavior::TryResultColumnsFirstNoOuterReferences
+        )
+    }
 }
 
 /// The result of resolving the `<id>` half of a qualified `<tbl>.<id>`
@@ -96,7 +115,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     };
                     let normalized_id = normalize_ident(id.as_str());
 
-                    if binding_behavior == BindingBehavior::TryResultColumnsFirst {
+                    if binding_behavior.tries_result_columns_first() {
                         if let Some(result_columns) = result_columns {
                             for result_column in result_columns.iter() {
                                 if let Some(alias) = &result_column.alias {
@@ -172,7 +191,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     //
                     // Ambiguity is only checked within the same scope depth. Once a match
                     // is found at depth N, deeper scopes (N+1, N+2, ...) are not checked.
-                    if match_result.is_none() {
+                    if match_result.is_none() && binding_behavior.allows_outer_query_refs() {
                         let mut matched_scope_depth = None;
                         for outer_ref in referenced_tables.outer_query_refs().iter() {
                             // CTEs (FromClauseSubquery) in outer_query_refs are only for table
@@ -334,7 +353,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     // that a subquery's FROM clause can *look up* the CTE by name; once the
                     // CTE is consumed into a FROM, column resolution must go through the
                     // corresponding `joined_table`, not the definition-only ref.
-                    if !identifier_matched {
+                    if !identifier_matched && binding_behavior.allows_outer_query_refs() {
                         let nearest_outer_scope = referenced_tables
                             .outer_query_refs()
                             .iter()
