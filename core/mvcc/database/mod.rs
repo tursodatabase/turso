@@ -387,12 +387,6 @@ impl LogRecord {
         }
     }
 
-    /// Plaintext payload size: bytes contributed by serialized ops, excluding
-    /// the pre-reserved framing prefix at the front of `buf`.
-    pub(crate) fn payload_size(&self) -> usize {
-        self.buf.len() - crate::mvcc::persistent_storage::logical_log::LOG_RECORD_PREFIX_SIZE
-    }
-
     /// True iff no ops (row versions or header) have been appended.
     pub fn is_empty(&self) -> bool {
         self.op_count == 0
