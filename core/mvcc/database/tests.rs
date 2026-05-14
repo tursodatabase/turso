@@ -3508,13 +3508,13 @@ fn test_future_row() {
 }
 
 use crate::mvcc::cursor::MvccLazyCursor;
+use crate::mvcc::database::CommitYieldPoint::LogRecordPrepared;
 use crate::mvcc::database::{MvStore, Row, RowID};
 use crate::types::Text;
 use crate::Value;
 use crate::{Database, StepResult};
 use crate::{MemoryIO, Statement};
 use crate::{ValueRef, DATABASE_MANAGER};
-
 // Simple atomic clock implementation for testing
 
 fn setup_test_db() -> (MvccTestDb, u64, MVTableId, i64) {
@@ -10968,4 +10968,201 @@ fn dropped_attached_commit_rolls_back_remaining_attached_mvcc_txs() {
         !aux2_pager.holds_read_lock(),
         "attached aux2 pager read lock must be released"
     );
+}
+
+/// DurableStorage::log_tx returning Busy should not leak pager_commit_lock.
+/// https://github.com/tursodatabase/turso/issues/6753.
+#[test]
+fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
+    use crate::io::FileSyncType;
+    use crate::mvcc;
+    use crate::mvcc::database::LogRecord;
+    use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
+    use crate::mvcc::persistent_storage::DurableStorage;
+    use crate::storage::encryption::EncryptionContext;
+    use crate::{CheckpointResult, File, Result, IO};
+    use std::time::Duration;
+
+    /// BusyOnLogTxStorage is a test double that can be stubbed to return [LimboError::Busy] from log_tx.
+    #[derive(Debug)]
+    struct BusyOnLogTxStorage {
+        inner: Arc<dyn DurableStorage>,
+        arm_log_tx_busy: AtomicBool,
+    }
+    impl BusyOnLogTxStorage {
+        fn new(inner: Arc<dyn DurableStorage>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                arm_log_tx_busy: AtomicBool::new(false),
+            })
+        }
+        fn arm(&self) {
+            self.arm_log_tx_busy.store(true, Ordering::Release);
+        }
+    }
+    impl DurableStorage for BusyOnLogTxStorage {
+        fn log_tx(
+            &self,
+            m: &LogRecord,
+            c: OnSerializationComplete<'_>,
+        ) -> Result<(Completion, u64)> {
+            if self.arm_log_tx_busy.swap(false, Ordering::AcqRel) {
+                return Err(LimboError::Busy);
+            }
+            self.inner.log_tx(m, c)
+        }
+        fn sync(&self, t: FileSyncType) -> Result<Completion> {
+            self.inner.sync(t)
+        }
+        fn update_header(&self) -> Result<Completion> {
+            self.inner.update_header()
+        }
+        fn truncate(&self) -> Result<Completion> {
+            self.inner.truncate()
+        }
+        fn get_logical_log_file(&self) -> Arc<dyn File> {
+            self.inner.get_logical_log_file()
+        }
+        fn should_checkpoint(&self) -> bool {
+            self.inner.should_checkpoint()
+        }
+        fn set_checkpoint_threshold(&self, t: i64) {
+            self.inner.set_checkpoint_threshold(t)
+        }
+        fn checkpoint_threshold(&self) -> i64 {
+            self.inner.checkpoint_threshold()
+        }
+        fn advance_logical_log_offset_after_success(&self, b: u64) {
+            self.inner.advance_logical_log_offset_after_success(b)
+        }
+        fn restore_logical_log_state_after_recovery(&self, o: u64, c: u32) {
+            self.inner.restore_logical_log_state_after_recovery(o, c)
+        }
+        fn set_header(&self, h: LogHeader) {
+            self.inner.set_header(h)
+        }
+        fn on_checkpoint_start(&self, m: u64) -> Result<()> {
+            self.inner.on_checkpoint_start(m)
+        }
+        fn on_checkpoint_end(&self, m: u64, r: Result<&CheckpointResult>) -> Result<()> {
+            self.inner.on_checkpoint_end(m, r)
+        }
+        fn encryption_ctx(&self) -> Option<EncryptionContext> {
+            self.inner.encryption_ctx()
+        }
+    }
+
+    fn drive_to_done_or_timeout(stmt: &mut Statement, budget: usize) {
+        for _ in 0..budget {
+            match stmt.step() {
+                Ok(StepResult::Done) => return,
+                Ok(StepResult::IO) => std::thread::sleep(Duration::from_millis(10)),
+                Ok(other) => panic!("unexpected step: {other:?}"),
+                Err(error) => panic!("received error: {error}"),
+            }
+        }
+        panic!("budged elapsed: {budget} iterations");
+    }
+
+    // Step 1: open normally so PRAGMA journal_mode=mvcc creates the logical log.
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}.db", rand::random::<u64>()));
+    let path_str = path.to_str().unwrap().to_string();
+    {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            &path_str,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+        DATABASE_MANAGER.lock().clear();
+    }
+
+    // Step 3: re-open with the busy-on-log_tx storage wrapper.
+    let log_path = path.with_extension("db-log");
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let log_file = io
+        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)
+        .unwrap();
+    let inner_storage: Arc<dyn DurableStorage> = Arc::new(mvcc::persistent_storage::Storage::new(
+        log_file,
+        io.clone(),
+        None,
+    ));
+    let busy_storage = BusyOnLogTxStorage::new(inner_storage);
+    let db = Database::open_file_with_flags_and_durable_storage(
+        io,
+        &path_str,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Some(busy_storage.clone() as Arc<dyn DurableStorage>),
+    )
+    .unwrap();
+
+    let conn_a = db.connect().unwrap();
+    let conn_b = db.connect().unwrap();
+    conn_a
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    let mv_store: Arc<MvStore<MvccClock>> = db.get_mv_store().clone().unwrap();
+
+    // Step 3: open a CONCURRENT tx, do an INSERT, then arm log_tx Busy.
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let tx_a = conn_a
+        .get_mv_tx_id()
+        .expect("tx_a must be open after INSERT");
+    assert!(
+        !mv_store.is_exclusive_tx(&tx_a),
+        "tx_a must be CONCURRENT (non-exclusive) so it goes through BeginCommitLogicalLog"
+    );
+    busy_storage.arm();
+
+    conn_a
+        .execute("COMMIT")
+        .expect_err("COMMIT must surface the injected Busy from log_tx");
+
+    // Step 4: from another CONCURRENT tx, do an INSERT; the INSERT should go through.
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+
+    let mut commit_b = conn_b.prepare("COMMIT").unwrap();
+    drive_to_done_or_timeout(&mut commit_b, 30); // this times out if pager_commit_lock is leaked
+}
+
+// https://github.com/tursodatabase/turso/issues/6757
+#[test]
+fn test_dropped_commit_corrupts_subsequent_insert() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    let conn = db.connect();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
+    conn.set_yield_injector(Some(FixedYieldInjector::new([LogRecordPrepared.point()])));
+
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            StepResult::IO | StepResult::Done => {}
+            other => panic!("unexpected step result: {other:?}"),
+        };
+    }
+
+    conn.execute("INSERT INTO t VALUES (2, 'second')").unwrap();
 }
