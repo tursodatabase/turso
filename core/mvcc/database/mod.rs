@@ -992,6 +992,7 @@ pub(crate) enum CommitYieldPoint {
     WaitForDependencies,
     LogRecordPrepared,
     BeforeCommittedTimestampWatermarkUpdate,
+    BeforeFinishCommittedTx,
     /// Boundary right after `remove_tx` runs but before the connection cache
     /// is cleared by the caller at vdbe/mod.rs. Used for failure injection
     /// to reproduce divergence between `mv_store.txs` and `connection.mv_tx_id`.
@@ -1033,6 +1034,7 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     yield_instance_id: u64,
     did_commit_schema_change: bool,
     tx_id: TxID,
+    mvcc_store: Arc<MvStore<Clock>>,
     connection: Arc<Connection>,
     /// Database index this commit is for (`MAIN_DB_ID` or an attached-db id).
     /// Threaded through so that `finish_committed_tx` can clear the matching
@@ -1054,6 +1056,12 @@ impl<Clock: LogicalClock> Debug for CommitStateMachine<Clock> {
             .field("state", &self.state)
             .field("is_finalized", &self.is_finalized)
             .finish()
+    }
+}
+
+impl<Clock: LogicalClock> Drop for CommitStateMachine<Clock> {
+    fn drop(&mut self) {
+        self.cleanup_unfinished_commit();
     }
 }
 
@@ -1093,55 +1101,11 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         }
     }
 
-    /// Release `pager_commit_lock` / `exclusive_tx` and roll back the in-flight
-    /// MVCC tx when the commit state machine has been abandoned mid-flight —
-    /// either because the wrapping Statement was dropped during an IO yield
-    /// (issues #6757 / #6755) or because a fallible helper like `log_tx`
-    /// returned an error and the VDBE abort handler's no-rollback list would
-    /// otherwise skip rollback (issue #6753).
-    ///
-    /// Gates `rollback_tx` on `is_tx_rollbackable` rather than bare `contains_key`:
-    /// `rollback_tx` asserts the tx state is `Active | Preparing(_)`, so we
-    /// must skip it if the tx already reached `Committed` in `CommitEnd` but
-    /// has not yet been removed from `txs`. The else-arm covers the narrow
-    /// window after `release_exclusive_tx` but before `finish_committed_tx`.
-    ///
-    /// For main-DB cleanups, also end the pager read tx and reset
-    /// `transaction_state` — matching what `Connection::rollback_current_txn_state`
-    /// would do. Without this, the next `op_transaction` either skips
-    /// `begin_read_tx` (stale `Write` state) or panics in `wal.begin_read_tx`
-    /// (pre-existing read lock not released).
-    ///
-    /// Returns true when cleanup actually ran, false if the state machine was
-    /// already finalized.
-    pub(crate) fn cleanup_abandoned_commit(&mut self, mv_store: &MvStore<Clock>) -> bool {
-        if self.is_finalized {
-            return false;
-        }
-        self.is_finalized = true;
-        if mv_store.is_tx_rollbackable(self.tx_id) {
-            mv_store.rollback_tx(self.tx_id, self.pager.clone(), &self.connection, self.db_id);
-        } else if mv_store.is_exclusive_tx(&self.tx_id) {
-            mv_store.release_exclusive_tx(&self.tx_id);
-            self.commit_coordinator.pager_commit_lock.unlock();
-            let tx = mv_store.txs.get(&self.tx_id).unwrap_or_else(|| {
-                panic!("tx id {} not found in cleanup_abandoned_commit", self.tx_id)
-            });
-            if tx.value().pager_commit_lock_held.load(Ordering::Acquire) {
-                self.commit_coordinator.pager_commit_lock.unlock();
-            }
-        }
-        if self.db_id == crate::MAIN_DB_ID {
-            self.pager.end_read_tx();
-            self.connection
-                .set_tx_state(crate::connection::TransactionState::None);
-        }
-        true
-    }
-
+    #[allow(clippy::too_many_arguments)]
     fn new(
         state: CommitState<Clock>,
         tx_id: TxID,
+        mvcc_store: Arc<MvStore<Clock>>,
         connection: Arc<Connection>,
         db_id: usize,
         commit_coordinator: Arc<CommitCoordinator>,
@@ -1167,6 +1131,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             yield_instance_id: connection.next_yield_instance_id(),
             did_commit_schema_change: schema_did_change_from_tx,
             tx_id,
+            mvcc_store,
             connection,
             db_id,
             commit_coordinator,
@@ -1176,6 +1141,50 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             sync_mode,
             _phantom: PhantomData,
         }
+    }
+
+    fn cleanup_unfinished_commit(&mut self) {
+        if !self.is_finalized {
+            self.cleanup_mvcc_checkpoint_state();
+            if !matches!(self.state, CommitState::Checkpoint { .. }) {
+                self.mvcc_store.cleanup_dropped_commit(
+                    self.tx_id,
+                    self.connection.as_ref(),
+                    self.db_id,
+                );
+            }
+            self.end_read_tx_for_db();
+            if self.db_id == crate::MAIN_DB_ID {
+                self.connection
+                    .set_tx_state(crate::connection::TransactionState::None);
+            }
+        }
+
+        let tx_id = self.tx_id;
+        let db_id = self.db_id;
+        turso_assert!(
+            self.mvcc_store.txs.get(&tx_id).is_none(),
+            "MVCC tx should be removed from txs after a successful commit",
+            { "tx_id": tx_id }
+        );
+        turso_assert!(
+            !self.mvcc_store.is_exclusive_tx(&tx_id),
+            "MVCC tx should not still hold the exclusive slot after a successful commit",
+            { "tx_id": tx_id }
+        );
+        turso_assert!(
+            self.connection.get_mv_tx_id_for_db(db_id) != Some(tx_id),
+            "Connection should not still reference an MVCC tx after a successful commit",
+            { "tx_id": tx_id, "db_id": db_id }
+        );
+    }
+
+    fn end_read_tx_for_db(&self) {
+        if let Ok(pager) = self.connection.get_pager_from_database_index(&self.db_id) {
+            pager.end_read_tx();
+            return;
+        }
+        self.pager.end_read_tx();
     }
 
     /// Validates commit-time write-write conflicts for one table row key.
@@ -1868,13 +1877,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
                 if !mvcc_store.is_exclusive_tx(&self.tx_id) {
                     // logical log needs to be serialized.
-                    //
-                    // Look up the tx BEFORE acquiring `pager_commit_lock` so
-                    // an `?` on a vanished tx cannot strand the lock. With
-                    // the previous order (acquire → fallible txs.get → set
-                    // flag) any Err between acquire and flag-set would leave
-                    // the lock held with no per-tx flag to signal release
-                    // (#6905).
                     let tx = mvcc_store
                         .txs
                         .get(&self.tx_id)
@@ -1918,7 +1920,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 }
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
-                let connection = self.connection.clone();
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
@@ -1933,8 +1934,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .map(|header| header.schema_cookie.get())
                         != Some(tx_header.schema_cookie.get());
                 if schema_did_change {
-                    let schema = connection.schema.read().clone();
-                    connection.db.update_schema_if_newer(schema);
+                    let schema = self.connection.schema.read().clone();
+                    self.connection.db.update_schema_if_newer(schema);
                 }
                 self.header.write().replace(tx_header);
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
@@ -2036,6 +2037,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 if mvcc_store.is_exclusive_tx(&self.tx_id) {
                     mvcc_store.release_exclusive_tx(&self.tx_id);
                 }
+                inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                 if mvcc_store.storage.should_checkpoint() {
@@ -3775,7 +3777,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ///
     /// * `tx_id` - The ID of the transaction to commit.
     pub fn commit_tx(
-        &self,
+        self: &Arc<Self>,
         tx_id: TxID,
         connection: &Arc<Connection>,
         db_id: usize,
@@ -3783,6 +3785,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let state = Box::new(CommitStateMachine::new(
             CommitState::Initial,
             tx_id,
+            self.clone(),
             connection.clone(),
             db_id,
             self.commit_coordinator.clone(),
@@ -3813,12 +3816,18 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// * `tx_id` - The ID of the transaction to abort.
     /// * `db` - The database index this transaction belongs to.
     pub fn rollback_tx(&self, tx_id: TxID, _pager: Arc<Pager>, connection: &Connection, db: usize) {
+        self.rollback_tx_inner(tx_id, Some(connection), db);
+    }
+
+    fn rollback_tx_inner(&self, tx_id: TxID, connection: Option<&Connection>, db: usize) {
         let tx_unlocked = self
             .txs
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx_unlocked.value();
-        connection.set_mv_tx_for_db(db, None);
+        if let Some(connection) = connection {
+            connection.set_mv_tx_for_db(db, None);
+        }
         turso_assert!(matches!(
             tx.state.load(),
             TransactionState::Active | TransactionState::Preparing(_)
@@ -3856,9 +3865,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         }
 
-        if connection.schema.read().schema_version > connection.db.schema.lock().schema_version {
-            // Connection made schema changes during tx and rolled back -> revert connection-local schema.
-            *connection.schema.write() = connection.db.clone_schema();
+        if let Some(connection) = connection {
+            if connection.schema.read().schema_version > connection.db.schema.lock().schema_version
+            {
+                // Connection made schema changes during tx and rolled back -> revert connection-local schema.
+                *connection.schema.write() = connection.db.clone_schema();
+            }
         }
 
         let tx = tx_unlocked.value();
@@ -3871,6 +3883,32 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // read lock), so no future txs.get() for this tx_id can come from a
         // speculative read path.
         self.remove_tx(tx_id);
+    }
+
+    fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
+        let tx_state = self.txs.get(&tx_id).map(|tx| tx.value().state.load());
+        match tx_state {
+            Some(TransactionState::Active | TransactionState::Preparing(_)) => {
+                self.rollback_tx_inner(tx_id, Some(connection), db_id);
+            }
+            Some(TransactionState::Committed(_)) => {
+                if let Some(tx) = self.txs.get(&tx_id) {
+                    self.unlock_commit_lock_if_held(tx.value());
+                }
+                if self.is_exclusive_tx(&tx_id) {
+                    self.release_exclusive_tx(&tx_id);
+                }
+                self.finish_committed_tx(tx_id, connection, db_id);
+            }
+            Some(TransactionState::Aborted | TransactionState::Terminated) | None => {
+                if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
+                    connection.set_mv_tx_for_db(db_id, None);
+                }
+                if self.is_exclusive_tx(&tx_id) {
+                    self.release_exclusive_tx(&tx_id);
+                }
+            }
+        }
     }
 
     fn unlock_commit_lock_if_held(&self, tx: &Transaction) {
