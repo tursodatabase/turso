@@ -1,7 +1,8 @@
 use crate::translate::expr::emit_table_column;
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
-    schema::{GeneratedType, Index, Schema, Table},
+    schema::{GeneratedType, Index, Schema, Table, EXPR_INDEX_SENTINEL},
     translate::{
         emitter::Resolver,
         expr::{
@@ -24,7 +25,9 @@ pub const MAX_INTEGRITY_CHECK_ERRORS: usize = 100;
 
 enum BoundIndexColumn {
     Column(usize),
-    Expr(Box<ast::Expr>),
+    /// The affiniy is `Some` when the index column refers to a virtual generated column
+    /// (the affinity is the column's declared type).
+    Expr(Box<ast::Expr>, Option<Affinity>),
 }
 
 struct BoundIntegrityIndex {
@@ -267,11 +270,16 @@ fn translate_integrity_check_impl(
                 let mut unique_nullable = Vec::with_capacity(index.columns.len());
                 for col in &index.columns {
                     if let Some(expr) = col.expr.as_deref() {
-                        columns.push(BoundIndexColumn::Expr(Box::new(bind_expr_for_table(
-                            expr,
-                            &mut table_references,
-                            resolver,
-                        )?)));
+                        let affinity = if col.pos_in_table != EXPR_INDEX_SENTINEL {
+                            Some(btree_table.columns()[col.pos_in_table].affinity())
+                        } else {
+                            // expression indexes don't apply affinity from the basae table
+                            None
+                        };
+                        columns.push(BoundIndexColumn::Expr(
+                            Box::new(bind_expr_for_table(expr, &mut table_references, resolver)?),
+                            affinity,
+                        ));
                         unique_nullable.push(true);
                     } else {
                         columns.push(BoundIndexColumn::Column(col.pos_in_table));
@@ -310,7 +318,10 @@ fn translate_integrity_check_impl(
                     GeneratedType::Virtual { expr, .. } => {
                         let bound =
                             bind_expr_for_table(expr, &mut table_references, resolver).ok()?;
-                        Some((BoundIndexColumn::Expr(Box::new(bound)), name))
+                        Some((
+                            BoundIndexColumn::Expr(Box::new(bound), Some(col.affinity())),
+                            name,
+                        ))
                     }
                     GeneratedType::NotGenerated => Some((BoundIndexColumn::Column(idx), name)),
                 }
@@ -340,7 +351,7 @@ fn translate_integrity_check_impl(
                 BoundIndexColumn::Column(idx) => {
                     program.emit_column_or_rowid(table_cursor_id, *idx, col_value_reg);
                 }
-                BoundIndexColumn::Expr(expr) => {
+                BoundIndexColumn::Expr(expr, _affinity) => {
                     let self_table_context = table_references.joined_tables().first().map(|jt| {
                         SelfTableContext::ForSelect {
                             table_ref_id: jt.internal_id,
@@ -452,7 +463,7 @@ fn translate_integrity_check_impl(
                             resolver,
                         )?;
                     }
-                    BoundIndexColumn::Expr(expr) => {
+                    BoundIndexColumn::Expr(expr, affinity) => {
                         let self_table_context =
                             table_references.joined_tables().first().map(|jt| {
                                 SelfTableContext::ForSelect {
@@ -475,7 +486,10 @@ fn translate_integrity_check_impl(
                                 )?;
                                 Ok(())
                             },
-                        )?
+                        )?;
+                        if let Some(aff) = affinity {
+                            program.emit_column_affinity(target, *aff);
+                        }
                     }
                 }
             }
