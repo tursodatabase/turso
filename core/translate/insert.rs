@@ -3480,7 +3480,7 @@ fn emit_index_column_value_for_insert(
             table,
             dest_reg,
         )?;
-        // For virtual generated column references, apply the column's 
+        // For virtual generated column references, apply the column's
         // declared affinity to the computed expression result.
         if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
             let column = &table.columns()[idx_col.pos_in_table];
