@@ -1873,8 +1873,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     // the previous order (acquire → fallible txs.get → set
                     // flag) any Err between acquire and flag-set would leave
                     // the lock held with no per-tx flag to signal release
-                    // (#6905). Holding the dashmap Ref across the try-lock
-                    // is safe — `pager_commit_lock.write()` does not block.
+                    // (#6905).
                     let tx = mvcc_store
                         .txs
                         .get(&self.tx_id)
@@ -3512,11 +3511,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         // Hoist: validate the existing tx still exists and snapshot the
         // `pager_commit_lock_held` flag BEFORE acquiring `pager_commit_lock`,
-        // so a vanished tx cannot strand the lock (#6905). The dashmap `Ref`
-        // is scoped to this block — we must NOT hold it across
-        // `get_new_transaction_database_header` further down, which blocks on
-        // I/O via `pager.io.block(...)`. Re-fetch the Ref later for the
-        // synchronous flag-store + header-write.
+        // so a vanished tx cannot strand the lock (#6905).
         let already_holds_commit_lock = match maybe_existing_tx_id {
             Some(existing_tx_id) => {
                 let tx = self.txs.get(&existing_tx_id).ok_or_else(|| {
