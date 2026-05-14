@@ -54,3 +54,25 @@ impl Display for Pragma {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Pragma, WalCheckpointMode};
+
+    #[test]
+    fn formats_wal_checkpoint_modes() {
+        let cases = [
+            (WalCheckpointMode::Passive, "PRAGMA wal_checkpoint(PASSIVE)"),
+            (WalCheckpointMode::Full, "PRAGMA wal_checkpoint(FULL)"),
+            (WalCheckpointMode::Restart, "PRAGMA wal_checkpoint(RESTART)"),
+            (
+                WalCheckpointMode::Truncate,
+                "PRAGMA wal_checkpoint(TRUNCATE)",
+            ),
+        ];
+
+        for (mode, expected) in cases {
+            assert_eq!(Pragma::WalCheckpoint(mode).to_string(), expected);
+        }
+    }
+}
