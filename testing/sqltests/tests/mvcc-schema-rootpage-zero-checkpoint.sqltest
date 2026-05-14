@@ -1,0 +1,52 @@
+@database :temp:
+@skip-file-if sqlite "MVCC is not supported in SQLite"
+@backend cli
+
+# Regression for https://github.com/tursodatabase/turso/issues/6938:
+# rootpage-0 sqlite_schema rows (views/triggers) that are created and dropped
+# before the first MVCC checkpoint never exist in the physical sqlite_schema
+# b-tree, so checkpoint must not try to delete them from pager storage.
+
+@requires trigger "requires trigger support"
+test mvcc-drop-uncheckpointed-trigger-then-checkpoint {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, u TEXT UNIQUE, v TEXT);
+    CREATE TRIGGER tr_ai AFTER INSERT ON t BEGIN SELECT RAISE(ABORT,'boom'); END;
+    DROP TRIGGER tr_ai;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    PRAGMA integrity_check;
+}
+expect {
+    mvcc
+    0|0|0
+    ok
+}
+
+test mvcc-drop-uncheckpointed-view-then-checkpoint {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    CREATE VIEW v_t AS SELECT v FROM t;
+    DROP VIEW v_t;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    PRAGMA integrity_check;
+}
+expect {
+    mvcc
+    0|0|0
+    ok
+}
+
+@requires trigger "requires trigger support"
+test mvcc-drop-uncheckpointed-table-with-trigger-then-checkpoint {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;
+    DROP TABLE t;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    PRAGMA integrity_check;
+}
+expect {
+    mvcc
+    0|0|0
+    ok
+}

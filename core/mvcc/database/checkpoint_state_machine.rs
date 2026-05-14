@@ -467,11 +467,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 });
             // - It is a delete, AND some version of the row exists in the database file.
             let is_delete_and_exists_in_db_file = end_ts.is_some() && exists_in_db_file;
-            // - It is a delete of a sqlite_schema row that hasn't been checkpointed yet. We need to
-            //   return these even if they don't exist in the DB file so we can track destroyed
-            //   tables/indexes and skip their data rows.
+            // - It is a delete of a b-tree-backed sqlite_schema row that hasn't been checkpointed
+            //   yet. We need to return these even if they don't exist in the DB file so we can track
+            //   destroyed tables/indexes and skip their data/index rows.
+            //
+            //   Rootpage-0 schema objects (views/triggers) do not own a b-tree. If they were created
+            //   and dropped before any checkpoint, there is no physical sqlite_schema row to delete;
+            //   checkpointing them would try to delete a never-written row from the pager b-tree.
             let is_schema_delete = table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
                 && !exists_in_db_file
+                && sqlite_schema_btree_identity(version).is_some()
                 && self
                     .durable_txid_max_old
                     .is_none_or(|txid_max_old| end_ts.is_some_and(|e| e > u64::from(txid_max_old)));
@@ -1905,6 +1910,47 @@ mod tests {
 
         assert_eq!(sqlite_schema_btree_identity(&tombstone), None);
         assert!(!is_schema_metadata_only_rewrite(&tombstone, None));
+    }
+
+    #[test]
+    fn checkpoint_skips_never_checkpointed_rootpage_zero_schema_delete() {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        let checkpoint = CheckpointStateMachine::new(
+            conn.pager.load().clone(),
+            db.get_mvcc_store(),
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+        );
+        let trigger = sqlite_schema_row_version(9, "trigger", "trg_t", "t", 0, Some(1), Some(2));
+
+        let versions =
+            checkpoint.maybe_get_checkpointable_versions(&[trigger], SQLITE_SCHEMA_MVCC_TABLE_ID);
+
+        assert!(
+            versions.is_empty(),
+            "a rootpage-0 trigger/view created and dropped before checkpoint has no physical sqlite_schema row to delete"
+        );
+    }
+
+    #[test]
+    fn checkpoint_tracks_never_checkpointed_btree_schema_delete() {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        let checkpoint = CheckpointStateMachine::new(
+            conn.pager.load().clone(),
+            db.get_mvcc_store(),
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+        );
+        let table = sqlite_schema_row_version(2, "table", "t", "t", -2, Some(1), Some(2));
+
+        let versions = checkpoint
+            .maybe_get_checkpointable_versions(&[table.clone()], SQLITE_SCHEMA_MVCC_TABLE_ID);
+
+        assert_eq!(versions.as_slice(), &[table]);
     }
 
     fn index_row_version(
