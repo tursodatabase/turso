@@ -2884,7 +2884,8 @@ fn test_checkpoint_stale_unique_index_delete_with_out_of_order_commit_yield() {
 /// Steps:
 /// 1. Disable automatic checkpoints and create a baseline table.
 /// 2. Checkpoint the baseline state so the durable boundary is non-zero.
-/// 3. Start an older concurrent transaction and yield it after it takes a commit timestamp.
+/// 3. Start an older concurrent transaction and yield it after it commits, releases the
+///    commit lock, and is just about to update the committed timestamp watermark.
 /// 4. Commit a newer `CREATE TABLE` plus row insert through ordinary SQL.
 /// 5. Resume the older transaction; without a monotonic committed watermark this regresses
 ///    the checkpoint boundary source.
@@ -2910,12 +2911,12 @@ fn test_checkpoint_stale_boundary_does_not_replay_checkpointed_create_table_afte
             .execute("UPDATE s SET v = 'older_commit' WHERE id = 1")
             .unwrap();
         older.set_yield_injector(Some(FixedYieldInjector::new([
-            CommitYieldPoint::LogRecordPrepared.point(),
+            CommitYieldPoint::BeforeCommittedTimestampWatermarkUpdate.point(),
         ])));
         let mut older_commit = older.prepare("COMMIT").unwrap();
         assert!(
             matches!(older_commit.step().unwrap(), StepResult::IO),
-            "older commit should yield after taking its commit timestamp"
+            "older commit should yield before updating the committed timestamp watermark"
         );
 
         let creator = db.connect();
