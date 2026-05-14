@@ -137,21 +137,30 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
 
 /// Flatten an ast::Expr::Binary(lhs, OR, rhs) into a list of disjuncts.
 fn flatten_or_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
-    let Expr::Binary(lhs, Operator::Or, rhs) = expr else {
-        return Ok(vec![expr]);
-    };
-    let mut flattened = flatten_or_expr_owned(*lhs)?;
-    flattened.extend(flatten_or_expr_owned(*rhs)?);
-    Ok(flattened)
+    flatten_binary_expr_owned(expr, Operator::Or)
 }
 
 /// Flatten an ast::Expr::Binary(lhs, AND, rhs) into a list of conjuncts.
 fn flatten_and_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
-    let Expr::Binary(lhs, Operator::And, rhs) = expr else {
-        return Ok(vec![expr]);
-    };
-    let mut flattened = flatten_and_expr_owned(*lhs)?;
-    flattened.extend(flatten_and_expr_owned(*rhs)?);
+    flatten_binary_expr_owned(expr, Operator::And)
+}
+
+fn flatten_binary_expr_owned(expr: Expr, operator: Operator) -> Result<Vec<Expr>> {
+    let mut stack = vec![expr];
+    let mut flattened = Vec::new();
+
+    while let Some(expr) = stack.pop() {
+        match expr {
+            Expr::Binary(lhs, op, rhs) if op == operator => {
+                // Push right before left so the LIFO stack preserves the
+                // original left-to-right operand order without recursion.
+                stack.push(*rhs);
+                stack.push(*lhs);
+            }
+            expr => flattened.push(expr),
+        }
+    }
+
     Ok(flattened)
 }
 
@@ -610,5 +619,54 @@ mod tests {
         assert_eq!(nonconsumed_terms[0].expr, a_expr);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_flatten_or_expr_deep_chain_without_recursion() -> Result<()> {
+        let expr = build_binary_chain(Operator::Or, 2048);
+        let flattened = flatten_or_expr_owned(expr)?;
+
+        assert_eq!(flattened.len(), 2048);
+        assert_eq!(
+            flattened.first(),
+            Some(&Expr::Literal(Literal::Numeric("0".to_string())))
+        );
+        assert_eq!(
+            flattened.last(),
+            Some(&Expr::Literal(Literal::Numeric("2047".to_string())))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_flatten_and_expr_deep_chain_without_recursion() -> Result<()> {
+        let expr = build_binary_chain(Operator::And, 2048);
+        let flattened = flatten_and_expr_owned(expr)?;
+
+        assert_eq!(flattened.len(), 2048);
+        assert_eq!(
+            flattened.first(),
+            Some(&Expr::Literal(Literal::Numeric("0".to_string())))
+        );
+        assert_eq!(
+            flattened.last(),
+            Some(&Expr::Literal(Literal::Numeric("2047".to_string())))
+        );
+
+        Ok(())
+    }
+
+    fn build_binary_chain(operator: Operator, len: usize) -> Expr {
+        assert!(len > 0);
+        let mut expr = Expr::Literal(Literal::Numeric("0".to_string()));
+        for i in 1..len {
+            expr = Expr::Binary(
+                Box::new(expr),
+                operator,
+                Box::new(Expr::Literal(Literal::Numeric(i.to_string()))),
+            );
+        }
+        expr
     }
 }
