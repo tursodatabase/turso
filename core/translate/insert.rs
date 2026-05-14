@@ -720,7 +720,15 @@ pub fn translate_insert(
             program.emit_insn(Insn::Goto {
                 target_pc: explicit_done_label,
             });
+
+            // Existing row + key <= seq: leave sqlite_sequence untouched (matches
+            // SQLite, which only rewrites the row when the key advances seq —
+            // important for non-numeric seq values like text 'abc' so the
+            // original storage class is preserved).
             program.preassign_label_to_next_insn(skip_seq_update_label);
+            program.emit_insn(Insn::Goto {
+                target_pc: explicit_done_label,
+            });
 
             // Missing sqlite_sequence row: materialize it once with max(existing_seq, explicit_key).
             // For first explicit negative insert this yields seq=0, matching SQLite.
@@ -1679,6 +1687,14 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
     });
 
     program.emit_column_or_rowid(seq_cursor_id, 1, r_seq);
+    // Force r_seq to integer storage class — SQLite emits AddImm r[seq], 0 here
+    // for AUTOINCREMENT; without it a non-numeric sqlite_sequence.seq (e.g.
+    // UPDATE sqlite_sequence SET seq='5abc') flows through MemMax and the
+    // i64::MAX overflow guard as Text and bypasses both.
+    program.emit_insn(Insn::AddImm {
+        register: r_seq,
+        value: 0,
+    });
     program.emit_insn(Insn::RowId {
         cursor_id: seq_cursor_id,
         dest: r_seq_rowid,
