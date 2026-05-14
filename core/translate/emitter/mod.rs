@@ -1804,7 +1804,7 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
-        // For virtual generated column references, apply the column's 
+        // For virtual generated column references, apply the column's
         // declared affinity to the computed expression result.
         if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
             if let Some(table) = program.btree_table_from_cursor(table_cursor_id) {
