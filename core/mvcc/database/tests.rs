@@ -6226,6 +6226,178 @@ fn test_mvcc_integrity_check() {
     ensure_integrity();
 }
 
+#[test]
+fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
+    fn run_pager_until_done<T>(
+        mut action: impl FnMut() -> Result<IOResult<T>>,
+        pager: &Pager,
+    ) -> Result<T> {
+        loop {
+            match action()? {
+                IOResult::Done(value) => return Ok(value),
+                IOResult::IO(io) => io.wait(pager.io.as_ref())?,
+            }
+        }
+    }
+
+    let db = MvccTestDb::new();
+    let pager = db.conn.pager.load().clone();
+    let index = crate::schema::Index {
+        name: "testindex".to_string(),
+        table_name: "test".to_string(),
+        root_page: 0,
+        columns: vec![crate::schema::IndexColumn {
+            name: "id".to_string(),
+            order: turso_parser::ast::SortOrder::Asc,
+            pos_in_table: 0,
+            collation: None,
+            default: None,
+            expr: None,
+        }],
+        unique: true,
+        ephemeral: false,
+        has_rowid: true,
+        where_clause: None,
+        index_method: None,
+        on_conflict: None,
+    };
+
+    pager.begin_read_tx().unwrap();
+    run_pager_until_done(
+        || pager.begin_write_tx(crate::storage::wal::WalAutoActions::all_enabled()),
+        pager.as_ref(),
+    )
+    .unwrap();
+    let root_page = pager
+        .io
+        .block(|| pager.btree_create(&crate::storage::pager::CreateBTreeFlags::new_index()))
+        .unwrap() as i64;
+    let cursor = Arc::new(RwLock::new(BTreeCursor::new_index(
+        pager.clone(),
+        root_page,
+        &index,
+        index.columns.len(),
+    )));
+
+    for key in 1..=600 {
+        let record = ImmutableRecord::from_values(&[Value::from_i64(key), Value::from_i64(key)], 2);
+        let seek_result = run_pager_until_done(
+            || {
+                cursor.write().seek(
+                    crate::types::SeekKey::IndexKey(&record),
+                    crate::types::SeekOp::GE { eq_only: true },
+                )
+            },
+            pager.as_ref(),
+        )
+        .unwrap();
+        if matches!(seek_result, SeekResult::TryAdvance) {
+            run_pager_until_done(|| cursor.write().next(), pager.as_ref()).unwrap();
+        }
+        run_pager_until_done(
+            || cursor.write().insert(&BTreeKey::new_index_key(&record)),
+            pager.as_ref(),
+        )
+        .unwrap();
+    }
+    run_pager_until_done(|| pager.commit_tx(&db.conn, true), pager.as_ref()).unwrap();
+
+    pager.begin_read_tx().unwrap();
+    let mut interior_key = None;
+    for key in 1..=600 {
+        let record = ImmutableRecord::from_values(&[Value::from_i64(key), Value::from_i64(key)], 2);
+        let seek_result = run_pager_until_done(
+            || {
+                cursor.write().seek(
+                    crate::types::SeekKey::IndexKey(&record),
+                    crate::types::SeekOp::GE { eq_only: true },
+                )
+            },
+            pager.as_ref(),
+        )
+        .unwrap();
+        if matches!(seek_result, SeekResult::TryAdvance) {
+            interior_key = Some(key);
+            break;
+        }
+    }
+    let interior_key = interior_key.expect("test setup should create an index interior key");
+    let count_before = run_pager_until_done(|| cursor.write().count(), pager.as_ref()).unwrap();
+
+    run_pager_until_done(
+        || pager.begin_write_tx(crate::storage::wal::WalAutoActions::all_enabled()),
+        pager.as_ref(),
+    )
+    .unwrap();
+    let index_info = Arc::new(IndexInfo::new_from_index(&index));
+    let record = ImmutableRecord::from_values(
+        &[Value::from_i64(interior_key), Value::from_i64(interior_key)],
+        2,
+    );
+    let row_key = SortableIndexKey::new_from_record(record, index_info);
+    let row = Row::new_index_row(
+        RowID::new(MVTableId::new(-42), RowKey::Record(row_key)),
+        index.columns.len(),
+    );
+    let mut write_row_sm = db
+        .mvcc_store
+        .write_row_to_pager(&row, cursor.clone(), true)
+        .unwrap();
+    loop {
+        match write_row_sm.step(&()).unwrap() {
+            IOResult::Done(()) => break,
+            IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
+        }
+    }
+    run_pager_until_done(|| pager.commit_tx(&db.conn, true), pager.as_ref()).unwrap();
+
+    pager.begin_read_tx().unwrap();
+    let count_after = run_pager_until_done(|| cursor.write().count(), pager.as_ref()).unwrap();
+    assert_eq!(
+        count_after, count_before,
+        "checkpoint index writer should overwrite an existing interior key, not insert a duplicate"
+    );
+}
+
+#[test]
+fn test_sql_checkpoint_reinsert_existing_interior_index_key_keeps_sqlite_integrity() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path.as_ref().unwrap().clone();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(payload BLOB, id INTEGER UNIQUE)")
+        .unwrap();
+
+    for id in 1..=600 {
+        conn.execute(format!(
+            "INSERT INTO t(rowid, payload, id) VALUES ({id}, x'70796c6f6164', {id})"
+        ))
+        .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    for id in 1..=600 {
+        conn.execute(format!("DELETE FROM t WHERE id = {id}"))
+            .unwrap();
+        conn.execute(format!(
+            "INSERT INTO t(rowid, payload, id) VALUES ({id}, x'7265696e73657274', {id})"
+        ))
+        .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
+
+    conn.close().unwrap();
+    force_close_for_artifact_tamper(&mut db);
+
+    let sqlite = rusqlite::Connection::open(db_path).unwrap();
+    let integrity: String = sqlite
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+}
+
 /// Test that integrity_check passes after DROP TABLE but before checkpoint.
 /// Issue #4975: After checkpointing a table and then dropping it, integrity_check
 /// would fail because the dropped table's btree pages still exist but aren't

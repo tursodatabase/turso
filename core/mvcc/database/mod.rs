@@ -966,6 +966,9 @@ pub enum CommitState<Clock: LogicalClock> {
 pub enum WriteRowState {
     Initial,
     Seek,
+    /// After seek returns TryAdvance for an index key stored in an interior node,
+    /// advance the cursor to that interior cell so insert overwrites it.
+    Advance,
     Insert,
     /// Move to the next record in order to leave the cursor in the next position, this is used for inserting multiple rows for optimizations.
     Next,
@@ -2127,12 +2130,37 @@ impl StateTransition for WriteRowStateMachine {
                     .write()
                     .seek(seek_key, SeekOp::GE { eq_only: true })?
                 {
-                    IOResult::Done(_) => {}
+                    IOResult::Done(seek_result) => {
+                        if self.row.is_index_row() && matches!(seek_result, SeekResult::TryAdvance)
+                        {
+                            self.state = WriteRowState::Advance;
+                            return Ok(TransitionResult::Continue);
+                        }
+                    }
                     IOResult::IO(io) => {
                         return Ok(TransitionResult::Io(io));
                     }
                 }
                 turso_assert_eq!(self.cursor.write().valid_state, CursorValidState::Valid);
+                self.state = WriteRowState::Insert;
+                Ok(TransitionResult::Continue)
+            }
+            WriteRowState::Advance => {
+                match self
+                    .cursor
+                    .write()
+                    .next()
+                    .map_err(|e: LimboError| LimboError::InternalError(e.to_string()))?
+                {
+                    IOResult::Done(_) => {}
+                    IOResult::IO(io) => {
+                        return Ok(TransitionResult::Io(io));
+                    }
+                }
+                turso_assert!(
+                    self.cursor.read().has_record(),
+                    "MVCC checkpoint index insert did not land on the matched interior record"
+                );
                 self.state = WriteRowState::Insert;
                 Ok(TransitionResult::Continue)
             }
