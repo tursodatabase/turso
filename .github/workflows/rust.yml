@@ -376,7 +376,7 @@ jobs:
         run: |
           cargo test -q -p turso_core --features "fs experimental_win_iocp" multiprocess_tests:: -- --nocapture
       - name: Run Windows multiprocess startup smoke
-        run: cargo run -q -p turso_whopper -- --mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01
+        run: cargo run -q -p turso_whopper -- --mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01 --max-steps 10000
 
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404
