@@ -2827,6 +2827,132 @@ fn test_checkpoint_retry_does_not_replay_checkpointed_btree_resident_unique_dele
     assert_eq!(&integrity[0][0].to_string(), "ok");
 }
 
+/// What this test checks: user-facing SQL plus a commit yield can produce out-of-order commit completion without lowering checkpoint metadata.
+/// Why this matters: this reproduces the Antithesis `MVCC delete ... not found` path without mutating MVCC internals.
+#[test]
+fn test_checkpoint_stale_unique_index_delete_with_out_of_order_commit_yield() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO s VALUES (1, 'first')").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'second')").unwrap();
+    conn.execute("INSERT INTO t VALUES (75, 'blue_river_906')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let older = db.connect();
+    older.execute("BEGIN CONCURRENT").unwrap();
+    older
+        .execute("UPDATE s SET v = 'older_commit' WHERE id = 1")
+        .unwrap();
+    older.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    let mut older_commit = older.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(older_commit.step().unwrap(), StepResult::IO),
+        "older commit should yield after taking its commit timestamp"
+    );
+
+    let updater = db.connect();
+    updater.execute("BEGIN CONCURRENT").unwrap();
+    updater
+        .execute("UPDATE t SET v = 'old_path_352' WHERE id = 75")
+        .unwrap();
+    updater.execute("COMMIT").unwrap();
+
+    older_commit.run_ignore_rows().unwrap();
+    drop(older_commit);
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t WHERE id = 75");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 75);
+    assert_eq!(&rows[0][1].to_string(), "old_path_352");
+}
+
+/// What this test checks: SQL-only recovery must not replay a CREATE TABLE frame already made durable by checkpoint.
+/// Why this matters: a regressed checkpoint boundary can make recovery replay the pre-checkpoint schema row with its negative root page after WAL recovery has already installed the positive root page.
+///
+/// Steps:
+/// 1. Disable automatic checkpoints and create a baseline table.
+/// 2. Checkpoint the baseline state so the durable boundary is non-zero.
+/// 3. Start an older concurrent transaction and yield it after it takes a commit timestamp.
+/// 4. Commit a newer `CREATE TABLE` plus row insert through ordinary SQL.
+/// 5. Resume the older transaction; without a monotonic committed watermark this regresses
+///    the checkpoint boundary source.
+/// 6. Run a checkpoint that fails after pager commit, leaving WAL recovery to install the
+///    checkpointed schema row with its positive root page.
+/// 7. Restart and query the created table; recovery must not also replay the stale logical-log
+///    `CREATE TABLE` frame whose schema row still has the negative MVCC root page.
+#[test]
+fn test_checkpoint_stale_boundary_does_not_replay_checkpointed_create_table_after_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO s VALUES (1, 'first')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        let older = db.connect();
+        older.execute("BEGIN CONCURRENT").unwrap();
+        older
+            .execute("UPDATE s SET v = 'older_commit' WHERE id = 1")
+            .unwrap();
+        older.set_yield_injector(Some(FixedYieldInjector::new([
+            CommitYieldPoint::LogRecordPrepared.point(),
+        ])));
+        let mut older_commit = older.prepare("COMMIT").unwrap();
+        assert!(
+            matches!(older_commit.step().unwrap(), StepResult::IO),
+            "older commit should yield after taking its commit timestamp"
+        );
+
+        let creator = db.connect();
+        creator
+            .execute("CREATE TABLE created_after_yield (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        creator
+            .execute("INSERT INTO created_after_yield VALUES (1, 'persisted')")
+            .unwrap();
+
+        older_commit.run_ignore_rows().unwrap();
+        drop(older_commit);
+
+        conn.set_failure_injector(Some(FixedFailureInjector::new([(
+            CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
+            LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+        )])));
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect_err("checkpoint should fail after pager commit");
+        conn.set_failure_injector(None);
+    };
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM created_after_yield ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(&rows[0][1].to_string(), "persisted");
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let rows = get_rows(&conn, "SELECT id, v FROM created_after_yield ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(&rows[0][1].to_string(), "persisted");
+}
+
 /// What this test checks: Replay gate uses metadata boundary and never applies frames at or below it.
 /// Why this matters: This enforces exactly-once effects at the DB-file apply boundary.
 #[test]
@@ -4939,6 +5065,67 @@ fn test_commit_dep_readonly_does_not_advance_timestamp() {
     assert_eq!(
         ts_before, ts_after,
         "read-only tx should NOT advance last_committed_tx_ts (was {ts_before}, now {ts_after})"
+    );
+}
+
+/// What this test checks: the committed timestamp cache is a monotonic watermark even when independent commits finish out of timestamp order.
+/// Why this matters: checkpoints use this cache as a durable replay boundary; lowering it can make DB pages advance past MVCC metadata.
+#[test]
+fn test_last_committed_timestamp_is_monotonic_for_out_of_order_commits() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    setup.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a
+        .execute("UPDATE t SET v = 'a1' WHERE id = 1")
+        .unwrap();
+    let tx_a_id = conn_a.get_mv_tx_id().expect("tx_a should be active");
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(commit_a.step().unwrap(), StepResult::IO),
+        "tx_a should yield after getting its commit timestamp"
+    );
+    let tx_a_end_ts = match mvcc_store
+        .txs
+        .get(&tx_a_id)
+        .expect("tx_a should still be tracked")
+        .value()
+        .state
+        .load()
+    {
+        TransactionState::Preparing(ts) => ts,
+        state => panic!("expected tx_a to be Preparing, got {state:?}"),
+    };
+
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b
+        .execute("UPDATE t SET v = 'b1' WHERE id = 2")
+        .unwrap();
+    conn_b.execute("COMMIT").unwrap();
+    let tx_b_committed = mvcc_store.last_committed_tx_ts.load(Ordering::Acquire);
+    assert!(
+        tx_b_committed > tx_a_end_ts,
+        "tx_b should commit at a newer timestamp than the yielded tx_a"
+    );
+
+    commit_a.run_ignore_rows().unwrap();
+    let final_watermark = mvcc_store.last_committed_tx_ts.load(Ordering::Acquire);
+    assert_eq!(
+        final_watermark, tx_b_committed,
+        "finishing an older commit must not lower the committed timestamp watermark"
     );
 }
 
