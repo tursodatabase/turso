@@ -1,0 +1,14 @@
+@database :temp:
+
+# Adapted from SQLite check.test check-4.10: VACUUM must still rebuild a
+# database containing rows that would violate currently ignored CHECKs.
+test check-constraint-vacuum-with-ignored-check-constraints {
+    PRAGMA ignore_check_constraints = ON;
+    CREATE TABLE vacuum_check_ignored(x, y, CHECK(x + y = 11));
+    INSERT INTO vacuum_check_ignored VALUES(1, 2);
+    VACUUM;
+    SELECT * FROM vacuum_check_ignored;
+}
+expect {
+    1|2
+}

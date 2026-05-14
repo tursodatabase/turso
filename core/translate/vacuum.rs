@@ -146,37 +146,24 @@ mod tests {
         )
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    fn debug_build_plain_vacuum_does_not_require_feature_flag() {
-        let conn = test_connection(DatabaseOpts::new().with_vacuum(false));
-        let mut program = test_program();
-
-        translate_vacuum(&mut program, None, None, conn)
-            .expect("debug/test builds should translate plain VACUUM without a feature flag");
-    }
-
-    #[cfg(not(debug_assertions))]
-    #[test]
-    fn release_build_plain_vacuum_requires_feature_flag() {
+    fn plain_vacuum_requires_feature_flag() {
         let conn = test_connection(DatabaseOpts::new().with_vacuum(false));
         let mut program = test_program();
 
         let err = translate_vacuum(&mut program, None, None, conn).unwrap_err();
         assert!(
             err.to_string().contains("experimental feature"),
-            "unexpected release-gate error: {err}"
+            "unexpected feature-gate error: {err}"
         );
     }
 
-    #[cfg(not(debug_assertions))]
     #[test]
-    fn release_build_plain_vacuum_translates_with_feature_flag() {
+    fn plain_vacuum_translates_with_feature_flag() {
         let conn = test_connection(DatabaseOpts::new().with_vacuum(true));
         let mut program = test_program();
 
-        translate_vacuum(&mut program, None, None, conn).expect(
-            "release builds should translate plain VACUUM when the feature flag is enabled",
-        );
+        translate_vacuum(&mut program, None, None, conn)
+            .expect("plain VACUUM should translate when the feature flag is enabled");
     }
 }

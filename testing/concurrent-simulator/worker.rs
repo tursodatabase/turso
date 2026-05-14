@@ -52,7 +52,9 @@ pub fn run_worker(
         .try_init();
 
     let io = multiprocess_platform_io()?;
-    let db_opts = DatabaseOpts::new().with_multiprocess_wal(true);
+    let db_opts = DatabaseOpts::new()
+        .with_multiprocess_wal(true)
+        .with_vacuum(true);
     let db = Database::open_file_with_flags(
         io,
         db_path,

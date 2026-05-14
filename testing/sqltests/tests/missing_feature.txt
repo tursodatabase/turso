@@ -1,0 +1,63 @@
+VACUUM SQLite parity tests skipped for missing features
+=======================================================
+
+testing/sqltests/tests/vacuum.sqltest
+- vacuum-with-count-changes: adapted from SQLite vacuum.test. Fails because
+  PRAGMA count_changes is not supported.
+- vacuum-large-schema-autovacuum: adapted from SQLite vacuum4.test. Skipped
+  because sqltests do not enable the experimental auto-vacuum implementation.
+- vacuum-page-size-transitions-from-sqlite: adapted from SQLite vacuum5.test.
+  Fails because this branch intentionally does not support changing page size
+  through VACUUM.
+- vacuum-attached-schema-from-sqlite: adapted from SQLite vacuum3.test. Fails
+  because schema-qualified VACUUM is supported only for main.
+- vacuum-temp-schema-from-sqlite: adapted from SQLite vacuum3.test. Fails
+  because schema-qualified VACUUM is supported only for main.
+- vacuum-rowid-renumbering-from-sqlite: adapted from SQLite e_vacuum.test.
+  Fails because plain VACUUM does not currently match SQLite rowid
+  renumbering for ordinary unindexed rowid tables.
+
+testing/sqltests/tests/vacuum_into.sqltest
+- vacuum-into-expression-target-from-sqlite,
+  vacuum-into-qualified-identifier-target-error-from-sqlite,
+  vacuum-into-main-qualified-identifier-target-error-from-sqlite,
+  vacuum-into-identifier-target-error-from-sqlite,
+  vacuum-into-null-target-error-from-sqlite,
+  vacuum-into-function-target-from-sqlite, and
+  vacuum-into-missing-function-target-error-from-sqlite: adapted from SQLite
+  vacuum_into.test. These fail because VACUUM INTO does not support arbitrary
+  target expressions.
+- vacuum-into-page-size-change-from-wal-source: adapted from SQLite
+  vacuum_into.test. Fails because this branch intentionally does not support
+  changing page size through VACUUM INTO.
+
+testing/sqltests/tests/vacuum_memory.sqltest
+- vacuum-memory-database-from-sqlite: adapted from SQLite vacuum.test. Fails
+  because plain VACUUM does not support in-memory databases.
+
+testing/sqltests/tests/gencol.sqltest
+- gencol_vacuum_stored_from_sqlite: adapted from SQLite gencol1.test. Fails
+  because STORED generated columns are not supported.
+
+testing/sqltests/tests/pragma_vacuum.sqltest
+- pragma-vacuum-preserves-default-cache-size-from-sqlite: adapted from SQLite
+  pragma.test. Fails because PRAGMA default_cache_size is not supported.
+
+testing/sqltests/tests/without_rowid_vacuum.sqltest
+- without-rowid-vacuum-secondary-indexes-from-sqlite: adapted from SQLite
+  without_rowid1.test, index6.test, and index7.test. Fails because secondary
+  indexes and secondary UNIQUE constraints on WITHOUT ROWID tables are not
+  supported.
+
+testing/sqltests/tests/misc_vacuum.sqltest
+- misc-vacuum-malformed-schema-error-from-sqlite: adapted from SQLite
+  misc4.test. Fails because PRAGMA writable_schema is not supported.
+
+testing/sqltests/tests/incrvacuum_vacuum.sqltest
+- incrvacuum-after-plain-vacuum-from-sqlite: adapted from SQLite
+  tkt3762.test. Fails because PRAGMA incremental_vacuum is not supported.
+
+testing/sqltests/tests/where_vacuum.sqltest
+- where-vacuum-with-reverse-unordered-selects-from-sqlite: adapted from
+  SQLite whereA.test. Fails because PRAGMA reverse_unordered_selects is not
+  supported.

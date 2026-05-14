@@ -1,0 +1,21 @@
+@database :temp:
+
+# Adapted from SQLite walbak.test/tkt-5d863f876e.test: VACUUM in WAL mode
+# preserves journal mode and indexed table content.
+test wal-vacuum-preserves-journal-mode {
+    CREATE TABLE vacuum_wal_mode(a, b);
+    CREATE INDEX vacuum_wal_mode_idx ON vacuum_wal_mode(a, b);
+    INSERT INTO vacuum_wal_mode VALUES(1, 2), (3, 4);
+    PRAGMA journal_mode = WAL;
+    VACUUM;
+    PRAGMA journal_mode;
+    SELECT * FROM vacuum_wal_mode ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    wal
+    wal
+    1|2
+    3|4
+    ok
+}

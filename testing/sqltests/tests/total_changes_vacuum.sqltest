@@ -1,0 +1,19 @@
+@database :temp:
+
+# Adapted from SQLite e_totalchanges.test: VACUUM does not count as a row
+# change.
+test total-changes-vacuum-does-not-change-total-changes {
+    CREATE TABLE vacuum_total_changes(a, b);
+    INSERT INTO vacuum_total_changes VALUES(1, 2), (3, 4);
+    SELECT total_changes();
+    VACUUM;
+    SELECT total_changes();
+    SELECT count(*) FROM vacuum_total_changes;
+    PRAGMA integrity_check;
+}
+expect {
+    2
+    2
+    2
+    ok
+}

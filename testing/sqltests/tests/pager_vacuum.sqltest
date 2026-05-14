@@ -1,0 +1,46 @@
+@database :temp:
+
+# Adapted from SQLite pager1.test pager1-19.1: VACUUM handles wide schemas
+# containing very large overflow records.
+test pager-vacuum-wide-table-large-overflow-records {
+    PRAGMA page_size = 512;
+    CREATE TABLE vacuum_wide_1(
+        aa, ab, ac, ad, ae, af, ag, ah,
+        ba, bb, bc, bd, be, bf, bg, bh,
+        ca, cb, cc, cd, ce, cf, cg, ch,
+        da, db, dc, dd, de, df, dg, dh
+    );
+    CREATE TABLE vacuum_wide_2(
+        aa, ab, ac, ad, ae, af, ag, ah,
+        ba, bb, bc, bd, be, bf, bg, bh,
+        ca, cb, cc, cd, ce, cf, cg, ch,
+        da, db, dc, dd, de, df, dg, dh
+    );
+    INSERT INTO vacuum_wide_1(aa) VALUES(randomblob(100000));
+    INSERT INTO vacuum_wide_2(aa) VALUES(randomblob(100000));
+    VACUUM;
+    SELECT count(*), length(aa) FROM vacuum_wide_1;
+    SELECT count(*), length(aa) FROM vacuum_wide_2;
+    PRAGMA integrity_check;
+}
+expect {
+    1|100000
+    1|100000
+    ok
+}
+
+# Adapted from SQLite pager1.test pager1-37.*: VACUUM works after opening a
+# URI-style database filename.
+@backend cli
+test pager-vacuum-uri-filename {
+    .open file:vacuum_uri_test.db?cache=shared
+    CREATE TABLE t1(x);
+    INSERT INTO t1 VALUES(1);
+    VACUUM;
+    SELECT * FROM t1;
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}

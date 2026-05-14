@@ -46,6 +46,7 @@ expect error {
 
 # Adapted from SQLite vacuum-into.test: VACUUM INTO must preserve tables with
 # generated columns and CHECK constraints.
+@skip-if sqlite "sqlite sqltest backend only supports final dot commands"
 @backend cli
 test vacuum-into-generated-column-and-check-constraint {
     CREATE TABLE t1(
@@ -96,10 +97,16 @@ expect error {
 
 # Adapted from SQLite vacuum-into.test: ':memory:' is accepted as an INTO
 # target expression.
-@backend cli
-test vacuum-into-memory-target {
+setup vacuum-into-memory-target {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
     INSERT INTO t1 VALUES(19, 'nineteen');
+    PRAGMA wal_checkpoint(TRUNCATE);
+}
+
+@skip-if mvcc "MVCC VACUUM INTO ':memory:' target opens through file I/O"
+@backend cli
+@setup vacuum-into-memory-target
+test vacuum-into-memory-target {
     VACUUM main INTO ':memory:';
     SELECT * FROM t1;
 }
@@ -109,6 +116,7 @@ expect {
 
 # Adapted from SQLite e_vacuum.test e_vacuum-3.1.5..3.1.6: VACUUM INTO
 # preserves hidden rowids for ordinary rowid tables.
+@skip-if sqlite "sqlite sqltest backend only supports final dot commands"
 @backend cli
 test vacuum-into-preserves-hidden-rowids-from-sqlite {
     CREATE TABLE vacuum_into_rowid(x);

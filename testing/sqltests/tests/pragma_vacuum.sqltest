@@ -1,0 +1,41 @@
+@database :temp:
+
+# Adapted from SQLite pragma.test pragma-8.2.4.2: VACUUM preserves the
+# user-version header field.
+test pragma-vacuum-preserves-user-version {
+    PRAGMA user_version = 2;
+    VACUUM;
+    PRAGMA user_version;
+    PRAGMA integrity_check;
+}
+expect {
+    2
+    ok
+}
+
+# Adapted from SQLite pragma.test pragma-8.2.4.2: VACUUM increments the
+# schema-version header field.
+test pragma-vacuum-increments-schema-version {
+    CREATE TABLE vacuum_schema_version(x);
+    PRAGMA schema_version;
+    VACUUM;
+    PRAGMA schema_version;
+}
+expect {
+    1
+    2
+}
+
+# Adapted from SQLite pragma.test pragma-1.9.2: VACUUM preserves
+# default_cache_size.
+@skip "missing feature: PRAGMA default_cache_size is not supported; see missing_feature.txt"
+test pragma-vacuum-preserves-default-cache-size-from-sqlite {
+    PRAGMA default_cache_size = -123;
+    VACUUM;
+    PRAGMA cache_size;
+    PRAGMA default_cache_size;
+}
+expect {
+    123
+    123
+}

@@ -66,6 +66,9 @@ fn normalized_schema_snapshot(conn: &Arc<Connection>) -> Vec<NormalizedSchemaRow
          ORDER BY type, name, tbl_name, COALESCE(sql, '')",
     );
     rows.into_iter()
+        .filter(|(object_type, name, _, sql)| {
+            !(object_type == "index" && sql.is_empty() && name.starts_with("sqlite_autoindex_"))
+        })
         .map(|(object_type, name, table_name, sql)| NormalizedSchemaRow {
             object_type,
             name,
@@ -5353,24 +5356,46 @@ fn test_plain_vacuum_preserves_strict_composite_pk() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_plain_vacuum_without_rowid_tables_are_unsupported() -> anyhow::Result<()> {
+fn test_plain_vacuum_preserves_without_rowid_tables() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_empty();
     let conn = tmp_db.connect_limbo();
 
-    let err = conn
-        .execute(
-            "CREATE TABLE config(
+    conn.execute(
+        "CREATE TABLE config(
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at TEXT
             ) WITHOUT ROWID",
-        )
-        .expect_err("WITHOUT ROWID tables should remain unsupported");
-    assert!(
-        err.to_string()
-            .contains("WITHOUT ROWID tables are not supported"),
-        "unexpected WITHOUT ROWID error: {err}"
+    )?;
+    conn.execute(
+        "INSERT INTO config VALUES
+            ('alpha', 'one', '2026-01-01'),
+            ('beta', 'two', '2026-01-02'),
+            ('gamma', 'three', '2026-01-03')",
+    )?;
+    conn.execute("DELETE FROM config WHERE key = 'beta'")?;
+
+    assert_plain_vacuum_preserves_content_hash(&tmp_db, &conn)?;
+
+    let rows: Vec<(String, String, String)> =
+        conn.exec_rows("SELECT key, value, updated_at FROM config ORDER BY key");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "alpha".to_string(),
+                "one".to_string(),
+                "2026-01-01".to_string()
+            ),
+            (
+                "gamma".to_string(),
+                "three".to_string(),
+                "2026-01-03".to_string()
+            ),
+        ]
     );
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
     Ok(())
 }
 
@@ -5435,7 +5460,13 @@ fn test_plain_vacuum_readonly_db_returns_readonly() -> anyhow::Result<()> {
 #[test]
 fn test_plain_vacuum_rejects_memory_database() -> anyhow::Result<()> {
     let io: Arc<dyn IO> = Arc::new(turso_core::MemoryIO::new());
-    let db = Database::open_file(io, ":memory:")?;
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_vacuum(true),
+        None,
+    )?;
     let conn = db.connect()?;
 
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;

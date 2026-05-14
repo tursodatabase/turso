@@ -1,6 +1,11 @@
 @database :temp:
 
+setup vacuum-uninitialized-file-backed-db-rejected {
+    PRAGMA wal_checkpoint(TRUNCATE);
+}
+
 @backend rust
+@setup vacuum-uninitialized-file-backed-db-rejected
 test vacuum-uninitialized-file-backed-db-rejected {
     VACUUM;
 }
@@ -8,11 +13,16 @@ expect error {
     initialized
 }
 
-@backend rust
-test vacuum-basic-success {
+setup vacuum-basic-success {
     CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
     INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');
     DELETE FROM t WHERE id = 2;
+    PRAGMA wal_checkpoint(TRUNCATE);
+}
+
+@backend rust
+@setup vacuum-basic-success
+test vacuum-basic-success {
     VACUUM;
     SELECT id, v FROM t ORDER BY id;
     PRAGMA integrity_check;
@@ -25,7 +35,7 @@ expect {
 
 # Adapted from SQLite e_vacuum.test: VACUUM reclaims freelist pages after
 # deleted data leaves free pages behind.
-test vacuum-reclaims-freelist-pages {
+setup vacuum-reclaims-freelist-pages {
     PRAGMA page_size = 1024;
     CREATE TABLE vacuum_freelist_keep(x);
     CREATE TABLE vacuum_freelist_drop(x);
@@ -33,6 +43,11 @@ test vacuum-reclaims-freelist-pages {
     INSERT INTO vacuum_freelist_drop SELECT randomblob(2000) FROM vacuum_freelist_drop;
     INSERT INTO vacuum_freelist_drop SELECT randomblob(2000) FROM vacuum_freelist_drop;
     DROP TABLE vacuum_freelist_drop;
+    PRAGMA wal_checkpoint(TRUNCATE);
+}
+
+@setup vacuum-reclaims-freelist-pages
+test vacuum-reclaims-freelist-pages {
     PRAGMA freelist_count;
     VACUUM;
     PRAGMA freelist_count;
@@ -44,11 +59,16 @@ expect {
     ok
 }
 
-@backend rust
-test vacuum-generated-columns {
+setup vacuum-generated-columns {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
     INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
     DELETE FROM t1 WHERE a IN (2, 4);
+    PRAGMA wal_checkpoint(TRUNCATE);
+}
+
+@backend rust
+@setup vacuum-generated-columns
+test vacuum-generated-columns {
     VACUUM;
     SELECT a, b FROM t1;
 }
@@ -113,6 +133,7 @@ expect error {
     cannot VACUUM from within a transaction
 }
 
+@skip-if sqlite "SQLite reports query_only VACUUM as a readonly database write"
 test vacuum-rejected-in-query-only {
     CREATE TABLE qo_t(x);
     PRAGMA query_only = 1;
@@ -124,10 +145,15 @@ expect error {
 
 # Adapted from SQLite vacuum5.test: an explicit main schema qualifier should
 # behave like plain VACUUM.
-test vacuum-explicit-main-schema {
+setup vacuum-explicit-main-schema {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
     INSERT INTO t1 VALUES(1, 'one'), (2, 'two'), (3, 'three');
     DELETE FROM t1 WHERE a = 2;
+    PRAGMA wal_checkpoint(TRUNCATE);
+}
+
+@setup vacuum-explicit-main-schema
+test vacuum-explicit-main-schema {
     VACUUM main;
     SELECT a, b FROM t1 ORDER BY a;
     PRAGMA integrity_check;
@@ -140,12 +166,17 @@ expect {
 
 # Adapted from SQLite vacuum6.test: duplicate indexes on the same column remain
 # valid across VACUUM.
-test vacuum-duplicate-indexes-same-column {
+setup vacuum-duplicate-indexes-same-column {
     CREATE TABLE t1(x, b);
     CREATE INDEX x1 ON t1(x);
     CREATE INDEX x2 ON t1(x);
     CREATE INDEX x3 ON t1(x);
     INSERT INTO t1 VALUES(2, '');
+    PRAGMA wal_checkpoint(TRUNCATE);
+}
+
+@setup vacuum-duplicate-indexes-same-column
+test vacuum-duplicate-indexes-same-column {
     VACUUM;
     SELECT count(*) FROM t1 WHERE x = 2;
     PRAGMA integrity_check;
@@ -157,7 +188,7 @@ expect {
 
 # Adapted from SQLite vacuum.test vacuum-1.4: VACUUM must preserve schema
 # objects that are reloaded after the source image is rebuilt.
-test vacuum-preserves-view-and-trigger {
+setup vacuum-preserves-view-and-trigger {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c TEXT);
     CREATE TABLE vacuum_trigger_log(a INTEGER, b TEXT);
     CREATE VIEW vacuum_view AS SELECT b, c FROM t1 WHERE a > 1;
@@ -166,6 +197,11 @@ test vacuum-preserves-view-and-trigger {
     END;
     INSERT INTO t1 VALUES(1, 'one', 'alpha'), (2, 'two', 'beta'), (3, 'three', 'gamma');
     DELETE FROM t1 WHERE a = 1;
+    PRAGMA wal_checkpoint(TRUNCATE);
+}
+
+@setup vacuum-preserves-view-and-trigger
+test vacuum-preserves-view-and-trigger {
     VACUUM;
     SELECT b, c FROM vacuum_view ORDER BY b;
     DELETE FROM t1 WHERE a = 2;
@@ -182,7 +218,7 @@ expect {
 
 # Adapted from SQLite vacuum.test ticket #515: VACUUM works after a table
 # referenced by a view is dropped and recreated with a compatible shape.
-test vacuum-after-recreate-view-table {
+setup vacuum-after-recreate-view-table {
     CREATE TABLE vacuum_recreate_test(id INTEGER PRIMARY KEY, value TEXT);
     INSERT INTO vacuum_recreate_test VALUES(1, 'before');
     CREATE VIEW vacuum_recreate_view AS SELECT id, value FROM vacuum_recreate_test;
@@ -192,6 +228,11 @@ test vacuum-after-recreate-view-table {
     CREATE TABLE vacuum_recreate_test(id INTEGER PRIMARY KEY, value TEXT);
     INSERT INTO vacuum_recreate_test SELECT id, value FROM vacuum_recreate_temp;
     DROP TABLE vacuum_recreate_temp;
+    PRAGMA wal_checkpoint(TRUNCATE);
+}
+
+@setup vacuum-after-recreate-view-table
+test vacuum-after-recreate-view-table {
     VACUUM;
     SELECT id, value FROM vacuum_recreate_view;
     PRAGMA integrity_check;
@@ -203,19 +244,36 @@ expect {
 
 # Adapted from SQLite vacuum.test vacuum-6.*: quoted identifiers and BLOB
 # literals survive VACUUM.
-test vacuum-quoted-table-name-and-blob {
+setup vacuum-quoted-table-name {
     CREATE TABLE "abc abc"(a, b, c);
     INSERT INTO "abc abc" VALUES(1, 2, 3);
+    PRAGMA wal_checkpoint(TRUNCATE);
+}
+
+@setup vacuum-quoted-table-name
+test vacuum-quoted-table-name {
     VACUUM;
     SELECT * FROM "abc abc";
-    DELETE FROM "abc abc";
+    PRAGMA integrity_check;
+}
+expect {
+    1|2|3
+    ok
+}
+
+setup vacuum-blob-literal {
+    CREATE TABLE "abc abc"(a, b, c);
     INSERT INTO "abc abc" VALUES(X'00112233', NULL, NULL);
+    PRAGMA wal_checkpoint(TRUNCATE);
+}
+
+@setup vacuum-blob-literal
+test vacuum-quoted-table-name-and-blob {
     VACUUM;
     SELECT count(*) FROM "abc abc" WHERE a = X'00112233';
     PRAGMA integrity_check;
 }
 expect {
-    1|2|3
     1
     ok
 }
@@ -301,7 +359,7 @@ expect {
 }
 
 # Adapted from SQLite vacuum6.test: VACUUM preserves larger indexed records.
-test vacuum-large-indexed-records {
+setup vacuum-large-indexed-records {
     CREATE TABLE vacuum_big_records(a INTEGER PRIMARY KEY, b);
     CREATE INDEX vacuum_big_records_b ON vacuum_big_records(b);
     INSERT INTO vacuum_big_records VALUES(1, randomblob(1200));
@@ -312,6 +370,11 @@ test vacuum-large-indexed-records {
     INSERT INTO vacuum_big_records SELECT a + 16, randomblob(1200) FROM vacuum_big_records;
     INSERT INTO vacuum_big_records SELECT a + 32, randomblob(1200) FROM vacuum_big_records;
     INSERT INTO vacuum_big_records SELECT a + 64, randomblob(1200) FROM vacuum_big_records;
+    PRAGMA wal_checkpoint(TRUNCATE);
+}
+
+@setup vacuum-large-indexed-records
+test vacuum-large-indexed-records {
     VACUUM;
     SELECT count(*), sum(length(b)) FROM vacuum_big_records;
     PRAGMA integrity_check;
@@ -323,7 +386,7 @@ expect {
 
 # Adapted from SQLite vacuum6.test 2.*: VACUUM preserves indexed records
 # across a range of payload sizes.
-test vacuum-indexed-record-size-matrix {
+setup vacuum-indexed-record-size-matrix {
     CREATE TABLE vacuum_records_400(a INTEGER PRIMARY KEY, b);
     CREATE INDEX vacuum_records_400_b ON vacuum_records_400(b);
     INSERT INTO vacuum_records_400 VALUES(1, randomblob(400));
@@ -360,6 +423,11 @@ test vacuum-indexed-record-size-matrix {
     INSERT INTO vacuum_records_9999 SELECT a + 64, randomblob(9999) FROM vacuum_records_9999;
     DELETE FROM vacuum_records_9999 WHERE a > 100;
 
+    PRAGMA wal_checkpoint(TRUNCATE);
+}
+
+@setup vacuum-indexed-record-size-matrix
+test vacuum-indexed-record-size-matrix {
     VACUUM;
     SELECT count(*), sum(length(b)) FROM vacuum_records_400;
     SELECT count(*), sum(length(b)) FROM vacuum_records_4000;
@@ -388,10 +456,16 @@ expect {
 
 # Regression for the currently supported WAL VACUUM behavior: pending page-size
 # changes do not rewrite the source database page size.
-test vacuum-preserves-wal-page-size {
+setup vacuum-preserves-wal-page-size {
     PRAGMA page_size = 1024;
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c BLOB);
     INSERT INTO t1 VALUES(1, 'one', randomblob(1000));
+    PRAGMA wal_checkpoint(TRUNCATE);
+}
+
+@skip-if sqlite "SQLite applies pending page-size changes during VACUUM"
+@setup vacuum-preserves-wal-page-size
+test vacuum-preserves-wal-page-size {
     PRAGMA page_size;
 
     PRAGMA page_size = 2048;

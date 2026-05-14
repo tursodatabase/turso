@@ -51,6 +51,7 @@ testing/*.log
 limbostress.log
 simulator.log
 **/*.txt
+!testing/sqltests/tests/missing_feature.txt
 profile.json.gz
 simulator-output/
 tests/*.sql

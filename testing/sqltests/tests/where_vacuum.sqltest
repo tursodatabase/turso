@@ -1,0 +1,18 @@
+@database :temp:
+
+# Adapted from SQLite whereA.test: SQLite verifies VACUUM while
+# reverse_unordered_selects is enabled.
+@skip "missing feature: PRAGMA reverse_unordered_selects is not supported; see missing_feature.txt"
+test where-vacuum-with-reverse-unordered-selects-from-sqlite {
+    CREATE TABLE vacuum_reverse_selects(a, b, c);
+    INSERT INTO vacuum_reverse_selects VALUES(1, 2, 3), (2, 'hello', 'world');
+    PRAGMA reverse_unordered_selects = 1;
+    VACUUM;
+    SELECT * FROM vacuum_reverse_selects ORDER BY rowid;
+    PRAGMA reverse_unordered_selects;
+}
+expect {
+    1|2|3
+    2|hello|world
+    1
+}

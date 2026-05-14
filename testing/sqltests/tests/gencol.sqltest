@@ -3509,10 +3509,15 @@ expect {
 
 # --- VACUUM ---
 
-test gencol_vacuum_virtual {
+setup gencol-vacuum-virtual {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
     INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
     DELETE FROM t1 WHERE a IN (2, 4);
+    PRAGMA wal_checkpoint(TRUNCATE);
+}
+
+@setup gencol-vacuum-virtual
+test gencol_vacuum_virtual {
     VACUUM;
     SELECT a, b FROM t1;
 }

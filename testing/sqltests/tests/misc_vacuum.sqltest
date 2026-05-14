@@ -1,0 +1,15 @@
+@database :temp:
+
+# Adapted from SQLite misc4.test: malformed schema SQL should surface a stable
+# parse error during VACUUM.
+@skip "missing feature: PRAGMA writable_schema is not supported; see missing_feature.txt"
+test misc-vacuum-malformed-schema-error-from-sqlite {
+    CREATE TABLE vacuum_malformed_schema(x);
+    PRAGMA writable_schema = ON;
+    UPDATE sqlite_master SET sql='CREATE TABLE [M%s%s%s%s%s%s%s%s%s%s%s%s%s'
+        WHERE name = 'vacuum_malformed_schema';
+    VACUUM;
+}
+expect error {
+    unrecognized token
+}

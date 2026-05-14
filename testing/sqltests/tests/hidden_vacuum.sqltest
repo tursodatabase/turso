@@ -1,0 +1,19 @@
+@database :temp:
+
+# Adapted from SQLite hidden.test and e_vacuum.test: rowids are preserved by
+# VACUUM for indexed rowid tables.
+test hidden-vacuum-preserves-indexed-hidden-rowids {
+    CREATE TABLE vacuum_hidden_rowid(a, __hidden__b, c UNIQUE);
+    INSERT INTO vacuum_hidden_rowid(a, __hidden__b, c) VALUES(1, 2, 3);
+    INSERT INTO vacuum_hidden_rowid(a, __hidden__b, c) VALUES(4, 5, 6);
+    INSERT INTO vacuum_hidden_rowid(a, __hidden__b, c) VALUES(7, 8, 9);
+    DELETE FROM vacuum_hidden_rowid WHERE __hidden__b = 5;
+    VACUUM;
+    SELECT rowid, a, __hidden__b, c FROM vacuum_hidden_rowid ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    1|1|2|3
+    3|7|8|9
+    ok
+}

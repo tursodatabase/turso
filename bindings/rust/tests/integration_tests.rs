@@ -267,6 +267,7 @@ async fn test_plain_vacuum_rejects_active_transaction_smoke() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("vacuum-active-txn.db");
     let db = Builder::new_local(db_path.to_str().unwrap())
+        .experimental_vacuum(true)
         .build()
         .await
         .unwrap();

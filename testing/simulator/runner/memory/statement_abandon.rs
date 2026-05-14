@@ -33,7 +33,7 @@ fn open_conn(io: Arc<MemorySimIO>, path: &str) -> Result<Arc<Connection>> {
         io as Arc<dyn IO>,
         path,
         OpenFlags::default(),
-        DatabaseOpts::new(),
+        DatabaseOpts::new().with_vacuum(true),
         None,
     )?;
     let conn = db.connect()?;
@@ -45,7 +45,7 @@ fn open_two_conns(io: Arc<MemorySimIO>, path: &str) -> Result<(Arc<Connection>, 
         io as Arc<dyn IO>,
         path,
         OpenFlags::default(),
-        DatabaseOpts::new(),
+        DatabaseOpts::new().with_vacuum(true),
         None,
     )?;
     let conn1 = db.connect()?;
