@@ -126,6 +126,17 @@ expect {
     1235|2
 }
 
+# SQLite allows direct DELETE from sqlite_sequence rows.
+@cross-check-integrity
+test autoinc-manual-delete-from-sequence-table {
+    CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
+    INSERT INTO t1 VALUES(NULL, 1);
+    DELETE FROM sqlite_sequence WHERE name='t1';
+    SELECT * FROM sqlite_sequence;
+}
+expect {
+}
+
 # Test: AUTOINCREMENT works for multiple tables independently.
 @cross-check-integrity
 test autoinc-multiple-tables {
