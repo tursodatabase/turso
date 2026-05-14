@@ -4908,3 +4908,51 @@ test update-expression-index-references-virtual-gencol {
     1|aaaaaa
     ok
 }
+
+@cross-check-integrity
+test gencol-virtual-affinity-applied-to-index {
+    CREATE TABLE t (a INTEGER, b INTEGER, v REAL AS (a + b));
+    INSERT INTO t (a, b) VALUES (5000000000000001, 5000000000000002);
+    INSERT INTO t (a, b) VALUES (1, 2);
+    CREATE INDEX idx_v ON t (v);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@cross-check-integrity
+test gencol-virtual-real-affinity-applied-to-index {
+    CREATE TABLE t (a INTEGER, b INTEGER, v REAL AS (a + b));
+    INSERT INTO t (a, b) VALUES (5000000000000001, 5000000000000002);
+    INSERT INTO t (a, b) VALUES (1, 2);
+    CREATE INDEX idx_v ON t (v);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@cross-check-integrity
+test gencol-update-old-image-real-affinity-applied-to-index {
+    CREATE TABLE t (
+        a INTEGER,
+        b INTEGER,
+        c BLOB,
+        v1 INTEGER AS (a + b),
+        v2 REAL AS (-a - v1)
+    );
+    CREATE INDEX i ON t (c, v1, v2);
+    INSERT INTO t (a, b, c) VALUES (-2929861166669336, -5586410532100113, X'0102');
+    UPDATE t SET c = X'0303';
+    SELECT a, b, quote(c), v1, v2 FROM t INDEXED BY i;
+    PRAGMA integrity_check;
+}
+expect {
+    -2929861166669336|-5586410532100113|X'0303'|-8516271698769449|1.14461328654388e+16
+    ok
+}
+expect @js {
+    -2929861166669336|-5586410532100113|X'0303'|-8516271698769449|11446132865438784
+    ok
+}
