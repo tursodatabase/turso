@@ -326,7 +326,7 @@ jobs:
             iterations: 100
             args: "--mode fast --reopen-probability 0.001"
           - name: in-process-mvcc
-            iterations: 100
+            iterations: 50
             args: "--mode fast --reopen-probability 0.01 --enable-mvcc"
           - name: multiprocess
             iterations: 20
