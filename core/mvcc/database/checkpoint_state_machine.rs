@@ -689,6 +689,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         }
     }
 
+    #[cfg(any(test, debug_assertions))]
     fn max_collected_version_timestamp(&self) -> u64 {
         fn max_version_timestamp(version: &RowVersion) -> u64 {
             [version.begin.as_ref(), version.end.as_ref()]
