@@ -253,6 +253,51 @@ fn test_chain_join_fuzz() {
     }
 }
 
+#[test]
+fn test_chain_join_greedy_handles_shuffled_long_chain() {
+    let chain_length = 62;
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    for i in 1..=chain_length {
+        if i == chain_length {
+            limbo_exec_rows(&conn, &format!("CREATE TABLE t{i}(c{i}, data)"));
+        } else {
+            limbo_exec_rows(&conn, &format!("CREATE TABLE t{i}(c{i}, c{})", i + 1));
+        }
+    }
+    for i in 1..=chain_length {
+        limbo_exec_rows(&conn, &format!("CREATE INDEX idx_t{i} ON t{i}(c{i})"));
+        if i == chain_length {
+            limbo_exec_rows(&conn, &format!("INSERT INTO t{i} VALUES (1, 'end')"));
+        } else {
+            limbo_exec_rows(&conn, &format!("INSERT INTO t{i} VALUES (1, 1)"));
+        }
+    }
+
+    let table_order = [
+        61, 8, 14, 37, 6, 3, 10, 33, 23, 11, 35, 21, 17, 42, 19, 54, 29, 49, 9, 30, 48, 25, 57, 4,
+        40, 45, 50, 47, 27, 46, 5, 56, 44, 7, 59, 34, 41, 13, 1, 51, 43, 15, 53, 26, 12, 22, 58,
+        36, 20, 32, 55, 39, 28, 62, 52, 38, 16, 24, 18, 60, 31, 2,
+    ];
+    let table_refs: Vec<String> = table_order.iter().map(|i| format!("t{i}")).collect();
+    let join_conditions: Vec<String> = (1..chain_length)
+        .map(|i| format!("t{i}.c{} = t{}.c{}", i + 1, i + 1, i + 1))
+        .collect();
+    let query = format!(
+        "SELECT t{chain_length}.data FROM {} WHERE {}",
+        table_refs.join(", "),
+        join_conditions.join(" AND ")
+    );
+
+    let result = limbo_exec_rows(&conn, &query);
+    assert_eq!(
+        result.len(),
+        1,
+        "Expected 1 row from shuffled {chain_length}-way chain join"
+    );
+}
+
 /// Test: clique join where every table joins to every other.
 /// Just verify that the plan can be constructed in a reasonable time and executed with a valid result.
 #[test]

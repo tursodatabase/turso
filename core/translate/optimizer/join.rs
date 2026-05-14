@@ -1412,7 +1412,7 @@ pub fn compute_greedy_join_order<'a>(
         &join_order,
         planning_context,
         access_methods_arena,
-        Cost(f64::MAX),
+        Cost(f64::INFINITY),
         joined_tables,
         where_clause,
         where_term_table_ids,
@@ -1462,14 +1462,22 @@ pub fn compute_greedy_join_order<'a>(
             }
         }
 
-        for idx in &remaining {
-            // Outer join RHS requires all preceding tables joined first
-            if let Some(required) = left_join_deps.get(&idx) {
-                if !current_mask.contains_all_set_bits_of(required) {
-                    continue;
+        let require_connected_passes: &[bool] = if has_connected_candidate {
+            &[true, false]
+        } else {
+            &[false]
+        };
+        for &require_connected in require_connected_passes {
+            // A connected table might still be impossible to use as the next
+            // RHS access path. If every connected candidate fails, allow the
+            // greedy planner to start another component and reconnect later.
+            for idx in &remaining {
+                // Outer join RHS requires all preceding tables joined first
+                if let Some(required) = left_join_deps.get(&idx) {
+                    if !current_mask.contains_all_set_bits_of(required) {
+                        continue;
+                    }
                 }
-            }
-            if has_connected_candidate {
                 let connected = where_term_table_ids.iter().any(|table_ids| {
                     let table_id = joined_tables[idx].internal_id;
                     table_ids.contains(&table_id)
@@ -1478,42 +1486,45 @@ pub fn compute_greedy_join_order<'a>(
                             .map(|table_no| joined_tables[table_no].internal_id)
                             .any(|id| table_ids.contains(&id))
                 });
-                if !connected {
+                if require_connected && !connected {
                     continue;
                 }
-            }
 
-            let table = &joined_tables[idx];
-            let last = join_order.last_mut().unwrap();
-            last.table_id = table.internal_id;
-            last.original_idx = idx;
-            last.is_outer = table.join_info.as_ref().is_some_and(|ji| ji.is_outer());
+                let table = &joined_tables[idx];
+                let last = join_order.last_mut().unwrap();
+                last.table_id = table.internal_id;
+                last.original_idx = idx;
+                last.is_outer = table.join_info.as_ref().is_some_and(|ji| ji.is_outer());
 
-            if let Some(plan) = join_lhs_and_rhs(
-                current_plan.as_ref(),
-                initial_input_cardinality,
-                table,
-                &constraints[idx],
-                constraints,
-                base_table_rows,
-                &join_order,
-                planning_context,
-                access_methods_arena,
-                Cost(f64::MAX),
-                joined_tables,
-                where_clause,
-                where_term_table_ids,
-                subqueries,
-                index_method_candidates,
-                params,
-                analyze_stats,
-                available_indexes,
-                table_references,
-                schema,
-            )? {
-                if best.as_ref().is_none_or(|(_, b)| plan.cost < b.cost) {
-                    best = Some((idx, plan));
+                if let Some(plan) = join_lhs_and_rhs(
+                    current_plan.as_ref(),
+                    initial_input_cardinality,
+                    table,
+                    &constraints[idx],
+                    constraints,
+                    base_table_rows,
+                    &join_order,
+                    planning_context,
+                    access_methods_arena,
+                    Cost(f64::INFINITY),
+                    joined_tables,
+                    where_clause,
+                    where_term_table_ids,
+                    subqueries,
+                    index_method_candidates,
+                    params,
+                    analyze_stats,
+                    available_indexes,
+                    table_references,
+                    schema,
+                )? {
+                    if best.as_ref().is_none_or(|(_, b)| plan.cost < b.cost) {
+                        best = Some((idx, plan));
+                    }
                 }
+            }
+            if best.is_some() {
+                break;
             }
         }
 
