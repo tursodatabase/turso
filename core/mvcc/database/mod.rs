@@ -991,6 +991,7 @@ pub(crate) enum CommitYieldPoint {
     CommitValidation,
     WaitForDependencies,
     LogRecordPrepared,
+    BeforeCommittedTimestampWatermarkUpdate,
     /// Boundary right after `remove_tx` runs but before the connection cache
     /// is cleared by the caller at vdbe/mod.rs. Used for failure injection
     /// to reproduce divergence between `mv_store.txs` and `connection.mv_tx_id`.
@@ -2002,6 +2003,11 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .global_header
                     .write()
                     .replace(*tx_unlocked.header.read());
+
+                inject_transition_yield!(
+                    self,
+                    CommitYieldPoint::BeforeCommittedTimestampWatermarkUpdate
+                );
 
                 // Since we assign a commit timestamp and then we drive the commit to completion,
                 // it is totally possible for so an older transaction can finish after a newer one.
