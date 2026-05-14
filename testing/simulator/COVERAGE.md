@@ -73,6 +73,7 @@ simulator covers and tests.
 | SELECT ... JOIN USING     | No      |                                                                                   |
 | SELECT ... NATURAL JOIN   | No      |                                                                                   |
 | UPDATE                    | Partial |                                                                                   |
+| Overflow page chains      | Partial | Covered by OverflowChainIntegrity property (large payload insert/update/delete).  |
 | VACUUM                    | No      |                                                                                   |
 | WITH clause               | No      |                                                                                   |
 | WINDOW functions          | No      |                                                                                   |

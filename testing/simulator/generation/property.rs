@@ -236,6 +236,41 @@ impl Property {
                     random_main_table_write(rng, ctx, write_kinds)
                 }
             }
+            Property::OverflowChainIntegrity { .. } => {
+                |rng: &mut R, ctx: &G, query_distr: &QueryDistribution, property: &Property| {
+                    let Property::OverflowChainIntegrity { table, column, .. } = property else {
+                        unreachable!()
+                    };
+                    let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    let tracked_row = vec![SimValue(types::Value::Text(
+                        overflow_large_value_a().into(),
+                    ))];
+                    let tracked_table = Table {
+                        name: table.clone(),
+                        columns: vec![sql_generation::model::table::Column {
+                            name: column.clone(),
+                            column_type: ColumnType::Text,
+                            constraints: Vec::new(),
+                        }],
+                        rows: vec![tracked_row],
+                        indexes: Vec::new(),
+                    };
+                    match &query {
+                        Query::Drop(Drop { table: t }) if *t == *table => None,
+                        Query::AlterTable(AlterTable { table_name: t, .. }) if *t == *table => None,
+                        Query::Delete(Delete {
+                            table: t,
+                            predicate,
+                        }) if *t == *table
+                            && predicate.test(&tracked_table.rows[0], &tracked_table) =>
+                        {
+                            None
+                        }
+                        Query::Update(Update { table: t, .. }) if *t == *table => None,
+                        _ => Some(query),
+                    }
+                }
+            }
             Property::Queries { .. } => {
                 unreachable!("No extensional querie generation for `Property::Queries`")
             }
@@ -1233,6 +1268,123 @@ impl Property {
                 interactions.push(assert_integrity_check(tables, connection_index));
                 interactions
             }
+            Property::OverflowChainIntegrity {
+                table,
+                column,
+                queries,
+            } => {
+                let mut interactions = Vec::with_capacity(queries.len() + 11);
+                if table.starts_with("__overflow_chain_integrity_") {
+                    interactions.push({
+                        let mut builder = InteractionBuilder::with_interaction(
+                            InteractionType::Query(Query::Create(Create {
+                                table: Table {
+                                    name: table.clone(),
+                                    columns: vec![sql_generation::model::table::Column {
+                                        name: column.clone(),
+                                        column_type: ColumnType::Blob,
+                                        constraints: Vec::new(),
+                                    }],
+                                    rows: Vec::new(),
+                                    indexes: Vec::new(),
+                                },
+                            })),
+                        );
+                        builder.ignore_error(true);
+                        builder
+                    });
+                }
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::Insert(Insert::Values {
+                        table: table.clone(),
+                        values: vec![vec![SimValue(types::Value::Text(
+                            overflow_large_value_a().into(),
+                        ))]],
+                        on_conflict: None,
+                    })),
+                ));
+                for i in 0..4 {
+                    let alt_value = if i % 2 == 0 {
+                        overflow_large_value_b()
+                    } else {
+                        overflow_large_value_a()
+                    };
+                    interactions.push(InteractionBuilder::with_interaction(
+                        InteractionType::Query(Query::Insert(Insert::Values {
+                            table: table.clone(),
+                            values: vec![vec![SimValue(types::Value::Text(alt_value.into()))]],
+                            on_conflict: None,
+                        })),
+                    ));
+                }
+                interactions.extend(queries.clone().into_iter().map(|query| {
+                    let mut builder =
+                        InteractionBuilder::with_interaction(InteractionType::Query(query));
+                    builder.property_meta(PropertyMetadata::new(self, true));
+                    builder
+                }));
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::Update(Update {
+                        table: table.clone(),
+                        set_values: vec![(
+                            column.clone(),
+                            SetValue::Simple(SimValue(types::Value::Text(
+                                overflow_small_value().into(),
+                            ))),
+                        )],
+                        predicate: Predicate::eq(
+                            Predicate::column(column.clone()),
+                            Predicate::value(SimValue(types::Value::Text(
+                                overflow_large_value_a().into(),
+                            ))),
+                        ),
+                    })),
+                ));
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::Update(Update {
+                        table: table.clone(),
+                        set_values: vec![(
+                            column.clone(),
+                            SetValue::Simple(SimValue(types::Value::Text(
+                                overflow_large_value_b().into(),
+                            ))),
+                        )],
+                        predicate: Predicate::eq(
+                            Predicate::column(column.clone()),
+                            Predicate::value(SimValue(types::Value::Text(
+                                overflow_small_value().into(),
+                            ))),
+                        ),
+                    })),
+                ));
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::Delete(Delete {
+                        table: table.clone(),
+                        predicate: Predicate::eq(
+                            Predicate::column(column.clone()),
+                            Predicate::value(SimValue(types::Value::Text(
+                                overflow_large_value_b().into(),
+                            ))),
+                        ),
+                    })),
+                ));
+                interactions.extend(assert_all_table_values(
+                    std::slice::from_ref(table),
+                    connection_index,
+                ));
+                interactions.push(assert_integrity_check(
+                    std::slice::from_ref(table),
+                    connection_index,
+                ));
+                if table.starts_with("__overflow_chain_integrity_") {
+                    interactions.push(InteractionBuilder::with_interaction(
+                        InteractionType::Query(Query::Drop(Drop {
+                            table: table.clone(),
+                        })),
+                    ));
+                }
+                interactions
+            }
         };
 
         assert!(!interactions.is_empty());
@@ -1678,6 +1830,58 @@ fn property_savepoint_rollback<R: rand::Rng + ?Sized>(
     }
 }
 
+fn overflow_large_value_a() -> String {
+    format!("{}{}", "overflow_a_", "x".repeat(8192))
+}
+
+fn overflow_large_value_b() -> String {
+    format!("{}{}", "overflow_b_", "y".repeat(8192))
+}
+
+fn overflow_small_value() -> &'static str {
+    "small-overflow-marker"
+}
+
+fn property_overflow_chain_integrity<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    let candidate_tables = ctx
+        .tables()
+        .iter()
+        .filter_map(|table| {
+            if table.columns.len() != 1 {
+                return None;
+            }
+            table.columns.first().and_then(|column| {
+                if matches!(column.column_type, ColumnType::Text | ColumnType::Blob) {
+                    Some((table.name.clone(), column.name.clone()))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let (table, column) = if candidate_tables.is_empty() {
+        (
+            format!("__overflow_chain_integrity_{}", rng.random::<u32>()),
+            "payload".to_string(),
+        )
+    } else {
+        pick(&candidate_tables, rng).clone()
+    };
+
+    let amount = rng.random_range(0..3);
+    Property::OverflowChainIntegrity {
+        table,
+        column,
+        queries: vec![Query::Placeholder; amount],
+    }
+}
+
 fn property_table_has_expected_content<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
@@ -1899,6 +2103,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::InsertValuesSelect => property_insert_values_select,
             PropertyDiscriminants::ReadYourUpdatesBack => property_read_your_updates_back,
             PropertyDiscriminants::SavepointRollback => property_savepoint_rollback,
+            PropertyDiscriminants::OverflowChainIntegrity => property_overflow_chain_integrity,
             PropertyDiscriminants::TableHasExpectedContent => property_table_has_expected_content,
             PropertyDiscriminants::AllTableHaveExpectedContent => {
                 property_all_tables_have_expected_content
@@ -1954,6 +2159,13 @@ impl PropertyDiscriminants {
                     && ctx.tables().iter().any(|table| !table.name.contains('.'))
                 {
                     remaining.insert + remaining.update + remaining.delete
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::OverflowChainIntegrity => {
+                if !env.opts.disable_overflow_chain_integrity && !env.profile.mvcc {
+                    (u32::min(remaining.insert, remaining.update) / 2).max(1)
                 } else {
                     0
                 }
@@ -2059,6 +2271,10 @@ impl PropertyDiscriminants {
                 QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
             }
             PropertyDiscriminants::SavepointRollback => QueryCapabilities::INSERT,
+            PropertyDiscriminants::OverflowChainIntegrity => QueryCapabilities::INSERT
+                .union(QueryCapabilities::UPDATE)
+                .union(QueryCapabilities::DELETE)
+                .union(QueryCapabilities::CREATE),
             PropertyDiscriminants::TableHasExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::AllTableHaveExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::DoubleCreateFailure => QueryCapabilities::CREATE,

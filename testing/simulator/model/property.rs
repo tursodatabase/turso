@@ -191,6 +191,18 @@ pub enum Property {
         tables: Vec<String>,
         write_kinds: Vec<QueryDiscriminants>,
     },
+    /// OverflowChainIntegrity exercises the B-tree overflow page chain allocator.
+    /// It inserts a row with an \>8 KiB TEXT/BLOB payload (well above the 4 KiB
+    /// page max-local threshold), then mutates the payload across the
+    /// in-page <-> overflow boundary multiple times (shrink to <200 B, regrow to
+    /// \>8 KiB) before deleting it. Asserts shadow-model parity and PRAGMA
+    /// integrity_check on the target table. Catches overflow allocator /
+    /// deallocator and freelist-interaction bugs.
+    OverflowChainIntegrity {
+        table: String,
+        column: String,
+        queries: Vec<Query>,
+    },
     /// Property used to subsititute a property with its queries only
     Queries {
         queries: Vec<Query>,
@@ -220,6 +232,7 @@ impl Property {
                 | Property::DeleteSelect { .. }
                 | Property::DropSelect { .. }
                 | Property::SavepointRollback { .. }
+                | Property::OverflowChainIntegrity { .. }
                 | Property::Queries { .. }
         )
     }
@@ -231,6 +244,7 @@ impl Property {
             | Property::DeleteSelect { queries, .. }
             | Property::DropSelect { queries, .. }
             | Property::SavepointRollback { queries, .. }
+            | Property::OverflowChainIntegrity { queries, .. }
             | Property::Queries { queries } => Some(queries),
             Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => None,
             Property::SelectLimit { .. }
