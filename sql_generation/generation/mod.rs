@@ -168,11 +168,15 @@ pub fn pick_n_unique<R: Rng + ?Sized>(
 /// gen_random_text uses `anarchist_readable_name_generator_lib` to generate random
 /// readable names for tables, columns, text values etc.
 pub fn gen_random_text<R: Rng + ?Sized>(rng: &mut R) -> String {
-    let big_text = rng.random_ratio(1, 1000);
-    if big_text {
-        // let max_size: u64 = 2 * 1024 * 1024 * 1024;
-        let max_size: u64 = 2 * 1024;
-        let size = rng.random_range(1024..max_size);
+    // 95% short names, 4% medium text, 1% overflow text (>max_local ~3900B on 4KiB pages) to exercise overflow chains.
+    let size = if rng.random_ratio(95, 100) {
+        None
+    } else if rng.random_ratio(4, 5) {
+        Some(rng.random_range(100..1024))
+    } else {
+        Some(rng.random_range(4096..16384))
+    };
+    if let Some(size) = size {
         let mut name = String::with_capacity(size as usize);
         for i in 0..size {
             name.push(((i % 26) as u8 + b'A') as char);

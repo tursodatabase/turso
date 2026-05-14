@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Added
+* sql_generation: bucketed `gen_random_text` distribution (95% short / 4% medium / 1% overflow up to ~16 KiB) so simulator-driven workloads can exercise B-tree overflow page allocation.
+
 ## 0.5.0 -- 2026-03-04
 
 ### Added
