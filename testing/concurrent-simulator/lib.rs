@@ -77,6 +77,56 @@ fn step_stmt_with_injected_yield(
     stmt.step()
 }
 
+fn rollback_open_transaction_before_restart(
+    fiber_idx: usize,
+    fiber: &mut SimulatorFiber,
+) -> anyhow::Result<()> {
+    if !fiber.connection.get_auto_commit() {
+        debug!(
+            "fiber {}: rolling back open transaction before restart",
+            fiber_idx
+        );
+        fiber.connection.execute("ROLLBACK")?;
+    }
+    Ok(())
+}
+
+fn reset_active_statement_before_restart(
+    fiber_idx: usize,
+    fiber: &mut SimulatorFiber,
+) -> anyhow::Result<()> {
+    if let Some(mut stmt) = fiber.statement.replace(None) {
+        debug!(
+            "fiber {}: resetting active statement before restart",
+            fiber_idx
+        );
+        stmt.reset()?;
+    }
+    fiber.rows.clear();
+    fiber.execution_id = None;
+    fiber.current_op = None;
+    fiber.chaotic_workload = None;
+    fiber.last_chaotic_result = None;
+    rollback_open_transaction_before_restart(fiber_idx, fiber)?;
+    fiber.state = FiberState::Idle;
+    fiber.txn_id = None;
+    Ok(())
+}
+
+fn abort_fiber_properties_before_restart(
+    properties: &[std::sync::Mutex<Box<dyn Property>>],
+    fiber_idx: usize,
+    fiber: &SimulatorFiber,
+) -> anyhow::Result<()> {
+    if fiber.current_op.is_some() || fiber.txn_id.is_some() {
+        for property in properties {
+            let mut property = property.lock().unwrap();
+            property.abort_fiber(fiber_idx, fiber.txn_id)?;
+        }
+    }
+    Ok(())
+}
+
 /// A bounded container for sampling values with reservoir sampling.
 #[derive(Debug, Clone)]
 pub struct SamplesContainer<T> {
@@ -240,13 +290,10 @@ pub struct WhopperOpts {
     pub max_connections: usize,
     /// Maximum number of simulation steps to run.
     pub max_steps: usize,
-    /// Maximum iterations the reopen drain loop runs before declaring an
-    /// engine-level infinite loop. Drain iterations do not count against
-    /// `max_steps`: legitimate IO-heavy operations (e.g.
-    /// `PRAGMA integrity_check`) can use thousands of yields per page and
-    /// would routinely exhaust the main budget during a reopen near the end
-    /// of a run. Exceeding `max_drain_steps` within a single reopen surfaces
-    /// as an error.
+    /// Maximum iterations allowed by restart drain paths that choose to drain
+    /// active statements. The in-process reopen path aborts in-flight
+    /// statements at the restart boundary, but this remains accepted so
+    /// existing simulator invocations keep working.
     pub max_drain_steps: usize,
     /// Probability of cosmic ray bit flip on each step (0.0-1.0).
     pub cosmic_ray_probability: f64,
@@ -1008,93 +1055,21 @@ impl Whopper {
     }
 
     /// Reopen the database by closing all connections and recreating them.
-    /// This simulates a database restart/reopen scenario.
-    /// Active statements are run to completion before closing.
+    /// This simulates a database restart/reopen scenario. Any in-flight
+    /// operation is aborted at the restart boundary instead of being forced to
+    /// complete, because MVCC statements can legitimately wait on each other
+    /// forever once the simulator has decided to restart.
     pub fn reopen(&mut self) -> anyhow::Result<()> {
         debug!(
-            "Restarting database, completing active statements for {} fibers",
+            "Restarting database, aborting active statements for {} fibers",
             self.context.fibers.len()
         );
 
-        let fibers = &mut self.context.fibers;
-        // Drain active statements with a per-reopen budget independent of
-        // `max_steps`. The main loop's step budget governs how long the
-        // simulator runs overall; drain is a finalization phase that runs
-        // until either every fiber's in-flight statement has terminated
-        // (Done/Busy/Err) or `max_drain_steps` iterations elapse. The latter
-        // catches genuine engine-side infinite loops (leaked lock,
-        // unresolvable IO yield). Legitimate IO-heavy operations like
-        // `PRAGMA integrity_check` can run for thousands of yields per page,
-        // so the cap needs to comfortably exceed that.
-        let mut drain_iterations = 0usize;
-        while fibers.iter().any(|f| f.statement.borrow().is_some()) {
-            if drain_iterations >= self.max_drain_steps {
-                let stuck: Vec<usize> = fibers
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, f)| f.statement.borrow().is_some().then_some(i))
-                    .collect();
-                anyhow::bail!(
-                    "reopen drain exceeded max_drain_steps ({}) with statements still live on \
-                     fibers {:?}; likely a leaked lock or other infinite loop in the engine",
-                    self.max_drain_steps,
-                    stuck,
-                );
-            }
-            for (fiber_idx, fiber) in fibers.iter_mut().enumerate() {
-                if fiber.statement.borrow().is_some() {
-                    let done = {
-                        let span = tracing::debug_span!(
-                            "step",
-                            step = self.current_step,
-                            fiber = fiber_idx
-                        );
-                        let _enter = span.enter();
-                        let connection = fiber.connection.clone();
-                        let yield_injector = fiber.yield_injector.clone();
-
-                        let mut stmt_borrow = fiber.statement.borrow_mut();
-                        if let Some(stmt) = stmt_borrow.as_mut() {
-                            let step_result =
-                                step_stmt_with_injected_yield(&connection, yield_injector, stmt);
-                            match step_result {
-                                Ok(result) => match result {
-                                    turso_core::StepResult::Row => {
-                                        if let Some(row) = stmt.row() {
-                                            let values: Vec<Value> =
-                                                row.get_values().cloned().collect();
-                                            fiber.rows.push(values);
-                                        }
-                                        false
-                                    }
-                                    turso_core::StepResult::Done => true,
-                                    turso_core::StepResult::Busy => true,
-                                    _ => false,
-                                },
-                                Err(_) => true, // On error, consider statement done
-                            }
-                        } else {
-                            true
-                        }
-                    };
-                    if done {
-                        debug!(
-                            "fiber {}: completed with {} rows before restart",
-                            fiber_idx,
-                            fiber.rows.len()
-                        );
-                        fiber
-                            .statement
-                            .replace(None)
-                            .unwrap()
-                            .reset()
-                            .expect("statement reset should succeed before restart");
-                        fiber.rows.clear();
-                    }
-                }
-            }
-            self.io.step().unwrap();
-            drain_iterations += 1;
+        for (fiber_idx, fiber) in self.context.fibers.iter().enumerate() {
+            abort_fiber_properties_before_restart(&self.properties, fiber_idx, fiber)?;
+        }
+        for (fiber_idx, fiber) in self.context.fibers.iter_mut().enumerate() {
+            reset_active_statement_before_restart(fiber_idx, fiber)?;
         }
 
         // Close and drop all fiber connections to release database Arc references
@@ -1304,4 +1279,54 @@ fn file_size_soft_limit_exceeded(
         sizes.get(wal_path).cloned().unwrap_or(0)
     };
     wal_size > FILE_SIZE_SOFT_LIMIT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reopen_aborts_active_statements_and_rolls_back_idle_transactions() -> anyhow::Result<()> {
+        let opts = WhopperOpts {
+            seed: Some(42),
+            max_connections: 2,
+            max_steps: 0,
+            max_drain_steps: 32,
+            enable_mvcc: true,
+            ..Default::default()
+        };
+        let mut whopper = Whopper::new(opts)?;
+        let waiter = whopper.context.fibers[0].connection.clone();
+        let holder = whopper.context.fibers[1].connection.clone();
+
+        waiter.execute(
+            "CREATE TABLE IF NOT EXISTS reopen_lock_test (key INTEGER PRIMARY KEY, value TEXT)",
+        )?;
+
+        holder.execute("BEGIN DEFERRED")?;
+        holder.execute("INSERT INTO reopen_lock_test VALUES (1, 'holder')")?;
+
+        waiter.execute("BEGIN CONCURRENT")?;
+        waiter.execute("INSERT INTO reopen_lock_test VALUES (2, 'waiter')")?;
+        let mut commit_stmt = waiter.prepare("COMMIT")?;
+        let commit_step = step_stmt_with_injected_yield(
+            &waiter,
+            whopper.context.fibers[0].yield_injector.clone(),
+            &mut commit_stmt,
+        )?;
+        assert!(matches!(commit_step, turso_core::StepResult::IO));
+        whopper.context.fibers[0]
+            .statement
+            .replace(Some(commit_stmt));
+
+        whopper.reopen()?;
+
+        for fiber in &whopper.context.fibers {
+            assert!(fiber.statement.borrow().is_none());
+            assert!(fiber.txn_id.is_none());
+            assert!(matches!(fiber.state, FiberState::Idle));
+        }
+
+        Ok(())
+    }
 }
