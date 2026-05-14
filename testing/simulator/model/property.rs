@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use sql_generation::model::query::{Create, Insert, Select, predicate::Predicate, update::Update};
+use sql_generation::model::query::{
+    Create, Insert, Select, pragma::CheckpointMode, predicate::Predicate, update::Update,
+};
 
 use crate::model::{Query, QueryDiscriminants};
 
@@ -191,6 +193,15 @@ pub enum Property {
         tables: Vec<String>,
         write_kinds: Vec<QueryDiscriminants>,
     },
+    /// CheckpointStress drives write traffic, runs an explicit WAL checkpoint,
+    /// then verifies the shadow model and integrity_check.
+    CheckpointStress {
+        queries: Vec<Query>,
+        tables: Vec<String>,
+        write_kinds: Vec<QueryDiscriminants>,
+        checkpoint_mode: CheckpointMode,
+        commit_before_checkpoint: bool,
+    },
     /// Property used to subsititute a property with its queries only
     Queries {
         queries: Vec<Query>,
@@ -220,6 +231,7 @@ impl Property {
                 | Property::DeleteSelect { .. }
                 | Property::DropSelect { .. }
                 | Property::SavepointRollback { .. }
+                | Property::CheckpointStress { .. }
                 | Property::Queries { .. }
         )
     }
@@ -231,6 +243,7 @@ impl Property {
             | Property::DeleteSelect { queries, .. }
             | Property::DropSelect { queries, .. }
             | Property::SavepointRollback { queries, .. }
+            | Property::CheckpointStress { queries, .. }
             | Property::Queries { queries } => Some(queries),
             Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => None,
             Property::SelectLimit { .. }
