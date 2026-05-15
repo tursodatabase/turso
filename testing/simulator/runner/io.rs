@@ -7,7 +7,10 @@ use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{Clock, IO, MonotonicInstant, OpenFlags, PlatformIO, Result, WallClockInstant};
 
-use crate::runner::{SimIO, cli::IoBackend, clock::SimulatorClock, file::SimulatorFile};
+use crate::{
+    profiles::io::FaultProfile,
+    runner::{SimIO, cli::IoBackend, clock::SimulatorClock, file::SimulatorFile},
+};
 
 pub(crate) struct SimulatorIO {
     pub(crate) inner: Box<dyn IO>,
@@ -17,6 +20,7 @@ pub(crate) struct SimulatorIO {
     pub(crate) page_size: usize,
     seed: u64,
     latency_probability: u8,
+    fault_profile: FaultProfile,
     clock: Arc<SimulatorClock>,
 }
 
@@ -30,6 +34,7 @@ impl SimulatorIO {
         latency_probability: u8,
         min_tick: u64,
         max_tick: u64,
+        fault_profile: FaultProfile,
         io_backend: IoBackend,
     ) -> Result<Self> {
         let inner: Box<dyn turso_core::IO> = match io_backend {
@@ -55,6 +60,7 @@ impl SimulatorIO {
             page_size,
             seed,
             latency_probability,
+            fault_profile,
             clock: Arc::new(clock),
         })
     }
@@ -142,6 +148,9 @@ impl IO for SimulatorIO {
             page_size: self.page_size,
             rng: RefCell::new(ChaCha8Rng::seed_from_u64(self.seed)),
             latency_probability: self.latency_probability,
+            fault_read: self.fault_profile.read,
+            fault_write: self.fault_profile.write,
+            fault_sync: self.fault_profile.sync,
             sync_completion: RefCell::new(None),
             queued_io: RefCell::new(Vec::new()),
             clock: self.clock.clone(),

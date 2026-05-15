@@ -8,9 +8,12 @@ use rand_chacha::ChaCha8Rng;
 use tracing::{Level, instrument};
 use turso_core::{Completion, File, Result};
 
-use crate::runner::{
-    clock::SimulatorClock,
-    memory::io::{CallbackQueue, Fd, Operation, OperationType},
+use crate::{
+    profiles::io::FaultProfile,
+    runner::{
+        clock::SimulatorClock,
+        memory::io::{CallbackQueue, Fd, Operation, OperationType},
+    },
 };
 
 /// Tracks IO calls and faults for each type of I/O operation
@@ -53,6 +56,7 @@ pub struct MemorySimFile {
     io_tracker: RefCell<IOTracker>,
     pub rng: RefCell<ChaCha8Rng>,
     pub latency_probability: u8,
+    fault_profile: FaultProfile,
     clock: Arc<SimulatorClock>,
     fault: Cell<bool>,
 }
@@ -66,6 +70,7 @@ impl MemorySimFile {
         fd: Fd,
         seed: u64,
         latency_probability: u8,
+        fault_profile: FaultProfile,
         clock: Arc<SimulatorClock>,
     ) -> Self {
         Self {
@@ -76,6 +81,7 @@ impl MemorySimFile {
             io_tracker: RefCell::new(IOTracker::default()),
             rng: RefCell::new(ChaCha8Rng::seed_from_u64(seed)),
             latency_probability,
+            fault_profile,
             clock,
             fault: Cell::new(false),
         }
@@ -131,8 +137,15 @@ impl MemorySimFile {
     }
 
     fn insert_op(&self, op: OperationType) {
-        // FIXME: currently avoid any fsync faults until we correctly define the expected behaviour in the simulator
-        let fault = self.fault.get() && !matches!(op, OperationType::Sync { .. });
+        let fault = self.fault.get()
+            && match op {
+                OperationType::Read { .. } => self.fault_profile.read,
+                OperationType::Write { .. } | OperationType::WriteV { .. } => {
+                    self.fault_profile.write
+                }
+                OperationType::Sync { .. } => self.fault_profile.sync,
+                OperationType::Truncate { .. } => self.fault_profile.write,
+            };
         if fault {
             let mut io_tracker = self.io_tracker.borrow_mut();
             match &op {

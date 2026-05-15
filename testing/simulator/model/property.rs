@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use sql_generation::model::query::{Create, Insert, Select, predicate::Predicate, update::Update};
+use sql_generation::model::query::{
+    Create, Insert, Select, pragma::CheckpointMode, predicate::Predicate, update::Update,
+};
 
 use crate::model::{Query, QueryDiscriminants};
 
@@ -182,6 +184,11 @@ pub enum Property {
     FaultyQuery {
         query: Query,
     },
+    /// Explicitly drives WAL checkpoints and validates the database afterward.
+    CheckpointStress {
+        mode: CheckpointMode,
+        tables: Vec<String>,
+    },
     /// SavepointRollback wraps random write interactions in a named savepoint,
     /// rolls them back, then checks that the database still matches the shadow
     /// model. This targets pager/WAL/cache-spill bugs where rolled-back page
@@ -232,7 +239,9 @@ impl Property {
             | Property::DropSelect { queries, .. }
             | Property::SavepointRollback { queries, .. }
             | Property::Queries { queries } => Some(queries),
-            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => None,
+            Property::FsyncNoWait { .. }
+            | Property::FaultyQuery { .. }
+            | Property::CheckpointStress { .. } => None,
             Property::SelectLimit { .. }
             | Property::SelectSelectOptimizer { .. }
             | Property::WhereTrueFalseNull { .. }

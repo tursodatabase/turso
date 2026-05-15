@@ -38,6 +38,9 @@ pub(crate) struct SimulatorFile {
     pub(crate) rng: RefCell<ChaCha8Rng>,
 
     pub latency_probability: u8,
+    pub fault_read: bool,
+    pub fault_write: bool,
+    pub fault_sync: bool,
 
     pub sync_completion: RefCell<Option<turso_core::Completion>>,
     pub queued_io: RefCell<Vec<DelayedIo>>,
@@ -70,7 +73,8 @@ impl SimulatorFile {
     pub(crate) fn stats_table(&self) -> String {
         let sum_calls =
             self.nr_pread_calls.get() + self.nr_pwrite_calls.get() + self.nr_sync_calls.get();
-        let sum_faults = self.nr_pread_faults.get() + self.nr_pwrite_faults.get();
+        let sum_faults =
+            self.nr_pread_faults.get() + self.nr_pwrite_faults.get() + self.nr_sync_faults.get();
         let stats_table = [
             "op           calls   faults".to_string(),
             "--------- -------- --------".to_string(),
@@ -87,7 +91,7 @@ impl SimulatorFile {
             format!(
                 "sync      {:8} {:8}",
                 self.nr_sync_calls.get(),
-                0 // No fault counter for sync
+                self.nr_sync_faults.get()
             ),
             "--------- -------- --------".to_string(),
             format!("total     {sum_calls:8} {sum_faults:8}"),
@@ -120,7 +124,7 @@ impl SimulatorFile {
 
 impl File for SimulatorFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
-        if self.fault.get() {
+        if self.fault.get() && self.fault_write {
             return Err(turso_core::LimboError::InternalError(
                 FAULT_ERROR_MSG.into(),
             ));
@@ -129,7 +133,7 @@ impl File for SimulatorFile {
     }
 
     fn unlock_file(&self) -> Result<()> {
-        if self.fault.get() {
+        if self.fault.get() && self.fault_write {
             return Err(turso_core::LimboError::InternalError(
                 FAULT_ERROR_MSG.into(),
             ));
@@ -139,7 +143,7 @@ impl File for SimulatorFile {
 
     fn pread(&self, pos: u64, c: turso_core::Completion) -> Result<turso_core::Completion> {
         self.nr_pread_calls.set(self.nr_pread_calls.get() + 1);
-        if self.fault.get() {
+        if self.fault.get() && self.fault_read {
             tracing::debug!("pread fault");
             self.nr_pread_faults.set(self.nr_pread_faults.get() + 1);
             return Err(turso_core::LimboError::InternalError(
@@ -165,7 +169,7 @@ impl File for SimulatorFile {
         c: turso_core::Completion,
     ) -> Result<turso_core::Completion> {
         self.nr_pwrite_calls.set(self.nr_pwrite_calls.get() + 1);
-        if self.fault.get() {
+        if self.fault.get() && self.fault_write {
             tracing::debug!("pwrite fault");
             self.nr_pwrite_faults.set(self.nr_pwrite_faults.get() + 1);
             return Err(turso_core::LimboError::InternalError(
@@ -190,12 +194,12 @@ impl File for SimulatorFile {
         sync_type: turso_core::io::FileSyncType,
     ) -> Result<turso_core::Completion> {
         self.nr_sync_calls.set(self.nr_sync_calls.get() + 1);
-        if self.fault.get() {
-            // TODO: Enable this when https://github.com/tursodatabase/turso/issues/2091 is fixed.
-            tracing::debug!(
-                "ignoring sync fault because it causes false positives with current simulator design"
-            );
-            self.fault.set(false);
+        if self.fault.get() && self.fault_sync {
+            tracing::debug!("sync fault");
+            self.nr_sync_faults.set(self.nr_sync_faults.get() + 1);
+            return Err(turso_core::LimboError::InternalError(
+                FAULT_ERROR_MSG.into(),
+            ));
         }
         let c = if let Some(latency) = self.generate_latency_duration() {
             let cloned_c = c.clone();
@@ -223,7 +227,7 @@ impl File for SimulatorFile {
         c: turso_core::Completion,
     ) -> Result<turso_core::Completion> {
         self.nr_pwrite_calls.set(self.nr_pwrite_calls.get() + 1);
-        if self.fault.get() {
+        if self.fault.get() && self.fault_write {
             tracing::debug!("pwritev fault");
             self.nr_pwrite_faults.set(self.nr_pwrite_faults.get() + 1);
             return Err(turso_core::LimboError::InternalError(
@@ -249,7 +253,7 @@ impl File for SimulatorFile {
     }
 
     fn truncate(&self, len: u64, c: turso_core::Completion) -> Result<turso_core::Completion> {
-        if self.fault.get() {
+        if self.fault.get() && self.fault_write {
             return Err(turso_core::LimboError::InternalError(
                 FAULT_ERROR_MSG.into(),
             ));

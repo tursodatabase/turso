@@ -7,6 +7,7 @@ use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{Clock, Completion, IO, MonotonicInstant, OpenFlags, Result, WallClockInstant};
 
+use crate::profiles::io::FaultProfile;
 use crate::runner::SimIO;
 use crate::runner::clock::SimulatorClock;
 use crate::runner::memory::file::MemorySimFile;
@@ -135,6 +136,7 @@ pub struct MemorySimIO {
     pub page_size: usize,
     seed: u64,
     latency_probability: u8,
+    fault_profile: FaultProfile,
     clock: Arc<SimulatorClock>,
 }
 
@@ -148,6 +150,7 @@ impl MemorySimIO {
         latency_probability: u8,
         min_tick: u64,
         max_tick: u64,
+        fault_profile: FaultProfile,
     ) -> Self {
         let files = RefCell::new(IndexMap::new());
         let rng = RefCell::new(ChaCha8Rng::seed_from_u64(seed));
@@ -159,6 +162,7 @@ impl MemorySimIO {
             page_size,
             seed,
             latency_probability,
+            fault_profile,
             clock: Arc::new(SimulatorClock::new(
                 ChaCha8Rng::seed_from_u64(seed),
                 min_tick,
@@ -256,6 +260,7 @@ impl IO for MemorySimIO {
                 fd.clone(),
                 self.seed,
                 self.latency_probability,
+                self.fault_profile.clone(),
                 self.clock.clone(),
             ));
             files.insert(fd, file.clone());

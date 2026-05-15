@@ -792,7 +792,15 @@ impl InteractionType {
             }
             let mut rows = rows.unwrap().unwrap();
             let mut out = Vec::new();
-            let mut current_prob = 0.05;
+            let sync_only_checkpoint = matches!(
+                query,
+                Query::Pragma(sql_generation::model::query::pragma::Pragma::WalCheckpoint(
+                    _
+                ))
+            ) && env.profile.io.fault.sync
+                && !env.profile.io.fault.read
+                && !env.profile.io.fault.write;
+            let mut current_prob = if sync_only_checkpoint { 1.0 } else { 0.05 };
             let mut incr = 0.001;
 
             // Pre-compute path stems for selective fault injection
@@ -819,8 +827,6 @@ impl InteractionType {
                 .collect();
 
             loop {
-                let syncing = env.io.syncing();
-
                 // Decide faults independently per database
                 let main_fault = env.rng.random_bool(current_prob);
                 let aux_prob = (current_prob * 0.5).min(1.0);
@@ -831,8 +837,7 @@ impl InteractionType {
                 }
                 let any_fault = fault_pairs.iter().any(|(_, f)| *f);
 
-                // TODO: avoid for now injecting faults when syncing
-                if any_fault && !syncing {
+                if any_fault {
                     env.io.inject_fault_selective(&fault_pairs);
                 }
 

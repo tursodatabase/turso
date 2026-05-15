@@ -14,6 +14,7 @@ use sql_generation::{
         query::{
             Create, Delete, Drop, Insert, Select,
             alter_table::{AlterTable, AlterTableType},
+            pragma::{CheckpointMode, Pragma},
             predicate::Predicate,
             select::{CompoundOperator, CompoundSelect, ResultColumn, SelectBody, SelectInner},
             transaction::{Begin, Commit, Rollback},
@@ -239,7 +240,9 @@ impl Property {
             Property::Queries { .. } => {
                 unreachable!("No extensional querie generation for `Property::Queries`")
             }
-            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => {
+            Property::FsyncNoWait { .. }
+            | Property::FaultyQuery { .. }
+            | Property::CheckpointStress { .. } => {
                 unreachable!("No extensional queries")
             }
             Property::SelectLimit { .. }
@@ -990,6 +993,21 @@ impl Property {
                 .map(InteractionBuilder::with_interaction)
                 .collect()
             }
+            Property::CheckpointStress { mode, tables } => {
+                let mut interactions = Vec::with_capacity(tables.len() * 2 + 2);
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::FaultyQuery(Query::Pragma(Pragma::WalCheckpoint(
+                        mode.clone(),
+                    ))),
+                ));
+                interactions.extend(assert_all_table_values(tables, connection_index));
+                interactions.push(assert_integrity_check(
+                    "PRAGMA integrity_check should be ok after checkpoint",
+                    tables,
+                    connection_index,
+                ));
+                interactions
+            }
             Property::WhereTrueFalseNull { select, predicate } => {
                 let tables_dependencies = select.dependencies().into_iter().collect::<Vec<_>>();
                 let assumption = InteractionType::Assumption(Assertion::new(
@@ -1230,7 +1248,11 @@ impl Property {
                     })),
                 ));
                 interactions.extend(assert_all_table_values(tables, connection_index));
-                interactions.push(assert_integrity_check(tables, connection_index));
+                interactions.push(assert_integrity_check(
+                    "PRAGMA integrity_check should be ok after savepoint rollback",
+                    tables,
+                    connection_index,
+                ));
                 interactions
             }
         };
@@ -1414,10 +1436,14 @@ fn random_main_table_delete<R: rand::Rng + ?Sized>(rng: &mut R, table: &Table) -
     })
 }
 
-fn assert_integrity_check(tables: &[String], connection_index: usize) -> InteractionBuilder {
+fn assert_integrity_check(
+    message: &'static str,
+    tables: &[String],
+    connection_index: usize,
+) -> InteractionBuilder {
     let tables = tables.to_vec();
     InteractionBuilder::with_interaction(InteractionType::Assertion(Assertion::new(
-        "PRAGMA integrity_check should be ok after savepoint rollback".to_string(),
+        message.to_string(),
         move |_stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
             let result = run_integrity_check(env, connection_index)?;
             if result == "ok" {
@@ -1678,6 +1704,29 @@ fn property_savepoint_rollback<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_checkpoint_stress<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    const MODES: [CheckpointMode; 4] = [
+        CheckpointMode::Passive,
+        CheckpointMode::Full,
+        CheckpointMode::Restart,
+        CheckpointMode::Truncate,
+    ];
+
+    Property::CheckpointStress {
+        mode: pick(&MODES, rng).clone(),
+        tables: ctx
+            .tables()
+            .iter()
+            .map(|table| table.name.clone())
+            .collect(),
+    }
+}
+
 fn property_table_has_expected_content<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
@@ -1914,6 +1963,7 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
+            PropertyDiscriminants::CheckpointStress => property_checkpoint_stress,
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
             }
@@ -2033,6 +2083,13 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::CheckpointStress => {
+                if env.profile.io.enable && !ctx.tables().is_empty() {
+                    remaining.insert + remaining.update + remaining.delete + remaining.select.max(1)
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
@@ -2074,6 +2131,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
+            PropertyDiscriminants::CheckpointStress => QueryCapabilities::SELECT,
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
         }
     }

@@ -4,11 +4,19 @@ use std::sync::Arc;
 use anyhow::Result;
 use turso_core::{Connection, Database, DatabaseOpts, IO, OpenFlags, StepResult};
 
+use crate::profiles::io::FaultProfile;
 use crate::runner::SimIO;
 use crate::runner::memory::io::MemorySimIO;
 
 fn make_io(seed: u64, latency_probability: u8) -> Arc<MemorySimIO> {
-    Arc::new(MemorySimIO::new(seed, 4096, latency_probability, 1, 5))
+    Arc::new(MemorySimIO::new(
+        seed,
+        4096,
+        latency_probability,
+        1,
+        5,
+        FaultProfile::default(),
+    ))
 }
 
 fn open_conn(io: Arc<MemorySimIO>, path: &str) -> Result<Arc<Connection>> {

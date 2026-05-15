@@ -947,6 +947,7 @@ impl SimulatorEnv {
         self.rng = ChaCha8Rng::seed_from_u64(self.opts.seed);
 
         let latency_prof = &self.profile.io.latency;
+        let fault_profile = self.profile.io.fault.clone();
 
         let io: Arc<dyn SimIO> = match self.io_backend {
             IoBackend::Memory => Arc::new(MemorySimIO::new(
@@ -955,6 +956,7 @@ impl SimulatorEnv {
                 latency_prof.latency_probability,
                 latency_prof.min_tick,
                 latency_prof.max_tick,
+                fault_profile,
             )),
             _ => Arc::new(
                 SimulatorIO::new(
@@ -963,6 +965,7 @@ impl SimulatorEnv {
                     latency_prof.latency_probability,
                     latency_prof.min_tick,
                     latency_prof.max_tick,
+                    fault_profile,
                     self.io_backend,
                 )
                 .unwrap(),
@@ -1176,6 +1179,7 @@ impl SimulatorEnv {
         profile.validate().unwrap();
 
         let latency_prof = &profile.io.latency;
+        let fault_profile = profile.io.fault.clone();
 
         let io_backend = cli_opts.io_backend;
         let io: Arc<dyn SimIO> = match io_backend {
@@ -1185,6 +1189,7 @@ impl SimulatorEnv {
                 latency_prof.latency_probability,
                 latency_prof.min_tick,
                 latency_prof.max_tick,
+                fault_profile,
             )),
             _ => Arc::new(
                 SimulatorIO::new(
@@ -1193,6 +1198,7 @@ impl SimulatorEnv {
                     latency_prof.latency_probability,
                     latency_prof.min_tick,
                     latency_prof.max_tick,
+                    fault_profile,
                     io_backend,
                 )
                 .unwrap(),

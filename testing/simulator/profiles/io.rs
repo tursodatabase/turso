@@ -13,7 +13,6 @@ pub struct IOProfile {
     pub latency: LatencyProfile,
     #[garde(dive)]
     pub fault: FaultProfile,
-    // TODO: expand here with header corruption options and faults on specific IO operations
 }
 
 impl Default for IOProfile {
@@ -58,7 +57,6 @@ impl Default for LatencyProfile {
 pub struct FaultProfile {
     #[garde(skip)]
     pub enable: bool,
-    // TODO: modify SimIo impls to have a FaultProfile inside so they can skip faults depending on the profile
     #[garde(skip)]
     pub read: bool,
     #[garde(skip)]

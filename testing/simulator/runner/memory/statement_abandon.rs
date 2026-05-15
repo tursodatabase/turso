@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use turso_core::{Connection, Database, DatabaseOpts, IO, OpenFlags, StepResult};
 
+use crate::profiles::io::FaultProfile;
 use crate::runner::SimIO;
 use crate::runner::memory::io::MemorySimIO;
 
@@ -23,8 +24,12 @@ fn make_two_conns(seed: u64) -> Result<(Arc<Connection>, Arc<Connection>, Arc<Me
 
 fn make_io(seed: u64) -> Arc<MemorySimIO> {
     Arc::new(MemorySimIO::new(
-        seed, 4096, 100, // Always schedule operations asynchronously.
-        1, 5,
+        seed,
+        4096,
+        100, // Always schedule operations asynchronously.
+        1,
+        5,
+        FaultProfile::default(),
     ))
 }
 
