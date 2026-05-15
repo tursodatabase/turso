@@ -328,3 +328,22 @@ test autoinc-expicit-negative-rowid-initializes-seq-table {
 } expect {
 	t|0
 }
+
+# Regression test for https://github.com/tursodatabase/turso/issues/6963
+@cross-check-integrity
+test autoinc-alter-drop-column-preserves-schema {
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        doomed INT,
+        v TEXT
+    );
+    INSERT INTO t(doomed, v) VALUES (9, 'a'), (8, 'b');
+    ALTER TABLE t DROP COLUMN doomed;
+    INSERT INTO t(v) VALUES ('c');
+    SELECT sql LIKE '%AUTOINCREMENT%' FROM sqlite_schema WHERE name='t';
+    SELECT name, seq FROM sqlite_sequence WHERE name='t';
+}
+expect {
+    1
+    t|3
+}

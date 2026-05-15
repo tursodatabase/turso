@@ -1,13 +1,76 @@
-//! Reopen-DB tests for ALTER TABLE ADD COLUMN with table-level UNIQUE constraints.
+//! Reopen-DB tests for ALTER TABLE schema rewrites.
 //!
-//! BTreeTable::to_sql() must emit table-level UNIQUE (...) so that after ADD COLUMN
-//! the stored schema in sqlite_schema still matches the sqlite_autoindex_* entries.
+//! BTreeTable::to_sql() must preserve schema details so that after ALTER TABLE
+//! the stored schema in sqlite_schema still matches the table metadata.
+//!
+//! For table-level UNIQUE (...), sqlite_schema must still match the sqlite_autoindex_* entries.
 //! Otherwise reopen triggers populate_indices panic: "all automatic indexes parsed
 //! from sqlite_schema should have been consumed, but N remain".
 //! See https://github.com/tursodatabase/turso/issues/5616
 
 use crate::common::{ExecRows, TempDatabase};
 use tempfile::TempDir;
+
+/// After ALTER TABLE DROP COLUMN on an AUTOINCREMENT table, reopen must parse
+/// the persisted schema as AUTOINCREMENT and avoid reusing deleted rowids.
+#[test]
+fn test_alter_table_drop_column_preserves_autoincrement_reopen() {
+    let path = TempDir::new()
+        .unwrap()
+        .keep()
+        .join("alter_drop_col_autoincrement_reopen.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute(
+            "CREATE TABLE t(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                doomed INT,
+                v TEXT
+            )",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t(doomed, v) VALUES (9, 'a'), (8, 'b')")
+            .unwrap();
+        conn.execute("ALTER TABLE t DROP COLUMN doomed").unwrap();
+        conn.execute("INSERT INTO t(v) VALUES ('c')").unwrap();
+        conn.close().unwrap();
+    }
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        let schema: Vec<(i64,)> =
+            conn.exec_rows("SELECT sql LIKE '%AUTOINCREMENT%' FROM sqlite_schema WHERE name = 't'");
+        assert_eq!(schema, vec![(1,)]);
+
+        let seq_before: Vec<(String, i64)> =
+            conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 't'");
+        assert_eq!(seq_before, vec![("t".into(), 3)]);
+
+        conn.execute("INSERT INTO t(v) VALUES ('d')").unwrap();
+        conn.execute("DELETE FROM t WHERE v = 'd'").unwrap();
+        conn.execute("INSERT INTO t(v) VALUES ('e')").unwrap();
+
+        let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                (1, "a".into()),
+                (2, "b".into()),
+                (3, "c".into()),
+                (5, "e".into()),
+            ]
+        );
+
+        let seq_after: Vec<(String, i64)> =
+            conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 't'");
+        assert_eq!(seq_after, vec![("t".into(), 5)]);
+        conn.close().unwrap();
+    }
+}
 
 /// After ALTER TABLE ADD COLUMN on a table with UNIQUE(stream_id, version), reopen
 /// must succeed (no orphan autoindex) and the unique constraint must still be enforced.
