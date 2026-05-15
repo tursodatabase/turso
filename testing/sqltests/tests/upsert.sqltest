@@ -48,6 +48,44 @@ expect {
 }
 
 @cross-check-integrity
+test upsert-partial-unique-index-target-where {
+    CREATE TABLE p (a TEXT, b TEXT, deleted INTEGER DEFAULT 0);
+    CREATE UNIQUE INDEX p_ab_live ON p(a, b) WHERE deleted = 0;
+    INSERT INTO p(a, b, deleted) VALUES ('a', 'b', 0);
+    INSERT INTO p(a, b, deleted) VALUES ('a', 'b', 0)
+      ON CONFLICT(a, b) WHERE deleted = 0
+      DO UPDATE SET b = excluded.b;
+    SELECT a, b, deleted FROM p;
+}
+expect {
+    a|b|0
+}
+
+@cross-check-integrity
+test upsert-partial-unique-index-target-requires-where {
+    CREATE TABLE p (a TEXT, b TEXT, deleted INTEGER DEFAULT 0);
+    CREATE UNIQUE INDEX p_ab_live ON p(a, b) WHERE deleted = 0;
+    INSERT INTO p(a, b, deleted) VALUES ('a', 'b', 0);
+    INSERT INTO p(a, b, deleted) VALUES ('a', 'b', 0)
+      ON CONFLICT(a, b)
+      DO UPDATE SET b = excluded.b;
+}
+expect error {
+}
+
+@cross-check-integrity
+test upsert-partial-unique-index-target-where-is-structural {
+    CREATE TABLE p (a TEXT, b TEXT, deleted INTEGER DEFAULT 0);
+    CREATE UNIQUE INDEX p_ab_live ON p(a, b) WHERE deleted = 0;
+    INSERT INTO p(a, b, deleted) VALUES ('a', 'b', 0);
+    INSERT INTO p(a, b, deleted) VALUES ('a', 'b', 0)
+      ON CONFLICT(a, b) WHERE 0 = deleted
+      DO UPDATE SET b = excluded.b;
+}
+expect error {
+}
+
+@cross-check-integrity
 test upsert-where-guard-no-change {
     CREATE TABLE g (a UNIQUE, b);
     INSERT INTO g VALUES (1,'x');

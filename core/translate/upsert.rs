@@ -35,7 +35,9 @@ use crate::{
         insert::Insertion,
         plan::{ResultSetColumn, TableReferences},
     },
-    util::{exprs_are_equivalent, normalize_ident},
+    util::{
+        check_ident_equivalency, check_literal_equivalency, exprs_are_equivalent, normalize_ident,
+    },
     vdbe::{
         affinity::Affinity,
         builder::{DmlColumnContext, ProgramBuilder},
@@ -257,17 +259,332 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
     });
 }
 
+/// Match partial-index predicates using SQLite-style structural comparison.
+///
+/// SQLite requires an ON CONFLICT target WHERE clause to structurally match the
+/// partial UNIQUE index predicate. This is intentionally stricter than
+/// `exprs_are_equivalent`: e.g. `deleted = 0` matches `(DELETED = 00)` and
+/// `p.deleted = 0`, but not the commuted form `0 = deleted`.
+fn partial_index_where_matches(
+    target_where: &Option<Box<ast::Expr>>,
+    index_where: &Option<Box<ast::Expr>>,
+) -> bool {
+    match (target_where.as_deref(), index_where.as_deref()) {
+        (None, None) => true,
+        (Some(target), Some(index)) => partial_index_exprs_match(target, index),
+        _ => false,
+    }
+}
+
+fn strip_single_parens(mut expr: &ast::Expr) -> &ast::Expr {
+    while let ast::Expr::Parenthesized(exprs) = expr {
+        if exprs.len() != 1 {
+            break;
+        }
+        expr = &exprs[0];
+    }
+    expr
+}
+
+fn partial_index_column_name(expr: &ast::Expr) -> Option<&str> {
+    match strip_single_parens(expr) {
+        ast::Expr::Id(name) | ast::Expr::Name(name) => Some(name.as_str()),
+        ast::Expr::Qualified(_, name) | ast::Expr::DoublyQualified(_, _, name) => {
+            Some(name.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn partial_index_option_exprs_match(lhs: Option<&ast::Expr>, rhs: Option<&ast::Expr>) -> bool {
+    match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) => partial_index_exprs_match(lhs, rhs),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn partial_index_expr_vecs_match(lhs: &[Box<ast::Expr>], rhs: &[Box<ast::Expr>]) -> bool {
+    lhs.len() == rhs.len()
+        && lhs
+            .iter()
+            .zip(rhs)
+            .all(|(lhs, rhs)| partial_index_exprs_match(lhs, rhs))
+}
+
+fn partial_index_sorted_columns_match(
+    lhs: &[ast::SortedColumn],
+    rhs: &[ast::SortedColumn],
+) -> bool {
+    lhs.len() == rhs.len()
+        && lhs.iter().zip(rhs).all(|(lhs, rhs)| {
+            lhs.order == rhs.order
+                && lhs.nulls == rhs.nulls
+                && partial_index_exprs_match(&lhs.expr, &rhs.expr)
+        })
+}
+
+fn partial_index_exprs_match(lhs: &ast::Expr, rhs: &ast::Expr) -> bool {
+    use ast::Expr;
+
+    let lhs = strip_single_parens(lhs);
+    let rhs = strip_single_parens(rhs);
+
+    if let (Some(lhs), Some(rhs)) = (
+        partial_index_column_name(lhs),
+        partial_index_column_name(rhs),
+    ) {
+        return check_ident_equivalency(lhs, rhs);
+    }
+
+    match (lhs, rhs) {
+        (
+            Expr::Between {
+                lhs: lhs_expr,
+                not: lhs_not,
+                start: lhs_start,
+                end: lhs_end,
+            },
+            Expr::Between {
+                lhs: rhs_expr,
+                not: rhs_not,
+                start: rhs_start,
+                end: rhs_end,
+            },
+        ) => {
+            lhs_not == rhs_not
+                && partial_index_exprs_match(lhs_expr, rhs_expr)
+                && partial_index_exprs_match(lhs_start, rhs_start)
+                && partial_index_exprs_match(lhs_end, rhs_end)
+        }
+        (Expr::Binary(lhs_left, lhs_op, lhs_right), Expr::Binary(rhs_left, rhs_op, rhs_right)) => {
+            lhs_op == rhs_op
+                && partial_index_exprs_match(lhs_left, rhs_left)
+                && partial_index_exprs_match(lhs_right, rhs_right)
+        }
+        (
+            Expr::Case {
+                base: lhs_base,
+                when_then_pairs: lhs_pairs,
+                else_expr: lhs_else,
+            },
+            Expr::Case {
+                base: rhs_base,
+                when_then_pairs: rhs_pairs,
+                else_expr: rhs_else,
+            },
+        ) => {
+            partial_index_option_exprs_match(lhs_base.as_deref(), rhs_base.as_deref())
+                && lhs_pairs.len() == rhs_pairs.len()
+                && lhs_pairs.iter().zip(rhs_pairs).all(
+                    |((lhs_when, lhs_then), (rhs_when, rhs_then))| {
+                        partial_index_exprs_match(lhs_when, rhs_when)
+                            && partial_index_exprs_match(lhs_then, rhs_then)
+                    },
+                )
+                && partial_index_option_exprs_match(lhs_else.as_deref(), rhs_else.as_deref())
+        }
+        (
+            Expr::Cast {
+                expr: lhs_expr,
+                type_name: lhs_type,
+            },
+            Expr::Cast {
+                expr: rhs_expr,
+                type_name: rhs_type,
+            },
+        ) => {
+            partial_index_exprs_match(lhs_expr, rhs_expr)
+                && match (lhs_type, rhs_type) {
+                    (Some(lhs_type), Some(rhs_type)) => {
+                        check_ident_equivalency(&lhs_type.name, &rhs_type.name)
+                    }
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        (Expr::Collate(lhs_expr, lhs_collation), Expr::Collate(rhs_expr, rhs_collation)) => {
+            partial_index_exprs_match(lhs_expr, rhs_expr)
+                && check_ident_equivalency(lhs_collation.as_str(), rhs_collation.as_str())
+        }
+        (
+            Expr::FieldAccess {
+                base: lhs_base,
+                field: lhs_field,
+                resolved: lhs_resolved,
+            },
+            Expr::FieldAccess {
+                base: rhs_base,
+                field: rhs_field,
+                resolved: rhs_resolved,
+            },
+        ) => {
+            partial_index_exprs_match(lhs_base, rhs_base)
+                && check_ident_equivalency(lhs_field.as_str(), rhs_field.as_str())
+                && lhs_resolved == rhs_resolved
+        }
+        (
+            Expr::FunctionCall {
+                name: lhs_name,
+                distinctness: lhs_distinctness,
+                args: lhs_args,
+                order_by: lhs_order_by,
+                filter_over: lhs_filter_over,
+            },
+            Expr::FunctionCall {
+                name: rhs_name,
+                distinctness: rhs_distinctness,
+                args: rhs_args,
+                order_by: rhs_order_by,
+                filter_over: rhs_filter_over,
+            },
+        ) => {
+            check_ident_equivalency(lhs_name.as_str(), rhs_name.as_str())
+                && lhs_distinctness == rhs_distinctness
+                && partial_index_expr_vecs_match(lhs_args, rhs_args)
+                && partial_index_sorted_columns_match(lhs_order_by, rhs_order_by)
+                && partial_index_option_exprs_match(
+                    lhs_filter_over.filter_clause.as_deref(),
+                    rhs_filter_over.filter_clause.as_deref(),
+                )
+                && lhs_filter_over.over_clause == rhs_filter_over.over_clause
+        }
+        (
+            Expr::FunctionCallStar {
+                name: lhs_name,
+                filter_over: lhs_filter_over,
+            },
+            Expr::FunctionCallStar {
+                name: rhs_name,
+                filter_over: rhs_filter_over,
+            },
+        ) => {
+            check_ident_equivalency(lhs_name.as_str(), rhs_name.as_str())
+                && partial_index_option_exprs_match(
+                    lhs_filter_over.filter_clause.as_deref(),
+                    rhs_filter_over.filter_clause.as_deref(),
+                )
+                && lhs_filter_over.over_clause == rhs_filter_over.over_clause
+        }
+        (
+            Expr::Column {
+                database: lhs_db,
+                table: lhs_table,
+                column: lhs_col,
+                is_rowid_alias: lhs_rowid,
+            },
+            Expr::Column {
+                database: rhs_db,
+                table: rhs_table,
+                column: rhs_col,
+                is_rowid_alias: rhs_rowid,
+            },
+        ) => {
+            lhs_db == rhs_db
+                && lhs_table == rhs_table
+                && lhs_col == rhs_col
+                && lhs_rowid == rhs_rowid
+        }
+        (
+            Expr::RowId {
+                database: lhs_db,
+                table: lhs_table,
+            },
+            Expr::RowId {
+                database: rhs_db,
+                table: rhs_table,
+            },
+        ) => lhs_db == rhs_db && lhs_table == rhs_table,
+        (
+            Expr::InList {
+                lhs: lhs_expr,
+                not: lhs_not,
+                rhs: lhs_values,
+            },
+            Expr::InList {
+                lhs: rhs_expr,
+                not: rhs_not,
+                rhs: rhs_values,
+            },
+        ) => {
+            lhs_not == rhs_not
+                && partial_index_exprs_match(lhs_expr, rhs_expr)
+                && partial_index_expr_vecs_match(lhs_values, rhs_values)
+        }
+        (Expr::IsNull(lhs_expr), Expr::IsNull(rhs_expr)) => {
+            partial_index_exprs_match(lhs_expr, rhs_expr)
+        }
+        (
+            Expr::Like {
+                lhs: lhs_lhs,
+                not: lhs_not,
+                op: lhs_op,
+                rhs: lhs_rhs,
+                escape: lhs_escape,
+            },
+            Expr::Like {
+                lhs: rhs_lhs,
+                not: rhs_not,
+                op: rhs_op,
+                rhs: rhs_rhs,
+                escape: rhs_escape,
+            },
+        ) => {
+            lhs_not == rhs_not
+                && lhs_op == rhs_op
+                && partial_index_exprs_match(lhs_lhs, rhs_lhs)
+                && partial_index_exprs_match(lhs_rhs, rhs_rhs)
+                && partial_index_option_exprs_match(lhs_escape.as_deref(), rhs_escape.as_deref())
+        }
+        (Expr::Literal(lhs_literal), Expr::Literal(rhs_literal)) => {
+            check_literal_equivalency(lhs_literal, rhs_literal)
+        }
+        (Expr::NotNull(lhs_expr), Expr::NotNull(rhs_expr)) => {
+            partial_index_exprs_match(lhs_expr, rhs_expr)
+        }
+        (Expr::Unary(lhs_op, lhs_expr), Expr::Unary(rhs_op, rhs_expr)) => {
+            lhs_op == rhs_op && partial_index_exprs_match(lhs_expr, rhs_expr)
+        }
+        (Expr::Variable(lhs_var), Expr::Variable(rhs_var)) => lhs_var == rhs_var,
+        (
+            Expr::Array {
+                elements: lhs_elements,
+            },
+            Expr::Array {
+                elements: rhs_elements,
+            },
+        ) => partial_index_expr_vecs_match(lhs_elements, rhs_elements),
+        (
+            Expr::Subscript {
+                base: lhs_base,
+                index: lhs_index,
+            },
+            Expr::Subscript {
+                base: rhs_base,
+                index: rhs_index,
+            },
+        ) => {
+            partial_index_exprs_match(lhs_base, rhs_base)
+                && partial_index_exprs_match(lhs_index, rhs_index)
+        }
+        _ => lhs == rhs,
+    }
+}
+
 /// Match ON CONFLICT target to a UNIQUE index, *ignoring order* but requiring
 /// exact coverage (same column multiset). If the target specifies a COLLATED
 /// column, the collation must match the index column's effective collation.
 /// If the target omits collation, any index collation is accepted.
-/// Partial (WHERE) indexes never match.
+/// Partial indexes match only when their WHERE predicate structurally matches
+/// the conflict target WHERE predicate.
 pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bool {
     let Some(target) = upsert.index.as_ref() else {
         return true;
     };
-    // must be a non-partial UNIQUE index with identical arity
-    if !index.unique || index.where_clause.is_some() || target.targets.len() != index.columns.len()
+    // must be a UNIQUE index with identical arity
+    if !index.unique
+        || !partial_index_where_matches(&target.where_clause, &index.where_clause)
+        || target.targets.len() != index.columns.len()
     {
         return false;
     }
