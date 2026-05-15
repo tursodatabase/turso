@@ -28,6 +28,13 @@ use super::{backtrack, pick};
 
 const CORRELATED_EXISTS_PREDICATE_PROB: f64 = 0.15;
 
+/// generates a predicate like:
+///
+/// ```ignore
+/// WHERE EXISTS (SELECT 1 FROM t WHERE t.random_col > 0 AND t.pk_col != outer_table.pk_col)
+/// ```
+///
+/// where `random_col` is a random column, and `t` and `outer_table` are the same table.
 fn random_exists_predicate<R: Rng + ?Sized>(rng: &mut R, table: &Table) -> Option<Predicate> {
     // Keep generation conservative: this pattern relies on table-qualified outer references.
     if table.name.contains('.') {

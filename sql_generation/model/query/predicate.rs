@@ -183,11 +183,11 @@ fn eval_exists_subquery<T: TableContext>(
     };
 
     if !compounds.is_empty() || !order_by.is_empty() || limit.is_some() || !from.joins.is_empty() {
-        return None;
+        panic!("compound selects, order by, limit, and joins not supported in simulated EXISTS clauses");
     }
 
     let ast::SelectTable::Table(tbl_name, alias, _) = from.select.as_ref() else {
-        return None;
+        panic!("only tables are supported in simulated EXISTS clauses");
     };
 
     let inner_table_name = alias
@@ -281,7 +281,7 @@ fn eval_correlated_exists_expr<T: TableContext>(
         }
         ast::Expr::Id(col_name) => lookup_column_value(inner_row, table, col_name.as_str())
             .or_else(|| lookup_column_value(outer_row, table, col_name.as_str())),
-        _ => None,
+        other => panic!("expression type not supported in correlated EXISTS subqueries: {other:?}"),
     }
 }
 
