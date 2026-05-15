@@ -1,5 +1,7 @@
 # Turso SDK kit
 
+> **Building a Rust application?** Use the [`turso`](https://crates.io/crates/turso) crate instead. This crate is the low-level C ABI used to build language bindings; it is not the Rust SDK for end users.
+
 Low-level, SQLite-compatible Turso API to make building SDKs in any language simple and predictable. The core logic is implemented in Rust and exposed through a small, portable C ABI (turso.h), so you can generate language bindings (e.g. via rust-bindgen) without re-implementing database semantics.
 
 Key ideas:
