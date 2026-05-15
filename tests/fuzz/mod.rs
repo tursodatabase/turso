@@ -5,6 +5,7 @@ pub mod grammar_generator;
 pub mod helpers;
 pub mod join;
 pub mod journal_mode;
+pub mod mvcc_rowid_allocator;
 pub mod orderby_collation;
 pub mod raise;
 pub mod rowid_alias;
