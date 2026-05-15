@@ -11,6 +11,32 @@
 use crate::common::{ExecRows, TempDatabase};
 use tempfile::TempDir;
 
+#[test]
+fn test_alter_column_check_constraint_enforced_before_reopen() {
+    let db = TempDatabase::new("alter_column_check_constraint_enforced_before_reopen.db");
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(a INTEGER)").unwrap();
+    conn.execute("ALTER TABLE t ALTER COLUMN a TO b INTEGER CHECK(b > 0)")
+        .unwrap();
+
+    let schema: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't'");
+    assert_eq!(
+        schema,
+        vec![("CREATE TABLE t (b INTEGER CHECK (b > 0))".into(),)]
+    );
+
+    let invalid_insert = conn.execute("INSERT INTO t VALUES(-1)");
+    assert!(
+        invalid_insert.is_err(),
+        "ALTER COLUMN must refresh the live CHECK metadata before reopen"
+    );
+
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".into(),)]);
+}
+
 /// After ALTER TABLE DROP COLUMN on an AUTOINCREMENT table, reopen must parse
 /// the persisted schema as AUTOINCREMENT and avoid reusing deleted rowids.
 #[test]
