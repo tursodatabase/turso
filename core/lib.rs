@@ -1641,7 +1641,7 @@ impl Database {
             // For file databases, try show the full absolute path if that doesn't fail
             match std::fs::canonicalize(&self.path) {
                 Ok(abs_path) => abs_path.to_string_lossy().to_string(),
-                Err(_) => self.db.path.to_string(),
+                Err(_) => self.path.to_string(),
             }
         }
     }
