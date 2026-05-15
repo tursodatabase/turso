@@ -1986,8 +1986,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     tx.state.store(TransactionState::Committed(end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
-                        self.commit_coordinator.pager_commit_lock.unlock();
                     }
+                    mvcc_store.unlock_commit_lock_if_held(tx);
                     mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
