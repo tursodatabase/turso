@@ -24,6 +24,12 @@ impl Default for IOFaultConfig {
     }
 }
 
+fn canonical_key(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
 pub struct SimulatorIO {
     files: Mutex<Vec<(String, Arc<SimulatorFile>)>>,
     file_sizes: Arc<Mutex<HashMap<String, u64>>>,
@@ -125,9 +131,10 @@ impl IO for SimulatorIO {
             .fetch_add(duration.as_micros() as u64, Ordering::SeqCst);
     }
     fn open_file(&self, path: &str, _flags: OpenFlags, _create_new: bool) -> Result<Arc<dyn File>> {
+        let lookup_key = canonical_key(path);
         {
             let files = self.files.lock().unwrap();
-            if let Some((_, file)) = files.iter().find(|f| f.0 == path) {
+            if let Some((_, file)) = files.iter().find(|f| f.0 == lookup_key) {
                 return Ok(file.clone());
             }
         }
@@ -137,9 +144,10 @@ impl IO for SimulatorIO {
             self.file_sizes.clone(),
             self.pending.clone(),
         ));
+        let insert_key = canonical_key(path);
 
         let mut files = self.files.lock().unwrap();
-        files.push((path.to_string(), file.clone()));
+        files.push((insert_key, file.clone()));
 
         Ok(file as Arc<dyn File>)
     }
@@ -149,8 +157,9 @@ impl IO for SimulatorIO {
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
+        let key = canonical_key(path);
         let mut files = self.files.lock().unwrap();
-        files.retain(|(p, _)| p != path);
+        files.retain(|(p, _)| p != &key);
 
         if !self.keep_files {
             let _ = std::fs::remove_file(path);
