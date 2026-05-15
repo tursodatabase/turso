@@ -1599,9 +1599,9 @@ impl Program {
                     {
                         if old_reg != new_reg {
                             match new_reg {
-                                Register::Value(v) => println!("R[{i}] = {v}"),
-                                Register::Aggregate(_) => println!("R[{i}] = <aggregate>"),
-                                Register::Record(_) => println!("R[{i}] = <record>"),
+                                Register::Value(v) => eprintln!("R[{i}] = {v}"),
+                                Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
+                                Register::Record(_) => eprintln!("R[{i}] = <record>"),
                             }
                         }
                     }
@@ -1610,9 +1610,9 @@ impl Program {
 
                 // Print CURRENT opcode
                 if matches!(insn, Insn::Init { .. }) {
-                    println!("VDBE Trace:");
+                    eprintln!("VDBE Trace:");
                 }
-                println!(
+                eprintln!(
                     "{}",
                     explain::insn_to_str(
                         self,
