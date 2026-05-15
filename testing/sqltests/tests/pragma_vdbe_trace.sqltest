@@ -1,0 +1,73 @@
+@database :memory:
+
+# PRAGMA vdbe_trace get/set round-trip. The query form returns the
+# connection's current trace flag as 1 (enabled) or 0 (disabled).
+
+test pragma-vdbe-trace-default-off {
+    PRAGMA vdbe_trace;
+}
+expect {
+    0
+}
+
+test pragma-vdbe-trace-on {
+    PRAGMA vdbe_trace = ON;
+    PRAGMA vdbe_trace;
+}
+expect {
+    1
+}
+
+test pragma-vdbe-trace-off {
+    PRAGMA vdbe_trace = ON;
+    PRAGMA vdbe_trace = OFF;
+    PRAGMA vdbe_trace;
+}
+expect {
+    0
+}
+
+test pragma-vdbe-trace-true {
+    PRAGMA vdbe_trace = OFF;
+    PRAGMA vdbe_trace = TRUE;
+    PRAGMA vdbe_trace;
+}
+expect {
+    1
+}
+
+test pragma-vdbe-trace-false {
+    PRAGMA vdbe_trace = ON;
+    PRAGMA vdbe_trace = FALSE;
+    PRAGMA vdbe_trace;
+}
+expect {
+    0
+}
+
+test pragma-vdbe-trace-numeric-one {
+    PRAGMA vdbe_trace = 0;
+    PRAGMA vdbe_trace = 1;
+    PRAGMA vdbe_trace;
+}
+expect {
+    1
+}
+
+test pragma-vdbe-trace-numeric-zero {
+    PRAGMA vdbe_trace = 1;
+    PRAGMA vdbe_trace = 0;
+    PRAGMA vdbe_trace;
+}
+expect {
+    0
+}
+
+test pragma-vdbe-trace-numeric-nonzero-true {
+    PRAGMA vdbe_trace = 0;
+    PRAGMA vdbe_trace = 2;
+    PRAGMA vdbe_trace;
+}
+expect {
+    1
+}
