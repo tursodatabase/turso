@@ -50,7 +50,19 @@ unsafe impl TursoAllocBackend for DefaultBackend {
 static DEFAULT_BACKEND: DefaultBackend = DefaultBackend;
 static BACKEND: OnceLock<&'static dyn TursoAllocBackend> = OnceLock::new();
 
-pub fn set_allocator(backend: &'static dyn TursoAllocBackend) -> Result<(), SetAllocatorError> {
+/// Sets Turso's process-wide allocation backend once.
+///
+/// # Safety
+///
+/// This function must be called before any database operation, or any other
+/// operation that can allocate through [`TursoAllocator`]. The allocator is
+/// process-wide and can only be set once. Allocating with one backend and
+/// deallocating with another can violate allocator invariants. In practice,
+/// some backend pairs may both delegate to the system allocator and happen to
+/// work, but callers must not rely on that.
+pub unsafe fn set_allocator(
+    backend: &'static dyn TursoAllocBackend,
+) -> Result<(), SetAllocatorError> {
     BACKEND
         .set(backend)
         .map_err(|_| SetAllocatorError::AlreadyInitialized)
