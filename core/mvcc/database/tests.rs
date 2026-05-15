@@ -11591,3 +11591,138 @@ fn abandoned_commit_in_committed_state_should_not_block_subsequent_checkpoint() 
 
     conn_b.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 }
+
+/// A concurrent explicit rowid insert must raise the allocator watermark before
+/// another transaction performs auto-rowid allocation. Otherwise later auto
+/// inserts can overwrite the explicit row and leave secondary indexes stale.
+#[test]
+fn test_concurrent_explicit_rowid_high_watermark_not_clobbered() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn0
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("INSERT INTO t(id, v) VALUES (1000, 'A-explicit')")
+        .unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t(v) VALUES ('B-auto')").unwrap();
+    conn2.execute("COMMIT").unwrap();
+    conn1.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn0, "SELECT rowid, v FROM t ORDER BY rowid");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1000);
+    assert_eq!(rows[0][1].to_string(), "A-explicit");
+    assert_eq!(rows[1][0].as_int().unwrap(), 1001);
+    assert_eq!(rows[1][1].to_string(), "B-auto");
+}
+
+#[test]
+fn test_concurrent_explicit_rowid_auto_rowid_does_not_walk_back_into_collision() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn0
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("INSERT INTO t(id, v) VALUES (5, 'A')")
+        .unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    for i in 0..5 {
+        conn2
+            .execute(format!("INSERT INTO t(v) VALUES ('B{i}')"))
+            .unwrap();
+    }
+    conn2.execute("COMMIT").unwrap();
+    conn1
+        .execute("COMMIT")
+        .expect("explicit rowid transaction should not conflict with auto rowids");
+
+    let rows = get_rows(&conn0, "SELECT rowid, v FROM t ORDER BY rowid");
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[0][0].as_int().unwrap(), 5);
+    assert_eq!(rows[0][1].to_string(), "A");
+    for i in 0..5 {
+        assert_eq!(rows[i + 1][0].as_int().unwrap(), 6 + i as i64);
+        assert_eq!(rows[i + 1][1].to_string(), format!("B{i}"));
+    }
+}
+
+#[test]
+fn test_concurrent_explicit_rowid_preserves_auto_rowid_watermark() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn1
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, k INTEGER)")
+        .unwrap();
+    conn1.execute("CREATE INDEX t_k ON t(k)").unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("INSERT INTO t(id, v, k) VALUES (5, 'A', 999)")
+        .unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("INSERT INTO t(v, k) VALUES ('B', 100)")
+        .unwrap();
+    conn2.execute("COMMIT").unwrap();
+    conn1.execute("COMMIT").unwrap();
+
+    for (v, k) in [("p2", 200), ("p3", 300), ("p4", 400), ("p5", 500)] {
+        conn1
+            .execute(format!("INSERT INTO t(v, k) VALUES ('{v}', {k})"))
+            .unwrap();
+    }
+
+    let integrity = get_rows(&conn1, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(
+        integrity[0][0].to_string(),
+        "ok",
+        "integrity_check should not report stale secondary index entries"
+    );
+
+    let indexed = get_rows(
+        &conn1,
+        "SELECT rowid, v, k FROM t INDEXED BY t_k WHERE k = 999",
+    );
+    assert_eq!(indexed.len(), 1);
+    assert_eq!(indexed[0][0].as_int().unwrap(), 5);
+    assert_eq!(indexed[0][1].to_string(), "A");
+    assert_eq!(indexed[0][2].as_int().unwrap(), 999);
+}
+
+#[test]
+fn test_auto_rowid_after_negative_explicit_rowid_uses_next_negative() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t(id, v) VALUES(-5, 'manual')")
+        .unwrap();
+    conn.execute("INSERT INTO t(v) VALUES('auto')").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), -5);
+    assert_eq!(rows[0][1].to_string(), "manual");
+    assert_eq!(rows[1][0].as_int().unwrap(), -4);
+    assert_eq!(rows[1][1].to_string(), "auto");
+}
