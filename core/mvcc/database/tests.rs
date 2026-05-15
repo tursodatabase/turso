@@ -8381,6 +8381,117 @@ fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
     observer.close().unwrap();
 }
 
+/// `step_build_log_record` chunks the commit's write_set into batches of
+/// `MVCC_COMMIT_BATCH_SIZE` rowids and yields between batches so that a
+/// large commit (e.g. CREATE INDEX over millions of rows) can't monopolize
+/// the executor.
+///
+/// We bracket the chunked yields with two injected yield points:
+/// `BuildLogRecordStart` (fires once on first entry into BuildLogRecord) and
+/// `LogRecordPrepared` (fires once after both passes complete). The IOs
+/// observed strictly between these two are the chunked yields, so the count
+/// is exact.
+///
+/// With `n_rows = 3 * BATCH_SIZE`, both passes (schema-row + data-row) walk
+/// the full write_set, each yielding twice and then transitioning without a
+/// final yield. Expected: 4 chunked yields between Start and Prepared.
+#[test]
+fn test_build_log_record_yields_for_large_write_set() {
+    use super::MVCC_COMMIT_BATCH_SIZE;
+
+    /// Yields once at each of the bracketing points and toggles the
+    /// corresponding flag so the test can detect when the bracket opens
+    /// and closes.
+    #[derive(Debug)]
+    struct BracketingYieldInjector {
+        start: YieldPoint,
+        end: YieldPoint,
+        started: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+    }
+    impl YieldInjector for BracketingYieldInjector {
+        fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+            if point == self.start && !self.started.load(Ordering::SeqCst) {
+                self.started.store(true, Ordering::SeqCst);
+                return true;
+            }
+            if point == self.end && !self.finished.load(Ordering::SeqCst) {
+                self.finished.store(true, Ordering::SeqCst);
+                return true;
+            }
+            false
+        }
+    }
+
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    let n_rows = 3 * MVCC_COMMIT_BATCH_SIZE;
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    for i in 1..=n_rows {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'val')"))
+            .unwrap();
+    }
+
+    let started = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    conn.set_yield_injector(Some(Arc::new(BracketingYieldInjector {
+        start: CommitYieldPoint::BuildLogRecordStart.point(),
+        end: CommitYieldPoint::LogRecordPrepared.point(),
+        started: started.clone(),
+        finished: finished.clone(),
+    })));
+
+    let mut stmt = conn.prepare("COMMIT").unwrap();
+    let mut chunked_io_yields = 0;
+    let mut saw_start = false;
+    loop {
+        match stmt.step().unwrap() {
+            crate::StepResult::IO => {
+                if !saw_start {
+                    // Wait for the BuildLogRecordStart yield to open the bracket.
+                    // IOs before this came from earlier states (Initial → Commit
+                    // → WaitForDependencies); they don't count.
+                    if started.load(Ordering::SeqCst) {
+                        saw_start = true;
+                    }
+                    continue;
+                }
+                if finished.load(Ordering::SeqCst) {
+                    // The IO we just popped is the LogRecordPrepared injection
+                    // closing the bracket. Don't count it.
+                    break;
+                }
+                // Strictly between Start and Prepared: a chunked yield from
+                // `Completion::new_yield()` in step_build_log_record's loop.
+                chunked_io_yields += 1;
+            }
+            crate::StepResult::Done => break,
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+
+    assert!(
+        saw_start,
+        "BuildLogRecordStart yield never fired — BuildLogRecord state never reached"
+    );
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "LogRecordPrepared yield never fired — BuildLogRecord did not complete"
+    );
+    // n_rows = 3 * BATCH_SIZE → 2 yields per pass × 2 passes = 4 chunked yields.
+    assert_eq!(
+        chunked_io_yields, 4,
+        "with {n_rows} rows, expected exactly 4 chunked IO yields between \
+         BuildLogRecordStart and LogRecordPrepared, got {chunked_io_yields}"
+    );
+
+    drop(stmt);
+    conn.close().unwrap();
+}
+
 /// Regression guard for the `mv_store.txs` ↔ `connection.mv_tx_id` divergence
 /// originally observed in production as `Transaction <id> not found while
 /// releasing savepoint` (panic) and `NoSuchTransactionID(<id>)` (read-path
