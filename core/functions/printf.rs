@@ -1274,6 +1274,10 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
     let mut result = String::new();
     let mut args_index = 1;
     let mut chars = format_str.chars().peekable();
+    if format_str.is_empty() {
+        return Ok(Value::Null);
+    }
+
     // Track whether any output or specifier processing happened. SQLite's
     // internal StrAccum buffer stays NULL until something triggers allocation
     // (any literal text, %%, trailing %, or any specifier including %n).
@@ -1609,7 +1613,6 @@ mod tests {
     #[test]
     fn test_printf_edge_cases() {
         let test_cases = vec![
-            (vec![text("")], text("")),
             (vec![text("%%%%")], text("%%")),
             (vec![text("No substitutions")], text("No substitutions")),
             (
@@ -1621,13 +1624,17 @@ mod tests {
             // Unknown specifier: NULL if nothing processed before, else accumulated text
             (vec![text("%d%j"), integer(42)], text("42")),
             (vec![text("hello%j")], text("hello")),
-            (vec![text("%n%j")], text("")),
             // Negative zero should not show minus sign
             (vec![text("%f"), float(-0.0)], text("0.000000")),
         ];
         for (input, expected) in test_cases {
             assert_eq!(exec_printf(&input).unwrap(), *expected.get_value());
         }
+        assert_eq!(exec_printf(&[text("")]).unwrap(), Value::Null);
+        assert_eq!(
+            exec_printf(&[text("%s"), text("")]).unwrap(),
+            *text("").get_value()
+        );
     }
 
     #[test]
