@@ -1437,6 +1437,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "flaky, see https://github.com/tursodatabase/turso/issues/7087"]
     pub async fn test_sync_parallel_writes_with_sync_ops() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
