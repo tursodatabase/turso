@@ -5594,7 +5594,18 @@ impl RowidAllocator {
     /// Initialize from btree max. Called once per table, under lock.
     pub fn initialize(&self, rowid: Option<i64>) {
         tracing::trace!("initialize({rowid:?})");
-        self.max_rowid.store(rowid.unwrap_or(0), Ordering::SeqCst);
+        let _ = self
+            .max_rowid
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                let next = match rowid {
+                    // max_rowid starts at 0, but a B-tree whose largest rowid is
+                    // negative still needs to seed automatic allocation from that value.
+                    Some(rowid) if cur == 0 => rowid,
+                    Some(rowid) => cur.max(rowid),
+                    None => cur,
+                };
+                (next != cur).then_some(next)
+            });
         self.initialized.store(true, Ordering::SeqCst);
     }
 
