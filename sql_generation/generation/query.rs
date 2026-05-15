@@ -1,6 +1,6 @@
 use crate::generation::{
-    Arbitrary, ArbitraryFrom, ArbitrarySized, GenerationContext, InsertOpts, gen_random_text,
-    pick_index, pick_n_unique, pick_unique,
+    gen_random_text, pick_index, pick_n_unique, pick_unique, Arbitrary, ArbitraryFrom,
+    ArbitrarySized, GenerationContext, InsertOpts,
 };
 use crate::model::query::alter_table::{AlterTable, AlterTableType, AlterTableTypeDiscriminants};
 use crate::model::query::predicate::Predicate;
@@ -16,8 +16,8 @@ use crate::model::table::{
     Column, ColumnType, Index, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
 };
 use indexmap::IndexSet;
-use rand::Rng;
 use rand::seq::IndexedRandom;
+use rand::Rng;
 use turso_parser::ast::{
     As, ColumnConstraint, Expr, Literal, OneSelect, Operator, QualifiedName,
     ResultColumn as AstResultColumn, Select as AstSelect, SelectBody as AstSelectBody,

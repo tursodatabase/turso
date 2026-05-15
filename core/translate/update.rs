@@ -464,9 +464,10 @@ fn prepare_update_plan(
     })
 }
 
-/// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
 fn where_clause_has_subquery(predicates: &[WhereTerm]) -> bool {
-    predicates.iter().any(|pred| expr_contains_subquery(&pred.expr))
+    predicates
+        .iter()
+        .any(|pred| expr_contains_subquery(&pred.expr))
 }
 
 fn collect_update_set_clauses(

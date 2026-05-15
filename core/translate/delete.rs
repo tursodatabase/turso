@@ -288,9 +288,10 @@ pub fn prepare_delete_plan(
     Ok(Plan::Delete(Box::new(delete_plan)))
 }
 
-/// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
 fn where_clause_has_subquery(predicates: &[WhereTerm]) -> bool {
-    predicates.iter().any(|pred| expr_contains_subquery(&pred.expr))
+    predicates
+        .iter()
+        .any(|pred| expr_contains_subquery(&pred.expr))
 }
 
 fn estimate_num_instructions(plan: &DeletePlan) -> usize {
