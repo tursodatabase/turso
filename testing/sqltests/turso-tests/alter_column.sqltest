@@ -717,3 +717,41 @@ expect {
     a2|a2c2|c2
     ok
 }
+
+# Issue #7077: Converting a column with a UNIQUE constraint to a generated
+# column must be rejected. The row-rewrite path does not rebuild secondary
+# indexes, so allowing the operation would leave the autoindex pointing at the
+# old stored values while DELETE/UPDATE use the new generated values, producing
+# "Corrupt database: IdxDelete: no matching index entry found".
+test fail-alter-column-to-generated-when-inline-unique {
+    CREATE TABLE p (a, b UNIQUE);
+    INSERT INTO p VALUES(1, 10);
+    ALTER TABLE p ALTER COLUMN b TO g AS (a + 1);
+}
+expect error {
+    cannot alter column "b" to a generated column: column has a UNIQUE constraint
+}
+
+# Same protection via an explicit CREATE INDEX (not an inline UNIQUE).
+test fail-alter-column-to-generated-when-explicitly-indexed {
+    CREATE TABLE q (a, b);
+    CREATE INDEX idx_q_b ON q (b);
+    INSERT INTO q VALUES(1, 10);
+    ALTER TABLE q ALTER COLUMN b TO g AS (a + 1);
+}
+expect error {
+    cannot alter column "b" to a generated column: column is referenced in index "idx_q_b"
+}
+
+# Altering an un-indexed column to generated must still work (no regression).
+test alter-column-to-generated-unindexed-ok {
+    CREATE TABLE r (a, b UNIQUE, c);
+    INSERT INTO r VALUES(1, 10, 99);
+    ALTER TABLE r ALTER COLUMN c TO g AS (a + 1);
+    SELECT a, b, g FROM r;
+    PRAGMA integrity_check;
+}
+expect {
+    1|10|2
+    ok
+}

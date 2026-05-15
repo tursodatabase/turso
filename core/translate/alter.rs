@@ -1691,6 +1691,31 @@ pub fn translate_alter_table(
                         "must have at least one non-generated column".to_string(),
                     ));
                 }
+
+                // Converting an indexed column to a generated column would leave the
+                // secondary index entries pointing at the old stored values while the
+                // rewritten rows reflect the new generated values, corrupting the index
+                // (issue #7077). Reject the operation until index rebuild is supported.
+                let old_column = &btree.columns()[column_index];
+                if old_column.unique()
+                    || btree.unique_sets.iter().any(|set| {
+                        set.columns
+                            .iter()
+                            .any(|(name, _)| name == &normalize_ident(from))
+                    })
+                {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot alter column \"{from}\" to a generated column: column has a UNIQUE constraint"
+                    )));
+                }
+                for index in table_indexes.iter() {
+                    if index.columns.iter().any(|col| col.pos_in_table == column_index) {
+                        return Err(LimboError::ParseError(format!(
+                            "cannot alter column \"{from}\" to a generated column: column is referenced in index \"{}\"",
+                            index.name
+                        )));
+                    }
+                }
             }
 
             let rewritten_table = if rewrites_physical_layout {
