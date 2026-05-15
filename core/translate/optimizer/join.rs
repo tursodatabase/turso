@@ -1557,12 +1557,13 @@ fn find_best_starting_table(
     base_table_rows: &[RowCountEstimate],
     left_join_deps: &HashMap<usize, TableMask>,
 ) -> usize {
-    // hub_score[t] = count of usable constraints on OTHER tables that reference t.
-    // If we join t first, each such constraint becomes usable for an index lookup.
+    // hub_score[t] = count of access-path constraints on OTHER tables that reference t.
+    // If we join t first, each such constraint can become usable for an index lookup.
     let mut hub_score = vec![0usize; num_tables];
     for (t, tc) in constraints.iter().enumerate() {
-        for c in &tc.constraints {
-            if c.usable && c.table_col_pos.is_some() {
+        for candidate in &tc.candidates {
+            for constraint_ref in &candidate.refs {
+                let c = &tc.constraints[constraint_ref.constraint_vec_pos];
                 for other in (0..num_tables).filter(|&x| x != t && c.lhs_mask.get(x)) {
                     hub_score[other] += 1;
                 }
@@ -1593,7 +1594,31 @@ fn find_best_starting_table(
             .map(|c| c.selectivity)
             .product();
 
-        let score = base_rows * selectivity / (1.0 + hub_score[t] as f64);
+        // Prefer tables that can seed useful lookups without first depending on
+        // another table. In a directed chain like `t1.c2 = t2.c2 ...` where only
+        // the RHS columns are indexed, every non-source table has a usable lookup
+        // constraint that requires a predecessor. Starting from one of those
+        // tables can make greedy planning walk the chain backwards and strand the
+        // unindexed source table for last. Penalize such lookup dependencies when
+        // choosing only the first table; later join steps still use the normal
+        // access-path cost model.
+        let mut lookup_dependency_count = 0;
+        let mut seen_constraint_refs = Vec::new();
+        for candidate in &constraints[t].candidates {
+            for constraint_ref in &candidate.refs {
+                if seen_constraint_refs.contains(&constraint_ref.constraint_vec_pos) {
+                    continue;
+                }
+                seen_constraint_refs.push(constraint_ref.constraint_vec_pos);
+                let c = &constraints[t].constraints[constraint_ref.constraint_vec_pos];
+                if c.lhs_mask.iter().any(|other| other != t) {
+                    lookup_dependency_count += 1;
+                }
+            }
+        }
+
+        let score = base_rows * selectivity * (1.0 + lookup_dependency_count as f64)
+            / (1.0 + hub_score[t] as f64);
 
         if best.is_none_or(|(_, s)| score < s) {
             best = Some((t, score));
@@ -2756,6 +2781,100 @@ mod tests {
             assert!(constraint.lhs_mask.get(i - 1));
             assert!(constraint.operator.as_ast_operator() == Some(ast::Operator::Equals));
         }
+    }
+
+    #[test]
+    /// Test that greedy join ordering starts a linked-list join at the source table.
+    ///
+    /// The source table has no usable index lookup from another table, while each
+    /// following table can be reached by a rowid lookup from its predecessor. If
+    /// greedy starts near the end because that table appears first in the FROM
+    /// clause, it can walk backwards and leave the unindexed source table for last.
+    fn test_compute_greedy_join_order_linked_list_starts_at_source_table() {
+        const NUM_TABLES: usize = GREEDY_JOIN_THRESHOLD + 1;
+
+        let mut tables = Vec::with_capacity(NUM_TABLES);
+        for i in 0..NUM_TABLES {
+            let mut columns = vec![_create_column_rowid_alias("id")];
+            if i < NUM_TABLES - 1 {
+                columns.push(_create_column_of_type("next_id", Type::Integer));
+            }
+            tables.push(_create_btree_table(&format!("t{}", i + 1), columns));
+        }
+
+        let mut table_id_counter = TableRefIdCounter::new();
+        let mut table_order = vec![NUM_TABLES - 2, NUM_TABLES - 1];
+        table_order.extend((0..NUM_TABLES - 2).rev());
+        let joined_tables: Vec<_> = table_order
+            .iter()
+            .map(|&table_idx| {
+                _create_table_reference(tables[table_idx].clone(), None, table_id_counter.next())
+            })
+            .collect();
+
+        let mut position_by_table = [0; NUM_TABLES];
+        for (position, &table_idx) in table_order.iter().enumerate() {
+            position_by_table[table_idx] = position;
+        }
+
+        let mut where_clause = Vec::new();
+        for table_idx in 0..NUM_TABLES - 1 {
+            let left_pos = position_by_table[table_idx];
+            let right_pos = position_by_table[table_idx + 1];
+            where_clause.push(_create_binary_expr(
+                _create_column_expr(joined_tables[left_pos].internal_id, 1, false),
+                ast::Operator::Equals,
+                _create_column_expr(joined_tables[right_pos].internal_id, 0, true),
+            ));
+        }
+
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let available_indexes = AvailableIndexes::default();
+        let mut access_methods_arena = Vec::new();
+        let table_constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            &[],
+            &empty_schema(),
+            &DEFAULT_PARAMS,
+        )
+        .unwrap();
+
+        let base_table_rows = default_base_rows(table_references.joined_tables().len());
+        let schema = empty_schema();
+        let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
+            table_references.joined_tables(),
+            1.0,
+            None,
+            &table_constraints,
+            &base_table_rows,
+            &mut access_methods_arena,
+            &mut where_clause,
+            &[],
+            &[],
+            &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
+        )
+        .unwrap()
+        .unwrap();
+
+        let planned_table_names = best_plan
+            .table_numbers()
+            .map(|table_idx| {
+                table_references.joined_tables()[table_idx]
+                    .table
+                    .get_name()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        let expected_table_names = (1..=NUM_TABLES)
+            .map(|i| format!("t{i}"))
+            .collect::<Vec<_>>();
+        assert_eq!(planned_table_names, expected_table_names);
     }
 
     #[test]
