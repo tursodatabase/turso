@@ -6,7 +6,7 @@ use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, Schema, Table, SCHEMA_TABLE_NAME,
+    render_gencol_expr_sql_with_new_names, GeneratedType, Schema, Table, SCHEMA_TABLE_NAME,
     SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
@@ -13015,13 +13015,18 @@ pub fn op_alter_column(
             .expect("btree column should be named")
             .clone();
 
-        // Update indexes on THIS table that name the old column (you already had this)
+        // Update indexes on THIS table that name the old column. Expression
+        // payloads for generated columns are refreshed after the table column
+        // definition is replaced and generated-column references are prepared.
         if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
             for idx in idxs {
                 let idx = Arc::make_mut(idx);
                 for ic in &mut idx.columns {
                     if ic.name.eq_ignore_ascii_case(&existing_column_name) {
                         ic.name.clone_from(&new_name);
+                    }
+                    if let Some(expr) = &mut ic.expr {
+                        rename_identifiers(expr, &old_column_name, &new_name);
                     }
                 }
                 // Update partial index WHERE clause column references
@@ -13050,6 +13055,20 @@ pub fn op_alter_column(
         }
 
         btree.prepare_generated_columns()?;
+
+        if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
+            for idx in idxs {
+                let idx = Arc::make_mut(idx);
+                for ic in &mut idx.columns {
+                    if let Some(column) = btree.columns().get(ic.pos_in_table) {
+                        ic.expr = match column.generated_type() {
+                            GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
+                            GeneratedType::NotGenerated => None,
+                        };
+                    }
+                }
+            }
+        }
 
         // Keep primary_key_columns consistent (names may change on rename)
         for (pk_name, _ord) in &mut btree.primary_key_columns {

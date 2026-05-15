@@ -850,7 +850,7 @@ fn string_literal_eq(value: &str, expected: &str) -> bool {
     value.trim_matches('\'').eq_ignore_ascii_case(expected)
 }
 
-fn emit_index_column_value_from_cursor(
+pub(crate) fn emit_index_column_value_from_cursor(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     table_references: &mut TableReferences,
