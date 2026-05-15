@@ -1781,16 +1781,7 @@ impl Connection {
     }
 
     pub fn get_database_canonical_path(&self) -> String {
-        if self.db.is_in_memory_db() {
-            // For in-memory databases, SQLite shows empty string
-            String::new()
-        } else {
-            // For file databases, try show the full absolute path if that doesn't fail
-            match std::fs::canonicalize(&self.db.path) {
-                Ok(abs_path) => abs_path.to_string_lossy().to_string(),
-                Err(_) => self.db.path.to_string(),
-            }
-        }
+        self.db.get_database_canonical_path()
     }
 
     /// Check if a specific attached database is read only or not, by its index
