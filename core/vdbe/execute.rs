@@ -3607,7 +3607,11 @@ pub fn op_transaction_inner(
                             "nested stmt should not begin a new read transaction"
                         );
                         pager.begin_read_tx()?;
-                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                        // https://github.com/tursodatabase/turso/issues/7106 : If auto-commit is turned off,
+                        // then we shouldn't be setting the auto_txn_cleanup, this will cause errors in case the client explicitly calls commit post a drop of the statement struct
+                        if conn.get_auto_commit() {
+                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                        }
                     }
 
                     if !is_secondary_db
