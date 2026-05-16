@@ -876,12 +876,15 @@ impl Value {
         match Affinity::affinity(datatype) {
             // NONE	Casting a value to a type-name with no affinity causes the value to be converted into a BLOB. Casting to a BLOB consists of first casting the value to TEXT in the encoding of the database connection, then interpreting the resulting byte sequence as a BLOB instead of as TEXT.
             // Historically called NONE, but it's the same as BLOB
-            Affinity::Blob => {
-                // Convert to TEXT first, then interpret as BLOB
-                // TODO: handle encoding
-                let text = self.to_string();
-                Value::Blob(text.into_bytes())
-            }
+            Affinity::Blob => match self {
+                Value::Blob(_) => self.to_owned(),
+                _ => {
+                    // Convert to TEXT first, then interpret as BLOB.
+                    // TODO: handle encoding
+                    let text = self.to_string();
+                    Value::Blob(text.into_bytes())
+                }
+            },
             // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
             // Casting an INTEGER or REAL value into TEXT renders the value as if via sqlite3_snprintf() except that the resulting TEXT uses the encoding of the database connection.
             Affinity::Text => {
@@ -3140,5 +3143,12 @@ mod tests {
             Value::exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
+    }
+
+    #[test]
+    fn test_cast_blob_to_blob_preserves_bytes() {
+        let input = Value::Blob(vec![0xf9, 0xcd, 0xa9, 0xe6]);
+
+        assert_eq!(input.exec_cast("BLOB"), input);
     }
 }
