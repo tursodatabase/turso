@@ -13037,6 +13037,14 @@ pub fn op_alter_column(
                 }
             }
         }
+        let clears_autoincrement_sequence = !*rename
+            && btree.has_autoincrement
+            && btree
+                .columns()
+                .get(*column_index)
+                .is_some_and(|column| column.is_rowid_alias())
+            && !new_column.is_rowid_alias();
+
         if *rename {
             btree.columns_mut()[*column_index].name = Some(new_name.clone());
 
@@ -13089,6 +13097,9 @@ pub fn op_alter_column(
         if !*rename {
             // recompute alias from `new_column`
             btree.columns_mut()[*column_index].set_rowid_alias(new_column.is_rowid_alias());
+            if clears_autoincrement_sequence {
+                btree.has_autoincrement = false;
+            }
         }
 
         // Update this table's OWN foreign keys

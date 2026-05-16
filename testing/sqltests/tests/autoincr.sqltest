@@ -218,6 +218,26 @@ expect {
     t2|2
 }
 
+# Regression test for https://github.com/tursodatabase/turso/issues/6769
+test autoinc-alter-column-clears-sequence-row {
+    CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT);
+    INSERT INTO t(b) VALUES('x'),('y');
+    ALTER TABLE t ALTER COLUMN a TO a2 TEXT;
+    SELECT COUNT(*) FROM sqlite_sequence WHERE name='t';
+    SELECT sql FROM sqlite_schema WHERE name='t';
+    INSERT INTO t(b) VALUES('z');
+    SELECT COUNT(*) FROM sqlite_sequence WHERE name='t';
+    SELECT a2, b FROM t ORDER BY rowid;
+}
+expect {
+    0
+    CREATE TABLE t (a2 TEXT, b TEXT)
+    0
+    1|x
+    2|y
+    |z
+}
+
 # Test: AUTOINCREMENT fails if the maximum rowid is reached. (Assumes 64-bit rowid)
 @cross-check-integrity
 test autoinc-fail-on-max-rowid {
