@@ -13,7 +13,7 @@ use sql_generation::{
         query::{
             Create, CreateIndex, Delete, DropIndex, Insert, Select,
             alter_table::AlterTable,
-            pragma::{Pragma, VacuumMode},
+            pragma::{Pragma, VacuumMode, WalCheckpointMode},
             update::Update,
         },
         table::Table,
@@ -84,6 +84,10 @@ fn random_create_index<R: rand::Rng + ?Sized>(
 }
 
 fn random_pragma<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
+    if rng.random_bool(0.25) {
+        return Query::Pragma(Pragma::WalCheckpoint(random_wal_checkpoint_mode(rng)));
+    }
+
     if !conn_ctx.tables().is_empty() && rng.random_bool(0.5) {
         let table = conn_ctx.tables().choose(rng).unwrap();
         return Query::Pragma(Pragma::ForeignKeyList(table.name.clone()));
@@ -98,6 +102,17 @@ fn random_pragma<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationC
     let mode = ALL_MODES.choose(rng).unwrap();
 
     Query::Pragma(Pragma::AutoVacuumMode(mode.clone()))
+}
+
+pub(crate) fn random_wal_checkpoint_mode<R: rand::Rng + ?Sized>(rng: &mut R) -> WalCheckpointMode {
+    const ALL_MODES: [WalCheckpointMode; 4] = [
+        WalCheckpointMode::Passive,
+        WalCheckpointMode::Full,
+        WalCheckpointMode::Restart,
+        WalCheckpointMode::Truncate,
+    ];
+
+    ALL_MODES.choose(rng).unwrap().clone()
 }
 
 fn random_alter_table<R: rand::Rng + ?Sized>(

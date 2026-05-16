@@ -154,7 +154,7 @@ simulator covers and tests.
 | PRAGMA vdbe_listing              | No         |                                                  |
 | PRAGMA vdbe_trace                | No         |                                                  |
 | PRAGMA wal_autocheckpoint        | No         |                                                  |
-| PRAGMA wal_checkpoint            | No         |                                                  |
+| PRAGMA wal_checkpoint            | Partial    | Covered by WalCheckpointStress property.         |
 | PRAGMA writable_schema           | No         |                                                  |
 
 ### Expressions
