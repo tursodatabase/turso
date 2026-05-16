@@ -563,3 +563,89 @@ fn insert_replace_notnull_no_default_preserves_row(tmp_db: TempDatabase) -> anyh
     conn.execute("ROLLBACK")?;
     Ok(())
 }
+
+/// INSERT OR REPLACE deletes the conflicting row before maintaining secondary
+/// indexes. If an expression-index value aborts after that delete, the
+/// statement journal must restore the original row.
+#[turso_macros::test]
+fn insert_replace_expression_index_error_preserves_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b INT)")?;
+    conn.execute("CREATE INDEX idx ON t(CASE WHEN b=2 THEN 'x' LIKE 'x' ESCAPE 'yy' ELSE b END)")?;
+    conn.execute("INSERT INTO t VALUES(1,1)")?;
+
+    assert!(
+        needs_stmt_journal(&conn, "INSERT OR REPLACE INTO t VALUES(1,2)"),
+        "REPLACE with row-dependent index expressions needs statement rollback"
+    );
+
+    conn.execute("BEGIN")?;
+    let result = conn.execute("INSERT OR REPLACE INTO t VALUES(1,2)");
+    assert!(
+        result.is_err(),
+        "INSERT should fail while computing the expression index"
+    );
+
+    let rows = query_rows(&conn, "SELECT id, b FROM t ORDER BY id");
+    assert_eq!(rows, vec!["1|1"], "original row should be preserved");
+
+    let ic = query_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(
+        ic,
+        vec!["ok"],
+        "integrity_check failed after INSERT OR REPLACE expression-index abort"
+    );
+
+    conn.execute("COMMIT")?;
+    let rows = query_rows(&conn, "SELECT id, b FROM t ORDER BY id");
+    assert_eq!(
+        rows,
+        vec!["1|1"],
+        "committing the transaction must not preserve partial REPLACE effects"
+    );
+    Ok(())
+}
+
+/// Partial-index predicates are evaluated during index maintenance too. A
+/// REPLACE that aborts while evaluating the predicate must restore the
+/// conflicting row deleted earlier in the statement.
+#[turso_macros::test]
+fn insert_replace_partial_index_error_preserves_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b INT)")?;
+    conn.execute(
+        "CREATE INDEX idx ON t(b) WHERE CASE WHEN b=2 THEN 'x' LIKE 'x' ESCAPE 'yy' ELSE b>0 END",
+    )?;
+    conn.execute("INSERT INTO t VALUES(1,1)")?;
+
+    assert!(
+        needs_stmt_journal(&conn, "INSERT OR REPLACE INTO t VALUES(1,2)"),
+        "REPLACE with row-dependent partial-index predicates needs statement rollback"
+    );
+
+    conn.execute("BEGIN")?;
+    let result = conn.execute("INSERT OR REPLACE INTO t VALUES(1,2)");
+    assert!(
+        result.is_err(),
+        "INSERT should fail while evaluating the partial-index predicate"
+    );
+
+    let rows = query_rows(&conn, "SELECT id, b FROM t ORDER BY id");
+    assert_eq!(rows, vec!["1|1"], "original row should be preserved");
+
+    let ic = query_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(
+        ic,
+        vec!["ok"],
+        "integrity_check failed after INSERT OR REPLACE partial-index abort"
+    );
+
+    conn.execute("COMMIT")?;
+    let rows = query_rows(&conn, "SELECT id, b FROM t ORDER BY id");
+    assert_eq!(
+        rows,
+        vec!["1|1"],
+        "committing the transaction must not preserve partial REPLACE effects"
+    );
+    Ok(())
+}

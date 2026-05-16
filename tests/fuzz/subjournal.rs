@@ -889,6 +889,117 @@ mod subjournal_tests {
         }
     }
 
+    /// Targeted differential fuzz: INSERT OR REPLACE deletes a conflicting row
+    /// before an expression-index value aborts. The failed statement must
+    /// preserve the original row inside the surrounding transaction.
+    #[turso_macros::test]
+    pub fn subjournal_replace_expression_index_abort_fuzz(db: TempDatabase) {
+        let (mut rng, seed) =
+            helpers::init_fuzz_test("subjournal_replace_expression_index_abort_fuzz");
+
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open(db.path.with_extension("sqlite")).unwrap();
+
+        for setup in [
+            "PRAGMA cache_size = 50",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, b INT, tag TEXT)",
+            "CREATE INDEX idx_expr_abort ON t(CASE WHEN b=2 THEN 'x' LIKE 'x' ESCAPE 'yy' ELSE b END)",
+        ] {
+            limbo_conn.execute(setup).unwrap();
+            sqlite_conn.execute(setup, params![]).unwrap();
+        }
+
+        for id in 1..=80 {
+            let stmt = format!("INSERT INTO t(id, b, tag) VALUES ({id}, 1, 'seed')");
+            limbo_conn.execute(&stmt).unwrap();
+            sqlite_conn.execute(&stmt, params![]).unwrap();
+        }
+
+        let iterations = helpers::fuzz_iterations(1000);
+        let mut history = Vec::with_capacity(iterations + 16);
+
+        for step in 0..iterations {
+            helpers::log_progress(
+                "subjournal_replace_expression_index_abort_fuzz",
+                step,
+                iterations,
+                8,
+            );
+
+            let id = rng.random_range(1..=80);
+            let tag = random_tag(&mut rng);
+            let b = match rng.random_range(0..100) {
+                0..=59 => 2, // expression index abort path
+                60..=79 => 1,
+                80..=89 => 3,
+                90..=99 => rng.random_range(4..=50),
+                _ => unreachable!(),
+            };
+            let stmt = format!("INSERT OR REPLACE INTO t(id, b, tag) VALUES ({id}, {b}, '{tag}')");
+            history.push(stmt.clone());
+
+            sqlite_conn.execute("BEGIN", params![]).unwrap();
+            limbo_conn.execute("BEGIN").unwrap();
+
+            let sqlite_stmt_res = sqlite_conn.execute(&stmt, params![]);
+            let limbo_stmt_res =
+                std::panic::catch_unwind(AssertUnwindSafe(|| limbo_conn.execute(&stmt)));
+            let limbo_stmt_res = match limbo_stmt_res {
+                Ok(res) => res,
+                Err(_) => {
+                    panic!(
+                        "turso panicked\nseed: {seed}\nstep: {step}\nstmt: {stmt}\nrecent:\n{}",
+                        history_tail(&history, 60)
+                    );
+                }
+            };
+
+            match (sqlite_stmt_res.is_ok(), limbo_stmt_res.is_ok()) {
+                (true, true) | (false, false) => {}
+                _ => {
+                    panic!(
+                        "expression-index REPLACE outcome mismatch\nseed: {seed}\nstep: {step}\nstmt: {stmt}\nsqlite: {sqlite_stmt_res:?}\nturso: {limbo_stmt_res:?}\nrecent:\n{}",
+                        history_tail(&history, 60)
+                    );
+                }
+            }
+
+            sqlite_conn.execute("COMMIT", params![]).unwrap();
+            limbo_conn.execute("COMMIT").unwrap();
+
+            let verify = "SELECT id, b, tag FROM t ORDER BY id";
+            let sqlite_rows = sqlite_exec_rows(&sqlite_conn, verify);
+            let limbo_rows =
+                std::panic::catch_unwind(AssertUnwindSafe(|| limbo_exec_rows(&limbo_conn, verify)));
+            let limbo_rows = match limbo_rows {
+                Ok(rows) => rows,
+                Err(_) => {
+                    panic!(
+                        "turso panicked during verify\nseed: {seed}\nstep: {step}\nrecent:\n{}",
+                        history_tail(&history, 60)
+                    );
+                }
+            };
+            assert_eq!(
+                limbo_rows,
+                sqlite_rows,
+                "expression-index REPLACE state mismatch\nseed: {seed}\nstep: {step}\nrecent:\n{}",
+                history_tail(&history, 60)
+            );
+
+            if step % 25 == 0 {
+                let limbo_ic = limbo_exec_rows(&limbo_conn, "PRAGMA integrity_check");
+                let sqlite_ic = sqlite_exec_rows(&sqlite_conn, "PRAGMA integrity_check");
+                assert_eq!(
+                    limbo_ic,
+                    sqlite_ic,
+                    "integrity_check mismatch\nseed: {seed}\nstep: {step}\nrecent:\n{}",
+                    history_tail(&history, 60)
+                );
+            }
+        }
+    }
+
     /// Targeted test: UPDATE OR REPLACE with UNIQUE constraint + nested savepoints.
     /// Tests the update path where REPLACE causes delete of conflicting row.
     #[turso_macros::test]

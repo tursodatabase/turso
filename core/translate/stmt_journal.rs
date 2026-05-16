@@ -136,25 +136,37 @@ pub(crate) fn set_insert_stmt_journal_flags(
     notnull_col_exists: bool,
     has_unique: bool,
 ) {
-    let index_modes: Vec<(Option<ResolveType>, bool)> = resolver.with_schema(database_id, |s| {
-        s.get_indices(&table.name)
-            .map(|idx| (idx.on_conflict, idx.unique))
-            .collect()
-    });
+    let index_info: Vec<(Option<ResolveType>, bool, bool)> =
+        resolver.with_schema(database_id, |s| {
+            s.get_indices(&table.name)
+                .map(|idx| {
+                    (
+                        idx.on_conflict,
+                        idx.unique,
+                        idx.is_expression_index() || idx.where_clause.is_some(),
+                    )
+                })
+                .collect()
+        });
     let any_replace = any_effective_replace(
         has_statement_conflict,
         statement_conflict,
         table.rowid_alias_conflict_clause,
-        index_modes.iter().map(|(oc, _)| *oc),
+        index_info.iter().map(|(oc, _, _)| *oc),
     );
+    let replace_may_abort_after_delete = any_replace
+        && index_info
+            .iter()
+            .any(|(_, _, may_evaluate_row_expr)| *may_evaluate_row_expr);
     let has_check = !table.check_constraints.is_empty();
     let may_abort = has_triggers
         || has_fks
+        || replace_may_abort_after_delete
         || constraint_may_abort(
             has_statement_conflict,
             statement_conflict,
             table.rowid_alias_conflict_clause,
-            index_modes.into_iter(),
+            index_info.into_iter().map(|(oc, unique, _)| (oc, unique)),
             notnull_col_exists,
             has_check,
             has_unique,
