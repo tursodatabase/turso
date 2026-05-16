@@ -219,6 +219,7 @@ expect {
 }
 
 # Regression test for https://github.com/tursodatabase/turso/issues/6769
+@skip-if sqlite "ALTER COLUMN is a Turso extension"
 test autoinc-alter-column-clears-sequence-row {
     CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT);
     INSERT INTO t(b) VALUES('x'),('y');
