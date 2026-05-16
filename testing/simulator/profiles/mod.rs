@@ -129,6 +129,51 @@ impl Profile {
         profile
     }
 
+    /// Profile that mixes write pressure with explicit WAL checkpoints.
+    pub fn checkpoint_stress() -> Self {
+        let profile = Profile {
+            cache_size_pages: Some(200),
+            query: QueryProfile {
+                gen_opts: Opts {
+                    table: TableOpts {
+                        large_table: LargeTableOpts {
+                            large_table_prob: 0.2,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    query: QueryOpts {
+                        insert: InsertOpts {
+                            min_rows: NonZeroU32::new(10).unwrap(),
+                            max_rows: NonZeroU32::new(80).unwrap(),
+                            ..Default::default()
+                        },
+                        update: UpdateOpts {
+                            padding_size: Some(8_000),
+                            force_late_failure: true,
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                select_weight: 15,
+                insert_weight: 35,
+                update_weight: 30,
+                delete_weight: 10,
+                create_index_weight: 10,
+                create_table_weight: 8,
+                drop_table_weight: 0,
+                alter_table_weight: 0,
+                drop_index: 0,
+                pragma_weight: 45,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        profile.validate().unwrap();
+        profile
+    }
+
     /// Profile that biases generation toward named savepoint rollback under
     /// cache pressure, where WAL spill and page restoration bugs tend to hide.
     pub fn savepoint_stress() -> Self {
@@ -234,6 +279,7 @@ impl Profile {
             ProfileType::Faultless => Self::faultless(),
             ProfileType::SimpleMvcc => Self::simple_mvcc(),
             ProfileType::WriteStress => Self::write_stress(),
+            ProfileType::CheckpointStress => Self::checkpoint_stress(),
             ProfileType::SavepointStress => Self::savepoint_stress(),
             ProfileType::Custom(path) => {
                 Self::parse(path).with_context(|| "failed to parse JSON profile")?
@@ -276,6 +322,7 @@ pub enum ProfileType {
     Faultless,
     SimpleMvcc,
     WriteStress,
+    CheckpointStress,
     SavepointStress,
     #[strum(disabled)]
     Custom(PathBuf),

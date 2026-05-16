@@ -418,6 +418,11 @@ impl Query {
     pub fn is_select(&self) -> bool {
         matches!(self, Self::Select(_))
     }
+
+    #[inline]
+    pub fn requires_all_table_check(&self) -> bool {
+        matches!(self, Self::Pragma(Pragma::WalCheckpoint(_)))
+    }
 }
 
 impl Display for Query {
@@ -468,7 +473,9 @@ impl Shadow for Query {
             Query::RollbackToSavepoint(rollback_to) => rollback_to.shadow(env),
             Query::ReleaseSavepoint(release) => release.shadow(env),
             Query::Placeholder => Ok(vec![]),
-            Query::Pragma(Pragma::AutoVacuumMode(_) | Pragma::ForeignKeyList(_)) => Ok(vec![]),
+            Query::Pragma(
+                Pragma::AutoVacuumMode(_) | Pragma::ForeignKeyList(_) | Pragma::WalCheckpoint(_),
+            ) => Ok(vec![]),
         }
     }
 }

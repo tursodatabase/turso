@@ -11,6 +11,7 @@ use std::{
 use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use sql_generation::model::query::pragma::Pragma;
 use sql_generation::model::table::SimValue;
 use turso_core::{Connection, Result, StepResult};
 
@@ -300,7 +301,7 @@ impl Interactions {
     pub fn check_tables(&self) -> bool {
         match &self.interactions {
             InteractionsType::Property(property) => property.check_tables(),
-            InteractionsType::Query(query) => query.is_dml(),
+            InteractionsType::Query(query) => query.is_dml() || query.requires_all_table_check(),
             // REOPEN_DATABASE tears down all connections and re-opens the
             // database, which exercises the on-disk recovery path (WAL replay,
             // header re-read, schema reload). Any committed row must still be
@@ -617,8 +618,13 @@ impl InteractionType {
             assert!(rows.is_some());
             let mut rows = rows.unwrap();
             let mut out = Vec::new();
+            let discard_rows = matches!(query, Query::Pragma(Pragma::WalCheckpoint(_)));
 
             rows.run_with_row_callback(|row| {
+                if discard_rows {
+                    return Ok(());
+                }
+
                 let mut r = Vec::new();
                 for v in row.get_values() {
                     let v = v.into();

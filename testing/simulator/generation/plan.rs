@@ -69,8 +69,9 @@ impl InteractionPlan {
                 .tables()
                 .is_empty()
         {
-            let interactions = if let InteractionsType::Query(query) = &i.interactions {
-                assert!(query.is_dml());
+            let interactions = if let InteractionsType::Query(query) = &i.interactions
+                && query.is_dml()
+            {
                 let mut table = query.uses();
                 assert!(table.len() == 1);
                 let table = table.pop().unwrap();

@@ -21,6 +21,26 @@ fn test_fail_drop_unique_column(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_fail_alter_indexed_column_rewrite_on_nonempty_table(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE p(a, b UNIQUE)")?;
+    conn.execute("INSERT INTO p VALUES(1, 10)")?;
+
+    let res = conn.execute("ALTER TABLE p ALTER COLUMN b TO g AS(a + 1)");
+    assert!(
+        res.is_err(),
+        "Expected ALTER COLUMN rewrite of an indexed non-empty table to fail"
+    );
+
+    conn.execute("DELETE FROM p")?;
+    Ok(())
+}
+
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b, UNIQUE(a, b));")]
 fn test_fail_drop_compound_unique_column(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();

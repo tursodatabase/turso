@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use rand::Rng;
+use sql_generation::model::query::pragma::Pragma;
 use sql_generation::model::table::SimValue;
 use tracing::instrument;
 use turso_core::{Connection, LimboError, Result, Value};
@@ -459,37 +460,10 @@ fn execute_query_rusqlite(
         );
     }
     match query {
-        Query::Select(select) => {
-            let mut stmt = connection.prepare(select.to_string().as_str())?;
-            let rows = stmt.query_map([], |row| {
-                let mut values = vec![];
-                for i in 0.. {
-                    let value = match row.get(i) {
-                        Ok(value) => value,
-                        Err(err) => match err {
-                            rusqlite::Error::InvalidColumnIndex(_) => break,
-                            _ => {
-                                tracing::error!(?err);
-                                panic!("{err}")
-                            }
-                        },
-                    };
-                    let value = match value {
-                        rusqlite::types::Value::Null => Value::Null,
-                        rusqlite::types::Value::Integer(i) => Value::from_i64(i),
-                        rusqlite::types::Value::Real(f) => Value::from_f64(f),
-                        rusqlite::types::Value::Text(s) => Value::build_text(s),
-                        rusqlite::types::Value::Blob(b) => Value::Blob(b),
-                    };
-                    values.push(SimValue(value));
-                }
-                Ok(values)
-            })?;
-            let mut result = vec![];
-            for row in rows {
-                result.push(row?);
-            }
-            Ok(result)
+        Query::Select(select) => collect_query_rows(connection, select.to_string().as_str()),
+        Query::Pragma(Pragma::WalCheckpoint(_)) => {
+            execute_and_discard_rows(connection, query.to_string().as_str())?;
+            Ok(vec![])
         }
         Query::Placeholder => {
             unreachable!("simulation cannot have a placeholder Query for execution")
@@ -499,4 +473,50 @@ fn execute_query_rusqlite(
             Ok(vec![])
         }
     }
+}
+
+fn collect_query_rows(
+    connection: &rusqlite::Connection,
+    query: &str,
+) -> rusqlite::Result<Vec<Vec<SimValue>>> {
+    let mut stmt = connection.prepare(query)?;
+    let rows = stmt.query_map([], |row| {
+        let mut values = vec![];
+        for i in 0.. {
+            let value = match row.get(i) {
+                Ok(value) => value,
+                Err(err) => match err {
+                    rusqlite::Error::InvalidColumnIndex(_) => break,
+                    _ => {
+                        tracing::error!(?err);
+                        panic!("{err}")
+                    }
+                },
+            };
+            let value = match value {
+                rusqlite::types::Value::Null => Value::Null,
+                rusqlite::types::Value::Integer(i) => Value::from_i64(i),
+                rusqlite::types::Value::Real(f) => Value::from_f64(f),
+                rusqlite::types::Value::Text(s) => Value::build_text(s),
+                rusqlite::types::Value::Blob(b) => Value::Blob(b),
+            };
+            values.push(SimValue(value));
+        }
+        Ok(values)
+    })?;
+    let mut result = vec![];
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+fn execute_and_discard_rows(
+    connection: &rusqlite::Connection,
+    query: &str,
+) -> rusqlite::Result<()> {
+    let mut stmt = connection.prepare(query)?;
+    let mut rows = stmt.query([])?;
+    while rows.next()?.is_some() {}
+    Ok(())
 }

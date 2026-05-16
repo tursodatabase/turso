@@ -380,6 +380,128 @@ fn emit_add_column_default_type_validation(
     Ok(())
 }
 
+fn emit_non_empty_table_halt(
+    program: &mut ProgramBuilder,
+    original_btree: Arc<BTreeTable>,
+    database_id: usize,
+    message: String,
+) {
+    let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: check_cursor_id,
+        root_page: original_btree.root_page,
+        db: database_id,
+    });
+
+    let skip_error_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: check_cursor_id,
+        pc_if_empty: skip_error_label,
+    });
+
+    program.emit_insn(Insn::Halt {
+        err_code: 1,
+        description: message,
+        on_error: None,
+        description_reg: None,
+    });
+
+    program.preassign_label_to_next_insn(skip_error_label);
+}
+
+fn alter_column_index_dependency(
+    table_indexes: &[Arc<crate::schema::Index>],
+    btree: &BTreeTable,
+    resolver: &Resolver,
+    table_name: &str,
+    column_name: &str,
+    column_index: usize,
+) -> Result<Option<String>> {
+    let column_name_normalized = normalize_ident(column_name);
+
+    if btree.columns()[column_index].primary_key() {
+        return Ok(Some("PRIMARY KEY".to_string()));
+    }
+
+    if btree.columns()[column_index].unique()
+        || btree.unique_sets.iter().any(|set| {
+            set.columns
+                .iter()
+                .any(|(name, _)| name == &column_name_normalized)
+        })
+    {
+        return Ok(Some("UNIQUE".to_string()));
+    }
+
+    for index in table_indexes {
+        if index
+            .columns
+            .iter()
+            .any(|index_column| index_column.pos_in_table == column_index)
+        {
+            return Ok(Some(format!("index {}", index.name)));
+        }
+
+        for index_column in &index.columns {
+            if let Some(expr) = &index_column.expr {
+                if check_expr_references_column(expr, &column_name_normalized) {
+                    return Ok(Some(format!("index {}", index.name)));
+                }
+            }
+        }
+
+        if index.where_clause.is_some() {
+            let mut table_references = TableReferences::new(
+                vec![],
+                vec![OuterQueryReference {
+                    identifier: table_name.to_string(),
+                    internal_id: TableInternalId::from(0),
+                    table: Table::BTree(Arc::new(btree.clone())),
+                    using_dedup_hidden_cols: ColumnMask::default(),
+                    col_used_mask: ColumnUsedMask::default(),
+                    cte_select: None,
+                    cte_explicit_columns: vec![],
+                    cte_id: None,
+                    cte_definition_only: false,
+                    rowid_referenced: false,
+                    scope_depth: 0,
+                }],
+            );
+            let where_copy = index
+                .bind_where_expr(Some(&mut table_references), resolver)
+                .ok_or_else(|| {
+                    LimboError::ParseError("index where clause unexpectedly missing".to_string())
+                })?;
+
+            let mut column_referenced = false;
+            walk_expr(
+                &where_copy,
+                &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
+                    if let ast::Expr::Column {
+                        table,
+                        column: expr_column_index,
+                        ..
+                    } = e
+                    {
+                        if *table == TableInternalId::from(0) && *expr_column_index == column_index
+                        {
+                            column_referenced = true;
+                            return Ok(WalkControl::SkipChildren);
+                        }
+                    }
+                    Ok(WalkControl::Continue)
+                },
+            )?;
+
+            if column_referenced {
+                return Ok(Some(format!("index {}", index.name)));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 /// Validate NOT NULL and CHECK constraints for a new virtual generated column
 /// by scanning each row and computing the expression.
 #[allow(clippy::too_many_arguments)]
@@ -1651,6 +1773,18 @@ pub fn translate_alter_table(
                     (rewrites_physical_layout, Some(replacement_column))
                 }
             };
+            let index_dependency_for_rewrite = if rewrites_physical_layout {
+                alter_column_index_dependency(
+                    &table_indexes,
+                    &btree,
+                    resolver,
+                    table_name,
+                    from,
+                    column_index,
+                )?
+            } else {
+                None
+            };
 
             let is_making_column_generated = definition
                 .constraints
@@ -1833,6 +1967,17 @@ pub fn translate_alter_table(
             } else {
                 None
             };
+
+            if let Some(index_dependency) = index_dependency_for_rewrite {
+                emit_non_empty_table_halt(
+                    program,
+                    original_btree.clone(),
+                    database_id,
+                    format!(
+                        "cannot alter column \"{from}\": {index_dependency} would require rebuilding table indexes"
+                    ),
+                );
+            }
 
             let sqlite_schema = resolver
                 .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))

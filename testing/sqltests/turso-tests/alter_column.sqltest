@@ -11,6 +11,14 @@ expect {
     CREATE INDEX i ON t (b)
 }
 
+test fail-alter-column-indexed-nonempty-rewrite {
+    CREATE TABLE p(a, b UNIQUE);
+    INSERT INTO p VALUES(1, 10);
+    ALTER TABLE p ALTER COLUMN b TO g AS(a + 1);
+}
+expect error {
+}
+
 test fail-alter-column-primary-key {
     CREATE TABLE t (a);
     ALTER TABLE t ALTER COLUMN a TO a PRIMARY KEY;
