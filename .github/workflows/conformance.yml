@@ -41,7 +41,6 @@ jobs:
           key: conformance-js-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             conformance-js-cargo-
-          save-always: true
       - name: Install JS binding dependencies
         working-directory: bindings/javascript
         run: yarn install
@@ -74,7 +73,6 @@ jobs:
           key: conformance-sqlite-tcl-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             conformance-sqlite-tcl-cargo-
-          save-always: true
       - name: Install TCL dev headers
         run: sudo apt-get update && sudo apt-get install -y tcl-dev tcl
       - name: Build libturso_tcl
