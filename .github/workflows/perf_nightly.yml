@@ -19,7 +19,7 @@ jobs:
     runs-on: nyrkio_perf_server_4cpu_ubuntu2404
     timeout-minutes: 45 # FIXME: make this run faster
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: useblacksmith/setup-node@v5
         with:
           node-version: 20
@@ -70,7 +70,7 @@ jobs:
     runs-on: nyrkio_perf_server_4cpu_ubuntu2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: useblacksmith/setup-node@v5
         with:
           node-version: 20
@@ -126,7 +126,7 @@ jobs:
     env:
       DB_FILE: "perf/tpc-h/TPC-H.db"
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
