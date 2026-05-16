@@ -139,11 +139,9 @@ pub fn process_returning_clause(
 ) -> Result<Vec<ResultSetColumn>> {
     let mut result_columns = Vec::with_capacity(returning.len());
 
-    let alias_to_string = |alias: &ast::As| alias.name().as_str().to_string();
-
     for rc in returning.iter_mut() {
         match rc {
-            ast::ResultColumn::Expr(expr, alias) => {
+            ast::ResultColumn::Expr(expr, maybe_as) => {
                 bind_and_rewrite_expr(
                     expr,
                     Some(table_references),
@@ -160,10 +158,20 @@ pub fn process_returning_clause(
                     );
                 }
 
+                let (alias, implicit_column_name) = match maybe_as {
+                    Some(ast::As::As(name)) | Some(ast::As::Elided(name)) => {
+                        (Some(name.as_str().to_string()), None)
+                    }
+                    Some(ast::As::ImplicitColumnName(name)) => {
+                        (None, Some(name.as_str().to_string()))
+                    }
+                    None => (None, None),
+                };
+
                 result_columns.push(ResultSetColumn {
                     expr: expr.as_ref().clone(),
-                    alias: alias.as_ref().map(alias_to_string),
-                    implicit_column_name: None,
+                    alias,
+                    implicit_column_name,
                     contains_aggregates: false,
                 });
             }
