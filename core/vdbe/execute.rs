@@ -3490,7 +3490,9 @@ pub fn op_transaction_inner(
                                 "nested stmt should not begin a new read transaction"
                             );
                             pager.begin_read_tx()?;
-                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                            if conn.get_auto_commit() {
+                                state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                            }
                         }
                         // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
                         pager.mvcc_refresh_if_db_changed();
