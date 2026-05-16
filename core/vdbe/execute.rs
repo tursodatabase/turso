@@ -11676,14 +11676,7 @@ pub fn op_add_imm(
         Register::Record(_) => &Value::Null,
     };
 
-    // Match SQLite's OP_AddImm semantics: coerce operand to integer
-    // (sqlite3VdbeIntValue), then add. Text/Blob use integer-prefix parsing
-    // — sign + digits, stops at first non-digit, no exponent or decimal
-    // handling (CAST AS INTEGER takes the same path; see vdbe/value.rs).
-    // Float saturates via sqlite3RealToI64. Final add uses wrapping_add to
-    // mirror SQLite's silent VDBE-layer overflow; the AUTOINCREMENT path's
-    // Ne r_key, i64::MAX → SQLITE_FULL guard (translate/insert.rs) catches
-    // the overflow case before AddImm runs.
+    // SQLite coerces the register to an integer before adding.
     let lhs = match current_value {
         Value::Numeric(Numeric::Integer(i)) => *i,
         Value::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(*f)),
@@ -14300,12 +14293,8 @@ fn execute_turso_version(version_integer: i64) -> String {
     format!("{major}.{minor}.{release}")
 }
 
-/// Coerce a value to i64 using SQLite's `sqlite3VdbeIntValue` rules: integer
-/// prefix parse for Text/Blob (sign + digits, stops at first non-digit, no
-/// exponent/decimal), saturating cast for Float, 0 for Null. Result matches
-/// what `OP_AddImm reg, 0` produces, so callers can rely on the two ops
-/// agreeing on text→int coercion (e.g. AUTOINCREMENT's MemMax-after-AddImm-0
-/// sequence in translate/insert.rs).
+/// Coerce a value to i64 using the same non-NULL conversion rules as
+/// SQLite's OP_AddImm.
 pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
     let value = value.as_value_ref();
     match value {

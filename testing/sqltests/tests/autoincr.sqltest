@@ -349,7 +349,6 @@ expect {
 }
 
 # regression tests for https://github.com/tursodatabase/turso/issues/6969
-
 # Partial-numeric text.
 @cross-check-integrity
 test autoinc-seq-text-prefix-coercion {
