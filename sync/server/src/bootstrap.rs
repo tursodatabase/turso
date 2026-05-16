@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use std::{
     io::IsTerminal,
     path::PathBuf,
@@ -10,11 +10,13 @@ use std::{
 };
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Connection, Database, DatabaseOpts, OpenFlags};
+use turso_core::{DatabaseOpts, OpenFlags};
+
+use crate::database::{open_connection, DatabaseOpenOptions, DatabaseProvider};
 
 pub struct ServerApp {
     pub opts: ServerOpts,
-    pub connection: Arc<Connection>,
+    pub database_provider: Arc<DatabaseProvider>,
     pub interrupt_count: Arc<AtomicUsize>,
     _tracing_guard: WorkerGuard,
 }
@@ -22,15 +24,25 @@ pub struct ServerApp {
 #[derive(Parser, Debug, Clone)]
 #[command(name = "turso-sync-server")]
 #[command(version, about = "Standalone Turso sync server")]
+#[command(group(
+    ArgGroup::new("database_source")
+        .required(true)
+        .args(["db_file", "db_dir"])
+))]
 pub struct ServerOpts {
-    #[clap(index = 1, help = "SQLite database file", default_value = ":memory:")]
-    pub database: PathBuf,
     #[clap(
         long = "sync-server",
         visible_alias = "listen",
         help = "Listen address for the sync server (for example 0.0.0.0:8080)"
     )]
     pub sync_server_address: String,
+    #[clap(long, help = "SQLite database file for single-db mode")]
+    pub db_file: Option<PathBuf>,
+    #[clap(
+        long,
+        help = "Directory containing database files for /db/{name} routing"
+    )]
+    pub db_dir: Option<PathBuf>,
     #[clap(
         short = 'v',
         long,
@@ -78,7 +90,7 @@ impl ServerApp {
     pub fn new() -> Result<Self> {
         let opts = ServerOpts::parse();
         let tracing_guard = init_tracing(&opts)?;
-        let connection = open_connection(&opts)?;
+        let database_provider = Arc::new(create_database_provider(&opts)?);
         let interrupt_count = Arc::new(AtomicUsize::new(0));
 
         {
@@ -90,7 +102,7 @@ impl ServerApp {
 
         Ok(Self {
             opts,
-            connection,
+            database_provider,
             interrupt_count,
             _tracing_guard: tracing_guard,
         })
@@ -136,7 +148,29 @@ fn init_tracing(opts: &ServerOpts) -> Result<WorkerGuard, std::io::Error> {
     Ok(guard)
 }
 
-fn open_connection(opts: &ServerOpts) -> Result<Arc<Connection>> {
+fn create_database_provider(opts: &ServerOpts) -> Result<DatabaseProvider> {
+    let open_options = create_open_options(opts);
+
+    if let Some(db_dir) = &opts.db_dir {
+        if !db_dir.is_dir() {
+            return Err(anyhow::anyhow!(
+                "database directory does not exist: {}",
+                db_dir.display()
+            ));
+        }
+        return Ok(DatabaseProvider::directory(db_dir.clone(), open_options));
+    }
+
+    let db_file = opts
+        .db_file
+        .clone()
+        .expect("db_file must be set when db_dir is not set");
+    let connection = open_connection(&db_file, &open_options)?;
+
+    Ok(DatabaseProvider::single(connection))
+}
+
+fn create_open_options(opts: &ServerOpts) -> DatabaseOpenOptions {
     let db_opts = DatabaseOpts::new()
         .with_views(opts.experimental_views)
         .with_custom_types(opts.experimental_custom_types)
@@ -150,72 +184,49 @@ fn open_connection(opts: &ServerOpts) -> Result<Arc<Connection>> {
         .with_multiprocess_wal(opts.experimental_multiprocess_wal)
         .with_unsafe_testing(opts.unsafe_testing);
 
-    let db_file = normalize_db_path(opts.database.to_string_lossy().to_string());
-
-    if db_file.starts_with("file:") {
-        let (_, connection) = Connection::from_uri(&db_file, db_opts)?;
-        return Ok(connection);
-    }
-
     let flags = if opts.readonly {
         OpenFlags::default().union(OpenFlags::ReadOnly)
     } else {
         OpenFlags::default()
     };
 
-    let (_, database) = Database::open_new(
-        &db_file,
-        opts.vfs.as_deref(),
+    DatabaseOpenOptions {
+        vfs: opts.vfs.clone(),
         flags,
-        db_opts.turso_cli(),
-        None,
-    )?;
-
-    database.connect().map_err(Into::into)
-}
-
-/// Normalize `path?key=val` to `file:path?key=val` so query parameters
-/// are parsed as URI options (e.g. `?locking=shared_reads`) instead of
-/// being treated as part of the filename.
-fn normalize_db_path(db_file: String) -> String {
-    if db_file.starts_with("file:") {
-        return db_file;
+        db_opts,
     }
-
-    if let Some(pos) = db_file.rfind('?') {
-        let query = &db_file[pos + 1..];
-        if query.contains('=') {
-            let path = &db_file[..pos];
-            let encoded_path = path.replace('?', "%3F");
-            return format!("file:{encoded_path}?{query}");
-        }
-    }
-
-    db_file
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_db_path;
+    use super::ServerOpts;
+    use clap::Parser;
 
     #[test]
-    fn normalize_db_path_adds_file_prefix_for_query_params() {
-        assert_eq!(
-            normalize_db_path("test.db?locking=shared_reads".into()),
-            "file:test.db?locking=shared_reads"
-        );
+    fn db_file_and_db_dir_conflict() {
+        let error = ServerOpts::try_parse_from([
+            "turso-sync-server",
+            "--sync-server",
+            "127.0.0.1:8080",
+            "--db-file",
+            "server.db",
+            "--db-dir",
+            "dbs",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
-    fn normalize_db_path_preserves_existing_file_prefix() {
-        assert_eq!(
-            normalize_db_path("file:test.db?locking=shared_reads".into()),
-            "file:test.db?locking=shared_reads"
-        );
-    }
+    fn database_source_is_required() {
+        let error =
+            ServerOpts::try_parse_from(["turso-sync-server", "--sync-server", "127.0.0.1:8080"])
+                .unwrap_err();
 
-    #[test]
-    fn normalize_db_path_keeps_plain_paths_unchanged() {
-        assert_eq!(normalize_db_path("test.db".into()), "test.db");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 }

@@ -1,6 +1,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 mod bootstrap;
+mod database;
 mod sync_server;
 
 use crate::{bootstrap::ServerApp, sync_server::TursoSyncServer};
@@ -14,7 +15,7 @@ fn main() -> anyhow::Result<()> {
 
     TursoSyncServer::new(
         app.opts.sync_server_address.clone(),
-        app.connection,
+        app.database_provider,
         app.interrupt_count,
     )
     .run()

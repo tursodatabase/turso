@@ -35,5 +35,8 @@ mimalloc = ["dep:mimalloc"]
 fts = ["turso_core/fts"]
 stacker = ["turso_core/stacker"]
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true

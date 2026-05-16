@@ -6550,6 +6550,7 @@ dependencies = [
  "prost 0.14.1",
  "roaring",
  "serde_json",
+ "tempfile",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
