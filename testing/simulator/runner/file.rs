@@ -270,7 +270,12 @@ impl File for SimulatorFile {
 
 impl Drop for SimulatorFile {
     fn drop(&mut self) {
-        self.inner.unlock_file().expect("Failed to unlock file");
+        // Best-effort unlock during cleanup. We must not panic from `drop` —
+        // it aborts the process if a panic is already in flight, which masks
+        // the original failure. On Windows in particular, `UnlockFileEx` on
+        // an already-unlocked region returns ERROR_NOT_LOCKED (os error 158),
+        // which is not a real error for our cleanup purposes.
+        let _ = self.inner.unlock_file();
     }
 }
 
