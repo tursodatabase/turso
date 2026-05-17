@@ -193,10 +193,10 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | ---------------------------- | ------ | ------- |
 | abs(X)                       | No     |         |
 | changes()                    | No     |         |
-| char(X1,X2,...,XN)           | No     |         |
+| char(X1,X2,...,XN)           | Partial | ScalarFunctionPersistence covers persisted numeric coercion edge cases |
 | coalesce(X,Y,...)            | No     |         |
 | concat(X,...)                | No     |         |
-| concat_ws(SEP,X,...)         | No     |         |
+| concat_ws(SEP,X,...)         | Partial | ScalarFunctionPersistence covers persisted blob coercion edge cases |
 | format(FORMAT,...)           | No     |         |
 | glob(X,Y)                    | No     |         |
 | hex(X)                       | No     |         |
@@ -213,7 +213,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | load_extension(X,Y)          | No     |         |
 | lower(X)                     | No     |         |
 | ltrim(X)                     | No     |         |
-| ltrim(X,Y)                   | No     |         |
+| ltrim(X,Y)                   | Partial | ScalarFunctionPersistence covers persisted NUL trim-set edge cases |
 | max(X,Y,...)                 | No     |         |
 | min(X,Y,...)                 | No     |         |
 | nullif(X,Y)                  | No     |         |
@@ -221,12 +221,12 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | printf(FORMAT,...)           | No     |         |
 | quote(X)                     | No     |         |
 | random()                     | No     |         |
-| randomblob(N)                | No     |         |
+| randomblob(N)                | Partial | ScalarFunctionPersistence covers persisted numeric coercion edge cases |
 | replace(X,Y,Z)               | No     |         |
-| round(X)                     | No     |         |
-| round(X,Y)                   | No     |         |
+| round(X)                     | Partial | ScalarFunctionPersistence covers persisted half-tie edge cases |
+| round(X,Y)                   | Partial | ScalarFunctionPersistence covers persisted half-tie edge cases |
 | rtrim(X)                     | No     |         |
-| rtrim(X,Y)                   | No     |         |
+| rtrim(X,Y)                   | Partial | ScalarFunctionPersistence covers persisted NUL trim-set edge cases |
 | sign(X)                      | No     |         |
 | soundex(X)                   | No     |         |
 | sqlite_compileoption_get(N)  | No     |         |
@@ -240,14 +240,14 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | substring(X,Y)               | No     |         |
 | total_changes()              | No     |         |
 | trim(X)                      | No     |         |
-| trim(X,Y)                    | No     |         |
+| trim(X,Y)                    | Partial | ScalarFunctionPersistence covers persisted NUL trim-set edge cases |
 | typeof(X)                    | No     |         |
 | unhex(X)                     | No     |         |
-| unhex(X,Y)                   | No     |         |
+| unhex(X,Y)                   | Partial | ScalarFunctionPersistence covers persisted blob ignore-set edge case |
 | unicode(X)                   | No     |         |
 | unlikely(X)                  | No     |         |
 | upper(X)                     | No     |         |
-| zeroblob(N)                  | No     |         |
+| zeroblob(N)                  | Partial | ScalarFunctionPersistence covers persisted numeric coercion edge cases |
 
 #### Mathematical functions
 

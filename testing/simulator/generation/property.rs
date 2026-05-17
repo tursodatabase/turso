@@ -6,6 +6,7 @@
 //! an optimization issue that is good to point out for the future
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use rand::distr::{Distribution, weighted::WeightedIndex};
 use sql_generation::{
@@ -38,7 +39,7 @@ use crate::{
         metrics::Remaining,
         property::{InteractiveQueryInfo, Property, PropertyDiscriminants},
     },
-    runner::env::SimulatorEnv,
+    runner::env::{SimConnection, SimulatorEnv},
 };
 
 type PropertyQueryGenFunc<'a, R, G> =
@@ -247,6 +248,7 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::ScalarFunctionPersistence
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => {
                 unreachable!("No extensional queries")
@@ -1201,6 +1203,20 @@ impl Property {
                 ),
                 ].into_iter().map(InteractionBuilder::with_interaction).collect()
             }
+            Property::ScalarFunctionPersistence => {
+                let table_prefix = format!("sim_scalar_persistence_{}", id.get());
+                let assertion = Assertion::new(
+                    "scalar function persisted writes should match SQLite".to_string(),
+                    move |_stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                        assert_scalar_function_persistence(env, connection_index, &table_prefix)
+                    },
+                    vec![],
+                );
+
+                vec![InteractionBuilder::with_interaction(
+                    InteractionType::Assertion(assertion),
+                )]
+            }
             Property::Queries { queries } => queries
                 .clone()
                 .into_iter()
@@ -1678,6 +1694,15 @@ fn property_savepoint_rollback<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_scalar_function_persistence<R: rand::Rng + ?Sized>(
+    _rng: &mut R,
+    _query_distr: &QueryDistribution,
+    _ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    Property::ScalarFunctionPersistence
+}
+
 fn property_table_has_expected_content<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
@@ -1899,6 +1924,9 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::InsertValuesSelect => property_insert_values_select,
             PropertyDiscriminants::ReadYourUpdatesBack => property_read_your_updates_back,
             PropertyDiscriminants::SavepointRollback => property_savepoint_rollback,
+            PropertyDiscriminants::ScalarFunctionPersistence => {
+                property_scalar_function_persistence
+            }
             PropertyDiscriminants::TableHasExpectedContent => property_table_has_expected_content,
             PropertyDiscriminants::AllTableHaveExpectedContent => {
                 property_all_tables_have_expected_content
@@ -1954,6 +1982,13 @@ impl PropertyDiscriminants {
                     && ctx.tables().iter().any(|table| !table.name.contains('.'))
                 {
                     remaining.insert + remaining.update + remaining.delete
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::ScalarFunctionPersistence => {
+                if !env.opts.disable_scalar_function_persistence {
+                    remaining.select.max(1)
                 } else {
                     0
                 }
@@ -2059,6 +2094,9 @@ impl PropertyDiscriminants {
                 QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
             }
             PropertyDiscriminants::SavepointRollback => QueryCapabilities::INSERT,
+            PropertyDiscriminants::ScalarFunctionPersistence => {
+                QueryCapabilities::SELECT.union(QueryCapabilities::INSERT)
+            }
             PropertyDiscriminants::TableHasExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::AllTableHaveExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::DoubleCreateFailure => QueryCapabilities::CREATE,
@@ -2141,6 +2179,232 @@ impl<'a> ArbitraryFrom<&PropertyDistribution<'a>> for Property {
         property_distr: &PropertyDistribution<'a>,
     ) -> Self {
         property_distr.sample(rng, conn_ctx)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScalarPersistenceCase {
+    name: &'static str,
+    expression: &'static str,
+    expected: [&'static str; 4],
+}
+
+const SCALAR_PERSISTENCE_CASES: &[ScalarPersistenceCase] = &[
+    ScalarPersistenceCase {
+        name: "round_positive_half_tie",
+        expression: "round(2.25, 1)",
+        expected: ["real", "2.3", "3", "322E33"],
+    },
+    ScalarPersistenceCase {
+        name: "round_negative_half_tie",
+        expression: "round(-2.25, 1)",
+        expected: ["real", "-2.3", "4", "2D322E33"],
+    },
+    ScalarPersistenceCase {
+        name: "zeroblob_text_numeric_prefix",
+        expression: "zeroblob('3.9suffix')",
+        expected: ["blob", "X'000000'", "3", "000000"],
+    },
+    ScalarPersistenceCase {
+        name: "zeroblob_blob_numeric_prefix",
+        expression: "zeroblob(x'332E39737566666978')",
+        expected: ["blob", "X'000000'", "3", "000000"],
+    },
+    ScalarPersistenceCase {
+        name: "randomblob_text_numeric_prefix_length",
+        expression: "length(randomblob('3.9suffix'))",
+        expected: ["integer", "3", "1", "33"],
+    },
+    ScalarPersistenceCase {
+        name: "randomblob_blob_numeric_prefix_length",
+        expression: "length(randomblob(x'332E39737566666978'))",
+        expected: ["integer", "3", "1", "33"],
+    },
+    ScalarPersistenceCase {
+        name: "char_real_truncates",
+        expression: "char(65.9)",
+        expected: ["text", "'A'", "1", "41"],
+    },
+    ScalarPersistenceCase {
+        name: "char_text_numeric_prefix",
+        expression: "char('65suffix')",
+        expected: ["text", "'A'", "1", "41"],
+    },
+    ScalarPersistenceCase {
+        name: "char_blob_numeric_prefix",
+        expression: "char(x'3635737566666978')",
+        expected: ["text", "'A'", "1", "41"],
+    },
+    ScalarPersistenceCase {
+        name: "concat_ws_blob_separator",
+        expression: "concat_ws(x'2D', 'a', 'b')",
+        expected: ["text", "'a-b'", "3", "612D62"],
+    },
+    ScalarPersistenceCase {
+        name: "concat_ws_blob_value",
+        expression: "concat_ws('-', 'a', x'42')",
+        expected: ["text", "'a-B'", "3", "612D42"],
+    },
+    ScalarPersistenceCase {
+        name: "unhex_blob_ignore_set",
+        expression: "unhex('41-42', x'2D')",
+        expected: ["blob", "X'4142'", "2", "4142"],
+    },
+    ScalarPersistenceCase {
+        name: "trim_nul_pattern",
+        expression: "trim(char(0) || 'abc' || char(0), char(0))",
+        expected: ["text", "''", "0", "0061626300"],
+    },
+    ScalarPersistenceCase {
+        name: "ltrim_nul_pattern",
+        expression: "ltrim(char(0) || 'abc' || char(0), char(0))",
+        expected: ["text", "''", "0", "0061626300"],
+    },
+    ScalarPersistenceCase {
+        name: "rtrim_nul_pattern",
+        expression: "rtrim(char(0) || 'abc' || char(0), char(0))",
+        expected: ["text", "''", "0", "0061626300"],
+    },
+];
+
+fn assert_scalar_function_persistence(
+    env: &mut SimulatorEnv,
+    connection_index: usize,
+    table_prefix: &str,
+) -> turso_core::Result<Result<(), String>> {
+    let mut failures = Vec::new();
+
+    for (idx, case) in SCALAR_PERSISTENCE_CASES.iter().enumerate() {
+        let table = format!("{table_prefix}_{idx}");
+        let setup = [
+            format!("DROP TABLE IF EXISTS {table}"),
+            format!("CREATE TABLE {table}(v)"),
+            format!("INSERT INTO {table} VALUES({})", case.expression),
+        ];
+        let select = format!("SELECT typeof(v), quote(v), length(v), hex(v) FROM {table}");
+        let cleanup = format!("DROP TABLE IF EXISTS {table}");
+
+        let rows = match &mut env.connections[connection_index] {
+            SimConnection::LimboConnection(conn) => {
+                query_scalar_persistence_limbo(conn, &setup, &select, &cleanup)?
+            }
+            SimConnection::SQLiteConnection(conn) => {
+                query_scalar_persistence_sqlite(conn, &setup, &select, &cleanup)?
+            }
+            SimConnection::Disconnected => {
+                return Err(LimboError::InternalError(
+                    "connection is disconnected during scalar-function assertion".into(),
+                ));
+            }
+        };
+
+        let expected = vec![
+            case.expected
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+        ];
+        if rows != expected {
+            failures.push(format!(
+                "{} persisted unexpected state: expected {:?}, got {:?}",
+                case.name, expected, rows
+            ));
+        }
+    }
+
+    if !failures.is_empty() {
+        return Ok(Err(failures.join("; ")));
+    }
+
+    Ok(Ok(()))
+}
+
+fn query_scalar_persistence_limbo(
+    conn: &Arc<turso_core::Connection>,
+    setup: &[String; 3],
+    select: &str,
+    cleanup: &str,
+) -> turso_core::Result<Vec<Vec<String>>> {
+    for statement in setup {
+        conn.execute(statement)?;
+    }
+
+    let result = (|| -> turso_core::Result<Vec<Vec<String>>> {
+        let mut rows = conn.query(select)?.ok_or_else(|| {
+            LimboError::InternalError("scalar-function assertion query returned no rows".into())
+        })?;
+        let mut out = Vec::new();
+        rows.run_with_row_callback(|row| {
+            out.push(row.get_values().map(value_to_state_cell).collect());
+            Ok(())
+        })?;
+        Ok(out)
+    })();
+
+    let cleanup_result = conn.execute(cleanup);
+    match (result, cleanup_result) {
+        (Ok(rows), Ok(())) => Ok(rows),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+    }
+}
+
+fn query_scalar_persistence_sqlite(
+    conn: &rusqlite::Connection,
+    setup: &[String; 3],
+    select: &str,
+    cleanup: &str,
+) -> turso_core::Result<Vec<Vec<String>>> {
+    for statement in setup {
+        conn.execute(statement, [])
+            .map_err(|err| LimboError::InternalError(err.to_string()))?;
+    }
+
+    let result = (|| -> rusqlite::Result<Vec<Vec<String>>> {
+        let mut stmt = conn.prepare(select)?;
+        let rows = stmt.query_map([], |row| {
+            (0..4)
+                .map(|idx| row.get_ref(idx).map(sqlite_value_to_state_cell))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        rows.collect()
+    })();
+
+    let cleanup_result = conn.execute(cleanup, []);
+    match (result, cleanup_result) {
+        (Ok(rows), Ok(_)) => Ok(rows),
+        (Err(err), _) | (_, Err(err)) => Err(LimboError::InternalError(err.to_string())),
+    }
+}
+
+fn value_to_state_cell(value: &types::Value) -> String {
+    match value {
+        types::Value::Null => "NULL".to_string(),
+        types::Value::Numeric(Numeric::Integer(i)) => i.to_string(),
+        types::Value::Numeric(Numeric::Float(f)) => f.to_string(),
+        types::Value::Text(text) => text.as_str().to_string(),
+        types::Value::Blob(blob) => blob
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(""),
+    }
+}
+
+fn sqlite_value_to_state_cell(value: rusqlite::types::ValueRef<'_>) -> String {
+    match value {
+        rusqlite::types::ValueRef::Null => "NULL".to_string(),
+        rusqlite::types::ValueRef::Integer(i) => i.to_string(),
+        rusqlite::types::ValueRef::Real(f) => {
+            let value = turso_core::Value::from_f64(f);
+            value.to_string()
+        }
+        rusqlite::types::ValueRef::Text(text) => String::from_utf8_lossy(text).into_owned(),
+        rusqlite::types::ValueRef::Blob(blob) => blob
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(""),
     }
 }
 

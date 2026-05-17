@@ -191,6 +191,12 @@ pub enum Property {
         tables: Vec<String>,
         write_kinds: Vec<QueryDiscriminants>,
     },
+    /// ScalarFunctionPersistence verifies that built-in scalar functions store
+    /// SQLite-compatible bytes when their results are materialized into a table.
+    /// This intentionally uses concrete edge cases that the general expression
+    /// generator does not currently model, such as decimal half-ties,
+    /// numeric-prefix zeroblob arguments, and NUL trim patterns.
+    ScalarFunctionPersistence,
     /// Property used to subsititute a property with its queries only
     Queries {
         queries: Vec<Query>,
@@ -238,6 +244,7 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::ScalarFunctionPersistence
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => None,
         }
