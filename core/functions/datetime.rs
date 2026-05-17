@@ -209,6 +209,8 @@ fn set_to_current(p: &mut DateTime) {
 }
 
 fn parse_date_or_time(value: &str, p: &mut DateTime) -> Result<()> {
+    let value = value.trim();
+
     if parse_yyyy_mm_dd(value, p) {
         return Ok(());
     }
@@ -2575,6 +2577,9 @@ mod tests {
 
         let result = exec_unixepoch(vec![Value::from_f64(2440587.5)]);
         assert_eq!(result, Value::from_i64(0));
+
+        let result = exec_unixepoch(vec![Value::build_text(" 9".to_string())]);
+        assert_eq!(result, Value::from_i64(-210865982400));
     }
 
     #[test]
