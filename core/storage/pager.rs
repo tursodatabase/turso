@@ -4790,36 +4790,13 @@ impl Pager {
             match &mut *state {
                 AllocatePageState::Start => {
                     let old_db_size = header.database_size.get();
-                    #[cfg(not(feature = "omit_autovacuum"))]
-                    let mut new_db_size = old_db_size;
-                    #[cfg(feature = "omit_autovacuum")]
-                    let new_db_size = old_db_size;
 
-                    tracing::debug!("allocate_page(database_size={})", new_db_size);
-                    #[cfg(not(feature = "omit_autovacuum"))]
-                    {
-                        //  If the following conditions are met, allocate a pointer map page, add to cache and increment the database size
-                        //  - autovacuum is enabled
-                        //  - the last page is a pointer map page
-                        if matches!(
-                            AutoVacuumMode::from(self.auto_vacuum_mode.load(Ordering::SeqCst)),
-                            AutoVacuumMode::Full
-                        ) && is_ptrmap_page(new_db_size + 1, header.page_size.get() as usize)
-                        {
-                            // we will allocate a ptrmap page, so increment size
-                            new_db_size += 1;
-                            let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
-                            self.add_dirty(&page)?;
-                            let page_key = PageCacheKey::new(page.get().id as usize);
-                            let mut cache = self.page_cache.write();
-                            cache.insert(page_key, page)?;
-                        }
-                    }
+                    tracing::debug!("allocate_page(database_size={})", old_db_size);
 
                     let first_freelist_trunk_page_id = header.freelist_trunk_page.get();
                     if first_freelist_trunk_page_id == 0 {
                         *state = AllocatePageState::AllocateNewPage {
-                            current_db_size: new_db_size,
+                            current_db_size: old_db_size,
                         };
                         continue;
                     }
@@ -4962,6 +4939,25 @@ impl Pager {
                 }
                 AllocatePageState::AllocateNewPage { current_db_size } => {
                     let mut new_db_size = *current_db_size + 1;
+
+                    #[cfg(not(feature = "omit_autovacuum"))]
+                    {
+                        if matches!(
+                            AutoVacuumMode::from(self.auto_vacuum_mode.load(Ordering::SeqCst)),
+                            AutoVacuumMode::Full
+                        ) && is_ptrmap_page(new_db_size, header.page_size.get() as usize)
+                        {
+                            let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                            self.add_dirty(&page)?;
+                            let page_key = PageCacheKey::new(page.get().id as usize);
+                            {
+                                let mut cache = self.page_cache.write();
+                                cache.insert(page_key, page)?;
+                            }
+                            header.database_size = new_db_size.into();
+                            new_db_size += 1;
+                        }
+                    }
 
                     // if new_db_size reaches the pending page, we need to allocate a new one
                     if Some(new_db_size) == self.pending_byte_page_id() {
