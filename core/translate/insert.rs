@@ -1745,6 +1745,18 @@ fn emit_notnulls(
                     NoConstantOptReason::RegisterReuse,
                 )?;
 
+                if ctx.table.is_strict {
+                    program.emit_insn(Insn::TypeCheck {
+                        start_reg: column_mapping.register,
+                        count: 1,
+                        check_generated: true,
+                        table_reference: BTreeTable::type_check_table_ref(
+                            ctx.table,
+                            resolver.schema(),
+                        ),
+                    });
+                }
+               
                 program.preassign_label_to_next_insn(skip_label);
             }
             // OR REPLACE but no DEFAULT, fall through to ABORT behavior
