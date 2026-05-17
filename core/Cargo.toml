@@ -72,6 +72,8 @@ turso_ext = { workspace = true, features = ["core_only"] }
 cfg_block = "0.1.1"
 fallible-iterator = { workspace = true }
 hex = { workspace = true }
+icu_collator = "1.5.0"
+icu_locid = "1.5.0"
 thiserror = { workspace = true }
 regex = { workspace = true }
 regex-syntax = { workspace = true, default-features = false, features = [

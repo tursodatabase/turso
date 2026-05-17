@@ -1,8 +1,11 @@
 use std::{cmp::Ordering, str::FromStr as _};
 
+use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
+use icu_locid::Locale;
 use turso_parser::ast::Expr;
 
 use crate::{
+    sync::{LazyLock, RwLock},
     translate::{
         expr::{walk_expr, WalkControl},
         plan::TableReferences,
@@ -10,30 +13,32 @@ use crate::{
     Result,
 };
 
-// TODO: in the future allow user to define collation sequences
-// Will have to meddle with ffi for this
-#[derive(
-    Debug, Clone, Copy, Eq, PartialEq, strum_macros::Display, strum_macros::EnumString, Default,
-)]
-#[strum(ascii_case_insensitive)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 /// **Pre defined collation sequences**\
 /// Collating functions only matter when comparing string values.
 /// Numeric values are always compared numerically, and BLOBs are always compared byte-by-byte using memcmp().
-#[repr(u8)]
 pub enum CollationSeq {
-    Unset = 0,
+    Unset,
     #[default]
-    Binary = 1,
-    NoCase = 2,
-    Rtrim = 3,
+    Binary,
+    NoCase,
+    Rtrim,
+    Locale(LocaleCollationId),
 }
 
 impl CollationSeq {
     pub fn new(collation: &str) -> crate::Result<Self> {
-        CollationSeq::from_str(collation).map_err(|_| {
-            crate::LimboError::ParseError(format!("no such collation sequence: {collation}"))
-        })
+        match collation.to_ascii_lowercase().as_str() {
+            "binary" => return Ok(CollationSeq::Binary),
+            "nocase" => return Ok(CollationSeq::NoCase),
+            "rtrim" => return Ok(CollationSeq::Rtrim),
+            _ => {}
+        }
+        LocaleCollationRegistry::global()
+            .get_or_register(collation)
+            .map(CollationSeq::Locale)
     }
+
     #[inline]
     /// Returns the collation, defaulting to BINARY if unset
     pub const fn from_bits(bits: u8) -> Self {
@@ -50,6 +55,7 @@ impl CollationSeq {
             CollationSeq::Unset | CollationSeq::Binary => Self::binary_cmp(lhs, rhs),
             CollationSeq::NoCase => Self::nocase_cmp(lhs, rhs),
             CollationSeq::Rtrim => Self::rtrim_cmp(lhs, rhs),
+            CollationSeq::Locale(id) => LocaleCollationRegistry::global().compare(*id, lhs, rhs),
         }
     }
 
@@ -68,6 +74,159 @@ impl CollationSeq {
     #[inline(always)]
     fn rtrim_cmp(lhs: &str, rhs: &str) -> Ordering {
         lhs.trim_end_matches(' ').cmp(rhs.trim_end_matches(' '))
+    }
+
+    #[inline]
+    pub const fn to_bits(self) -> u16 {
+        match self {
+            CollationSeq::Unset => 0,
+            CollationSeq::Binary => 1,
+            CollationSeq::NoCase => 2,
+            CollationSeq::Rtrim => 3,
+            CollationSeq::Locale(id) => id.to_bits(),
+        }
+    }
+
+    #[inline]
+    pub const fn from_storage_bits(bits: u16) -> Self {
+        match bits {
+            0 => CollationSeq::Unset,
+            1 => CollationSeq::Binary,
+            2 => CollationSeq::NoCase,
+            3 => CollationSeq::Rtrim,
+            bits => CollationSeq::Locale(LocaleCollationId::from_bits(bits)),
+        }
+    }
+
+    pub fn hash_key(&self, text: &str) -> Vec<u8> {
+        match self {
+            CollationSeq::Unset | CollationSeq::Binary => text.as_bytes().to_vec(),
+            CollationSeq::NoCase => text.bytes().map(|b| b.to_ascii_lowercase()).collect(),
+            CollationSeq::Rtrim => text.trim_end_matches(' ').as_bytes().to_vec(),
+            CollationSeq::Locale(id) => LocaleCollationRegistry::global().sort_key(*id, text),
+        }
+    }
+}
+
+impl std::fmt::Display for CollationSeq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CollationSeq::Unset => write!(f, "Unset"),
+            CollationSeq::Binary => write!(f, "Binary"),
+            CollationSeq::NoCase => write!(f, "NoCase"),
+            CollationSeq::Rtrim => write!(f, "Rtrim"),
+            CollationSeq::Locale(id) => {
+                write!(f, "{}", LocaleCollationRegistry::global().name(*id))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct LocaleCollationId(u16);
+
+impl LocaleCollationId {
+    const FIRST_STORAGE_BIT: u16 = 4;
+
+    fn from_index(index: usize) -> Result<Self> {
+        if index > (u16::MAX - Self::FIRST_STORAGE_BIT) as usize {
+            return Err(crate::LimboError::ParseError(
+                "too many locale collation sequences".to_string(),
+            ));
+        }
+        Ok(Self(index as u16))
+    }
+
+    const fn from_bits(bits: u16) -> Self {
+        Self(bits - Self::FIRST_STORAGE_BIT)
+    }
+
+    const fn to_bits(self) -> u16 {
+        self.0 + Self::FIRST_STORAGE_BIT
+    }
+}
+
+struct LocaleCollation {
+    name: String,
+    collator: CollatorBorrowed<'static>,
+}
+
+struct LocaleCollationRegistry {
+    collations: RwLock<Vec<LocaleCollation>>,
+}
+
+impl LocaleCollationRegistry {
+    fn global() -> &'static Self {
+        static REGISTRY: LazyLock<LocaleCollationRegistry> =
+            LazyLock::new(|| LocaleCollationRegistry {
+                collations: RwLock::new(Vec::new()),
+            });
+        &REGISTRY
+    }
+
+    fn get_or_register(&self, name: &str) -> Result<LocaleCollationId> {
+        if let Some(id) = self.find(name) {
+            return Ok(id);
+        }
+
+        let locale = Locale::from_str(name).map_err(|_| {
+            crate::LimboError::ParseError(format!("no such collation sequence: {name}"))
+        })?;
+        let collator =
+            Collator::try_new(locale.into(), CollatorOptions::default()).map_err(|_| {
+                crate::LimboError::ParseError(format!("no such collation sequence: {name}"))
+            })?;
+
+        let mut collations = self.collations.write();
+        if let Some((idx, _)) = collations
+            .iter()
+            .enumerate()
+            .find(|(_, collation)| collation.name.eq_ignore_ascii_case(name))
+        {
+            return LocaleCollationId::from_index(idx);
+        }
+        let id = LocaleCollationId::from_index(collations.len())?;
+        collations.push(LocaleCollation {
+            name: name.to_string(),
+            collator,
+        });
+        Ok(id)
+    }
+
+    fn find(&self, name: &str) -> Option<LocaleCollationId> {
+        self.collations
+            .read()
+            .iter()
+            .enumerate()
+            .find(|(_, collation)| collation.name.eq_ignore_ascii_case(name))
+            .and_then(|(idx, _)| LocaleCollationId::from_index(idx).ok())
+    }
+
+    fn compare(&self, id: LocaleCollationId, lhs: &str, rhs: &str) -> Ordering {
+        self.with_collation(id, |collation| collation.collator.compare(lhs, rhs))
+    }
+
+    fn sort_key(&self, id: LocaleCollationId, text: &str) -> Vec<u8> {
+        self.with_collation(id, |collation| {
+            let mut key = Vec::new();
+            collation
+                .collator
+                .write_sort_key_to(text, &mut key)
+                .expect("Vec collation key sink should be infallible");
+            key
+        })
+    }
+
+    fn name(&self, id: LocaleCollationId) -> String {
+        self.with_collation(id, |collation| collation.name.clone())
+    }
+
+    fn with_collation<T>(&self, id: LocaleCollationId, f: impl FnOnce(&LocaleCollation) -> T) -> T {
+        let collations = self.collations.read();
+        let collation = collations
+            .get(id.0 as usize)
+            .expect("locale collation id should be registered");
+        f(collation)
     }
 }
 
@@ -238,6 +397,42 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn test_locale_collation_names() {
+        assert!(matches!(
+            CollationSeq::new("fr-FR").unwrap(),
+            CollationSeq::Locale(_)
+        ));
+        assert!(matches!(
+            CollationSeq::new("es-u-co-trad").unwrap(),
+            CollationSeq::Locale(_)
+        ));
+        assert!(matches!(
+            CollationSeq::new("en-u-kf-upper").unwrap(),
+            CollationSeq::Locale(_)
+        ));
+        assert!(matches!(
+            CollationSeq::new("en-US-u-kf-upper").unwrap(),
+            CollationSeq::Locale(_)
+        ));
+        assert!(CollationSeq::new("compile_options").is_err());
+    }
+
+    #[test]
+    fn test_locale_collation_compare() {
+        let traditional_spanish = CollationSeq::new("es-u-co-trad").unwrap();
+        assert_eq!(
+            traditional_spanish.compare_strings("pollo", "polvo"),
+            Ordering::Greater
+        );
+
+        let upper_first = CollationSeq::new("en-u-kf-upper").unwrap();
+        assert_eq!(upper_first.compare_strings("A", "a"), Ordering::Less);
+
+        let upper_first_us = CollationSeq::new("en-US-u-kf-upper").unwrap();
+        assert_eq!(upper_first_us.compare_strings("A", "a"), Ordering::Less);
+    }
 
     #[test]
     fn test_get_collseq_from_expr_single_table_single_column() {
