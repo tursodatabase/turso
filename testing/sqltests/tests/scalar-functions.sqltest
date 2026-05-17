@@ -63,6 +63,20 @@ expect {
     ab,bc,cd
 }
 
+test concat_ws-blob-separator {
+    select concat_ws(x'2d', 'a', 'b');
+}
+expect {
+    a-b
+}
+
+test concat_ws-blob-value {
+    select concat_ws('-', 'a', x'42');
+}
+expect {
+    a-B
+}
+
 # Regression test: CONCAT with complex first argument that allocates internal registers
 test concat-complex-first-arg {
     select concat((1 IN (2,3)), 'hello', 'world')
@@ -551,6 +565,13 @@ expect {
     X'AABBCC'
 }
 
+test unhex-blob-ignore-set {
+    SELECT quote(unhex('41-42', x'2d'));
+}
+expect {
+    X'4142'
+}
+
 test unhex-space-separated {
     SELECT quote(unhex('aa bb', ' '));
 }
@@ -623,6 +644,20 @@ expect {
     Limbo
 }
 
+test trim-nul-pattern-preserves-text {
+    SELECT hex(trim(char(0) || 'abc' || char(0), char(0)));
+}
+expect {
+    0061626300
+}
+
+test trim-nul-terminated-pattern {
+    SELECT hex(trim('x' || char(0) || 'abc' || char(0) || 'x', 'x' || char(0)));
+}
+expect {
+    0061626300
+}
+
 test ltrim {
     SELECT ltrim('   Limbo    ');
 }
@@ -680,6 +715,13 @@ test ltrim-no-match-pattern {
 }
 expect {
     Limbo
+}
+
+test ltrim-nul-pattern-preserves-text {
+    SELECT hex(ltrim(char(0) || 'abc' || char(0), char(0)));
+}
+expect {
+    0061626300
 }
 
 test rtrim {
@@ -741,6 +783,13 @@ expect {
     Limbo
 }
 
+test rtrim-nul-pattern-preserves-text {
+    SELECT hex(rtrim(char(0) || 'abc' || char(0), char(0)));
+}
+expect {
+    0061626300
+}
+
 # TRIM always returns TEXT, even for numeric inputs.
 # This is important for expression indexes that use TRIM on numeric columns.
 test trim-integer-returns-text {
@@ -793,6 +842,32 @@ test round-float-with-precision {
 }
 expect {
     123.46
+}
+
+test round-float-half-away-positive {
+    SELECT round(2.25, 1);
+}
+expect {
+    2.3
+}
+
+test round-float-half-away-negative {
+    SELECT round(-2.25, 1);
+}
+expect {
+    -2.3
+}
+
+test round-float-half-away-persistent-update {
+    CREATE TABLE round_regression(id INT PRIMARY KEY, r REAL, v REAL);
+    INSERT INTO round_regression(id, r) VALUES(1, -2.25), (2, -2.35), (3, 2.25);
+    UPDATE round_regression SET v = round(r, 1);
+    SELECT id, typeof(v), quote(v) FROM round_regression ORDER BY id;
+}
+expect {
+    1|real|-2.3
+    2|real|-2.4
+    3|real|2.3
 }
 
 test round-float-with-text-precision {
@@ -1599,6 +1674,27 @@ expect {
     2
 }
 
+test randomblob-text-numeric-prefix {
+    SELECT length(randomblob('3.9suffix'));
+}
+expect {
+    3
+}
+
+test randomblob-blob-numeric-prefix {
+    SELECT length(randomblob(x'332e39737566666978'));
+}
+expect {
+    3
+}
+
+test char-numeric-coercions {
+    SELECT char(65.9), char('65suffix'), char(x'3635737566666978');
+}
+expect {
+    A|A|A
+}
+
 test zeroblob-int-0 {
     SELECT zeroblob(0) = x'';
 }
@@ -1615,6 +1711,20 @@ expect {
 
 test zeroblob-str-3 {
     SELECT zeroblob('3') = x'000000';
+}
+expect {
+    1
+}
+
+test zeroblob-str-float-prefix {
+    SELECT zeroblob('3.9suffix') = x'000000';
+}
+expect {
+    1
+}
+
+test zeroblob-blob-float-prefix {
+    SELECT zeroblob(x'332E39737566666978') = x'000000';
 }
 expect {
     1
