@@ -14,6 +14,7 @@ use sql_generation::{
         query::{
             Create, Delete, Drop, Insert, Select,
             alter_table::{AlterTable, AlterTableType},
+            pragma::{Pragma, WalCheckpointMode},
             predicate::Predicate,
             select::{CompoundOperator, CompoundSelect, ResultColumn, SelectBody, SelectInner},
             transaction::{Begin, Commit, Rollback},
@@ -233,6 +234,15 @@ impl Property {
                     let Property::SavepointRollback { write_kinds, .. } = property else {
                         unreachable!()
                     };
+                    if rng.random_bool(0.30) {
+                        let mode = match rng.random_range(0..4) {
+                            0 => WalCheckpointMode::Passive,
+                            1 => WalCheckpointMode::Full,
+                            2 => WalCheckpointMode::Restart,
+                            _ => WalCheckpointMode::Truncate,
+                        };
+                        return Some(Query::Pragma(Pragma::WalCheckpoint(mode)));
+                    }
                     random_main_table_write(rng, ctx, write_kinds)
                 }
             }

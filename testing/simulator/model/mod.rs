@@ -468,7 +468,11 @@ impl Shadow for Query {
             Query::RollbackToSavepoint(rollback_to) => rollback_to.shadow(env),
             Query::ReleaseSavepoint(release) => release.shadow(env),
             Query::Placeholder => Ok(vec![]),
-            Query::Pragma(Pragma::AutoVacuumMode(_) | Pragma::ForeignKeyList(_)) => Ok(vec![]),
+            Query::Pragma(
+                Pragma::AutoVacuumMode(_)
+                | Pragma::ForeignKeyList(_)
+                | Pragma::WalCheckpoint(_),
+            ) => Ok(vec![]),
         }
     }
 }
