@@ -11,12 +11,14 @@ use super::{
         write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
     },
 };
+#[cfg(not(feature = "omit_autovacuum"))]
+use crate::storage::pager::{ptrmap::PtrmapType, AutoVacuumMode};
 use crate::{
     io::CompletionGroup,
     io_yield_one,
     schema::{BTreeTable, Index},
     storage::{
-        pager::{ptrmap::PtrmapType, AutoVacuumMode, BtreePageAllocMode, Pager},
+        pager::{BtreePageAllocMode, Pager},
         sqlite3_ondisk::{
             payload_overflows, read_u32, read_varint, write_varint, BTreeCell, DatabaseHeader,
             PageContent, PageSize, PageType, TableInteriorCell, TableLeafCell, CELL_PTR_SIZE_BYTES,
@@ -2628,11 +2630,14 @@ impl BTreeCursor {
             {
                 let new_page_id = *new_page_id;
                 let parent_page_id = *parent_page_id;
+                #[cfg(not(feature = "omit_autovacuum"))]
                 return_if_io!(self.pager.ptrmap_put(
                     new_page_id,
                     PtrmapType::BTreeNode,
                     parent_page_id,
                 ));
+                #[cfg(feature = "omit_autovacuum")]
+                let _ = (new_page_id, parent_page_id);
                 self.stack.pop();
 
                 let BalanceState { sub_state, .. } = &mut self.balance_state;
@@ -2710,7 +2715,12 @@ impl BTreeCursor {
             let parent_page_id = parent.get().id as u32;
             parent_contents.write_rightmost_ptr(new_page_id);
 
-            if self.pager.get_auto_vacuum_mode() == AutoVacuumMode::Full {
+            #[cfg(not(feature = "omit_autovacuum"))]
+            let should_update_ptrmap = self.pager.get_auto_vacuum_mode() == AutoVacuumMode::Full;
+            #[cfg(feature = "omit_autovacuum")]
+            let should_update_ptrmap = false;
+
+            if should_update_ptrmap {
                 let BalanceState { sub_state, .. } = &mut self.balance_state;
                 *sub_state = BalanceSubState::QuickUpdatePtrmap {
                     new_page_id,
@@ -3984,7 +3994,13 @@ impl BTreeCursor {
                     recovered_vec.clear();
                     *reusable_cell_payloads = recovered_vec;
 
-                    if self.pager.get_auto_vacuum_mode() == AutoVacuumMode::Full {
+                    #[cfg(not(feature = "omit_autovacuum"))]
+                    let should_update_ptrmap =
+                        self.pager.get_auto_vacuum_mode() == AutoVacuumMode::Full;
+                    #[cfg(feature = "omit_autovacuum")]
+                    let should_update_ptrmap = false;
+
+                    if should_update_ptrmap {
                         let page_ids = pages_to_balance_new
                             .iter()
                             .take(sibling_count_new)
@@ -4012,11 +4028,14 @@ impl BTreeCursor {
                     sibling_count_new,
                 } => {
                     if *page_idx < page_ids.len() {
+                        #[cfg(not(feature = "omit_autovacuum"))]
                         return_if_io!(self.pager.ptrmap_put(
                             page_ids[*page_idx],
                             PtrmapType::BTreeNode,
                             *parent_page_id,
                         ));
+                        #[cfg(feature = "omit_autovacuum")]
+                        let _ = parent_page_id;
                         *page_idx += 1;
                         continue;
                     }
@@ -4526,11 +4545,14 @@ impl BTreeCursor {
         {
             let child_page_id = *child_page_id;
             let root_page_id = *root_page_id;
+            #[cfg(not(feature = "omit_autovacuum"))]
             return_if_io!(self.pager.ptrmap_put(
                 child_page_id,
                 PtrmapType::BTreeNode,
                 root_page_id,
             ));
+            #[cfg(feature = "omit_autovacuum")]
+            let _ = (child_page_id, root_page_id);
             return Ok(IOResult::Done(()));
         }
 
@@ -4613,7 +4635,13 @@ impl BTreeCursor {
         self.stack.push(root);
         self.stack.set_cell_index(0); // leave parent pointing at the rightmost pointer (in this case 0, as there are no cells), since we will be balancing the rightmost child page.
         self.stack.push(child);
-        if self.pager.get_auto_vacuum_mode() == AutoVacuumMode::Full {
+
+        #[cfg(not(feature = "omit_autovacuum"))]
+        let should_update_ptrmap = self.pager.get_auto_vacuum_mode() == AutoVacuumMode::Full;
+        #[cfg(feature = "omit_autovacuum")]
+        let should_update_ptrmap = false;
+
+        if should_update_ptrmap {
             let BalanceState { sub_state, .. } = &mut self.balance_state;
             *sub_state = BalanceSubState::BalanceRootUpdatePtrmap {
                 child_page_id,

@@ -75,7 +75,7 @@ fn test_autovacuum_freelist_allocation_updates_header_at_ptrmap_boundary() -> an
             .map(|value| format!("({value})"))
             .collect::<Vec<_>>()
             .join(",");
-        conn.execute(&format!("INSERT INTO t VALUES {values}"))?;
+        conn.execute(format!("INSERT INTO t VALUES {values}"))?;
     }
     conn.execute("DELETE FROM t WHERE x IN (1,2,3)")?;
     conn.execute("INSERT INTO t VALUES (101),(102),(103),(104),(105)")?;
