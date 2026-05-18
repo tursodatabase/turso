@@ -871,7 +871,7 @@ fn multiprocess_shm_hold_open_child_process() {
         .map(std::path::PathBuf::from)
         .unwrap();
 
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db

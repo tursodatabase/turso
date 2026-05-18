@@ -235,16 +235,9 @@ fn truncate_checkpoint_until_stable(whopper: &mut MultiprocessWhopper, connectio
 
 #[cfg(all(unix, target_pointer_width = "64"))]
 fn is_multiprocess_vacuum_rejection(err: &LimboError) -> bool {
-    match err {
-        LimboError::ParseError(msg) => {
-            msg.contains("VACUUM is incompatible with experimental multiprocess WAL")
-        }
-        LimboError::TxError(msg) | LimboError::InternalError(msg) => {
-            msg.contains("cannot VACUUM experimental multiprocess WAL databases")
-                || msg.contains("VACUUM is incompatible with experimental multiprocess WAL")
-        }
-        _ => false,
-    }
+    let msg = err.to_string();
+    msg.contains("cannot VACUUM experimental multiprocess WAL databases")
+        || msg.contains("VACUUM is incompatible with experimental multiprocess WAL")
 }
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
