@@ -709,6 +709,16 @@ mod tests {
         let columns = stmt.num_columns();
         assert_eq!(columns, 0);
 
+        let stmt = conn.prepare(
+            "insert into \"test\" (\"foo\", \"bar\", \"baz\") values (1, 2, 3) \
+             returning \"test\".\"foo\", \"bar\", baz as explicit_baz;",
+        )?;
+        let columns = stmt.num_columns();
+        assert_eq!(columns, 3);
+        assert_eq!(stmt.get_column_name(0), "foo");
+        assert_eq!(stmt.get_column_name(1), "bar");
+        assert_eq!(stmt.get_column_name(2), "explicit_baz");
+
         let stmt = conn.prepare("delete from test where foo = 1")?;
         let columns = stmt.num_columns();
         assert_eq!(columns, 0);
