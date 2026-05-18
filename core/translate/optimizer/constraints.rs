@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::{
     schema::{Column, Index, Schema},
     translate::{
@@ -1131,7 +1132,7 @@ pub fn usable_constraints_for_join_order<'a>(
     constraints: &'a [Constraint],
     refs: &'a [ConstraintRef],
     join_order: &[JoinOrderMember],
-) -> Vec<RangeConstraintRef> {
+) -> Result<Vec<RangeConstraintRef>> {
     turso_debug_assert!(refs.is_sorted_by_key(|x| x.index_col_pos));
 
     let table_idx = join_order.last().unwrap().original_idx;
@@ -1139,8 +1140,13 @@ pub fn usable_constraints_for_join_order<'a>(
         .iter()
         .take(join_order.len() - 1)
         .map(|j| j.original_idx)
-        .collect();
-    usable_constraints_for_lhs_mask(constraints, refs, &lhs_mask, table_idx)
+        .try_collect()?;
+    Ok(usable_constraints_for_lhs_mask(
+        constraints,
+        refs,
+        &lhs_mask,
+        table_idx,
+    ))
 }
 
 /// Order synthetic key columns for a materialized subquery seek index.
@@ -1422,14 +1428,14 @@ fn estimate_bound_expr_selectivity(
 pub fn convert_to_vtab_constraint(
     constraints: &[Constraint],
     join_order: &[JoinOrderMember],
-) -> Vec<ConstraintInfo> {
+) -> Result<Vec<ConstraintInfo>> {
     let table_idx = join_order.last().unwrap().original_idx;
     let lhs_mask: TableMask = join_order
         .iter()
         .take(join_order.len() - 1)
         .map(|j| j.original_idx)
-        .collect();
-    constraints
+        .try_collect()?;
+    let constraints = constraints
         .iter()
         .enumerate()
         .filter_map(|(i, constraint)| {
@@ -1447,7 +1453,8 @@ pub fn convert_to_vtab_constraint(
                 index: i,
             })
         })
-        .collect()
+        .collect();
+    Ok(constraints)
 }
 
 fn to_ext_constraint_op(op: &ConstraintOperator) -> Option<ConstraintOp> {

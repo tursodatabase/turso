@@ -1,4 +1,5 @@
 use super::*;
+use crate::alloc::TursoIteratorExt;
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
 use crate::translate::plan::ColumnUsedMask;
@@ -158,7 +159,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                     );
                     let payload_signature_columns: ColumnUsedMask = (0..payload_columns.len())
                         .map(|i| *payload_num_keys + i)
-                        .collect();
+                        .try_collect()?;
                     (
                         payload_columns.clone(),
                         payload_signature_columns,
@@ -340,8 +341,9 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         }
 
         if !config.use_materialized_keys {
-            let build_only_mask: TableMask =
-                [planner.hash_join_op.build_table_idx].into_iter().collect();
+            let build_only_mask: TableMask = [planner.hash_join_op.build_table_idx]
+                .into_iter()
+                .try_collect()?;
             for cond in planner.predicates.iter() {
                 if cond.from_outer_join.is_some() {
                     // OUTER JOIN predicates must stay on the right-table loop

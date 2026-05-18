@@ -1,4 +1,5 @@
 use super::*;
+use crate::alloc::TursoIteratorExt;
 
 pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<DistinctCtx> {
     let collations = plan
@@ -90,7 +91,7 @@ impl InitLoop {
         let mut required_tables: TableMask = join_order
             .iter()
             .map(|member| member.original_idx)
-            .collect();
+            .try_collect()?;
         for table in tables.joined_tables().iter() {
             if let Operation::HashJoin(hash_join_op) = &table.op {
                 required_tables.set(hash_join_op.build_table_idx);
