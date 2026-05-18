@@ -4786,6 +4786,7 @@ pub fn op_seek_rowid(
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
     }
+    invalidate_deferred_seeks_for_cursor(state, *cursor_id);
     let (pc, did_seek) = {
         let cursor = get_cursor!(state, *cursor_id);
 
