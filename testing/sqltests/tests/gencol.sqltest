@@ -3211,6 +3211,17 @@ expect {
     3|7|10
 }
 
+# Regression for https://github.com/tursodatabase/turso/issues/7077.
+@skip-if sqlite "ALTER COLUMN is a Turso extension"
+test gencol_alter_indexed_column_to_virtual_rejected {
+    CREATE TABLE p(a, b UNIQUE);
+    INSERT INTO p VALUES(1, 10);
+    ALTER TABLE p ALTER COLUMN b TO g AS(a + 1);
+}
+expect error {
+    cannot ALTER COLUMN "b" because it is used by an index
+}
+
 # Non-deterministic functions in generated columns are rejected
 test gencol_alter_add_virtual_random_error {
     CREATE TABLE t1(a INTEGER);

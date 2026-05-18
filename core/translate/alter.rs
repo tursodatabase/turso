@@ -12,7 +12,7 @@ use super::{
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
-    schema::{CheckConstraint, Column, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
+    schema::{CheckConstraint, Column, ForeignKey, Index, Table, RESERVED_TABLE_PREFIXES},
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
@@ -1745,6 +1745,15 @@ pub fn translate_alter_table(
             }
 
             let rewritten_table = if rewrites_physical_layout {
+                let referenced_by_index = resolver.with_schema(database_id, |s| {
+                    s.get_indices(btree.name.as_str())
+                        .any(|idx| index_references_column_for_alter(idx, column_index, from))
+                });
+                if referenced_by_index {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot ALTER COLUMN \"{from}\" because it is used by an index"
+                    )));
+                }
                 let mut table = btree.clone();
                 table.columns_mut()[column_index] =
                     replacement_column.expect("replacement_column must exist for ALTER COLUMN");
@@ -2196,6 +2205,25 @@ fn non_virtual_affinity_str(table: &BTreeTable) -> String {
         .filter(|col| !col.is_virtual_generated())
         .map(|col| col.affinity_with_strict(table.is_strict).aff_mask())
         .collect()
+}
+
+fn index_references_column_for_alter(
+    index: &Index,
+    column_index: usize,
+    column_name: &str,
+) -> bool {
+    let column_name = normalize_ident(column_name);
+    index.columns.iter().any(|column| {
+        column.pos_in_table == column_index
+            || normalize_ident(&column.name) == column_name
+            || column
+                .expr
+                .as_ref()
+                .is_some_and(|expr| check_expr_references_column(expr, &column_name))
+    }) || index
+        .where_clause
+        .as_ref()
+        .is_some_and(|expr| check_expr_references_column(expr, &column_name))
 }
 
 fn translate_rename_virtual_table(
