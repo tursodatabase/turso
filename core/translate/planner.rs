@@ -524,7 +524,7 @@ fn plan_cte(
             identifier: referenced_table.identifier.clone(),
             internal_id: referenced_table.internal_id,
             table: referenced_table.table.clone(),
-            using_dedup_hidden_cols: referenced_table.using_dedup_hidden_cols(),
+            using_dedup_hidden_cols: referenced_table.using_dedup_hidden_cols()?,
             col_used_mask: ColumnUsedMask::default(),
             cte_select: None,
             cte_explicit_columns: vec![],

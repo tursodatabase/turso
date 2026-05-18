@@ -4,6 +4,7 @@ use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType};
 
 use crate::{
+    alloc::TursoIteratorExt,
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
@@ -308,7 +309,7 @@ pub fn plan_subqueries_from_select_plan(
     }
 
     // LIMIT and OFFSET cannot reference columns from the outer query
-    let get_outer_query_refs = |_: &TableReferences| vec![];
+    let get_outer_query_refs = |_: &TableReferences| Ok(crate::alloc::try_vec![]?);
     {
         let mut subquery_parser = get_subquery_parser(
             program,
@@ -519,7 +520,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
     // including nested cases where a subquery inside a subquery references columns from its parent's parent
     // and so on.
     let get_outer_query_refs = |referenced_tables: &TableReferences| {
-        referenced_tables
+        let outer_refs = referenced_tables
             .joined_tables()
             .iter()
             .map(|t| {
@@ -528,39 +529,38 @@ fn plan_subqueries_with_outer_query_access<'a>(
                     Table::FromClauseSubquery(subq) => subq.cte_id(),
                     _ => None,
                 };
-                OuterQueryReference {
+                let outer_ref = OuterQueryReference {
                     table: t.table.clone(),
                     identifier: t.identifier.clone(),
                     internal_id: t.internal_id,
-                    using_dedup_hidden_cols: t.using_dedup_hidden_cols(),
+                    using_dedup_hidden_cols: t.using_dedup_hidden_cols()?,
                     col_used_mask: ColumnUsedMask::default(),
                     cte_select: None,
-                    cte_explicit_columns: vec![],
+                    cte_explicit_columns: Vec::new(),
                     cte_id,
                     cte_definition_only: false,
                     rowid_referenced: false,
                     scope_depth: 0,
-                }
+                };
+                Ok::<_, crate::LimboError>(outer_ref)
             })
-            .chain(
-                referenced_tables
-                    .outer_query_refs()
-                    .iter()
-                    .map(|t| OuterQueryReference {
-                        table: t.table.clone(),
-                        identifier: t.identifier.clone(),
-                        internal_id: t.internal_id,
-                        using_dedup_hidden_cols: t.using_dedup_hidden_cols.clone(),
-                        col_used_mask: ColumnUsedMask::default(),
-                        cte_select: t.cte_select.clone(),
-                        cte_explicit_columns: t.cte_explicit_columns.clone(),
-                        cte_id: t.cte_id, // Preserve CTE ID from outer query refs
-                        cte_definition_only: t.cte_definition_only,
-                        rowid_referenced: false,
-                        scope_depth: t.scope_depth + 1,
-                    }),
-            )
-            .collect::<Vec<_>>()
+            .chain(referenced_tables.outer_query_refs().iter().map(|t| {
+                Ok(OuterQueryReference {
+                    table: t.table.clone(),
+                    identifier: t.identifier.clone(),
+                    internal_id: t.internal_id,
+                    using_dedup_hidden_cols: t.using_dedup_hidden_cols.clone(),
+                    col_used_mask: ColumnUsedMask::default(),
+                    cte_select: t.cte_select.clone(),
+                    cte_explicit_columns: t.cte_explicit_columns.clone(),
+                    cte_id: t.cte_id, // Preserve CTE ID from outer query refs
+                    cte_definition_only: t.cte_definition_only,
+                    rowid_referenced: false,
+                    scope_depth: t.scope_depth + 1,
+                })
+            }))
+            .try_collect::<Result<crate::alloc::Vec<_>>>()??;
+        Ok(outer_refs)
     };
 
     let mut subquery_parser = get_subquery_parser(
@@ -589,7 +589,8 @@ fn get_subquery_parser<'a>(
     referenced_tables: &'a mut TableReferences,
     resolver: &'a Resolver,
     connection: &'a Arc<Connection>,
-    get_outer_query_refs: impl Fn(&TableReferences) -> Vec<OuterQueryReference> + 'a,
+    get_outer_query_refs: impl Fn(&TableReferences) -> Result<crate::alloc::Vec<OuterQueryReference>>
+        + 'a,
     position: SubqueryPosition,
     origin: SubqueryOrigin,
     allow_correlated: bool,
@@ -612,7 +613,7 @@ fn get_subquery_parser<'a>(
                 let outer_query_refs = {
                     crate::stack::trace_stack!("get_outer_refs");
                     get_outer_query_refs(referenced_tables)
-                };
+                }?;
 
                 let result_reg = program.alloc_register();
                 let subquery_type = SubqueryType::Exists { result_reg };
@@ -662,7 +663,7 @@ fn get_subquery_parser<'a>(
                 let outer_query_refs = {
                     crate::stack::trace_stack!("get_outer_refs");
                     get_outer_query_refs(referenced_tables)
-                };
+                }?;
 
                 let result_expr = ast::Expr::SubqueryResult {
                     subquery_id,
@@ -773,7 +774,7 @@ fn get_subquery_parser<'a>(
                 let outer_query_refs = {
                     crate::stack::trace_stack!("get_outer_refs");
                     get_outer_query_refs(referenced_tables)
-                };
+                }?;
 
                 let ast::Expr::InSelect { lhs, not, rhs } = ({
                     crate::stack::trace_stack!("take_in_select_expr");
@@ -998,12 +999,16 @@ fn update_column_used_masks(
                     }
                     joined_table.column_use_counts[col_idx] += 1;
                 }
-                joined_table.col_used_mask |= &child_outer_query_ref.col_used_mask;
+                joined_table
+                    .col_used_mask
+                    .union_with(&child_outer_query_ref.col_used_mask)?;
             }
             if let Some(outer_query_ref) = table_refs
                 .find_outer_query_ref_by_internal_id_mut(child_outer_query_ref.internal_id)
             {
-                outer_query_ref.col_used_mask |= &child_outer_query_ref.col_used_mask;
+                outer_query_ref
+                    .col_used_mask
+                    .union_with(&child_outer_query_ref.col_used_mask)?;
             }
         }
 
@@ -1233,7 +1238,7 @@ pub fn emit_from_clause_subqueries(
         .iter()
         .map(|member| member.original_idx)
         .collect();
-    let visit_set: TableMask = visit_order.iter().copied().collect();
+    let visit_set: TableMask = visit_order.iter().copied().try_collect()?;
     for table in tables.joined_tables().iter() {
         if let Operation::HashJoin(hash_join_op) = &table.op {
             let build_idx = hash_join_op.build_table_idx;
@@ -1248,7 +1253,7 @@ pub fn emit_from_clause_subqueries(
         .iter()
         .filter(|m| m.is_outer)
         .map(|m| m.original_idx)
-        .collect();
+        .try_collect()?;
 
     for table_index in visit_order {
         let table_reference = &mut tables.joined_tables_mut()[table_index];

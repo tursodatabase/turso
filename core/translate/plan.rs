@@ -1,5 +1,5 @@
 use crate::{
-    alloc::{self, TursoAllocExt},
+    alloc::{self, TursoAllocExt, TursoFromIterator, TursoIteratorExt},
     function::{AggFunc, WindowFunc},
     schema::{
         BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table, Type, ROWID_SENTINEL,
@@ -1088,25 +1088,25 @@ pub struct JoinedTable {
 }
 
 impl JoinedTable {
-    pub fn using_dedup_hidden_cols(&self) -> ColumnMask {
-        self.join_info
-            .as_ref()
-            .map(|join_info| {
-                self.table
-                    .columns()
+    pub fn using_dedup_hidden_cols(&self) -> Result<ColumnMask> {
+        let Some(join_info) = self.join_info.as_ref() else {
+            return Ok(ColumnMask::default());
+        };
+        let col_mask = self
+            .table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| {
+                let col_name = col.name.as_deref()?;
+                join_info
+                    .using
                     .iter()
-                    .enumerate()
-                    .filter_map(|(idx, col)| {
-                        let col_name = col.name.as_deref()?;
-                        join_info
-                            .using
-                            .iter()
-                            .any(|using_col| using_col.as_str().eq_ignore_ascii_case(col_name))
-                            .then_some(idx)
-                    })
-                    .collect()
+                    .any(|using_col| using_col.as_str().eq_ignore_ascii_case(col_name))
+                    .then_some(idx)
             })
-            .unwrap_or_default()
+            .try_collect()?;
+        Ok(col_mask)
     }
 }
 
