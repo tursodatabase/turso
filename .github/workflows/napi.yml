@@ -113,18 +113,6 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.settings.target }}
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            .cargo-cache
-            target/
-          key: ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}-
       - uses: mlugg/setup-zig@v2
         if: ${{ matrix.settings.target == 'armv7-unknown-linux-gnueabihf' || matrix.settings.target == 'armv7-unknown-linux-musleabihf' }}
         with:
@@ -149,9 +137,6 @@ jobs:
         working-directory: .
         run: |
           docker run --rm --user 0:0 \
-            -v ${{ github.workspace }}/.cargo-cache/git/db:/usr/local/cargo/git/db \
-            -v ${{ github.workspace }}/.cargo/registry/cache:/usr/local/cargo/registry/cache \
-            -v ${{ github.workspace }}/.cargo/registry/index:/usr/local/cargo/registry/index \
             -v ${{ github.workspace }}:/build \
             -w /build/bindings/javascript \
             ${{ matrix.settings.docker }} \
