@@ -25,8 +25,6 @@ use crate::types::IOResult;
 use crate::types::ImmutableRecord;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
-#[cfg(feature = "conn_raw_api")]
-use crate::types::Value;
 use crate::File;
 use crate::IOExt;
 use crate::LimboError;
@@ -61,6 +59,13 @@ pub use checkpoint_state_machine::{
 use super::persistent_storage::logical_log::{
     HeaderReadResult, IndexOpKind, ParsedOp, StreamingLogicalLogReader, StreamingResult,
     LOG_HDR_SIZE,
+};
+#[cfg(feature = "conn_raw_api")]
+use super::portable_logical::{
+    encode_header_logical_op, encode_row_logical_op, encode_schema_logical_op,
+    portable_schema_row_from_record, prepend_origin_client_id, stable_table_id_from_rootpage,
+    LOGICAL_OP_DELETE_ROW, LOGICAL_OP_UPSERT_ROW, LOGICAL_SCHEMA_CREATE, LOGICAL_SCHEMA_DROP,
+    LOGICAL_SCHEMA_REFRESH,
 };
 
 #[cfg(test)]
@@ -458,164 +463,6 @@ impl LogRecord {
 }
 
 #[cfg(feature = "conn_raw_api")]
-const LOGICAL_OP_UPSERT_ROW: u64 = 0;
-#[cfg(feature = "conn_raw_api")]
-const LOGICAL_OP_DELETE_ROW: u64 = 1;
-#[cfg(feature = "conn_raw_api")]
-const LOGICAL_OP_SCHEMA: u64 = 2;
-#[cfg(feature = "conn_raw_api")]
-const LOGICAL_OP_UPDATE_HEADER: u64 = 3;
-
-#[cfg(feature = "conn_raw_api")]
-const LOGICAL_SCHEMA_CREATE: u64 = 0;
-#[cfg(feature = "conn_raw_api")]
-const LOGICAL_SCHEMA_DROP: u64 = 1;
-#[cfg(feature = "conn_raw_api")]
-const LOGICAL_SCHEMA_REFRESH: u64 = 2;
-
-#[cfg(feature = "conn_raw_api")]
-const LOGICAL_SCHEMA_KIND_TABLE: u64 = 0;
-#[cfg(feature = "conn_raw_api")]
-const LOGICAL_SCHEMA_KIND_INDEX: u64 = 1;
-#[cfg(feature = "conn_raw_api")]
-const LOGICAL_SCHEMA_KIND_TRIGGER: u64 = 2;
-#[cfg(feature = "conn_raw_api")]
-const LOGICAL_SCHEMA_KIND_VIEW: u64 = 3;
-
-#[cfg(feature = "conn_raw_api")]
-const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
-#[cfg(feature = "conn_raw_api")]
-const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
-#[cfg(feature = "conn_raw_api")]
-const TURSO_CDC_TABLE_NAME: &str = "turso_cdc";
-#[cfg(feature = "conn_raw_api")]
-const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
-
-// Minimal protobuf encoder for the server/client `LogicalTxnData` wire shape.
-// Keeping this local avoids making turso_core depend on the sync engine or
-// server proto crate while still writing bytes that those layers can decode.
-#[cfg(feature = "conn_raw_api")]
-fn write_proto_varint(mut value: u64, out: &mut Vec<u8>) {
-    while value >= 0x80 {
-        out.push((value as u8) | 0x80);
-        value >>= 7;
-    }
-    out.push(value as u8);
-}
-
-#[cfg(feature = "conn_raw_api")]
-fn write_proto_key(field: u64, wire_type: u64, out: &mut Vec<u8>) {
-    write_proto_varint((field << 3) | wire_type, out);
-}
-
-#[cfg(feature = "conn_raw_api")]
-fn write_proto_uint64(field: u64, value: u64, out: &mut Vec<u8>) {
-    write_proto_key(field, 0, out);
-    write_proto_varint(value, out);
-}
-
-#[cfg(feature = "conn_raw_api")]
-fn write_proto_sint64(field: u64, value: i64, out: &mut Vec<u8>) {
-    let zigzag = ((value << 1) ^ (value >> 63)) as u64;
-    write_proto_uint64(field, zigzag, out);
-}
-
-#[cfg(feature = "conn_raw_api")]
-fn write_proto_bytes(field: u64, value: &[u8], out: &mut Vec<u8>) {
-    write_proto_key(field, 2, out);
-    write_proto_varint(value.len() as u64, out);
-    out.extend_from_slice(value);
-}
-
-#[cfg(feature = "conn_raw_api")]
-fn write_proto_string(field: u64, value: &str, out: &mut Vec<u8>) {
-    write_proto_bytes(field, value.as_bytes(), out);
-}
-
-#[cfg(feature = "conn_raw_api")]
-fn append_logical_op(op_body: Vec<u8>, out: &mut Vec<u8>) {
-    write_proto_key(3, 2, out);
-    write_proto_varint(op_body.len() as u64, out);
-    out.extend_from_slice(&op_body);
-}
-
-#[cfg(feature = "conn_raw_api")]
-fn is_portable_logical_name(name: &str) -> bool {
-    !name.starts_with(SQLITE_INTERNAL_PREFIX)
-        && !name.starts_with(TURSO_INTERNAL_PREFIX)
-        && name != TURSO_CDC_TABLE_NAME
-        && name != TURSO_CDC_VERSION_TABLE_NAME
-}
-
-/// Decoded subset of a `sqlite_schema` record needed to materialize stable
-/// portable schema operations at MVCC commit time.
-#[derive(Clone, Debug)]
-#[cfg(feature = "conn_raw_api")]
-struct PortableSchemaRow {
-    row_type: String,
-    name: String,
-    rootpage: i64,
-    sql: Option<String>,
-}
-
-#[cfg(feature = "conn_raw_api")]
-fn portable_schema_row_from_record(record_bytes: &[u8]) -> Result<PortableSchemaRow> {
-    let values = ImmutableRecord::from_bin_record(record_bytes.to_vec()).get_values_owned()?;
-    if values.len() < 5 {
-        return Err(LimboError::Corrupt(format!(
-            "sqlite_schema record must have at least 5 columns, got {}",
-            values.len()
-        )));
-    }
-    let text = |value: &Value, field: &str| -> Result<String> {
-        match value {
-            Value::Text(text) => Ok(text.as_str().to_string()),
-            other => Err(LimboError::Corrupt(format!(
-                "{field} must be text in sqlite_schema record, got {other:?}"
-            ))),
-        }
-    };
-    let optional_text = |value: &Value, field: &str| -> Result<Option<String>> {
-        match value {
-            Value::Text(text) => Ok(Some(text.as_str().to_string())),
-            Value::Null => Ok(None),
-            other => Err(LimboError::Corrupt(format!(
-                "{field} must be text or null in sqlite_schema record, got {other:?}"
-            ))),
-        }
-    };
-    let integer = |value: &Value, field: &str| -> Result<i64> {
-        match value {
-            Value::Numeric(Numeric::Integer(value)) => Ok(*value),
-            other => Err(LimboError::Corrupt(format!(
-                "{field} must be integer in sqlite_schema record, got {other:?}"
-            ))),
-        }
-    };
-    Ok(PortableSchemaRow {
-        row_type: text(&values[0], "sqlite_schema.type")?,
-        name: text(&values[1], "sqlite_schema.name")?,
-        rootpage: integer(&values[3], "sqlite_schema.rootpage")?,
-        sql: optional_text(&values[4], "sqlite_schema.sql")?,
-    })
-}
-
-#[cfg(feature = "conn_raw_api")]
-fn portable_schema_kind(row_type: &str) -> Option<u64> {
-    if row_type.eq_ignore_ascii_case("table") {
-        Some(LOGICAL_SCHEMA_KIND_TABLE)
-    } else if row_type.eq_ignore_ascii_case("index") {
-        Some(LOGICAL_SCHEMA_KIND_INDEX)
-    } else if row_type.eq_ignore_ascii_case("trigger") {
-        Some(LOGICAL_SCHEMA_KIND_TRIGGER)
-    } else if row_type.eq_ignore_ascii_case("view") {
-        Some(LOGICAL_SCHEMA_KIND_VIEW)
-    } else {
-        None
-    }
-}
-
-#[cfg(feature = "conn_raw_api")]
 fn portable_table_id_from_rootpage(rootpage: i64) -> MVTableId {
     if rootpage > 0 {
         MVTableId::from(-rootpage)
@@ -624,81 +471,11 @@ fn portable_table_id_from_rootpage(rootpage: i64) -> MVTableId {
     }
 }
 
-#[cfg(feature = "conn_raw_api")]
-fn stable_table_id_from_rootpage(rootpage: i64) -> Option<u64> {
-    (rootpage != 0).then_some(rootpage.unsigned_abs())
-}
-
 #[derive(Clone, Debug)]
 #[cfg(feature = "conn_raw_api")]
 struct PortableTableRef {
     name: String,
     stable_table_id: u64,
-}
-
-#[cfg(feature = "conn_raw_api")]
-fn encode_schema_logical_op(
-    action: u64,
-    row: &PortableSchemaRow,
-    stable_table_id: Option<u64>,
-    out: &mut Vec<u8>,
-) -> bool {
-    let Some(kind) = portable_schema_kind(&row.row_type) else {
-        return false;
-    };
-    if !is_portable_logical_name(&row.name) {
-        return false;
-    }
-    let mut op = Vec::new();
-    write_proto_uint64(1, LOGICAL_OP_SCHEMA, &mut op);
-    if matches!(action, LOGICAL_SCHEMA_CREATE | LOGICAL_SCHEMA_REFRESH) {
-        if let Some(sql) = row.sql.as_deref() {
-            write_proto_string(5, sql, &mut op);
-        }
-    }
-    write_proto_uint64(8, action, &mut op);
-    write_proto_uint64(9, kind, &mut op);
-    write_proto_string(10, &row.name, &mut op);
-    if let Some(stable_table_id) = stable_table_id {
-        write_proto_uint64(11, stable_table_id, &mut op);
-    }
-    append_logical_op(op, out);
-    true
-}
-
-#[cfg(feature = "conn_raw_api")]
-fn encode_row_logical_op(
-    op_type: u64,
-    table_name: &str,
-    include_table_name: bool,
-    stable_table_id: u64,
-    rowid: i64,
-    record: &[u8],
-    out: &mut Vec<u8>,
-) {
-    if !is_portable_logical_name(table_name) {
-        return;
-    }
-    let mut op = Vec::new();
-    write_proto_uint64(1, op_type, &mut op);
-    if include_table_name {
-        write_proto_string(2, table_name, &mut op);
-    }
-    write_proto_sint64(3, rowid, &mut op);
-    write_proto_uint64(11, stable_table_id, &mut op);
-    if op_type == LOGICAL_OP_UPSERT_ROW {
-        write_proto_bytes(4, record, &mut op);
-    }
-    append_logical_op(op, out);
-}
-
-#[cfg(feature = "conn_raw_api")]
-fn encode_header_logical_op(header: &DatabaseHeader, out: &mut Vec<u8>) {
-    let mut op = Vec::new();
-    write_proto_uint64(1, LOGICAL_OP_UPDATE_HEADER, &mut op);
-    write_proto_uint64(6, header.user_version.get() as u64, &mut op);
-    write_proto_uint64(7, header.application_id.get() as u64, &mut op);
-    append_logical_op(op, out);
 }
 
 /// A transaction timestamp or ID.
@@ -2269,7 +2046,11 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             }
 
             let mut encoded_ops = Vec::new();
-            let origin_client_id = self.connection.mvcc_log_meta("client");
+            let origin_client_id = if self.db_id == crate::MAIN_DB_ID {
+                self.connection.take_mvcc_log_meta().remove("client")
+            } else {
+                None
+            };
 
             if let Some(header) = log_record.portable_header.as_ref() {
                 encode_header_logical_op(header, &mut encoded_ops);
@@ -2284,32 +2065,16 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             // commit. Build it while the committing connection still has the exact
             // schema context that produced the recovery log record.
             let mut table_refs_by_id = HashMap::default();
-            {
-                let schema = self.connection.schema.read();
-                for (name, table) in schema.tables.iter() {
-                    let Ok(rootpage) = table.get_root_page() else {
-                        continue;
-                    };
-                    let Some(stable_table_id) = stable_table_id_from_rootpage(rootpage) else {
-                        continue;
-                    };
-                    let table_ref = PortableTableRef {
-                        name: name.clone(),
-                        stable_table_id,
-                    };
-                    if rootpage > 0 {
-                        table_refs_by_id.insert(MVTableId::from(-rootpage), table_ref);
-                    } else if rootpage < 0 {
-                        table_refs_by_id.insert(MVTableId::from(rootpage), table_ref);
-                    }
-                }
-            }
 
             let mut schema_upserts = HashMap::default();
             let mut schema_deletes = HashMap::default();
             let mut schema_rowids = Vec::new();
+            let mut data_table_ids = HashSet::default();
             for version in &log_record.portable_row_versions {
                 if version.row.id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                    if !matches!(version.row.id.row_id, RowKey::Record(_)) {
+                        data_table_ids.insert(version.row.id.table_id);
+                    }
                     continue;
                 }
                 let rowid = version.row.id.row_id.to_int_or_panic();
@@ -2417,14 +2182,86 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 }
             }
 
-            for entry in mvcc_store.table_id_to_rootpage.iter() {
-                let table_id = *entry.key();
-                let Some(rootpage) = *entry.value() else {
+            let rootpage_for_table_id = |table_id: MVTableId| -> i64 {
+                mvcc_store
+                    .table_id_to_rootpage
+                    .get(&table_id)
+                    .and_then(|entry| *entry.value())
+                    .map(|rootpage| rootpage as i64)
+                    .unwrap_or_else(|| i64::from(table_id))
+            };
+
+            let mut unresolved_data_tables = Vec::new();
+            let mut needed_rootpages = HashSet::default();
+            for table_id in data_table_ids {
+                if table_refs_by_id.contains_key(&table_id) {
                     continue;
-                };
-                let root_table_id = MVTableId::from(-(rootpage as i64));
+                }
+                let rootpage = rootpage_for_table_id(table_id);
+                if rootpage == 0 {
+                    continue;
+                }
+                let root_table_id = portable_table_id_from_rootpage(rootpage);
                 if let Some(table_ref) = table_refs_by_id.get(&root_table_id).cloned() {
                     table_refs_by_id.insert(table_id, table_ref);
+                    continue;
+                }
+                needed_rootpages.insert(rootpage);
+                unresolved_data_tables.push((table_id, root_table_id));
+            }
+
+            if !needed_rootpages.is_empty() {
+                let schema = self.connection.schema.read();
+                for rootpage in needed_rootpages {
+                    let table_ref = if let Some(name) = schema.table_name_for_root_page(rootpage) {
+                        let Some(stable_table_id) = stable_table_id_from_rootpage(rootpage) else {
+                            continue;
+                        };
+                        PortableTableRef {
+                            name: name.to_string(),
+                            stable_table_id,
+                        }
+                    } else if rootpage < 0 {
+                        let checkpointed_rootpage = -rootpage;
+                        let Some(name) = schema.table_name_for_root_page(checkpointed_rootpage)
+                        else {
+                            continue;
+                        };
+                        let Some(stable_table_id) =
+                            stable_table_id_from_rootpage(checkpointed_rootpage)
+                        else {
+                            continue;
+                        };
+                        PortableTableRef {
+                            name: name.to_string(),
+                            stable_table_id,
+                        }
+                    } else if rootpage > 0 {
+                        let uncheckpointed_rootpage = -rootpage;
+                        let Some(name) = schema.table_name_for_root_page(uncheckpointed_rootpage)
+                        else {
+                            continue;
+                        };
+                        let Some(stable_table_id) = stable_table_id_from_rootpage(rootpage) else {
+                            continue;
+                        };
+                        PortableTableRef {
+                            name: name.to_string(),
+                            stable_table_id,
+                        }
+                    } else {
+                        continue;
+                    };
+                    table_refs_by_id.insert(
+                        MVTableId::from(-(table_ref.stable_table_id as i64)),
+                        table_ref,
+                    );
+                }
+
+                for (table_id, root_table_id) in unresolved_data_tables {
+                    if let Some(table_ref) = table_refs_by_id.get(&root_table_id).cloned() {
+                        table_refs_by_id.insert(table_id, table_ref);
+                    }
                 }
             }
 
@@ -2470,11 +2307,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             }
 
             if let Some(client_id) = origin_client_id {
-                let mut txn_fields = Vec::new();
-                // LogicalTxnData.origin_client_id, field 4.
-                write_proto_string(4, &client_id, &mut txn_fields);
-                txn_fields.extend_from_slice(&encoded_ops);
-                encoded_ops = txn_fields;
+                encoded_ops = prepend_origin_client_id(&client_id, encoded_ops);
             }
 
             log_record.portable_changes = encoded_ops;
@@ -4906,6 +4739,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = tx_unlocked.value();
         if let Some(connection) = connection {
             connection.set_mv_tx_for_db(db, None);
+            if db == crate::MAIN_DB_ID {
+                connection.clear_mvcc_log_meta();
+            }
         }
         turso_assert!(matches!(
             tx.state.load(),

@@ -290,13 +290,14 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     Some(io) => io,
                     None => persistent_io(metadata.partial_bootstrap_server_revision.is_some())?,
                 };
-                let db_file = database_sync_engine::DatabaseSyncEngine::init_db_storage(
-                    io.clone(),
-                    sync_engine_io.clone(),
-                    &metadata,
-                    &main_db_path,
-                    sync_engine_opts.remote_encryption_key.as_deref(),
-                )?;
+                let (db_file, _server_revision) =
+                    database_sync_engine::DatabaseSyncEngine::init_db_storage(
+                        io.clone(),
+                        sync_engine_io.clone(),
+                        &metadata,
+                        &main_db_path,
+                        sync_engine_opts.remote_encryption_key.as_deref(),
+                    )?;
                 let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
                     turso_sdk_kit::rsapi::TursoDatabaseConfig {
                         db_file: Some(db_file),
@@ -354,13 +355,14 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     metadata,
                 )
                 .await?;
-                let db_file = database_sync_engine::DatabaseSyncEngine::init_db_storage(
-                    io.clone(),
-                    sync_engine_io.clone(),
-                    &metadata,
-                    &main_db_path,
-                    sync_engine_opts.remote_encryption_key.as_deref(),
-                )?;
+                let (db_file, _server_revision) =
+                    database_sync_engine::DatabaseSyncEngine::init_db_storage(
+                        io.clone(),
+                        sync_engine_io.clone(),
+                        &metadata,
+                        &main_db_path,
+                        sync_engine_opts.remote_encryption_key.as_deref(),
+                    )?;
                 let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
                     turso_sdk_kit::rsapi::TursoDatabaseConfig {
                         db_file: Some(db_file),

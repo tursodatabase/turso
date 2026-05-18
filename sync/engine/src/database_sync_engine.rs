@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
 };
 
@@ -17,8 +17,8 @@ use crate::{
     database_sync_operations::{
         acquire_slot, apply_logical_transactions_file_without_commit_with_table_map,
         apply_transformation, bootstrap_db_file, connect_untracked, count_local_changes, has_table,
-        max_local_change_id, pull_updates_v1, push_logical_changes, read_last_change_id,
-        read_logical_replay_table_map, read_wal_salt, reset_wal_file,
+        is_logically_replayable_table, max_local_change_id, pull_updates_v1, push_logical_changes,
+        read_last_change_id, read_logical_replay_table_map, read_wal_salt, reset_wal_file,
         summarize_logical_transactions_file, update_last_change_id, wait_all_results,
         wal_apply_from_file, wal_pull_to_file, PullUpdatesV1Result, SyncEngineIoStats,
         SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
@@ -33,8 +33,8 @@ use crate::{
     types::{
         Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowTransformResult,
         DatabaseSavedConfiguration, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
-        DbChangesStatus, DbChangesStreamKind, PartialSyncOpts, SyncEngineIoResult, SyncEngineStats,
-        DATABASE_METADATA_VERSION,
+        DatabaseTapeRowChange, DbChangesStatus, DbChangesStreamKind, PartialSyncOpts,
+        SyncEngineIoResult, SyncEngineStats, DATABASE_METADATA_VERSION,
     },
     wal_session::WalSession,
     Result,
@@ -113,6 +113,7 @@ pub struct DatabaseSyncEngine<IO: SyncEngineIo> {
     opts: DatabaseSyncEngineOpts,
     meta: Mutex<DatabaseMetadata>,
     client_unique_id: String,
+    partial_lazy_server_revision: Option<Arc<RwLock<String>>>,
 }
 
 fn db_size_from_page(page: &[u8]) -> u32 {
@@ -193,9 +194,6 @@ struct ReplaceBaseApplyGuard<IO: SyncEngineIo> {
     complete: bool,
 }
 
-const REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER_ENV: &str =
-    "TURSO_SYNC_DEBUG_INJECT_REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER";
-
 #[cfg(test)]
 thread_local! {
     static REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER: std::cell::Cell<usize> =
@@ -203,18 +201,9 @@ thread_local! {
 }
 
 /// Reads the test/debug fault-injection point for replace-base local replay.
+#[cfg(test)]
 fn replace_base_local_replay_failure_after() -> usize {
-    #[cfg(test)]
-    {
-        let injected = REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER.with(|value| value.get());
-        if injected != usize::MAX {
-            return injected;
-        }
-    }
-    std::env::var(REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER_ENV)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(usize::MAX)
+    REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER.with(|value| value.get())
 }
 
 /// Injects a deterministic failure after a selected local replay operation.
@@ -226,10 +215,13 @@ fn maybe_inject_replace_base_local_replay_failure(
     replace_base_pages: bool,
     replay_index: usize,
 ) -> Result<()> {
-    if replace_base_pages && replay_index == replace_base_local_replay_failure_after() {
-        return Err(Error::DatabaseSyncEngineError(format!(
-            "injected replace-base local replay failure at change {replay_index}"
-        )));
+    #[cfg(test)]
+    {
+        if replace_base_pages && replay_index == replace_base_local_replay_failure_after() {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "injected replace-base local replay failure at change {replay_index}"
+            )));
+        }
     }
     let _ = (replace_base_pages, replay_index);
     Ok(())
@@ -463,7 +455,6 @@ fn resolve_local_replay_floor_change_id(
     };
 
     if use_pushed_change_hint
-        && remote_pull_gen == local_pull_gen
         && last_pushed_pull_gen_hint == local_pull_gen
         && last_pushed_change_id_hint > 0
         && last_change_id.unwrap_or(0) < last_pushed_change_id_hint
@@ -1067,8 +1058,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         meta: &DatabaseMetadata,
         main_db_path: &str,
         remote_encryption_key: Option<&str>,
-    ) -> Result<Arc<dyn DatabaseStorage>> {
+    ) -> Result<(Arc<dyn DatabaseStorage>, Option<Arc<RwLock<String>>>)> {
         let db_file = io.open_file(main_db_path, turso_core::OpenFlags::Create, false)?;
+        let mut partial_lazy_server_revision = None;
         let db_file: Arc<dyn DatabaseStorage> = if let Some(partial_sync_opts) =
             meta.partial_sync_opts()
         {
@@ -1085,11 +1077,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             };
             tracing::info!("create LazyDatabaseStorage database storage");
             let encoded_key = remote_encryption_key.map(|k| k.to_string());
+            let revision_handle = Arc::new(RwLock::new(revision.to_string()));
+            partial_lazy_server_revision = Some(revision_handle.clone());
             Arc::new(LazyDatabaseStorage::new(
                 db_file,
                 None, // todo(sivukhin): allocate dirty file for FS IO
                 sync_engine_io.clone(),
-                revision.to_string(),
+                revision_handle,
                 partial_sync_opts,
                 meta.saved_configuration
                     .as_ref()
@@ -1101,7 +1095,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             Arc::new(turso_core::storage::database::DatabaseFile::new(db_file))
         };
 
-        Ok(db_file)
+        Ok((db_file, partial_lazy_server_revision))
     }
 
     pub async fn open_db<Ctx>(
@@ -1185,6 +1179,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             opts,
             meta: Mutex::new(meta.clone()),
             client_unique_id: meta.client_unique_id.clone(),
+            partial_lazy_server_revision: None,
         };
 
         let synced_revision = meta.synced_revision.as_ref();
@@ -1230,7 +1225,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             meta,
         )
         .await?;
-        let main_db_storage = Self::init_db_storage(
+        let (main_db_storage, partial_lazy_server_revision) = Self::init_db_storage(
             io.clone(),
             sync_engine_io.clone(),
             &meta,
@@ -1260,7 +1255,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
         };
 
-        let db = Self::open_db(coro, io, sync_engine_io, main_db, opts).await?;
+        let mut db = Self::open_db(coro, io, sync_engine_io, main_db, opts).await?;
+        db.partial_lazy_server_revision = partial_lazy_server_revision;
         if fresh_bootstrap {
             let main_conn = connect_untracked(&db.main_tape)?;
             acknowledge_existing_cdc_for_client(
@@ -1864,9 +1860,18 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         coro: &Coro<Ctx>,
         remote_changes: DbChangesStatus,
     ) -> Result<()> {
+        let new_revision = remote_changes.revision.clone();
+        let update_partial_lazy_revision = || {
+            if let (Some(revision_handle), DatabasePullRevision::V1 { revision }) =
+                (&self.partial_lazy_server_revision, &new_revision)
+            {
+                *revision_handle.write().unwrap() = revision.clone();
+            }
+        };
         if remote_changes.is_empty() {
+            update_partial_lazy_revision();
             self.update_meta(coro, |m| {
-                m.synced_revision = Some(remote_changes.revision);
+                m.synced_revision = Some(new_revision.clone());
                 m.last_pull_unix_time = Some(remote_changes.time.secs);
             })
             .await?;
@@ -1892,13 +1897,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         self.update_meta(coro, |m| {
             m.revert_since_wal_watermark = revert_since_wal_watermark;
-            m.synced_revision = Some(remote_changes.revision);
+            m.synced_revision = Some(new_revision.clone());
             m.last_pushed_pull_gen_hint = 0;
             m.last_pushed_change_id_hint = 0;
             m.last_pull_unix_time = Some(remote_changes.time.secs);
             m.logical_table_names_by_stable_id = logical_table_names_by_stable_id;
         })
         .await?;
+        update_partial_lazy_revision();
         Ok(())
     }
 
@@ -1945,6 +1951,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.main_db_path,
             pre_apply_local_change_id
         );
+        // The original raw-WAL page replay path normalizes the schema cookie
+        // after installing remote pages. Preserve that for legacy/V1 page sync
+        // that does not switch to the SQL replay connection.
+        let main_conn_schema_version = main_conn.read_schema_version()?;
 
         // read current pull generation from local table for the given client
         let (local_pull_gen, local_last_change_id) =
@@ -1964,6 +1974,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 meta.last_pushed_change_id_hint,
             )
         };
+        let precollect_local_changes_before_remote_apply = replace_base_pages
+            || matches!(stream_kind, DbChangesStreamKind::Logical)
+            || should_replay_raw_pages_on_sql_conn(
+                self.opts.protocol_version_hint,
+                false,
+                stream_kind,
+            );
         let replace_base_precollection_floor = if replace_base_pages {
             // Replace-base snapshots are installed before local CDC replay, so
             // collect local changes from the old view. Use the same push-hint
@@ -1981,40 +1998,50 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         } else {
             None
         };
-        // Pull apply rolls back local WAL frames before installing remote
-        // changes. Collect pending local CDC from the old local view now; after
-        // raw page apply or logical replay, a fresh CDC iterator may no longer
-        // see those rows.
-        let iterate_opts = DatabaseChangesIteratorOpts {
-            first_change_id: if replace_base_pages {
-                replace_base_precollection_floor.map(|change_id| change_id + 1)
-            } else {
-                None
-            },
-            last_change_id: pre_apply_local_change_id,
-            mode: DatabaseChangesIteratorMode::Apply,
-            ignore_schema_changes: false,
-            ..Default::default()
-        };
         let mut precollected_local_changes = Vec::with_capacity(64);
-        let mut iterator = self.main_tape.iterate_changes(iterate_opts)?;
-        while let Some(operation) = iterator.next(coro).await? {
-            match operation {
-                DatabaseTapeOperation::RowChange(change) => precollected_local_changes.push(change),
-                DatabaseTapeOperation::Commit => continue,
-                DatabaseTapeOperation::StmtReplay(_) => {
-                    panic!("changes iterator must not use StmtReplay option")
-                }
-                DatabaseTapeOperation::SchemaReplay(_) => {
-                    panic!("changes iterator must not use SchemaReplay option")
+        if precollect_local_changes_before_remote_apply {
+            // Pull apply rolls back local WAL frames before installing remote
+            // changes. Replace-base and MVCC logical/SQL replay need the old
+            // local view because a fresh iterator may no longer see those rows
+            // after the remote snapshot/log is installed. The original raw WAL
+            // page replay path keeps the old post-apply collection point.
+            let iterate_opts = DatabaseChangesIteratorOpts {
+                first_change_id: if replace_base_pages {
+                    replace_base_precollection_floor.map(|change_id| change_id + 1)
+                } else {
+                    None
+                },
+                last_change_id: pre_apply_local_change_id,
+                mode: DatabaseChangesIteratorMode::Apply,
+                ignore_schema_changes: false,
+                ..Default::default()
+            };
+            let mut iterator = self.main_tape.iterate_changes(iterate_opts)?;
+            while let Some(operation) = iterator.next(coro).await? {
+                match operation {
+                    DatabaseTapeOperation::RowChange(change) => {
+                        precollected_local_changes.push(change)
+                    }
+                    DatabaseTapeOperation::Commit => continue,
+                    DatabaseTapeOperation::StmtReplay(_) => {
+                        panic!("changes iterator must not use StmtReplay option")
+                    }
+                    DatabaseTapeOperation::SchemaReplay(_) => {
+                        panic!("changes iterator must not use SchemaReplay option")
+                    }
                 }
             }
+            tracing::info!(
+                "apply_changes(path={}): precollected {} local changes for replay",
+                self.main_db_path,
+                precollected_local_changes.len(),
+            );
+        } else {
+            tracing::info!(
+                "apply_changes(path={}): using post-apply local change collection",
+                self.main_db_path,
+            );
         }
-        tracing::info!(
-            "apply_changes(path={}): precollected {} local changes for replay",
-            self.main_db_path,
-            precollected_local_changes.len(),
-        );
         let previous_synced_revision = self.meta().synced_revision.clone();
         let mut logical_table_names_by_stable_id =
             self.meta().logical_table_names_by_stable_id.clone();
@@ -2328,6 +2355,20 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 .as_mut()
                 .expect("main WAL session must be active")
                 .commit(applied_raw_db_size)?;
+            if stream_kind_applies_remote_pages(stream_kind)
+                && !replace_base_pages
+                && raw_page_replay_on_sql_conn
+            {
+                let current_schema_version = main_conn.read_schema_version()?;
+                let final_schema_version =
+                    current_schema_version.max(main_conn_schema_version) + 1;
+                main_conn.write_schema_version(final_schema_version)?;
+                tracing::info!(
+                    "apply_changes(path={}): updated schema version to {}",
+                    self.main_db_path,
+                    final_schema_version
+                );
+            }
         }
         debug_integrity_check(
             coro,
@@ -2394,12 +2435,36 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             last_pushed_change_id_hint,
             last_change_id,
         );
-        // Phase 5: filter the local changes precollected before remote apply.
+        // Phase 5: collect/filter local changes for replay.
         let replay_floor = last_change_id.unwrap_or(0);
-        let local_changes = precollected_local_changes
-            .into_iter()
-            .filter(|change| change.change_id > replay_floor)
-            .collect::<Vec<_>>();
+        let local_changes = if precollect_local_changes_before_remote_apply {
+            precollected_local_changes
+                .into_iter()
+                .filter(|change| change.change_id > replay_floor)
+                .collect::<Vec<_>>()
+        } else {
+            let iterate_opts = DatabaseChangesIteratorOpts {
+                first_change_id: Some(replay_floor + 1),
+                mode: DatabaseChangesIteratorMode::Apply,
+                ignore_schema_changes: false,
+                ..Default::default()
+            };
+            let mut local_changes = Vec::new();
+            let mut iterator = self.main_tape.iterate_changes(iterate_opts)?;
+            while let Some(operation) = iterator.next(coro).await? {
+                match operation {
+                    DatabaseTapeOperation::RowChange(change) => local_changes.push(change),
+                    DatabaseTapeOperation::Commit => continue,
+                    DatabaseTapeOperation::StmtReplay(_) => {
+                        panic!("changes iterator must not use StmtReplay option")
+                    }
+                    DatabaseTapeOperation::SchemaReplay(_) => {
+                        panic!("changes iterator must not use SchemaReplay option")
+                    }
+                }
+            }
+            local_changes
+        };
         let replayed_local_changes = !local_changes.is_empty();
         tracing::info!(
             "apply_changes(path={}): collected {} changes",
@@ -2449,7 +2514,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                             "failed to reinitialize CDC pragma before local replay: {error}",
                         ))
                     })?;
-                phase_conn.publish_schema_if_newer();
+                if replace_base_pages || raw_page_replay_on_sql_conn {
+                    phase_conn.publish_schema_if_newer();
+                }
             }
 
             let mut replay = DatabaseReplaySession {
@@ -2461,11 +2528,28 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 generator: DatabaseReplayGenerator {
                     conn: phase_conn.clone(),
                     opts: DatabaseReplaySessionOpts {
-                        use_implicit_rowid: false,
+                        use_implicit_rowid: raw_page_replay_on_sql_conn,
                     },
                 },
             };
 
+            let should_transform_local_change = |change: &DatabaseTapeRowChange| {
+                is_logically_replayable_table(&change.table_name)
+                    && !self
+                        .opts
+                        .tables_ignore
+                        .iter()
+                        .any(|table| table == &change.table_name)
+            };
+            let transform_changes = if self.opts.use_transform {
+                local_changes
+                    .iter()
+                    .filter(|change| should_transform_local_change(change))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             let mut transformed = if self.opts.use_transform {
                 let ctx = &SyncOperationCtx::new(
                     coro,
@@ -2473,23 +2557,33 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     self.meta().remote_url(),
                     self.opts.remote_encryption_key.as_deref(),
                 );
-                Some(apply_transformation(ctx, &local_changes, &replay.generator).await?)
+                Some(apply_transformation(ctx, &transform_changes, &replay.generator).await?)
             } else {
                 None
             };
+            let mut transform_index = 0usize;
 
             assert!(!replay.conn().get_auto_commit());
             // Replay local changes collected on Phase 5
             for (i, change) in local_changes.into_iter().enumerate() {
-                let operation = if let Some(transformed) = &mut transformed {
-                    match std::mem::replace(&mut transformed[i], DatabaseRowTransformResult::Skip) {
-                        DatabaseRowTransformResult::Keep => {
-                            DatabaseTapeOperation::RowChange(change)
+                let operation = if should_transform_local_change(&change) {
+                    if let Some(transformed) = &mut transformed {
+                        let transform_result = std::mem::replace(
+                            &mut transformed[transform_index],
+                            DatabaseRowTransformResult::Skip,
+                        );
+                        transform_index += 1;
+                        match transform_result {
+                            DatabaseRowTransformResult::Keep => {
+                                DatabaseTapeOperation::RowChange(change)
+                            }
+                            DatabaseRowTransformResult::Skip => continue,
+                            DatabaseRowTransformResult::Rewrite(replay) => {
+                                DatabaseTapeOperation::StmtReplay(replay)
+                            }
                         }
-                        DatabaseRowTransformResult::Skip => continue,
-                        DatabaseRowTransformResult::Rewrite(replay) => {
-                            DatabaseTapeOperation::StmtReplay(replay)
-                        }
+                    } else {
+                        DatabaseTapeOperation::RowChange(change)
                     }
                 } else {
                     DatabaseTapeOperation::RowChange(change)
@@ -2594,8 +2688,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 "failed to finalize raw WAL session after remote apply: {error}",
                 ))
         })?;
-        main_conn.publish_schema_if_newer();
-        if had_cdc_table || replace_base_pages {
+        if raw_page_replay_on_sql_conn {
+            main_conn.publish_schema_if_newer();
+        }
+        if (had_cdc_table || replace_base_pages) && (replace_base_pages || raw_page_replay_on_sql_conn)
+        {
             publish_schema_after_raw_wal_replay(&main_conn, "raw WAL replay")?;
             tracing::info!(
                 "apply_changes(path={}): reinitialize CDC pragma after WAL replay commit",
@@ -3071,9 +3168,9 @@ mod tests {
     }
 
     #[test]
-    fn logical_replay_ignores_last_pushed_hint_when_remote_pull_generation_rolls_back() {
+    fn logical_replay_uses_last_pushed_hint_when_remote_pull_generation_rolls_back() {
         let floor = resolve_local_replay_floor_change_id(true, 7, 6, Some(12), 7, 34);
-        assert_eq!(floor, Some(0));
+        assert_eq!(floor, Some(34));
     }
 
     #[test]
@@ -3097,7 +3194,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_page_stream_keeps_original_wal_session_replay_path() {
+    fn v1_page_stream_uses_sql_connection_raw_page_replay_path() {
         assert!(!should_replay_raw_pages_on_sql_conn(
             DatabaseSyncEngineProtocolVersion::Legacy,
             false,

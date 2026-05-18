@@ -35,6 +35,8 @@ pub mod clock;
 pub mod cursor;
 pub mod database;
 pub mod persistent_storage;
+#[cfg(feature = "conn_raw_api")]
+pub(crate) mod portable_logical;
 #[cfg(any(test, injected_yields))]
 pub(crate) mod yield_hooks;
 pub mod yield_points;

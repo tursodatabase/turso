@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{atomic::AtomicU64, Arc, Mutex},
+    sync::{atomic::AtomicU64, Arc, Mutex, RwLock},
 };
 
 use turso_core::{
@@ -50,6 +50,8 @@ enum PageLoadAction {
     /// Caller must wait for the load operation result
     Wait,
 }
+
+type PageRevisions = Arc<Mutex<HashMap<usize, Option<String>>>>;
 
 impl PageStates {
     pub fn new() -> Self {
@@ -224,7 +226,8 @@ pub struct LazyDatabaseStorage<IO: SyncEngineIo> {
     clean_file: Arc<dyn File>,
     dirty_file: Option<Arc<dyn File>>,
     sync_engine_io: SyncEngineIoStats<IO>,
-    server_revision: String,
+    server_revision: Arc<RwLock<String>>,
+    page_revisions: PageRevisions,
     page_states: Arc<Mutex<PageStates>>,
     opts: PartialSyncOpts,
     // optional remote_url from saved configuration section of metadata file
@@ -238,23 +241,34 @@ impl<IO: SyncEngineIo> LazyDatabaseStorage<IO> {
         clean_file: Arc<dyn File>,
         dirty_file: Option<Arc<dyn File>>,
         sync_engine_io: SyncEngineIoStats<IO>,
-        server_revision: String,
+        server_revision: Arc<RwLock<String>>,
         opts: PartialSyncOpts,
         remote_url: Option<String>,
         remote_encryption_key: Option<String>,
     ) -> Result<Self, errors::Error> {
-        let clean_file_size = Arc::new(clean_file.size()?.into());
+        let clean_file_size = Arc::new(AtomicU64::new(clean_file.size()?));
+        let mut page_revisions = HashMap::new();
+        let initial_pages =
+            clean_file_size.load(std::sync::atomic::Ordering::SeqCst) as usize / PAGE_SIZE;
+        for page in 0..initial_pages {
+            page_revisions.insert(page, Some(server_revision.read().unwrap().clone()));
+        }
         Ok(Self {
             clean_file_size,
             clean_file,
             dirty_file,
             sync_engine_io,
             server_revision,
+            page_revisions: Arc::new(Mutex::new(page_revisions)),
             opts,
             page_states: Arc::new(Mutex::new(PageStates::new())),
             remote_url,
             remote_encryption_key,
         })
+    }
+
+    pub fn revision_handle(&self) -> Arc<RwLock<String>> {
+        self.server_revision.clone()
     }
 }
 
@@ -264,6 +278,7 @@ async fn lazy_load_pages<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     clean_file: Arc<dyn File>,
     dirty_file: Option<Arc<dyn File>>,
+    page_revisions: PageRevisions,
     page_states_guard: &mut PageStatesGuard,
     server_revision: &str,
     completion_page: Option<u32>,
@@ -324,6 +339,10 @@ async fn lazy_load_pages<IO: SyncEngineIo, Ctx>(
         if let Some(dirty_file) = &dirty_file {
             dirty_file.punch_hole(page_offset as usize, page.len())?;
         }
+        page_revisions
+            .lock()
+            .unwrap()
+            .insert(page_id as usize, Some(server_revision.to_string()));
         page_states_guard.load_end(page_id as usize, Ok(page));
     }
 
@@ -342,6 +361,7 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     clean_file: Arc<dyn File>,
     dirty_file: Option<Arc<dyn File>>,
+    page_revisions: PageRevisions,
     guard: &mut PageStatesGuard,
     server_revision: &str,
     page: usize,
@@ -390,6 +410,7 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
             ctx,
             clean_file.clone(),
             dirty_file.clone(),
+            page_revisions.clone(),
             guard,
             server_revision,
             Some(page as u32),
@@ -447,7 +468,16 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
                     }
                 }
             }
-            lazy_load_pages(ctx, clean_file, dirty_file, guard, server_revision, None).await?;
+            lazy_load_pages(
+                ctx,
+                clean_file,
+                dirty_file,
+                page_revisions,
+                guard,
+                server_revision,
+                None,
+            )
+            .await?;
         }
     }
 
@@ -506,39 +536,59 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             .clean_file
             .has_hole(page_offset as usize, read_buf_len)?;
 
-        tracing::debug!("read_page(page={}): is_hole={}", page, is_hole);
+        let server_revision = self.server_revision.read().unwrap().clone();
+        let stale_remote_page = !is_hole
+            && self
+                .page_revisions
+                .lock()
+                .unwrap()
+                .get(&page)
+                .and_then(|revision| revision.as_ref())
+                .is_some_and(|revision| revision != &server_revision);
+
+        tracing::debug!(
+            "read_page(page={}): is_hole={}, stale_remote_page={}",
+            page,
+            is_hole,
+            stale_remote_page
+        );
         if !is_hole {
-            let Some(dirty_file) = &self.dirty_file else {
-                // no dirty file was set - this means that FS is atomic (e.g. MemoryIO)
-                return self.clean_file.pread(page_offset, c);
-            };
-            if dirty_file.has_hole(page_offset as usize, size)? {
-                // dirty file has no hole - this means that we cleanly removed the hole when we wrote to the clean file
-                return self.clean_file.pread(page_offset, c);
-            }
-            let check_buffer = Arc::new(Buffer::new_temporary(size));
-            let check_c = dirty_file.pread(
-                page_offset,
-                Completion::new_read(check_buffer.clone(), |_| None),
-            )?;
-            assert!(
-                check_c.finished(),
-                "LazyDatabaseStorage works only with sync IO"
-            );
+            if stale_remote_page {
+                self.clean_file
+                    .punch_hole(page_offset as usize, read_buf_len)?;
+            } else {
+                let Some(dirty_file) = &self.dirty_file else {
+                    // no dirty file was set - this means that FS is atomic (e.g. MemoryIO)
+                    return self.clean_file.pread(page_offset, c);
+                };
+                if dirty_file.has_hole(page_offset as usize, size)? {
+                    // dirty file has no hole - this means that we cleanly removed the hole when we wrote to the clean file
+                    return self.clean_file.pread(page_offset, c);
+                }
+                let check_buffer = Arc::new(Buffer::new_temporary(size));
+                let check_c = dirty_file.pread(
+                    page_offset,
+                    Completion::new_read(check_buffer.clone(), |_| None),
+                )?;
+                assert!(
+                    check_c.finished(),
+                    "LazyDatabaseStorage works only with sync IO"
+                );
 
-            let clean_buffer = r.buf_arc();
-            let clean_c = self.clean_file.pread(
-                page_offset,
-                Completion::new_read(clean_buffer.clone(), |_| None),
-            )?;
-            assert!(
-                clean_c.finished(),
-                "LazyDatabaseStorage works only with sync IO"
-            );
+                let clean_buffer = r.buf_arc();
+                let clean_c = self.clean_file.pread(
+                    page_offset,
+                    Completion::new_read(clean_buffer.clone(), |_| None),
+                )?;
+                assert!(
+                    clean_c.finished(),
+                    "LazyDatabaseStorage works only with sync IO"
+                );
 
-            if check_buffer.as_slice().eq(clean_buffer.as_slice()) {
-                // dirty buffer matches clean buffer - this means that clean data is valid
-                return self.clean_file.pread(page_offset, c);
+                if check_buffer.as_slice().eq(clean_buffer.as_slice()) {
+                    // dirty buffer matches clean buffer - this means that clean data is valid
+                    return self.clean_file.pread(page_offset, c);
+                }
             }
         }
 
@@ -551,9 +601,9 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             let remote_url = self.remote_url.clone();
             let remote_encryption_key = self.remote_encryption_key.clone();
             let sync_engine_io = self.sync_engine_io.clone();
-            let server_revision = self.server_revision.clone();
             let clean_file = self.clean_file.clone();
             let dirty_file = self.dirty_file.clone();
+            let page_revisions = self.page_revisions.clone();
             let page_states = self.page_states.clone();
             let segment_size = self.opts.segment_size();
             let prefetch = self.opts.prefetch;
@@ -571,6 +621,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
                     ctx,
                     clean_file,
                     dirty_file,
+                    page_revisions,
                     &mut guard,
                     &server_revision,
                     page_idx - 1,
@@ -625,6 +676,10 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
         if let Some(dirty_file) = &self.dirty_file {
             dirty_file.punch_hole(start_pos as usize, buffer_size)?;
         }
+        self.page_revisions
+            .lock()
+            .unwrap()
+            .insert(page_idx - 1, None);
         let end_pos = start_pos + buffer_size as u64;
         let clean_file_size = self.clean_file_size.clone();
         let nc = Completion::new_write(move |result| match result {
@@ -663,6 +718,12 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
         // we write to the database only during checkpoint - so we need to punch hole in the dirty file in order to mark this region as valid
         if let Some(dirty_file) = &self.dirty_file {
             dirty_file.punch_hole(start_pos as usize, buffers_size)?;
+        }
+        {
+            let mut page_revisions = self.page_revisions.lock().unwrap();
+            for page in first_page_idx - 1..first_page_idx - 1 + buffers.len() {
+                page_revisions.insert(page, None);
+            }
         }
         let clean_file_size = self.clean_file_size.clone();
         let nc = Completion::new_write(move |result| match result {

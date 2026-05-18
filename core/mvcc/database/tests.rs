@@ -11,6 +11,10 @@ use crate::mvcc::persistent_storage::logical_log::StreamingLogicalLogReader;
 use crate::mvcc::persistent_storage::logical_log::{
     ENCRYPTED_PAYLOAD_CHUNK_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,
 };
+#[cfg(feature = "conn_raw_api")]
+use crate::mvcc::portable_logical::{
+    encode_schema_logical_op, PortableSchemaRow, LOGICAL_SCHEMA_CREATE, LOGICAL_SCHEMA_REFRESH,
+};
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
 use crate::state_machine::{StateTransition, TransitionResult};
@@ -11412,7 +11416,7 @@ fn test_mvcc_portable_changes_encoder_matches_logical_op_wire_golden() {
     assert_eq!(
         encoded,
         vec![
-            0x1a, 0x24, // LogicalTxnData.ops, length 36
+            0x1a, 0x24, // PortableLogicalTxn.ops, length 36
             0x08, 0x02, // LogicalOp.op_type = Schema
             0x2a, 0x19, // LogicalOp.sql, length 25
             b'C', b'R', b'E', b'A', b'T', b'E', b' ', b'V', b'I', b'E', b'W', b' ', b'v', b' ',
@@ -11752,6 +11756,75 @@ fn test_mvcc_log_meta_sets_portable_origin() {
     let origins = decode_portable_change_origins(&portable_changes);
 
     assert!(origins.iter().any(|origin| origin == "turso-sync-client-a"));
+    assert_eq!(
+        origins
+            .iter()
+            .filter(|origin| origin.as_str() == "turso-sync-client-a")
+            .count(),
+        1
+    );
+}
+
+#[test]
+#[cfg(feature = "conn_raw_api")]
+fn test_mvcc_log_meta_is_consumed_after_commit() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("PRAGMA mvcc_log_meta('client', 'turso-sync-client-a')")
+        .unwrap();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (1, 'alpha')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let origins = decode_portable_change_origins(&portable_changes);
+
+    assert_eq!(origins, vec!["turso-sync-client-a".to_string()]);
+}
+
+#[test]
+#[cfg(feature = "conn_raw_api")]
+fn test_mvcc_log_meta_is_cleared_on_rollback() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("PRAGMA mvcc_log_meta('client', 'turso-sync-client-a')")
+        .unwrap();
+    db.conn.execute("BEGIN").unwrap();
+    db.conn
+        .execute("CREATE TABLE rolled_back(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn.execute("ROLLBACK").unwrap();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let origins = decode_portable_change_origins(&portable_changes);
+
+    assert!(origins.is_empty());
+}
+
+#[test]
+#[cfg(feature = "conn_raw_api")]
+fn test_mvcc_log_meta_null_clears_portable_origin() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("PRAGMA mvcc_log_meta('client', 'turso-sync-client-a')")
+        .unwrap();
+    db.conn
+        .execute("PRAGMA mvcc_log_meta('client', NULL)")
+        .unwrap();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let origins = decode_portable_change_origins(&portable_changes);
+
+    assert!(origins.is_empty());
 }
 
 #[test]

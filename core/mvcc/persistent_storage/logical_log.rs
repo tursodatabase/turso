@@ -1028,24 +1028,24 @@ fn encode_portable_change_payload(end_offset: u64, commit_ts: u64, encoded_ops: 
         2 + proto_varint_len(end_offset) + proto_varint_len(commit_ts) + encoded_ops.len();
     let mut out = Vec::with_capacity(proto_varint_len(body_len as u64) + body_len);
     write_proto_varint(body_len as u64, &mut out);
-    // LogicalTxnData.end_offset, field 1, varint.
+    // PortableLogicalTxn.end_offset, field 1, varint.
     write_proto_varint(1 << 3, &mut out);
     write_proto_varint(end_offset, &mut out);
-    // LogicalTxnData.commit_ts, field 2, varint.
+    // PortableLogicalTxn.commit_ts, field 2, varint.
     write_proto_varint(2 << 3, &mut out);
     write_proto_varint(commit_ts, &mut out);
-    // LogicalTxnData.ops, field 3, length-delimited messages already encoded by the commit builder.
+    // PortableLogicalTxn.ops, field 3, length-delimited messages already encoded by the commit builder.
     out.extend_from_slice(encoded_ops);
     out
 }
 
 /// Wraps commit-built logical op messages in one length-delimited
-/// `LogicalTxnData` protobuf payload and iterates until the embedded
+/// portable MVCC logical transaction payload and iterates until the embedded
 /// `end_offset` matches the final frame size.
 ///
-/// `end_offset` is part of the sync cursor, but its varint width can change the
-/// payload length. The fixed-point loop converges after the varint width stops
-/// changing.
+/// `end_offset` is part of the raw-log replay cursor, but its varint width can
+/// change the payload length. The fixed-point loop converges after the varint
+/// width stops changing.
 fn encode_portable_change_payload_with_stable_end_offset(
     write_offset: u64,
     bytes_before_portable_changes: usize,
@@ -1056,7 +1056,7 @@ fn encode_portable_change_payload_with_stable_end_offset(
         .checked_add(bytes_before_portable_changes as u64)
         .and_then(|value| value.checked_add(TX_TRAILER_SIZE as u64))
         .ok_or_else(|| {
-            LimboError::InternalError("logical sync frame offset overflow".to_string())
+            LimboError::InternalError("portable logical frame offset overflow".to_string())
         })?;
     loop {
         let payload = encode_portable_change_payload(end_offset, tx_timestamp, portable_changes);
@@ -1065,7 +1065,7 @@ fn encode_portable_change_payload_with_stable_end_offset(
             .and_then(|value| value.checked_add(payload.len() as u64))
             .and_then(|value| value.checked_add(TX_TRAILER_SIZE as u64))
             .ok_or_else(|| {
-                LimboError::InternalError("logical sync frame offset overflow".to_string())
+                LimboError::InternalError("portable logical frame offset overflow".to_string())
             })?;
         if next_end_offset == end_offset {
             return Ok(payload);

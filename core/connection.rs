@@ -1795,6 +1795,7 @@ impl Connection {
                 self.set_tx_state(TransactionState::None);
             }
         }
+        self.clear_mvcc_log_meta();
 
         let is_memory_db = is_memory_like(&self.db.path);
         let should_checkpoint_on_close = pager
@@ -1845,9 +1846,8 @@ impl Connection {
     pub fn portable_logical_changes_enabled(&self) -> bool {
         #[cfg(feature = "conn_raw_api")]
         {
-            return self
-                .portable_logical_changes_enabled
-                .load(Ordering::Acquire);
+            self.portable_logical_changes_enabled
+                .load(Ordering::Acquire)
         }
         #[cfg(not(feature = "conn_raw_api"))]
         {
@@ -1873,6 +1873,18 @@ impl Connection {
         #[cfg(not(feature = "conn_raw_api"))]
         {
             let _ = (key, value);
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub(crate) fn take_mvcc_log_meta(&self) -> HashMap<String, String> {
+        std::mem::take(&mut *self.mvcc_log_metadata.write())
+    }
+
+    pub(crate) fn clear_mvcc_log_meta(&self) {
+        #[cfg(feature = "conn_raw_api")]
+        {
+            self.mvcc_log_metadata.write().clear();
         }
     }
 

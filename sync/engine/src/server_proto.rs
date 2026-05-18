@@ -155,9 +155,9 @@ pub struct LogicalOp {
     pub schema_name: String,
     /// Stable table/object identifier carried by portable MVCC logical changes.
     ///
-    /// This is optional for the current replay path, which still resolves row
-    /// changes by table name. New raw-log clients can use it to maintain a
-    /// compact identity map without depending on negative MVCC table ids.
+    /// Row operations may omit `table_name` when this is set. The sync engine
+    /// maintains the stable-id-to-name map from schema operations, and still
+    /// accepts named row operations for compatibility with older logical paths.
     #[prost(uint64, tag = "11")]
     pub stable_table_id: u64,
 }

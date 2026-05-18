@@ -26,33 +26,4 @@ mod tests {
             .with_ansi(false)
             .init();
     }
-
-    #[allow(dead_code)]
-    pub fn seed_u64() -> u64 {
-        seed().parse().unwrap_or(0)
-    }
-
-    #[allow(dead_code)]
-    pub fn seed() -> String {
-        std::env::var("SEED").unwrap_or("0".to_string())
-    }
-
-    #[allow(dead_code)]
-    pub fn deterministic_runtime_from_seed<F: std::future::Future<Output = ()>>(
-        seed: &[u8],
-        f: impl Fn() -> F,
-    ) {
-        let mut builder = tokio::runtime::Builder::new_current_thread();
-        builder.enable_time();
-        builder.start_paused(true);
-        let _ = seed;
-        let runtime = builder.build().unwrap();
-        runtime.block_on(f());
-    }
-
-    #[allow(dead_code)]
-    pub fn deterministic_runtime<F: std::future::Future<Output = ()>>(f: impl Fn() -> F) {
-        let seed = seed();
-        deterministic_runtime_from_seed(seed.as_bytes(), f);
-    }
 }

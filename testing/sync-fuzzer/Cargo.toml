@@ -1,0 +1,21 @@
+[package]
+name = "turso-sync-engine-examples"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+prost = "0.14.1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+turso = { path = "../../bindings/rust", features = ["sync"] }
+turso_sync_engine = { path = "../../sync/engine" }
+
+[[bin]]
+name = "sync"
+path = "src/bin/sync.rs"

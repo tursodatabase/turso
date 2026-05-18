@@ -12739,6 +12739,8 @@ pub fn op_rename_table(
             .tables
             .remove(&normalized_from)
             .expect("table being renamed should be in schema");
+        #[cfg(feature = "conn_raw_api")]
+        schema.unregister_table_root_page(table.as_ref());
         match Arc::make_mut(&mut table) {
             Table::BTree(btree) => {
                 let btree = Arc::make_mut(btree);
@@ -12767,6 +12769,8 @@ pub fn op_rename_table(
             _ => panic!("only btree and virtual tables can be renamed"),
         }
 
+        #[cfg(feature = "conn_raw_api")]
+        schema.register_table_root_page(&normalized_to, table.as_ref());
         schema.tables.insert(normalized_to.to_owned(), table);
 
         for (tname, t_arc) in schema.tables.iter_mut() {

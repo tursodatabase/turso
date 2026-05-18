@@ -356,7 +356,9 @@ fn update_mvcc_log_meta(
         bail_parse_error!("mvcc_log_meta key must not be empty");
     }
     let value = values.next().unwrap();
-    let value = if matches!(value.as_ref(), Expr::Literal(Literal::Null)) {
+    let value = if matches!(value.as_ref(), Expr::Literal(Literal::Null))
+        || matches!(value.as_ref(), Expr::Literal(Literal::Keyword(keyword)) if keyword.eq_ignore_ascii_case("NULL"))
+    {
         None
     } else {
         Some(parse_string(&value)?)
