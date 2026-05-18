@@ -104,6 +104,7 @@ turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.7.0-pre.1" }
 limbo_completion = { path = "extensions/completion", version = "0.7.0-pre.1" }
 turso_core = { path = "core", version = "0.7.0-pre.1" }
 turso_sync_engine = { path = "sync/engine", version = "0.7.0-pre.1" }
+turso_sync_server = { package = "turso-sync-server", path = "sync/server", version = "0.7.0-pre.1" }
 turso_ext = { path = "extensions/core", version = "0.7.0-pre.1" }
 turso_macros = { path = "macros", version = "0.7.0-pre.1" }
 turso_parser = { path = "parser", version = "0.7.0-pre.1" }

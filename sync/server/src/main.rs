@@ -1,10 +1,9 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 mod bootstrap;
-mod database;
-mod sync_server;
 
-use crate::{bootstrap::ServerApp, sync_server::TursoSyncServer};
+use crate::bootstrap::ServerApp;
+use turso_sync_server::TursoSyncServer;
 
 #[cfg(all(feature = "mimalloc", not(target_family = "wasm"), not(miri)))]
 #[global_allocator]

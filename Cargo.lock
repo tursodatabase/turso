@@ -6594,8 +6594,8 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "turso-sync-server",
  "turso_core",
- "turso_sync_engine",
  "validator",
 ]
 

@@ -12,7 +12,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{DatabaseOpts, OpenFlags};
 
-use crate::database::{open_connection, DatabaseOpenOptions, DatabaseProvider};
+use turso_sync_server::database::{open_connection, DatabaseOpenOptions, DatabaseProvider};
 
 pub struct ServerApp {
     pub opts: ServerOpts,
