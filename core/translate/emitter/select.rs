@@ -1,4 +1,5 @@
 use crate::{
+    alloc::{TursoFromIterator, TursoIteratorExt},
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
@@ -594,7 +595,7 @@ fn prune_join_order_for_materialized_inputs(
             continue;
         }
         if matches!(input.mode, MaterializedBuildInputMode::KeyPayload { .. }) {
-            tables_to_remove.extend(input.prefix_tables.iter());
+            tables_to_remove.try_extend(input.prefix_tables.iter())?;
         }
     }
 
@@ -677,7 +678,10 @@ fn materialization_prefix(
         });
     }
 
-    let mut included_tables: TableMask = prefix_join_order.iter().map(|m| m.original_idx).collect();
+    let mut included_tables: TableMask = prefix_join_order
+        .iter()
+        .map(|m| m.original_idx)
+        .try_collect()?;
     for member in prefix_join_order.iter() {
         let table_ref = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table_ref.op {
@@ -785,7 +789,7 @@ fn build_materialized_build_input_plan(
     // Bitmask of tables that are actually in the prefix join order for
     // this materialization subplan. Anything that depends on other tables
     // cannot be evaluated during those table scans.
-    let join_prefix_mask: TableMask = join_order.iter().map(|m| m.original_idx).collect();
+    let join_prefix_mask: TableMask = join_order.iter().map(|m| m.original_idx).try_collect()?;
 
     // Clone WHERE terms for the materialization subplan. We cannot reuse the
     // parent plan's consumed flags because the optimizer may have consumed
