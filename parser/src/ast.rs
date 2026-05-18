@@ -1845,6 +1845,8 @@ pub enum PragmaName {
     ListTypes,
     /// Deprecated no-op: control whether callback is invoked for empty result sets
     EmptyResultCallbacks,
+    /// VDBE opcode trace output
+    VdbeTrace,
 }
 
 /// `CREATE TRIGGER` time

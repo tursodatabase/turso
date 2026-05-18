@@ -1711,6 +1711,7 @@ impl Database {
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
+            vdbe_trace: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
             dqs_dml: AtomicBool::new(true),
             mv_tx: RwLock::new(None),

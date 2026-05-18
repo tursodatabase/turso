@@ -230,7 +230,7 @@ impl CommitState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Register {
     Value(Value),
     Aggregate(AggContext),
@@ -624,6 +624,8 @@ pub struct ProgramState {
     pub(crate) cursors: Vec<Option<Cursor>>,
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
+    /// Trace state: register snapshot for diffing.
+    pre_op_registers: Option<Box<[Register]>>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seeks: Vec<Option<DeferredSeekState>>,
@@ -721,6 +723,7 @@ impl ProgramState {
             cursors,
             cursor_seqs,
             registers,
+            pre_op_registers: None,
             result_row: None,
             last_compare: None,
             deferred_seeks: vec![None; max_cursors],
@@ -1585,6 +1588,46 @@ impl Program {
             if enable_tracing {
                 trace_insn(self, state.pc as InsnReference, insn);
                 crate::stack::trace_remaining("program_step:opcode");
+            }
+            if self.connection.get_vdbe_trace() {
+                // Diff registers from PREVIOUS opcode
+                // The last opcode (Halt) won't have its diff printed, but Halt
+                // doesn't write to any registers
+                if let Some(ref old) = state.pre_op_registers {
+                    for (i, (old_reg, new_reg)) in
+                        old.iter().zip(state.registers.iter()).enumerate()
+                    {
+                        if old_reg != new_reg {
+                            match new_reg {
+                                Register::Value(v) => eprintln!("R[{i}] = {v}"),
+                                Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
+                                Register::Record(_) => eprintln!("R[{i}] = <record>"),
+                            }
+                        }
+                    }
+                    state.pre_op_registers = None;
+                }
+
+                // Print CURRENT opcode
+                if matches!(insn, Insn::Init { .. }) {
+                    eprintln!("VDBE Trace:");
+                }
+                eprintln!(
+                    "{}",
+                    explain::insn_to_str(
+                        self,
+                        state.pc as InsnReference,
+                        insn,
+                        String::new(),
+                        self.comments
+                            .iter()
+                            .find(|(offset, _)| *offset == state.pc as InsnReference)
+                            .map(|(_, comment)| comment)
+                            .copied()
+                    )
+                );
+                // Snapshot for next iteration
+                state.pre_op_registers = Some(state.registers.clone());
             }
             // Always increment VM steps for every loop iteration
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);

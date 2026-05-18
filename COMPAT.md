@@ -207,7 +207,7 @@ ongoing work to pass the full SQLite TCL test suite.
 | PRAGMA vdbe_addoptrace           | ❌ No         |                                              |
 | PRAGMA vdbe_debug                | ❌ No         |                                              |
 | PRAGMA vdbe_listing              | ❌ No         |                                              |
-| PRAGMA vdbe_trace                | ❌ No         |                                              |
+| PRAGMA vdbe_trace                | ✅ Yes        |                                              |
 | PRAGMA wal_autocheckpoint        | ❌ No         |                                              |
 | PRAGMA wal_checkpoint            | 🚧 Partial    | Not Needed calling with param (pragma-value) |
 | PRAGMA writable_schema           | ❌ No         |                                              |
