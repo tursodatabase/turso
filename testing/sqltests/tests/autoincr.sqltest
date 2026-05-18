@@ -126,6 +126,23 @@ expect {
     1235|2
 }
 
+# Test: Manually deleting a sequence row is allowed and the next insert recreates it.
+@cross-check-integrity
+test autoinc-manual-delete-from-sqlite-sequence {
+    CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT);
+    INSERT INTO t1 VALUES(NULL);
+    DELETE FROM sqlite_sequence WHERE name='t1';
+    SELECT name, seq FROM sqlite_sequence WHERE name='t1';
+    INSERT INTO t1 VALUES(NULL);
+    SELECT x FROM t1 ORDER BY x;
+    SELECT name, seq FROM sqlite_sequence WHERE name='t1';
+}
+expect {
+    1
+    2
+    t1|2
+}
+
 # Test: AUTOINCREMENT works for multiple tables independently.
 @cross-check-integrity
 test autoinc-multiple-tables {
