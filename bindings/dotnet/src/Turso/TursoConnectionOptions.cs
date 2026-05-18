@@ -76,7 +76,8 @@ public class TursoConnectionOptions
         "Pooling",
         "Vfs",
         "Encryption Cipher",
-        "Encryption Key"
+        "Encryption Key",
+        "Experimental Features"
     ];
 
     public static TursoConnectionOptions Parse(string connectionString)

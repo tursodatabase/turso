@@ -8,11 +8,14 @@ namespace Turso.Raw.Public;
 
 public static class TursoBindings
 {
-    public static TursoDatabaseHandle OpenDatabase(string path)
+    public static TursoDatabaseHandle OpenDatabase(string path, string? experimentalFeatures = null)
     {
         ArgumentNullException.ThrowIfNull(path);
 
-        var dbPtr = TursoInterop.OpenDatabase(path, out var errorPtr);
+        IntPtr errorPtr;
+        var dbPtr = experimentalFeatures is null
+            ? TursoInterop.OpenDatabase(path, out errorPtr)
+            : TursoInterop.OpenDatabaseWithOptions(path, experimentalFeatures, out errorPtr);
         if (errorPtr != IntPtr.Zero)
             ThrowException(errorPtr);
 
@@ -26,13 +29,20 @@ public static class TursoBindings
     /// <param name="cipher">The encryption cipher to use.</param>
     /// <param name="hexkey">The hex-encoded encryption key.</param>
     /// <returns>A handle to the opened database.</returns>
-    public static TursoDatabaseHandle OpenDatabaseWithEncryption(string path, TursoEncryptionCipher cipher, string hexkey)
+    public static TursoDatabaseHandle OpenDatabaseWithEncryption(
+        string path,
+        TursoEncryptionCipher cipher,
+        string hexkey,
+        string? experimentalFeatures = null)
     {
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(hexkey);
 
         var cipherStr = cipher.ToRustString();
-        var dbPtr = TursoInterop.OpenDatabaseWithEncryption(path, cipherStr, hexkey, out var errorPtr);
+        IntPtr errorPtr;
+        var dbPtr = experimentalFeatures is null
+            ? TursoInterop.OpenDatabaseWithEncryption(path, cipherStr, hexkey, out errorPtr)
+            : TursoInterop.OpenDatabaseWithEncryptionAndOptions(path, cipherStr, hexkey, experimentalFeatures, out errorPtr);
         if (errorPtr != IntPtr.Zero)
             ThrowException(errorPtr);
 

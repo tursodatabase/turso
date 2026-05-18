@@ -182,7 +182,17 @@ public final class TursoDB implements AutoCloseable {
    * @param filePath e.g. path to file
    */
   public static TursoDB create(String url, String filePath) throws SQLException {
-    return new TursoDB(url, filePath, null, null);
+    return new TursoDB(url, filePath, null, null, null);
+  }
+
+  /**
+   * @param url eTurso.gTursoTurso. "jdbc:turso:fileName
+   * @param filePath e.g. path to file
+   * @param experimentalFeatures comma-separated experimental features to enable
+   */
+  public static TursoDB create(String url, String filePath, @Nullable String experimentalFeatures)
+      throws SQLException {
+    return new TursoDB(url, filePath, null, null, experimentalFeatures);
   }
 
   /**
@@ -196,17 +206,21 @@ public final class TursoDB implements AutoCloseable {
   public static TursoDB createWithEncryption(
       String url, String filePath, TursoEncryptionCipher cipher, String hexkey)
       throws SQLException {
-    return new TursoDB(url, filePath, cipher, hexkey);
+    return new TursoDB(url, filePath, cipher, hexkey, null);
   }
 
   // TODO: receive config as argument
   private TursoDB(
-      String url, String filePath, @Nullable TursoEncryptionCipher cipher, @Nullable String hexkey)
+      String url,
+      String filePath,
+      @Nullable TursoEncryptionCipher cipher,
+      @Nullable String hexkey,
+      @Nullable String experimentalFeatures)
       throws SQLException {
     this.url = url;
     this.filePath = filePath;
     load();
-    open(0, cipher != null ? cipher.getValue() : null, hexkey);
+    open(0, cipher != null ? cipher.getValue() : null, hexkey, experimentalFeatures);
   }
 
   // TODO: add support for JNI
@@ -220,13 +234,21 @@ public final class TursoDB implements AutoCloseable {
     return this.isOpen;
   }
 
-  private void open(int openFlags, @Nullable String cipher, @Nullable String hexkey)
+  private void open(
+      int openFlags,
+      @Nullable String cipher,
+      @Nullable String hexkey,
+      @Nullable String experimentalFeatures)
       throws SQLException {
-    open0(filePath, openFlags, cipher, hexkey);
+    open0(filePath, openFlags, cipher, hexkey, experimentalFeatures);
   }
 
   private void open0(
-      String filePath, int openFlags, @Nullable String cipher, @Nullable String hexkey)
+      String filePath,
+      int openFlags,
+      @Nullable String cipher,
+      @Nullable String hexkey,
+      @Nullable String experimentalFeatures)
       throws SQLException {
     byte[] filePathBytes = stringToUtf8ByteArray(filePath);
     if (filePathBytes == null) {
@@ -236,17 +258,24 @@ public final class TursoDB implements AutoCloseable {
     }
 
     if (cipher != null && hexkey != null) {
-      dbPointer = openWithEncryptionUtf8(filePathBytes, openFlags, cipher, hexkey);
+      dbPointer =
+          openWithEncryptionUtf8(filePathBytes, openFlags, cipher, hexkey, experimentalFeatures);
     } else {
-      dbPointer = openUtf8(filePathBytes, openFlags);
+      dbPointer = openUtf8(filePathBytes, openFlags, experimentalFeatures);
     }
     isOpen = true;
   }
 
-  private native long openUtf8(byte[] file, int openFlags) throws SQLException;
+  private native long openUtf8(byte[] file, int openFlags, @Nullable String experimentalFeatures)
+      throws SQLException;
 
   private native long openWithEncryptionUtf8(
-      byte[] file, int openFlags, String cipher, String hexkey) throws SQLException;
+      byte[] file,
+      int openFlags,
+      String cipher,
+      String hexkey,
+      @Nullable String experimentalFeatures)
+      throws SQLException;
 
   public long connect() throws SQLException {
     return connect0(dbPointer);

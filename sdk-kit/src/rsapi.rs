@@ -1380,6 +1380,44 @@ mod tests {
     }
 
     #[test]
+    pub fn test_db_rsapi_vacuum_smoke() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("vacuum-smoke.db");
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: db_path.to_str().unwrap().to_string(),
+            experimental_features: Some("vacuum".to_string()),
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+        let conn = db.connect().unwrap();
+
+        for sql in [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)",
+            "INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+            "DELETE FROM t WHERE id = 2",
+            "VACUUM",
+        ] {
+            let mut stmt = conn.prepare_single(sql).unwrap();
+            assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+        }
+
+        let mut count_stmt = conn.prepare_single("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count_stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(count_stmt.row_value(0).unwrap().as_int(), Some(2));
+        assert_eq!(count_stmt.step(None).unwrap(), TursoStatusCode::Done);
+
+        let mut integrity_stmt = conn.prepare_single("PRAGMA integrity_check").unwrap();
+        assert_eq!(integrity_stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(integrity_stmt.row_value(0).unwrap().to_text(), Some("ok"));
+        assert_eq!(integrity_stmt.step(None).unwrap(), TursoStatusCode::Done);
+    }
+
+    #[test]
     pub fn test_named_position_requires_prefixed_name() {
         let db = TursoDatabase::new(TursoDatabaseConfig {
             path: ":memory:".to_string(),

@@ -39,14 +39,15 @@ public class TursoConnection : DbConnection
         var filename = _connectionOptions["Data Source"] ?? ":memory:";
         var cipher = _connectionOptions.GetEncryptionCipher();
         var hexkey = _connectionOptions["Encryption Key"];
+        var experimentalFeatures = _connectionOptions["Experimental Features"];
 
         if (cipher.HasValue && hexkey is not null)
         {
-            _turso = TursoBindings.OpenDatabaseWithEncryption(filename, cipher.Value, hexkey);
+            _turso = TursoBindings.OpenDatabaseWithEncryption(filename, cipher.Value, hexkey, experimentalFeatures);
         }
         else
         {
-            _turso = TursoBindings.OpenDatabase(filename);
+            _turso = TursoBindings.OpenDatabase(filename, experimentalFeatures);
         }
     }
 

@@ -170,6 +170,7 @@ namespace turso
                 std::string normalizedPath = normalizePath(path);
 
                 // Build database config
+                std::string experimentalFeatures;
                 turso_database_config_t db_config = {0};
                 db_config.async_io = 1;  // Default to async IO for React Native
                 db_config.path = normalizedPath.c_str();
@@ -187,6 +188,15 @@ namespace turso
                     if (config.hasProperty(rt, "async_io"))
                     {
                         db_config.async_io = config.getProperty(rt, "async_io").getBool() ? 1 : 0;
+                    }
+                    if (config.hasProperty(rt, "experimental_features"))
+                    {
+                        jsi::Value value = config.getProperty(rt, "experimental_features");
+                        if (value.isString())
+                        {
+                            experimentalFeatures = value.asString(rt).utf8(rt);
+                            db_config.experimental_features = experimentalFeatures.c_str();
+                        }
                     }
                 }
 
@@ -234,6 +244,7 @@ namespace turso
                 // Normalize path (prepend basePath if relative)
                 std::string normalizedPath = normalizePath(path);
 
+                std::string experimentalFeatures;
                 turso_database_config_t db_config = {0};
                 db_config.async_io = 1;  // Default to async IO for React Native
                 db_config.path = normalizedPath.c_str();
@@ -244,6 +255,15 @@ namespace turso
                     db_config.async_io = dbConfigObj.getProperty(rt, "async_io").getBool() ? 1 : 0;
                 }
                 db_config.experimental_features = nullptr;
+                if (dbConfigObj.hasProperty(rt, "experimental_features"))
+                {
+                    jsi::Value value = dbConfigObj.getProperty(rt, "experimental_features");
+                    if (value.isString())
+                    {
+                        experimentalFeatures = value.asString(rt).utf8(rt);
+                        db_config.experimental_features = experimentalFeatures.c_str();
+                    }
+                }
                 db_config.vfs = nullptr;
                 db_config.encryption_cipher = nullptr;
                 db_config.encryption_hexkey = nullptr;

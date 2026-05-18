@@ -9,6 +9,27 @@ import turso.aio
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
 
 
+@pytest.mark.asyncio
+async def test_vacuum_smoke(tmp_path):
+    db_file = tmp_path / "vacuum-smoke-async.db"
+    conn = await turso.aio.connect(str(db_file), experimental_features="vacuum")
+    try:
+        cur = conn.cursor()
+        await cur.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")
+        await cur.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        await cur.execute("DELETE FROM t WHERE id = 2")
+        await conn.commit()
+
+        await cur.execute("VACUUM")
+
+        await cur.execute("SELECT COUNT(*) FROM t")
+        assert await cur.fetchone() == (2,)
+        await cur.execute("PRAGMA integrity_check")
+        assert await cur.fetchone() == ("ok",)
+    finally:
+        await conn.close()
+
+
 @pytest.fixture(autouse=True)
 def setup_database():
     db_path = "tests/database.db"

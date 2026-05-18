@@ -85,6 +85,100 @@ pub fn to_value(value: TursoValue) -> Value {
     }
 }
 
+fn database_opts_from_experimental_features(
+    experimental_features: Option<&str>,
+    encryption: bool,
+) -> DatabaseOpts {
+    let mut opts = DatabaseOpts::new();
+    if encryption {
+        opts = opts.with_encryption(true);
+    }
+    if let Some(experimental_features) = experimental_features {
+        for feature in experimental_features.split(',').map(str::trim) {
+            opts = match feature {
+                "views" => opts.with_views(true),
+                "custom_types" => opts.with_custom_types(true),
+                "encryption" => opts.with_encryption(true),
+                "index_method" => opts.with_index_method(true),
+                "autovacuum" => opts.with_autovacuum(true),
+                "vacuum" => opts.with_vacuum(true),
+                "attach" => opts.with_attach(true),
+                "generated_columns" => opts.with_generated_columns(true),
+                "multiprocess_wal" => opts.with_multiprocess_wal(true),
+                "without_rowid" => opts.with_without_rowid(true),
+                _ => opts,
+            };
+        }
+    }
+    opts
+}
+
+unsafe fn optional_c_str<'a>(
+    ptr: *const c_char,
+    error_ptr: *mut Error,
+    label: &str,
+) -> Option<&'a str> {
+    if ptr.is_null() {
+        return None;
+    }
+    let cstr = unsafe { CStr::from_ptr(ptr) };
+    match cstr.to_str() {
+        Ok(value) => Some(value),
+        Err(err) => {
+            unsafe {
+                *error_ptr = allocate_string(format!("Invalid {label} encoding: {err}").as_str())
+            }
+            None
+        }
+    }
+}
+
+unsafe fn db_open_impl(
+    path_ptr: *const c_char,
+    experimental_features_ptr: *const c_char,
+    error_ptr: *mut Error,
+) -> *const Database {
+    let path_cstr: &CStr = unsafe { CStr::from_ptr(path_ptr) };
+    let path_str = match path_cstr.to_str() {
+        Ok(s) => s,
+        Err(err) => {
+            unsafe {
+                *error_ptr = allocate_string(format!("Invalid path encoding: {err}").as_str())
+            }
+            return null();
+        }
+    };
+    let experimental_features = match unsafe {
+        optional_c_str(
+            experimental_features_ptr,
+            error_ptr,
+            "experimental_features",
+        )
+    } {
+        Some(features) => Some(features),
+        None if experimental_features_ptr.is_null() => None,
+        None => return null(),
+    };
+
+    let connection_result = Connection::from_uri(
+        path_str,
+        database_opts_from_experimental_features(experimental_features, false),
+    );
+    match connection_result {
+        Ok((io, val)) => allocate(Database {
+            io,
+            connection: val,
+        }),
+        Err(err) => {
+            unsafe {
+                *error_ptr =
+                    allocate_string(format!("Error while opening database: {err}").as_str())
+            }
+            null()
+        }
+    }
+}
+
 /// Opens a database at the specified path and returns a pointer to the database.
 /// If an error occurred, returns null and writes a pointer to a null-terminated string into `error_ptr`.
 ///
@@ -99,23 +193,25 @@ pub unsafe extern "C" fn db_open(
     path_ptr: *const c_char,
     error_ptr: *mut Error,
 ) -> *const Database {
-    let path_cstr: &CStr = unsafe { CStr::from_ptr(path_ptr) };
-    let path_str = path_cstr.to_str();
+    unsafe { db_open_impl(path_ptr, null(), error_ptr) }
+}
 
-    let connection_result = Connection::from_uri(path_str.unwrap(), DatabaseOpts::new());
-    match connection_result {
-        Ok((io, val)) => allocate(Database {
-            io,
-            connection: val,
-        }),
-        Err(err) => {
-            unsafe {
-                *error_ptr =
-                    allocate_string(format!("Error while opening database: {err}").as_str())
-            }
-            null()
-        }
-    }
+#[no_mangle]
+/// Opens a database with optional experimental features.
+///
+/// # Safety
+///
+/// - The returned database pointer must be freed with `db_close`.
+/// - Any error string written to `error_ptr` must be freed with `free_string`.
+/// - `path_ptr` must not be null and must point to a valid null-terminated UTF-8 string.
+/// - `experimental_features_ptr` must be null or point to a valid null-terminated UTF-8 string.
+/// - `error_ptr` must not be null and must point to a valid writable location.
+pub unsafe extern "C" fn db_open_with_options(
+    path_ptr: *const c_char,
+    experimental_features_ptr: *const c_char,
+    error_ptr: *mut Error,
+) -> *const Database {
+    unsafe { db_open_impl(path_ptr, experimental_features_ptr, error_ptr) }
 }
 
 /// Opens a database with encryption at the specified path.
@@ -134,6 +230,44 @@ pub unsafe extern "C" fn db_open_with_encryption(
     path_ptr: *const c_char,
     cipher_ptr: *const c_char,
     hexkey_ptr: *const c_char,
+    error_ptr: *mut Error,
+) -> *const Database {
+    unsafe { db_open_with_encryption_impl(path_ptr, cipher_ptr, hexkey_ptr, null(), error_ptr) }
+}
+
+#[no_mangle]
+/// Opens an encrypted database with optional experimental features.
+///
+/// # Safety
+///
+/// - The returned database pointer must be freed with `db_close`.
+/// - Any error string written to `error_ptr` must be freed with `free_string`.
+/// - `path_ptr` must not be null and must point to a valid null-terminated UTF-8 string.
+/// - `cipher_ptr`, `hexkey_ptr`, and `experimental_features_ptr` must be null or point to valid null-terminated UTF-8 strings.
+/// - `error_ptr` must not be null and must point to a valid writable location.
+pub unsafe extern "C" fn db_open_with_encryption_and_options(
+    path_ptr: *const c_char,
+    cipher_ptr: *const c_char,
+    hexkey_ptr: *const c_char,
+    experimental_features_ptr: *const c_char,
+    error_ptr: *mut Error,
+) -> *const Database {
+    unsafe {
+        db_open_with_encryption_impl(
+            path_ptr,
+            cipher_ptr,
+            hexkey_ptr,
+            experimental_features_ptr,
+            error_ptr,
+        )
+    }
+}
+
+unsafe fn db_open_with_encryption_impl(
+    path_ptr: *const c_char,
+    cipher_ptr: *const c_char,
+    hexkey_ptr: *const c_char,
+    experimental_features_ptr: *const c_char,
     error_ptr: *mut Error,
 ) -> *const Database {
     let path_cstr: &CStr = unsafe { CStr::from_ptr(path_ptr) };
@@ -179,11 +313,20 @@ pub unsafe extern "C" fn db_open_with_encryption(
         None
     };
 
-    let db_opts = if encryption_opts.is_some() {
-        DatabaseOpts::new().with_encryption(true)
-    } else {
-        DatabaseOpts::new()
+    let experimental_features = match unsafe {
+        optional_c_str(
+            experimental_features_ptr,
+            error_ptr,
+            "experimental_features",
+        )
+    } {
+        Some(features) => Some(features),
+        None if experimental_features_ptr.is_null() => None,
+        None => return null(),
     };
+
+    let db_opts =
+        database_opts_from_experimental_features(experimental_features, encryption_opts.is_some());
 
     let io: Arc<dyn IO> = match turso_core::PlatformIO::new() {
         Ok(io) => Arc::new(io),

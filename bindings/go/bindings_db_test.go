@@ -1,6 +1,7 @@
 package turso
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -18,6 +19,32 @@ func openInMemory(t *testing.T) (*dbConn, func()) {
 	db, err := turso_database_new(TursoDatabaseConfig{
 		Path:                 ":memory:",
 		ExperimentalFeatures: "",
+		AsyncIO:              false,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, db)
+
+	require.NoError(t, turso_database_open(db))
+
+	conn, err := turso_database_connect(db)
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+
+	cleanup := func() {
+		_ = turso_connection_close(conn)
+		turso_connection_deinit(conn)
+		turso_database_deinit(db)
+	}
+	return &dbConn{db: db, conn: conn}, cleanup
+}
+
+func openFileWithExperimental(t *testing.T, experimentalFeatures string) (*dbConn, func()) {
+	t.Helper()
+
+	dbPath := filepath.Join(t.TempDir(), "local.db")
+	db, err := turso_database_new(TursoDatabaseConfig{
+		Path:                 dbPath,
+		ExperimentalFeatures: experimentalFeatures,
 		AsyncIO:              false,
 	})
 	require.NoError(t, err)
@@ -78,6 +105,32 @@ func TestSetupAndOpenMemory(t *testing.T) {
 	// simple sanity DDL
 	changes := prepExec(t, conn.conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)")
 	assert.Equal(t, uint64(0), changes)
+}
+
+func TestVacuumBindings(t *testing.T) {
+	conn, cleanup := openFileWithExperimental(t, "vacuum")
+	defer cleanup()
+
+	prepExec(t, conn.conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")
+	prepExec(t, conn.conn, "INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+	prepExec(t, conn.conn, "DELETE FROM t WHERE id = 2")
+	prepExec(t, conn.conn, "VACUUM")
+
+	stmt := prepStmt(t, conn.conn, "SELECT COUNT(*) FROM t")
+	require.True(t, stepRow(t, stmt))
+	assert.Equal(t, int64(2), turso_statement_row_value_int(stmt, 0))
+	require.False(t, stepRow(t, stmt))
+	_ = turso_statement_finalize(stmt)
+	turso_statement_deinit(stmt)
+
+	stmt = prepStmt(t, conn.conn, "PRAGMA integrity_check")
+	defer func() {
+		_ = turso_statement_finalize(stmt)
+		turso_statement_deinit(stmt)
+	}()
+	require.True(t, stepRow(t, stmt))
+	assert.Equal(t, "ok", turso_statement_row_value_text(stmt, 0))
+	require.False(t, stepRow(t, stmt))
 }
 
 func TestPrepareFirstMultipleStatements(t *testing.T) {

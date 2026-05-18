@@ -125,6 +125,7 @@ export class Database {
     const dbConfig = {
       path: this._opts.path,
       async_io: false, // use blocking IO for local database
+      experimental_features: this._opts.experimental?.join(','),
     };
 
     // Create native database (path normalization happens in C++ JSI layer)
@@ -157,6 +158,7 @@ export class Database {
     const dbConfig = {
       path: this._opts.path,
       async_io: true, // use async IO for synced database as we have network IO loop externally from the turso core
+      experimental_features: this._opts.experimental?.join(','),
     };
 
     // Calculate reserved bytes from cipher

@@ -33,6 +33,32 @@ func openMem(t *testing.T) *sql.DB {
 	return db
 }
 
+func TestVacuum(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := path.Join(tmp, "vacuum.db")
+	conn, err := sql.Open("turso", fmt.Sprintf("%s?experimental=vacuum", dbPath))
+	require.NoError(t, err)
+	defer conn.Close()
+
+	require.NoError(t, conn.Ping())
+	_, err = conn.Exec("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")
+	require.NoError(t, err)
+	_, err = conn.Exec("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+	require.NoError(t, err)
+	_, err = conn.Exec("DELETE FROM t WHERE id = 2")
+	require.NoError(t, err)
+
+	_, err = conn.Exec("VACUUM")
+	require.NoError(t, err)
+
+	var count int
+	require.NoError(t, conn.QueryRow("SELECT COUNT(*) FROM t").Scan(&count))
+	require.Equal(t, 2, count)
+	var integrity string
+	require.NoError(t, conn.QueryRow("PRAGMA integrity_check").Scan(&integrity))
+	require.Equal(t, "ok", integrity)
+}
+
 func TestMain(m *testing.M) {
 	InitLibrary(turso_libs.LoadTursoLibraryConfig{LoadStrategy: "mixed"})
 	var err error

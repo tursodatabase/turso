@@ -138,6 +138,41 @@ public class TursoTests
     }
 
     [Test]
+    public void TestVacuumWithExperimentalFeature()
+    {
+        var dbPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"{System.Guid.NewGuid()}.db");
+        try
+        {
+            using var connection = new TursoConnection($"Data Source={dbPath};Experimental Features=vacuum");
+            connection.Open();
+
+            connection.ExecuteNonQuery("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)");
+            connection.ExecuteNonQuery("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')");
+            connection.ExecuteNonQuery("DELETE FROM t WHERE id = 2");
+            connection.ExecuteNonQuery("VACUUM");
+
+            using var countCmd = new TursoCommand(connection, "SELECT COUNT(*) FROM t");
+            using (var reader = countCmd.ExecuteReader())
+            {
+                reader.Read().Should().BeTrue();
+                reader.GetInt32(0).Should().Be(2);
+                reader.Read().Should().BeFalse();
+            }
+
+            using var integrityCmd = new TursoCommand(connection, "PRAGMA integrity_check");
+            using var integrityReader = integrityCmd.ExecuteReader();
+            integrityReader.Read().Should().BeTrue();
+            integrityReader.GetString(0).Should().Be("ok");
+            integrityReader.Read().Should().BeFalse();
+        }
+        finally
+        {
+            System.IO.File.Delete(dbPath);
+            System.IO.File.Delete($"{dbPath}-wal");
+        }
+    }
+
+    [Test]
     public void TestFetchSpecificColumns()
     {
         using var connection = new TursoConnection();

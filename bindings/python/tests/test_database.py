@@ -16,6 +16,26 @@ def connect(provider, database):
     raise Exception(f"Provider `{provider}` is not supported")
 
 
+def test_vacuum_smoke(tmp_path):
+    db_file = tmp_path / "vacuum-smoke.db"
+    conn = turso.connect(str(db_file), experimental_features="vacuum")
+    try:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")
+        cur.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        cur.execute("DELETE FROM t WHERE id = 2")
+        conn.commit()
+
+        cur.execute("VACUUM")
+
+        cur.execute("SELECT COUNT(*) FROM t")
+        assert cur.fetchone() == (2,)
+        cur.execute("PRAGMA integrity_check")
+        assert cur.fetchone() == ("ok",)
+    finally:
+        conn.close()
+
+
 @pytest.fixture(autouse=True)
 def setup_database():
     db_path = "tests/database.db"
