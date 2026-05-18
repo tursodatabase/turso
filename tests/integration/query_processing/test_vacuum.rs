@@ -5373,7 +5373,6 @@ fn test_plain_vacuum_preserves_without_rowid_tables() -> anyhow::Result<()> {
             ('beta', 'two', '2026-01-02'),
             ('gamma', 'three', '2026-01-03')",
     )?;
-    conn.execute("DELETE FROM config WHERE key = 'beta'")?;
 
     assert_plain_vacuum_preserves_content_hash(&tmp_db, &conn)?;
 
@@ -5386,6 +5385,11 @@ fn test_plain_vacuum_preserves_without_rowid_tables() -> anyhow::Result<()> {
                 "alpha".to_string(),
                 "one".to_string(),
                 "2026-01-01".to_string()
+            ),
+            (
+                "beta".to_string(),
+                "two".to_string(),
+                "2026-01-02".to_string()
             ),
             (
                 "gamma".to_string(),

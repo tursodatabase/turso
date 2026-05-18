@@ -241,6 +241,7 @@ fn is_multiprocess_vacuum_rejection(err: &LimboError) -> bool {
         }
         LimboError::TxError(msg) | LimboError::InternalError(msg) => {
             msg.contains("cannot VACUUM experimental multiprocess WAL databases")
+                || msg.contains("VACUUM is incompatible with experimental multiprocess WAL")
         }
         _ => false,
     }
