@@ -34,7 +34,7 @@ use crate::util::{
     trigger_still_references_renamed_column, trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
-    apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
+    apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
 };
 use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
@@ -11676,13 +11676,17 @@ pub fn op_add_imm(
         Register::Record(_) => &Value::Null,
     };
 
-    let int_val = match current_value {
-        Value::Numeric(Numeric::Integer(i)) => i + value,
-        Value::Numeric(Numeric::Float(f)) => (f64::from(*f) as i64) + value,
-        Value::Text(s) => s.as_str().parse::<i64>().unwrap_or(0) + value,
-        Value::Blob(_) => *value, // BLOB becomes the added value
-        Value::Null => *value,    // NULL becomes the added value
+    // SQLite coerces the register to an integer before adding.
+    let lhs = match current_value {
+        Value::Numeric(Numeric::Integer(i)) => *i,
+        Value::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(*f)),
+        Value::Text(s) => crate::numeric::str_to_i64(s.as_str()).unwrap_or(0),
+        Value::Blob(b) => {
+            crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
+        }
+        Value::Null => 0,
     };
+    let int_val = lhs.wrapping_add(*value);
 
     state.registers[*register].set_int(int_val);
     state.pc += 1;
@@ -14289,32 +14293,16 @@ fn execute_turso_version(version_integer: i64) -> String {
     format!("{major}.{minor}.{release}")
 }
 
+/// Coerce a value to i64 using the same non-NULL conversion rules as
+/// SQLite's OP_AddImm.
 pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
     let value = value.as_value_ref();
     match value {
         ValueRef::Numeric(Numeric::Integer(i)) => i,
-        ValueRef::Numeric(Numeric::Float(f)) => {
-            let f = f64::from(f);
-            // Use sqlite3RealToI64 equivalent
-            if f < -9223372036854774784.0 {
-                i64::MIN
-            } else if f > 9223372036854774784.0 {
-                i64::MAX
-            } else {
-                f as i64
-            }
-        }
-        ValueRef::Text(t) => {
-            // Try to parse as integer, return 0 if failed
-            t.as_str().parse::<i64>().unwrap_or(0)
-        }
+        ValueRef::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(f)),
+        ValueRef::Text(t) => crate::numeric::str_to_i64(t.as_str()).unwrap_or(0),
         ValueRef::Blob(b) => {
-            // Try to parse blob as string then as integer
-            if let Ok(s) = std::str::from_utf8(b) {
-                s.parse::<i64>().unwrap_or(0)
-            } else {
-                0
-            }
+            crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
         }
         ValueRef::Null => 0,
     }
