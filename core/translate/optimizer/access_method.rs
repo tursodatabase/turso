@@ -821,7 +821,7 @@ fn find_best_access_method_for_btree(
             best_access_method.cost,
             &lhs_mask,
             analyze_stats,
-        ) {
+        )? {
             best_access_method = multi_idx_method;
         }
 
@@ -838,7 +838,7 @@ fn find_best_access_method_for_btree(
             best_access_method.cost,
             &lhs_mask,
             analyze_stats,
-        ) {
+        )? {
             best_access_method = multi_idx_and_method;
         }
     }
