@@ -185,6 +185,35 @@ fn insert_fk_violation_in_tx_rolls_back_row(tmp_db: TempDatabase) -> anyhow::Res
     Ok(())
 }
 
+/// Regression: DO UPDATE in an UPSERT always aborts on a secondary UNIQUE
+/// violation, even when the outer INSERT policy is OR REPLACE. The statement
+/// journal must roll back any index changes made before that abort.
+#[turso_macros::test]
+fn insert_or_replace_upsert_unique_abort_rolls_back_indexes(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA journal_mode=WAL")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, u TEXT UNIQUE, a TEXT UNIQUE)")?;
+    conn.execute("INSERT INTO t VALUES(1,'u1','a1'),(2,'u2','a2')")?;
+
+    conn.execute("BEGIN")?;
+    let result = conn.execute(
+        "INSERT OR REPLACE INTO t(u,a) VALUES('u1','a2') \
+         ON CONFLICT(u) DO UPDATE SET a=excluded.a",
+    );
+    assert!(result.is_err(), "UPSERT should fail with UNIQUE violation");
+
+    let integrity = query_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(integrity, vec!["ok"]);
+    conn.execute("COMMIT")?;
+    let integrity = query_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(integrity, vec!["ok"]);
+    let rows = query_rows(&conn, "SELECT id,u,a FROM t ORDER BY id");
+    assert_eq!(rows, vec!["1|u1|a1", "2|u2|a2"]);
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────
 // UPDATE
 // ──────────────────────────────────────────────────────────

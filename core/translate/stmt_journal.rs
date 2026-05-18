@@ -150,6 +150,9 @@ pub(crate) fn set_insert_stmt_journal_flags(
     let has_check = !table.check_constraints.is_empty();
     let may_abort = has_triggers
         || has_fks
+        // SQLite treats the DO UPDATE arm of an UPSERT as ABORT, even when
+        // the outer INSERT policy is OR REPLACE.
+        || (has_upsert && matches!(statement_conflict, ResolveType::Replace))
         || constraint_may_abort(
             has_statement_conflict,
             statement_conflict,
