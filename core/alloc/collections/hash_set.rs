@@ -22,22 +22,8 @@ where
     S: BuildHasher,
 {
     fn try_insert(&mut self, value: T) -> Result<bool, TryReserveError> {
-        self.try_reserve(1).map_err(TryReserveError::from)?;
+        self.try_reserve(1)?;
         Ok(self.insert(value))
-    }
-
-    fn try_extend<I>(&mut self, iter: I) -> Result<(), TryReserveError>
-    where
-        I: IntoIterator<Item = T>,
-    {
-        let iter = iter.into_iter();
-        let (lower, upper) = iter.size_hint();
-        self.try_reserve(upper.unwrap_or(lower))
-            .map_err(TryReserveError::from)?;
-        for value in iter {
-            TursoHashSetExt::try_insert(self, value)?;
-        }
-        Ok(())
     }
 }
 
@@ -48,9 +34,7 @@ where
 {
     fn try_with_capacity(capacity: usize) -> Result<Self, TryReserveError> {
         let mut values = <Self as TursoAllocExt>::new();
-        values
-            .try_reserve(capacity)
-            .map_err(TryReserveError::from)?;
+        values.try_reserve(capacity)?;
         Ok(values)
     }
 }
@@ -73,6 +57,19 @@ where
         }
         Ok(values)
     }
+
+    fn try_extend<I>(&mut self, iter: I) -> Result<(), TryReserveError>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let iter = iter.into_iter();
+        let (lower, upper) = iter.size_hint();
+        self.try_reserve(upper.unwrap_or(lower))?;
+        for value in iter {
+            TursoHashSetExt::try_insert(self, value)?;
+        }
+        Ok(())
+    }
 }
 
 impl<T, S> TryClone for HashSet<T, S>
@@ -84,9 +81,7 @@ where
 
     fn try_clone(&self) -> Result<Self, Self::Error> {
         let mut cloned = Self::with_hasher(self.hasher().clone());
-        cloned
-            .try_reserve(self.len())
-            .map_err(TryReserveError::from)?;
+        cloned.try_reserve(self.len())?;
         cloned.extend(self.iter().cloned());
         Ok(cloned)
     }

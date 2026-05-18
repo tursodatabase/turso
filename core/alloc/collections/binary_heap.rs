@@ -1,7 +1,5 @@
-use super::{
-    TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoFromIterator, TursoTryWithCapacityExt,
-};
-use crate::alloc::{BinaryHeap, TryReserveError};
+use super::*;
+use crate::alloc::*;
 
 #[cfg(not(nightly))]
 fn binary_heap<T: Ord>() -> BinaryHeap<T> {
@@ -29,9 +27,39 @@ impl<T: Ord> TursoAllocExt for BinaryHeap<T> {
 
 impl<T: Ord> TursoBinaryHeapExt<T> for BinaryHeap<T> {
     fn try_push(&mut self, value: T) -> Result<(), TryReserveError> {
-        self.try_reserve(1).map_err(TryReserveError::from)?;
+        self.try_reserve(1)?;
         self.push(value);
         Ok(())
+    }
+}
+
+impl<T: Ord> TursoTryWithCapacityExt for BinaryHeap<T> {
+    fn try_with_capacity(capacity: usize) -> Result<Self, TryReserveError> {
+        let mut values = <Self as TursoAllocExt>::new();
+        values.try_reserve(capacity)?;
+        Ok(values)
+    }
+}
+
+// For these 2 impls we use std::vec because on `stable` we can't use allocator on BinaryHeap, but on nightly we can
+impl<T: Ord> TursoFromIterator<T> for BinaryHeap<T> {
+    fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let iter = iter.into_iter();
+        let (lower, upper) = iter.size_hint();
+        // We use std::vec here because on stable we dont have allocators for BinaryHeap. On Nightly, we create a Vec with the TursoAllocator
+        #[cfg(nightly)]
+        let mut values = super::vec::vec();
+        #[cfg(not(nightly))]
+        let mut values = std::vec::Vec::new();
+        values.try_reserve(upper.unwrap_or(lower))?;
+        for value in iter {
+            // We already reserved enough space above so no panics should happen
+            values.push(value);
+        }
+        Ok(BinaryHeap::from(values))
     }
 
     fn try_extend<I>(&mut self, iter: I) -> Result<(), TryReserveError>
@@ -40,38 +68,15 @@ impl<T: Ord> TursoBinaryHeapExt<T> for BinaryHeap<T> {
     {
         let iter = iter.into_iter();
         let (lower, upper) = iter.size_hint();
-        self.try_reserve(upper.unwrap_or(lower))
-            .map_err(TryReserveError::from)?;
+        let mut values = std::mem::take(self).into_vec();
+        values.try_reserve(upper.unwrap_or(lower))?;
         for value in iter {
-            self.try_push(value)?;
+            // We already reserved enough space above so no panics should happen
+            values.push(value);
         }
+
+        *self = BinaryHeap::from(values);
         Ok(())
-    }
-}
-
-impl<T: Ord> TursoTryWithCapacityExt for BinaryHeap<T> {
-    fn try_with_capacity(capacity: usize) -> Result<Self, TryReserveError> {
-        let mut values = <Self as TursoAllocExt>::new();
-        values
-            .try_reserve(capacity)
-            .map_err(TryReserveError::from)?;
-        Ok(values)
-    }
-}
-
-impl<T: Ord> TursoFromIterator<T> for BinaryHeap<T> {
-    fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
-    where
-        I: IntoIterator<Item = T>,
-    {
-        let iter = iter.into_iter();
-        let (lower, upper) = iter.size_hint();
-        let capacity = upper.unwrap_or(lower);
-        let mut values = <Self as TursoTryWithCapacityExt>::try_with_capacity(capacity)?;
-        for value in iter {
-            values.try_push(value)?;
-        }
-        Ok(values)
     }
 }
 
@@ -86,9 +91,7 @@ impl<T: Clone + Ord> TryClone for BinaryHeap<T> {
             let alloc = self.allocator().clone();
             Self::new_in(alloc)
         };
-        cloned
-            .try_reserve(self.len())
-            .map_err(TryReserveError::from)?;
+        cloned.try_reserve(self.len())?;
         cloned.extend(self.iter().cloned());
         Ok(cloned)
     }

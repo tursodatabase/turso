@@ -39,20 +39,6 @@ impl<T> TursoVecDequeExt<T> for VecDeque<T> {
         self.push_front(value);
         Ok(())
     }
-
-    fn try_extend<I>(&mut self, iter: I) -> Result<(), TryReserveError>
-    where
-        I: IntoIterator<Item = T>,
-    {
-        let iter = iter.into_iter();
-        let (lower, upper) = iter.size_hint();
-        self.try_reserve(upper.unwrap_or(lower))
-            .map_err(TryReserveError::from)?;
-        for value in iter {
-            self.try_push_back(value)?;
-        }
-        Ok(())
-    }
 }
 
 impl<T> TursoTryWithCapacityExt for VecDeque<T> {
@@ -79,6 +65,19 @@ impl<T> TursoFromIterator<T> for VecDeque<T> {
         }
         Ok(values)
     }
+
+    fn try_extend<I>(&mut self, iter: I) -> Result<(), TryReserveError>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let iter = iter.into_iter();
+        let (lower, upper) = iter.size_hint();
+        self.try_reserve(upper.unwrap_or(lower))?;
+        for value in iter {
+            self.try_push_back(value)?;
+        }
+        Ok(())
+    }
 }
 
 impl<T: Clone> TryClone for VecDeque<T> {
@@ -92,9 +91,7 @@ impl<T: Clone> TryClone for VecDeque<T> {
             let alloc = self.allocator().clone();
             Self::new_in(alloc)
         };
-        cloned
-            .try_reserve(self.len())
-            .map_err(TryReserveError::from)?;
+        cloned.try_reserve(self.len())?;
         cloned.extend(self.iter().cloned());
         Ok(cloned)
     }
