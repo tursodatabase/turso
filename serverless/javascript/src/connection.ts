@@ -59,7 +59,6 @@ export class Connection {
   private session: Session;
   private isOpen: boolean = true;
   private defaultSafeIntegerMode: boolean = false;
-  private _inTransaction: boolean = false;
   private execLock: AsyncLock = new AsyncLock();
 
   constructor(config: Config) {
@@ -71,16 +70,23 @@ export class Connection {
     
     // Define inTransaction property
     Object.defineProperty(this, 'inTransaction', {
-      get: () => this._inTransaction,
+      get: () => this.session.isStreamOpen,
       enumerable: true
     });
   }
 
   /**
-   * Whether the database is currently in a transaction.
+   * Whether the database is currently inside a transaction.
+   *
+   * Derived from the server's view: if the server is keeping a stream open
+   * for us, we're not in autocommit. This catches BEGIN/COMMIT correctly and
+   * mirrors how `sqlite3_get_autocommit()` is exposed on the native bindings.
+   * (Strictly, a non-null baton can also mean stored SQL or pragma side-
+   * effects; we don't use stored SQL and pragma side-effects are rare enough
+   * that treating them as "stateful" is acceptable.)
    */
   get inTransaction(): boolean {
-    return this._inTransaction;
+    return this.session.isStreamOpen;
   }
 
   /**
@@ -318,15 +324,12 @@ export class Connection {
     const wrapTxn = (mode: string) => {
       return async (...bindParameters: any[]) => {
         await db.exec("BEGIN " + mode);
-        db._inTransaction = true;
         try {
           const result = await fn(...bindParameters);
           await db.exec("COMMIT");
-          db._inTransaction = false;
           return result;
         } catch (err) {
           await db.exec("ROLLBACK");
-          db._inTransaction = false;
           throw err;
         }
       };

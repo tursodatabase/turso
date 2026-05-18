@@ -157,6 +157,21 @@ test.serial("Database.pragma() after close()", async (t) => {
 // Database.transaction()
 // ==========================================================================
 
+test.serial("Connection is in autocommit after a one-shot query", async (t) => {
+  const db = t.context.db;
+  // After a stateless query (no BEGIN, no pragma side-effects) the connection
+  // must report autocommit — `inTransaction` is false. On native backends
+  // this maps directly to `sqlite3_get_autocommit()`; on the serverless
+  // driver this requires the HTTP server to have closed the stream and the
+  // driver to honor that signal (baton: null per the Hrana spec). A leaked
+  // baton would leave `inTransaction` true even though the connection is in
+  // autocommit, lying about connection state to user code.
+  const stmt = await db.prepare("SELECT 1 AS n");
+  await stmt.get();
+  t.false(db.inTransaction,
+    "inTransaction should be false after a stateless one-shot query");
+});
+
 test.serial("Database.transaction()", async (t) => {
   const db = t.context.db;
 
