@@ -348,3 +348,23 @@ test('example-2', async () => {
         { name: 'Bob', email: 'bob@example.com' }
     ]);
 })
+
+test('transaction.concurrent uses BEGIN CONCURRENT', async () => {
+    const db = await connect(':memory:');
+    const originalExec = db.exec;
+    const calls: string[] = [];
+    db.exec = async (sql) => {
+        calls.push(sql);
+    };
+
+    try {
+        const txn = db.transaction(async () => {
+            calls.push('body');
+        }).concurrent;
+        await txn();
+        expect(calls).toEqual(['BEGIN CONCURRENT', 'body', 'COMMIT']);
+    } finally {
+        db.exec = originalExec;
+        await db.close();
+    }
+})
