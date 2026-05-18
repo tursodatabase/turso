@@ -946,6 +946,23 @@ pub fn insert_returning_qualified_quoted_table(limbo: TempDatabase) {
 }
 
 #[turso_macros::test]
+pub fn returning_quoted_column_name(limbo: TempDatabase) {
+    let conn = limbo.db.connect().unwrap();
+    conn.execute("CREATE TABLE counters (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+
+    let stmt = conn
+        .prepare("INSERT INTO counters (name) VALUES ('test') RETURNING `id`")
+        .unwrap();
+    assert_eq!(stmt.get_column_name(0), "id");
+
+    let stmt = conn
+        .prepare(r#"INSERT INTO counters (name) VALUES ('test') RETURNING "id""#)
+        .unwrap();
+    assert_eq!(stmt.get_column_name(0), "id");
+}
+
+#[turso_macros::test]
 pub fn concurrent_writes_over_single_connection(limbo: TempDatabase) {
     const COUNT: usize = 16;
     let conn = limbo.db.connect().unwrap();
