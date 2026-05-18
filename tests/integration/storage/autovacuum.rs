@@ -1,3 +1,4 @@
+#[cfg(not(feature = "omit_autovacuum"))]
 use crate::common::rusqlite_integrity_check;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -46,6 +47,7 @@ fn test_autovacuum_readonly_behavior() {
 }
 
 #[test]
+#[cfg(not(feature = "omit_autovacuum"))]
 fn test_autovacuum_freelist_allocation_updates_header_at_ptrmap_boundary() -> anyhow::Result<()> {
     let temp_dir = TempDir::new()?;
     let db_path = temp_dir.path().join("ptrmap-boundary.db");
