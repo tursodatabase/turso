@@ -1,6 +1,7 @@
 //! VDBE bytecode generation for pragma statements.
 //! More info: https://www.sqlite.org/pragma.html.
 
+use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
 use crate::turso_soft_unreachable;
 use chrono::Datelike;
@@ -47,19 +48,20 @@ fn parse_max_errors_from_value(value: &Option<Expr>) -> usize {
     }
 }
 
-fn visible_database_ids_for_table_list(connection: &crate::Connection) -> BitSet {
+fn visible_database_ids_for_table_list(connection: &crate::Connection) -> crate::Result<BitSet> {
+    use crate::alloc::*;
     let mut ids = BitSet::default();
     ids.set(crate::MAIN_DB_ID);
     ids.set(crate::TEMP_DB_ID);
-    ids.extend(
+    ids.try_extend(
         connection
             .attached_databases()
             .read()
             .index_to_data
             .keys()
             .copied(),
-    );
-    ids
+    )?;
+    Ok(ids)
 }
 
 fn display_table_list_name(database_id: usize, name: &str) -> String {
@@ -1228,9 +1230,9 @@ fn query_pragma(
             program.alloc_registers(5);
 
             let database_ids = if schema_was_explicit {
-                [database_id].into_iter().collect::<BitSet>()
+                [database_id].into_iter().try_collect::<BitSet>()?
             } else {
-                visible_database_ids_for_table_list(connection.as_ref())
+                visible_database_ids_for_table_list(connection.as_ref())?
             };
             for current_database_id in &database_ids {
                 let database_name = connection
