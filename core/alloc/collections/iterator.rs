@@ -17,7 +17,11 @@ where
                 None
             }
         }))?;
-        if saw_none { Ok(None) } else { Ok(Some(values)) }
+        if saw_none {
+            Ok(None)
+        } else {
+            Ok(Some(values))
+        }
     }
 
     fn try_extend<I>(&mut self, iter: I) -> Result<(), TryReserveError>

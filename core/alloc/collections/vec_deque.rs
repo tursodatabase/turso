@@ -60,8 +60,14 @@ impl<T> TursoFromIterator<T> for VecDeque<T> {
         let (lower, upper) = iter.size_hint();
         let capacity = upper.unwrap_or(lower);
         let mut values = <Self as TursoTryWithCapacityExt>::try_with_capacity(capacity)?;
-        for value in iter {
-            values.try_push_back(value)?;
+        if upper.is_some() {
+            for value in iter {
+                values.push_back(value);
+            }
+        } else {
+            for value in iter {
+                values.try_push_back(value)?;
+            }
         }
         Ok(values)
     }
@@ -73,8 +79,14 @@ impl<T> TursoFromIterator<T> for VecDeque<T> {
         let iter = iter.into_iter();
         let (lower, upper) = iter.size_hint();
         self.try_reserve(upper.unwrap_or(lower))?;
-        for value in iter {
-            self.try_push_back(value)?;
+        if upper.is_some() {
+            for value in iter {
+                self.push_back(value);
+            }
+        } else {
+            for value in iter {
+                self.try_push_back(value)?;
+            }
         }
         Ok(())
     }

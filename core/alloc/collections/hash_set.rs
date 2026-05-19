@@ -52,8 +52,14 @@ where
         let (lower, upper) = iter.size_hint();
         let capacity = upper.unwrap_or(lower);
         let mut values = <Self as TursoTryWithCapacityExt>::try_with_capacity(capacity)?;
-        for value in iter {
-            TursoHashSetExt::try_insert(&mut values, value)?;
+        if upper.is_some() {
+            for value in iter {
+                values.insert(value);
+            }
+        } else {
+            for value in iter {
+                TursoHashSetExt::try_insert(&mut values, value)?;
+            }
         }
         Ok(values)
     }
@@ -65,8 +71,14 @@ where
         let iter = iter.into_iter();
         let (lower, upper) = iter.size_hint();
         self.try_reserve(upper.unwrap_or(lower))?;
-        for value in iter {
-            TursoHashSetExt::try_insert(self, value)?;
+        if upper.is_some() {
+            for value in iter {
+                self.insert(value);
+            }
+        } else {
+            for value in iter {
+                TursoHashSetExt::try_insert(self, value)?;
+            }
         }
         Ok(())
     }
