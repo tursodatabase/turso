@@ -57,7 +57,7 @@ where
 
     #[inline(always)]
     fn try_clone(&self) -> Result<Self, Self::Error> {
-        let mut cloned = Self::with_hasher(self.hasher().clone());
+        let mut cloned = Self::with_hasher(*self.hasher());
         cloned.try_reserve(self.len())?;
         // TODO: have a `TryClone` boundary for K and V here instead of `Clone`
         cloned.extend(self.iter().map(|(key, value)| (key.clone(), value.clone())));

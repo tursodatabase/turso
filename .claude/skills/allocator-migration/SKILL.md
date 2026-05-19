@@ -171,4 +171,26 @@ Before allocator-sensitive commits, also check the nightly cfg build:
 RUSTFLAGS="--cfg nightly" cargo +nightly check -p turso_core
 ```
 
+For allocator collection performance work, use the Divan comparison script. It
+runs the `alloc_collections` bench by default and prints a sorted std-vs-Turso
+comparison table:
+
+```bash
+scripts/compare-divan-std-turso.py --run
+```
+
+To exercise the nightly allocator paths, run:
+
+```bash
+scripts/compare-divan-std-turso.py --run --nightly
+```
+
+Useful variants:
+
+```bash
+scripts/compare-divan-std-turso.py --run --bench-filter hash_map --filter hash_map
+scripts/compare-divan-std-turso.py --run --save-output /tmp/alloc_collections.txt
+scripts/compare-divan-std-turso.py /tmp/alloc_collections.txt
+```
+
 Run focused tests only when the touched code path is risky, behavior changed, or compilation is not enough to validate the migration.

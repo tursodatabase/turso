@@ -10,7 +10,7 @@ where
         I: IntoIterator<Item = Option<T>>,
     {
         let mut saw_none = false;
-        let values = C::try_from_iter(iter.into_iter().scan((), |(), item| match item {
+        let values = C::try_from_iter(iter.into_iter().map_while(|item| match item {
             Some(value) => Some(value),
             None => {
                 saw_none = true;
@@ -32,7 +32,7 @@ where
             return Ok(());
         };
         let mut saw_none = false;
-        values.try_extend(iter.into_iter().scan((), |(), item| match item {
+        values.try_extend(iter.into_iter().map_while(|item| match item {
             Some(value) => Some(value),
             None => {
                 saw_none = true;
@@ -56,7 +56,7 @@ where
         I: IntoIterator<Item = Result<T, E>>,
     {
         let mut error = None;
-        let values = C::try_from_iter(iter.into_iter().scan((), |(), item| match item {
+        let values = C::try_from_iter(iter.into_iter().map_while(|item| match item {
             Ok(value) => Some(value),
             Err(err) => {
                 error = Some(F::from(err));
@@ -78,7 +78,7 @@ where
             return Ok(());
         };
         let mut error = None;
-        values.try_extend(iter.into_iter().scan((), |(), item| match item {
+        values.try_extend(iter.into_iter().map_while(|item| match item {
             Ok(value) => Some(value),
             Err(err) => {
                 error = Some(F::from(err));
