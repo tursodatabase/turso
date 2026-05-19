@@ -21,7 +21,7 @@ impl<T> TursoVecExt<T> for Vec<T> {
     }
 
     fn try_push(&mut self, value: T) -> Result<(), TryReserveError> {
-        self.try_reserve(1).map_err(TryReserveError::from)?;
+        self.try_reserve(1)?;
         self.push(value);
         Ok(())
     }
@@ -32,9 +32,7 @@ impl<T> TursoTryWithCapacityExt for Vec<T> {
         #[cfg(not(nightly))]
         {
             let mut values = vec();
-            values
-                .try_reserve(capacity)
-                .map_err(TryReserveError::from)?;
+            values.try_reserve(capacity)?;
             Ok(values)
         }
         #[cfg(nightly)]
@@ -55,9 +53,7 @@ impl<T> TursoFromIterator<T> for Vec<T> {
         let capacity = upper.unwrap_or(lower);
         let mut values = <Self as TursoTryWithCapacityExt>::try_with_capacity(capacity)?;
         if upper.is_some() {
-            for value in iter {
-                values.push(value);
-            }
+            values.extend(iter);
         } else {
             for value in iter {
                 values.try_push(value)?;

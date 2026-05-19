@@ -55,9 +55,13 @@ impl<T: Ord> TursoFromIterator<T> for BinaryHeap<T> {
         #[cfg(not(nightly))]
         let mut values = std::vec::Vec::new();
         values.try_reserve(upper.unwrap_or(lower))?;
-        for value in iter {
-            // We already reserved enough space above so no panics should happen
-            values.push(value);
+        if upper.is_some() {
+            values.extend(iter);
+        } else {
+            for value in iter {
+                values.try_reserve(1)?;
+                values.push(value);
+            }
         }
         Ok(BinaryHeap::from(values))
     }
@@ -70,9 +74,13 @@ impl<T: Ord> TursoFromIterator<T> for BinaryHeap<T> {
         let (lower, upper) = iter.size_hint();
         let mut values = std::mem::take(self).into_vec();
         values.try_reserve(upper.unwrap_or(lower))?;
-        for value in iter {
-            // We already reserved enough space above so no panics should happen
-            values.push(value);
+        if upper.is_some() {
+            values.extend(iter);
+        } else {
+            for value in iter {
+                values.try_reserve(1)?;
+                values.push(value);
+            }
         }
 
         *self = BinaryHeap::from(values);

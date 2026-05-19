@@ -29,13 +29,13 @@ impl<T> TursoAllocExt for VecDeque<T> {
 
 impl<T> TursoVecDequeExt<T> for VecDeque<T> {
     fn try_push_back(&mut self, value: T) -> Result<(), TryReserveError> {
-        self.try_reserve(1).map_err(TryReserveError::from)?;
+        self.try_reserve(1)?;
         self.push_back(value);
         Ok(())
     }
 
     fn try_push_front(&mut self, value: T) -> Result<(), TryReserveError> {
-        self.try_reserve(1).map_err(TryReserveError::from)?;
+        self.try_reserve(1)?;
         self.push_front(value);
         Ok(())
     }
@@ -44,9 +44,7 @@ impl<T> TursoVecDequeExt<T> for VecDeque<T> {
 impl<T> TursoTryWithCapacityExt for VecDeque<T> {
     fn try_with_capacity(capacity: usize) -> Result<Self, TryReserveError> {
         let mut values = <Self as TursoAllocExt>::new();
-        values
-            .try_reserve(capacity)
-            .map_err(TryReserveError::from)?;
+        values.try_reserve(capacity)?;
         Ok(values)
     }
 }
@@ -61,9 +59,7 @@ impl<T> TursoFromIterator<T> for VecDeque<T> {
         let capacity = upper.unwrap_or(lower);
         let mut values = <Self as TursoTryWithCapacityExt>::try_with_capacity(capacity)?;
         if upper.is_some() {
-            for value in iter {
-                values.push_back(value);
-            }
+            values.extend(iter);
         } else {
             for value in iter {
                 values.try_push_back(value)?;
@@ -80,9 +76,7 @@ impl<T> TursoFromIterator<T> for VecDeque<T> {
         let (lower, upper) = iter.size_hint();
         self.try_reserve(upper.unwrap_or(lower))?;
         if upper.is_some() {
-            for value in iter {
-                self.push_back(value);
-            }
+            self.extend(iter);
         } else {
             for value in iter {
                 self.try_push_back(value)?;
