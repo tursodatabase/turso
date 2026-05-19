@@ -1,4 +1,4 @@
-import { unlinkSync } from "node:fs";
+import { existsSync, unlinkSync } from "node:fs";
 import { test as baseTest, expect } from 'vitest'
 import { connect, Database, DatabaseRowMutation, DatabaseRowTransformResult, retryFetch } from './promise.js'
 import { TursoServer } from './turso-server.js'
@@ -20,6 +20,35 @@ function cleanup(path: string) {
     unlinkSync(`${path}-changes`);
     try { unlinkSync(`${path}-wal-revert`) } catch (e) { }
 }
+
+function unlinkIfExists(path: string) {
+    if (existsSync(path)) {
+        unlinkSync(path);
+    }
+}
+
+baseTest('local vacuum', async () => {
+    const path = `sync-vacuum-${(Math.random() * 10000) | 0}.db`;
+    let db: Database | undefined;
+    try {
+        db = await connect({
+            path,
+            experimental: ['vacuum'],
+        });
+        await db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)");
+        await db.exec("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')");
+        await db.exec("DELETE FROM t WHERE id = 2");
+
+        await db.exec("VACUUM");
+
+        expect(await (await db.prepare("SELECT COUNT(*) as cnt FROM t")).all()).toEqual([{ cnt: 2 }]);
+        expect(await (await db.prepare("PRAGMA integrity_check")).all()).toEqual([{ integrity_check: "ok" }]);
+    } finally {
+        await db?.close();
+        unlinkIfExists(path);
+        unlinkIfExists(`${path}-wal`);
+    }
+});
 
 test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync concurrency', async ({ server }) => {
     {

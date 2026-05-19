@@ -1,8 +1,14 @@
-import { unlinkSync } from "node:fs";
+import { existsSync, unlinkSync } from "node:fs";
 import { expect, test } from 'vitest'
 import { Database, connect } from './promise.js'
 import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
+
+function unlinkIfExists(path: string) {
+    if (existsSync(path)) {
+        unlinkSync(path);
+    }
+}
 
 test('drizzle-orm', async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
@@ -63,6 +69,26 @@ test('readonly-db', async () => {
 test('file-must-exist', async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     await expect(async () => await connect(path, { fileMustExist: true })).rejects.toThrowError(/failed to open database/);
+})
+
+test('vacuum', async () => {
+    const path = `test-vacuum-${(Math.random() * 10000) | 0}.db`;
+    let db: Database | undefined;
+    try {
+        db = await connect(path, { experimental: ["vacuum"] });
+        await db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)");
+        await db.exec("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')");
+        await db.exec("DELETE FROM t WHERE id = 2");
+
+        await db.exec("VACUUM");
+
+        expect(await (await db.prepare("SELECT COUNT(*) as cnt FROM t")).get()).toEqual({ cnt: 2 });
+        expect(await (await db.prepare("PRAGMA integrity_check")).get()).toEqual({ integrity_check: "ok" });
+    } finally {
+        db?.close();
+        unlinkIfExists(path);
+        unlinkIfExists(`${path}-wal`);
+    }
 })
 
 test('implicit connect', async () => {
