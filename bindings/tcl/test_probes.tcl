@@ -111,6 +111,24 @@ assert_eq "multi-statement db eval keeps rows from every statement" \
     {1 one 2 two 2} [db eval $multi_sql]
 
 # ---------------------------------------------------------------------------
+# Probe 5: VACUUM is enabled for the native binding and preserves data.
+# ---------------------------------------------------------------------------
+
+set vacuum_db [file join $here vacuum-probe-[pid].db]
+file delete -force $vacuum_db ${vacuum_db}-wal ${vacuum_db}-shm
+sqlite3 vac $vacuum_db
+vac eval {
+    CREATE TABLE tv(id INTEGER PRIMARY KEY, payload TEXT);
+    INSERT INTO tv VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    DELETE FROM tv WHERE id = 2;
+    VACUUM;
+}
+assert_eq "vacuum keeps data and integrity" \
+    {2 ok} [vac eval {SELECT count(*) FROM tv; PRAGMA integrity_check;}]
+vac close
+file delete -force $vacuum_db ${vacuum_db}-wal ${vacuum_db}-shm
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
