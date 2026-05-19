@@ -1392,18 +1392,18 @@ pub fn compute_greedy_join_order<'a>(
         .map(|(j, _)| {
             let mut required = TableMask::default();
             for k in 0..j {
-                required.set(k);
+                required.set(k)?;
             }
-            (j, required)
+            Ok((j, required))
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     let mut remaining: TableMask = (0..num_tables).try_collect()?;
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
 
     // Pick starting table: prefer tables with high "hub score" (referenced by many constraints).
     let first_idx =
-        find_best_starting_table(num_tables, constraints, base_table_rows, &left_join_deps);
+        find_best_starting_table(num_tables, constraints, base_table_rows, &left_join_deps)?;
     let first_table = &joined_tables[first_idx];
     join_order.push(JoinOrderMember {
         table_id: first_table.internal_id,
@@ -1566,7 +1566,7 @@ fn find_best_starting_table(
     constraints: &[TableConstraints],
     base_table_rows: &[RowCountEstimate],
     left_join_deps: &HashMap<usize, TableMask>,
-) -> usize {
+) -> Result<usize> {
     // hub_score[t] = count of usable constraints on OTHER tables that reference t.
     // If we join t first, each such constraint becomes usable for an index lookup.
     let mut hub_score = vec![0usize; num_tables];
@@ -1591,7 +1591,7 @@ fn find_best_starting_table(
         // Self-constraints compare columns within the same table (e.g., t.col1 < t.col2).
         let self_mask = {
             let mut m = TableMask::default();
-            m.set(t);
+            m.set(t)?;
             m
         };
 
@@ -1611,7 +1611,7 @@ fn find_best_starting_table(
     }
 
     // Table 0 can never be outer join RHS, so best is always Some.
-    best.expect("no valid starting table").0
+    Ok(best.expect("no valid starting table").0)
 }
 
 /// Specialized version of [compute_best_join_order] that just joins tables in the order they are given

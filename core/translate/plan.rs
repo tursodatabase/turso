@@ -1157,8 +1157,9 @@ impl OuterQueryReference {
     }
 
     /// Marks a column as used; used means that the column is referenced in the query.
-    pub fn mark_column_used(&mut self, column_index: usize) {
-        self.col_used_mask.set(column_index);
+    pub fn mark_column_used(&mut self, column_index: usize) -> Result<()> {
+        self.col_used_mask.set(column_index)?;
+        Ok(())
     }
 
     /// Whether the OuterQueryReference is used by the current query scope.
@@ -1441,7 +1442,9 @@ impl TableReferences {
         } else if let Some(outer_query_ref) =
             self.find_outer_query_ref_by_internal_id_mut(internal_id)
         {
-            outer_query_ref.mark_column_used(column_index);
+            outer_query_ref
+                .mark_column_used(column_index)
+                .expect("TODO: alloc error");
         } else {
             panic!("table with internal id {internal_id} not found in table references");
         }
@@ -2393,7 +2396,7 @@ impl JoinedTable {
             self.column_use_counts.resize(index + 1, 0);
         }
         self.column_use_counts[index] += 1;
-        self.col_used_mask.set(index);
+        self.col_used_mask.set(index).expect("TODO: alloc error");
     }
 
     /// Clear any previously registered expression index usages.

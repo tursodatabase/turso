@@ -174,7 +174,7 @@ fn collect_changed_cols(
             if c.is_rowid_alias() {
                 rowid_changed = true;
             } else {
-                cols_changed.set(*col_idx);
+                cols_changed.set(*col_idx).expect("TODO: alloc error");
             }
         }
     }
@@ -323,7 +323,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
         }
 
         if let Some(i) = found {
-            matched.set(i);
+            matched.set(i).expect("TODO: alloc error");
         } else {
             return false;
         }

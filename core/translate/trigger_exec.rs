@@ -633,7 +633,7 @@ fn execute_trigger_commands(
     // before OP_Program enters the subprogram.
     for db_id in &subprogram_prepared.write_databases {
         if db_id == crate::MAIN_DB_ID {
-            program.begin_write_operation();
+            program.begin_write_operation()?;
         } else {
             let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
             program.begin_write_on_database(db_id, schema_cookie)?;

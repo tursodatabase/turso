@@ -408,7 +408,7 @@ pub fn translate_inner(
 
     // Indicate write operations so that in the epilogue we can emit the correct type of transaction
     if is_write {
-        program.begin_write_operation();
+        program.begin_write_operation()?;
     }
 
     // Indicate read operations so that in the epilogue we can emit the correct type of transaction

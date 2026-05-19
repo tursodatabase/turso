@@ -2208,7 +2208,7 @@ fn translate_rename_virtual_table(
     database_id: usize,
 ) -> Result<()> {
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_operation();
+    program.begin_write_operation()?;
     let vtab_cur = program.alloc_cursor_id(CursorType::VirtualTable(vtab));
     program.emit_insn(Insn::VOpen {
         cursor_id: vtab_cur,

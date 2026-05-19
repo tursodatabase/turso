@@ -647,7 +647,7 @@ pub fn try_capture_parameters_column_agnostic(
                 continue;
             }
             if exprs_are_equivalent(pattern_col, query_col) {
-                matched_pattern_indices.set(i);
+                matched_pattern_indices.set(i).expect("TODO: alloc error");
                 found_match = true;
                 break;
             }
