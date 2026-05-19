@@ -155,27 +155,20 @@ fn populate_blob_test_rows(whopper: &mut MultiprocessWhopper) {
         .expect("commit should succeed");
 }
 
+/// Returns `(max_frame, nbackfills)`
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn create_partial_checkpoint_state(whopper: &mut MultiprocessWhopper) -> (u64, u64) {
     populate_blob_test_rows(whopper);
 
-    let snapshot_before_checkpoint = whopper
-        .shared_wal_snapshot_direct(0)
-        .expect("read shared WAL snapshot before checkpoint")
-        .expect("shared WAL snapshot should be available");
+    let snapshot_before_checkpoint = whopper.shared_wal_snapshot_direct(0).unwrap().unwrap();
     assert!(
         snapshot_before_checkpoint.max_frame > 1,
         "partial-checkpoint restart coverage requires more than one WAL frame before checkpointing"
     );
 
-    whopper
-        .passive_checkpoint_direct(0, Some(1))
-        .expect("run partial checkpoint");
+    whopper.passive_checkpoint_direct(0, Some(1)).unwrap();
 
-    let snapshot_after_checkpoint = whopper
-        .shared_wal_snapshot_direct(0)
-        .expect("read shared WAL snapshot after checkpoint")
-        .expect("shared WAL snapshot should be available");
+    let snapshot_after_checkpoint = whopper.shared_wal_snapshot_direct(0).unwrap().unwrap();
     assert!(
         snapshot_after_checkpoint.nbackfills > 0,
         "partial-checkpoint restart coverage requires positive nbackfills"
@@ -622,122 +615,40 @@ fn multiprocess_finalize_after_restart_preserves_simple_kv_rows() {
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
-fn multiprocess_seed_5724542806254236599_restart_then_finalize_preserves_key_684() {
-    configure_worker_exe();
-    let mut whopper = MultiprocessWhopper::new(MultiprocessOpts {
-        seed: Some(5724542806254236599),
-        enable_mvcc: false,
-        process_count: 16,
-        connections_per_process: 1,
-        max_steps: 4951,
-        elle_tables: vec![],
-        workloads: vec![
-            (10, Box::new(IntegrityCheckWorkload)),
-            (5, Box::new(WalCheckpointWorkload)),
-            (10, Box::new(CreateSimpleTableWorkload)),
-            (20, Box::new(SimpleSelectWorkload)),
-            (20, Box::new(SimpleInsertWorkload)),
-            (15, Box::new(UpdateWorkload)),
-            (15, Box::new(DeleteWorkload)),
-            (2, Box::new(CreateIndexWorkload)),
-            (2, Box::new(DropIndexWorkload)),
-            (30, Box::new(BeginWorkload)),
-            (10, Box::new(CommitWorkload)),
-            (10, Box::new(RollbackWorkload)),
-        ],
-        properties: vec![],
-        chaotic_profiles: vec![],
-        kill_probability: 0.0,
-        restart_probability: 0.05,
-        history_output: None,
-        keep_files: true,
-    })
-    .expect("create seeded multiprocess whopper");
+fn multiprocess_integrity_check_after_restart_preserves_authoritative_wal_snapshot()
+-> anyhow::Result<()> {
+    let mut whopper = create_multiprocess_whopper_with_keep(1, true);
     let db_path = whopper.db_path().to_path_buf();
 
-    while whopper.current_step < 4950 {
-        whopper.step().expect("seeded whopper step");
-    }
+    let (max_frame, nbackfills_before_restart) = create_partial_checkpoint_state(&mut whopper);
+    assert!(max_frame > nbackfills_before_restart);
 
-    let rows_after_restart = whopper
-        .execute_sql_direct(
-            0,
-            "select count(*), min(length(value)), max(length(value)) from simple_kv_19961 where key='key_684'",
-        )
-        .expect("query key_684 after restart")
-        .expect("post-restart query should succeed");
-    assert_eq!(
-        rows_after_restart[0][0].as_int(),
-        Some(1),
-        "row should remain visible immediately after the step 4950 restart",
-    );
-    assert_eq!(rows_after_restart[0][1].as_int(), Some(6871));
-    assert_eq!(rows_after_restart[0][2].as_int(), Some(6871));
-    let snapshot_after_restart = whopper
-        .shared_wal_snapshot_direct(0)
-        .expect("read shared WAL snapshot after restart")
-        .expect("shared WAL snapshot should exist after restart");
+    whopper.restart_all_workers_preserve_files()?;
 
-    whopper.step().expect("run step 4951 after restart");
-    let snapshot_after_integrity_check = whopper
-        .shared_wal_snapshot_direct(0)
-        .expect("read shared WAL snapshot after integrity check")
-        .expect("shared WAL snapshot should exist after integrity check");
+    let snapshot_after_restart = whopper.shared_wal_snapshot_direct(0)?.unwrap();
+    assert!(snapshot_after_restart.max_frame > snapshot_after_restart.nbackfills,);
+
+    assert_integrity_check_ok(&mut whopper, 0);
+
+    let snapshot_after_integrity_check = whopper.shared_wal_snapshot_direct(0)?.unwrap();
     assert_eq!(
-        snapshot_after_integrity_check.max_frame, snapshot_after_restart.max_frame,
-        "integrity_check must not mutate authoritative max_frame",
+        snapshot_after_integrity_check.max_frame,
+        snapshot_after_restart.max_frame,
     );
     assert_eq!(
-        snapshot_after_integrity_check.nbackfills, snapshot_after_restart.nbackfills,
-        "integrity_check must not publish checkpoint progress",
+        snapshot_after_integrity_check.nbackfills,
+        snapshot_after_restart.nbackfills,
     );
     assert_eq!(
-        snapshot_after_integrity_check.checkpoint_seq, snapshot_after_restart.checkpoint_seq,
-        "integrity_check must not advance the WAL generation",
+        snapshot_after_integrity_check.checkpoint_seq,
+        snapshot_after_restart.checkpoint_seq,
     );
 
-    let pre_finalize_rows = whopper
-        .execute_sql_direct(
-            0,
-            "select count(*), min(length(value)), max(length(value)) from simple_kv_19961 where key='key_684'",
-        )
-        .expect("query key_684 before finalize")
-        .expect("pre-finalize query should succeed");
-    assert_eq!(
-        pre_finalize_rows[0][0].as_int(),
-        Some(1),
-        "row should still be visible after the step 4951 integrity check",
-    );
-    assert_eq!(pre_finalize_rows[0][1].as_int(), Some(6871));
-    assert_eq!(pre_finalize_rows[0][2].as_int(), Some(6871));
-
-    whopper
-        .finalize()
-        .expect("finalize seeded multiprocess whopper");
-
-    let io: Arc<dyn IO> = multiprocess_test_io();
-    let reopened = Database::open_file(io, db_path.to_str().expect("db path utf8"))
-        .expect("reopen finalized seeded database");
-    let conn = reopened.connect().expect("connect reopened seeded db");
-    let mut stmt = conn
-        .prepare("select count(*), min(length(value)), max(length(value)) from simple_kv_19961 where key='key_684'")
-        .expect("prepare reopened seeded query");
-    let mut reopened_rows = Vec::new();
-    stmt.run_with_row_callback(|row| {
-        reopened_rows.push((
-            row.get::<i64>(0).expect("count column"),
-            row.get::<i64>(1).expect("min length column"),
-            row.get::<i64>(2).expect("max length column"),
-        ));
-        Ok(())
-    })
-    .expect("run reopened seeded query");
-    assert_eq!(reopened_rows, vec![(1, 6871, 6871)]);
-
-    let db_str = db_path.to_str().expect("db path utf8");
+    let db_str = db_path.to_str().unwrap();
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_file(format!("{db_str}-wal"));
     let _ = std::fs::remove_file(format!("{db_str}-tshm"));
+    Ok(())
 }
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
