@@ -5016,6 +5016,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             })?;
         }
         let mut index_infos: HashMap<MVTableId, Arc<IndexInfo>> = HashMap::default();
+        let mut transient_schema_index_ids: HashSet<MVTableId> = HashSet::default();
 
         // Track whether we have pending schema changes that need a rebuild.
         // We defer rebuild_schema() until all consecutive schema rows have been
@@ -5154,17 +5155,30 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         .map(|value| value as i64)
                         .unwrap_or_else(|| i64::from(index_id)); // this can be negative for non-checkpointed indexes
 
-                    let index = schema
+                    let found_index = schema
                         .indexes
                         .values()
                         .flatten()
-                        .find(|idx| idx.root_page == root_page)
-                        .ok_or_else(|| {
-                            LimboError::InternalError(format!(
+                        .find(|idx| idx.root_page == root_page);
+                    let index = match found_index {
+                        Some(index) => IndexInfo::new_from_index(index),
+                        None if root_page < 0 => {
+                            // This index was created and dropped before being checkpointed.
+                            // The logical log can still contain its index-row operations, but
+                            // the rebuilt schema intentionally has no entry for the negative
+                            // root page. The streaming log reader needs some index metadata to
+                            // decode the key payload before the match arm below can skip it, so
+                            // use throwaway default metadata and mark the index id as transient.
+                            transient_schema_index_ids.insert(index_id);
+                            IndexInfo::default()
+                        }
+                        None => {
+                            return Err(LimboError::InternalError(format!(
                                 "Index with root page {root_page} not found in schema",
-                            ))
-                        })?;
-                    let index_info = Arc::new(IndexInfo::new_from_index(index));
+                            )));
+                        }
+                    };
+                    let index_info = Arc::new(index);
                     index_infos.insert(index_id, index_info.clone());
                     Ok(index_info)
                 }
@@ -5396,6 +5410,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     if commit_ts <= replay_cutoff_ts {
                         continue;
                     }
+                    if transient_schema_index_ids.contains(&rowid.table_id) {
+                        continue;
+                    }
                     let version_id = self.get_version_id();
                     let row_version = RowVersion {
                         id: version_id,
@@ -5417,6 +5434,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 } => {
                     max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
                     if commit_ts <= replay_cutoff_ts {
+                        continue;
+                    }
+                    if transient_schema_index_ids.contains(&rowid.table_id) {
                         continue;
                     }
                     let RowKey::Record(sortable_key) = rowid.row_id.clone() else {

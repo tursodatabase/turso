@@ -8781,6 +8781,52 @@ fn test_close_persists_drop_index() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+/// Reproducer: CREATE INDEX followed by DROP INDEX in the same transaction
+/// leaves a deleted sqlite_schema row that was never checkpointed into the
+/// B-tree. After restart, checkpoint must retire the transient index metadata
+/// without trying to delete that absent sqlite_schema row from the pager.
+#[test]
+fn test_checkpoint_skips_same_tx_create_drop_index_schema_delete() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'seed')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+        conn.execute("DROP INDEX idx_t_v").unwrap();
+        conn.execute("COMMIT").unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(
+        &conn,
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'idx_t_v'",
+    );
+    assert_eq!(rows.len(), 0);
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "seed");
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
 #[test]
 fn test_partial_commit_visibility_bug() {
     use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};

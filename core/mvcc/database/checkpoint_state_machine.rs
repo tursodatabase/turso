@@ -639,6 +639,19 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             }
                         }
                     }
+                } else {
+                    let is_transient_schema_tombstone = key.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
+                        && is_delete
+                        && !version.btree_resident
+                        && version.row.column_count == 0;
+                    if is_transient_schema_tombstone {
+                        // A payloadless, non-B-tree-resident sqlite_schema delete is a tombstone
+                        // recovered for a schema row that was inserted and deleted before any
+                        // checkpoint. `column_count == 0` means recovery had no pre-delete schema
+                        // record to preserve; `!btree_resident` means no sqlite_schema pager row
+                        // ever existed. Checkpoint can retire that logical tombstone locally.
+                        skip_write = true;
+                    }
                 }
                 if !skip_write {
                     tracing::trace!("adding to write_set {:?}", (&version, &special_write));
