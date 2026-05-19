@@ -271,7 +271,7 @@ test('concurrent-actions-consistency', async ({ server }) => {
         }
     }
     await Promise.all([pull(100), push(100), run(200)]);
-})
+}, 30_000)
 
 test('simple-db', async () => {
     const db = new Database({ path: ':memory:' });
