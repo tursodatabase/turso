@@ -3787,6 +3787,7 @@ impl Wal for WalFile {
 
     fn rollback(&self, rollback_to: Option<RollbackTo>) {
         let is_savepoint = rollback_to.is_some();
+        let local_state = self.connection_state();
         let snapshot = self.load_coordination_snapshot();
         let max_frame = rollback_to
             .as_ref()
@@ -3796,18 +3797,33 @@ impl Wal for WalFile {
             .as_ref()
             .map(|r| r.checksum)
             .unwrap_or(snapshot.last_checksum);
+        let preserve_unpublished_tail = is_savepoint
+            && self.has_unpublished_frames.load(Ordering::Acquire)
+            && local_state.snapshot.max_frame > max_frame;
         // Savepoints can be opened on a stale connection-local WAL snapshot.
         // Do not let that rollback remove frame-cache mappings for frames that
         // are already globally committed by another connection.
-        let cache_rollback_frame = if is_savepoint {
+        //
+        // Cache spills also append uncommitted frames before the final commit
+        // marker. A savepoint rollback restores changed pages through the
+        // subjournal, but the outer transaction can still need earlier dirty
+        // pages that were spilled and evicted after the savepoint opened. Keep
+        // that unpublished tail visible locally so those pages can be read and
+        // the eventual commit frame continues the checksum chain.
+        let cache_rollback_frame = if preserve_unpublished_tail {
+            local_state.snapshot.max_frame
+        } else if is_savepoint {
             max_frame.max(snapshot.max_frame)
         } else {
             max_frame
         };
         self.coordination.rollback_cache(cache_rollback_frame);
-        *self.last_checksum.write() = last_checksum;
-        self.max_frame.store(max_frame, Ordering::Release);
+        if !preserve_unpublished_tail {
+            *self.last_checksum.write() = last_checksum;
+            self.max_frame.store(max_frame, Ordering::Release);
+        }
         if !is_savepoint {
+            self.has_unpublished_frames.store(false, Ordering::Release);
             self.reset_internal_states();
         }
     }
@@ -4202,10 +4218,26 @@ impl Wal for WalFile {
         let mut page_frame_and_checksum: Vec<(PageRef, u64, (u32, u32))> =
             Vec::with_capacity(pages.len());
 
-        // Rolling checksum input to each frame build
-        let mut rolling_checksum: (u32, u32) = *self.last_checksum.read();
+        // Rolling checksum input to each frame build. Cache-spill writes do not
+        // go through prepare_frames(), so refresh stale local state here too.
+        let local_state = self.connection_state();
+        let snapshot = self.load_coordination_snapshot();
+        let local_has_stale_zero_frame_seed = snapshot.max_frame == 0
+            && local_state.snapshot.max_frame == 0
+            && local_state.snapshot.last_checksum != snapshot.last_checksum;
+        let (mut rolling_checksum, mut next_frame_id) = if local_has_stale_zero_frame_seed
+            && !self.has_unpublished_frames.load(Ordering::Acquire)
+        {
+            self.install_connection_state(local_state.with_snapshot(snapshot));
+            (snapshot.last_checksum, snapshot.max_frame + 1)
+        } else {
+            (
+                local_state.snapshot.last_checksum,
+                local_state.snapshot.max_frame + 1,
+            )
+        };
 
-        let mut next_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
+        let first_frame_id = next_frame_id;
         // Build every frame in order, updating the rolling checksum
         for page in pages.iter() {
             tracing::debug!("append_frames_vectored: page_id={}", page.get().id);
@@ -4246,7 +4278,6 @@ impl Wal for WalFile {
             next_frame_id += 1;
         }
 
-        let first_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
         let start_off = self.frame_offset(first_frame_id);
 
         // single completion for the whole batch
@@ -4278,6 +4309,7 @@ impl Wal for WalFile {
         for (page, fid, csum) in &page_frame_and_checksum {
             self.complete_append_frame(page.get().id as u64, *fid, *csum);
         }
+        self.has_unpublished_frames.store(true, Ordering::Release);
 
         Ok(c)
     }
@@ -5918,6 +5950,147 @@ pub mod test {
         wal.commit_prepared_frames(&[prepared]);
         wal.finish_append_frames_commit().unwrap();
         expected
+    }
+
+    #[test]
+    fn append_frames_vectored_after_external_header_refresh_uses_current_checksum_seed() {
+        let page_size = 512;
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool
+            .finalize_with_page_size(page_size as usize)
+            .unwrap();
+        let file = io
+            .open_file("stale-header-refresh.db-wal", OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let page_size = PageSize::new(page_size).unwrap();
+
+        let initializer =
+            WalFile::new(io.clone(), shared.clone(), ((0, 0), 0), buffer_pool.clone());
+        if let Some(c) = initializer.prepare_wal_start(page_size).unwrap() {
+            io.wait_for_completion(c).unwrap();
+        }
+        io.wait_for_completion(initializer.prepare_wal_finish(FileSyncType::Fsync).unwrap())
+            .unwrap();
+        let initial_header = initializer.coordination.wal_header();
+        let restart_seed = (initial_header.checksum_1, initial_header.checksum_2);
+
+        {
+            let mut shared = shared.write();
+            {
+                let mut header = shared.metadata.wal_header.lock();
+                header.checkpoint_seq = header.checkpoint_seq.wrapping_add(1);
+                header.salt_1 = header.salt_1.wrapping_add(1);
+                header.salt_2 = header.salt_2.wrapping_add(1);
+            }
+            shared.metadata.max_frame.store(0, Ordering::Release);
+            shared.metadata.nbackfills.store(0, Ordering::Release);
+            shared.metadata.last_checksum = restart_seed;
+            shared.metadata.initialized.store(false, Ordering::Release);
+        }
+
+        let stale_writer = WalFile::new(
+            io.clone(),
+            shared.clone(),
+            (restart_seed, 0),
+            buffer_pool.clone(),
+        );
+        let header_writer =
+            WalFile::new(io.clone(), shared, (restart_seed, 0), buffer_pool.clone());
+        if let Some(c) = header_writer.prepare_wal_start(page_size).unwrap() {
+            io.wait_for_completion(c).unwrap();
+        }
+        io.wait_for_completion(
+            header_writer
+                .prepare_wal_finish(FileSyncType::Fsync)
+                .unwrap(),
+        )
+        .unwrap();
+
+        let current_header = header_writer.coordination.wal_header();
+        let current_seed = (current_header.checksum_1, current_header.checksum_2);
+        assert_ne!(
+            restart_seed, current_seed,
+            "header rewrite must change the checksum seed for the regression to be meaningful"
+        );
+
+        let page = page_with_pattern(1, 0x42, &buffer_pool);
+        let c = stale_writer
+            .append_frames_vectored(vec![page], page_size)
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let mut frame_bytes =
+            vec![0; sqlite3_ondisk::WAL_FRAME_HEADER_SIZE + page_size.get() as usize];
+        let c = stale_writer.read_frame_raw(1, &mut frame_bytes).unwrap();
+        io.wait_for_completion(c).unwrap();
+        let (frame_header, frame_page) = sqlite3_ondisk::parse_wal_frame_header(&frame_bytes);
+        let use_native_endian = cfg!(target_endian = "big") == ((current_header.magic & 1) != 0);
+        let header_checksum = sqlite3_ondisk::checksum_wal(
+            &frame_bytes[..8],
+            &current_header,
+            current_seed,
+            use_native_endian,
+        );
+        let expected_checksum = sqlite3_ondisk::checksum_wal(
+            frame_page,
+            &current_header,
+            header_checksum,
+            use_native_endian,
+        );
+
+        assert_eq!(
+            (frame_header.checksum_1, frame_header.checksum_2),
+            expected_checksum,
+            "first spill frame after an external header refresh must validate against the current WAL header"
+        );
+    }
+
+    #[test]
+    fn savepoint_rollback_preserves_unpublished_spill_tail() {
+        let page_size = 512;
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool
+            .finalize_with_page_size(page_size as usize)
+            .unwrap();
+        let file = io
+            .open_file("savepoint-spill-tail.db-wal", OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let page_size = PageSize::new(page_size).unwrap();
+        let wal = WalFile::new(io.clone(), shared, ((0, 0), 0), buffer_pool.clone());
+
+        if let Some(c) = wal.prepare_wal_start(page_size).unwrap() {
+            io.wait_for_completion(c).unwrap();
+        }
+        io.wait_for_completion(wal.prepare_wal_finish(FileSyncType::Fsync).unwrap())
+            .unwrap();
+        let savepoint_checksum = wal.get_last_checksum();
+        let page = page_with_pattern(7, 0x5a, &buffer_pool);
+        let c = wal.append_frames_vectored(vec![page], page_size).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let spill_checksum = wal.get_last_checksum();
+        assert_eq!(wal.get_max_frame(), 1);
+        assert_ne!(savepoint_checksum, spill_checksum);
+
+        wal.rollback(Some(RollbackTo {
+            frame: 0,
+            checksum: savepoint_checksum,
+        }));
+
+        assert_eq!(
+            wal.get_max_frame(),
+            1,
+            "savepoint rollback must keep unpublished spill frames available for the outer transaction"
+        );
+        assert_eq!(
+            wal.get_last_checksum(),
+            spill_checksum,
+            "future commit frames must keep chaining after the unpublished spill tail"
+        );
     }
 
     fn wait_for_completion_error(io: &Arc<dyn IO>, completion: Completion) -> CompletionError {
