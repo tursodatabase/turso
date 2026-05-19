@@ -2439,13 +2439,11 @@ fn rewrite_trigger_sql_for_column_rename(
     // Get the trigger's owning table to check unqualified column references
     let trigger_table_name_raw = tbl_name.name.as_str();
     let trigger_table_name = normalize_ident(trigger_table_name_raw);
-    let trigger_table = resolver
-        .with_schema(trigger_database_id, |schema| {
-            schema.get_btree_table(&trigger_table_name)
-        })
-        .ok_or_else(|| {
-            LimboError::ParseError(format!("trigger table not found: {trigger_table_name}"))
-        })?;
+    let trigger_table =
+        resolve_trigger_command_table_for_alter(resolver, trigger_database_id, &trigger_table_name)
+            .ok_or_else(|| {
+                LimboError::ParseError(format!("trigger table not found: {trigger_table_name}"))
+            })?;
 
     // Check if this trigger references the column being renamed
     // We need to check if the column exists in the table being renamed

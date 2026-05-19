@@ -972,6 +972,26 @@ fn test_alter_table_rename_column_propagates_to_multiple_triggers(db: TempDataba
 }
 
 #[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_with_temp_trigger_on_main_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (a INTEGER, b INTEGER)")
+        .unwrap();
+    conn.execute(
+        "CREATE TEMP TRIGGER tr BEFORE INSERT ON t BEGIN
+         SELECT 1;
+        END",
+    )
+    .unwrap();
+
+    conn.execute("ALTER TABLE t RENAME COLUMN a TO c").unwrap();
+    conn.execute("INSERT INTO t(c, b) VALUES (1, 2)").unwrap();
+
+    let columns: Vec<(String,)> = conn.exec_rows("SELECT name FROM pragma_table_info('t')");
+    assert_eq!(columns, vec![("c".to_string(),), ("b".to_string(),)]);
+}
+
+#[turso_macros::test(mvcc)]
 fn test_alter_table_drop_column_fails_with_old_reference_in_update_trigger(db: TempDatabase) {
     let conn = db.connect_limbo();
 
