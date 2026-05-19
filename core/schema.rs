@@ -2762,31 +2762,33 @@ impl BTreeTable {
         table: &Arc<BTreeTable>,
         schema: &Schema,
         only_columns: Option<&ColumnMask>,
-    ) -> Arc<BTreeTable> {
+    ) -> Result<Arc<BTreeTable>> {
         let has_virtual = table.has_virtual_columns();
         let has_custom = table
             .columns
             .iter()
             .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
         if !has_custom && !has_virtual {
-            return Arc::clone(table);
+            return Ok(Arc::clone(table));
         }
         let mut modified = (**table).clone();
         let remapped_only_columns = if has_virtual {
-            let remapped = only_columns.map(|only| {
-                let mut new_set = ColumnMask::default();
-                let mut physical = 0usize;
-                for (orig, col) in modified.columns.iter().enumerate() {
-                    if col.is_virtual_generated() {
-                        continue;
+            let remapped = only_columns
+                .map(|only| {
+                    let mut new_set = ColumnMask::default();
+                    let mut physical = 0usize;
+                    for (orig, col) in modified.columns.iter().enumerate() {
+                        if col.is_virtual_generated() {
+                            continue;
+                        }
+                        if only.get(orig) {
+                            new_set.set(physical)?;
+                        }
+                        physical += 1;
                     }
-                    if only.get(orig) {
-                        new_set.set(physical);
-                    }
-                    physical += 1;
-                }
-                new_set
-            });
+                    Ok::<_, LimboError>(new_set)
+                })
+                .transpose()?;
             modified.columns.retain(|c| !c.is_virtual_generated());
             modified.has_virtual_columns = false;
             remapped
@@ -2809,7 +2811,7 @@ impl BTreeTable {
                 col.ty_str = type_def.value_input_type().to_uppercase();
             }
         }
-        Arc::new(modified)
+        Ok(Arc::new(modified))
     }
 
     /// Override column type metadata for custom type columns so that
@@ -6153,7 +6155,7 @@ mod tests {
         )?;
         let mut expected = t.columns_affected_by_update([0])?;
         let b_mask = t.columns_affected_by_update([1])?;
-        expected.union_with(&b_mask);
+        expected.union_with(&b_mask).unwrap();
         let union_mask = t.columns_affected_by_update([0, 1])?;
         assert_eq!(indices(&union_mask), indices(&expected));
         Ok(())

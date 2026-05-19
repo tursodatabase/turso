@@ -1704,7 +1704,7 @@ fn emit_update_insns<'a>(
                     &btree_table,
                     t_ctx.resolver.schema(),
                     Some(&set_col_indices),
-                ),
+                )?,
             });
 
             // Encode only SET clause columns. Non-SET columns were read from disk

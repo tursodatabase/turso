@@ -619,7 +619,7 @@ pub fn emit_upsert(
                     &bt,
                     resolver.schema(),
                     None,
-                ),
+                )?,
             });
 
             // Encode ALL columns. Both non-SET columns (decoded from disk above)

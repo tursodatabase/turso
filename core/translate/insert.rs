@@ -653,7 +653,7 @@ pub fn translate_insert(
                 ctx.table,
                 resolver.schema(),
                 None,
-            ),
+            )?,
         });
 
         // Encode values for columns with custom types.
