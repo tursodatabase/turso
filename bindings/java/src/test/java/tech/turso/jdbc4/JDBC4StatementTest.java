@@ -58,6 +58,31 @@ class JDBC4StatementTest {
   }
 
   @Test
+  void execute_vacuum_with_experimental_feature() throws Exception {
+    String filePath = TestUtils.createTempFile();
+    String url = "jdbc:turso:" + filePath;
+    Properties properties = new Properties();
+    properties.setProperty("experimental_features", "vacuum");
+
+    try (JDBC4Connection connection = new JDBC4Connection(url, filePath, properties);
+        Statement statement = connection.createStatement()) {
+      statement.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);");
+      statement.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');");
+      statement.execute("DELETE FROM t WHERE id = 2;");
+
+      assertFalse(statement.execute("VACUUM;"));
+
+      ResultSet count = statement.executeQuery("SELECT COUNT(*) FROM t;");
+      assertTrue(count.next());
+      assertEquals(2, count.getInt(1));
+
+      ResultSet integrity = statement.executeQuery("PRAGMA integrity_check;");
+      assertTrue(integrity.next());
+      assertEquals("ok", integrity.getString(1));
+    }
+  }
+
+  @Test
   void execute_select() throws Exception {
     stmt.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);");
     stmt.execute("INSERT INTO users VALUES (1, 'turso 1')");
