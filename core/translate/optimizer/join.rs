@@ -238,7 +238,7 @@ pub fn join_lhs_and_rhs<'a>(
     // (e.g., t.col1 < t.col2). Include them in selectivity since they filter rows.
     let rhs_self_mask = {
         let mut m = TableMask::default();
-        m.set(rhs_table_number);
+        m.set(rhs_table_number)?;
         m
     };
 
@@ -1050,7 +1050,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // there were no other tables.
     for i in 0..num_tables {
         let mut mask = TableMask::default();
-        mask.set(i);
+        mask.set(i)?;
         let table_ref = &joined_tables[i];
         join_order[0] = JoinOrderMember {
             table_id: table_ref.internal_id,
@@ -1116,10 +1116,10 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     {
                         // bitwise OR the masks
                         if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
-                            illegal_lhs.set(j);
+                            illegal_lhs.set(j)?;
                         } else {
                             let mut mask = TableMask::default();
-                            mask.set(j);
+                            mask.set(j)?;
                             left_join_illegal_map.insert(i, mask);
                         }
                     }

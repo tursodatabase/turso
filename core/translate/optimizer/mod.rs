@@ -1088,7 +1088,7 @@ fn collect_subquery_ids_from_exprs<'a>(
     let mut ids = BitSet::<turso_parser::ast::TableInternalId>::default();
     let mut collector = |e: &ast::Expr| -> Result<WalkControl> {
         if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
-            ids.set(*subquery_id);
+            ids.set(*subquery_id)?;
         }
         Ok(WalkControl::Continue)
     };
@@ -1113,7 +1113,7 @@ fn collect_update_phase_subquery_ids(
         plan.returning
             .iter()
             .flat_map(|returning| returning.iter().map(|column| &column.expr)),
-    )?);
+    )?)?;
     Ok(ids)
 }
 
@@ -2146,7 +2146,7 @@ fn optimize_table_access(
                         "hash join build/probe tables are not adjacent in join order"
                     );
                 }
-                probe_tables.set(*probe_table_idx);
+                probe_tables.set(*probe_table_idx)?;
                 build_tables.insert(*build_table_idx, *materialize_build_input);
             }
         }

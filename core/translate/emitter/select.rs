@@ -335,7 +335,7 @@ pub(crate) fn emit_materialized_build_inputs(
     for table in plan.table_references.joined_tables().iter() {
         if let Operation::HashJoin(hash_join_op) = &table.op {
             let build_table = &plan.table_references.joined_tables()[hash_join_op.build_table_idx];
-            hash_tables_to_keep_open.set(build_table.internal_id.into());
+            hash_tables_to_keep_open.set(build_table.internal_id.into())?;
         }
     }
 
@@ -350,7 +350,7 @@ pub(crate) fn emit_materialized_build_inputs(
             {
                 continue;
             }
-            seen_build_tables.set(hash_join_op.build_table_idx);
+            seen_build_tables.set(hash_join_op.build_table_idx)?;
 
             let probe_table_idx = hash_join_op.probe_table_idx;
             let probe_pos = plan
@@ -585,7 +585,7 @@ fn prune_join_order_for_materialized_inputs(
     for member in plan.join_order.iter() {
         let table = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table.op {
-            build_tables_in_plan.set(hash_join_op.build_table_idx);
+            build_tables_in_plan.set(hash_join_op.build_table_idx)?;
         }
     }
 
@@ -685,7 +685,7 @@ fn materialization_prefix(
     for member in prefix_join_order.iter() {
         let table_ref = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table_ref.op {
-            included_tables.set(hash_join_op.build_table_idx);
+            included_tables.set(hash_join_op.build_table_idx)?;
         }
     }
     Ok((prefix_join_order, included_tables))

@@ -291,7 +291,7 @@ impl AggregateFunction {
             _ => {
                 return Err(LimboError::InternalError(format!(
                     "Unknown aggregate type code: {type_code:?}"
-                )))
+                )));
             }
         };
 
@@ -827,7 +827,7 @@ impl AggregateState {
             _ => {
                 return Err(LimboError::InternalError(format!(
                     "Expected Integer for aggregate count, got {num_aggregates:?}"
-                )))
+                )));
             }
         };
         cursor += 1;
@@ -927,7 +927,7 @@ impl AggregateState {
                         _ => {
                             return Err(LimboError::InternalError(format!(
                                 "Expected Float for AVG sum, got {sum:?}"
-                            )))
+                            )));
                         }
                     };
                     cursor += 1;
@@ -940,7 +940,7 @@ impl AggregateState {
                         _ => {
                             return Err(LimboError::InternalError(format!(
                                 "Expected Integer for AVG count, got {count:?}"
-                            )))
+                            )));
                         }
                     };
                     cursor += 1;
@@ -1024,12 +1024,12 @@ impl AggregateState {
             Value::Numeric(Numeric::Integer(n)) => {
                 return Err(LimboError::InternalError(format!(
                     "Negative group key count: {n}"
-                )))
+                )));
             }
             other => {
                 return Err(LimboError::InternalError(format!(
                     "Expected Integer for group key count, got {other:?}"
-                )))
+                )));
             }
         };
 
@@ -1408,7 +1408,7 @@ impl AggregateOperator {
                 AggregateFunction::CountDistinct(col_idx)
                 | AggregateFunction::SumDistinct(col_idx)
                 | AggregateFunction::AvgDistinct(col_idx) => {
-                    distinct_columns.set(*col_idx);
+                    distinct_columns.set(*col_idx)?;
                 }
                 _ => {}
             }

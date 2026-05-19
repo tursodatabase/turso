@@ -71,7 +71,7 @@ pub fn single_table_column_usage(expr: &ast::Expr) -> Option<(TableInternalId, C
             } else {
                 table_id = Some(*table);
             }
-            columns.set(*column);
+            columns.set(*column)?;
         }
         Ok(WalkControl::Continue)
     });

@@ -213,7 +213,7 @@ fn referenced_index_cols(idx: &Index, table: &Table) -> crate::Result<ColumnMask
         if let Some(expr) = &ic.expr {
             index_expression_cols(table, &mut referenced_cols, expr);
         } else {
-            referenced_cols.set(ic.pos_in_table);
+            referenced_cols.set(ic.pos_in_table)?;
         }
     }
     match table.btree() {
@@ -247,7 +247,7 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
                 let tname = normalize_ident(table.get_name());
                 if nsn.eq_ignore_ascii_case(&tname) {
                     if let Some((i, _)) = table.get_column_by_name(&normalize_ident(c.as_str())) {
-                        out.set(i);
+                        out.set(i)?;
                     }
                 }
             }

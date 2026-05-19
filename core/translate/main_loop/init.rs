@@ -94,7 +94,7 @@ impl InitLoop {
             .try_collect()?;
         for table in tables.joined_tables().iter() {
             if let Operation::HashJoin(hash_join_op) = &table.op {
-                required_tables.set(hash_join_op.build_table_idx);
+                required_tables.set(hash_join_op.build_table_idx)?;
             }
         }
 

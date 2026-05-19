@@ -573,7 +573,7 @@ fn collect_indexes_to_update(
             if let Some(expr) = col.expr.as_ref() {
                 let cols_used =
                     expression_index_column_usage(expr.as_ref(), target_table_ref, resolver)?;
-                expression_cols_used.union_with(&cols_used);
+                expression_cols_used.union_with(&cols_used)?;
 
                 if !must_update
                     && affected_cols.as_ref().is_some_and(|affected_cols| {

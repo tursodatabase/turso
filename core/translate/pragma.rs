@@ -51,8 +51,8 @@ fn parse_max_errors_from_value(value: &Option<Expr>) -> usize {
 fn visible_database_ids_for_table_list(connection: &crate::Connection) -> crate::Result<BitSet> {
     use crate::alloc::*;
     let mut ids = BitSet::default();
-    ids.set(crate::MAIN_DB_ID);
-    ids.set(crate::TEMP_DB_ID);
+    ids.set(crate::MAIN_DB_ID)?;
+    ids.set(crate::TEMP_DB_ID)?;
     ids.try_extend(
         connection
             .attached_databases()

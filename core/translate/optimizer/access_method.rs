@@ -240,7 +240,7 @@ pub(super) fn choose_best_btree_candidate(
 
     // Build a mask for the rhs table itself.
     let mut rhs_table_mask = TableMask::default();
-    rhs_table_mask.set(rhs_table_idx);
+    rhs_table_mask.set(rhs_table_idx)?;
 
     // Estimate cost for each candidate index (including the rowid index) and
     // keep the best candidate.
