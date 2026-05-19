@@ -391,6 +391,26 @@ fn test_pragma_cache_size_min_value(db: TempDatabase) {
     assert_eq!(*value, 200);
 }
 
+#[turso_macros::test(mvcc)]
+fn test_pragma_cache_size_i32_min_order_by(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Regression for #7150: ORDER BY must not panic when cache_size is at i32::MIN.
+    // The pragma stores the raw KB-mode value verbatim, so op_sorter_open later
+    // reads i32::MIN back via get_cache_size(). Computing abs() on i32::MIN overflows.
+    let i32_min = i32::MIN as i64;
+    let query = format!("PRAGMA cache_size = {i32_min}");
+    conn.execute(&query).unwrap();
+    conn.execute("CREATE TABLE items (id TEXT)").unwrap();
+    conn.execute("INSERT INTO items VALUES ('b'), ('a')")
+        .unwrap();
+
+    let rows = limbo_exec_rows(&conn, "SELECT id FROM items ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], vec![RValue::Text("a".to_string())]);
+    assert_eq!(rows[1], vec![RValue::Text("b".to_string())]);
+}
+
 #[turso_macros::test]
 fn test_pragma_wal_checkpoint_targets_attached_database(db: TempDatabase) {
     let conn = db.connect_limbo();
