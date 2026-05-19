@@ -708,7 +708,7 @@ impl AggregateEvalState {
                         existing_groups,
                         old_values,
                         pre_existing_groups,
-                    );
+                    )?;
 
                     *self = AggregateEvalState::Done {
                         output: (output_delta, computed_states),
@@ -1062,7 +1062,7 @@ impl AggregateState {
         aggregates: &[AggregateFunction],
         _column_names: &[String], // No longer needed
         distinct_transitions: &HashMap<usize, DistinctTransition>,
-    ) {
+    ) -> Result<()> {
         // Update COUNT
         self.count += weight as i64;
 
@@ -1089,7 +1089,7 @@ impl AggregateState {
                                 TransitionType::Removed => current_count - 1,
                             };
                             self.distinct_counts.insert(*col_idx, new_count);
-                            processed_counts.set(*col_idx);
+                            processed_counts.set(*col_idx)?;
                         }
                     }
                 }
@@ -1105,7 +1105,7 @@ impl AggregateState {
                                 TransitionType::Removed => current_count - 1,
                             };
                             self.distinct_counts.insert(*col_idx, new_count);
-                            processed_counts.set(*col_idx);
+                            processed_counts.set(*col_idx)?;
                         }
 
                         // Update sum if not already processed
@@ -1123,7 +1123,7 @@ impl AggregateState {
                                 TransitionType::Removed => current_sum - value_as_float,
                             };
                             self.distinct_sums.insert(*col_idx, new_sum);
-                            processed_sums.set(*col_idx);
+                            processed_sums.set(*col_idx)?;
                         }
                     }
                 }
@@ -1177,6 +1177,7 @@ impl AggregateState {
                 }
             }
         }
+        Ok(())
     }
 
     /// Convert aggregate state to output values
@@ -1501,7 +1502,7 @@ impl AggregateOperator {
         existing_groups: &mut HashMap<String, AggregateState>,
         old_values: &mut HashMap<String, Vec<Value>>,
         pre_existing_groups: &HashSet<String>,
-    ) -> MergeResult {
+    ) -> Result<MergeResult> {
         let mut output_delta = Delta::new();
         let mut temp_keys: HashMap<String, Vec<Value>> = HashMap::default();
 
@@ -1558,7 +1559,7 @@ impl AggregateOperator {
                 &self.aggregates,
                 &self.input_column_names,
                 &distinct_transitions,
-            );
+            )?;
         }
 
         // Generate output delta from temporary states and collect final states
@@ -1627,7 +1628,7 @@ impl AggregateOperator {
             }
         }
 
-        (output_delta, final_states)
+        Ok((output_delta, final_states))
     }
 
     /// Extract distinct values from delta changes for batch tracking
