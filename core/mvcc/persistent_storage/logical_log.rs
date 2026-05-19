@@ -1034,12 +1034,6 @@ pub(crate) fn serialize_op_entry(
     portable_extension: Option<&[u8]>,
 ) -> Result<()> {
     let is_delete = row_version.end.is_some();
-    let tag = match (&row_version.row.id.row_id, is_delete) {
-        (RowKey::Int(_), false) => OP_UPSERT_TABLE,
-        (RowKey::Int(_), true) => OP_DELETE_TABLE,
-        (RowKey::Record(_), false) => OP_UPSERT_INDEX,
-        (RowKey::Record(_), true) => OP_DELETE_INDEX,
-    };
 
     let mut flags = 0u8;
     if row_version.btree_resident {
@@ -1060,15 +1054,15 @@ pub(crate) fn serialize_op_entry(
     );
     let table_id_i32 = table_id_i64 as i32;
 
-    buffer.push(tag);
-    buffer.push(flags);
-    buffer.extend_from_slice(&table_id_i32.to_le_bytes());
+    let write_header = |buf: &mut Vec<u8>, tag: u8| {
+        buf.push(tag);
+        buf.push(flags);
+        buf.extend_from_slice(&table_id_i32.to_le_bytes());
+    };
 
-    match tag {
-        OP_UPSERT_TABLE => {
-            let RowKey::Int(rowid) = row_version.row.id.row_id else {
-                unreachable!("table ops must have RowKey::Int")
-            };
+    match (&row_version.row.id.row_id, is_delete) {
+        (&RowKey::Int(rowid), false) => {
+            write_header(buffer, OP_UPSERT_TABLE);
             let record_bytes = row_version.row.payload();
             let rowid_u64 = rowid as u64;
             let rowid_len = varint_len(rowid_u64);
@@ -1077,24 +1071,25 @@ pub(crate) fn serialize_op_entry(
             write_varint_to_vec(rowid_u64, buffer);
             buffer.extend_from_slice(record_bytes);
         }
-        OP_DELETE_TABLE => {
-            let RowKey::Int(rowid) = row_version.row.id.row_id else {
-                unreachable!("table ops must have RowKey::Int")
-            };
+        (&RowKey::Int(rowid), true) => {
+            write_header(buffer, OP_DELETE_TABLE);
             let rowid_u64 = rowid as u64;
             let rowid_len = varint_len(rowid_u64);
             write_varint_to_vec(rowid_len as u64, buffer);
             write_varint_to_vec(rowid_u64, buffer);
         }
-        OP_UPSERT_INDEX | OP_DELETE_INDEX => {
+        (RowKey::Record(_), is_delete) => {
+            write_header(
+                buffer,
+                if is_delete {
+                    OP_DELETE_INDEX
+                } else {
+                    OP_UPSERT_INDEX
+                },
+            );
             let key_bytes = row_version.row.payload();
             write_varint_to_vec(key_bytes.len() as u64, buffer);
             buffer.extend_from_slice(key_bytes);
-        }
-        _ => {
-            return Err(LimboError::InternalError(format!(
-                "invalid logical log op tag: {tag}"
-            )));
         }
     }
 
