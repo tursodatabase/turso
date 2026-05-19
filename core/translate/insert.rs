@@ -1747,8 +1747,8 @@ fn emit_notnulls(
 
                 if ctx.table.is_strict {
                     program.emit_insn(Insn::TypeCheck {
-                        start_reg: column_mapping.register,
-                        count: 1,
+                        start_reg: insertion.first_col_register(),
+                        count: insertion.num_non_virtual_cols,
                         check_generated: true,
                         table_reference: BTreeTable::type_check_table_ref(
                             ctx.table,
