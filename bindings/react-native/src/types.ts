@@ -304,6 +304,11 @@ export interface DatabaseOpts {
   remoteEncryption?: EncryptionOpts;
 
   /**
+   * Experimental local database features to enable, for example `vacuum`.
+   */
+  experimental?: string[];
+
+  /**
    * Optional long-polling timeout for pull operation
    * If not set - no timeout is applied
    */
