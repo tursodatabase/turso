@@ -5535,11 +5535,15 @@ pub mod test {
     use crate::storage::shared_wal_coordination::{
         MappedSharedWalCoordination, SharedWalCoordinationHeader, SharedWalCoordinationOpenMode,
     };
-    use crate::sync::{atomic::Ordering, Arc};
+    use crate::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
     use crate::sync::{Mutex, RwLock};
     use crate::{
         io::FileSyncType,
         storage::{
+            btree::PinGuard,
             buffer_pool::BufferPool,
             database::{DatabaseFile, DatabaseStorage},
             pager::{allocate_new_page, PageRef},
@@ -5548,8 +5552,9 @@ pub mod test {
         },
         types::IOResult,
         util::IOExt,
-        Buffer, CheckpointMode, CheckpointResult, Completion, CompletionError, Connection,
-        Database, File, LimboError, MemoryIO, OpenFlags, PlatformIO, SyncMode, WalFileShared, IO,
+        Buffer, CheckpointMode, CheckpointResult, Clock, Completion, CompletionError, Connection,
+        Database, File, LimboError, MemoryIO, MonotonicInstant, OpenFlags, PlatformIO, Result,
+        SyncMode, Value, WalFileShared, WallClockInstant, IO,
     };
     use std::num::NonZeroUsize;
     #[cfg(unix)]
@@ -5884,6 +5889,255 @@ pub mod test {
         (io, buffer_pool, wal)
     }
 
+    type WriteHook = Box<dyn FnOnce() + Send + 'static>;
+
+    // IO wrapper that installs a one-shot hook only on the WAL file. The
+    // spill tests use it to run SQL during WAL pwritev, before the write
+    // completion callback updates page dirty/WAL-tag state.
+    struct WalWriteHookIo {
+        inner: Arc<dyn IO>,
+        pwritev_hook: Arc<Mutex<Option<WriteHook>>>,
+    }
+
+    impl WalWriteHookIo {
+        fn new(inner: Arc<dyn IO>) -> Self {
+            Self {
+                inner,
+                pwritev_hook: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn set_wal_pwritev_hook(&self, hook: impl FnOnce() + Send + 'static) {
+            *self.pwritev_hook.lock() = Some(Box::new(hook));
+        }
+    }
+
+    impl Clock for WalWriteHookIo {
+        fn current_time_monotonic(&self) -> MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+
+        fn current_time_wall_clock(&self) -> WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for WalWriteHookIo {
+        fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+            let file = self.inner.open_file(path, flags, direct)?;
+            if path.ends_with("-wal") {
+                Ok(Arc::new(WalWriteHookFile {
+                    inner: file,
+                    pwritev_hook: self.pwritev_hook.clone(),
+                }))
+            } else {
+                Ok(file)
+            }
+        }
+
+        fn remove_file(&self, path: &str) -> Result<()> {
+            self.inner.remove_file(path)
+        }
+
+        fn file_id(&self, path: &str) -> Result<crate::io::FileId> {
+            self.inner.file_id(path)
+        }
+
+        fn step(&self) -> Result<()> {
+            self.inner.step()
+        }
+
+        fn cancel(&self, completions: &[Completion]) -> Result<()> {
+            self.inner.cancel(completions)
+        }
+
+        fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
+            self.inner.drain_completions(completions)
+        }
+
+        fn wait_for_completion(&self, completion: Completion) -> Result<()> {
+            self.inner.wait_for_completion(completion)
+        }
+
+        fn generate_random_number(&self) -> i64 {
+            self.inner.generate_random_number()
+        }
+
+        fn fill_bytes(&self, dest: &mut [u8]) {
+            self.inner.fill_bytes(dest);
+        }
+
+        fn get_memory_io(&self) -> Arc<MemoryIO> {
+            self.inner.get_memory_io()
+        }
+
+        fn register_fixed_buffer(&self, ptr: std::ptr::NonNull<u8>, len: usize) -> Result<u32> {
+            self.inner.register_fixed_buffer(ptr, len)
+        }
+
+        fn yield_now(&self) {
+            self.inner.yield_now();
+        }
+    }
+
+    // File wrapper for "-wal" paths that fires the registered hook immediately
+    // before forwarding pwritev to the real file.
+    struct WalWriteHookFile {
+        inner: Arc<dyn File>,
+        pwritev_hook: Arc<Mutex<Option<WriteHook>>>,
+    }
+
+    impl File for WalWriteHookFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+
+        fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            self.inner.pwrite(pos, buffer, c)
+        }
+
+        fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            self.inner.sync(c, sync_type)
+        }
+
+        fn pwritev(
+            &self,
+            pos: u64,
+            buffers: Vec<Arc<Buffer>>,
+            c: Completion,
+        ) -> Result<Completion> {
+            let hook = self.pwritev_hook.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            self.inner.pwritev(pos, buffers, c)
+        }
+
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+    }
+
+    // Minimal WAL file double for low-level WalFile tests. It tracks logical
+    // file size and can run a pwritev hook without involving the full database.
+    struct HookedFile {
+        size: AtomicU64,
+        pwritev_hook: Mutex<Option<WriteHook>>,
+    }
+
+    impl HookedFile {
+        fn new() -> Self {
+            Self {
+                size: AtomicU64::new(0),
+                pwritev_hook: Mutex::new(None),
+            }
+        }
+
+        fn set_pwritev_hook(&self, hook: impl FnOnce() + Send + 'static) {
+            *self.pwritev_hook.lock() = Some(Box::new(hook));
+        }
+
+        fn grow_to(&self, end: u64) {
+            let mut current = self.size.load(Ordering::Acquire);
+            while end > current {
+                match self.size.compare_exchange_weak(
+                    current,
+                    end,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => current = next,
+                }
+            }
+        }
+    }
+
+    impl File for HookedFile {
+        fn lock_file(&self, _exclusive: bool) -> Result<()> {
+            Ok(())
+        }
+
+        fn unlock_file(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn pread(&self, _pos: u64, c: Completion) -> Result<Completion> {
+            c.complete(0);
+            Ok(c)
+        }
+
+        fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            self.grow_to(pos + buffer.len() as u64);
+            c.complete(buffer.len() as i32);
+            Ok(c)
+        }
+
+        fn sync(&self, c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
+            c.complete(0);
+            Ok(c)
+        }
+
+        fn pwritev(
+            &self,
+            pos: u64,
+            buffers: Vec<Arc<Buffer>>,
+            c: Completion,
+        ) -> Result<Completion> {
+            let total_len = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
+            if let Some(hook) = self.pwritev_hook.lock().take() {
+                hook();
+            }
+            self.grow_to(pos + total_len as u64);
+            c.complete(total_len as i32);
+            Ok(c)
+        }
+
+        fn size(&self) -> Result<u64> {
+            Ok(self.size.load(Ordering::Acquire))
+        }
+
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            self.size.store(len, Ordering::Release);
+            c.complete(0);
+            Ok(c)
+        }
+    }
+
+    fn make_initialized_hooked_wal(
+        page_size: u32,
+    ) -> (Arc<dyn IO>, Arc<BufferPool>, WalFile, Arc<HookedFile>) {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool
+            .finalize_with_page_size(page_size as usize)
+            .unwrap();
+        let file = Arc::new(HookedFile::new());
+        let shared = WalFileShared::new_shared(file.clone()).unwrap();
+        let wal = WalFile::new(io.clone(), shared, ((0, 0), 0), buffer_pool.clone());
+        let page_size = PageSize::new(page_size).unwrap();
+
+        if let Some(c) = wal.prepare_wal_start(page_size).unwrap() {
+            io.wait_for_completion(c).unwrap();
+        }
+        let c = wal.prepare_wal_finish(FileSyncType::Fsync).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        (io, buffer_pool, wal, file)
+    }
+
     fn page_with_pattern(page_id: i64, seed: u8, buffer_pool: &Arc<BufferPool>) -> PageRef {
         let page = allocate_new_page(page_id, buffer_pool);
         for (idx, byte) in page.get_contents().as_ptr().iter_mut().enumerate() {
@@ -5918,6 +6172,227 @@ pub mod test {
         wal.commit_prepared_frames(&[prepared]);
         wal.finish_append_frames_commit().unwrap();
         expected
+    }
+
+    #[test]
+    fn append_frames_vectored_keeps_page_dirty_if_modified_during_write() {
+        // This is a unit test for WAL completion state. The hook directly
+        // mutates the same cached page to model the pager dirtying it again
+        // while the WAL write is still pending.
+        // Start writing a dirty page to the WAL, then change that same page
+        // before the write finishes. The page must stay dirty afterward because
+        // the new bytes were not part of the WAL write.
+        let page_size = 512;
+        let (io, buffer_pool, wal, file) = make_initialized_hooked_wal(page_size);
+        let page = page_with_pattern(2, 0x10, &buffer_pool);
+        page.set_dirty();
+        page.set_write_pending();
+
+        let page_for_hook = page.clone();
+        file.set_pwritev_hook(move || {
+            // Offset 17 and value 0xaa are arbitrary; the test only needs to
+            // change one byte so the page is newer than the WAL write.
+            page_for_hook.get_contents().as_ptr()[17] = 0xaa;
+            page_for_hook.set_dirty();
+        });
+
+        let completion = wal
+            .append_frames_vectored(vec![page.clone()], PageSize::new(page_size).unwrap())
+            .unwrap();
+        io.wait_for_completion(completion).unwrap();
+
+        assert!(page.is_dirty());
+        assert!(!page.has_wal_tag());
+        assert_eq!(page.get_contents().as_ptr()[17], 0xaa);
+    }
+
+    fn first_pragma_i64(conn: &Arc<Connection>, pragma: &str) -> i64 {
+        let rows = conn.pragma_query(pragma).unwrap();
+        let value = rows
+            .first()
+            .and_then(|row| row.first())
+            .unwrap_or_else(|| panic!("PRAGMA {pragma} returned no rows"));
+        match value {
+            Value::Numeric(crate::Numeric::Integer(value)) => *value,
+            other => panic!("PRAGMA {pragma} returned non-integer value {other:?}"),
+        }
+    }
+
+    fn integrity_check_text(conn: &Arc<Connection>) -> String {
+        conn.pragma_query("integrity_check")
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| {
+                row.into_iter().next().map(|value| match value {
+                    Value::Text(text) => text.as_str().to_string(),
+                    other => format!("{other:?}"),
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn query_i64s(conn: &Arc<Connection>, sql: &str) -> Vec<i64> {
+        let mut values = Vec::new();
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.run_with_row_callback(|row| {
+            values.push(row.get::<i64>(0).unwrap());
+            Ok(())
+        })
+        .unwrap();
+        values
+    }
+
+    // Shared setup for the UNIQUE BLOB overflow corruption regressions:
+    // 1. Use 4096-byte pages, WAL mode, and the UNIQUE BLOB table shape.
+    // 2. Insert and delete a large BLOB so reusable overflow/freelist pages exist.
+    // 3. Register a WAL pwritev hook that inserts a zeroblob before the spill
+    //    write completion runs. This forces the page state transition the WAL
+    //    callback must handle: a cached page is dirtied after its WAL frame is
+    //    built but before completion updates its dirty/WAL-tag state.
+    // 4. Force the spill, then churn the schema so freed overflow pages are
+    //    reused before commit. That gives stale spill completion state a chance
+    //    to hide dirty overflow/index bytes from the final WAL commit.
+    fn run_wal_spill_unique_blob_index_overflow_scenario(
+        path: &str,
+    ) -> (Arc<WalWriteHookIo>, Arc<Database>, Arc<Connection>) {
+        let io = Arc::new(WalWriteHookIo::new(Arc::new(MemoryIO::new())));
+        let db = Database::open_file(io.clone(), path).unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("PRAGMA page_size = 4096").unwrap();
+        conn.execute("PRAGMA journal_mode = WAL").unwrap();
+        conn.execute(
+            "CREATE TABLE empty_grass_810 (
+                dark_cloud_827 BLOB UNIQUE,
+                green_stone_480 INTEGER,
+                shy_door_499 TEXT,
+                loud_dog_117 INTEGER PRIMARY KEY,
+                blue_fruit_852 REAL,
+                calm_sand_8 TEXT UNIQUE,
+                dark_root_952 REAL,
+                big_cloud_555 NUMERIC
+            )",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO empty_grass_810(dark_cloud_827, loud_dog_117)
+             VALUES(randomblob(9000), 1)",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.pager
+                .load()
+                .change_page_cache_size(16)
+                .expect("resize page cache"),
+            crate::storage::page_cache::CacheResizeResult::Done
+        );
+        conn.execute("BEGIN").unwrap();
+        conn.execute("DELETE FROM empty_grass_810 WHERE loud_dog_117 = 1")
+            .unwrap();
+
+        let mut filler_idx = 0;
+        while first_pragma_i64(&conn, "freelist_count") > 2 {
+            conn.execute(format!("CREATE TABLE filler_{filler_idx}(x)").as_str())
+                .unwrap();
+            filler_idx += 1;
+            assert!(
+                filler_idx < 128,
+                "failed to reduce freelist to two pages; freelist_count={}",
+                first_pragma_i64(&conn, "freelist_count")
+            );
+        }
+        assert_eq!(first_pragma_i64(&conn, "freelist_count"), 2);
+
+        let hook_conn = conn.clone();
+        io.set_wal_pwritev_hook(move || {
+            // Run normal SQL before the spill write completion callback observes the page tag.
+            hook_conn
+                .execute(
+                    "INSERT INTO empty_grass_810(dark_cloud_827, loud_dog_117)
+                     VALUES(zeroblob(7000), 2)",
+                )
+                .unwrap();
+        });
+
+        let pager = conn.pager.load().clone();
+        // Keep the table and index roots pinned so the forced spill matches an in-flight
+        // statement: roots stay live, but reusable overflow/freelist pages are spillable.
+        let pinned_roots = query_i64s(
+            &conn,
+            "SELECT rootpage FROM sqlite_schema
+             WHERE tbl_name = 'empty_grass_810' AND rootpage > 0",
+        )
+        .into_iter()
+        .map(|root_page| {
+            let (page, completion) = pager.read_page(root_page).unwrap();
+            if let Some(completion) = completion {
+                io.wait_for_completion(completion).unwrap();
+            }
+            PinGuard::new(page)
+        })
+        .collect::<Vec<_>>();
+
+        match pager.force_spill_dirty_pages_for_test().unwrap() {
+            IOResult::Done(spilled) => assert!(spilled, "expected dirty page spill"),
+            IOResult::IO(completions) => completions.wait(io.as_ref()).unwrap(),
+        }
+
+        for i in 0..96 {
+            conn.execute(format!("CREATE TABLE post_flush_{i}(x)").as_str())
+                .unwrap();
+        }
+        drop(pinned_roots);
+        conn.execute("COMMIT").unwrap();
+
+        (io, db, conn)
+    }
+
+    #[test]
+    fn wal_spill_rewrites_unique_blob_index_overflow_modified_during_write() {
+        // Reproduces the spill/reuse path and checks the live WAL view keeps
+        // the UNIQUE BLOB index consistent.
+        let (_, _db, conn) =
+            run_wal_spill_unique_blob_index_overflow_scenario("wal-spill-index-overflow.db");
+
+        let result = integrity_check_text(&conn);
+        assert_eq!(result, "ok", "integrity_check failed:\n{result}");
+    }
+
+    #[test]
+    fn wal_spill_rewrites_unique_blob_index_overflow_survives_checkpoint_to_db_file() {
+        // Runs the same spill/reuse scenario, then checkpoints and reopens so
+        // any stale overflow page would be visible from the main DB image.
+        let db_path = "wal-spill-index-overflow-checkpoint.db";
+        let (io, db, conn) = run_wal_spill_unique_blob_index_overflow_scenario(db_path);
+
+        let pager = conn.pager.load().clone();
+        let checkpoint = run_checkpoint_until_done(
+            &pager,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        );
+        assert!(
+            checkpoint.wal_checkpoint_backfilled > 0,
+            "checkpoint should move WAL frames into the database file"
+        );
+        assert!(
+            checkpoint.wal_truncate_sent,
+            "TRUNCATE checkpoint should truncate the WAL after backfill"
+        );
+
+        drop(conn);
+        drop(db);
+
+        let reopened = Database::open_file(io, db_path).unwrap();
+        let reopened_conn = reopened.connect().unwrap();
+        let result = integrity_check_text(&reopened_conn);
+        assert_eq!(
+            result, "ok",
+            "integrity_check failed after checkpoint:\n{result}"
+        );
     }
 
     fn wait_for_completion_error(io: &Arc<dyn IO>, completion: Completion) -> CompletionError {

@@ -3534,6 +3534,55 @@ impl Pager {
         }
     }
 
+    #[cfg(test)]
+    /// Test helper that immediately writes spillable dirty cache pages to the WAL.
+    /// Normal code only does this under cache pressure; tests use it to create
+    /// that timing point without depending on page-cache sizing details.
+    pub(crate) fn force_spill_dirty_pages_for_test(&self) -> Result<IOResult<bool>> {
+        let pages = {
+            let cache = self.page_cache.read();
+            cache.collect_spillable_pages(IOV_MAX)
+        };
+        if pages.is_empty() {
+            return Ok(IOResult::Done(false));
+        }
+
+        let Some(wal) = self.wal.as_ref() else {
+            return Ok(IOResult::Done(false));
+        };
+        let page_sz = self.get_page_size().unwrap_or_default();
+
+        if let Some(c) = wal.prepare_wal_start(page_sz)? {
+            self.io.wait_for_completion(c)?;
+            let c = wal.prepare_wal_finish(self.get_sync_type())?;
+            self.io.wait_for_completion(c)?;
+        }
+
+        let wal_pages: Vec<PageRef> = pages
+            .iter()
+            .map(|page| -> Result<PageRef> {
+                self.subjournal_page_if_required(page)?;
+                page.set_write_pending();
+                Ok(page.to_page())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let c = wal.append_frames_vectored(wal_pages, page_sz)?;
+        if !c.succeeded() {
+            return Ok(IOResult::IO(IOCompletions::Single(c)));
+        }
+
+        let mut cache = self.page_cache.write();
+        for page in &pages {
+            if page.has_wal_tag() {
+                let key = PageCacheKey::new(page.get().id);
+                cache.notify_page_spilled(key);
+                page.set_spilled();
+            }
+        }
+
+        Ok(IOResult::Done(true))
+    }
+
     /// Wait for any in-flight spill writes to finish.
     /// This prevents publishing WAL metadata that references frames that are not yet durable.
     fn wait_for_spill_completions(&self) -> Result<IOResult<()>> {
