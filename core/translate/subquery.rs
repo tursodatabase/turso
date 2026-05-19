@@ -14,7 +14,8 @@ use crate::{
             emit_program_for_select_with_resolver, emit_query,
         },
         expr::{
-            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr_mut, WalkControl,
+            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr, walk_expr_mut,
+            WalkControl,
         },
         optimizer::optimize_select_plan,
         plan::{
@@ -345,7 +346,7 @@ pub fn plan_subqueries_from_select_plan(
         recollect_aggregates(plan, resolver)?;
     }
 
-    assign_select_subquery_eval_phases(plan);
+    assign_select_subquery_eval_phases(plan)?;
     mark_shared_cte_materialization_requirements(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
@@ -1969,18 +1970,38 @@ pub fn emit_non_from_clause_subqueries_for_eval_at(
     )
 }
 
-fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
+fn aggregate_step_subquery_ids(plan: &SelectPlan) -> Result<Vec<ast::TableInternalId>> {
+    let mut ids = Vec::new();
+    for agg in &plan.aggregates {
+        for expr in agg.args.iter().chain(agg.filter_expr.as_ref().into_iter()) {
+            walk_expr(expr, &mut |expr| -> Result<WalkControl> {
+                if let ast::Expr::SubqueryResult { subquery_id, .. } = expr {
+                    ids.push(*subquery_id);
+                }
+                Ok(WalkControl::Continue)
+            })?;
+        }
+    }
+    Ok(ids)
+}
+
+fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) -> Result<()> {
     let has_grouped_output = plan
         .group_by
         .as_ref()
         .is_some_and(|group_by| !group_by.exprs.is_empty());
+    let aggregate_step_subqueries = aggregate_step_subquery_ids(plan)?;
 
     for subquery in plan.non_from_clause_subqueries.iter_mut() {
         subquery.eval_phase = match subquery.origin {
+            _ if aggregate_step_subqueries.contains(&subquery.internal_id) => {
+                SubqueryEvalPhase::BeforeLoop
+            }
             SubqueryOrigin::SelectHaving | SubqueryOrigin::SelectOrderBy if has_grouped_output => {
                 SubqueryEvalPhase::GroupedOutput
             }
             _ => subquery.origin.phase_floor(),
         };
     }
+    Ok(())
 }

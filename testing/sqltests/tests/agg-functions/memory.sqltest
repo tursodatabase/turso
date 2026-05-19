@@ -319,6 +319,15 @@ expect {
 }
 
 @cross-check-integrity
+test filter-with-in-subquery-in-having {
+    SELECT 1
+    GROUP BY 1
+    HAVING COUNT(*) FILTER (WHERE 1 IN (SELECT 2)) = 1;
+}
+expect {
+}
+
+@cross-check-integrity
 test filter-group-by-multiple-groups {
     CREATE TABLE t(val INTEGER, a TEXT, b TEXT);
     INSERT INTO t VALUES (1, 'x', 'p'), (2, 'x', 'q'), (3, 'y', 'p'), (4, 'y', 'q');
