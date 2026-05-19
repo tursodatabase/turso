@@ -6529,13 +6529,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "turso-dotnet"
-version = "0.7.0-pre.1"
-dependencies = [
- "turso_core",
-]
-
-[[package]]
 name = "turso-java"
 version = "0.7.0-pre.1"
 dependencies = [
