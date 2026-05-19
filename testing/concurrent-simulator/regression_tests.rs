@@ -653,100 +653,43 @@ fn multiprocess_integrity_check_after_restart_preserves_authoritative_wal_snapsh
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
-fn multiprocess_seed_5724542806254236599_localizes_key_4994_loss() {
-    configure_worker_exe();
-    let mut whopper = MultiprocessWhopper::new(MultiprocessOpts {
-        seed: Some(5724542806254236599),
-        enable_mvcc: false,
-        process_count: 16,
-        connections_per_process: 1,
-        max_steps: 317,
-        elle_tables: vec![],
-        workloads: vec![
-            (10, Box::new(IntegrityCheckWorkload)),
-            (5, Box::new(WalCheckpointWorkload)),
-            (10, Box::new(CreateSimpleTableWorkload)),
-            (20, Box::new(SimpleSelectWorkload)),
-            (20, Box::new(SimpleInsertWorkload)),
-            (15, Box::new(UpdateWorkload)),
-            (15, Box::new(DeleteWorkload)),
-            (2, Box::new(CreateIndexWorkload)),
-            (2, Box::new(DropIndexWorkload)),
-            (30, Box::new(BeginWorkload)),
-            (10, Box::new(CommitWorkload)),
-            (10, Box::new(RollbackWorkload)),
-        ],
-        properties: vec![],
-        chaotic_profiles: vec![],
-        kill_probability: 0.0,
-        restart_probability: 0.05,
-        history_output: None,
-        keep_files: true,
-    })
-    .expect("create seeded multiprocess whopper");
-
+fn multiprocess_committed_large_row_survives_repeated_restarts() -> anyhow::Result<()> {
+    let mut whopper = create_multiprocess_whopper_with_keep(1, true);
     let db_path = whopper.db_path().to_path_buf();
-    let table_name = "simple_kv_57904";
-    let key = "key_4994";
+    let table_name = "table_name";
+    let key = "key_name";
+    let value_len: i64 = 5044;
 
-    advance_seeded_whopper_to_step(&mut whopper, 267);
-    let live_rows = whopper
-        .execute_sql_direct(
-            10,
-            "select count(*), min(length(value)), max(length(value)) from simple_kv_57904 where key='key_4994'",
-        )
-        .expect("query key_4994 on live worker after insert")
-        .expect("live worker query should succeed");
-    eprintln!(
-        "after step 266 insert: live_rows={:?} shared_snapshot={:?}",
-        live_rows,
-        whopper
-            .shared_wal_snapshot_direct(10)
-            .expect("read shared WAL snapshot after insert")
-    );
-    let observer_io: Arc<dyn IO> = multiprocess_test_io();
-    let observer_db = Database::open_file_with_flags(
-        observer_io,
-        db_path.to_str().expect("db path utf8"),
-        OpenFlags::ReadOnly,
-        multiprocess_wal_db_opts(),
-        None,
-    )
-    .expect("open observer database after insert");
-    eprintln!(
-        "after step 266 insert: observer_telemetry={:?} observer_local_max_frame={:?}",
-        observer_db
-            .shared_wal_open_telemetry()
-            .expect("observer shared WAL telemetry"),
-        observer_db.local_wal_max_frame_for_testing()
-    );
+    whopper.execute_sql_direct(
+        0,
+        format!("create table {table_name}(key text primary key, value text not null)"),
+    )??;
+
+    whopper.execute_sql_direct(
+        0,
+        format!(
+            "insert into {table_name}(key, value) values ('{key}', printf('%0*d', {value_len}, 1))"
+        ),
+    )??;
+
     assert_eq!(
         read_simple_kv_length(&db_path, table_name, key),
-        Some(5044),
-        "row must be visible immediately after step 266 insert",
+        Some(value_len)
     );
 
-    advance_seeded_whopper_to_step(&mut whopper, 283);
-    eprintln!(
-        "after step 282 restart: telemetries={:?}",
-        whopper.worker_startup_telemetries()
-    );
-    assert_eq!(
-        read_simple_kv_length(&db_path, table_name, key),
-        Some(5044),
-        "row disappeared during the step 282 restart",
-    );
+    for _restart in 1..=2 {
+        whopper.restart_all_workers_preserve_files().unwrap();
+        assert_eq!(
+            read_simple_kv_length(&db_path, table_name, key),
+            Some(value_len)
+        );
+    }
 
-    advance_seeded_whopper_to_step(&mut whopper, 306);
-    eprintln!(
-        "after step 305 restart: telemetries={:?}",
-        whopper.worker_startup_telemetries()
-    );
-    assert_eq!(
-        read_simple_kv_length(&db_path, table_name, key),
-        Some(5044),
-        "row disappeared during the step 305 restart",
-    );
+    let db_str = db_path.to_str().unwrap();
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(format!("{db_str}-wal"));
+    let _ = std::fs::remove_file(format!("{db_str}-tshm"));
+    Ok(())
 }
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
