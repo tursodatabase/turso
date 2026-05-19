@@ -42,6 +42,32 @@ impl NonCopyValue {
     }
 }
 
+struct LowerBoundOnly<I> {
+    iter: I,
+}
+
+impl<I> LowerBoundOnly<I> {
+    fn new(iter: I) -> Self {
+        Self { iter }
+    }
+}
+
+impl<I> Iterator for LowerBoundOnly<I>
+where
+    I: Iterator,
+{
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (lower, _) = self.iter.size_hint();
+        (lower, None)
+    }
+}
+
 #[divan::bench(args = [64, 1_024, 16_384])]
 fn vec_push_turso(bencher: Bencher, len: usize) {
     bencher
@@ -370,6 +396,213 @@ fn hash_map_insert_std(bencher: Bencher, len: usize) {
         for value in 0..len {
             values.insert(black_box(value), black_box(value));
         }
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn vec_collect_unknown_upper_std(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let values = LowerBoundOnly::new((0..len).map(black_box)).collect::<std::vec::Vec<_>>();
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn vec_collect_unknown_upper_turso(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let values = LowerBoundOnly::new((0..len).map(black_box))
+            .try_collect::<alloc::Vec<_>>()
+            .unwrap();
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn vec_extend_unknown_upper_std(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let mut values = std::vec::Vec::with_capacity(len);
+        values.extend(LowerBoundOnly::new((0..len).map(black_box)));
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn vec_extend_unknown_upper_turso(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let mut values =
+            <alloc::Vec<usize> as TursoTryWithCapacityExt>::try_with_capacity(len).unwrap();
+        TursoFromIterator::try_extend(&mut values, LowerBoundOnly::new((0..len).map(black_box)))
+            .unwrap();
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn vec_deque_collect_unknown_upper_std(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let values =
+            LowerBoundOnly::new((0..len).map(black_box)).collect::<std::collections::VecDeque<_>>();
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn vec_deque_collect_unknown_upper_turso(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let values = LowerBoundOnly::new((0..len).map(black_box))
+            .try_collect::<alloc::VecDeque<_>>()
+            .unwrap();
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn vec_deque_extend_unknown_upper_std(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let mut values = std::collections::VecDeque::with_capacity(len);
+        values.extend(LowerBoundOnly::new((0..len).map(black_box)));
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn vec_deque_extend_unknown_upper_turso(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let mut values =
+            <alloc::VecDeque<usize> as TursoTryWithCapacityExt>::try_with_capacity(len).unwrap();
+        TursoFromIterator::try_extend(&mut values, LowerBoundOnly::new((0..len).map(black_box)))
+            .unwrap();
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn binary_heap_collect_unknown_upper_std(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let values = LowerBoundOnly::new((0..len).map(black_box))
+            .collect::<std::collections::BinaryHeap<_>>();
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn binary_heap_collect_unknown_upper_turso(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let values = LowerBoundOnly::new((0..len).map(black_box))
+            .try_collect::<alloc::BinaryHeap<_>>()
+            .unwrap();
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn binary_heap_extend_unknown_upper_std(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let mut values = std::collections::BinaryHeap::with_capacity(len);
+        values.extend(LowerBoundOnly::new((0..len).map(black_box)));
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn binary_heap_extend_unknown_upper_turso(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let mut values =
+            <alloc::BinaryHeap<usize> as TursoTryWithCapacityExt>::try_with_capacity(len).unwrap();
+        TursoFromIterator::try_extend(&mut values, LowerBoundOnly::new((0..len).map(black_box)))
+            .unwrap();
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn hash_set_collect_unknown_upper_std(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let values = LowerBoundOnly::new((0..len).map(black_box))
+            .collect::<std::collections::HashSet<_, FxBuildHasher>>();
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn hash_set_collect_unknown_upper_turso(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let values = LowerBoundOnly::new((0..len).map(black_box))
+            .try_collect::<alloc::HashSet<_, FxBuildHasher>>()
+            .unwrap();
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn hash_set_extend_unknown_upper_std(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let mut values = std::collections::HashSet::with_capacity_and_hasher(len, FxBuildHasher);
+        values.extend(LowerBoundOnly::new((0..len).map(black_box)));
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn hash_set_extend_unknown_upper_turso(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let mut values =
+            <alloc::HashSet<usize, FxBuildHasher> as TursoTryWithCapacityExt>::try_with_capacity(
+                len,
+            )
+            .unwrap();
+        TursoFromIterator::try_extend(&mut values, LowerBoundOnly::new((0..len).map(black_box)))
+            .unwrap();
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn hash_map_collect_unknown_upper_std(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let values =
+            LowerBoundOnly::new((0..len).map(|value| (black_box(value), black_box(value))))
+                .collect::<std::collections::HashMap<_, _, FxBuildHasher>>();
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn hash_map_collect_unknown_upper_turso(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let values =
+            LowerBoundOnly::new((0..len).map(|value| (black_box(value), black_box(value))))
+                .try_collect::<alloc::HashMap<_, _, FxBuildHasher>>()
+                .unwrap();
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn hash_map_extend_unknown_upper_std(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let mut values = std::collections::HashMap::with_capacity_and_hasher(len, FxBuildHasher);
+        values.extend(LowerBoundOnly::new(
+            (0..len).map(|value| (black_box(value), black_box(value))),
+        ));
+        black_box(values)
+    });
+}
+
+#[divan::bench(args = [64, 1_024, 16_384])]
+fn hash_map_extend_unknown_upper_turso(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let mut values =
+            <alloc::HashMap<usize, usize, FxBuildHasher> as TursoTryWithCapacityExt>::try_with_capacity(
+                len,
+            )
+            .unwrap();
+        TursoFromIterator::try_extend(
+            &mut values,
+            LowerBoundOnly::new((0..len).map(|value| (black_box(value), black_box(value)))),
+        )
+        .unwrap();
         black_box(values)
     });
 }
