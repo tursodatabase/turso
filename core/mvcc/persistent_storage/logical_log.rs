@@ -3571,8 +3571,7 @@ mod tests {
         // the reader's magic validation check.
         let commit_ts = 201u64;
         let db_header = DatabaseHeader::default();
-        let header_tx =
-            crate::mvcc::database::LogRecord::for_test(commit_ts, &[], Some(db_header));
+        let header_tx = crate::mvcc::database::LogRecord::for_test(commit_ts, &[], Some(db_header));
         let c = log.log_tx(header_tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -3811,8 +3810,7 @@ mod tests {
                     btree_resident,
                 }
             });
-            let tx =
-                crate::mvcc::database::LogRecord::for_test(commit_ts, &[row_version], None);
+            let tx = crate::mvcc::database::LogRecord::for_test(commit_ts, &[row_version], None);
             let Ok(c) = log.log_tx(tx) else {
                 return false;
             };
@@ -5660,8 +5658,7 @@ mod tests {
 
         // Write 2 frames.
         let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
-        let first_tx =
-            crate::mvcc::database::LogRecord::for_test(100, &[first_row_version], None);
+        let first_tx = crate::mvcc::database::LogRecord::for_test(100, &[first_row_version], None);
         append_encrypted_tx(&mut log, &io, first_tx);
         let second_tx = crate::mvcc::database::LogRecord::for_test(
             101,
@@ -5838,8 +5835,7 @@ mod tests {
         let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
         let first_row_version = make_test_row_version(table_id, 1, "prefix", 500);
         let expected_prefix_record_bytes = first_row_version.row.payload().to_vec();
-        let first_tx =
-            crate::mvcc::database::LogRecord::for_test(500, &[first_row_version], None);
+        let first_tx = crate::mvcc::database::LogRecord::for_test(500, &[first_row_version], None);
         let c = log.log_tx(first_tx).unwrap();
         io.wait_for_completion(c).unwrap();
         let second_frame_start = log.offset as usize;
