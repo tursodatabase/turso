@@ -1,3 +1,4 @@
+use crate::alloc::TursoFromIterator;
 use crate::function::{Deterministic, Func};
 use crate::incremental::view::IncrementalView;
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, operator::create_dbsp_state_index};
@@ -2558,7 +2559,7 @@ impl GeneratedColGraph {
                     col.name.as_deref().unwrap_or("?")
                 );
             }
-            let direct_mask: ColumnMask = ColumnMask::from_iter(direct.iter());
+            let direct_mask: ColumnMask = ColumnMask::try_from_iter(direct.iter())?;
             direct_deps[j].union_with(&direct_mask);
             for i in direct.iter() {
                 direct_dependents[i].set(j);

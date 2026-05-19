@@ -644,7 +644,11 @@ pub fn constraints_from_where_clause(
                 let estimated_values = rhs.len() as f64;
                 let mut rhs_mask = TableMask::default();
                 for rhs_expr in rhs.iter() {
-                    rhs_mask |= &table_mask_from_expr(rhs_expr, table_references, subqueries)?;
+                    rhs_mask.union_with(&table_mask_from_expr(
+                        rhs_expr,
+                        table_references,
+                        subqueries,
+                    )?)?;
                 }
                 let table_stats = schema
                     .analyze_stats

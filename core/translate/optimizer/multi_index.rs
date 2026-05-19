@@ -943,7 +943,7 @@ pub fn consider_multi_index_union(
         // Each disjunct is replanned with branch-local `TableConstraints`, so
         // compound conjuncts can reuse the same compound-seek analysis as
         // ordinary btree access.
-        let branches: Result<Option<Vec<MultiIdxBranch>>> = disjuncts
+        let branches = disjuncts
             .into_iter()
             .map(|disjunct_expr| {
                 let Ok(disjunct_expr) = crate::translate::expr::unwrap_parens(disjunct_expr) else {
@@ -1007,7 +1007,7 @@ pub fn consider_multi_index_union(
                 });
                 Ok(Some(chosen))
             })
-            .collect()?;
+            .collect::<Result<_>>()?;
 
         let Some(branches) = branches else {
             continue;

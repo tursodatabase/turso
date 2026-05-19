@@ -1,5 +1,5 @@
 use crate::{
-    alloc::{self, TursoAllocExt, TursoFromIterator, TursoIteratorExt},
+    alloc::{self, TursoIteratorExt},
     function::{AggFunc, WindowFunc},
     schema::{
         BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table, Type, ROWID_SENTINEL,

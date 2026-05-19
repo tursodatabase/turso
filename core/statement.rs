@@ -13,6 +13,7 @@ use turso_parser::{
     parser::Parser,
 };
 
+use crate::alloc::TursoIteratorExt;
 use crate::{
     busy::BusyHandlerState,
     parameters,
@@ -547,7 +548,7 @@ impl Statement {
             .iter()
             .chain(self.program.prepared.read_databases.iter())
             .filter(|&id| id != crate::MAIN_DB_ID)
-            .collect();
+            .try_collect()?;
         for db_id in &attached_db_ids {
             // Discard any connection-local schema changes for this non-main DB
             // (temp or attached) so the re-translate reads the committed schema.
