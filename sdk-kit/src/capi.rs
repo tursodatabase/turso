@@ -703,6 +703,28 @@ mod tests {
         });
     }
 
+    unsafe fn execute_sql(connection: *mut c::turso_connection_t, sql: &str) {
+        let sql = CString::new(sql).unwrap();
+        let mut statement = std::ptr::null_mut();
+        let status = turso_connection_prepare_single(
+            connection,
+            sql.as_ptr(),
+            &mut statement,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(status, turso_status_code_t::TURSO_OK);
+        loop {
+            let status =
+                turso_statement_execute(statement, std::ptr::null_mut(), std::ptr::null_mut());
+            if status == turso_status_code_t::TURSO_DONE {
+                break;
+            }
+            let status = turso_statement_run_io(statement, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_DONE);
+        }
+        turso_statement_deinit(statement);
+    }
+
     #[test]
     pub fn test_version() {
         unsafe {
@@ -738,6 +760,90 @@ mod tests {
             let status = turso_database_open(db, std::ptr::null_mut());
             assert_eq!(status, turso_status_code_t::TURSO_OK);
 
+            turso_database_deinit(db);
+        }
+    }
+
+    #[test]
+    pub fn test_db_vacuum_smoke() {
+        unsafe {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir.path().join("vacuum-smoke.db");
+            let path = CString::new(db_path.to_str().unwrap()).unwrap();
+            let config = c::turso_database_config_t {
+                path: path.as_ptr(),
+                experimental_features: c"vacuum".as_ptr(),
+                ..Default::default()
+            };
+            let mut db = std::ptr::null();
+            let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let status = turso_database_open(db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let mut connection = std::ptr::null_mut();
+            let status = turso_database_connect(db, &mut connection, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            execute_sql(
+                connection,
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)",
+            );
+            execute_sql(
+                connection,
+                "INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+            );
+            execute_sql(connection, "DELETE FROM t WHERE id = 2");
+            execute_sql(connection, "VACUUM");
+
+            let sql = c"SELECT COUNT(*) FROM t";
+            let mut statement = std::ptr::null_mut();
+            let status = turso_connection_prepare_single(
+                connection,
+                sql.as_ptr(),
+                &mut statement,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+            assert_eq!(
+                turso_statement_step(statement, std::ptr::null_mut()),
+                turso_status_code_t::TURSO_ROW
+            );
+            assert_eq!(
+                value_from_c_value(statement, 0),
+                turso_core::Value::from_i64(2)
+            );
+            assert_eq!(
+                turso_statement_step(statement, std::ptr::null_mut()),
+                turso_status_code_t::TURSO_DONE
+            );
+            turso_statement_deinit(statement);
+
+            let sql = c"PRAGMA integrity_check";
+            let mut statement = std::ptr::null_mut();
+            let status = turso_connection_prepare_single(
+                connection,
+                sql.as_ptr(),
+                &mut statement,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+            assert_eq!(
+                turso_statement_step(statement, std::ptr::null_mut()),
+                turso_status_code_t::TURSO_ROW
+            );
+            assert_eq!(
+                value_from_c_value(statement, 0),
+                turso_core::Value::Text(Text::new("ok"))
+            );
+            assert_eq!(
+                turso_statement_step(statement, std::ptr::null_mut()),
+                turso_status_code_t::TURSO_DONE
+            );
+            turso_statement_deinit(statement);
+
+            turso_connection_deinit(connection);
             turso_database_deinit(db);
         }
     }
