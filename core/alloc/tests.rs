@@ -44,7 +44,7 @@ fn try_extend_accepts_iterators_without_upper_bounds() {
 
 #[test]
 fn hash_map_try_insert_and_extend_reserve_before_mutation() {
-    let mut values: HashMap<&str, usize> = TursoAllocExt::new();
+    let mut values: HashMap<&str, usize> = HashMap::default();
 
     assert_eq!(
         TursoHashMapExt::try_insert(&mut values, "one", 1).unwrap(),
@@ -63,7 +63,7 @@ fn hash_map_try_insert_and_extend_reserve_before_mutation() {
 
 #[test]
 fn hash_set_try_insert_and_extend_reserve_before_mutation() {
-    let mut values: HashSet<usize> = TursoAllocExt::new();
+    let mut values: HashSet<usize> = HashSet::default();
 
     assert!(TursoHashSetExt::try_insert(&mut values, 1).unwrap());
     assert!(!TursoHashSetExt::try_insert(&mut values, 1).unwrap());

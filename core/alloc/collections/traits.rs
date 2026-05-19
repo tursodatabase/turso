@@ -53,6 +53,7 @@ pub trait TursoFromIterator<T>: Sized {
 }
 
 pub trait TursoIteratorExt: Iterator + Sized {
+    #[inline]
     fn try_collect<C>(self) -> Result<C, TryReserveError>
     where
         C: TursoFromIterator<Self::Item>,
@@ -60,6 +61,7 @@ pub trait TursoIteratorExt: Iterator + Sized {
         C::try_from_iter(self)
     }
 
+    #[inline]
     fn try_unzip<A, B, FromA, FromB>(self) -> Result<(FromA, FromB), TryReserveError>
     where
         (FromA, FromB): TursoFromIterator<(A, B)>,

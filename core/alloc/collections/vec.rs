@@ -1,83 +1,79 @@
 use super::{TryClone, TursoAllocExt, TursoFromIterator, TursoTryWithCapacityExt, TursoVecExt};
-use crate::alloc::{TryReserveError, TursoAllocator, Vec};
+#[cfg(nightly)]
+use crate::alloc::TursoAllocator;
+use crate::alloc::{TryReserveError, Vec};
 
-pub(super) fn vec<T>() -> Vec<T> {
+#[cfg(not(nightly))]
+pub(super) const fn vec<T>() -> Vec<T> {
+    Vec::new()
+}
+
+#[cfg(nightly)]
+pub(super) const fn vec<T>() -> Vec<T> {
     Vec::new_in(TursoAllocator)
 }
 
+#[cfg(not(nightly))]
+fn vec_with_capacity<T>(capacity: usize) -> Vec<T> {
+    Vec::with_capacity(capacity)
+}
+
+#[cfg(nightly)]
 fn vec_with_capacity<T>(capacity: usize) -> Vec<T> {
     Vec::with_capacity_in(capacity, TursoAllocator)
 }
 
 impl<T> TursoAllocExt for Vec<T> {
+    #[inline(always)]
     fn new() -> Self {
         vec()
     }
 }
 
 impl<T> TursoVecExt<T> for Vec<T> {
+    #[inline(always)]
     fn with_capacity(capacity: usize) -> Self {
         vec_with_capacity(capacity)
     }
 
+    #[inline(always)]
     fn try_push(&mut self, value: T) -> Result<(), TryReserveError> {
-        self.try_reserve(1)?;
         self.push(value);
         Ok(())
     }
 }
 
 impl<T> TursoTryWithCapacityExt for Vec<T> {
+    #[inline(always)]
     fn try_with_capacity(capacity: usize) -> Result<Self, TryReserveError> {
-        #[cfg(not(nightly))]
-        {
-            let mut values = vec();
-            values.try_reserve(capacity)?;
-            Ok(values)
-        }
-        #[cfg(nightly)]
-        {
-            std::vec::Vec::try_with_capacity_in(capacity, TursoAllocator)
-                .map_err(TryReserveError::from)
-        }
+        Ok(vec_with_capacity(capacity))
     }
 }
 
 impl<T> TursoFromIterator<T> for Vec<T> {
+    #[inline(always)]
     fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
     where
         I: IntoIterator<Item = T>,
     {
-        let iter = iter.into_iter();
-        let (lower, upper) = iter.size_hint();
-        let capacity = upper.unwrap_or(lower);
-        let mut values = <Self as TursoTryWithCapacityExt>::try_with_capacity(capacity)?;
-        if upper.is_some() {
-            values.extend(iter);
-        } else {
-            for value in iter {
-                values.try_push(value)?;
-            }
+        #[cfg(not(nightly))]
+        {
+            Ok(iter.into_iter().collect())
         }
-        Ok(values)
+        #[cfg(nightly)]
+        {
+            let mut values = vec();
+            values.extend(iter);
+            Ok(values)
+        }
     }
 
+    #[inline(always)]
     fn try_extend<I>(&mut self, iter: I) -> Result<(), TryReserveError>
     where
         I: IntoIterator<Item = T>,
     {
-        let iter = iter.into_iter();
-        let (lower, upper) = iter.size_hint();
-        self.try_reserve(upper.unwrap_or(lower))?;
-        if upper.is_some() {
-            for value in iter {
-                self.push(value);
-            }
-        } else {
-            for value in iter {
-                self.try_push(value)?;
-            }
-        }
+        self.extend(iter);
         Ok(())
     }
 }
@@ -85,6 +81,7 @@ impl<T> TursoFromIterator<T> for Vec<T> {
 impl<T: Clone> TryClone for Vec<T> {
     type Error = TryReserveError;
 
+    #[inline(always)]
     fn try_clone(&self) -> Result<Self, Self::Error> {
         #[cfg(not(nightly))]
         let mut cloned = <Self as TursoTryWithCapacityExt>::try_with_capacity(self.len())?;
