@@ -5,11 +5,12 @@
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <RootNamespace>Turso</RootNamespace>
-    
-    <PackageId>Turso</PackageId>
-    <Title>Turso ADO.NET Provider</Title>
-    <Description>ADO.NET provider for Turso, exposing SQLite-compatible local database access through System.Data.Common.</Description>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>Turso.Data.Sqlite</RootNamespace>
+
+    <PackageId>Turso.Data.Sqlite</PackageId>
+    <Title>Turso SQLite-compatible ADO.NET Provider</Title>
+    <Description>SQLite-compatible ADO.NET facade for Turso, intended to ease migration from Microsoft.Data.Sqlite.</Description>
     <Version>0.0.2</Version>
     <Authors>Turso authors</Authors>
     <PackageTags>turso;sqlite;database;ado.net;system.data</PackageTags>
@@ -21,11 +22,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);1591</NoWarn>
   </PropertyGroup>
-  
-  <ItemGroup>
-    <PackageReference Include="Turso.Raw" Version="0.0.2" />
-  </ItemGroup>
-  
+
   <ItemGroup>
     <ProjectReference Include="..\Turso.Raw\Turso.Raw.csproj" />
   </ItemGroup>
