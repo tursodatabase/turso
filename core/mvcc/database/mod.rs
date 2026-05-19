@@ -2395,14 +2395,14 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .store(true, Ordering::Release);
                 }
                 let end_ts = *end_ts;
-                let mut log_record = match std::mem::replace(
+                let log_record = match std::mem::replace(
                     &mut self.state,
                     CommitState::SyncLogicalLog { end_ts },
                 ) {
                     CommitState::BeginCommitLogicalLog { log_record, .. } => log_record,
                     _ => unreachable!(),
                 };
-                let (c, append_bytes) = mvcc_store.storage.log_tx(&mut log_record, None)?;
+                let (c, append_bytes) = mvcc_store.storage.log_tx(log_record, None)?;
                 self.pending_log_append_bytes = Some(append_bytes);
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {

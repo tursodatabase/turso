@@ -63,7 +63,7 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
 
     fn log_tx(
         &self,
-        m: &mut turso_core::mvcc::database::LogRecord,
+        m: turso_core::mvcc::database::LogRecord,
         on_serialization_complete: Option<&dyn Fn(&[u8], u32) -> turso_core::Result<()>>,
     ) -> turso_core::Result<(turso_core::Completion, u64)> {
         self.used_log_tx

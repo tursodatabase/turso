@@ -562,7 +562,7 @@ impl LogicalLog {
     /// until `advance_offset_after_success` is called (MVCC commit path).
     fn frame_and_pwrite_tx(
         &mut self,
-        tx: &mut LogRecord,
+        mut tx: LogRecord,
         advance_offset_immediately: bool,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
@@ -686,11 +686,11 @@ impl LogicalLog {
             cb(&tx.buf[on_disk_start..], crc)?;
         }
 
-        // 7. Hand off `tx.buf` to the I/O layer without copying. `mem::take`
-        // leaves `tx.buf` as an empty Vec. For non-first-write commits, the
-        // Buffer wrapper exposes only `data[LOG_HDR_SIZE..]` so the unused
-        // 56-byte prefix never reaches disk — a single pwrite, no shift.
-        let raw = std::mem::take(&mut tx.buf);
+        // 7. Hand off `tx.buf` to the I/O layer without copying. For
+        // non-first-write commits, the Buffer wrapper exposes only
+        // `data[LOG_HDR_SIZE..]` so the unused 56-byte prefix never reaches
+        // disk — a single pwrite, no shift.
+        let raw = tx.buf;
         let buffer = if is_first_write {
             Arc::new(Buffer::new(raw))
         } else {
@@ -719,7 +719,7 @@ impl LogicalLog {
 
     /// Writes a transaction to the log and immediately advances the writer offset.
     /// Used for checkpoint-initiated writes where no two-phase commit is needed.
-    pub fn log_tx(&mut self, tx: &mut LogRecord) -> Result<Completion> {
+    pub fn log_tx(&mut self, tx: LogRecord) -> Result<Completion> {
         let (c, _) = self.frame_and_pwrite_tx(tx, true, None)?;
         Ok(c)
     }
@@ -733,7 +733,7 @@ impl LogicalLog {
     /// before the disk write.
     pub fn log_tx_deferred_offset(
         &mut self,
-        tx: &mut LogRecord,
+        tx: LogRecord,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
         self.frame_and_pwrite_tx(tx, false, on_serialization_complete)
@@ -2396,7 +2396,7 @@ mod tests {
             btree_resident: false,
         };
         tx.push_row_version_for_test(&version);
-        let c = log.log_tx(&mut tx).unwrap();
+        let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let rowid_len = varint_len(1);
@@ -2486,8 +2486,8 @@ mod tests {
             row,
             btree_resident,
         };
-        let mut tx = crate::mvcc::database::LogRecord::for_test(commit_ts, &[row_version], None);
-        let c = log.log_tx(&mut tx).unwrap();
+        let tx = crate::mvcc::database::LogRecord::for_test(commit_ts, &[row_version], None);
+        let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
     }
 
@@ -2919,7 +2919,7 @@ mod tests {
             row: row.clone(),
             btree_resident: false,
         });
-        let c = log.log_tx(&mut tx1).unwrap();
+        let c = log.log_tx(tx1).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let mut tx2 = crate::mvcc::database::LogRecord::new(20);
@@ -2930,7 +2930,7 @@ mod tests {
             row,
             btree_resident: false,
         });
-        let c = log.log_tx(&mut tx2).unwrap();
+        let c = log.log_tx(tx2).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let file_size = file.size().unwrap() as usize;
@@ -3070,7 +3070,7 @@ mod tests {
 
         // Frame 3: deferred path — offset must not advance until confirmed.
         let row3 = generate_simple_string_row((-2).into(), 3, "deferred");
-        let mut tx3 = crate::mvcc::database::LogRecord::for_test(
+        let tx3 = crate::mvcc::database::LogRecord::for_test(
             3,
             &[crate::mvcc::database::RowVersion {
                 id: 3,
@@ -3081,7 +3081,7 @@ mod tests {
             }],
             None,
         );
-        let (c, bytes_written) = log.log_tx_deferred_offset(&mut tx3, None).unwrap();
+        let (c, bytes_written) = log.log_tx_deferred_offset(tx3, None).unwrap();
         io.wait_for_completion(c).unwrap();
 
         assert_eq!(
@@ -3132,7 +3132,7 @@ mod tests {
             btree_resident: false,
         };
         tx.push_row_version_for_test(&version);
-        let c = log.log_tx(&mut tx).unwrap();
+        let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         // Flip one byte in the op data (varint payload_len).
@@ -3360,8 +3360,8 @@ mod tests {
             .open_file("header-corrupt.db-log", crate::OpenFlags::Create, false)
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
-        let mut tx = crate::mvcc::database::LogRecord::for_test(77, &[], None);
-        let c = log.log_tx(&mut tx).unwrap();
+        let tx = crate::mvcc::database::LogRecord::for_test(77, &[], None);
+        let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         // Corrupt magic bytes in the file header.
@@ -3563,17 +3563,17 @@ mod tests {
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         // Frame 1: empty tx (no ops). The reader must skip it silently (ops.is_empty() → continue).
-        let mut tx = crate::mvcc::database::LogRecord::for_test(200, &[], None);
-        let c = log.log_tx(&mut tx).unwrap();
+        let tx = crate::mvcc::database::LogRecord::for_test(200, &[], None);
+        let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         // Frame 2: header-only tx. DatabaseHeader::default() has the SQLite magic that passes
         // the reader's magic validation check.
         let commit_ts = 201u64;
         let db_header = DatabaseHeader::default();
-        let mut header_tx =
+        let header_tx =
             crate::mvcc::database::LogRecord::for_test(commit_ts, &[], Some(db_header));
-        let c = log.log_tx(&mut header_tx).unwrap();
+        let c = log.log_tx(header_tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
@@ -3623,7 +3623,7 @@ mod tests {
             row: generate_simple_string_row((-2).into(), 42, "flip"),
             btree_resident: false,
         });
-        let c = log.log_tx(&mut tx).unwrap();
+        let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let size = file.size().unwrap() as usize;
@@ -3731,7 +3731,7 @@ mod tests {
                     });
                 }
             }
-            let c = log.log_tx(&mut tx).unwrap();
+            let c = log.log_tx(tx).unwrap();
             io.wait_for_completion(c).unwrap();
         }
 
@@ -3759,7 +3759,7 @@ mod tests {
                 btree_resident: false,
             });
         }
-        let c = log.log_tx(&mut large_tx).unwrap();
+        let c = log.log_tx(large_tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let got = read_table_ops(file.clone(), &io);
@@ -3811,9 +3811,9 @@ mod tests {
                     btree_resident,
                 }
             });
-            let mut tx =
+            let tx =
                 crate::mvcc::database::LogRecord::for_test(commit_ts, &[row_version], None);
-            let Ok(c) = log.log_tx(&mut tx) else {
+            let Ok(c) = log.log_tx(tx) else {
                 return false;
             };
             if io.wait_for_completion(c).is_err() {
@@ -3902,7 +3902,7 @@ mod tests {
             btree_resident: true,
         };
         tx.push_row_version_for_test(&version);
-        let c = log.log_tx(&mut tx).unwrap();
+        let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         // Verify the on-disk frame header binary layout.
@@ -3961,7 +3961,7 @@ mod tests {
             btree_resident: false,
         };
         tx.push_row_version_for_test(&version);
-        let c = log.log_tx(&mut tx).unwrap();
+        let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let c = file
@@ -4417,7 +4417,7 @@ mod tests {
     fn append_encrypted_tx(
         log: &mut LogicalLog,
         io: &Arc<dyn crate::IO>,
-        tx: &mut crate::mvcc::database::LogRecord,
+        tx: crate::mvcc::database::LogRecord,
     ) {
         let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
@@ -4427,7 +4427,7 @@ mod tests {
         file: Arc<dyn crate::File>,
         io: &Arc<dyn crate::IO>,
         enc_ctx: &crate::storage::encryption::EncryptionContext,
-        tx: &mut crate::mvcc::database::LogRecord,
+        tx: crate::mvcc::database::LogRecord,
     ) {
         assert_eq!(
             file.size().unwrap(),
@@ -4443,7 +4443,7 @@ mod tests {
         io: &Arc<dyn crate::IO>,
         enc_ctx: &crate::storage::encryption::EncryptionContext,
         encrypted_payload_chunk_size: usize,
-        tx: &mut crate::mvcc::database::LogRecord,
+        tx: crate::mvcc::database::LogRecord,
     ) {
         assert_eq!(
             file.size().unwrap(),
@@ -4463,7 +4463,7 @@ mod tests {
         io: &Arc<dyn crate::IO>,
         file_name: &str,
         enc_ctx: &crate::storage::encryption::EncryptionContext,
-        tx: &mut crate::mvcc::database::LogRecord,
+        tx: crate::mvcc::database::LogRecord,
     ) -> Arc<dyn crate::File> {
         let file = open_test_file(io, file_name);
         write_first_encrypted_tx(file.clone(), io, enc_ctx, tx);
@@ -4475,7 +4475,7 @@ mod tests {
         file_name: &str,
         enc_ctx: &crate::storage::encryption::EncryptionContext,
         encrypted_payload_chunk_size: usize,
-        tx: &mut crate::mvcc::database::LogRecord,
+        tx: crate::mvcc::database::LogRecord,
     ) -> Arc<dyn crate::File> {
         let file = open_test_file(io, file_name);
         write_first_encrypted_tx_with_chunk_size_for_test(
@@ -4493,7 +4493,7 @@ mod tests {
         file_name: &str,
         enc_ctx: &crate::storage::encryption::EncryptionContext,
         encrypted_payload_chunk_size: usize,
-        txs: &mut [crate::mvcc::database::LogRecord],
+        txs: Vec<crate::mvcc::database::LogRecord>,
     ) -> Arc<dyn crate::File> {
         let file = open_test_file(io, file_name);
         let mut log = LogicalLog::new_with_payload_chunk_size(
@@ -4933,7 +4933,7 @@ mod tests {
             .to_vec();
 
         // Write one encrypted frame with 2 ops.
-        let mut tx = crate::mvcc::database::LogRecord::for_test(
+        let tx = crate::mvcc::database::LogRecord::for_test(
             100,
             &[
                 make_test_row_version(table_id, 1, "hello", 100),
@@ -4941,7 +4941,7 @@ mod tests {
             ],
             None,
         );
-        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, &mut tx);
+        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, tx);
 
         // ── Layout invariant check ──
         // Read the raw TX header to extract payload_size.
@@ -5013,14 +5013,14 @@ mod tests {
         let value = "t".repeat(text_len);
         let row_version = make_test_row_version((-2).into(), 1, &value, 100);
         let expected_record_bytes = row_version.row.payload().to_vec();
-        let mut tx = crate::mvcc::database::LogRecord::for_test(100, &[row_version], None);
+        let tx = crate::mvcc::database::LogRecord::for_test(100, &[row_version], None);
 
         let file = write_single_encrypted_tx_with_chunk_size_for_test(
             &io,
             "enc-roundtrip-test-chunk-size.db-log",
             &enc_ctx,
             TEST_CHUNK_SIZE,
-            &mut tx,
+            tx,
         );
 
         assert_eq!(
@@ -5073,7 +5073,7 @@ mod tests {
         for case_index in 0..case_count {
             let case_seed = rng.next_u64();
             let include_forced_prefix = case_index == forced_case_index;
-            let (mut txs, expected_frames) = generate_encrypted_carry_fuzz_case(
+            let (txs, expected_frames) = generate_encrypted_carry_fuzz_case(
                 case_seed,
                 TEST_CHUNK_SIZE,
                 include_forced_prefix,
@@ -5084,7 +5084,7 @@ mod tests {
                 &format!("enc-carry-fuzz-{seed}-{case_index}.db-log"),
                 &enc_ctx,
                 TEST_CHUNK_SIZE,
-                &mut txs,
+                txs,
             );
             let actual_frames = parse_all_encrypted_tx_ops_with_chunk_size_for_test(
                 file,
@@ -5194,7 +5194,7 @@ mod tests {
         ] {
             let text_len = text_len_for_single_upsert_table_op_size(payload_size);
             let value = "p".repeat(text_len);
-            let mut tx = crate::mvcc::database::LogRecord::for_test(
+            let tx = crate::mvcc::database::LogRecord::for_test(
                 100,
                 &[make_test_row_version((-2).into(), 1, &value, 100)],
                 None,
@@ -5203,7 +5203,7 @@ mod tests {
                 &io,
                 &format!("enc-layout-pinned-{payload_size}.db-log"),
                 &enc_ctx,
-                &mut tx,
+                tx,
             );
 
             let frame_bytes = read_file_bytes(file.clone(), &io);
@@ -5237,12 +5237,12 @@ mod tests {
         let value = "s".repeat(text_len);
 
         let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
-        let mut tx = crate::mvcc::database::LogRecord::for_test(
+        let tx = crate::mvcc::database::LogRecord::for_test(
             444,
             &[make_test_row_version(table_id, 1, &value, 444)],
             None,
         );
-        append_encrypted_tx(&mut log, &io, &mut tx);
+        append_encrypted_tx(&mut log, &io, tx);
 
         let frame_bytes = read_file_bytes(file.clone(), &io);
         let payload_size = u64::from_le_bytes(
@@ -5285,12 +5285,12 @@ mod tests {
             let value = "x".repeat(text_len);
             let row_version = make_test_row_version((-2).into(), 1, &value, 100);
             let expected_record_bytes = row_version.row.payload().to_vec();
-            let mut tx = crate::mvcc::database::LogRecord::for_test(100, &[row_version], None);
+            let tx = crate::mvcc::database::LogRecord::for_test(100, &[row_version], None);
             let file = write_single_encrypted_tx(
                 &io,
                 &format!("enc-layout-{target_op_size}.db-log"),
                 &enc_ctx,
-                &mut tx,
+                tx,
             );
 
             let frame_hdr = read_file_bytes(file.clone(), &io);
@@ -5329,8 +5329,8 @@ mod tests {
         let row_version = make_test_row_version((-2).into(), 1, &value, 100);
         let expected_record_bytes = row_version.row.payload().to_vec();
 
-        let mut tx = crate::mvcc::database::LogRecord::for_test(100, &[row_version], None);
-        let file = write_single_encrypted_tx(&io, "enc-cross-boundary.db-log", &enc_ctx, &mut tx);
+        let tx = crate::mvcc::database::LogRecord::for_test(100, &[row_version], None);
+        let file = write_single_encrypted_tx(&io, "enc-cross-boundary.db-log", &enc_ctx, tx);
         let ops = parse_only_encrypted_tx_ops(file, &io, &enc_ctx);
         assert_eq!(ops.len(), 1);
         assert_upsert_table_op(&ops[0], (-2).into(), 1, &expected_record_bytes, 100);
@@ -5380,8 +5380,8 @@ mod tests {
             "chunk boundary should fall after the first payload_len varint byte"
         );
 
-        let mut tx = crate::mvcc::database::LogRecord::for_test(100, &[filler, second], None);
-        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, &mut tx);
+        let tx = crate::mvcc::database::LogRecord::for_test(100, &[filler, second], None);
+        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, tx);
         let ops = parse_only_encrypted_tx_ops(file, &io, &enc_ctx);
         assert_eq!(ops.len(), 2);
         assert_upsert_table_op(&ops[0], (-2).into(), 1, &expected_filler_record_bytes, 100);
@@ -5419,8 +5419,8 @@ mod tests {
             "chunk boundary should split the header op after its first byte"
         );
 
-        let mut tx = crate::mvcc::database::LogRecord::for_test(100, &[filler], Some(header));
-        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, &mut tx);
+        let tx = crate::mvcc::database::LogRecord::for_test(100, &[filler], Some(header));
+        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, tx);
         let ops = parse_only_encrypted_tx_ops(file, &io, &enc_ctx);
         assert_eq!(ops.len(), 2);
         assert_upsert_table_op(&ops[0], (-2).into(), 1, &expected_filler_record_bytes, 100);
@@ -5449,8 +5449,8 @@ mod tests {
             .iter()
             .map(|row_version| row_version.row.payload().to_vec())
             .collect::<Vec<_>>();
-        let mut tx = crate::mvcc::database::LogRecord::for_test(200, &row_versions, None);
-        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, &mut tx);
+        let tx = crate::mvcc::database::LogRecord::for_test(200, &row_versions, None);
+        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, tx);
         let ops = parse_only_encrypted_tx_ops(file, &io, &enc_ctx);
         assert_eq!(ops.len(), 96);
         for (idx, op) in ops.iter().enumerate() {
@@ -5476,8 +5476,8 @@ mod tests {
         let row_version = make_test_index_row_version(index_id, 42, &value, 250);
         let expected_payload = row_version.row.payload().to_vec();
 
-        let mut tx = crate::mvcc::database::LogRecord::for_test(250, &[row_version], None);
-        let file = write_single_encrypted_tx(&io, "enc-index-boundary.db-log", &enc_ctx, &mut tx);
+        let tx = crate::mvcc::database::LogRecord::for_test(250, &[row_version], None);
+        let file = write_single_encrypted_tx(&io, "enc-index-boundary.db-log", &enc_ctx, tx);
 
         let frame_bytes = read_file_bytes(file.clone(), &io);
         let payload_size = u64::from_le_bytes(
@@ -5513,7 +5513,7 @@ mod tests {
 
         let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
         for i in 0..5u64 {
-            let mut tx = crate::mvcc::database::LogRecord::for_test(
+            let tx = crate::mvcc::database::LogRecord::for_test(
                 100 + i,
                 &[make_test_row_version(
                     table_id,
@@ -5523,7 +5523,7 @@ mod tests {
                 )],
                 None,
             );
-            append_encrypted_tx(&mut log, &io, &mut tx);
+            append_encrypted_tx(&mut log, &io, tx);
         }
 
         let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
@@ -5565,12 +5565,12 @@ mod tests {
                 .unwrap();
 
             let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
-            let mut tx = crate::mvcc::database::LogRecord::for_test(
+            let tx = crate::mvcc::database::LogRecord::for_test(
                 100,
                 &[make_test_row_version(table_id, 1, "secret", 100)],
                 None,
             );
-            append_encrypted_tx(&mut log, &io, &mut tx);
+            append_encrypted_tx(&mut log, &io, tx);
 
             let mut reader = StreamingLogicalLogReader::new(file, Some(wrong_key_enc_ctx()));
             reader.read_header(&io).unwrap();
@@ -5591,12 +5591,12 @@ mod tests {
                 .unwrap();
 
             let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
-            let mut tx = crate::mvcc::database::LogRecord::for_test(
+            let tx = crate::mvcc::database::LogRecord::for_test(
                 100,
                 &[make_test_row_version(table_id, 1, "hdr_tamper", 100)],
                 None,
             );
-            append_encrypted_tx(&mut log, &io, &mut tx);
+            append_encrypted_tx(&mut log, &io, tx);
 
             // Flip a byte in the commit_ts field (TX header offset 16..24, file offset = LOG_HDR + 16).
             let corrupt_offset = (LOG_HDR_SIZE + 16) as u64;
@@ -5622,12 +5622,12 @@ mod tests {
                 .unwrap();
 
             let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
-            let mut tx = crate::mvcc::database::LogRecord::for_test(
+            let tx = crate::mvcc::database::LogRecord::for_test(
                 100,
                 &[make_test_row_version(table_id, 1, "tamper_me", 100)],
                 None,
             );
-            append_encrypted_tx(&mut log, &io, &mut tx);
+            append_encrypted_tx(&mut log, &io, tx);
 
             // Flip a byte in the ciphertext (after log header + TX header).
             let corrupt_offset = (LOG_HDR_SIZE + TX_HEADER_SIZE + 1) as u64;
@@ -5660,15 +5660,15 @@ mod tests {
 
         // Write 2 frames.
         let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
-        let mut first_tx =
+        let first_tx =
             crate::mvcc::database::LogRecord::for_test(100, &[first_row_version], None);
-        append_encrypted_tx(&mut log, &io, &mut first_tx);
-        let mut second_tx = crate::mvcc::database::LogRecord::for_test(
+        append_encrypted_tx(&mut log, &io, first_tx);
+        let second_tx = crate::mvcc::database::LogRecord::for_test(
             101,
             &[make_test_row_version(table_id, 1, "data", 101)],
             None,
         );
-        append_encrypted_tx(&mut log, &io, &mut second_tx);
+        append_encrypted_tx(&mut log, &io, second_tx);
 
         // Truncate mid-way through the second frame.
         let file_size = file.size().unwrap();
@@ -5710,8 +5710,8 @@ mod tests {
         let base_file = open_test_file(&io, "enc-chunk-integrity-base.db-log");
         let row_version = make_test_row_version((-2).into(), 1, &value, 333);
         let expected_record_bytes = row_version.row.payload().to_vec();
-        let mut tx = crate::mvcc::database::LogRecord::for_test(333, &[row_version], None);
-        write_first_encrypted_tx(base_file.clone(), &io, &enc_ctx, &mut tx);
+        let tx = crate::mvcc::database::LogRecord::for_test(333, &[row_version], None);
+        write_first_encrypted_tx(base_file.clone(), &io, &enc_ctx, tx);
         let base_ops = parse_only_encrypted_tx_ops(base_file.clone(), &io, &enc_ctx);
         assert_eq!(base_ops.len(), 1);
         assert_upsert_table_op(&base_ops[0], (-2).into(), 1, &expected_record_bytes, 333);
@@ -5838,18 +5838,18 @@ mod tests {
         let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
         let first_row_version = make_test_row_version(table_id, 1, "prefix", 500);
         let expected_prefix_record_bytes = first_row_version.row.payload().to_vec();
-        let mut first_tx =
+        let first_tx =
             crate::mvcc::database::LogRecord::for_test(500, &[first_row_version], None);
-        let c = log.log_tx(&mut first_tx).unwrap();
+        let c = log.log_tx(first_tx).unwrap();
         io.wait_for_completion(c).unwrap();
         let second_frame_start = log.offset as usize;
 
-        let mut second_tx = crate::mvcc::database::LogRecord::for_test(
+        let second_tx = crate::mvcc::database::LogRecord::for_test(
             600,
             &[make_test_row_version(table_id, 2, &value, 600)],
             None,
         );
-        let c = log.log_tx(&mut second_tx).unwrap();
+        let c = log.log_tx(second_tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let base_bytes = read_file_bytes(file.clone(), &io);

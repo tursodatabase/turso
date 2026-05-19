@@ -39,7 +39,7 @@ pub trait DurableStorage: Send + Sync + Debug {
     /// is held, so it should be fast (e.g. memcpy to a side buffer).
     fn log_tx(
         &self,
-        m: &mut LogRecord,
+        m: LogRecord,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)>;
 
@@ -153,7 +153,7 @@ impl DurableStorage for Storage {
 
     fn log_tx(
         &self,
-        m: &mut LogRecord,
+        m: LogRecord,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
         self.logical_log

@@ -12692,7 +12692,7 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
         }
         fn log_tx(
             &self,
-            m: &mut LogRecord,
+            m: LogRecord,
             c: OnSerializationComplete<'_>,
         ) -> Result<(Completion, u64)> {
             if self.arm_log_tx_busy.swap(false, Ordering::AcqRel) {
