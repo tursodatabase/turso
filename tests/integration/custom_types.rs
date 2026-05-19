@@ -3,6 +3,44 @@ mod tests {
     use crate::common::{ExecRows, TempDatabase};
     use tempfile::TempDir;
 
+    #[test]
+    fn test_builtin_uuid_type_accepts_generated_uuid_blob() {
+        let db = TempDatabase::builder()
+            .with_opts(
+                turso_core::DatabaseOpts::new()
+                    .with_custom_types(true)
+                    .with_encryption(true),
+            )
+            .build();
+        let conn = db.connect_limbo();
+
+        conn.execute(
+            "CREATE TABLE events (
+                id uuid PRIMARY KEY,
+                name varchar(100),
+                event_date date,
+                is_active boolean DEFAULT 1,
+                metadata json
+            ) STRICT",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events VALUES (
+                uuid4(),
+                'Product Launch',
+                '2025-03-15',
+                1,
+                '{\"venue\": \"online\"}'
+            )",
+        )
+        .unwrap();
+
+        let rows: Vec<(String, String)> = conn.exec_rows("SELECT id, name FROM events");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.len(), 36);
+        assert_eq!(rows[0].1, "Product Launch");
+    }
+
     /// Custom types must be loaded from __turso_internal_types when reopening
     /// a database. Without this, SELECT returns raw encoded values and PRAGMA
     /// list_types omits user-defined types.

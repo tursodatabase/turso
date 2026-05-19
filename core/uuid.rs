@@ -133,11 +133,23 @@ fn uuid_str(args: &[Value]) -> Value {
 
 #[scalar(name = "uuid_blob")]
 fn uuid_blob(&self, args: &[Value]) -> Value {
-    let Some(text) = args.first().and_then(|a| a.to_text()) else {
+    let Some(value) = args.first() else {
         return Value::error_with_message(
             "wrong number of arguments to function uuid_blob()".into(),
         );
     };
+
+    if let Some(blob) = value.to_blob() {
+        return match uuid::Uuid::from_slice(&blob) {
+            Ok(_) => Value::from_blob(blob),
+            Err(_) => Value::null(),
+        };
+    }
+
+    let Some(text) = value.to_text() else {
+        return Value::null();
+    };
+
     match uuid::Uuid::parse_str(text) {
         Ok(uuid) => Value::from_blob(uuid.as_bytes().to_vec()),
         Err(_) => Value::null(),
