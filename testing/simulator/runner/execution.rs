@@ -305,12 +305,16 @@ pub fn execute_interaction_turso(
             let results = interaction
                 .execute_faulty_query(&conn, env)
                 .inspect_err(|err| tracing::error!(?err));
+            let skip_integrity_check = matches!(results, Err(LimboError::CompletionError(_)));
 
             stack.push(results);
             // Reset fault injection
             env.io.inject_fault(false);
             // TODO: skip integrity check with mvcc
-            if !env.profile.mvcc && env.rng.random_ratio(1, 10) {
+            // A faulted completion can make statement reset cleanup fail by design.
+            // Let later interactions exercise recovery instead of checking the
+            // same connection while the injected abort is still being unwound.
+            if !skip_integrity_check && !env.profile.mvcc && env.rng.random_ratio(1, 10) {
                 limbo_integrity_check(&conn)?;
             }
         }
