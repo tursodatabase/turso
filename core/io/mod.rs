@@ -551,20 +551,12 @@ impl Debug for Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         match self {
-            Self::Heap(buf) => {
+            Self::Heap(buf) | Self::HeapView { data: buf, .. } => {
                 let underlying_len = buf.len();
                 TEMP_BUFFER_CACHE.with(|cache| {
                     let mut cache = cache.borrow_mut();
                     // take ownership of the buffer by swapping it with a dummy
                     let buffer = std::mem::replace(buf, Pin::new(vec![].into_boxed_slice()));
-                    cache.return_buffer(buffer, underlying_len);
-                });
-            }
-            Self::HeapView { data, .. } => {
-                let underlying_len = data.len();
-                TEMP_BUFFER_CACHE.with(|cache| {
-                    let mut cache = cache.borrow_mut();
-                    let buffer = std::mem::replace(data, Pin::new(vec![].into_boxed_slice()));
                     cache.return_buffer(buffer, underlying_len);
                 });
             }

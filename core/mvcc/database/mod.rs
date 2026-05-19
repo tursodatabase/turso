@@ -342,19 +342,6 @@ pub type TxID = u64;
 /// pre-serialized into a frame buffer that the logical-log flush path
 /// finalizes (backfills the TX header, appends the CRC trailer, optionally
 /// chunk-encrypts the payload) and writes to disk.
-///
-/// `buf` is laid out from construction with a `LOG_HDR_SIZE + TX_HEADER_SIZE`
-/// zero prefix so ops can be appended directly at the right offset. The
-/// flush path backfills the prefix in place and never shifts the payload:
-/// - First-write commits fill the log header slot and write the whole buffer.
-/// - Non-first-write commits leave the log header slot as zeros and wrap the
-///   buffer with `Buffer::new_with_start(..., LOG_HDR_SIZE)`, so the I/O
-///   layer simply skips the 56 unused bytes without a memmove.
-///
-/// The buffer is populated incrementally during commit via
-/// [`DurableStorage::serialize_row_version`] and
-/// [`DurableStorage::serialize_database_header`], so the committing
-/// transaction never materializes a `Vec<RowVersion>`-sized intermediate.
 #[derive(Clone, Debug)]
 pub struct LogRecord {
     pub(crate) tx_timestamp: TxID,
@@ -1947,11 +1934,6 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             return Ok(TransitionResult::Continue);
         }
 
-        // Both row-version passes complete. Append the captured DatabaseHeader
-        // op (if any) at the tail of the payload — this preserves the on-disk
-        // order: row-version ops first, header op last. (Order matches the
-        // previous implementation where `serialize_ops_into_write_buf` walked
-        // `row_versions` then optionally serialized `header`.)
         if let Some(header) = ctx.pending_header.take() {
             mvcc_store
                 .storage
@@ -2413,15 +2395,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .store(true, Ordering::Release);
                 }
                 let end_ts = *end_ts;
-                // The pattern binding `end_ts: &u64` is no longer used after
-                // the copy above, so NLL drops the shared borrow on
-                // `self.state` and lets us swap it mutably here. We swap
-                // ahead of `log_tx` because `log_tx` consumes the LogRecord's
-                // buffer in place (it becomes the on-disk frame buffer
-                // handed to pwrite); on error the LogRecord is partially
-                // framed and not usable for retry — which matches the
-                // pre-existing semantics where a log_tx failure aborts the
-                // commit.
                 let mut log_record = match std::mem::replace(
                     &mut self.state,
                     CommitState::SyncLogicalLog { end_ts },

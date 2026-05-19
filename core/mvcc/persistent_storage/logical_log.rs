@@ -269,10 +269,7 @@ pub(crate) const TX_HEADER_SIZE: usize = 24; // FRAME_MAGIC(4) + payload_size(8)
 const TX_TRAILER_SIZE: usize = 8; // crc32c(4) + END_MAGIC(4)
 const TX_MIN_FRAME_SIZE: usize = TX_HEADER_SIZE + TX_TRAILER_SIZE; // 32
 
-/// Total bytes pre-reserved at the front of a `LogRecord::buf` so the flush
-/// path never has to shift the payload. The log-header slot is included for
-/// first-write commits; non-first-write commits leave it as zeros in memory
-/// and skip it at I/O time via `Buffer::new_with_start(..., LOG_HDR_SIZE)`.
+/// Total bytes pre-reserved at the front of a `LogRecord::buf`.
 pub(crate) const LOG_RECORD_PREFIX_SIZE: usize = LOG_HDR_SIZE + TX_HEADER_SIZE;
 
 fn encrypted_payload_chunk_count(payload_size: usize, chunk_size: usize) -> usize {
@@ -560,14 +557,6 @@ impl LogicalLog {
     /// — optional log header, TX header, optional chunked encryption, CRC
     /// trailer — and pwrites the resulting frame to disk.
     ///
-    /// Ops are serialized into `tx.buf` during commit
-    /// (see [`DurableStorage::serialize_row_version`] /
-    /// [`DurableStorage::serialize_database_header`]); this function adds the
-    /// framing in place so the same allocation that held the plaintext payload
-    /// becomes the on-disk frame buffer handed to the I/O layer. There is no
-    /// separate `write_buf` held by `LogicalLog` — once we hand the buffer to
-    /// pwrite, `tx.buf` is left empty.
-    ///
     /// `advance_offset_immediately`: when true, the writer offset advances right
     /// after the pwrite (checkpoint path). When false, the offset stays behind
     /// until `advance_offset_after_success` is called (MVCC commit path).
@@ -581,10 +570,6 @@ impl LogicalLog {
         let commit_ts = tx.tx_timestamp;
         // `tx.buf` is laid out as:
         //   [LOG_HDR slot (56B, zeros)] [TX_HEADER slot (24B, zeros)] [payload]
-        // Both prefix slots were pre-reserved by `LogRecord::new`. The flush
-        // path either fills the LOG_HDR slot (first-write, single pwrite of
-        // the whole buf) or skips it via `Buffer::new_with_start` (every
-        // other commit) — never shifting the payload in memory.
         debug_assert!(
             tx.buf.len() >= LOG_RECORD_PREFIX_SIZE,
             "LogRecord buf missing pre-reserved framing prefix"
@@ -734,8 +719,6 @@ impl LogicalLog {
 
     /// Writes a transaction to the log and immediately advances the writer offset.
     /// Used for checkpoint-initiated writes where no two-phase commit is needed.
-    /// On return, `tx.buf` is empty: its allocation has been moved into the
-    /// pwrite buffer.
     pub fn log_tx(&mut self, tx: &mut LogRecord) -> Result<Completion> {
         let (c, _) = self.frame_and_pwrite_tx(tx, true, None)?;
         Ok(c)
@@ -744,9 +727,6 @@ impl LogicalLog {
     /// Writes a transaction to the log but does NOT advance the writer offset.
     /// Returns `(completion, bytes_written)`. The caller must call
     /// `advance_offset_after_success(bytes)` after confirming the commit succeeded.
-    ///
-    /// On return, `tx.buf` is empty: its allocation has been moved into the
-    /// pwrite buffer.
     ///
     /// If `on_serialization_complete` is provided, it is called with a zero-copy
     /// reference to the framed bytes and the running CRC after framing but

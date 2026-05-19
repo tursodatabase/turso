@@ -18,10 +18,6 @@ use crate::{CheckpointResult, Completion, File, LimboError, Result};
 pub trait DurableStorage: Send + Sync + Debug {
     /// Append one row-version op to `log_record`'s payload buffer, in the
     /// on-disk wire format used by the logical log. Updates `op_count`.
-    ///
-    /// Called incrementally during `BuildLogRecord` so the committing
-    /// transaction can stream bytes into the log record without first
-    /// collecting a `Vec<RowVersion>` intermediate.
     fn serialize_row_version(
         &self,
         log_record: &mut LogRecord,
@@ -29,8 +25,6 @@ pub trait DurableStorage: Send + Sync + Debug {
     ) -> Result<()>;
 
     /// Append a `DatabaseHeader` op to `log_record`'s payload buffer.
-    /// Asserts that no header op has already been appended. Updates
-    /// `op_count` and sets `has_header`.
     fn serialize_database_header(
         &self,
         log_record: &mut LogRecord,
@@ -38,13 +32,6 @@ pub trait DurableStorage: Send + Sync + Debug {
     ) -> Result<()>;
 
     /// Write a transaction to the logical log without advancing the writer offset.
-    ///
-    /// `m.buf` is the plaintext payload built incrementally via
-    /// [`serialize_row_version`] and [`serialize_database_header`]. The
-    /// implementation reuses `m.buf` as the on-disk frame buffer (wrapping it
-    /// with the TX header, optional chunked encryption, and the trailer), then
-    /// hands the same allocation to the I/O layer — no separate framing buffer
-    /// is kept alive across calls. On return, `m.buf` is emptied.
     ///
     /// If `on_serialization_complete` is provided, it is called with a zero-copy
     /// reference to the framed bytes and the running CRC after framing but
