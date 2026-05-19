@@ -45,6 +45,42 @@ fn to_turso_db(ptr: jlong) -> Result<&'static mut TursoDB> {
     }
 }
 
+fn database_opts_from_experimental_features(experimental_features: Option<&str>) -> DatabaseOpts {
+    let mut opts = DatabaseOpts::new();
+    if let Some(experimental_features) = experimental_features {
+        for feature in experimental_features.split(',').map(str::trim) {
+            opts = match feature {
+                "views" => opts.with_views(true),
+                "custom_types" => opts.with_custom_types(true),
+                "encryption" => opts.with_encryption(true),
+                "index_method" => opts.with_index_method(true),
+                "autovacuum" => opts.with_autovacuum(true),
+                "vacuum" => opts.with_vacuum(true),
+                "attach" => opts.with_attach(true),
+                "generated_columns" => opts.with_generated_columns(true),
+                "multiprocess_wal" => opts.with_multiprocess_wal(true),
+                "without_rowid" => opts.with_without_rowid(true),
+                _ => opts,
+            };
+        }
+    }
+    opts
+}
+
+fn optional_jstring(
+    env: &mut JNIEnv<'_>,
+    value: JString<'_>,
+    label: &str,
+) -> std::result::Result<Option<String>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    match env.get_string(&value) {
+        Ok(s) => Ok(Some(s.into())),
+        Err(e) => Err(format!("invalid {label}: {e}")),
+    }
+}
+
 #[no_mangle]
 #[allow(clippy::arc_with_non_send_sync)]
 pub extern "system" fn Java_tech_turso_core_TursoDB_openUtf8<'local>(
@@ -52,6 +88,7 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_openUtf8<'local>(
     obj: JObject<'local>,
     file_path_byte_arr: JByteArray<'local>,
     _open_flags: jint,
+    experimental_features: JString<'local>,
 ) -> jlong {
     let io = match turso_core::PlatformIO::new() {
         Ok(io) => Arc::new(io),
@@ -78,13 +115,24 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_openUtf8<'local>(
         }
     };
 
-    let db = match Database::open_file(io.clone(), &path) {
-        Ok(db) => db,
-        Err(e) => {
-            set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
-            return -1;
-        }
-    };
+    let experimental_features =
+        match optional_jstring(&mut env, experimental_features, "experimental_features") {
+            Ok(features) => features,
+            Err(e) => {
+                set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e);
+                return -1;
+            }
+        };
+    let db_opts = database_opts_from_experimental_features(experimental_features.as_deref());
+
+    let db =
+        match Database::open_file_with_flags(io.clone(), &path, OpenFlags::Create, db_opts, None) {
+            Ok(db) => db,
+            Err(e) => {
+                set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
+                return -1;
+            }
+        };
 
     TursoDB::new(db, io, None).to_ptr()
 }
@@ -100,6 +148,7 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_openWithEncryptionUtf8<'loca
     _open_flags: jint,
     cipher: JString<'local>,
     hexkey: JString<'local>,
+    experimental_features: JString<'local>,
 ) -> jlong {
     let io = match turso_core::PlatformIO::new() {
         Ok(io) => Arc::new(io),
@@ -155,11 +204,19 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_openWithEncryptionUtf8<'loca
         .as_ref()
         .map(|opts| (opts.cipher.clone(), opts.hexkey.clone()));
 
-    let db_opts = if encryption_opts.is_some() {
-        DatabaseOpts::new().with_encryption(true)
-    } else {
-        DatabaseOpts::new()
-    };
+    let experimental_features =
+        match optional_jstring(&mut env, experimental_features, "experimental_features") {
+            Ok(features) => features,
+            Err(e) => {
+                set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e);
+                return -1;
+            }
+        };
+
+    let mut db_opts = database_opts_from_experimental_features(experimental_features.as_deref());
+    if encryption_opts.is_some() {
+        db_opts = db_opts.with_encryption(true);
+    }
 
     let db = match Database::open_file_with_flags(
         io.clone(),

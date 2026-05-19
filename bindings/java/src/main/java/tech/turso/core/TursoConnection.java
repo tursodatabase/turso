@@ -57,7 +57,7 @@ public final class TursoConnection {
 
   private static TursoDB open(String url, String filePath, Properties properties)
       throws SQLException {
-    return TursoDB.create(url, filePath);
+    return TursoDB.create(url, filePath, properties.getProperty("experimental_features"));
   }
 
   public void checkOpen() throws SQLException {
