@@ -3021,14 +3021,44 @@ impl Pager {
             IOResult::Done(true) => {
                 let mut page_cache = self.page_cache.write();
                 let page_key = PageCacheKey::new(page_idx);
-                match page_cache.insert(page_key, page) {
+                match page_cache.insert(page_key, page.clone()) {
+                    Ok(_) => Ok(IOResult::Done(())),
+                    Err(CacheError::KeyExists) => Ok(IOResult::Done(())),
+                    Err(CacheError::Full) => {
+                        match page_cache.insert_over_capacity(page_key, page) {
+                            Ok(_) => Ok(IOResult::Done(())),
+                            Err(CacheError::KeyExists) => Ok(IOResult::Done(())),
+                            Err(e) => Err(e.into()),
+                        }
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+            IOResult::Done(false) => {
+                let mut page_cache = self.page_cache.write();
+                let page_key = PageCacheKey::new(page_idx);
+                match page_cache.insert_over_capacity(page_key, page) {
                     Ok(_) => Ok(IOResult::Done(())),
                     Err(CacheError::KeyExists) => Ok(IOResult::Done(())),
                     Err(e) => Err(e.into()),
                 }
             }
-            IOResult::Done(false) => Err(LimboError::Busy),
             IOResult::IO(c) => Ok(IOResult::IO(c)),
+        }
+    }
+
+    fn cache_insert_over_soft_limit(&self, page_idx: usize, page: PageRef) -> Result<()> {
+        let mut page_cache = self.page_cache.write();
+        let page_key = PageCacheKey::new(page_idx);
+        match page_cache.insert(page_key, page.clone()) {
+            Ok(_) => Ok(()),
+            Err(CacheError::KeyExists) => Ok(()),
+            Err(CacheError::Full) => match page_cache.insert_over_capacity(page_key, page) {
+                Ok(_) => Ok(()),
+                Err(CacheError::KeyExists) => Ok(()),
+                Err(e) => Err(e.into()),
+            },
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -3593,11 +3623,12 @@ impl Pager {
                         // After spilling, try to evict clean pages to make room in the cache
                         let mut cache = self.page_cache.write();
                         if let Err(e) = cache.make_room_for(1, false) {
-                            // Cache is completely full with unevictable pages
-                            tracing::error!(
-                                "ensure_cache_space: {e} cache full, could not make room"
+                            if !matches!(e, CacheError::Full) {
+                                return Err(e.into());
+                            }
+                            tracing::debug!(
+                                "ensure_cache_space: cache full after spill; proceeding past soft cache limit"
                             );
-                            return Err(LimboError::CacheError(CacheError::Full));
                         }
                     }
                 }
@@ -4746,11 +4777,7 @@ impl Pager {
             AllocatePage1State::Writing { page } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done)");
-                let page_key = PageCacheKey::new(page.get().id);
-                let mut cache = self.page_cache.write();
-                cache.insert(page_key, page.clone()).map_err(|e| {
-                    LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
-                })?;
+                self.cache_insert_over_soft_limit(page.get().id, page.clone())?;
                 // After we wrote the header page, we may now set this None, to signify we initialized
                 self.init_page_1.store(None);
                 page.unpin();
@@ -4810,9 +4837,7 @@ impl Pager {
                             new_db_size += 1;
                             let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
                             self.add_dirty(&page)?;
-                            let page_key = PageCacheKey::new(page.get().id as usize);
-                            let mut cache = self.page_cache.write();
-                            cache.insert(page_key, page)?;
+                            self.cache_insert_over_soft_limit(page.get().id as usize, page)?;
                         }
                     }
 
@@ -4968,11 +4993,10 @@ impl Pager {
                         let richard_hipp_special_page =
                             allocate_new_page(new_db_size as i64, &self.buffer_pool);
                         self.add_dirty(&richard_hipp_special_page)?;
-                        let page_key = PageCacheKey::new(richard_hipp_special_page.get().id);
-                        {
-                            let mut cache = self.page_cache.write();
-                            cache.insert(page_key, richard_hipp_special_page).unwrap();
-                        }
+                        self.cache_insert_over_soft_limit(
+                            richard_hipp_special_page.get().id,
+                            richard_hipp_special_page,
+                        )?;
                         // HIPP special page is assumed to zeroed and should never be read or written to by the BTREE
                         new_db_size += 1;
                     }
@@ -4991,12 +5015,7 @@ impl Pager {
                         // setup page and add to cache
                         self.add_dirty(&page)?;
 
-                        let page_key = PageCacheKey::new(page.get().id as usize);
-                        {
-                            // Run in separate block to avoid deadlock on page cache write lock
-                            let mut cache = self.page_cache.write();
-                            cache.insert(page_key, page.clone())?;
-                        }
+                        self.cache_insert_over_soft_limit(page.get().id as usize, page.clone())?;
                         header.database_size = new_db_size.into();
                         *state = AllocatePageState::Start;
                         return Ok(IOResult::Done(page));
@@ -5019,11 +5038,23 @@ impl Pager {
         if dirty_page_must_exist {
             turso_assert!(page.is_dirty(), "page must be dirty for upsert", { "page_id": id });
         }
-        cache.upsert_page(page_key, page.clone()).map_err(|e| {
-            LimboError::InternalError(format!(
-                "Failed to insert loaded page {id} into cache: {e:?}"
-            ))
-        })?;
+        match cache.upsert_page(page_key, page.clone()) {
+            Ok(()) => {}
+            Err(CacheError::Full) => {
+                cache
+                    .force_upsert_page(page_key, page.clone())
+                    .map_err(|e| {
+                        LimboError::InternalError(format!(
+                            "Failed to insert loaded page {id} into cache: {e:?}"
+                        ))
+                    })?
+            }
+            Err(e) => {
+                return Err(LimboError::InternalError(format!(
+                    "Failed to insert loaded page {id} into cache: {e:?}"
+                )));
+            }
+        }
         page.set_loaded();
         page.clear_wal_tag();
         Ok(())
@@ -5431,13 +5462,15 @@ pub(crate) mod ptrmap {
 
 #[cfg(test)]
 mod tests {
-    use crate::sync::Arc;
-
-    use crate::sync::RwLock;
-
+    use crate::io::MemoryIO;
+    use crate::storage::buffer_pool::BufferPool;
+    use crate::storage::database::{DatabaseFile, DatabaseStorage};
     use crate::storage::page_cache::{PageCache, PageCacheKey};
+    use crate::sync::{Arc, Mutex, RwLock};
+    use crate::{OpenFlags, IO};
+    use arc_swap::ArcSwapOption;
 
-    use super::Page;
+    use super::{allocate_new_page, default_page1, Page, Pager};
 
     #[test]
     fn test_shared_cache() {
@@ -5460,6 +5493,40 @@ mod tests {
         let page_key = PageCacheKey::new(1);
         let page = cache.get(&page_key).unwrap();
         assert_eq!(page.unwrap().get().id, 1);
+    }
+
+    #[test]
+    fn upsert_page_in_cache_allows_dirty_page_past_soft_limit() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(
+            io.open_file("test.db", OpenFlags::Create, true).unwrap(),
+        ));
+        let buffer_pool = BufferPool::begin_init(&io, 65536);
+        let init_page_1 = Arc::new(ArcSwapOption::new(Some(default_page1(None))));
+        let pager = Pager::new(
+            db_file,
+            None,
+            io,
+            PageCache::new(1),
+            buffer_pool.clone(),
+            Arc::new(Mutex::new(())),
+            init_page_1,
+        )
+        .unwrap();
+
+        let blocking_page = default_page1(None);
+        pager
+            .page_cache
+            .write()
+            .insert(PageCacheKey::new(1), blocking_page)
+            .unwrap();
+
+        let page = allocate_new_page(2, &buffer_pool);
+        page.set_dirty();
+
+        pager.upsert_page_in_cache(2, page, true).unwrap();
+
+        assert!(pager.page_cache.read().contains_key(&PageCacheKey::new(2)));
     }
 }
 

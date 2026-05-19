@@ -110,6 +110,76 @@ fn test_savepoint_rollback_after_cache_spill_preserves_wal_pages(
     Ok(())
 }
 
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_cache_spill_off_allows_large_wal_update(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA page_size=512;")?;
+    conn.execute("PRAGMA journal_mode=WAL;")?;
+    conn.execute("PRAGMA temp_store=MEMORY;")?;
+    conn.execute("PRAGMA cache_spill=OFF;")?;
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, pad TEXT);")?;
+    conn.execute("CREATE INDEX t_k ON t(k);")?;
+    for i in 1..=800 {
+        conn.execute(format!(
+            "INSERT INTO t(id, k, pad) VALUES ({i}, {i}, printf('%0*d', 400, {i}));"
+        ))?;
+    }
+
+    conn.execute("PRAGMA cache_size=200;")?;
+    conn.execute("BEGIN;")?;
+    conn.execute("INSERT INTO t(id, k, pad) VALUES (1001, 1001, printf('%0*d', 400, 1001));")?;
+    conn.execute("INSERT INTO t(id, k, pad) VALUES (1002, 1002, printf('%0*d', 400, 1002));")?;
+    conn.execute("UPDATE t SET pad = printf('%0*d', 400, id + 200000) WHERE id <= 800;")?;
+    conn.execute("COMMIT;")?;
+
+    let result = execute_and_get_ints(
+        &conn,
+        "SELECT COUNT(*), SUM(CASE WHEN id <= 800 AND pad = printf('%0*d', 400, id + 200000) THEN 1 ELSE 0 END) FROM t;",
+    )?;
+    assert_eq!(result, vec![802, 800]);
+
+    let integrity = execute_and_get_strings(&conn, "PRAGMA integrity_check;")?;
+    assert_eq!(integrity, vec!["ok"]);
+
+    Ok(())
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_cache_spill_off_allows_page_allocation_past_soft_limit(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA page_size=512;")?;
+    conn.execute("PRAGMA journal_mode=WAL;")?;
+    conn.execute("PRAGMA cache_spill=OFF;")?;
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, pad TEXT);")?;
+    conn.execute("CREATE INDEX t_k ON t(k);")?;
+    for i in 1..=120 {
+        conn.execute(format!(
+            "INSERT INTO t(id, k, pad) VALUES ({i}, {i}, printf('%0*d', 300, {i}));"
+        ))?;
+    }
+
+    conn.execute("PRAGMA cache_size=35;")?;
+    conn.execute("BEGIN;")?;
+    conn.execute("SAVEPOINT s;")?;
+    conn.execute("UPDATE t SET pad = printf('%0*d', 4000, id + 100000) WHERE id <= 100;")?;
+    conn.execute("ROLLBACK TO s;")?;
+    conn.execute("RELEASE s;")?;
+    conn.execute("COMMIT;")?;
+
+    let integrity = execute_and_get_strings(&conn, "PRAGMA integrity_check;")?;
+    assert_eq!(integrity, vec!["ok"]);
+
+    Ok(())
+}
+
 #[test]
 #[ignore = "ignored for now because it's flaky"]
 fn test_wal_1_writer_1_reader() -> Result<()> {
