@@ -127,6 +127,11 @@ use util::parse_schema_rows;
 pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use error::{io_error, CompletionError, LimboError};
+pub use function::{
+    ContextAggregateFinalFunction, ContextAggregateInitFunction, ContextAggregateStepFunction,
+    ContextCollationFunction, ContextDestructor, ContextScalarFunction, ContextValue,
+    ContextValueBytes, ContextValueData, ContextValueDestructor, ContextValueType,
+};
 #[cfg(all(feature = "fs", target_family = "unix", not(miri)))]
 pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring", not(miri)))]
@@ -1741,6 +1746,7 @@ impl Database {
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             full_column_names: AtomicBool::new(false),
             short_column_names: AtomicBool::new(true),
+            enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             n_active_writes: AtomicI32::new(0),

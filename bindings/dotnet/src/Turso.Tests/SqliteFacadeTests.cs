@@ -385,24 +385,6 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    public void AdvancedApisRequireCoreManagedExtensionSupport()
-    {
-        using var connection = new SqliteConnection("Data Source=:memory:");
-
-        Assert.Throws<NotSupportedException>(() => connection.CreateFunction("test", () => 1L))!
-            .Message.Should().Contain("core managed extension support");
-        Assert.Throws<NotSupportedException>(() => connection.CreateAggregate<int>("test", value => value))!
-            .Message.Should().Contain("core managed extension support");
-        Assert.Throws<NotSupportedException>(() => connection.CreateCollation("test", StringComparer.Ordinal.Compare))!
-            .Message.Should().Contain("core managed extension support");
-        Assert.Throws<NotSupportedException>(() => connection.EnableExtensions())!
-            .Message.Should().Contain("core managed extension support");
-        Assert.Throws<NotSupportedException>(() => connection.LoadExtension("unknown"))!
-            .Message.Should().Contain("core managed extension support");
-    }
-
-    [Test]
-    [Ignore("Requires Turso core managed extension support.")]
     public void ScalarFunctionWorksWhenRegisteredBeforeOpen()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -413,7 +395,6 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    [Ignore("Requires Turso core managed extension support.")]
     public void ScalarFunctionSupportsVariadicArgumentsAndBlobValues()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -425,7 +406,6 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    [Ignore("Requires Turso core managed extension support.")]
     public void ScalarFunctionReportsNullForNonNullableParameters()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -439,7 +419,6 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    [Ignore("Requires Turso core managed extension support.")]
     public void ScalarFunctionPropagatesSqliteExceptionCode()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -453,7 +432,6 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    [Ignore("Requires Turso core managed extension support.")]
     public void ScalarFunctionCanBeRemoved()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -468,7 +446,6 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    [Ignore("Requires Turso core managed extension support.")]
     public void AggregateFunctionWorksWhenRegisteredBeforeOpen()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -485,7 +462,6 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    [Ignore("Requires Turso core managed extension support.")]
     public void AggregateFunctionSupportsVariadicArgumentsAndNoRows()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -498,7 +474,6 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    [Ignore("Requires Turso core managed extension support.")]
     public void AggregateFunctionPropagatesSqliteExceptionCode()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -514,7 +489,6 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    [Ignore("Requires Turso core managed extension support.")]
     public void AggregateFunctionFinalizerErrorLeavesConnectionUsable()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -534,7 +508,6 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    [Ignore("Requires Turso core managed extension support.")]
     public void AggregateFunctionCanBeRemoved()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -550,7 +523,6 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    [Ignore("Requires Turso core managed extension support.")]
     public void CollationWorksWhenRegisteredBeforeOpen()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -561,7 +533,6 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    [Ignore("Requires Turso core managed extension support.")]
     public void CollationStateOverloadCanBeRemoved()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -576,8 +547,7 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    [Ignore("Requires Turso core managed extension support.")]
-    public void CustomCollationUnsupportedPathsDoNotFallBackToBinary()
+    public void CustomCollationQueryTimePathsDoNotFallBackToBinary()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
         connection.Open();
@@ -589,14 +559,13 @@ public class SqliteFacadeTests
             .Message.Should().Contain("custom collations are not supported");
 
         connection.ExecuteNonQuery("CREATE TABLE Data(Value TEXT); INSERT INTO Data VALUES ('a'), ('b');");
-        Assert.Throws<SqliteException>(() => connection.ExecuteScalar<string>("SELECT Value FROM Data ORDER BY Value COLLATE reverse_text LIMIT 1;"))!
-            .Message.Should().Contain("custom collations are not supported");
+        connection.ExecuteScalar<string>("SELECT Value FROM Data ORDER BY Value COLLATE reverse_text LIMIT 1;")
+            .Should().Be("b");
         Assert.Throws<SqliteException>(() => connection.ExecuteNonQuery("CREATE INDEX Data_Value_Custom ON Data(Value COLLATE reverse_text);"))!
             .Message.Should().Contain("custom collations are not supported");
     }
 
     [Test]
-    [Ignore("Requires Turso core managed extension support.")]
     public void EnableExtensionsControlsSqlLoadExtension()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -627,7 +596,6 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    [Ignore("Requires Turso core managed extension support.")]
     public void LoadExtensionUsesNativeLoaderEvenWhenSqlFunctionDisabled()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -641,7 +609,6 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    [Ignore("Requires Turso core managed extension support.")]
     public void LoadExtensionWhenClosedRunsOnNextOpen()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");

@@ -1,5 +1,6 @@
 use turso_parser::ast;
 
+use crate::sync::Arc;
 use crate::{
     function::AggFunc,
     schema::Table,
@@ -556,17 +557,22 @@ pub fn translate_aggregation_step(
             target_register
         }
         AggFunc::External(ref func) => {
-            let argc = func.agg_args().map_err(|_| {
+            let registered_argc = func.agg_args().map_err(|_| {
                 LimboError::ExtensionError(
                     "External aggregate function called with wrong number of arguments".to_string(),
                 )
             })?;
-            if argc != num_args {
+            if registered_argc >= 0 && registered_argc as usize != num_args {
                 crate::bail_parse_error!(
                     "External aggregate function called with wrong number of arguments"
                 );
             }
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            let argc = num_args;
+            let expr_reg = if argc == 0 {
+                0
+            } else {
+                agg_arg_source.translate(program, referenced_tables, resolver, 0)?
+            };
             for i in 0..argc {
                 if i != 0 {
                     let _ = agg_arg_source.translate(program, referenced_tables, resolver, i)?;
@@ -580,7 +586,13 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::External(func.clone()),
+                func: AggFunc::External(if registered_argc < 0 {
+                    // Variadic registrations store -1, but the VDBE needs the
+                    // concrete call-site arity to slice argument registers.
+                    Arc::new(func.with_aggregate_arg_count(num_args))
+                } else {
+                    func.clone()
+                }),
                 comparator: None,
             });
             target_register

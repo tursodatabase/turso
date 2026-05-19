@@ -19,10 +19,15 @@ public partial class SqliteConnection
         if (function is null)
         {
             _scalarFunctions.Remove(name);
+            if (_database is not null)
+                TursoBindings.UnregisterFunction(DatabaseHandle, name);
             return;
         }
 
-        throw new NotSupportedException(AdvancedExtensionApisNotSupportedMessage);
+        var registration = new ScalarFunctionRegistration(name, argc, isDeterministic, function);
+        _scalarFunctions[name] = registration;
+        if (_database is not null)
+            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
     }
 
     private void RegisterScalarFunctions()

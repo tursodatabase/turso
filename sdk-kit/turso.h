@@ -48,6 +48,43 @@ typedef enum
 
 typedef enum
 {
+    TURSO_CONTEXT_VALUE_NULL = 0,
+    TURSO_CONTEXT_VALUE_INTEGER = 1,
+    TURSO_CONTEXT_VALUE_FLOAT = 2,
+    TURSO_CONTEXT_VALUE_TEXT = 3,
+    TURSO_CONTEXT_VALUE_BLOB = 4,
+    TURSO_CONTEXT_VALUE_ERROR = 5,
+} turso_context_value_type_t;
+
+typedef struct
+{
+    const uint8_t *ptr;
+    size_t len;
+} turso_context_value_bytes_t;
+
+typedef union
+{
+    int64_t int_value;
+    double float_value;
+    turso_context_value_bytes_t bytes;
+} turso_context_value_data_t;
+
+typedef struct
+{
+    turso_context_value_type_t value_type;
+    turso_context_value_data_t value;
+} turso_context_value_t;
+
+typedef void (*turso_scalar_function_callback_t)(uintptr_t context, int32_t argc, const void *argv, turso_context_value_t *result);
+typedef uintptr_t (*turso_aggregate_init_callback_t)(uintptr_t context);
+typedef void (*turso_aggregate_step_callback_t)(uintptr_t context, uintptr_t aggregate_context, int32_t argc, const void *argv, turso_context_value_t *result);
+typedef void (*turso_aggregate_final_callback_t)(uintptr_t context, uintptr_t aggregate_context, turso_context_value_t *result);
+typedef int32_t (*turso_collation_callback_t)(uintptr_t context, const uint8_t *left_ptr, size_t left_len, const uint8_t *right_ptr, size_t right_len);
+typedef void (*turso_context_destructor_callback_t)(uintptr_t context);
+typedef void (*turso_value_destructor_callback_t)(turso_context_value_t *result);
+
+typedef enum
+{
     TURSO_TRACING_LEVEL_ERROR = 1,
     TURSO_TRACING_LEVEL_WARN,
     TURSO_TRACING_LEVEL_INFO,
@@ -164,6 +201,59 @@ bool turso_connection_get_autocommit(const turso_connection_t *self);
 
 /** Get last insert rowid for the connection or 0 if no inserts happened before */
 int64_t turso_connection_last_insert_rowid(const turso_connection_t *self);
+
+turso_status_code_t turso_connection_register_scalar_function(
+    const turso_connection_t *self,
+    const char *name,
+    int32_t argc,
+    bool deterministic,
+    uintptr_t context,
+    turso_scalar_function_callback_t callback,
+    turso_context_destructor_callback_t context_destructor,
+    turso_value_destructor_callback_t value_destructor,
+    const char **error_opt_out);
+
+turso_status_code_t turso_connection_register_aggregate_function(
+    const turso_connection_t *self,
+    const char *name,
+    int32_t argc,
+    bool deterministic,
+    uintptr_t context,
+    turso_aggregate_init_callback_t init,
+    turso_aggregate_step_callback_t step,
+    turso_aggregate_final_callback_t finalize,
+    turso_context_destructor_callback_t context_destructor,
+    turso_context_destructor_callback_t aggregate_destructor,
+    turso_value_destructor_callback_t value_destructor,
+    const char **error_opt_out);
+
+turso_status_code_t turso_connection_unregister_function(
+    const turso_connection_t *self,
+    const char *name,
+    const char **error_opt_out);
+
+turso_status_code_t turso_connection_register_collation(
+    const turso_connection_t *self,
+    const char *name,
+    uintptr_t context,
+    turso_collation_callback_t callback,
+    turso_context_destructor_callback_t context_destructor,
+    const char **error_opt_out);
+
+turso_status_code_t turso_connection_unregister_collation(
+    const turso_connection_t *self,
+    const char *name,
+    const char **error_opt_out);
+
+turso_status_code_t turso_connection_enable_load_extension(
+    const turso_connection_t *self,
+    bool enabled,
+    const char **error_opt_out);
+
+turso_status_code_t turso_connection_load_extension(
+    const turso_connection_t *self,
+    const char *path,
+    const char **error_opt_out);
 
 /** Prepare single statement in a connection */
 turso_status_code_t

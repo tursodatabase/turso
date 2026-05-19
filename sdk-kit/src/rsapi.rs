@@ -831,6 +831,85 @@ impl TursoConnection {
         self.connection.last_insert_rowid()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_scalar_function(
+        &self,
+        name: String,
+        argc: i32,
+        deterministic: bool,
+        context: usize,
+        callback: turso_core::ContextScalarFunction,
+        context_destructor: Option<turso_core::ContextDestructor>,
+        value_destructor: Option<turso_core::ContextValueDestructor>,
+    ) {
+        self.connection.register_external_scalar_function(
+            name,
+            argc,
+            deterministic,
+            context,
+            callback,
+            context_destructor,
+            value_destructor,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_aggregate_function(
+        &self,
+        name: String,
+        argc: i32,
+        deterministic: bool,
+        context: usize,
+        init: turso_core::ContextAggregateInitFunction,
+        step: turso_core::ContextAggregateStepFunction,
+        finalize: turso_core::ContextAggregateFinalFunction,
+        context_destructor: Option<turso_core::ContextDestructor>,
+        aggregate_destructor: Option<turso_core::ContextDestructor>,
+        value_destructor: Option<turso_core::ContextValueDestructor>,
+    ) {
+        self.connection.register_external_aggregate_function(
+            name,
+            argc,
+            deterministic,
+            context,
+            init,
+            step,
+            finalize,
+            context_destructor,
+            aggregate_destructor,
+            value_destructor,
+        );
+    }
+
+    pub fn unregister_external_function(&self, name: &str) {
+        self.connection.unregister_external_function(name);
+    }
+
+    pub fn register_external_collation(
+        &self,
+        name: String,
+        context: usize,
+        callback: turso_core::ContextCollationFunction,
+        context_destructor: Option<turso_core::ContextDestructor>,
+    ) {
+        self.connection
+            .register_external_collation(name, context, callback, context_destructor);
+    }
+
+    pub fn unregister_external_collation(&self, name: &str) {
+        self.connection.unregister_external_collation(name);
+    }
+
+    pub fn set_load_extension_enabled(&self, enabled: bool) {
+        self.connection.set_load_extension_enabled(enabled);
+    }
+
+    pub fn load_extension(&self, path: &str) -> Result<(), TursoError> {
+        turso_core::resolve_ext_path(path)
+            .and_then(|path| self.connection.load_extension(path))
+            .map_err(TursoError::from)
+    }
+
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
         let statement = self.connection.prepare(sql)?;

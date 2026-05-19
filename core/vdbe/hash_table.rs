@@ -81,7 +81,7 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
             ValueRef::Text(text) => {
                 let collation = collations.get(idx).unwrap_or(&CollationSeq::Binary);
                 hasher.write_u8(TEXT_HASH);
-                match collation {
+                match *collation {
                     CollationSeq::NoCase => {
                         hash_text_nocase(&mut hasher, text.as_str());
                     }
@@ -94,6 +94,9 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
                     }
                     CollationSeq::Locale(_) => {
                         hasher.write(&collation.hash_key(text.as_str()));
+                    }
+                    CollationSeq::Custom(_) => {
+                        hasher.write(text.as_bytes());
                     }
                 }
             }

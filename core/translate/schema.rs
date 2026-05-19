@@ -10,6 +10,7 @@ use crate::schema::{
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
@@ -751,6 +752,14 @@ fn validate(
                         let expr =
                             translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone());
                         validate_default_expr(&expr, col_i)?
+                    }
+                    ast::ColumnConstraint::Collate { collation_name } => {
+                        let collation = CollationSeq::new(collation_name.as_str())?;
+                        if collation.is_custom() {
+                            bail_parse_error!(
+                                "custom collations are not supported in schema definitions"
+                            );
+                        }
                     }
                     _ => {}
                 }

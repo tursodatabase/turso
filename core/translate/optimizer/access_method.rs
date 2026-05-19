@@ -7,6 +7,7 @@ use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
+use crate::translate::collate::CollationSeq;
 use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, ordered_materialized_key_columns, BinaryExprSide, Constraint,
@@ -975,6 +976,21 @@ pub fn find_equijoin_conditions(
     join_keys
 }
 
+fn expr_uses_custom_collation(expr: &ast::Expr) -> bool {
+    let mut uses_custom = false;
+    let _ = walk_expr(expr, &mut |expr| -> Result<WalkControl> {
+        if let ast::Expr::Collate(_, collation_name) = expr {
+            uses_custom =
+                CollationSeq::new(collation_name.as_str()).is_ok_and(CollationSeq::is_custom);
+            if uses_custom {
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    uses_custom
+}
+
 /// Estimate the cost of a hash join between two tables.
 ///
 /// The cost model accounts for:
@@ -1149,6 +1165,14 @@ pub fn try_hash_join_access_method(
 
     // Need at least one equi-join condition
     if join_keys.is_empty() {
+        return None;
+    }
+    // Custom-collated equality depends on a connection-owned callback, so the
+    // hash join planner cannot derive a stable hash/equality pair here.
+    if join_keys.iter().any(|join_key| {
+        expr_uses_custom_collation(join_key.get_build_expr(where_clause))
+            || expr_uses_custom_collation(join_key.get_probe_expr(where_clause))
+    }) {
         return None;
     }
 

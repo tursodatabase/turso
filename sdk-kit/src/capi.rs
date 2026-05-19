@@ -132,6 +132,174 @@ pub extern "C" fn turso_connection_last_insert_rowid(
 }
 
 #[no_mangle]
+pub extern "C" fn turso_connection_register_scalar_function(
+    connection: *const c::turso_connection_t,
+    name: *const std::ffi::c_char,
+    argc: i32,
+    deterministic: bool,
+    context: usize,
+    callback: turso_core::ContextScalarFunction,
+    context_destructor: Option<turso_core::ContextDestructor>,
+    value_destructor: Option<turso_core::ContextValueDestructor>,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let name = match unsafe { str_from_c_str(name) } {
+        Ok(name) => name,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+
+    connection.register_external_scalar_function(
+        name.to_string(),
+        argc,
+        deterministic,
+        context,
+        callback,
+        context_destructor,
+        value_destructor,
+    );
+    c::turso_status_code_t::TURSO_OK
+}
+
+#[no_mangle]
+pub extern "C" fn turso_connection_register_aggregate_function(
+    connection: *const c::turso_connection_t,
+    name: *const std::ffi::c_char,
+    argc: i32,
+    deterministic: bool,
+    context: usize,
+    init: turso_core::ContextAggregateInitFunction,
+    step: turso_core::ContextAggregateStepFunction,
+    finalize: turso_core::ContextAggregateFinalFunction,
+    context_destructor: Option<turso_core::ContextDestructor>,
+    aggregate_destructor: Option<turso_core::ContextDestructor>,
+    value_destructor: Option<turso_core::ContextValueDestructor>,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let name = match unsafe { str_from_c_str(name) } {
+        Ok(name) => name,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+
+    connection.register_external_aggregate_function(
+        name.to_string(),
+        argc,
+        deterministic,
+        context,
+        init,
+        step,
+        finalize,
+        context_destructor,
+        aggregate_destructor,
+        value_destructor,
+    );
+    c::turso_status_code_t::TURSO_OK
+}
+
+#[no_mangle]
+pub extern "C" fn turso_connection_unregister_function(
+    connection: *const c::turso_connection_t,
+    name: *const std::ffi::c_char,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let name = match unsafe { str_from_c_str(name) } {
+        Ok(name) => name,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+
+    connection.unregister_external_function(name);
+    c::turso_status_code_t::TURSO_OK
+}
+
+#[no_mangle]
+pub extern "C" fn turso_connection_register_collation(
+    connection: *const c::turso_connection_t,
+    name: *const std::ffi::c_char,
+    context: usize,
+    callback: turso_core::ContextCollationFunction,
+    context_destructor: Option<turso_core::ContextDestructor>,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let name = match unsafe { str_from_c_str(name) } {
+        Ok(name) => name,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+
+    connection.register_external_collation(name.to_string(), context, callback, context_destructor);
+    c::turso_status_code_t::TURSO_OK
+}
+
+#[no_mangle]
+pub extern "C" fn turso_connection_unregister_collation(
+    connection: *const c::turso_connection_t,
+    name: *const std::ffi::c_char,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let name = match unsafe { str_from_c_str(name) } {
+        Ok(name) => name,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+
+    connection.unregister_external_collation(name);
+    c::turso_status_code_t::TURSO_OK
+}
+
+#[no_mangle]
+pub extern "C" fn turso_connection_enable_load_extension(
+    connection: *const c::turso_connection_t,
+    enabled: bool,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+
+    connection.set_load_extension_enabled(enabled);
+    c::turso_status_code_t::TURSO_OK
+}
+
+#[no_mangle]
+pub extern "C" fn turso_connection_load_extension(
+    connection: *const c::turso_connection_t,
+    path: *const std::ffi::c_char,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let path = match unsafe { str_from_c_str(path) } {
+        Ok(path) => path,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+
+    match connection.load_extension(path) {
+        Ok(()) => c::turso_status_code_t::TURSO_OK,
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
+    }
+}
+
+#[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_connection_prepare_single(
     connection: *const c::turso_connection_t,

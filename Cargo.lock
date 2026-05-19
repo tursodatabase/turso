@@ -1153,6 +1153,7 @@ dependencies = [
  "turso",
  "turso-dbhash",
  "turso_core",
+ "turso_ext",
  "turso_macros",
  "turso_parser",
  "turso_sdk_kit",

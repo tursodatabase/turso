@@ -7,9 +7,6 @@ namespace Turso.Raw.Public;
 
 public static class TursoBindings
 {
-    private const string AdvancedExtensionApisMessage =
-        "SQLite-compatible function, aggregate, collation, and extension-loading APIs require Turso core managed extension support.";
-
     public static TursoDatabaseHandle OpenDatabase(string path)
     {
         ArgumentNullException.ThrowIfNull(path);
@@ -58,7 +55,17 @@ public static class TursoBindings
         ArgumentNullException.ThrowIfNull(contextDestructor);
         ArgumentNullException.ThrowIfNull(valueDestructor);
 
-        throw new NotSupportedException(AdvancedExtensionApisMessage);
+        var status = TursoInterop.RegisterScalarFunction(
+            db,
+            name,
+            argc,
+            deterministic,
+            context,
+            callback,
+            contextDestructor,
+            valueDestructor,
+            out var errorPtr);
+        ThrowIfError(status, errorPtr);
     }
 
     public static void RegisterAggregateFunction(
@@ -83,7 +90,20 @@ public static class TursoBindings
         ArgumentNullException.ThrowIfNull(aggregateDestructor);
         ArgumentNullException.ThrowIfNull(valueDestructor);
 
-        throw new NotSupportedException(AdvancedExtensionApisMessage);
+        var status = TursoInterop.RegisterAggregateFunction(
+            db,
+            name,
+            argc,
+            deterministic,
+            context,
+            init,
+            step,
+            finalize,
+            contextDestructor,
+            aggregateDestructor,
+            valueDestructor,
+            out var errorPtr);
+        ThrowIfError(status, errorPtr);
     }
 
     public static void UnregisterFunction(TursoDatabaseHandle db, string name)
@@ -91,7 +111,8 @@ public static class TursoBindings
         db.ThrowIfInvalid();
         ArgumentNullException.ThrowIfNull(name);
 
-        throw new NotSupportedException(AdvancedExtensionApisMessage);
+        var status = TursoInterop.UnregisterFunction(db, name, out var errorPtr);
+        ThrowIfError(status, errorPtr);
     }
 
     public static void RegisterCollation(
@@ -106,7 +127,8 @@ public static class TursoBindings
         ArgumentNullException.ThrowIfNull(callback);
         ArgumentNullException.ThrowIfNull(contextDestructor);
 
-        throw new NotSupportedException(AdvancedExtensionApisMessage);
+        var status = TursoInterop.RegisterCollation(db, name, context, callback, contextDestructor, out var errorPtr);
+        ThrowIfError(status, errorPtr);
     }
 
     public static void UnregisterCollation(TursoDatabaseHandle db, string name)
@@ -114,13 +136,15 @@ public static class TursoBindings
         db.ThrowIfInvalid();
         ArgumentNullException.ThrowIfNull(name);
 
-        throw new NotSupportedException(AdvancedExtensionApisMessage);
+        var status = TursoInterop.UnregisterCollation(db, name, out var errorPtr);
+        ThrowIfError(status, errorPtr);
     }
 
     public static void EnableLoadExtension(TursoDatabaseHandle db, bool enabled)
     {
         db.ThrowIfInvalid();
-        throw new NotSupportedException(AdvancedExtensionApisMessage);
+        var status = TursoInterop.EnableLoadExtension(db, enabled, out var errorPtr);
+        ThrowIfError(status, errorPtr);
     }
 
     public static void LoadExtension(TursoDatabaseHandle db, string path)
@@ -128,7 +152,8 @@ public static class TursoBindings
         db.ThrowIfInvalid();
         ArgumentNullException.ThrowIfNull(path);
 
-        throw new NotSupportedException(AdvancedExtensionApisMessage);
+        var status = TursoInterop.LoadExtension(db, path, out var errorPtr);
+        ThrowIfError(status, errorPtr);
     }
 
     public static void BindParameter(TursoStatementHandle statement, int index, TursoValue parameter)

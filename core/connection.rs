@@ -21,6 +21,7 @@ use crate::{
     parse_schema_rows,
     progress::{ProgressHandler, ProgressHandlerCallback},
     refresh_analyze_stats, translate,
+    translate::collate::CollationSeq,
     util::IOExt,
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
     BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
@@ -34,10 +35,10 @@ use crate::{MAIN_DB_ID, TEMP_DB_ID};
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
-use std::fmt::Display;
 use std::ops::Deref;
 #[cfg(feature = "simulator")]
 use std::path::Path;
+use std::{cmp::Ordering as CmpOrdering, fmt::Display};
 #[cfg(not(target_family = "wasm"))]
 use tempfile::TempDir;
 use tracing::{instrument, Level};
@@ -206,6 +207,8 @@ pub struct Connection {
     pub(super) full_column_names: AtomicBool,
     /// Deprecated pragma: when ON (default), column refs use just the column name
     pub(super) short_column_names: AtomicBool,
+    /// Per-connection runtime extension loading flag.
+    pub(super) enable_load_extension: AtomicBool,
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
     /// Per-attached-database MVCC transactions.
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
@@ -2871,14 +2874,198 @@ impl Connection {
             .functions
             .values()
             .map(|f| {
-                let is_agg = matches!(f.func, function::ExtFunc::Aggregate { .. });
+                let is_agg = f.func.is_aggregate();
                 let argc = match &f.func {
                     function::ExtFunc::Aggregate { argc, .. } => *argc as i32,
+                    function::ExtFunc::ContextScalar { argc, .. }
+                    | function::ExtFunc::ContextAggregate { argc, .. } => *argc,
                     function::ExtFunc::Scalar(_) => -1,
                 };
                 (f.name.clone(), is_agg, argc)
             })
             .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_scalar_function(
+        &self,
+        name: String,
+        argc: i32,
+        deterministic: bool,
+        context: usize,
+        callback: crate::ContextScalarFunction,
+        context_destructor: Option<crate::ContextDestructor>,
+        value_destructor: Option<crate::ContextValueDestructor>,
+    ) {
+        let normalized_name = crate::util::normalize_ident(&name);
+        self.syms.write().functions.insert(
+            normalized_name.clone(),
+            Arc::new(function::ExternalFunc::new_context_scalar(
+                normalized_name,
+                argc,
+                deterministic,
+                context,
+                callback,
+                context_destructor,
+                value_destructor,
+            )),
+        );
+        self.bump_prepare_context_generation();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_aggregate_function(
+        &self,
+        name: String,
+        argc: i32,
+        deterministic: bool,
+        context: usize,
+        init: crate::ContextAggregateInitFunction,
+        step: crate::ContextAggregateStepFunction,
+        finalize: crate::ContextAggregateFinalFunction,
+        context_destructor: Option<crate::ContextDestructor>,
+        aggregate_destructor: Option<crate::ContextDestructor>,
+        value_destructor: Option<crate::ContextValueDestructor>,
+    ) {
+        let normalized_name = crate::util::normalize_ident(&name);
+        self.syms.write().functions.insert(
+            normalized_name.clone(),
+            Arc::new(function::ExternalFunc::new_context_aggregate(
+                normalized_name,
+                argc,
+                deterministic,
+                context,
+                init,
+                step,
+                finalize,
+                context_destructor,
+                aggregate_destructor,
+                value_destructor,
+            )),
+        );
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn unregister_external_function(&self, name: &str) {
+        let normalized_name = crate::util::normalize_ident(name);
+        self.syms.write().functions.remove(&normalized_name);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn register_external_collation(
+        &self,
+        name: String,
+        context: usize,
+        callback: crate::ContextCollationFunction,
+        context_destructor: Option<crate::ContextDestructor>,
+    ) {
+        let collation = CollationSeq::register_custom(&name);
+        let normalized_name = crate::util::normalize_ident(&name);
+        self.syms.write().collations.insert(
+            collation.id(),
+            Arc::new(function::ExternalCollation::new(
+                normalized_name,
+                context,
+                callback,
+                context_destructor,
+            )),
+        );
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn unregister_external_collation(&self, name: &str) {
+        if let Some(collation) = CollationSeq::registered_custom(name) {
+            if self
+                .syms
+                .write()
+                .collations
+                .remove(&collation.id())
+                .is_some()
+            {
+                self.bump_prepare_context_generation();
+            }
+        }
+    }
+
+    pub(crate) fn get_external_collation(
+        &self,
+        collation: CollationSeq,
+    ) -> Result<Arc<function::ExternalCollation>> {
+        self.syms
+            .read()
+            .collations
+            .get(&collation.id())
+            .cloned()
+            .ok_or_else(|| {
+                LimboError::ParseError(format!("no such collation sequence: {}", collation.name()))
+            })
+    }
+
+    pub(crate) fn custom_collation_compare(
+        external: &function::ExternalCollation,
+        left: &str,
+        right: &str,
+    ) -> CmpOrdering {
+        let result = unsafe {
+            (external.callback)(
+                external.context,
+                left.as_ptr(),
+                left.len(),
+                right.as_ptr(),
+                right.len(),
+            )
+        };
+        result.cmp(&0)
+    }
+
+    pub(crate) fn external_collation_comparator(
+        external: Arc<function::ExternalCollation>,
+    ) -> crate::vdbe::sorter::SortComparator {
+        Arc::new(move |left, right| match (left, right) {
+            (crate::ValueRef::Text(left), crate::ValueRef::Text(right)) => {
+                Self::custom_collation_compare(&external, left.as_str(), right.as_str())
+            }
+            _ => left.partial_cmp(right).unwrap_or(CmpOrdering::Equal),
+        })
+    }
+
+    pub(crate) fn make_collation_comparator(
+        &self,
+        collation: CollationSeq,
+    ) -> Result<crate::vdbe::sorter::SortComparator> {
+        let external = self.get_external_collation(collation)?;
+        Ok(Self::external_collation_comparator(external))
+    }
+
+    pub(crate) fn compare_with_collation(
+        &self,
+        collation: CollationSeq,
+        left: &str,
+        right: &str,
+    ) -> Result<CmpOrdering> {
+        if collation.is_custom() {
+            let external = self.get_external_collation(collation)?;
+            Ok(Self::custom_collation_compare(&external, left, right))
+        } else {
+            Ok(collation.compare_strings(left, right))
+        }
+    }
+
+    pub fn set_load_extension_enabled(&self, enabled: bool) {
+        self.enable_load_extension.store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn can_load_extensions(&self) -> bool {
+        self.enable_load_extension.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn compare_external_collation(
+        &self,
+        collation: CollationSeq,
+        left: &str,
+        right: &str,
+    ) -> Result<CmpOrdering> {
+        self.compare_with_collation(collation, left, right)
     }
 
     pub(crate) fn database_ptr(&self) -> usize {
@@ -3344,6 +3531,7 @@ pub type StepResult = vdbe::StepResult;
 #[derive(Default)]
 pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
+    pub collations: HashMap<u32, Arc<function::ExternalCollation>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
     pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
     pub index_methods: HashMap<String, Arc<dyn IndexMethod>>,
@@ -3353,6 +3541,7 @@ impl std::fmt::Debug for SymbolTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SymbolTable")
             .field("functions", &self.functions)
+            .field("collations", &self.collations)
             .finish()
     }
 }
@@ -3383,6 +3572,7 @@ impl SymbolTable {
     pub fn new() -> Self {
         Self {
             functions: HashMap::default(),
+            collations: HashMap::default(),
             vtabs: HashMap::default(),
             vtab_modules: HashMap::default(),
             index_methods: HashMap::default(),
@@ -3391,9 +3581,12 @@ impl SymbolTable {
     pub fn resolve_function(
         &self,
         name: &str,
-        _arg_count: usize,
+        arg_count: usize,
     ) -> Option<Arc<function::ExternalFunc>> {
-        self.functions.get(name).cloned()
+        self.functions
+            .get(&crate::util::normalize_ident(name))
+            .filter(|func| func.func.matches_arg_count(arg_count))
+            .cloned()
     }
 
     pub fn extend(&mut self, other: &SymbolTable) {

@@ -643,7 +643,11 @@ fn extract_collation(expr: &Expr) -> crate::Result<(Option<CollationSeq>, &Expr)
     let mut current = expr;
     let mut coll = None;
     while let Expr::Collate(inner, seq) = current {
-        coll = Some(CollationSeq::new(seq.as_str())?);
+        let collation = CollationSeq::new(seq.as_str())?;
+        if collation.is_custom() {
+            crate::bail_parse_error!("custom collations are not supported in indexes");
+        }
+        coll = Some(collation);
         current = inner.as_ref();
     }
     Ok((coll, current))

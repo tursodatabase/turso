@@ -17,10 +17,15 @@ public partial class SqliteConnection
         if (step is null)
         {
             _aggregateFunctions.Remove(name);
+            if (_database is not null)
+                TursoBindings.UnregisterFunction(DatabaseHandle, name);
             return;
         }
 
-        throw new NotSupportedException(AdvancedExtensionApisNotSupportedMessage);
+        var registration = new AggregateFunctionRegistration(name, argc, isDeterministic, seed, step, resultSelector);
+        _aggregateFunctions[name] = registration;
+        if (_database is not null)
+            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
     }
 
     private void RegisterAggregateFunctions()

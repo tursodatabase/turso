@@ -6,6 +6,10 @@ use turso_parser::ast::SortOrder;
 
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
+use crate::function::{
+    ContextAggregateFinalFunction, ContextAggregateStepFunction, ContextDestructor, ContextValue,
+    ContextValueDestructor,
+};
 use crate::index_method::IndexMethodCursor;
 use crate::numeric::format_float;
 use crate::numeric::nonnan::NonNan;
@@ -486,12 +490,46 @@ impl Value {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ExternalAggState {
-    pub state: *mut AggCtx,
-    pub argc: usize,
-    pub step_fn: StepFunction,
-    pub finalize_fn: FinalizeFunction,
+#[derive(Clone, PartialEq)]
+pub enum ExternalAggState {
+    Legacy {
+        state: *mut AggCtx,
+        argc: usize,
+        step_fn: StepFunction,
+        finalize_fn: FinalizeFunction,
+    },
+    Context {
+        context: usize,
+        aggregate_context: usize,
+        argc: usize,
+        step_fn: ContextAggregateStepFunction,
+        finalize_fn: ContextAggregateFinalFunction,
+        aggregate_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ContextValueDestructor>,
+    },
+}
+
+impl std::fmt::Debug for ExternalAggState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Legacy { state, argc, .. } => f
+                .debug_struct("Legacy")
+                .field("state", state)
+                .field("argc", argc)
+                .finish_non_exhaustive(),
+            Self::Context {
+                context,
+                aggregate_context,
+                argc,
+                ..
+            } => f
+                .debug_struct("Context")
+                .field("context", context)
+                .field("aggregate_context", aggregate_context)
+                .field("argc", argc)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Please use Display trait for all limbo output so we have single origin of truth
@@ -717,11 +755,36 @@ pub enum AggContext {
 
 impl AggContext {
     pub fn compute_external(&self) -> Result<Value> {
-        if let Self::External(ext_state) = self {
-            let final_value = unsafe { (ext_state.finalize_fn)(ext_state.state) };
-            Value::from_ffi(final_value)
-        } else {
+        let Self::External(ext_state) = self else {
             panic!("AggContext::compute_external() expected External, found {self:?}");
+        };
+
+        match ext_state {
+            ExternalAggState::Legacy {
+                state, finalize_fn, ..
+            } => {
+                let final_value = unsafe { finalize_fn(*state) };
+                Value::from_ffi(final_value)
+            }
+            ExternalAggState::Context {
+                context,
+                aggregate_context,
+                finalize_fn,
+                aggregate_destructor,
+                value_destructor,
+                ..
+            } => {
+                let mut result = ContextValue::null();
+                unsafe { finalize_fn(*context, *aggregate_context, &mut result) };
+                let value = result.into_value();
+                if let Some(value_destructor) = value_destructor {
+                    unsafe { value_destructor(&mut result) };
+                }
+                if let Some(aggregate_destructor) = aggregate_destructor {
+                    unsafe { aggregate_destructor(*aggregate_context) };
+                }
+                value
+            }
         }
     }
 

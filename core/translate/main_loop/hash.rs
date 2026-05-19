@@ -143,7 +143,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
         let use_bloom_filter = self.hash_join_op.use_bloom_filter
             && collations
                 .iter()
-                .all(|c| matches!(c, CollationSeq::Binary | CollationSeq::Unset));
+                .all(|c| matches!(*c, CollationSeq::Binary | CollationSeq::Unset));
 
         let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
         let (payload_columns, payload_signature_columns, use_materialized_keys, allow_seek) =

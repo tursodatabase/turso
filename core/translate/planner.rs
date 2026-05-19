@@ -23,10 +23,7 @@ use crate::{
     util::{exprs_are_equivalent, normalize_ident},
     Result,
 };
-use crate::{
-    function::{AggFunc, ExtFunc},
-    translate::expr::bind_and_rewrite_expr,
-};
+use crate::{function::AggFunc, translate::expr::bind_and_rewrite_expr};
 use crate::{
     translate::plan::{Window, WindowFunction, WindowFunctionKind},
     vdbe::builder::ProgramBuilder,
@@ -263,7 +260,7 @@ pub fn resolve_window_and_aggregate_functions(
                             .resolve_function(name.as_str(), args_count)
                         {
                             let func = AggFunc::External(f.func.clone().into());
-                            if let ExtFunc::Aggregate { .. } = f.as_ref().func {
+                            if f.as_ref().func.is_aggregate() {
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
                                     link_with_window(
                                         windows.as_deref_mut(),
@@ -356,7 +353,7 @@ pub fn resolve_window_and_aggregate_functions(
                     None => {
                         if let Some(f) = resolver.symbol_table.resolve_function(name.as_str(), 0) {
                             let func = AggFunc::External(f.func.clone().into());
-                            if let ExtFunc::Aggregate { .. } = f.as_ref().func {
+                            if f.as_ref().func.is_aggregate() {
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
                                     link_with_window(
                                         windows.as_deref_mut(),

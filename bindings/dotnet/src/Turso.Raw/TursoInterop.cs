@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using Turso.Raw.Public;
 using Turso.Raw.Public.Handles;
 
 namespace Turso.Raw;
@@ -70,6 +71,66 @@ internal static class TursoInterop
 
     [DllImport(DllName, EntryPoint = "turso_connection_deinit", CallingConvention = CallingConvention.Cdecl)]
     public static extern void ConnectionDeinit(IntPtr connection);
+
+    [DllImport(DllName, EntryPoint = "turso_connection_register_scalar_function", CallingConvention = CallingConvention.Cdecl)]
+    public static extern TursoStatusCode RegisterScalarFunction(
+        TursoDatabaseHandle connection,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+        int argc,
+        [MarshalAs(UnmanagedType.I1)] bool deterministic,
+        IntPtr context,
+        TursoScalarFunctionCallback callback,
+        TursoContextDestructorCallback contextDestructor,
+        TursoValueDestructorCallback valueDestructor,
+        out IntPtr errorPtr);
+
+    [DllImport(DllName, EntryPoint = "turso_connection_register_aggregate_function", CallingConvention = CallingConvention.Cdecl)]
+    public static extern TursoStatusCode RegisterAggregateFunction(
+        TursoDatabaseHandle connection,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+        int argc,
+        [MarshalAs(UnmanagedType.I1)] bool deterministic,
+        IntPtr context,
+        TursoAggregateInitCallback init,
+        TursoAggregateStepCallback step,
+        TursoAggregateFinalCallback finalize,
+        TursoContextDestructorCallback contextDestructor,
+        TursoContextDestructorCallback aggregateDestructor,
+        TursoValueDestructorCallback valueDestructor,
+        out IntPtr errorPtr);
+
+    [DllImport(DllName, EntryPoint = "turso_connection_unregister_function", CallingConvention = CallingConvention.Cdecl)]
+    public static extern TursoStatusCode UnregisterFunction(
+        TursoDatabaseHandle connection,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+        out IntPtr errorPtr);
+
+    [DllImport(DllName, EntryPoint = "turso_connection_register_collation", CallingConvention = CallingConvention.Cdecl)]
+    public static extern TursoStatusCode RegisterCollation(
+        TursoDatabaseHandle connection,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+        IntPtr context,
+        TursoCollationCallback callback,
+        TursoContextDestructorCallback contextDestructor,
+        out IntPtr errorPtr);
+
+    [DllImport(DllName, EntryPoint = "turso_connection_unregister_collation", CallingConvention = CallingConvention.Cdecl)]
+    public static extern TursoStatusCode UnregisterCollation(
+        TursoDatabaseHandle connection,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+        out IntPtr errorPtr);
+
+    [DllImport(DllName, EntryPoint = "turso_connection_enable_load_extension", CallingConvention = CallingConvention.Cdecl)]
+    public static extern TursoStatusCode EnableLoadExtension(
+        TursoDatabaseHandle connection,
+        [MarshalAs(UnmanagedType.I1)] bool enabled,
+        out IntPtr errorPtr);
+
+    [DllImport(DllName, EntryPoint = "turso_connection_load_extension", CallingConvention = CallingConvention.Cdecl)]
+    public static extern TursoStatusCode LoadExtension(
+        TursoDatabaseHandle connection,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+        out IntPtr errorPtr);
 
     [DllImport(DllName, EntryPoint = "turso_connection_prepare_single", CallingConvention = CallingConvention.Cdecl)]
     public static extern TursoStatusCode ConnectionPrepareSingle(

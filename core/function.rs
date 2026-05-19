@@ -2,9 +2,117 @@ use crate::sync::Arc;
 use std::fmt;
 use std::fmt::{Debug, Display};
 use strum::IntoEnumIterator;
-use turso_ext::{FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction};
+use turso_ext::{
+    FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction, Value as ExtValue,
+};
 
-use crate::LimboError;
+use crate::{LimboError, Value};
+
+pub type ContextScalarFunction = unsafe extern "C" fn(
+    context: usize,
+    argc: i32,
+    argv: *const ExtValue,
+    result: *mut ContextValue,
+);
+pub type ContextAggregateInitFunction = unsafe extern "C" fn(context: usize) -> usize;
+pub type ContextAggregateStepFunction = unsafe extern "C" fn(
+    context: usize,
+    aggregate_context: usize,
+    argc: i32,
+    argv: *const ExtValue,
+    result: *mut ContextValue,
+);
+pub type ContextAggregateFinalFunction =
+    unsafe extern "C" fn(context: usize, aggregate_context: usize, result: *mut ContextValue);
+pub type ContextCollationFunction = unsafe extern "C" fn(
+    context: usize,
+    left_ptr: *const u8,
+    left_len: usize,
+    right_ptr: *const u8,
+    right_len: usize,
+) -> i32;
+pub type ContextDestructor = unsafe extern "C" fn(context: usize);
+pub type ContextValueDestructor = unsafe extern "C" fn(result: *mut ContextValue);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextValueType {
+    Null,
+    Integer,
+    Float,
+    Text,
+    Blob,
+    Error,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ContextValueBytes {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union ContextValueData {
+    pub int: i64,
+    pub float: f64,
+    pub bytes: ContextValueBytes,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ContextValue {
+    pub value_type: ContextValueType,
+    pub value: ContextValueData,
+}
+
+impl ContextValue {
+    pub fn null() -> Self {
+        Self {
+            value_type: ContextValueType::Null,
+            value: ContextValueData { int: 0 },
+        }
+    }
+
+    pub fn into_value(self) -> Result<Value, LimboError> {
+        // Text/blob/error payloads are callback-owned; copy them before the
+        // caller invokes the registered value destructor.
+        match self.value_type {
+            ContextValueType::Null => Ok(Value::Null),
+            ContextValueType::Integer => Ok(Value::from_i64(unsafe { self.value.int })),
+            ContextValueType::Float => Ok(Value::from_f64(unsafe { self.value.float })),
+            ContextValueType::Text => {
+                let bytes = unsafe { self.value.bytes };
+                if bytes.ptr.is_null() {
+                    return Ok(Value::Null);
+                }
+                let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+                let text = std::str::from_utf8(slice)
+                    .map_err(|err| LimboError::ExtensionError(err.to_string()))?;
+                Ok(Value::build_text(text.to_string()))
+            }
+            ContextValueType::Blob => {
+                let bytes = unsafe { self.value.bytes };
+                if bytes.ptr.is_null() {
+                    return Ok(Value::Blob(Vec::new()));
+                }
+                let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+                Ok(Value::Blob(slice.to_vec()))
+            }
+            ContextValueType::Error => {
+                let bytes = unsafe { self.value.bytes };
+                if bytes.ptr.is_null() {
+                    return Err(LimboError::ExtensionError(String::new()));
+                }
+                let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+                let message = std::str::from_utf8(slice)
+                    .map_err(|err| LimboError::ExtensionError(err.to_string()))?;
+                Err(LimboError::ExtensionError(message.to_string()))
+            }
+        }
+    }
+}
 
 pub trait Deterministic: std::fmt::Display {
     fn is_deterministic(&self) -> bool;
@@ -15,30 +123,145 @@ pub struct ExternalFunc {
     pub func: ExtFunc,
 }
 
+pub struct ExternalCollation {
+    pub name: String,
+    pub context: usize,
+    pub callback: ContextCollationFunction,
+    pub context_destructor: Option<ContextDestructor>,
+}
+
+impl ExternalCollation {
+    pub fn new(
+        name: String,
+        context: usize,
+        callback: ContextCollationFunction,
+        context_destructor: Option<ContextDestructor>,
+    ) -> Self {
+        Self {
+            name,
+            context,
+            callback,
+            context_destructor,
+        }
+    }
+}
+
+impl Drop for ExternalCollation {
+    fn drop(&mut self) {
+        crate::translate::collate::CollationSeq::unregister_custom(&self.name);
+        if let Some(destructor) = self.context_destructor {
+            unsafe { destructor(self.context) };
+        }
+    }
+}
+
+impl Debug for ExternalCollation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExternalCollation")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
 impl Deterministic for ExternalFunc {
     fn is_deterministic(&self) -> bool {
-        // external functions can be whatever so let's just default to false
-        false
+        match self.func {
+            ExtFunc::ContextScalar { deterministic, .. }
+            | ExtFunc::ContextAggregate { deterministic, .. } => deterministic,
+            _ => false,
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum ExtFunc {
     Scalar(ScalarFunction),
+    ContextScalar {
+        context: usize,
+        argc: i32,
+        deterministic: bool,
+        callback: ContextScalarFunction,
+        context_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ContextValueDestructor>,
+    },
     Aggregate {
         argc: usize,
         init: InitAggFunction,
         step: StepFunction,
         finalize: FinalizeFunction,
     },
+    ContextAggregate {
+        context: usize,
+        argc: i32,
+        deterministic: bool,
+        init: ContextAggregateInitFunction,
+        step: ContextAggregateStepFunction,
+        finalize: ContextAggregateFinalFunction,
+        context_destructor: Option<ContextDestructor>,
+        aggregate_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ContextValueDestructor>,
+    },
 }
 
 impl ExtFunc {
-    pub fn agg_args(&self) -> Result<usize, ()> {
-        if let ExtFunc::Aggregate { argc, .. } = self {
-            return Ok(*argc);
+    pub fn agg_args(&self) -> Result<i32, ()> {
+        match self {
+            ExtFunc::Aggregate { argc, .. } => Ok(*argc as i32),
+            ExtFunc::ContextAggregate { argc, .. } => Ok(*argc),
+            _ => Err(()),
         }
-        Err(())
+    }
+
+    pub fn matches_arg_count(&self, arg_count: usize) -> bool {
+        match self {
+            Self::ContextScalar { argc, .. } | Self::ContextAggregate { argc, .. } => {
+                *argc < 0 || *argc as usize == arg_count
+            }
+            Self::Aggregate { argc, .. } => *argc == arg_count,
+            Self::Scalar(_) => true,
+        }
+    }
+
+    pub fn is_aggregate(&self) -> bool {
+        matches!(self, Self::Aggregate { .. } | Self::ContextAggregate { .. })
+    }
+
+    pub fn with_aggregate_arg_count(&self, arg_count: usize) -> Self {
+        match self {
+            Self::ContextAggregate {
+                context,
+                deterministic,
+                init,
+                step,
+                finalize,
+                context_destructor,
+                aggregate_destructor,
+                value_destructor,
+                ..
+            } => Self::ContextAggregate {
+                context: *context,
+                argc: arg_count as i32,
+                deterministic: *deterministic,
+                init: *init,
+                step: *step,
+                finalize: *finalize,
+                context_destructor: *context_destructor,
+                aggregate_destructor: *aggregate_destructor,
+                value_destructor: *value_destructor,
+            },
+            Self::Aggregate {
+                init,
+                step,
+                finalize,
+                ..
+            } => Self::Aggregate {
+                argc: arg_count,
+                init: *init,
+                step: *step,
+                finalize: *finalize,
+            },
+            _ => self.clone(),
+        }
     }
 }
 
@@ -63,6 +286,75 @@ impl ExternalFunc {
                 step: func.1,
                 finalize: func.2,
             },
+        }
+    }
+
+    pub fn new_context_scalar(
+        name: String,
+        argc: i32,
+        deterministic: bool,
+        context: usize,
+        callback: ContextScalarFunction,
+        context_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ContextValueDestructor>,
+    ) -> Self {
+        Self {
+            name,
+            func: ExtFunc::ContextScalar {
+                context,
+                argc,
+                deterministic,
+                callback,
+                context_destructor,
+                value_destructor,
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_context_aggregate(
+        name: String,
+        argc: i32,
+        deterministic: bool,
+        context: usize,
+        init: ContextAggregateInitFunction,
+        step: ContextAggregateStepFunction,
+        finalize: ContextAggregateFinalFunction,
+        context_destructor: Option<ContextDestructor>,
+        aggregate_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ContextValueDestructor>,
+    ) -> Self {
+        Self {
+            name,
+            func: ExtFunc::ContextAggregate {
+                context,
+                argc,
+                deterministic,
+                init,
+                step,
+                finalize,
+                context_destructor,
+                aggregate_destructor,
+                value_destructor,
+            },
+        }
+    }
+}
+
+impl Drop for ExternalFunc {
+    fn drop(&mut self) {
+        match self.func {
+            ExtFunc::ContextScalar {
+                context,
+                context_destructor: Some(context_destructor),
+                ..
+            }
+            | ExtFunc::ContextAggregate {
+                context,
+                context_destructor: Some(context_destructor),
+                ..
+            } => unsafe { context_destructor(context) },
+            _ => {}
         }
     }
 }
@@ -382,7 +674,10 @@ impl AggFunc {
             Self::JsonGroupArray | Self::JsonbGroupArray => 1,
             #[cfg(feature = "json")]
             Self::JsonGroupObject | Self::JsonbGroupObject => 2,
-            Self::External(func) => func.agg_args().unwrap_or(0),
+            Self::External(func) => func
+                .agg_args()
+                .map(|argc| argc.max(0) as usize)
+                .unwrap_or(0),
         }
     }
 
