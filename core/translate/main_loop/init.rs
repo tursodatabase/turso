@@ -106,7 +106,7 @@ impl InitLoop {
             let schema_cookie = t_ctx
                 .resolver
                 .with_schema(table.database_id, |s| s.schema_version);
-            program.begin_read_on_database(table.database_id, schema_cookie);
+            program.begin_read_on_database(table.database_id, schema_cookie)?;
             // Initialize bookkeeping for OUTER JOIN
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.is_outer() {

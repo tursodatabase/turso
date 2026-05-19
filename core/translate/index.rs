@@ -123,7 +123,7 @@ pub fn translate_create_index(
     program.extend(&opts);
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
 
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
@@ -939,7 +939,7 @@ pub fn translate_drop_index(
     program.extend(&opts);
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
 
     // Find the index in Schema
     let mut maybe_index = None;

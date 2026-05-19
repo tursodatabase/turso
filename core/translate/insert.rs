@@ -326,7 +326,7 @@ pub fn translate_insert(
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), table.get_name())?;
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
 
     let mut table_references = TableReferences::new(
         vec![JoinedTable {

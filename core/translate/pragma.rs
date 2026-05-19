@@ -281,13 +281,13 @@ pub fn translate_pragma(
         TransactionMode::None => {}
         TransactionMode::Read => {
             let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-            program.begin_read_on_database(database_id, schema_cookie);
-            program.begin_read_operation();
+            program.begin_read_on_database(database_id, schema_cookie)?;
+            program.begin_read_operation()?;
         }
         TransactionMode::Write => {
             let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-            program.begin_write_on_database(database_id, schema_cookie);
-            program.begin_write_operation();
+            program.begin_write_on_database(database_id, schema_cookie)?;
+            program.begin_write_operation()?;
         }
         TransactionMode::Concurrent => {
             program.begin_concurrent_operation();

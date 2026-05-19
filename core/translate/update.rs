@@ -262,7 +262,7 @@ fn prepare_update_plan(
         bail_parse_error!("UPDATE of WITHOUT ROWID tables is not supported");
     }
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
     validate_update(
         schema,
         &body,

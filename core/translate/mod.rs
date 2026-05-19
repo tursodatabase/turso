@@ -413,7 +413,7 @@ pub fn translate_inner(
 
     // Indicate read operations so that in the epilogue we can emit the correct type of transaction
     if is_select && !program.table_references.is_empty() {
-        program.begin_read_operation();
+        program.begin_read_operation()?;
     }
 
     Ok(())

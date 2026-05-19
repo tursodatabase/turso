@@ -636,7 +636,7 @@ fn execute_trigger_commands(
             program.begin_write_operation();
         } else {
             let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
-            program.begin_write_on_database(db_id, schema_cookie);
+            program.begin_write_on_database(db_id, schema_cookie)?;
         }
     }
     for db_id in &subprogram_prepared.read_databases {
@@ -644,10 +644,10 @@ fn execute_trigger_commands(
             continue;
         }
         if db_id == crate::MAIN_DB_ID {
-            program.begin_read_operation();
+            program.begin_read_operation()?;
         } else {
             let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
-            program.begin_read_on_database(db_id, schema_cookie);
+            program.begin_read_on_database(db_id, schema_cookie)?;
         }
     }
 

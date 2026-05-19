@@ -723,8 +723,8 @@ pub fn translate_alter_table(
     } = alter;
     let database_id = resolver.resolve_existing_table_database_id_qualified(&qualified_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
-    program.begin_write_operation();
+    program.begin_write_on_database(database_id, schema_cookie)?;
+    program.begin_write_operation()?;
     let table_name = qualified_name.name.as_str();
     // For attached databases, qualify sqlite_schema with the database name
     // so that the UPDATE targets the correct database's schema table.
@@ -1464,7 +1464,7 @@ pub fn translate_alter_table(
 
             let temp_schema_version = if !temp_triggers_to_rewrite.is_empty() {
                 let schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
-                program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie);
+                program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie)?;
                 Some(schema_cookie)
             } else {
                 None
@@ -1879,7 +1879,7 @@ pub fn translate_alter_table(
                     .any(|(db, _, _)| *db == crate::TEMP_DB_ID);
             let temp_schema_version = if has_temp_rewrites {
                 let schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
-                program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie);
+                program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie)?;
                 Some(schema_cookie)
             } else {
                 None
