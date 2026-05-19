@@ -10,10 +10,10 @@ public static class TursoBindings
     private const string AdvancedExtensionApisMessage =
         "SQLite-compatible function, aggregate, collation, and extension-loading APIs require Turso core managed extension support.";
 
-    public static TursoDatabaseHandle OpenDatabase(string path)
+    public static TursoDatabaseHandle OpenDatabase(string path, string? experimentalFeatures = null)
     {
         ArgumentNullException.ThrowIfNull(path);
-        return OpenDatabase(path, cipher: null, hexkey: null);
+        return OpenDatabase(path, cipher: null, hexkey: null, experimentalFeatures);
     }
 
     /// <summary>
@@ -23,12 +23,16 @@ public static class TursoBindings
     /// <param name="cipher">The encryption cipher to use.</param>
     /// <param name="hexkey">The hex-encoded encryption key.</param>
     /// <returns>A handle to the opened database.</returns>
-    public static TursoDatabaseHandle OpenDatabaseWithEncryption(string path, TursoEncryptionCipher cipher, string hexkey)
+    public static TursoDatabaseHandle OpenDatabaseWithEncryption(
+        string path,
+        TursoEncryptionCipher cipher,
+        string hexkey,
+        string? experimentalFeatures = null)
     {
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(hexkey);
 
-        return OpenDatabase(path, cipher.ToRustString(), hexkey);
+        return OpenDatabase(path, cipher.ToRustString(), hexkey, experimentalFeatures);
     }
 
     public static TursoStatementHandle PrepareStatement(TursoDatabaseHandle db, string sql)
@@ -261,10 +265,14 @@ public static class TursoBindings
         }
     }
 
-    private static TursoDatabaseHandle OpenDatabase(string path, string? cipher, string? hexkey)
+    private static TursoDatabaseHandle OpenDatabase(
+        string path,
+        string? cipher,
+        string? hexkey,
+        string? experimentalFeatures)
     {
         using var pathString = NativeUtf8String.From(path);
-        using var featuresString = NativeUtf8String.From(cipher is null ? null : "encryption");
+        using var featuresString = NativeUtf8String.From(ExperimentalFeaturesWithEncryption(experimentalFeatures, cipher));
         using var cipherString = NativeUtf8String.From(cipher);
         using var hexkeyString = NativeUtf8String.From(hexkey);
 
@@ -389,6 +397,14 @@ public static class TursoBindings
         var exception = new TursoException($"{messagePrefix}{errorMessage ?? "Internal error"}");
         TursoInterop.FreeString(errorPtr);
         throw exception;
+    }
+
+    private static string? ExperimentalFeaturesWithEncryption(string? experimentalFeatures, string? cipher)
+    {
+        if (string.IsNullOrWhiteSpace(experimentalFeatures))
+            return cipher is null ? null : "encryption";
+
+        return cipher is null ? experimentalFeatures : $"{experimentalFeatures},encryption";
     }
 
     private sealed class NativeUtf8String : IDisposable

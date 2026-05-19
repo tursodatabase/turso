@@ -30,6 +30,8 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         ["EncryptionCipher"] = "Encryption Cipher",
         ["Encryption Key"] = "Encryption Key",
         ["EncryptionKey"] = "Encryption Key",
+        ["Experimental Features"] = "Experimental Features",
+        ["ExperimentalFeatures"] = "Experimental Features",
     };
 
     public TursoConnectionStringBuilder()
@@ -109,6 +111,12 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
     {
         get => GetString("Encryption Key");
         set => SetString("Encryption Key", value);
+    }
+
+    public string ExperimentalFeatures
+    {
+        get => GetString("Experimental Features");
+        set => SetString("Experimental Features", value);
     }
 
     [AllowNull]
