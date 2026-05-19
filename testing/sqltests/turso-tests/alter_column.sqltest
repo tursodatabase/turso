@@ -717,3 +717,32 @@ expect {
     a2|a2c2|c2
     ok
 }
+
+# Issue #7077: turning an indexed regular column into a virtual generated
+# column rewrites the table rows, so the existing index must be rewritten too.
+test alter-column-regular-to-virtual-rewrites-index-entries {
+    CREATE TABLE p(a, b UNIQUE);
+    INSERT INTO p VALUES(1, 10);
+    ALTER TABLE p ALTER COLUMN b TO g AS(a + 1);
+    SELECT rowid, a, g FROM p;
+    SELECT g FROM p INDEXED BY sqlite_autoindex_p_1;
+    PRAGMA integrity_check;
+    DELETE FROM p;
+    SELECT count(*) FROM p;
+    PRAGMA integrity_check;
+}
+expect {
+    1|1|2
+    2
+    ok
+    0
+    ok
+}
+
+test alter-column-regular-to-virtual-rejects-unique-conflict {
+    CREATE TABLE p(a, b UNIQUE);
+    INSERT INTO p VALUES(1, 10), (1, 20);
+    ALTER TABLE p ALTER COLUMN b TO g AS(a + 1);
+}
+expect error {
+}
