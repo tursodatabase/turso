@@ -358,6 +358,28 @@ pub fn plan_subqueries_from_select_plan(
     Ok(())
 }
 
+fn plan_subqueries_from_plan(
+    program: &mut ProgramBuilder,
+    plan: &mut Plan,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    match plan {
+        Plan::Select(select_plan) => {
+            plan_subqueries_from_select_plan(program, select_plan, resolver, connection)
+        }
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            for (select_plan, _) in left {
+                plan_subqueries_from_select_plan(program, select_plan, resolver, connection)?;
+            }
+            plan_subqueries_from_select_plan(program, right_most, resolver, connection)
+        }
+        Plan::Delete(_) | Plan::Update(_) => Ok(()),
+    }
+}
+
 /// Compute query plans for subqueries in a DML statement's WHERE clause.
 /// This is used by DELETE and UPDATE statements which only have subqueries in the WHERE clause.
 /// Similar to [plan_subqueries_from_select_plan] but only handles the WHERE clause
@@ -642,6 +664,7 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
+                plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
                 optimize_select_plan(&mut plan, resolver)?;
                 let correlated = select_plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
@@ -694,6 +717,7 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
+                plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
                 optimize_select_plan(&mut plan, resolver)?;
                 let reg_count = plan.result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
@@ -789,6 +813,8 @@ fn get_subquery_parser<'a>(
                     QueryDestination::Unset,
                     connection,
                 )?;
+                let mut plan = plan;
+                plan_subqueries_from_plan(program, &mut plan, resolver, connection)?;
                 let mut plan = match plan {
                     Plan::Select(mut select_plan) => {
                         optimize_select_plan(&mut select_plan, resolver)?;

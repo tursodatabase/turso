@@ -863,6 +863,73 @@ fn test_insert_with_column_names(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 #[turso_macros::test()]
+fn update_rejects_invalid_cte_column_before_mutation(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE x(a, b)")?;
+    conn.execute("INSERT INTO x(a) VALUES (1)")?;
+    conn.execute("CREATE TABLE z(q INTEGER, p INTEGER)")?;
+    conn.execute("CREATE TABLE y(id INTEGER PRIMARY KEY, d INTEGER)")?;
+
+    let result = conn.execute(
+        "UPDATE x
+         SET b = 1
+         WHERE
+           1 OR (
+             SELECT d
+             FROM y
+             ORDER BY
+               id,
+               MAX(
+                 0,
+                 d,
+                 EXISTS (
+                   WITH c AS (
+                     SELECT *
+                     FROM z
+                     WHERE p
+                   )
+                   SELECT DISTINCT c0
+                   FROM c
+                   WHERE c0
+                   ORDER BY c0
+                 )
+               )
+             LIMIT 1
+           )
+         RETURNING a, b",
+    );
+
+    let error = result.expect_err("invalid CTE column should be rejected");
+    match error {
+        LimboError::ParseError(message) => assert_eq!(message, "no such column: c0"),
+        other => panic!("unexpected error for invalid CTE column: {other}"),
+    }
+
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT a, b FROM x"),
+        vec![vec![RValue::Integer(1), RValue::Null]],
+        "invalid UPDATE must not mutate rows"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test()]
+fn order_by_rowid_still_elides_in_select_arity_check(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b)")?;
+    conn.execute("INSERT INTO t VALUES (1, 10)")?;
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT b FROM t ORDER BY id, b IN (SELECT id, b FROM t) LIMIT 1",
+    );
+
+    assert_eq!(rows, vec![vec![RValue::Integer(10)]]);
+    Ok(())
+}
+
+#[turso_macros::test()]
 pub fn delete_search_op_ignore_nulls(limbo: TempDatabase) {
     let conn = limbo.db.connect().unwrap();
     for sql in [

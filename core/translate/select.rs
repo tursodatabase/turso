@@ -692,6 +692,9 @@ fn prepare_one_select_plan(
                 let rowid_alias_col = joined
                     .btree()
                     .and_then(|t| t.get_rowid_alias_column().map(|(idx, _)| idx));
+                let elided_tail_needs_subquery_resolution = plan.order_by[1..]
+                    .iter()
+                    .any(|(expr, _, _)| expr_contains_scalar_or_exists_subquery(expr));
 
                 let first_is_rowid = match plan.order_by[0].0.as_ref() {
                     ast::Expr::Column { table, column, .. } => {
@@ -700,7 +703,7 @@ fn prepare_one_select_plan(
                     ast::Expr::RowId { table, .. } => *table == table_id,
                     _ => false,
                 };
-                if first_is_rowid {
+                if first_is_rowid && !elided_tail_needs_subquery_resolution {
                     plan.order_by.truncate(1);
                 }
             }
@@ -1493,6 +1496,125 @@ fn select_has_non_from_subqueries(
         }
     }
 
+    false
+}
+
+fn expr_contains_scalar_or_exists_subquery(expr: &Expr) -> bool {
+    // SQLite still resolves scalar/EXISTS subqueries in ORDER BY terms that are
+    // later elided by a leading rowid sort key.  Keep those terms around until
+    // subquery planning has validated names.  Row-value arity checks for IN
+    // subqueries are intentionally still elided for compatibility with existing
+    // SQLite behavior.
+    let mut stack = vec![expr];
+    while let Some(node) = stack.pop() {
+        match node {
+            Expr::Subquery(_) | Expr::Exists(_) => return true,
+            Expr::InSelect { lhs, .. } => {
+                stack.push(lhs.as_ref());
+            }
+            Expr::Between {
+                lhs, start, end, ..
+            } => {
+                stack.push(lhs.as_ref());
+                stack.push(start.as_ref());
+                stack.push(end.as_ref());
+            }
+            Expr::Binary(lhs, _, rhs) => {
+                stack.push(rhs.as_ref());
+                stack.push(lhs.as_ref());
+            }
+            Expr::Case {
+                base,
+                when_then_pairs,
+                else_expr,
+            } => {
+                if let Some(expr) = else_expr.as_deref() {
+                    stack.push(expr);
+                }
+                for (when_expr, then_expr) in when_then_pairs.iter().rev() {
+                    stack.push(then_expr.as_ref());
+                    stack.push(when_expr.as_ref());
+                }
+                if let Some(base_expr) = base.as_deref() {
+                    stack.push(base_expr);
+                }
+            }
+            Expr::Cast { expr, .. }
+            | Expr::Collate(expr, _)
+            | Expr::IsNull(expr)
+            | Expr::NotNull(expr)
+            | Expr::Unary(_, expr) => {
+                stack.push(expr.as_ref());
+            }
+            Expr::FunctionCall {
+                args,
+                order_by,
+                filter_over,
+                ..
+            } => {
+                push_function_tail_exprs(&mut stack, filter_over);
+                for sorted in order_by.iter().rev() {
+                    stack.push(sorted.expr.as_ref());
+                }
+                for arg in args.iter().rev() {
+                    stack.push(arg.as_ref());
+                }
+            }
+            Expr::FunctionCallStar { filter_over, .. } => {
+                push_function_tail_exprs(&mut stack, filter_over);
+            }
+            Expr::InList { lhs, rhs, .. } => {
+                for item in rhs.iter().rev() {
+                    stack.push(item.as_ref());
+                }
+                stack.push(lhs.as_ref());
+            }
+            Expr::InTable { lhs, args, .. } => {
+                for arg in args.iter().rev() {
+                    stack.push(arg.as_ref());
+                }
+                stack.push(lhs.as_ref());
+            }
+            Expr::Like {
+                lhs, rhs, escape, ..
+            } => {
+                if let Some(escape_expr) = escape.as_deref() {
+                    stack.push(escape_expr);
+                }
+                stack.push(rhs.as_ref());
+                stack.push(lhs.as_ref());
+            }
+            Expr::Parenthesized(exprs) => {
+                for expr in exprs.iter().rev() {
+                    stack.push(expr.as_ref());
+                }
+            }
+            Expr::Raise(_, raise_expr) => {
+                if let Some(expr) = raise_expr.as_deref() {
+                    stack.push(expr);
+                }
+            }
+            Expr::SubqueryResult { lhs, .. } => {
+                if let Some(expr) = lhs.as_deref() {
+                    stack.push(expr);
+                }
+            }
+            Expr::Array { .. } | Expr::Subscript { .. } => {
+                unreachable!("Array and Subscript are desugared into function calls by the parser")
+            }
+            Expr::Column { .. }
+            | Expr::DoublyQualified(_, _, _)
+            | Expr::Id(_)
+            | Expr::Literal(_)
+            | Expr::Name(_)
+            | Expr::Qualified(_, _)
+            | Expr::FieldAccess { .. }
+            | Expr::Register(_)
+            | Expr::RowId { .. }
+            | Expr::Variable(_)
+            | Expr::Default => {}
+        }
+    }
     false
 }
 
