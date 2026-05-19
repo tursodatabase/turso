@@ -5526,7 +5526,6 @@ fn test_insert_in_middle_commit_of_create_index_returns_err() {
 
     let conn_a = db.connect();
     let conn_b = db.connect();
-    let mvcc_store = db.get_mvcc_store();
 
     // T1 (conn_a): CREATE INDEX, yielding at `LogRecordPrepared` — the
     // point in the commit pipeline where `end_ts` has been assigned and the
