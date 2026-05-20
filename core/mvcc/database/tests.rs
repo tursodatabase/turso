@@ -11968,3 +11968,133 @@ fn test_auto_rowid_after_negative_explicit_rowid_uses_next_negative() {
     assert_eq!(rows[1][0].as_int().unwrap(), -4);
     assert_eq!(rows[1][1].to_string(), "auto");
 }
+/// Regression: out-of-order MVCC commit completion must not regress
+/// `mvcc_store.global_header.schema_cookie`.
+///
+/// `CommitStateMachine::FinalizeCommit` writes `global_header` with the
+/// committing tx's header. Two commits that interleave (older end_ts
+/// reaches FinalizeCommit *after* a newer one with a bumped cookie)
+/// would otherwise overwrite the latest cookie with a stale value.
+///
+/// Once `global_header.schema_cookie` regresses below
+/// `db.schema.schema_version`, `maybe_reparse_schema`'s early-exit fails
+/// on every subsequent statement — it triggers a disk reparse, the inner
+/// `SELECT * FROM sqlite_schema` speculatively reads any still-Preparing
+/// writer's row (Hekaton §2.7), registers a commit dependency, and the
+/// single-threaded reparse loop in `Statement::run_with_row_callback`
+/// parks in `WaitForDependencies` forever. This is the deadlock seed
+/// 4729871996470817193 hit in whopper MVCC soak.
+///
+/// Repro shape:
+/// - tx_a: CONCURRENT update, pinned at `LogRecordPrepared` (in
+///   BuildLogRecord state, end_ts already assigned but commit not yet
+///   logged).
+/// - tx_b: exclusive DDL (CREATE TABLE) ran end-to-end while tx_a is
+///   paused. tx_b acquired a newer end_ts and bumped the cookie; its
+///   `FinalizeCommit` writes the new cookie into `global_header`.
+/// - tx_a resumes, runs through to `FinalizeCommit`. Its tx_header
+///   carries the OLD cookie. Without the guard,
+///   `global_header.write().replace(...)` regresses the cookie.
+///
+/// The fix in `FinalizeCommit` reorders
+/// `last_committed_tx_ts.fetch_max(end_ts)` before the `global_header`
+/// write and only writes when `prev_committed_ts <= *end_ts` — i.e. only
+/// when our commit is still the most recent.
+#[test]
+fn test_global_header_cookie_no_regression_on_out_of_order_finalize() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let setup = db.connect();
+        setup
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        setup
+            .execute("INSERT INTO t VALUES (1, 'initial')")
+            .unwrap();
+        setup.close().unwrap();
+    }
+    let mvcc_store = db.get_mvcc_store();
+    let cookie_before = mvcc_store
+        .with_header(|h| h.schema_cookie.get(), None)
+        .unwrap();
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    // tx_a: CONCURRENT update. Pin its commit inside FinalizeCommit, after
+    // CommitEnd has already marked the tx Committed but before the
+    // watermark / global_header writes. tx_a is no longer Preparing at the
+    // yield, so `acquire_exclusive_tx`'s `has_preparing_tx_other_than` check
+    // lets tx_b take the slot.
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a
+        .execute("UPDATE t SET v = 'a-mod' WHERE id = 1")
+        .unwrap();
+    let tx_a_id = conn_a.get_mv_tx_id().expect("tx_a should be active");
+
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeCommittedTimestampWatermarkUpdate.point(),
+    ])));
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    let mut yielded = false;
+    for _ in 0..200 {
+        match commit_a.step().unwrap() {
+            StepResult::IO => {
+                yielded = true;
+                break;
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert!(
+        yielded,
+        "tx_a's COMMIT should yield at BeforeCommittedTimestampWatermarkUpdate"
+    );
+    assert!(
+        matches!(
+            mvcc_store
+                .txs
+                .get(&tx_a_id)
+                .expect("tx_a should be tracked")
+                .value()
+                .state
+                .load(),
+            TransactionState::Committed(_)
+        ),
+        "tx_a should be Committed (set by CommitEnd) by the time we yield in FinalizeCommit"
+    );
+
+    // tx_b: exclusive DDL. tx_a is Committed so `acquire_exclusive_tx`
+    // does not see a Preparing other-than. tx_b runs end-to-end and its
+    // FinalizeCommit writes the bumped cookie into global_header.
+    conn_b.execute("BEGIN").unwrap();
+    conn_b.execute("CREATE TABLE foo(x INTEGER)").unwrap();
+    conn_b.execute("COMMIT").unwrap();
+    let cookie_after_b = mvcc_store
+        .with_header(|h| h.schema_cookie.get(), None)
+        .unwrap();
+    assert!(
+        cookie_after_b > cookie_before,
+        "tx_b's CREATE TABLE should bump global_header.schema_cookie \
+         (before={cookie_before} after_b={cookie_after_b})"
+    );
+
+    // Resume tx_a. Its FinalizeCommit's global_header write must not
+    // overwrite tx_b's newer cookie.
+    conn_a.set_yield_injector(None);
+    commit_a.run_ignore_rows().unwrap();
+    drop(commit_a);
+
+    let cookie_final = mvcc_store
+        .with_header(|h| h.schema_cookie.get(), None)
+        .unwrap();
+    assert_eq!(
+        cookie_final, cookie_after_b,
+        "global_header.schema_cookie regressed after older tx_a finalized \
+         after newer DDL tx_b — before={cookie_before} after_b={cookie_after_b} \
+         final={cookie_final}"
+    );
+}
+
+
