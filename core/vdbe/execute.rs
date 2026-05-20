@@ -2870,6 +2870,7 @@ pub fn halt(
 ) -> Result<InsnFunctionStepResult> {
     let mv_store = program.connection.mv_store();
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
+    let owns_auto_txn = state.owns_auto_txn();
 
     // Check if we're resuming from a FAIL commit I/O wait.
     // If pending_fail_error is set, we were in the middle of committing partial changes
@@ -2945,7 +2946,7 @@ pub fn halt(
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
         // Note: ON CONFLICT FAIL does NOT apply to FK violations, so we check for those first.
-        if program.resolve_type == ResolveType::Fail && auto_commit {
+        if program.resolve_type == ResolveType::Fail && owns_auto_txn {
             // Check for immediate FK violations - FK errors don't respect ON CONFLICT
             if program.connection.foreign_keys_enabled()
                 && state.get_fk_immediate_violations_during_stmt() > 0
@@ -2976,7 +2977,11 @@ pub fn halt(
         return Err(error);
     }
 
-    tracing::trace!("halt(auto_commit={})", auto_commit);
+    tracing::trace!(
+        "halt(auto_commit={}, owns_auto_txn={})",
+        auto_commit,
+        owns_auto_txn
+    );
 
     // Check for immediate foreign key violations.
     // Any immediate violation causes the statement subtransaction to roll back.
@@ -2995,7 +3000,7 @@ pub fn halt(
     if auto_commit {
         // In autocommit mode, a statement that leaves deferred violations must fail here,
         // and it also ends the transaction.
-        if program.connection.foreign_keys_enabled() {
+        if owns_auto_txn && program.connection.foreign_keys_enabled() {
             let deferred_violations = program
                 .connection
                 .fk_deferred_violations
@@ -3017,19 +3022,34 @@ pub fn halt(
             }
         }
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
-        vtab_commit_all(&program.connection)?;
-        index_method_pre_commit_all(state, pager)?;
-        let result = program
-            .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
-            .map(Into::into);
-        // Apply deferred CDC state and reset CDC txn ID after successful commit
-        if matches!(result, Ok(InsnFunctionStepResult::Done)) {
+        if owns_auto_txn {
+            vtab_commit_all(&program.connection)?;
+            index_method_pre_commit_all(state, pager)?;
+            let result = program
+                .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
+                .map(Into::into);
+            // Apply deferred CDC state and reset CDC txn ID after successful commit
+            if matches!(result, Ok(InsnFunctionStepResult::Done)) {
+                if let Some(cdc_info) = state.pending_cdc_info.take() {
+                    program.connection.set_capture_data_changes_info(cdc_info);
+                }
+                program.connection.set_cdc_transaction_id(-1);
+            }
+            result
+        } else {
+            // Another root statement may own the implicit autocommit
+            // transaction. This statement can finish, but must not commit or
+            // roll back connection-level state it did not start.
             if let Some(cdc_info) = state.pending_cdc_info.take() {
                 program.connection.set_capture_data_changes_info(cdc_info);
             }
-            program.connection.set_cdc_transaction_id(-1);
+            if program.change_cnt_on {
+                program
+                    .connection
+                    .set_changes(state.n_change.load(Ordering::SeqCst));
+            }
+            Ok(InsnFunctionStepResult::Done)
         }
-        result
     } else {
         // Even if deferred violations are present, the statement subtransaction completes successfully when
         // it is part of an interactive transaction.

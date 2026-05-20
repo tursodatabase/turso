@@ -1,5 +1,9 @@
+use std::sync::Arc;
+
 use crate::common::{limbo_exec_rows, TempDatabase};
+use crate::queued_io::QueuedIo;
 use turso_core::vdbe::StepResult;
+use turso_core::{Database, LimboError};
 
 /// Helper: step a statement through IO until it returns Row or Done.
 fn step_blocking(stmt: &mut turso_core::Statement) -> turso_core::Result<StepResult> {
@@ -92,6 +96,42 @@ fn returning_delete_drop_after_partial_read_commits(tmp_db: TempDatabase) -> any
     Ok(())
 }
 
+#[turso_macros::test]
+fn unrelated_runtime_error_does_not_rollback_open_returning_statement(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE pending (id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("CREATE TABLE overflow (x INTEGER)")?;
+    conn.execute("INSERT INTO overflow VALUES (9223372036854775807), (1)")?;
+
+    {
+        let mut owner =
+            conn.prepare("INSERT INTO pending VALUES (1, 'a'), (2, 'b') RETURNING id")?;
+        let result = step_blocking(&mut owner)?;
+        assert!(
+            matches!(result, StepResult::Row),
+            "expected Row, got {result:?}"
+        );
+
+        let err = conn
+            .execute("SELECT sum(x) FROM overflow")
+            .expect_err("sum overflow should fail");
+        assert!(matches!(err, LimboError::IntegerOverflow), "{err:?}");
+    }
+
+    let rows = limbo_exec_rows(&conn, "SELECT id FROM pending ORDER BY id");
+    let ids: Vec<i64> = rows
+        .iter()
+        .map(|row| match &row[0] {
+            rusqlite::types::Value::Integer(i) => *i,
+            other => panic!("expected integer, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 2]);
+    Ok(())
+}
+
 /// Plain INSERT (no RETURNING): runs to completion via step(), then drop.
 /// This is the normal case — Halt commits the transaction.
 #[turso_macros::test(init_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")]
@@ -113,6 +153,33 @@ fn plain_insert_step_to_done_commits(tmp_db: TempDatabase) -> anyhow::Result<()>
         other => panic!("expected integer, got {other:?}"),
     };
     assert_eq!(count, 2);
+    Ok(())
+}
+
+#[test]
+fn dropping_explicit_commit_waiting_on_io_rolls_back_transaction() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open_file(io, "queued-explicit-commit-drop.db")?;
+    let conn = db.connect()?;
+
+    conn.execute("CREATE TABLE t(x INTEGER)")?;
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+
+    {
+        let mut commit = conn.prepare("COMMIT")?;
+        assert!(matches!(commit.step()?, StepResult::IO));
+    }
+
+    conn.execute("INSERT INTO t VALUES (2)")?;
+
+    let mut stmt = conn.prepare("SELECT x FROM t ORDER BY x")?;
+    let mut values = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        values.push(row.get::<i64>(0)?);
+        Ok(())
+    })?;
+    assert_eq!(values, vec![2]);
     Ok(())
 }
 
