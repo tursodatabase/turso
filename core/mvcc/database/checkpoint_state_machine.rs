@@ -254,6 +254,19 @@ fn sqlite_schema_btree_identity(version: &RowVersion) -> Option<SqliteSchemaBtre
     Some(SqliteSchemaBtreeIdentity { kind, root_page })
 }
 
+fn sqlite_schema_row_has_zero_root_page(version: &RowVersion) -> bool {
+    if version.row.id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID || version.row.payload().is_empty() {
+        return false;
+    }
+
+    let row_data = ImmutableRecord::from_bin_record(version.row.payload().to_vec());
+    let Ok(root_page) = row_data.get_value(3) else {
+        return false;
+    };
+
+    matches!(root_page, ValueRef::Numeric(Numeric::Integer(0)))
+}
+
 fn sqlite_schema_versions_refer_to_btree(lhs: &RowVersion, rhs: &RowVersion) -> bool {
     sqlite_schema_btree_identity(lhs)
         .zip(sqlite_schema_btree_identity(rhs))
@@ -536,6 +549,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // Set to true for schema deletes of never-checkpointed tables/indexes.
                 // These don't need to be written to the B-tree, we just need to track them.
                 let mut skip_write = false;
+
+                if key.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
+                    && is_delete
+                    && !version.btree_resident
+                    && sqlite_schema_row_has_zero_root_page(&version)
+                {
+                    skip_write = true;
+                }
 
                 if let Some(schema_identity) = sqlite_schema_btree_identity(&version) {
                     let root_page = schema_identity.root_page;

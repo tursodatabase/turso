@@ -66,3 +66,17 @@ expect {
     mvcc
     42
 }
+
+test mvcc-checkpoint-skips-never-checkpointed-trigger-delete {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t_trigger(id INTEGER PRIMARY KEY, u TEXT UNIQUE, v TEXT);
+    CREATE TRIGGER tr_ai AFTER INSERT ON t_trigger BEGIN SELECT RAISE(ABORT, 'boom'); END;
+    DROP TRIGGER tr_ai;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    PRAGMA integrity_check;
+}
+expect {
+    mvcc
+    0|0|0
+    ok
+}
