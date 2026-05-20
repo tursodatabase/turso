@@ -1330,17 +1330,48 @@ impl Connection {
         }
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
-        if matches!(self.get_tx_state(), TransactionState::None)
-            && self.get_mv_tx().is_none()
-            && self.next_attached_mv_tx().is_none()
-            // In MVCC, checkpoint root publication can replace Database::schema
-            // without changing SQLite's schema cookie. If this connection
-            // still holds an older Schema snapshot, prepared statements must be
-            // invalidated and recompiled against the current roots.
+        if self.has_no_open_transaction_state()
             && (current_schema.schema_version != schema.schema_version
-                || (self.mvcc_enabled() && !Arc::ptr_eq(&current_schema, &schema)))
+                || self.is_same_version_mvcc_shared_schema_replacement(&current_schema, &schema))
         {
             *self.schema.write() = schema.clone();
+            self.bump_prepare_context_generation();
+        }
+    }
+
+    fn has_no_open_transaction_state(&self) -> bool {
+        matches!(self.get_tx_state(), TransactionState::None)
+            && self.get_mv_tx().is_none()
+            && self.next_attached_mv_tx().is_none()
+    }
+
+    fn is_same_version_mvcc_shared_schema_replacement(
+        &self,
+        current_schema: &Arc<Schema>,
+        schema: &Arc<Schema>,
+    ) -> bool {
+        self.mvcc_enabled()
+            && current_schema.schema_version == schema.schema_version
+            && !Arc::ptr_eq(current_schema, schema)
+    }
+
+    pub(crate) fn has_stale_mvcc_shared_schema_before_transaction(&self) -> bool {
+        if !self.has_no_open_transaction_state() {
+            return false;
+        }
+        let current_schema = self.schema.read().clone();
+        let schema = self.db.schema.lock();
+        self.is_same_version_mvcc_shared_schema_replacement(&current_schema, &schema)
+    }
+
+    pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {
+        let current_schema = self.schema.read().clone();
+        let schema = self.db.schema.lock().clone();
+        if current_schema.schema_version < schema.schema_version
+            || (self.has_no_open_transaction_state()
+                && self.is_same_version_mvcc_shared_schema_replacement(&current_schema, &schema))
+        {
+            *self.schema.write() = schema;
             self.bump_prepare_context_generation();
         }
     }

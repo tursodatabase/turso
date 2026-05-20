@@ -3387,6 +3387,17 @@ pub fn op_transaction_inner(
                     return Err(LimboError::ReadOnly);
                 }
 
+                // Fast path: if checkpoint root publication already replaced the
+                // shared schema, force reprepare before opening any transaction state.
+                if *db == crate::MAIN_DB_ID
+                    && mv_store.is_some()
+                    && conn.has_stale_mvcc_shared_schema_before_transaction()
+                {
+                    tracing::debug!(
+                        "MVCC shared schema changed without a schema-cookie change; force reprepare"
+                    );
+                    return Err(LimboError::SchemaUpdated);
+                }
                 #[cfg(any(test, injected_yields))]
                 {
                     if let Some(IOResult::IO(io)) =
@@ -3551,6 +3562,19 @@ pub fn op_transaction_inner(
                         if !has_existing_mv_tx {
                             match begin_mvcc_tx(mv_store, &pager, tx_mode, None) {
                                 Ok(tx_id) => {
+                                    // Check again in case checkpoint published roots after the
+                                    // previous check and before this transaction was protected.
+                                    if conn.has_stale_mvcc_shared_schema_before_transaction() {
+                                        tracing::debug!(
+                                            "MVCC shared schema changed while starting transaction; force reprepare"
+                                        );
+                                        mv_store.rollback_tx(tx_id, pager.clone(), &conn, *db);
+                                        if started_read_tx {
+                                            pager.end_read_tx();
+                                            state.auto_txn_cleanup = TxnCleanup::None;
+                                        }
+                                        return Err(LimboError::SchemaUpdated);
+                                    }
                                     program
                                         .connection
                                         .set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
