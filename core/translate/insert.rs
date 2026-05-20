@@ -1679,7 +1679,7 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
         lhs: table_name_reg,
         rhs: name_col_reg,
         target_pc: found_label,
-        flags: Default::default(),
+        flags: CmpInsFlags::default().jump_if_null(),
         collation: None,
     });
 

@@ -218,6 +218,68 @@ expect {
     t2|2
 }
 
+# Regression test for https://github.com/tursodatabase/turso/issues/6966
+@cross-check-integrity
+test autoinc-null-sequence-name-does-not-match-insert {
+    CREATE TABLE t1(i INTEGER PRIMARY KEY AUTOINCREMENT);
+    CREATE TABLE t2(i INTEGER PRIMARY KEY AUTOINCREMENT);
+    CREATE TABLE t3(i INTEGER PRIMARY KEY AUTOINCREMENT);
+    INSERT INTO t1 VALUES(NULL);
+    INSERT INTO t2 VALUES(NULL);
+    INSERT INTO t3 VALUES(NULL);
+    UPDATE sqlite_sequence SET name=NULL WHERE name='t2';
+    INSERT INTO t3 VALUES(NULL);
+    SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+    1|t1|1
+    2||1
+    3|t3|2
+}
+
+@cross-check-integrity
+test autoinc-null-sequence-name-does-not-match-rename {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY AUTOINCREMENT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY AUTOINCREMENT);
+    INSERT INTO t1 VALUES(NULL);
+    INSERT INTO t2 VALUES(NULL);
+    UPDATE sqlite_sequence SET name=NULL WHERE name='t1';
+    ALTER TABLE t2 RENAME TO t3;
+    SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+    1||1
+    2|t3|1
+}
+
+@cross-check-integrity
+test autoinc-null-sequence-name-does-not-match-drop {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY AUTOINCREMENT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY AUTOINCREMENT);
+    INSERT INTO t1 VALUES(NULL);
+    INSERT INTO t2 VALUES(NULL);
+    UPDATE sqlite_sequence SET name=NULL WHERE name='t1';
+    DROP TABLE t2;
+    SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+    1||1
+}
+
+@skip-if sqlite "ALTER COLUMN is a Turso extension"
+test autoinc-null-sequence-name-does-not-match-alter-column {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY AUTOINCREMENT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO t1 VALUES(NULL);
+    INSERT INTO t2 VALUES(NULL, 'x');
+    UPDATE sqlite_sequence SET name=NULL WHERE name='t1';
+    ALTER TABLE t2 ALTER COLUMN id TO id2 TEXT;
+    SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+    1||1
+}
+
 # Regression test for https://github.com/tursodatabase/turso/issues/6769
 @skip-if sqlite "ALTER COLUMN is a Turso extension"
 test autoinc-alter-column-clears-sequence-row {
