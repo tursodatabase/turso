@@ -1121,6 +1121,17 @@ fn test_fts_ngram_tokenizer(tmp_db: TempDatabase) {
     // With ngram(2,3), "Pho" generates ngrams that should match ngrams in "iPhone"
     assert!(!rows.is_empty());
 
+    // Ngram should also follow the default/simple tokenizer case-insensitive behavior
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM products WHERE fts_match(name, 'pho')",
+    );
+    assert_eq!(rows.len(), 1);
+    match &rows[0][0] {
+        rusqlite::types::Value::Integer(i) => assert_eq!(*i, 1),
+        _ => panic!("Expected integer"),
+    }
+
     // Search for "Gal" should match "Galaxy"
     let rows = limbo_exec_rows(
         &conn,

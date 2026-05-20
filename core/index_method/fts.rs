@@ -1893,7 +1893,10 @@ impl FtsCursor {
         // Register "ngram" tokenizer - 2-3 character n-grams for substring matching
         // Using prefix=false for full n-gram (not just prefix)
         if let Ok(ngram) = NgramTokenizer::new(2, 3, false) {
-            tokenizers.register("ngram", ngram);
+            let analyzer = TextAnalyzer::builder(ngram)
+                .filter(tantivy::tokenizer::LowerCaser)
+                .build();
+            tokenizers.register("ngram", analyzer);
         }
     }
 
