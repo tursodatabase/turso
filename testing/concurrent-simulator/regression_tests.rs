@@ -6,10 +6,12 @@ use turso_core::{Connection, Database, DatabaseOpts, IO, LimboError, OpenFlags};
 use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
 use turso_whopper::{
     multiprocess_platform_io,
+    properties::{IntegrityCheckProperty, SimpleKeysDoNotDisappear},
     workloads::{
         BeginWorkload, CommitWorkload, CreateIndexWorkload, CreateSimpleTableWorkload,
-        DeleteWorkload, DropIndexWorkload, IntegrityCheckWorkload, RollbackWorkload,
-        SimpleInsertWorkload, SimpleSelectWorkload, UpdateWorkload, WalCheckpointWorkload,
+        DeleteWorkload, DropIndexWorkload, IntegrityCheckWorkload, LargeSimpleInsertWorkload,
+        RollbackWorkload, SimpleInsertWorkload, SimpleSelectWorkload, UpdateWorkload,
+        WalCheckpointModeWorkload, WalCheckpointWorkload,
     },
 };
 
@@ -1135,5 +1137,51 @@ fn multiprocess_restart_rebuilds_from_disk_after_restart_checkpoint_changes_gene
         "conservative reopen after RESTART-generation checkpoint churn should preserve both generations of rows"
     );
 
+    whopper.finalize().expect("finalize multiprocess whopper");
+}
+
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+#[test]
+fn multiprocess_wal_stress_preserves_rows_after_stale_disk_scan_reopen() {
+    configure_worker_exe();
+    let mut whopper = MultiprocessWhopper::new(MultiprocessOpts {
+        seed: Some(7512),
+        enable_mvcc: false,
+        process_count: 2,
+        connections_per_process: 2,
+        max_steps: 1403,
+        elle_tables: vec![],
+        workloads: vec![
+            (30, Box::new(IntegrityCheckWorkload)),
+            (25, Box::new(WalCheckpointModeWorkload { mode: "TRUNCATE" })),
+            (25, Box::new(WalCheckpointModeWorkload { mode: "RESTART" })),
+            (10, Box::new(WalCheckpointModeWorkload { mode: "PASSIVE" })),
+            (8, Box::new(CreateSimpleTableWorkload)),
+            (8, Box::new(SimpleSelectWorkload)),
+            (12, Box::new(SimpleInsertWorkload)),
+            (45, Box::new(LargeSimpleInsertWorkload)),
+            (5, Box::new(UpdateWorkload)),
+            (5, Box::new(DeleteWorkload)),
+            (2, Box::new(CreateIndexWorkload)),
+            (2, Box::new(DropIndexWorkload)),
+            (15, Box::new(BeginWorkload)),
+            (20, Box::new(CommitWorkload)),
+            (3, Box::new(RollbackWorkload)),
+        ],
+        properties: vec![
+            Box::new(IntegrityCheckProperty),
+            Box::new(SimpleKeysDoNotDisappear::new()),
+        ],
+        chaotic_profiles: vec![],
+        kill_probability: 0.04,
+        restart_probability: 0.04,
+        history_output: None,
+        keep_files: false,
+    })
+    .expect("create multiprocess whopper");
+
+    while !whopper.is_done() {
+        whopper.step().expect("step should succeed");
+    }
     whopper.finalize().expect("finalize multiprocess whopper");
 }

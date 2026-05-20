@@ -30,7 +30,7 @@ struct Args {
     #[command(subcommand)]
     subcommand: Option<SubCmd>,
 
-    /// Simulation mode (fast, chaos, ragnarök/ragnarok)
+    /// Simulation mode (fast, chaos, wal_stress, ragnarök/ragnarok)
     #[arg(long, default_value = "fast")]
     mode: String,
     /// Max connections
@@ -157,6 +157,7 @@ fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     }
     let base_max_steps = match args.mode.as_str() {
         "fast" => 100_000,
+        "wal_stress" => 250_000,
         "chaos" => 10_000_000,
         "ragnarök" | "ragnarok" => 1_000_000,
         mode => return Err(anyhow::anyhow!("Unknown mode: {}", mode)),
@@ -345,6 +346,31 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
         let et = vec![(table_name.to_string(), create_sql.to_string())];
 
         (w, p, et, chaotic)
+    } else if args.mode == "wal_stress" {
+        let w: Vec<(u32, Box<dyn Workload>)> = vec![
+            (30, Box::new(IntegrityCheckWorkload)),
+            (25, Box::new(WalCheckpointModeWorkload { mode: "TRUNCATE" })),
+            (25, Box::new(WalCheckpointModeWorkload { mode: "RESTART" })),
+            (10, Box::new(WalCheckpointModeWorkload { mode: "PASSIVE" })),
+            (8, Box::new(CreateSimpleTableWorkload)),
+            (8, Box::new(SimpleSelectWorkload)),
+            (12, Box::new(SimpleInsertWorkload)),
+            (45, Box::new(LargeSimpleInsertWorkload)),
+            (5, Box::new(UpdateWorkload)),
+            (5, Box::new(DeleteWorkload)),
+            (2, Box::new(CreateIndexWorkload)),
+            (2, Box::new(DropIndexWorkload)),
+            (15, Box::new(BeginWorkload)),
+            (20, Box::new(CommitWorkload)),
+            (3, Box::new(RollbackWorkload)),
+        ];
+
+        let p: Vec<Box<dyn Property>> = vec![
+            Box::new(IntegrityCheckProperty),
+            Box::new(SimpleKeysDoNotDisappear::new()),
+        ];
+
+        (w, p, vec![], vec![])
     } else {
         let w: Vec<(u32, Box<dyn Workload>)> = vec![
             (10, Box::new(IntegrityCheckWorkload)),
@@ -379,6 +405,7 @@ type BuildArtifacts = (WorkerWorkloads, PropertyList, TableSchemas, ChaosProfile
 fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
     let mut base_opts = match args.mode.as_str() {
         "fast" => WhopperOpts::fast(),
+        "wal_stress" => WhopperOpts::fast().with_max_steps(250_000),
         "chaos" => WhopperOpts::chaos(),
         "ragnarök" | "ragnarok" => WhopperOpts::ragnarok(),
         mode => return Err(anyhow::anyhow!("Unknown mode: {}", mode)),

@@ -1416,6 +1416,21 @@ impl ShmWalCoordination {
         Self::install_local_snapshot(&mut shared, snapshot, snapshot.page_size != 0);
     }
 
+    fn sync_local_from_authority_after_stale_disk_scan(
+        &self,
+        snapshot: SharedWalCoordinationHeader,
+    ) {
+        let mut shared = self.shared.write();
+        Self::install_local_snapshot(&mut shared, snapshot, snapshot.page_size != 0);
+        // The local frame cache still belongs to the disk scan we decided not
+        // to trust. Do not let a later same-process connection rebuild the
+        // authority from that stale cache after we adopt the authority snapshot.
+        shared
+            .metadata
+            .loaded_from_disk_scan
+            .store(false, Ordering::Release);
+    }
+
     fn sync_authority_from_local(&self) {
         self.authority
             .install_snapshot(self.local_authority_snapshot());
@@ -1425,6 +1440,10 @@ impl ShmWalCoordination {
         let mut shared = self.shared.write();
         Self::install_local_snapshot(&mut shared, snapshot, true);
         shared.metadata.initialized.store(false, Ordering::Release);
+        shared
+            .metadata
+            .loaded_from_disk_scan
+            .store(false, Ordering::Release);
         shared.runtime.frame_cache.lock().clear();
         shared.runtime.overflow_fallback_coverage.lock().clear();
     }
@@ -1468,11 +1487,11 @@ impl ShmWalCoordination {
         }
         if Self::local_scan_cannot_disprove_zero_frame_authority(authority_snapshot, local_snapshot)
         {
-            self.sync_local_from_authority(authority_snapshot);
+            self.sync_local_from_authority_after_stale_disk_scan(authority_snapshot);
             return;
         }
         if Self::local_scan_cannot_disprove_positive_authority(authority_snapshot, local_snapshot) {
-            self.sync_local_from_authority(authority_snapshot);
+            self.sync_local_from_authority_after_stale_disk_scan(authority_snapshot);
             return;
         }
         if Self::authority_matches_local_wal_scan(authority_snapshot, local_snapshot) {
@@ -1505,7 +1524,7 @@ impl ShmWalCoordination {
         // frame index — it is maintained by writers and must not be replaced
         // with a potentially incomplete reconstruction.
         if Self::authority_is_same_or_newer_generation(authority_snapshot, local_snapshot) {
-            self.sync_local_from_authority(authority_snapshot);
+            self.sync_local_from_authority_after_stale_disk_scan(authority_snapshot);
             if authority_snapshot.checkpoint_seq == local_snapshot.checkpoint_seq
                 && self.authority.frame_index_overflowed()
             {
@@ -7358,6 +7377,65 @@ pub mod test {
             .load(Ordering::Acquire));
         let reopened_coordination = ShmWalCoordination::new(reopened_shared, reopened_authority);
         assert_eq!(reopened_coordination.find_frame(7, 0, 1, None), Some(1));
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn test_shm_coordination_stale_disk_scan_adoption_does_not_clear_frame_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-stale-scan-adopt.db-wal");
+        let shm_path = dir.path().join("test-stale-scan-adopt.db-tshm");
+        let io = shared_wal_test_io();
+        let authoritative = write_test_wal_with_single_commit_frame(&io, &wal_path);
+
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        authority.install_snapshot(authoritative);
+        authority.record_frame(7, 1);
+        assert_eq!(authority.find_frame(7, 0, 1, None), Some(1));
+
+        let stale_file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let stale_shared = WalFileShared::new_shared(stale_file).unwrap();
+        {
+            let mut shared = stale_shared.write();
+            shared
+                .metadata
+                .loaded_from_disk_scan
+                .store(true, Ordering::Release);
+            shared.metadata.max_frame.store(0, Ordering::Release);
+            shared.metadata.nbackfills.store(0, Ordering::Release);
+            shared.metadata.last_checksum = (11, 13);
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = authoritative.page_size;
+            header.checkpoint_seq = authoritative.checkpoint_seq.wrapping_sub(1);
+            header.salt_1 = authoritative.salt_1.wrapping_sub(1);
+            header.salt_2 = authoritative.salt_2.wrapping_sub(1);
+            header.checksum_1 = 11;
+            header.checksum_2 = 13;
+        }
+
+        let first_coordination = ShmWalCoordination::new(stale_shared.clone(), authority.clone());
+        assert_eq!(first_coordination.load_snapshot().max_frame, 1);
+        assert!(
+            !stale_shared
+                .read()
+                .metadata
+                .loaded_from_disk_scan
+                .load(Ordering::Acquire),
+            "adopting a newer authority from a stale local scan must stop treating the empty local cache as a disk scan"
+        );
+        assert_eq!(authority.find_frame(7, 0, 1, None), Some(1));
+        drop(first_coordination);
+
+        let second_coordination = ShmWalCoordination::new(stale_shared, authority.clone());
+        assert_eq!(
+            second_coordination.find_frame(7, 0, 1, None),
+            Some(1),
+            "a second connection must not clear the authoritative frame index using the stale local cache"
+        );
+        assert_eq!(authority.iter_latest_frames(0, 1), vec![(7, 1)]);
     }
 
     #[cfg(host_shared_wal)]

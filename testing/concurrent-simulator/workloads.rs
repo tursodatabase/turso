@@ -146,6 +146,29 @@ impl Workload for SimpleInsertWorkload {
     }
 }
 
+/// Execute a larger INSERT into a random simple table to grow WAL frames quickly.
+pub struct LargeSimpleInsertWorkload;
+
+impl Workload for LargeSimpleInsertWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if ctx.sim_state.simple_tables.is_empty() {
+            return None;
+        }
+        let table_name = match ctx.sim_state.simple_tables.pick(rng) {
+            Some((name, _)) => name.clone(),
+            None => return None,
+        };
+        let key = format!("large_key_{}", rng.random_range(0..1_000_000));
+        let value_length = rng.random_range(32 * 1024..256 * 1024);
+
+        Some(Operation::SimpleInsert {
+            table_name,
+            key,
+            value_length,
+        })
+    }
+}
+
 /// Execute a SELECT query (works in both Idle and InTx states).
 pub struct SelectWorkload;
 
@@ -248,6 +271,22 @@ impl Workload for WalCheckpointWorkload {
             .expect("array is not empty");
         Some(Operation::WalCheckpoint {
             mode: mode.to_string(),
+        })
+    }
+}
+
+/// Run WAL checkpoint with a fixed mode.
+pub struct WalCheckpointModeWorkload {
+    pub mode: &'static str,
+}
+
+impl Workload for WalCheckpointModeWorkload {
+    fn generate(&self, ctx: &WorkloadContext, _rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if *ctx.fiber_state != FiberState::Idle {
+            return None;
+        }
+        Some(Operation::WalCheckpoint {
+            mode: self.mode.to_string(),
         })
     }
 }
