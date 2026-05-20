@@ -74,6 +74,8 @@ cfg_block = "0.1.1"
 fallible-iterator = { workspace = true }
 allocator-api2 = { workspace = true }
 hex = { workspace = true }
+icu_collator = "2.2.0"
+icu_locale = "2.2.0"
 thiserror = { workspace = true }
 regex = { workspace = true }
 regex-syntax = { workspace = true, default-features = false, features = [

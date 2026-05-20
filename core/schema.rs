@@ -4338,7 +4338,7 @@ pub struct Column {
     pub ty_params: Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
     generated_type: GeneratedType,
-    raw: u16,
+    raw: u32,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -4369,26 +4369,26 @@ pub enum GeneratedType {
 }
 
 // flags
-const F_PRIMARY_KEY: u16 = 1;
-const F_ROWID_ALIAS: u16 = 2;
-const F_NOTNULL: u16 = 4;
-const F_UNIQUE: u16 = 8;
-const F_HIDDEN: u16 = 16;
+const F_PRIMARY_KEY: u32 = 1;
+const F_ROWID_ALIAS: u32 = 2;
+const F_NOTNULL: u32 = 4;
+const F_UNIQUE: u32 = 8;
+const F_HIDDEN: u32 = 16;
 
 // pack Type and Collation in the remaining bits
-const TYPE_SHIFT: u16 = 5;
-const TYPE_MASK: u16 = 0b111 << TYPE_SHIFT;
-const COLL_SHIFT: u16 = TYPE_SHIFT + 3;
-const COLL_MASK: u16 = 0b11 << COLL_SHIFT;
+const TYPE_SHIFT: u32 = 5;
+const TYPE_MASK: u32 = 0b111 << TYPE_SHIFT;
+const COLL_SHIFT: u32 = TYPE_SHIFT + 3;
+const COLL_MASK: u32 = 0b1111_1111_1111 << COLL_SHIFT;
 
-// Bits 10-12: base type affinity override for custom type columns.
+// Bits 20-22: base type affinity override for custom type columns.
 // 0 = not set (use ty_str-based affinity), 1-5 = Affinity value + 1
-const BASE_AFF_SHIFT: u16 = COLL_SHIFT + 2;
-const BASE_AFF_MASK: u16 = 0b111 << BASE_AFF_SHIFT;
+const BASE_AFF_SHIFT: u32 = COLL_SHIFT + 12;
+const BASE_AFF_MASK: u32 = 0b111 << BASE_AFF_SHIFT;
 
-// Bits 13-15: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
-const ARRAY_DIM_SHIFT: u16 = 13;
-const ARRAY_DIM_MASK: u16 = 0b111 << ARRAY_DIM_SHIFT;
+// Bits 23-25: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
+const ARRAY_DIM_SHIFT: u32 = BASE_AFF_SHIFT + 3;
+const ARRAY_DIM_MASK: u32 = 0b111 << ARRAY_DIM_SHIFT;
 
 impl Column {
     pub fn affinity(&self) -> Affinity {
@@ -4411,7 +4411,7 @@ impl Column {
     /// This ensures affinity rules use the custom type's BASE type
     /// rather than applying SQLite name-based rules to the type name.
     pub fn set_base_affinity(&mut self, affinity: Affinity) {
-        let v: u16 = match affinity {
+        let v: u32 = match affinity {
             Affinity::Integer => 1,
             Affinity::Text => 2,
             Affinity::Blob => 3,
@@ -4474,10 +4474,10 @@ impl Column {
             }
             None => GeneratedType::NotGenerated,
         };
-        let mut raw = 0u16;
-        raw |= (ty as u16) << TYPE_SHIFT;
+        let mut raw = 0u32;
+        raw |= (ty as u32) << TYPE_SHIFT;
         if let Some(c) = col {
-            raw |= (c as u16) << COLL_SHIFT;
+            raw |= (u32::from(c.to_bits()) << COLL_SHIFT) & COLL_MASK;
         }
         if coldef.primary_key {
             raw |= F_PRIMARY_KEY
@@ -4513,7 +4513,7 @@ impl Column {
 
     #[inline]
     pub const fn set_ty(&mut self, ty: Type) {
-        self.raw = (self.raw & !TYPE_MASK) | (((ty as u16) << TYPE_SHIFT) & TYPE_MASK);
+        self.raw = (self.raw & !TYPE_MASK) | (((ty as u32) << TYPE_SHIFT) & TYPE_MASK);
     }
 
     #[inline]
@@ -4527,20 +4527,24 @@ impl Column {
 
     #[inline]
     pub const fn collation(&self) -> CollationSeq {
-        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u8;
-        CollationSeq::from_bits(v)
+        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u16;
+        if v == CollationSeq::Unset.to_bits() {
+            CollationSeq::Binary
+        } else {
+            CollationSeq::from_storage_bits(v)
+        }
     }
 
     #[inline]
     pub const fn has_explicit_collation(&self) -> bool {
-        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u8;
-        v != CollationSeq::Unset as u8
+        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u16;
+        v != CollationSeq::Unset.to_bits()
     }
 
     #[inline]
     pub const fn set_collation(&mut self, c: Option<CollationSeq>) {
         if let Some(c) = c {
-            self.raw = (self.raw & !COLL_MASK) | (((c as u16) << COLL_SHIFT) & COLL_MASK);
+            self.raw = (self.raw & !COLL_MASK) | (((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK);
         }
     }
 
@@ -4649,17 +4653,17 @@ impl Column {
     /// Number of array dimensions (0 = scalar, 1 = `[]`, 2 = `[][]`, etc.)
     #[inline]
     pub const fn array_dimensions(&self) -> u32 {
-        ((self.raw & ARRAY_DIM_MASK) >> ARRAY_DIM_SHIFT) as u32
+        (self.raw & ARRAY_DIM_MASK) >> ARRAY_DIM_SHIFT
     }
 
     #[inline]
     pub fn set_array_dimensions(&mut self, dims: u32) {
         assert!(dims <= 7, "array dimensions must be <= 7");
-        self.raw = (self.raw & !ARRAY_DIM_MASK) | ((dims as u16) << ARRAY_DIM_SHIFT);
+        self.raw = (self.raw & !ARRAY_DIM_MASK) | (dims << ARRAY_DIM_SHIFT);
     }
 
     #[inline]
-    const fn set_flag(&mut self, mask: u16, val: bool) {
+    const fn set_flag(&mut self, mask: u32, val: bool) {
         if val {
             self.raw |= mask
         } else {
@@ -5185,6 +5189,16 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         assert!(!table.has_rowid, "has_rowid should be set to false");
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_column_default_collation_is_effective_binary() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a TEXT);"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        let column = table.get_column("a").unwrap().1;
+        assert_eq!(column.collation(), CollationSeq::Binary);
+        assert_eq!(column.collation_opt(), None);
         Ok(())
     }
 
