@@ -284,6 +284,14 @@ impl Statement {
 
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
+            let conn = self.program.connection.clone();
+            // There is another statement running with write tx open. Let's not allow this statement
+            // from running because it could commit changes from other statement.
+            let has_write_tx = matches!(conn.get_tx_state(), TransactionState::Write { .. })
+                || matches!(conn.get_mv_tx(), Some((_, TransactionMode::Write)));
+            if has_write_tx && conn.n_active_root_statements.load(Ordering::SeqCst) > 0 {
+                return Err(LimboError::Busy);
+            }
             self.program
                 .connection
                 .n_active_root_statements
