@@ -3830,7 +3830,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let ty = match col_type {
                     Some(data_type) => {
                         let (ty, ei) = type_from_name(&data_type.name);
-                        typename_exactly_integer = ei;
+                        typename_exactly_integer = ei && ty_params.is_empty();
                         ty
                     }
                     None => Type::Null,
@@ -4057,6 +4057,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     }
 
     if has_autoincrement {
+        if !has_rowid {
+            crate::bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
+        }
+
         // only allow integers
         if primary_key_columns.len() != 1 {
             crate::bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
@@ -4070,7 +4074,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         });
 
         if let Some(col) = pk_col {
-            if col.ty() != Type::Integer {
+            if !col.is_rowid_alias() {
                 crate::bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
             }
         }

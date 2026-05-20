@@ -275,6 +275,36 @@ test autoinc-fail-on-non-integer-pk {
 expect error {
 }
 
+# Regression tests for https://github.com/tursodatabase/turso/issues/6940
+# AUTOINCREMENT is valid only on a true INTEGER PRIMARY KEY rowid alias.
+@cross-check-integrity
+test autoinc-fail-on-int-pk {
+    CREATE TABLE t(a INT PRIMARY KEY AUTOINCREMENT);
+}
+expect error {
+}
+
+@cross-check-integrity
+test autoinc-fail-on-bigint-pk {
+    CREATE TABLE t(a BIGINT PRIMARY KEY AUTOINCREMENT);
+}
+expect error {
+}
+
+@cross-check-integrity
+test autoinc-fail-on-sized-integer-pk {
+    CREATE TABLE t(a INTEGER(8) PRIMARY KEY AUTOINCREMENT);
+}
+expect error {
+}
+
+@cross-check-integrity
+test autoinc-fail-on-desc-integer-pk {
+    CREATE TABLE t(a INTEGER PRIMARY KEY DESC AUTOINCREMENT);
+}
+expect error {
+}
+
 # Test: An empty INSERT...SELECT does not damage the sequence table. (Ticket #3148)
 @cross-check-integrity
 test autoinc-empty-insert-select-is-safe {
