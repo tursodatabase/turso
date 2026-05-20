@@ -884,6 +884,14 @@ impl ProgramState {
         self.subprogram_stmt_cache.clear();
     }
 
+    /// Whether this statement owns the implicit autocommit transaction it is
+    /// about to finish, including re-entry while its commit is in progress.
+    #[inline]
+    pub(crate) fn owns_auto_txn(&self) -> bool {
+        self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+            || !matches!(self.commit_state, CommitState::Ready)
+    }
+
     #[inline]
     pub fn record_rows_read(&mut self, count: u64) {
         self.metrics.rows_read = self.metrics.rows_read.saturating_add(count);
@@ -2253,6 +2261,7 @@ impl Program {
         }
         // Errors from nested statements are handled by the parent statement.
         if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
+            let owns_auto_txn = state.owns_auto_txn();
             if err.is_some() && !pager.is_checkpointing() {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
@@ -2293,7 +2302,7 @@ impl Program {
                 // FK errors always behave like ABORT: rollback statement,
                 // rollback transaction in autocommit mode.
                 Some(LimboError::ForeignKeyConstraint(_)) => {
-                    if self.connection.get_auto_commit() {
+                    if owns_auto_txn {
                         self.rollback_current_txn(pager);
                     }
                     self.connection.set_changes_without_total(0);
@@ -2329,7 +2338,7 @@ impl Program {
                                     "Failed to release statement savepoint during abort",
                                 );
                             }
-                            if self.connection.get_auto_commit() {
+                            if owns_auto_txn {
                                 // Autocommit FAIL: commit partial changes.
                                 // This matches halt()'s FAIL+autocommit path.
                                 let mv_store = self.connection.mv_store();
@@ -2378,7 +2387,7 @@ impl Program {
                             }
                         }
                         _ => {
-                            if self.connection.get_auto_commit() {
+                            if owns_auto_txn {
                                 self.rollback_current_txn(pager);
                             }
                         }
@@ -2403,7 +2412,9 @@ impl Program {
                         self.rollback_current_txn(pager);
                     }
                     TxnCleanup::RollbackSavepoint => {
-                        if err.is_none() && !pager.is_checkpointing() {
+                        if owns_auto_txn {
+                            self.rollback_current_txn(pager);
+                        } else if err.is_none() && !pager.is_checkpointing() {
                             if let Err(end_stmt_err) = state.end_statement(
                                 &self.connection,
                                 pager,
@@ -2418,7 +2429,7 @@ impl Program {
                         }
                     }
                     TxnCleanup::None => {
-                        if err.is_some() {
+                        if owns_auto_txn || (!self.connection.get_auto_commit() && err.is_some()) {
                             self.rollback_current_txn(pager);
                         }
                     }
