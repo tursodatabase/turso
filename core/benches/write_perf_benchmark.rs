@@ -27,6 +27,23 @@ use turso_core::{Database, PlatformIO, StepResult};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(not(feature = "codspeed"))]
+macro_rules! iter_custom_or_iter {
+    ($b:expr, |$iters:ident| $body:block) => {
+        $b.iter_custom(|$iters| $body)
+    };
+}
+
+#[cfg(feature = "codspeed")]
+macro_rules! iter_custom_or_iter {
+    ($b:expr, |$iters:ident| $body:block) => {
+        $b.iter(|| {
+            let $iters = 1;
+            $body
+        })
+    };
+}
+
 /// Helper to execute a statement to completion
 fn run_to_completion(
     stmt: &mut turso_core::Statement,
@@ -148,7 +165,7 @@ fn bench_index_impact(criterion: &mut Criterion) {
         group.bench_function(BenchmarkId::new("limbo", name), |b| {
             let mut insert_stmt = conn.prepare(&values).unwrap();
             let mut delete_stmt = conn.query("DELETE FROM test").unwrap().unwrap();
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
@@ -170,7 +187,7 @@ fn bench_index_impact(criterion: &mut Criterion) {
 
             group.bench_function(BenchmarkId::new("sqlite", name), |b| {
                 let mut stmt = sqlite_conn.prepare(&values).unwrap();
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
@@ -227,7 +244,7 @@ fn bench_transaction_size(criterion: &mut Criterion) {
             let mut insert_stmt = conn.prepare(&values).unwrap();
             let mut delete_stmt = conn.query("DELETE FROM test").unwrap().unwrap();
 
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
@@ -255,7 +272,7 @@ fn bench_transaction_size(criterion: &mut Criterion) {
             );
 
             group.bench_function(BenchmarkId::new("sqlite", format!("{tx_size}_rows")), |b| {
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
@@ -328,7 +345,7 @@ fn bench_key_pattern(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo", "sequential_keys"), |b| {
         let mut stmt = conn.prepare(&seq_values).unwrap();
         let mut delete_stmt = conn.query("DELETE FROM test").unwrap().unwrap();
-        b.iter_custom(|iters| {
+        iter_custom_or_iter!(b, |iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
                 let start = std::time::Instant::now();
@@ -353,7 +370,7 @@ fn bench_key_pattern(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo", "random_keys"), |b| {
         let mut stmt = conn.prepare(&rand_values).unwrap();
         let mut delete_stmt = conn.query("DELETE FROM test").unwrap().unwrap();
-        b.iter_custom(|iters| {
+        iter_custom_or_iter!(b, |iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
                 let start = std::time::Instant::now();
@@ -377,7 +394,7 @@ fn bench_key_pattern(criterion: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("sqlite", "sequential_keys"), |b| {
             let mut stmt = sqlite_conn.prepare(&seq_values).unwrap();
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
@@ -398,7 +415,7 @@ fn bench_key_pattern(criterion: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("sqlite", "random_keys"), |b| {
             let mut stmt = sqlite_conn.prepare(&rand_values).unwrap();
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
@@ -531,7 +548,7 @@ fn bench_delete_performance(criterion: &mut Criterion) {
     let conn = db.connect().unwrap();
 
     group.bench_function(BenchmarkId::new("limbo", "range_delete"), |b| {
-        b.iter_custom(|iters| {
+        iter_custom_or_iter!(b, |iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
                 // Re-insert data
@@ -561,7 +578,7 @@ fn bench_delete_performance(criterion: &mut Criterion) {
         );
 
         group.bench_function(BenchmarkId::new("sqlite", "range_delete"), |b| {
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     // Re-insert data
@@ -624,7 +641,7 @@ fn bench_large_transaction_commit(criterion: &mut Criterion) {
         group.bench_function(
             BenchmarkId::new("limbo", format!("{row_count}_rows")),
             |b| {
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         // BEGIN
@@ -661,7 +678,7 @@ fn bench_large_transaction_commit(criterion: &mut Criterion) {
             group.bench_function(
                 BenchmarkId::new("sqlite", format!("{row_count}_rows")),
                 |b| {
-                    b.iter_custom(|iters| {
+                    iter_custom_or_iter!(b, |iters| {
                         let mut total = std::time::Duration::ZERO;
                         for _ in 0..iters {
                             sqlite_conn.execute("BEGIN", []).unwrap();
@@ -715,7 +732,7 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo", "sync_FULL"), |b| {
         let mut insert_stmt = conn.prepare(&values).unwrap();
         let mut delete_stmt = conn.query("DELETE FROM test").unwrap().unwrap();
-        b.iter_custom(|iters| {
+        iter_custom_or_iter!(b, |iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
                 let start = std::time::Instant::now();
@@ -741,7 +758,7 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo", "sync_OFF"), |b| {
         let mut insert_stmt = conn.prepare(&values).unwrap();
         let mut delete_stmt = conn.query("DELETE FROM test").unwrap().unwrap();
-        b.iter_custom(|iters| {
+        iter_custom_or_iter!(b, |iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
                 let start = std::time::Instant::now();
@@ -765,7 +782,7 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("sqlite", "sync_FULL"), |b| {
             let mut stmt = sqlite_conn.prepare(&values).unwrap();
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
@@ -796,7 +813,7 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("sqlite", "sync_OFF"), |b| {
             let mut stmt = sqlite_conn.prepare(&values).unwrap();
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
