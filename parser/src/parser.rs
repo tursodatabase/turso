@@ -3669,14 +3669,15 @@ impl<'a> Parser<'a> {
         let typ = match self.peek()? {
             Some(tok) => match tok.token_type.fallback_id_if_ok() {
                 TK_ID => {
-                    let tok = eat_assert!(self, TK_ID);
                     let s = from_bytes(tok.as_bytes());
                     if s.eq_ignore_ascii_case("STORED") {
+                        eat_assert!(self, TK_ID);
                         Some(GeneratedColumnType::Stored)
                     } else if s.eq_ignore_ascii_case("VIRTUAL") {
+                        eat_assert!(self, TK_ID);
                         Some(GeneratedColumnType::Virtual)
                     } else {
-                        None
+                        return Err(Error::Custom(format!("unknown generated column type: {s}")));
                     }
                 }
                 _ => None,
@@ -3693,6 +3694,8 @@ impl<'a> Parser<'a> {
     ) -> Result<Vec<NamedColumnConstraint>> {
         let mut result = vec![];
         let mut has_primary_key = false;
+        let mut has_default = false;
+        let mut has_generated = false;
 
         loop {
             let name = match self.peek()? {
@@ -3749,6 +3752,12 @@ impl<'a> Parser<'a> {
             match self.peek()? {
                 Some(tok) => match tok.token_type {
                     TK_DEFAULT => {
+                        if has_generated {
+                            return Err(Error::Custom(
+                                "generated columns cannot have a DEFAULT value".to_owned(),
+                            ));
+                        }
+                        has_default = true;
                         result.push(NamedColumnConstraint {
                             name,
                             constraint: self.parse_default_column_constraint()?,
@@ -3813,6 +3822,17 @@ impl<'a> Parser<'a> {
                         });
                     }
                     TK_GENERATED | TK_AS => {
+                        if has_generated {
+                            return Err(Error::Custom(
+                                "multiple generated column clauses on a single column".to_owned(),
+                            ));
+                        }
+                        if has_default {
+                            return Err(Error::Custom(
+                                "generated columns cannot have a DEFAULT value".to_owned(),
+                            ));
+                        }
+                        has_generated = true;
                         result.push(NamedColumnConstraint {
                             name,
                             constraint: self.parse_generated_column_constraint()?,
