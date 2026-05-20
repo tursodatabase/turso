@@ -356,6 +356,10 @@ pub struct Row {
 pub enum TxnCleanup {
     None,
     RollbackTxn,
+    /// begin_statement was called and statement is participating in an interactive transaction.
+    /// If statement is abandoned and/or dropped without an apparent error, we should rollback statement
+    /// to previous savepoint.
+    RollbackSavepoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2394,11 +2398,31 @@ impl Program {
                         "RaiseIgnore should be caught by op_program, not reach abort"
                     );
                 }
-                _ => {
-                    if state.auto_txn_cleanup != TxnCleanup::None || err.is_some() {
+                _ => match state.auto_txn_cleanup {
+                    TxnCleanup::RollbackTxn => {
                         self.rollback_current_txn(pager);
                     }
-                }
+                    TxnCleanup::RollbackSavepoint => {
+                        if err.is_none() && !pager.is_checkpointing() {
+                            if let Err(end_stmt_err) = state.end_statement(
+                                &self.connection,
+                                pager,
+                                EndStatement::RollbackSavepoint,
+                            ) {
+                                capture_abort_error(
+                                    &mut abort_error,
+                                    end_stmt_err,
+                                    "Failed to rollback statement savepoint during abort",
+                                );
+                            }
+                        }
+                    }
+                    TxnCleanup::None => {
+                        if err.is_some() {
+                            self.rollback_current_txn(pager);
+                        }
+                    }
+                },
             }
         }
         if state.uses_subjournal {
