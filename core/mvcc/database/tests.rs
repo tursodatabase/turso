@@ -5507,6 +5507,83 @@ fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     rows
 }
 
+/// Any ddl specially CREATE INDEX must cause SchemaUpdated errors on ongoing INSERTS because
+/// we shouldn't commit an insert without inserting rows to this new index that is being created.
+/// Here we test that case by injecting in the middle of CREATE INDEX's commit and then doing a
+/// regular concurrent insert that will not take into account new index.
+#[test]
+fn test_insert_in_middle_commit_of_create_index_returns_err() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let setup = db.connect();
+        setup
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c INTEGER)")
+            .unwrap();
+        setup.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        setup.close().unwrap();
+    }
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    // T1 (conn_a): CREATE INDEX, yielding at `LogRecordPrepared` — the
+    // point in the commit pipeline where `end_ts` has been assigned and the
+    // log record is built, but the global header and
+    // `last_committed_schema_change_ts` haven't been published yet.
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    let mut create_idx = conn_a.prepare("CREATE INDEX i ON t(c)").unwrap();
+    let mut yielded = false;
+    for _ in 0..200 {
+        match create_idx.step().unwrap() {
+            StepResult::IO => {
+                yielded = true;
+                break;
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert!(
+        yielded,
+        "CREATE INDEX should yield at CommitYieldPoint::LogRecordPrepared"
+    );
+
+    // T2 (conn_b): start a new tx now — its begin_ts will be > T1's end_ts,
+    // but the global schema view still doesn't know about the new index `i`.
+    // The INSERT compiles its bytecode against the stale schema and emits
+    // IdxInsert ops only for the indexes the stale schema knows about.
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+
+    // T1 finishes finalizing the CREATE INDEX. After this point, the global
+    // header carries the new schema_cookie and `last_committed_schema_change_ts`
+    // is bumped to T1's `end_ts`.
+    create_idx.run_ignore_rows().unwrap();
+    drop(create_idx);
+
+    // T2 commits. The schema-conflict check at `CommitState::Initial` compares
+    // `last_committed_schema_change_ts (= T1.end_ts) > tx_b.begin_ts (> T1.end_ts)`
+    // which is FALSE — so no conflict is raised and T2 commits cleanly, even
+    // though its writes never touched the new index.
+
+    let commit_result = conn_b.execute("COMMIT");
+
+    assert!(
+        matches!(
+            commit_result,
+            Err(LimboError::SchemaConflict | LimboError::SchemaUpdated)
+        ),
+        "BUG: tx_b's COMMIT returned {commit_result:?} but should have been \
+         aborted with SchemaConflict/SchemaUpdated. tx_b began with a stale \
+         schema (missing index `i`), so its INSERT silently skipped writing \
+         to that index. Allowing the commit leaves `i` permanently short the \
+         row tx_b wrote."
+    );
+}
+
 /// What this test checks: MVCC transaction visibility and conflict handling follow the intended isolation behavior.
 /// Why this matters: Concurrency bugs are correctness bugs: they create anomalies users can observe as wrong query results.
 #[test]
