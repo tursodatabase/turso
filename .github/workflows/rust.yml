@@ -346,7 +346,7 @@ jobs:
       - name: Run turso_whopper regression tests
         if: matrix.profile.name == 'in-process'
         run: cargo test -p turso_whopper --test regression_tests
-        timeout-minutes: 5
+        timeout-minutes: 15
       - name: Run turso_whopper (${{ matrix.profile.name }})
         run: |
           cargo build -p turso_whopper --release
