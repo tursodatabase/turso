@@ -1972,7 +1972,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@tursodatabase/database-common@npm:^0.7.0-pre.1, @tursodatabase/database-common@workspace:packages/common":
+"@tursodatabase/database-common@npm:^0.7.0-pre.2, @tursodatabase/database-common@workspace:packages/common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/database-common@workspace:packages/common"
   dependencies:
@@ -1981,7 +1981,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/database-wasm-common@npm:^0.7.0-pre.1, @tursodatabase/database-wasm-common@workspace:packages/wasm-common":
+"@tursodatabase/database-wasm-common@npm:^0.7.0-pre.2, @tursodatabase/database-wasm-common@workspace:packages/wasm-common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/database-wasm-common@workspace:packages/wasm-common"
   dependencies:
@@ -1997,8 +1997,8 @@ __metadata:
   resolution: "@tursodatabase/database-wasm@workspace:packages/wasm"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.7.0-pre.1"
-    "@tursodatabase/database-wasm-common": "npm:^0.7.0-pre.1"
+    "@tursodatabase/database-common": "npm:^0.7.0-pre.2"
+    "@tursodatabase/database-wasm-common": "npm:^0.7.0-pre.2"
     "@vitest/browser": "npm:^3.2.4"
     playwright: "npm:^1.55.0"
     typescript: "npm:^5.9.2"
@@ -2012,7 +2012,7 @@ __metadata:
   resolution: "@tursodatabase/database@workspace:packages/native"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.7.0-pre.1"
+    "@tursodatabase/database-common": "npm:^0.7.0-pre.2"
     "@types/node": "npm:^24.3.1"
     better-sqlite3: "npm:^12.2.0"
     drizzle-kit: "npm:^0.31.4"
@@ -2029,11 +2029,11 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@tursodatabase/sync-common@npm:^0.7.0-pre.1, @tursodatabase/sync-common@workspace:sync/packages/common":
+"@tursodatabase/sync-common@npm:^0.7.0-pre.2, @tursodatabase/sync-common@workspace:sync/packages/common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/sync-common@workspace:sync/packages/common"
   dependencies:
-    "@tursodatabase/database-common": "npm:^0.7.0-pre.1"
+    "@tursodatabase/database-common": "npm:^0.7.0-pre.2"
     "@tursodatabase/serverless": "npm:^0.2.2"
     "@types/node": "npm:^24.12.2"
     typescript: "npm:^5.9.2"
@@ -2045,9 +2045,9 @@ __metadata:
   resolution: "@tursodatabase/sync-wasm@workspace:sync/packages/wasm"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.7.0-pre.1"
-    "@tursodatabase/database-wasm-common": "npm:^0.7.0-pre.1"
-    "@tursodatabase/sync-common": "npm:^0.7.0-pre.1"
+    "@tursodatabase/database-common": "npm:^0.7.0-pre.2"
+    "@tursodatabase/database-wasm-common": "npm:^0.7.0-pre.2"
+    "@tursodatabase/sync-common": "npm:^0.7.0-pre.2"
     "@vitest/browser": "npm:^3.2.4"
     playwright: "npm:^1.57.0"
     typescript: "npm:^5.9.2"
@@ -2061,8 +2061,8 @@ __metadata:
   resolution: "@tursodatabase/sync@workspace:sync/packages/native"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.7.0-pre.1"
-    "@tursodatabase/sync-common": "npm:^0.7.0-pre.1"
+    "@tursodatabase/database-common": "npm:^0.7.0-pre.2"
+    "@tursodatabase/sync-common": "npm:^0.7.0-pre.2"
     "@types/node": "npm:^24.12.2"
     typescript: "npm:^5.9.2"
     vitest: "npm:^3.2.4"
@@ -3312,7 +3312,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"nanoid@npm:^3.3.11":
+"nanoid@npm:^3.3.12":
   version: 3.3.12
   resolution: "nanoid@npm:3.3.12"
   bin:
@@ -3455,13 +3455,13 @@ __metadata:
   linkType: hard
 
 "postcss@npm:^8.5.6":
-  version: 8.5.14
-  resolution: "postcss@npm:8.5.14"
+  version: 8.5.15
+  resolution: "postcss@npm:8.5.15"
   dependencies:
-    nanoid: "npm:^3.3.11"
+    nanoid: "npm:^3.3.12"
     picocolors: "npm:^1.1.1"
     source-map-js: "npm:^1.2.1"
-  checksum: 10c0/48138207cf5ef5581be1bfe2cb65ccfe0ac75e43888ba045afc8ed6043d7b56aeb3b9a9fe5b353ff554be943cd0cc15d826ccb991525159175971e5ee8ab0237
+  checksum: 10c0/7f2e63ae22fbe43aace1bf652bd99da4e90737c64194d49e51ddc9cd0f9e51ff2861a7d734379b494deffa03a880a5c65eec70bc29ee9ebaa7136dde3eee8f31
   languageName: node
   linkType: hard
 
@@ -3897,8 +3897,8 @@ __metadata:
   linkType: hard
 
 "tsx@npm:^4.21.0":
-  version: 4.22.0
-  resolution: "tsx@npm:4.22.0"
+  version: 4.22.3
+  resolution: "tsx@npm:4.22.3"
   dependencies:
     esbuild: "npm:~0.28.0"
     fsevents: "npm:~2.3.3"
@@ -3907,7 +3907,7 @@ __metadata:
       optional: true
   bin:
     tsx: dist/cli.mjs
-  checksum: 10c0/cc7474ac13eebf6bb4d87ce21bdd79213261a37a6e247a74d7920b3e0ce7b704b42e7642e7978e2f3de5762981b3b74ed0ae14cf60934107aa0b1390f25e46ba
+  checksum: 10c0/09a5a7d354ff75e5af6285217d709ec80a46c2ee19e0d9b5c5d00eab81047c3ea6b2a5498a2c5255f3960d6e7acd1a1eee34b9433dc56fb32907ca3b38271f41
   languageName: node
   linkType: hard
 
