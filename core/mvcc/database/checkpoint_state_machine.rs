@@ -16,7 +16,7 @@ use crate::storage::wal::{CheckpointMode, TursoRwLock, WalAutoActions};
 use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
-use crate::types::{IOCompletions, IOResult, ImmutableRecord};
+use crate::types::{IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef};
 use crate::{turso_assert, turso_assert_eq};
 use crate::{
     CheckpointResult, Completion, Connection, IOExt, LimboError, Numeric, Pager, Result, SyncMode,
@@ -229,7 +229,7 @@ fn sqlite_schema_btree_identity(version: &RowVersion) -> Option<SqliteSchemaBtre
         return None;
     }
 
-    let row_data = ImmutableRecord::from_bin_record(version.row.payload().to_vec());
+    let row_data = ImmutableRecordRef::from_bin_record(version.row.payload());
     let Ok((col0, col3)) = row_data.get_two_values(0, 3) else {
         return None;
     };
@@ -1288,8 +1288,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                     "row version not found in write set".to_string(),
                                 )
                             })?;
-                        let record =
-                            ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
+                        let record = ImmutableRecordRef::from_bin_record(row_version.row.payload());
 
                         let mut values = record.get_values_owned()?;
                         values[3] = Value::from_i64(root_page as i64);
@@ -1323,8 +1322,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                     "row version not found in write set".to_string(),
                                 )
                             })?;
-                        let record =
-                            ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
+                        let record = ImmutableRecordRef::from_bin_record(row_version.row.payload());
                         let mut values = record.get_values_owned()?;
                         values[3] = Value::from_i64(root_page as i64);
                         let record = ImmutableRecord::from_values(&values, values.len());

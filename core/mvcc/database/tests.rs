@@ -19,6 +19,7 @@ use crate::storage::sqlite3_ondisk::{
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
+use crate::types::ImmutableRecordRef;
 use crate::vdbe::execute::TransactionYieldPoint;
 use crate::{
     Buffer, Completion, DatabaseOpts, EncryptionKey, LimboError, OpenFlags, StatementStatusCounter,
@@ -775,7 +776,7 @@ fn tamper_db_metadata_row_value(db_path: &str, metadata_root_page: u32, new_valu
     let mut page = read_db_page(db_path, metadata_root_page, page_size);
     let loc = table_leaf_first_cell_loc(&page, metadata_root_page);
     let payload = &page[loc.payload_offset..loc.payload_offset + loc.payload_len];
-    let record = ImmutableRecord::from_bin_record(payload.to_vec());
+    let record = ImmutableRecordRef::from_bin_record(payload);
     let key = record
         .get_value_opt(0)
         .expect("metadata key column missing");
@@ -804,7 +805,7 @@ fn tamper_db_metadata_row_value_by_key(
     let mut updated = false;
     for loc in table_leaf_cell_locs(&page, metadata_root_page) {
         let payload = &page[loc.payload_offset..loc.payload_offset + loc.payload_len];
-        let record = ImmutableRecord::from_bin_record(payload.to_vec());
+        let record = ImmutableRecordRef::from_bin_record(payload);
         let key = record
             .get_value_opt(0)
             .expect("metadata key column missing");
@@ -847,7 +848,7 @@ fn tamper_db_metadata_row_key(db_path: &str, metadata_root_page: u32, new_key: &
     let mut page = read_db_page(db_path, metadata_root_page, page_size);
     let loc = table_leaf_first_cell_loc(&page, metadata_root_page);
     let payload = &page[loc.payload_offset..loc.payload_offset + loc.payload_len];
-    let record = ImmutableRecord::from_bin_record(payload.to_vec());
+    let record = ImmutableRecordRef::from_bin_record(payload);
     let value = record
         .get_value_opt(1)
         .expect("metadata value column missing");

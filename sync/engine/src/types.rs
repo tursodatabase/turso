@@ -582,8 +582,10 @@ pub enum SyncEngineIoResult {
     IO,
 }
 
-pub fn parse_bin_record(bin_record: Vec<u8>) -> Result<Vec<turso_core::Value>> {
-    match turso_core::types::ImmutableRecord::from_bin_record(bin_record).get_values_owned() {
+pub fn parse_bin_record(bin_record: impl AsRef<[u8]>) -> Result<Vec<turso_core::Value>> {
+    match turso_core::types::ImmutableRecordRef::from_bin_record(bin_record.as_ref())
+        .get_values_owned()
+    {
         Ok(values) => Ok(values),
         Err(err) => Err(Error::DatabaseTapeError(format!(
             "unable to parse bin record: {err}"
