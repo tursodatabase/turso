@@ -6545,6 +6545,70 @@ fn test_integrity_check_after_drop_index_before_checkpoint() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+#[test]
+fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
+    let io = Arc::new(MemoryIO::new());
+    let path = ":memory:interrupted-drop-table-schema-rollback";
+    let db = Database::open_file(io.clone(), path).unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+    conn.execute("CREATE TABLE repro_target(c0 INTEGER, c1 REAL)")
+        .unwrap();
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_repro_target_c0 \
+         ON repro_target (c0) WHERE c1 IS NULL",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let target_schema_rows = get_rows(
+        &conn,
+        "SELECT type, name FROM sqlite_schema \
+         WHERE tbl_name = 'repro_target' ORDER BY rowid",
+    );
+    assert_eq!(target_schema_rows.len(), 2);
+    assert_eq!(target_schema_rows[0][0].to_string(), "table");
+    assert_eq!(target_schema_rows[0][1].to_string(), "repro_target");
+    assert_eq!(target_schema_rows[1][0].to_string(), "index");
+    assert_eq!(target_schema_rows[1][1].to_string(), "idx_repro_target_c0");
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CursorYieldPoint::NextStart.point()
+    ])));
+
+    let mut drop_stmt = conn.prepare("DROP TABLE repro_target").unwrap();
+    match drop_stmt.step().unwrap() {
+        crate::StepResult::IO => {}
+        other => panic!("expected injected IO yield while dropping repro_target; got {other:?}"),
+    }
+    conn.set_yield_injector(None);
+
+    let rows = get_rows(&conn, "SELECT 1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "1");
+
+    drop(drop_stmt);
+    drop(conn);
+    drop(db);
+
+    // Reopening used to fail here because the same-connection SELECT could
+    // commit the interrupted DROP TABLE's partial sqlite_schema delete.
+    let db = Database::open_file(io, path).unwrap();
+    let conn = db.connect().unwrap();
+    let target_schema_rows = get_rows(
+        &conn,
+        "SELECT type, name FROM sqlite_schema \
+         WHERE tbl_name = 'repro_target' ORDER BY rowid",
+    );
+    assert_eq!(target_schema_rows.len(), 2);
+    assert_eq!(target_schema_rows[0][0].to_string(), "table");
+    assert_eq!(target_schema_rows[0][1].to_string(), "repro_target");
+    assert_eq!(target_schema_rows[1][0].to_string(), "index");
+    assert_eq!(target_schema_rows[1][1].to_string(), "idx_repro_target_c0");
+}
+
 /// What this test checks: Rollback/savepoint behavior restores exactly the intended state when statements or transactions fail.
 /// Why this matters: Partial rollback mistakes leave data in impossible intermediate states.
 #[test]
