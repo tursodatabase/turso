@@ -639,6 +639,18 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             }
                         }
                     }
+                } else {
+                    let is_payloadless_schema_tombstone = key.table_id
+                        == SQLITE_SCHEMA_MVCC_TABLE_ID
+                        && is_delete
+                        && !version.btree_resident
+                        && version.row.payload().is_empty();
+                    if is_payloadless_schema_tombstone {
+                        // Recovery can synthesize an empty sqlite_schema tombstone for a
+                        // row that was created and deleted before any checkpoint. There is
+                        // no schema identity to track and no pager row to delete.
+                        skip_write = true;
+                    }
                 }
                 if !skip_write {
                     tracing::trace!("adding to write_set {:?}", (&version, &special_write));
@@ -1905,6 +1917,43 @@ mod tests {
 
         assert_eq!(sqlite_schema_btree_identity(&tombstone), None);
         assert!(!is_schema_metadata_only_rewrite(&tombstone, None));
+    }
+
+    #[test]
+    fn checkpoint_skips_payloadless_nonresident_schema_tombstone() {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        let mvstore = db.get_mvcc_store();
+        let pager = conn.pager.load().clone();
+        let mut checkpoint = CheckpointStateMachine::new(
+            pager,
+            mvstore.clone(),
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+        );
+        checkpoint.durable_txid_max_old = std::num::NonZeroU64::new(7_000);
+        checkpoint.durable_txid_max_new = 7_421;
+
+        let row_id = RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(377));
+        let row_version = RowVersion {
+            id: 260,
+            begin: None,
+            end: Some(TxTimestampOrID::Timestamp(7_421)),
+            row: Row::new_table_row(row_id.clone(), Vec::new(), 0),
+            btree_resident: false,
+        };
+        let versions = mvstore
+            .rows
+            .get_or_insert_with(row_id, || Arc::new(RwLock::new(Vec::new())));
+        mvstore.insert_version_raw(&mut versions.value().write(), row_version);
+
+        checkpoint.collect_committed_table_row_versions();
+
+        assert!(
+            checkpoint.write_set.is_empty(),
+            "payloadless nonresident sqlite_schema tombstones have no pager row to delete"
+        );
     }
 
     fn index_row_version(
