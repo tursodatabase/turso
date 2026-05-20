@@ -3500,6 +3500,10 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
             bail_parse_error!("bind parameters prohibited in generated columns");
         }
 
+        Expr::Raise(_, _) => {
+            bail_parse_error!("RAISE() may only be used within a trigger-program");
+        }
+
         Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_) | Expr::InTable { .. } => {
             bail_parse_error!("subqueries prohibited in generated columns");
         }

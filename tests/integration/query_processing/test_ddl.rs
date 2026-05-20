@@ -1,4 +1,5 @@
 use crate::common::{ExecRows, TempDatabase};
+use turso_core::DatabaseOpts;
 
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
 fn test_fail_drop_indexed_column(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -213,6 +214,40 @@ fn test_create_table_without_rowid_rejects_autoincrement(
             .contains("AUTOINCREMENT is not allowed on WITHOUT ROWID tables"),
         "Expected error message about AUTOINCREMENT"
     );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_generated_column_rejects_raise_at_schema_creation(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    let db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_generated_columns(true))
+        .build();
+    let conn = db.connect_limbo();
+
+    for sql in [
+        "CREATE TABLE t(a, b AS (RAISE(IGNORE)))",
+        "CREATE TABLE t(a, b AS (CASE WHEN a IS NULL THEN RAISE(ABORT, 'bad') ELSE a END))",
+    ] {
+        let err = conn
+            .execute(sql)
+            .expect_err("RAISE() is only valid in trigger programs");
+        assert!(
+            err.to_string().contains("RAISE()"),
+            "unexpected error: {err}"
+        );
+    }
+
+    let rows: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 't'");
+    assert!(
+        rows.is_empty(),
+        "invalid generated column schema should not be persisted"
+    );
+
     Ok(())
 }
 
