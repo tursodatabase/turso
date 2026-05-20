@@ -185,36 +185,58 @@ pub struct Resolver<'a> {
 struct SelfTableScope {
     context: SelfTableContext,
     affinities: Option<Arc<[Affinity]>>,
+    collations: Option<Arc<[Option<CollationSeq>]>>,
 }
 
 impl SelfTableScope {
     fn new(context: SelfTableContext) -> Self {
-        let affinities = match &context {
-            SelfTableContext::ForDML { table, .. } => Some(
-                table
-                    .columns()
-                    .iter()
-                    .map(|c| c.affinity_with_strict(table.is_strict))
-                    .collect(),
+        let (affinities, collations) = match &context {
+            SelfTableContext::ForDML { table, .. } => (
+                Some(
+                    table
+                        .columns()
+                        .iter()
+                        .map(|c| c.affinity_with_strict(table.is_strict))
+                        .collect(),
+                ),
+                Some(table.columns().iter().map(|c| c.collation_opt()).collect()),
             ),
             SelfTableContext::ForSelect {
                 table_ref_id,
                 referenced_tables,
-            } => referenced_tables
-                .find_table_by_internal_id(*table_ref_id)
-                .and_then(|(_, table_ref)| table_ref.btree())
-                .map(|btree| {
-                    btree
-                        .columns()
-                        .iter()
-                        .map(|c| c.affinity_with_strict(btree.is_strict))
-                        .collect()
-                }),
+            } => {
+                let Some((_, table_ref)) =
+                    referenced_tables.find_table_by_internal_id(*table_ref_id)
+                else {
+                    return Self {
+                        context,
+                        affinities: None,
+                        collations: None,
+                    };
+                };
+                (
+                    table_ref.btree().map(|btree| {
+                        btree
+                            .columns()
+                            .iter()
+                            .map(|c| c.affinity_with_strict(btree.is_strict))
+                            .collect()
+                    }),
+                    Some(
+                        table_ref
+                            .columns()
+                            .iter()
+                            .map(|c| c.collation_opt())
+                            .collect(),
+                    ),
+                )
+            }
         };
 
         Self {
             context,
             affinities,
+            collations,
         }
     }
 
@@ -222,6 +244,12 @@ impl SelfTableScope {
         self.affinities
             .as_ref()
             .and_then(|affinities| affinities.get(column).copied())
+    }
+
+    fn collation_opt(&self, column: usize) -> Option<CollationSeq> {
+        self.collations
+            .as_ref()
+            .and_then(|collations| collations.get(column).copied().flatten())
     }
 
     fn column_type_str(&self, column: usize) -> Option<String> {
@@ -373,11 +401,22 @@ impl<'a> Resolver<'a> {
         f(ctx.as_ref())
     }
 
+    pub(crate) fn has_self_table_context(&self) -> bool {
+        self.self_table_scope.borrow().is_some()
+    }
+
     pub(crate) fn self_table_affinity(&self, column: usize) -> Option<Affinity> {
         self.self_table_scope
             .borrow()
             .as_ref()
             .and_then(|scope| scope.affinity(column))
+    }
+
+    pub(crate) fn self_table_collation_opt(&self, column: usize) -> Option<CollationSeq> {
+        self.self_table_scope
+            .borrow()
+            .as_ref()
+            .and_then(|scope| scope.collation_opt(column))
     }
 
     pub(crate) fn self_table_column_type_str(&self, column: usize) -> Option<String> {

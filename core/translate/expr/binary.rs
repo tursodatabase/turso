@@ -422,7 +422,7 @@ pub(super) fn row_component_affinity_collation(
     let rhs_for_cmp = row_value_component_expr(rhs_expr, idx)?.unwrap_or(rhs_expr);
     Ok((
         comparison_affinity(lhs_for_cmp, rhs_for_cmp, referenced_tables, resolver),
-        comparison_collation(lhs_for_cmp, rhs_for_cmp, referenced_tables)?,
+        comparison_collation(lhs_for_cmp, rhs_for_cmp, referenced_tables, resolver)?,
     ))
 }
 
@@ -444,20 +444,46 @@ pub(super) fn comparison_collation(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
+    resolver: Option<&Resolver>,
 ) -> Result<Option<CollationSeq>> {
     if let Some(tables) = referenced_tables {
-        let lhs_collation = get_collseq_from_expr(lhs_expr, tables)?;
-        if lhs_collation.is_some() {
-            return Ok(lhs_collation);
-        }
-        return get_collseq_from_expr(rhs_expr, tables);
+        return resolve_comparison_collseq_opt(lhs_expr, rhs_expr, tables, resolver);
     }
 
     let lhs_collation = explicit_collation(lhs_expr)?;
     if lhs_collation.is_some() {
         return Ok(lhs_collation);
     }
-    explicit_collation(rhs_expr)
+    let rhs_collation = explicit_collation(rhs_expr)?;
+    if rhs_collation.is_some() {
+        return Ok(rhs_collation);
+    }
+
+    let lhs_collation = self_table_collation(lhs_expr, resolver)?;
+    if lhs_collation.is_some() {
+        return Ok(lhs_collation);
+    }
+    self_table_collation(rhs_expr, resolver)
+}
+
+fn self_table_collation(expr: &Expr, resolver: Option<&Resolver>) -> Result<Option<CollationSeq>> {
+    let Some(resolver) = resolver.filter(|r| r.has_self_table_context()) else {
+        return Ok(None);
+    };
+    let mut found = None;
+    walk_expr(expr, &mut |e| -> Result<WalkControl> {
+        match e {
+            Expr::Collate(_, _) => Ok(WalkControl::SkipChildren),
+            Expr::Column { table, column, .. } if table.is_self_table() => {
+                if found.is_none() {
+                    found = resolver.self_table_collation_opt(*column);
+                }
+                Ok(WalkControl::Continue)
+            }
+            _ => Ok(WalkControl::Continue),
+        }
+    })?;
+    Ok(found)
 }
 
 #[allow(clippy::too_many_arguments)]

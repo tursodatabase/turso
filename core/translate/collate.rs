@@ -4,6 +4,7 @@ use turso_parser::ast::Expr;
 
 use crate::{
     translate::{
+        emitter::Resolver,
         expr::{walk_expr, WalkControl},
         plan::TableReferences,
     },
@@ -98,7 +99,7 @@ pub fn get_collseq_from_expr(
     top_expr: &Expr,
     referenced_tables: &TableReferences,
 ) -> Result<Option<CollationSeq>> {
-    let (explicit, column) = get_collseq_parts_from_expr(top_expr, referenced_tables)?;
+    let (explicit, column) = get_collseq_parts_from_expr(top_expr, referenced_tables, None)?;
     Ok(explicit.or(column))
 }
 
@@ -162,13 +163,23 @@ pub fn resolve_comparison_collseq(
     rhs_expr: &Expr,
     referenced_tables: &TableReferences,
 ) -> Result<CollationSeq> {
-    let (lhs_explicit, lhs_column) = get_collseq_parts_from_expr(lhs_expr, referenced_tables)?;
-    let (rhs_explicit, rhs_column) = get_collseq_parts_from_expr(rhs_expr, referenced_tables)?;
-    Ok(lhs_explicit
-        .or(rhs_explicit)
-        .or(lhs_column)
-        .or(rhs_column)
-        .unwrap_or(CollationSeq::Binary))
+    Ok(
+        resolve_comparison_collseq_opt(lhs_expr, rhs_expr, referenced_tables, None)?
+            .unwrap_or(CollationSeq::Binary),
+    )
+}
+
+pub fn resolve_comparison_collseq_opt(
+    lhs_expr: &Expr,
+    rhs_expr: &Expr,
+    referenced_tables: &TableReferences,
+    resolver: Option<&Resolver>,
+) -> Result<Option<CollationSeq>> {
+    let (lhs_explicit, lhs_column) =
+        get_collseq_parts_from_expr(lhs_expr, referenced_tables, resolver)?;
+    let (rhs_explicit, rhs_column) =
+        get_collseq_parts_from_expr(rhs_expr, referenced_tables, resolver)?;
+    Ok(lhs_explicit.or(rhs_explicit).or(lhs_column).or(rhs_column))
 }
 
 /// Returns (explicit_collation, column_collation) from a single expression.
@@ -178,6 +189,7 @@ pub fn resolve_comparison_collseq(
 fn get_collseq_parts_from_expr(
     top_expr: &Expr,
     referenced_tables: &TableReferences,
+    resolver: Option<&Resolver>,
 ) -> Result<(Option<CollationSeq>, Option<CollationSeq>)> {
     let mut maybe_column_collseq = None;
     let mut maybe_explicit_collseq = None;
@@ -194,6 +206,17 @@ fn get_collseq_parts_from_expr(
                 return Ok(WalkControl::SkipChildren);
             }
             Expr::Column { table, column, .. } => {
+                if table.is_self_table() {
+                    if resolver.is_some_and(|r| r.has_self_table_context()) {
+                        if maybe_column_collseq.is_none() {
+                            maybe_column_collseq =
+                                resolver.and_then(|r| r.self_table_collation_opt(*column));
+                        }
+                        return Ok(WalkControl::Continue);
+                    } else {
+                        return Err(crate::LimboError::ParseError("table not found".to_string()));
+                    }
+                }
                 let (_, table_ref) = referenced_tables
                     .find_table_by_internal_id(*table)
                     .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
@@ -206,6 +229,13 @@ fn get_collseq_parts_from_expr(
                 return Ok(WalkControl::Continue);
             }
             Expr::RowId { table, .. } => {
+                if table.is_self_table() {
+                    if resolver.is_some_and(|r| r.has_self_table_context()) {
+                        return Ok(WalkControl::Continue);
+                    } else {
+                        return Err(crate::LimboError::ParseError("table not found".to_string()));
+                    }
+                }
                 let (_, table_ref) = referenced_tables
                     .find_table_by_internal_id(*table)
                     .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;

@@ -249,3 +249,26 @@ fn test_prepared_stmt_reprepare_ddl_change_txn(tmp_db: TempDatabase) -> anyhow::
 
     Ok(())
 }
+
+#[test]
+fn test_generated_column_row_value_resolves_columns() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE t(
+            a TEXT COLLATE NOCASE,
+            b AS ((a, 1) < ('B', 2)),
+            c AS ((a, 1) = ('B' COLLATE BINARY, 1))
+        )",
+    )?;
+    conn.execute("INSERT INTO t(a) VALUES ('b'), ('c')")?;
+
+    let rows: Vec<(String, i64, i64)> = conn.exec_rows("SELECT a, b, c FROM t ORDER BY rowid");
+    assert_eq!(rows, vec![("b".to_string(), 1, 0), ("c".to_string(), 0, 0)]);
+
+    Ok(())
+}
