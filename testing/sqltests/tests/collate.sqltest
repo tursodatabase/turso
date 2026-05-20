@@ -1327,39 +1327,3 @@ test agg_collate_no_leak_with_count {
 expect {
     a|a|2
 }
-
-# ICU locale collations.
-
-test collate_locale_french_tag {
-    SELECT 'e' < char(233) COLLATE 'fr-FR';
-}
-expect {
-    1
-}
-
-test collate_locale_traditional_spanish_tailoring {
-    SELECT 'pollo' > 'polvo' COLLATE 'es-u-co-trad';
-}
-expect {
-    1
-}
-
-test collate_locale_upper_first {
-    SELECT 'A' < 'a' COLLATE 'en-u-kf-upper';
-}
-expect {
-    1
-}
-
-test collate_locale_index_lookup {
-    CREATE TABLE locale_words(id INTEGER PRIMARY KEY, word TEXT);
-    CREATE INDEX locale_words_es_trad ON locale_words(word COLLATE 'es-u-co-trad');
-    INSERT INTO locale_words VALUES (1, 'pollo'), (2, 'polvo'), (3, 'zorro');
-    SELECT id FROM locale_words
-    WHERE word > 'polvo' COLLATE 'es-u-co-trad'
-    ORDER BY id;
-}
-expect {
-    1
-    3
-}

@@ -4653,13 +4653,13 @@ impl Column {
     /// Number of array dimensions (0 = scalar, 1 = `[]`, 2 = `[][]`, etc.)
     #[inline]
     pub const fn array_dimensions(&self) -> u32 {
-        ((self.raw & ARRAY_DIM_MASK) >> ARRAY_DIM_SHIFT) as u32
+        (self.raw & ARRAY_DIM_MASK) >> ARRAY_DIM_SHIFT
     }
 
     #[inline]
     pub fn set_array_dimensions(&mut self, dims: u32) {
         assert!(dims <= 7, "array dimensions must be <= 7");
-        self.raw = (self.raw & !ARRAY_DIM_MASK) | ((dims as u32) << ARRAY_DIM_SHIFT);
+        self.raw = (self.raw & !ARRAY_DIM_MASK) | (dims << ARRAY_DIM_SHIFT);
     }
 
     #[inline]
