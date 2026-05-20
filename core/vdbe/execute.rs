@@ -3790,6 +3790,9 @@ pub fn op_transaction_inner(
                         .n_active_writes
                         .fetch_add(1, Ordering::SeqCst);
                     state.is_active_write = true;
+                    if state.has_stmt_transaction {
+                        state.auto_txn_cleanup = TxnCleanup::RollbackSavepoint;
+                    }
                 }
                 state.pc += 1;
                 state.active_op_state.clear();
