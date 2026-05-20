@@ -686,9 +686,9 @@ where
                             .iter()
                             .find(|t| &t.name == final_name)
                         {
-                            assert!(
-                                txn_table.columns.len() > committed.columns.len(),
-                                "Transaction table should have more columns than committed table"
+                            debug_assert!(
+                                txn_table.columns.len() >= committed.columns.len(),
+                                "unexpected column shrink while applying AddColumn operation"
                             );
                         }
                         committed.columns.push(column.clone());
@@ -719,9 +719,9 @@ where
                             .iter()
                             .find(|t| &t.name == final_name)
                         {
-                            assert!(
-                                txn_table.columns.len() < committed.columns.len(),
-                                "Transaction table should have fewer columns than committed table"
+                            debug_assert!(
+                                txn_table.columns.len() <= committed.columns.len(),
+                                "unexpected column growth while applying DropColumn operation"
                             );
                         }
                         let old_col_count = committed.columns.len();
@@ -896,6 +896,58 @@ mod tests {
             .expect("outer transaction should remain open")
             .expect_snaphot();
         assert!(snapshot.savepoints.is_empty());
+    }
+
+    #[test]
+    fn apply_snapshot_add_column_does_not_panic_when_snapshot_width_matches_committed() {
+        let base_col = sql_generation::model::table::Column {
+            name: "id".to_string(),
+            column_type: sql_generation::model::table::ColumnType::Integer,
+            constraints: vec![],
+        };
+        let second_col = sql_generation::model::table::Column {
+            name: "name".to_string(),
+            column_type: sql_generation::model::table::ColumnType::Text,
+            constraints: vec![],
+        };
+        let added_col = sql_generation::model::table::Column {
+            name: "extra".to_string(),
+            column_type: sql_generation::model::table::ColumnType::Text,
+            constraints: vec![],
+        };
+
+        let mut commited_tables = vec![Table {
+            name: "t".to_string(),
+            columns: vec![base_col.clone(), second_col.clone()],
+            rows: vec![vec![SimValue::NULL, SimValue::NULL]],
+            indexes: vec![],
+        }];
+
+        let snapshot = Snapshot {
+            current_tables: vec![Table {
+                name: "t".to_string(),
+                // Simulates the stale-width condition from issue #4589 where current_tables
+                // can temporarily match committed width even though an AddColumn op exists.
+                columns: vec![base_col, second_col],
+                rows: vec![],
+                indexes: vec![],
+            }],
+            operations: vec![TxOperation::AddColumn {
+                table_name: "t".to_string(),
+                column: added_col,
+            }],
+            savepoints: vec![],
+            transaction_mode: TransactionMode::Write,
+        };
+        let mut transaction_tables = Some(TransactionTables::Snapshot(snapshot));
+
+        {
+            let mut tables = shadow_tables_mut(&mut commited_tables, &mut transaction_tables);
+            tables.apply_snapshot();
+        }
+
+        assert_eq!(commited_tables[0].columns.len(), 3);
+        assert_eq!(commited_tables[0].rows[0].len(), 3);
     }
 }
 
