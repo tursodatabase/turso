@@ -951,14 +951,18 @@ fn query_pragma(
             }
 
             // External (extension) functions
-            for (name, is_agg, argc) in connection.get_syms_functions() {
+            for (name, is_agg, argc, deterministic) in connection.get_syms_functions() {
                 let func_type = if is_agg { "a" } else { "s" };
+                let mut flags = 0;
+                if deterministic {
+                    flags |= SQLITE_DETERMINISTIC;
+                }
                 program.emit_string8(name, base_reg);
                 program.emit_int(0, base_reg + 1); // builtin = 0
                 program.emit_string8(func_type.to_string(), base_reg + 2);
                 program.emit_string8("utf8".to_string(), base_reg + 3);
                 program.emit_int(argc as i64, base_reg + 4);
-                program.emit_int(0, base_reg + 5); // flags = 0 for extensions
+                program.emit_int(flags, base_reg + 5);
                 program.emit_result_row(base_reg, 6);
             }
 

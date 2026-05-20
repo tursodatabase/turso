@@ -8194,6 +8194,36 @@ pub fn op_function(
                     }
                 }
             }
+            ExtFunc::ContextScalar {
+                context,
+                callback,
+                value_destructor,
+                ..
+            } => {
+                let mut ext_values = Vec::with_capacity(arg_count);
+                if arg_count != 0 {
+                    let register_slice = &state.registers[*start_reg..*start_reg + arg_count];
+                    for ov in register_slice.iter() {
+                        ext_values.push(ov.get_value().to_ffi());
+                    }
+                }
+
+                let argv_ptr = if ext_values.is_empty() {
+                    std::ptr::null()
+                } else {
+                    ext_values.as_ptr()
+                };
+                let mut result = crate::function::ContextValue::null();
+                unsafe { callback(context, arg_count as i32, argv_ptr, &mut result) };
+                let value = result.into_value();
+                if let Some(value_destructor) = value_destructor {
+                    unsafe { value_destructor(&mut result) };
+                }
+                for ext_value in ext_values {
+                    unsafe { ext_value.__free_internal_type() };
+                }
+                state.registers[*dest].set_value(value?);
+            }
             _ => unreachable!("aggregate called in scalar context"),
         },
         crate::function::Func::Math(math_func) => match math_func.arity() {

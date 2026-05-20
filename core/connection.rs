@@ -2911,21 +2911,64 @@ impl Connection {
         self.syms.read().vtab_modules.keys().cloned().collect()
     }
 
-    /// Returns external (extension) functions: (name, is_aggregate, argc)
-    pub fn get_syms_functions(&self) -> Vec<(String, bool, i32)> {
+    /// Returns external (extension) functions: (name, is_aggregate, argc, deterministic)
+    pub fn get_syms_functions(&self) -> Vec<(String, bool, i32, bool)> {
         self.syms
             .read()
             .functions
             .values()
             .map(|f| {
-                let is_agg = matches!(f.func, function::ExtFunc::Aggregate { .. });
+                let is_agg = f.func.is_aggregate();
                 let argc = match &f.func {
                     function::ExtFunc::Aggregate { argc, .. } => *argc as i32,
+                    function::ExtFunc::ContextScalar { argc, .. } => *argc,
                     function::ExtFunc::Scalar(_) => -1,
                 };
-                (f.name.clone(), is_agg, argc)
+                (
+                    f.name.clone(),
+                    is_agg,
+                    argc,
+                    function::Deterministic::is_deterministic(f.as_ref()),
+                )
             })
             .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_scalar_function(
+        &self,
+        name: String,
+        argc: i32,
+        deterministic: bool,
+        context: usize,
+        callback: crate::ContextScalarFunction,
+        context_destructor: Option<crate::ContextDestructor>,
+        value_destructor: Option<crate::ContextValueDestructor>,
+    ) {
+        assert!(
+            argc >= -1,
+            "managed scalar argument count must be -1 (variadic) or non-negative"
+        );
+        let normalized_name = crate::util::normalize_ident(&name);
+        self.syms.write().functions.insert(
+            normalized_name.clone(),
+            Arc::new(function::ExternalFunc::new_context_scalar(
+                normalized_name,
+                argc,
+                deterministic,
+                context,
+                callback,
+                context_destructor,
+                value_destructor,
+            )),
+        );
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn unregister_external_function(&self, name: &str) {
+        let normalized_name = crate::util::normalize_ident(name);
+        self.syms.write().functions.remove(&normalized_name);
+        self.bump_prepare_context_generation();
     }
 
     pub(crate) fn database_ptr(&self) -> usize {
@@ -3438,9 +3481,17 @@ impl SymbolTable {
     pub fn resolve_function(
         &self,
         name: &str,
-        _arg_count: usize,
+        arg_count: usize,
     ) -> Option<Arc<function::ExternalFunc>> {
-        self.functions.get(name).cloned()
+        self.functions
+            .get(name)
+            .cloned()
+            .or_else(|| {
+                self.functions
+                    .get(&crate::util::normalize_ident(name))
+                    .cloned()
+            })
+            .filter(|func| func.func.matches_arg_count(arg_count))
     }
 
     pub fn extend(&mut self, other: &SymbolTable) {
