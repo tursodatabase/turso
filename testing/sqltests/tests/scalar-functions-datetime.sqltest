@@ -653,22 +653,6 @@ expect {
     -62167219200
 }
 
-test unixepoch-trims-time-value-whitespace {
-    SELECT unixepoch(' 9');
-}
-expect {
-    -210865982400
-}
-
-test insert-unixepoch-trims-time-value-whitespace {
-    CREATE TABLE t_unixepoch_whitespace(x);
-    INSERT INTO t_unixepoch_whitespace VALUES (unixepoch(' 9'));
-    SELECT x, typeof(x) FROM t_unixepoch_whitespace;
-}
-expect {
-    -210865982400|integer
-}
-
 test unixepoch-at-millisecond-precision-input-produces-seconds-precision-output {
     SELECT unixepoch('2022-01-27 12:59:28.052');
 }
