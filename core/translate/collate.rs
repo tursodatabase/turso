@@ -1,7 +1,7 @@
 use std::{cmp::Ordering, str::FromStr as _};
 
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
-use icu_locid::Locale;
+use icu_locale::Locale;
 use turso_parser::ast::Expr;
 
 use crate::{
