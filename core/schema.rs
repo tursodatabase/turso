@@ -4528,7 +4528,11 @@ impl Column {
     #[inline]
     pub const fn collation(&self) -> CollationSeq {
         let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u16;
-        CollationSeq::from_storage_bits(v)
+        if v == CollationSeq::Unset.to_bits() {
+            CollationSeq::Binary
+        } else {
+            CollationSeq::from_storage_bits(v)
+        }
     }
 
     #[inline]
@@ -5185,6 +5189,16 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         assert!(!table.has_rowid, "has_rowid should be set to false");
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_column_default_collation_is_effective_binary() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a TEXT);"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        let column = table.get_column("a").unwrap().1;
+        assert_eq!(column.collation(), CollationSeq::Binary);
+        assert_eq!(column.collation_opt(), None);
         Ok(())
     }
 
