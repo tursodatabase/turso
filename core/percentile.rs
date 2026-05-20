@@ -1,7 +1,13 @@
-use turso_ext::{register_extension, AggFunc, AggregateDerive, Value};
+use turso_ext::{AggFunc, AggregateDerive, ExtensionApi, Value};
 
-register_extension! {
-    aggregates: { Median, Percentile, PercentileCont, PercentileDisc, StandardDeviation }
+pub fn register_extension(ext_api: &mut ExtensionApi) {
+    unsafe {
+        Median::register_Median(ext_api);
+        Percentile::register_Percentile(ext_api);
+        PercentileCont::register_PercentileCont(ext_api);
+        PercentileDisc::register_PercentileDisc(ext_api);
+        StandardDeviation::register_StandardDeviation(ext_api);
+    }
 }
 
 #[derive(AggregateDerive)]
