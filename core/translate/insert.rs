@@ -753,6 +753,11 @@ pub fn translate_insert(
         }
     }
 
+    // NOT NULL default substitution for REPLACE has to run before generated
+    // columns and CHECK constraints. A generated column may depend on a base
+    // column whose explicit NULL is replaced by its DEFAULT.
+    emit_notnull_replace_defaults(program, &ctx, &insertion, resolver)?;
+
     // Make computed virtual columns accessible to CHECK and NOT NULL constraint evaluation
     if insertion.has_virtual_columns() {
         //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
@@ -835,9 +840,9 @@ pub fn translate_insert(
         connection,
         table_references: &mut table_references,
     };
-    // NOT NULL default substitution must happen before index key registers are
-    // copied in preflight constraint checks. Otherwise the index entry gets NULL
-    // while the table row gets the default value, causing integrity_check failures.
+    // NOT NULL handling must happen before index key registers are copied in
+    // preflight constraint checks. Defaults for REPLACE were substituted above
+    // so generated columns and CHECK constraints saw the defaulted row image.
     emit_notnulls(program, &ctx, &insertion, resolver)?;
 
     // Populate register-to-affinity map so partial index WHERE clauses get
@@ -1723,14 +1728,7 @@ fn emit_notnulls(
 
         // Compute effective conflict for this NOT NULL constraint:
         // Statement-level OR clause overrides; otherwise use column's clause.
-        let effective = if ctx.statement_on_conflict.is_some() {
-            ctx.on_conflict
-        } else {
-            column_mapping
-                .column
-                .notnull_conflict_clause
-                .unwrap_or(ResolveType::Abort)
-        };
+        let effective = notnull_effective_conflict(ctx, column_mapping);
         let on_replace = matches!(effective, ResolveType::Replace);
         let on_ignore = matches!(effective, ResolveType::Ignore);
 
@@ -1822,6 +1820,61 @@ fn emit_notnulls(
         }
     }
     Ok(())
+}
+
+fn emit_notnull_replace_defaults(
+    program: &mut ProgramBuilder,
+    ctx: &InsertEmitCtx,
+    insertion: &Insertion,
+    resolver: &Resolver,
+) -> Result<()> {
+    for column_mapping in insertion
+        .col_mappings
+        .iter()
+        .filter(|column_mapping| column_mapping.column.notnull())
+    {
+        if column_mapping.column.is_rowid_alias() {
+            continue;
+        }
+
+        if !matches!(
+            notnull_effective_conflict(ctx, column_mapping),
+            ResolveType::Replace
+        ) {
+            continue;
+        }
+        let Some(default_expr) = column_mapping.column.default.as_ref() else {
+            continue;
+        };
+
+        let skip_label = program.allocate_label();
+        program.emit_insn(Insn::NotNull {
+            reg: column_mapping.register,
+            target_pc: skip_label,
+        });
+        translate_expr_no_constant_opt(
+            program,
+            None,
+            default_expr,
+            column_mapping.register,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+        program.preassign_label_to_next_insn(skip_label);
+    }
+
+    Ok(())
+}
+
+fn notnull_effective_conflict(ctx: &InsertEmitCtx, column_mapping: &ColMapping<'_>) -> ResolveType {
+    if ctx.statement_on_conflict.is_some() {
+        ctx.on_conflict
+    } else {
+        column_mapping
+            .column
+            .notnull_conflict_clause
+            .unwrap_or(ResolveType::Abort)
+    }
 }
 
 struct BoundInsertResult {

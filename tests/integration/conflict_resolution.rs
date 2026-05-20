@@ -2298,6 +2298,76 @@ fn test_ddl_mixed_replace_abort_insert(tmp_db: TempDatabase) -> anyhow::Result<(
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_replace_recomputes_generated_columns_after_defaults(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    let limbo_db = TempDatabase::builder()
+        .with_db_name("generated_column_replace_defaults.db")
+        .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    let sqlite_conn = rusqlite::Connection::open_in_memory()?;
+
+    let setup = [
+        "CREATE TABLE t(a NOT NULL DEFAULT 5, b AS(a+1) UNIQUE)",
+        "INSERT INTO t(a) VALUES(5)",
+    ];
+    for sql in setup {
+        limbo_conn.execute(sql)?;
+        sqlite_conn.execute(sql, params![])?;
+    }
+
+    let replace = "REPLACE INTO t(a) VALUES(NULL) RETURNING a,b";
+    let limbo_returning = limbo_exec_rows(&limbo_conn, replace);
+    let sqlite_returning = sqlite_exec_rows(&sqlite_conn, replace);
+    assert_eq!(
+        limbo_returning, sqlite_returning,
+        "RETURNING should expose generated columns after NOT NULL defaults are applied"
+    );
+
+    let verify = "SELECT rowid,a,b FROM t ORDER BY rowid";
+    let limbo_rows = limbo_exec_rows(&limbo_conn, verify);
+    let sqlite_rows = sqlite_exec_rows(&sqlite_conn, verify);
+    assert_eq!(
+        limbo_rows, sqlite_rows,
+        "stored row should match SQLite after REPLACE applies defaults"
+    );
+
+    let indexed_verify = "SELECT rowid FROM t WHERE b = 6 ORDER BY rowid";
+    let limbo_indexed = limbo_exec_rows(&limbo_conn, indexed_verify);
+    let sqlite_indexed = sqlite_exec_rows(&sqlite_conn, indexed_verify);
+    assert_eq!(
+        limbo_indexed, sqlite_indexed,
+        "generated-column UNIQUE index should use the defaulted value"
+    );
+
+    let check_setup = "CREATE TABLE u(a NOT NULL DEFAULT 5, b AS(a+1) CHECK(b=7))";
+    limbo_conn.execute(check_setup)?;
+    sqlite_conn.execute(check_setup, params![])?;
+
+    let check_replace = "REPLACE INTO u(a) VALUES(NULL)";
+    let limbo_check = limbo_try_exec(&limbo_conn, check_replace);
+    let sqlite_check = sqlite_try_exec(&sqlite_conn, check_replace);
+    assert_eq!(
+        limbo_check.is_err(),
+        sqlite_check.is_err(),
+        "CHECK should evaluate generated columns after NOT NULL defaults are applied"
+    );
+
+    let verify_check = "SELECT a,b FROM u";
+    let limbo_check_rows = limbo_exec_rows(&limbo_conn, verify_check);
+    let sqlite_check_rows = sqlite_exec_rows(&sqlite_conn, verify_check);
+    assert_eq!(
+        limbo_check_rows, sqlite_check_rows,
+        "failed CHECK should leave the generated-column table unchanged"
+    );
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // FK violations during UPDATE — stmt_journal rollback correctness
 // ---------------------------------------------------------------------------
