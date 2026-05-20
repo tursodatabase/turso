@@ -257,18 +257,62 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
     });
 }
 
+fn normalize_partial_index_predicate(expr: &ast::Expr, table: &Table) -> ast::Expr {
+    let table_name = normalize_ident(table.get_name());
+    let mut expr = expr.clone();
+    let _ = walk_expr_mut(
+        &mut expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            match e {
+                ast::Expr::Qualified(t, c) if normalize_ident(t.as_str()) == table_name => {
+                    *e = ast::Expr::Id(c.clone());
+                    Ok(WalkControl::SkipChildren)
+                }
+                ast::Expr::DoublyQualified(_, t, c)
+                    if normalize_ident(t.as_str()) == table_name =>
+                {
+                    *e = ast::Expr::Id(c.clone());
+                    Ok(WalkControl::SkipChildren)
+                }
+                _ => Ok(WalkControl::Continue),
+            }
+        },
+    );
+    expr
+}
+
+fn upsert_target_where_matches_index(
+    target: &ast::UpsertIndex,
+    index: &Index,
+    table: &Table,
+) -> bool {
+    match index.where_clause.as_deref() {
+        None => true,
+        Some(index_where) => target.where_clause.as_deref().is_some_and(|target_where| {
+            exprs_are_equivalent(target_where, index_where)
+                || exprs_are_equivalent(
+                    &normalize_partial_index_predicate(target_where, table),
+                    &normalize_partial_index_predicate(index_where, table),
+                )
+        }),
+    }
+}
+
 /// Match ON CONFLICT target to a UNIQUE index, *ignoring order* but requiring
 /// exact coverage (same column multiset). If the target specifies a COLLATED
 /// column, the collation must match the index column's effective collation.
 /// If the target omits collation, any index collation is accepted.
-/// Partial (WHERE) indexes never match.
+/// Partial (WHERE) indexes match only when the target has the same predicate.
 pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bool {
     let Some(target) = upsert.index.as_ref() else {
         return true;
     };
-    // must be a non-partial UNIQUE index with identical arity
-    if !index.unique || index.where_clause.is_some() || target.targets.len() != index.columns.len()
-    {
+    // must be a UNIQUE index with identical arity and matching partial predicate
+    if !index.unique || target.targets.len() != index.columns.len() {
+        return false;
+    }
+
+    if !upsert_target_where_matches_index(target, index, table) {
         return false;
     }
 

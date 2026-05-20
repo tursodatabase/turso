@@ -924,6 +924,74 @@ pub fn upsert_conflict(limbo: TempDatabase) {
 }
 
 #[turso_macros::test]
+pub fn upsert_partial_unique_index_target(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute(
+        "CREATE TABLE t (
+            a TEXT,
+            b TEXT,
+            deleted INTEGER DEFAULT 0
+        )",
+    )
+    .unwrap();
+    conn.execute("CREATE UNIQUE INDEX t_ab_live ON t(a, b) WHERE deleted = 0")
+        .unwrap();
+    conn.execute("INSERT INTO t(a, b, deleted) VALUES ('a', 'b', 0)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO t(a, b, deleted)
+         VALUES ('a', 'b', 0)
+         ON CONFLICT(a, b) WHERE deleted = 0
+         DO UPDATE SET b = excluded.b",
+    )
+    .unwrap();
+
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT a, b, deleted FROM t"),
+        vec![vec![
+            RValue::Text("a".to_string()),
+            RValue::Text("b".to_string()),
+            RValue::Integer(0),
+        ]]
+    );
+
+    conn.execute(
+        "INSERT INTO t(a, b, deleted)
+         VALUES ('a', 'b', 0)
+         ON CONFLICT(a, b) WHERE t.deleted = 0
+         DO UPDATE SET b = excluded.b",
+    )
+    .unwrap();
+
+    let err = conn.execute(
+        "INSERT INTO t(a, b, deleted)
+         VALUES ('a', 'b', 0)
+         ON CONFLICT(a, b) WHERE deleted = 1
+         DO UPDATE SET b = excluded.b",
+    );
+    assert!(err.is_err(), "mismatched partial-index target must fail");
+}
+
+#[turso_macros::test]
+pub fn upsert_conflict_target_where_matches_nonpartial_unique_index(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(a INT UNIQUE, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
+    conn.execute(
+        "INSERT INTO t VALUES (1, 'new')
+         ON CONFLICT(a) WHERE a = 2
+         DO UPDATE SET v = excluded.v",
+    )
+    .unwrap();
+
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT a, v FROM t"),
+        vec![vec![RValue::Integer(1), RValue::Text("new".to_string())]]
+    );
+}
+
+#[turso_macros::test]
 pub fn insert_returning_qualified_quoted_table(limbo: TempDatabase) {
     // Regression: qualified column refs in RETURNING (e.g. "users"."id")
     // failed with `no such table: users` when the table was created with
