@@ -473,7 +473,16 @@ pub fn join_lhs_and_rhs<'a>(
             // Eligibility gate: prefer nested-loop when uses a selective probe seek.
             // Probe->build chaining is only allowed when the
             // build input is materialized from the join prefix.
-            let allow_hash_join = !rhs_has_selective_seek
+            //
+            // A FULL OUTER JOIN can only run as a hash join (the unmatched-build
+            // scan has no nested-loop form), so a selective probe seek must not
+            // disable it. A rowid/PRIMARY KEY join column always has such a seek,
+            // which otherwise leaves the join with no plan.
+            let rhs_is_full_outer = rhs_table_reference
+                .join_info
+                .as_ref()
+                .is_some_and(|ji| ji.is_full_outer());
+            let allow_hash_join = (!rhs_has_selective_seek || rhs_is_full_outer)
                 && !probe_table_is_prior_build
                 && (!build_has_prior_constraints || build_has_rowid)
                 && !chaining_across_outer;

@@ -229,6 +229,25 @@ expect {
     2|y||
 }
 
+# Regression: FULL OUTER JOIN on rowid-alias (INTEGER PRIMARY KEY) columns. The
+# probe side has a selective rowid seek available, which previously disabled the
+# hash join and left the FULL OUTER JOIN with no plan, wrongly rejecting it as
+# "requires an equality condition in the ON clause".
+@cross-check-integrity
+test full-outer-join-primary-key {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, b);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (2, 'a'), (4, 'b');
+    SELECT t1.id, t1.b, t2.id, t2.d FROM t1 FULL OUTER JOIN t2 ON t1.id = t2.id ORDER BY coalesce(t1.id, t2.id);
+}
+expect {
+    1|x||
+    2|y|2|a
+    3|z||
+    ||4|b
+}
+
 @cross-check-integrity
 test full-outer-join-count {
     CREATE TABLE t1(a, b);
