@@ -81,7 +81,7 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
             ValueRef::Text(text) => {
                 let collation = collations.get(idx).unwrap_or(&CollationSeq::Binary);
                 hasher.write_u8(TEXT_HASH);
-                match collation {
+                match *collation {
                     CollationSeq::NoCase => {
                         hash_text_nocase(&mut hasher, text.as_str());
                     }
@@ -94,6 +94,11 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
                     }
                     CollationSeq::Locale(_) => {
                         hasher.write(&collation.hash_key(text.as_str()));
+                    }
+                    CollationSeq::Custom(_) => {
+                        unreachable!(
+                            "custom collations are rejected before hash table construction"
+                        )
                     }
                 }
             }
@@ -1042,6 +1047,17 @@ enum ParseChunkResult {
 impl HashTable {
     /// Create a new hash table.
     pub fn new(config: HashTableConfig, io: Arc<dyn IO>) -> Result<Self> {
+        if config
+            .collations
+            .iter()
+            .any(|collation| collation.is_custom())
+        {
+            // Custom collation equality is a connection-owned callback. Hash tables do
+            // not carry connection context, so hash/equality cannot be made consistent here.
+            return Err(LimboError::InternalError(
+                "custom collations are not supported by hash tables".to_string(),
+            ));
+        }
         let num_buckets = config.initial_buckets;
         let buckets = (0..num_buckets).map(|_| HashBucket::new()).try_collect()?;
         let matched_bits = if config.track_matched {
@@ -3268,6 +3284,22 @@ mod hashtests {
     use crate::alloc::vec;
     use crate::io::Buffer;
     use crate::MemoryIO;
+
+    #[test]
+    fn test_hash_table_rejects_custom_collations() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            collations: vec![CollationSeq::custom("hash_table_custom")],
+            ..Default::default()
+        };
+        let err = match HashTable::new(config, io) {
+            Ok(_) => panic!("custom-collated hash table should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("custom collations are not supported by hash tables"));
+    }
 
     #[test]
     fn test_hash_function_consistency() {

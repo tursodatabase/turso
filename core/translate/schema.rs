@@ -752,6 +752,14 @@ fn validate(
                             translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone());
                         validate_default_expr(&expr, col_i)?
                     }
+                    ast::ColumnConstraint::Collate { collation_name } => {
+                        let collation = resolver.resolve_collation(collation_name.as_str())?;
+                        if collation.is_custom() {
+                            bail_parse_error!(
+                                "custom collations are not supported in schema definitions"
+                            );
+                        }
+                    }
                     _ => {}
                 }
             }

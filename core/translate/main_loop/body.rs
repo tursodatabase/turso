@@ -251,7 +251,12 @@ fn emit_loop_source<'a>(
                     None
                 };
 
-                emit_collseq_if_needed(program, &plan.table_references, &min_max.argument);
+                emit_collseq_if_needed(
+                    program,
+                    &plan.table_references,
+                    &min_max.argument,
+                    &t_ctx.resolver,
+                );
                 let comparator = custom_type_comparator(
                     &min_max.argument,
                     &plan.table_references,

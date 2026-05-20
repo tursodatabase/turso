@@ -7,7 +7,7 @@ use crate::{
     emit_explain,
     schema::{Index, IndexColumn, PseudoCursorType, Schema},
     translate::{
-        collate::{get_collseq_from_expr, CollationSeq},
+        collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         group_by::is_orderby_agg_or_const,
         plan::Aggregate,
     },
@@ -204,7 +204,11 @@ impl EmitOrderBy {
             let mut index_columns =
                 Vec::try_with_capacity_ext(order_by.len() + result_columns.len())?;
             for (column, order, _nulls) in order_by {
-                let collation = get_collseq_from_expr(column, referenced_tables)?;
+                let collation = get_collseq_from_expr_with_symbols(
+                    column,
+                    referenced_tables,
+                    Some(t_ctx.resolver.symbol_table),
+                )?;
                 let pos_in_table = index_columns.len();
                 // Have enough space pre-allocatoed to push without realloc
                 index_columns.push(IndexColumn {
@@ -281,7 +285,11 @@ impl EmitOrderBy {
             )> = order_by
                 .iter()
                 .map(|(expr, dir, nulls)| {
-                    let collation = get_collseq_from_expr(expr, referenced_tables)?;
+                    let collation = get_collseq_from_expr_with_symbols(
+                        expr,
+                        referenced_tables,
+                        Some(t_ctx.resolver.symbol_table),
+                    )?;
                     Ok::<_, crate::LimboError>((*dir, collation, *nulls))
                 })
                 .try_collect::<Result<Vec<_>>>()??;

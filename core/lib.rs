@@ -128,6 +128,7 @@ use util::parse_schema_rows;
 pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use error::{io_error, CompletionError, LimboError};
+pub use function::ContextCollationFunction;
 #[cfg(all(feature = "fs", target_family = "unix", not(miri)))]
 pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring", not(miri)))]
@@ -154,6 +155,7 @@ pub use storage::{
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
 pub use translate::expr::{walk_expr_mut, WalkControl};
+pub use turso_ext::ContextDestructor;
 pub use turso_macros::{
     turso_assert, turso_assert_all, turso_assert_eq, turso_assert_greater_than,
     turso_assert_greater_than_or_equal, turso_assert_less_than, turso_assert_less_than_or_equal,

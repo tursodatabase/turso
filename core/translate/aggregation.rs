@@ -181,10 +181,11 @@ pub(crate) fn emit_collseq_if_needed(
     program: &mut ProgramBuilder,
     referenced_tables: &TableReferences,
     expr: &ast::Expr,
+    resolver: &Resolver,
 ) {
     // Check if this is a column expression with explicit COLLATE clause
     if let ast::Expr::Collate(_, collation_name) = expr {
-        if let Ok(collation) = CollationSeq::new(collation_name.as_str()) {
+        if let Ok(collation) = resolver.resolve_collation(collation_name.as_str()) {
             program.emit_insn(Insn::CollSeq {
                 reg: None,
                 collation,
@@ -426,7 +427,7 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
-            emit_collseq_if_needed(program, referenced_tables, expr);
+            emit_collseq_if_needed(program, referenced_tables, expr, resolver);
             let comparator =
                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
             program.emit_insn(Insn::AggStep {
@@ -445,7 +446,7 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
-            emit_collseq_if_needed(program, referenced_tables, expr);
+            emit_collseq_if_needed(program, referenced_tables, expr, resolver);
             let comparator =
                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
             program.emit_insn(Insn::AggStep {

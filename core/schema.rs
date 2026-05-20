@@ -3928,7 +3928,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             });
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
-                            collation = Some(CollationSeq::new(collation_name.as_str())?);
+                            let collation_seq = CollationSeq::new(collation_name.as_str())?;
+                            if collation_seq.is_custom() {
+                                crate::bail_parse_error!(
+                                    "custom collations are not supported in schema definitions"
+                                );
+                            }
+                            collation = Some(collation_seq);
                         }
                         ast::ColumnConstraint::ForeignKey {
                             clause,
@@ -4718,7 +4724,13 @@ impl TryFrom<&ColumnDefinition> for Column {
                     );
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
-                    collation.replace(CollationSeq::new(collation_name.as_str())?);
+                    let collation_seq = CollationSeq::new(collation_name.as_str())?;
+                    if collation_seq.is_custom() {
+                        crate::bail_parse_error!(
+                            "custom collations are not supported in schema definitions"
+                        );
+                    }
+                    collation.replace(collation_seq);
                 }
                 ast::ColumnConstraint::Generated { expr, .. } => {
                     generated = Some(expr.clone());

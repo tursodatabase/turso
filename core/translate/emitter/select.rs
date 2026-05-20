@@ -191,7 +191,7 @@ pub fn emit_query<'a>(
     }
 
     let distinct_ctx = if let Distinctness::Distinct { .. } = &plan.distinctness {
-        Some(init_distinct(program, plan)?)
+        Some(init_distinct(program, plan, &t_ctx.resolver)?)
     } else {
         None
     };

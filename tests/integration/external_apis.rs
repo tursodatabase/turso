@@ -2,6 +2,7 @@ use crate::common::{limbo_exec_rows, ExecRows, TempDatabase};
 use rusqlite::types::Value as SqliteValue;
 use serial_test::serial;
 use std::{
+    cmp::Ordering,
     ffi::CString,
     os::raw::c_void,
     sync::{
@@ -743,5 +744,155 @@ fn managed_aggregate_errors_leave_connection_usable(tmp_db: TempDatabase) -> any
         counters.aggregate_inits.load(AtomicOrdering::SeqCst),
         counters.aggregate_drops.load(AtomicOrdering::SeqCst)
     );
+    Ok(())
+}
+
+unsafe extern "C" fn dotnet_nocase_collation(
+    _context: usize,
+    left_ptr: *const u8,
+    left_len: usize,
+    right_ptr: *const u8,
+    right_len: usize,
+) -> i32 {
+    let left = unsafe { std::slice::from_raw_parts(left_ptr, left_len) };
+    let right = unsafe { std::slice::from_raw_parts(right_ptr, right_len) };
+    let left = String::from_utf8_lossy(left).to_ascii_lowercase();
+    let right = String::from_utf8_lossy(right).to_ascii_lowercase();
+    match left.cmp(&right) {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    }
+}
+
+unsafe extern "C" fn dotnet_case_sensitive_collation(
+    _context: usize,
+    left_ptr: *const u8,
+    left_len: usize,
+    right_ptr: *const u8,
+    right_len: usize,
+) -> i32 {
+    let left = unsafe { std::slice::from_raw_parts(left_ptr, left_len) };
+    let right = unsafe { std::slice::from_raw_parts(right_ptr, right_len) };
+    match left.cmp(right) {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    }
+}
+
+#[turso_macros::test]
+#[serial]
+fn custom_collations_cover_dotnet_create_collation_cases(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_external_collation(
+        "dotnet_nocase".to_string(),
+        0,
+        dotnet_nocase_collation,
+        None,
+    );
+    conn.execute("CREATE TABLE names(value TEXT)")?;
+    conn.execute("INSERT INTO names VALUES ('beta'), ('ALPHA'), ('alpha'), ('Gamma')")?;
+
+    let ordered: Vec<(String,)> =
+        conn.exec_rows("SELECT value FROM names ORDER BY value COLLATE dotnet_nocase, value");
+    assert_eq!(
+        ordered,
+        vec![
+            ("ALPHA".to_string(),),
+            ("alpha".to_string(),),
+            ("beta".to_string(),),
+            ("Gamma".to_string(),)
+        ]
+    );
+
+    let equal_rows: Vec<(String,)> = conn.exec_rows(
+        "SELECT value FROM names WHERE value = 'ALPHA' COLLATE dotnet_nocase ORDER BY value",
+    );
+    assert_eq!(
+        equal_rows,
+        vec![("ALPHA".to_string(),), ("alpha".to_string(),)]
+    );
+
+    let min_max: Vec<(String, String)> = conn.exec_rows(
+        "SELECT min(value COLLATE dotnet_nocase), max(value COLLATE dotnet_nocase) FROM names",
+    );
+    assert_eq!(min_max, vec![("ALPHA".to_string(), "Gamma".to_string())]);
+
+    let err = conn
+        .execute("CREATE TABLE bad(value TEXT COLLATE dotnet_nocase)")
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("custom collations are not supported"));
+    let err = conn
+        .execute("CREATE INDEX bad_idx ON names(value COLLATE dotnet_nocase)")
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("custom collations are not supported"));
+
+    conn.execute("CREATE TABLE left_values(value TEXT)")?;
+    conn.execute("CREATE TABLE right_values(value TEXT)")?;
+    for id in 0..100 {
+        let key = format!("key{:02}", id % 10);
+        conn.execute(format!("INSERT INTO left_values VALUES ('{key}')"))?;
+        conn.execute(format!("INSERT INTO right_values VALUES ('{key}')"))?;
+    }
+    let binary_join_sql =
+        "SELECT count(*) FROM left_values AS l JOIN right_values AS r ON l.value = r.value";
+    let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {binary_join_sql}"));
+    let has_hash = explain_rows.iter().any(|row| {
+        row.get(1).is_some_and(|value| {
+            matches!(value, SqliteValue::Text(op) if op == "HashBuild" || op == "HashProbe")
+        })
+    });
+    assert!(has_hash, "expected equivalent binary join to use hash join");
+
+    conn.execute("DELETE FROM right_values")?;
+    for id in 0..100 {
+        let key = format!("KEY{:02}", id % 10);
+        conn.execute(format!("INSERT INTO right_values VALUES ('{key}')"))?;
+    }
+    let join_sql = "SELECT count(*) FROM left_values AS l JOIN right_values AS r \
+        ON l.value = r.value COLLATE dotnet_nocase";
+    let joined: Vec<(i64,)> = conn.exec_rows(join_sql);
+    assert_eq!(joined, vec![(1000,)]);
+    let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {join_sql}"));
+    let has_hash = explain_rows.iter().any(|row| {
+        row.get(1).is_some_and(|value| {
+            matches!(value, SqliteValue::Text(op) if op == "HashBuild" || op == "HashProbe")
+        })
+    });
+    assert!(
+        !has_hash,
+        "custom collations must not use binary-hashed joins"
+    );
+
+    let other_conn = tmp_db.connect_limbo();
+    other_conn.register_external_collation(
+        "dotnet_nocase".to_string(),
+        0,
+        dotnet_case_sensitive_collation,
+        None,
+    );
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT 'ok' WHERE 'A' = 'a' COLLATE dotnet_nocase");
+    assert_eq!(rows, vec![("ok".to_string(),)]);
+    let rows: Vec<(String,)> =
+        other_conn.exec_rows("SELECT 'ok' WHERE 'A' = 'a' COLLATE dotnet_nocase");
+    assert_eq!(rows, Vec::<(String,)>::new());
+
+    conn.unregister_external_collation("dotnet_nocase");
+    let err = conn
+        .execute("SELECT 'ok' WHERE 'A' = 'a' COLLATE dotnet_nocase")
+        .unwrap_err();
+    assert!(err.to_string().contains("no such collation sequence"));
+    let rows: Vec<(String,)> =
+        other_conn.exec_rows("SELECT 'ok' WHERE 'A' = 'A' COLLATE dotnet_nocase");
+    assert_eq!(rows, vec![("ok".to_string(),)]);
+    other_conn.unregister_external_collation("dotnet_nocase");
+
     Ok(())
 }
