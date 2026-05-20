@@ -8744,6 +8744,72 @@ fn test_close_persists_drop_table() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+#[test]
+fn test_cant_commit_interrupted_drop_table() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let io = Arc::new(MemoryIO::new());
+    let path = ":memory:interrupted-drop-table-schema-rollback";
+    let db = Database::open_file(io.clone(), path).unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+    conn.execute("CREATE TABLE repro_target(c0 INTEGER, c1 REAL)")
+        .unwrap();
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_repro_target_c0 \
+         ON repro_target (c0) WHERE c1 IS NULL",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let target_schema_rows = get_rows(
+        &conn,
+        "SELECT type, name FROM sqlite_schema \
+         WHERE tbl_name = 'repro_target' ORDER BY rowid",
+    );
+    assert_eq!(target_schema_rows.len(), 2);
+    assert_eq!(target_schema_rows[0][0].to_string(), "table");
+    assert_eq!(target_schema_rows[0][1].to_string(), "repro_target");
+    assert_eq!(target_schema_rows[1][0].to_string(), "index");
+    assert_eq!(target_schema_rows[1][1].to_string(), "idx_repro_target_c0");
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CursorYieldPoint::NextStart.point()
+    ])));
+
+    let mut drop_stmt = conn.prepare("DROP TABLE repro_target").unwrap();
+    match drop_stmt.step().unwrap() {
+        crate::StepResult::IO => {}
+        other => panic!("expected injected IO yield while dropping repro_target; got {other:?}"),
+    }
+    conn.set_yield_injector(None);
+    tracing::info!("yielded pere");
+
+    let mut select_1 = conn.prepare("SELECT 1").unwrap();
+    let res = select_1.run_collect_rows();
+    assert!(matches!(res, Err(LimboError::Busy)));
+
+    drop(drop_stmt);
+    drop(conn);
+    drop(db);
+
+    // FIXME this fails with
+    // called `Result::unwrap()` on an `Err` value: Corrupt("sqlite_schema contains index for missing table 'repro_target': rootpage=3 sql=CREATE UNIQUE INDEX IF NOT EXISTS idx_repro_target_c0 ON repro_target (c0) WHERE c1 IS NULL")
+    let db = Database::open_file(io, path).unwrap();
+    let conn = db.connect().unwrap();
+    let target_schema_rows = get_rows(
+        &conn,
+        "SELECT type, name FROM sqlite_schema \
+         WHERE tbl_name = 'repro_target' ORDER BY rowid",
+    );
+    assert_eq!(target_schema_rows.len(), 2);
+    assert_eq!(target_schema_rows[0][0].to_string(), "table");
+    assert_eq!(target_schema_rows[0][1].to_string(), "repro_target");
+    assert_eq!(target_schema_rows[1][0].to_string(), "index");
+    assert_eq!(target_schema_rows[1][1].to_string(), "idx_repro_target_c0");
+}
+
 /// Reproducer: DROP INDEX ghost pages after restart without explicit checkpoint.
 /// Session 1: create table + index + insert + checkpoint. Session 2: drop index. Session 3: reopen.
 #[test]
