@@ -8744,6 +8744,60 @@ fn test_close_persists_drop_table() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+#[test]
+fn test_abandoned_drop() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let io = Arc::new(MemoryIO::new());
+    let path = ":memory:";
+    let db = Database::open_file(io.clone(), path).unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, row_number INTEGER, ts INTEGER)")
+        .unwrap();
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS t_index \
+         ON t (row_number) WHERE ts IS NULL",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    assert!(conn.get_auto_commit());
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CursorYieldPoint::NextStart.point()
+    ])));
+    conn.execute("BEGIN").unwrap();
+    let mut drop_stmt = conn.prepare("DROP TABLE t").unwrap();
+    match drop_stmt.step().unwrap() {
+        crate::StepResult::IO => {}
+        other => panic!("expected injected IO yield mid-DROP TABLE; got {other:?}"),
+    }
+    conn.set_yield_injector(None);
+
+    drop_stmt.reset().unwrap();
+    drop(drop_stmt);
+
+    conn.execute("COMMIT").unwrap();
+
+    drop(conn);
+    drop(db);
+
+    let db = Database::open_file(io, path).expect(
+        "reopen should not fail; abandoned DROP must not have committed its partial Delete",
+    );
+    let conn = db.connect().unwrap();
+    let after = get_rows(
+        &conn,
+        "SELECT type, name FROM sqlite_schema \
+         WHERE tbl_name = 't' ORDER BY rowid",
+    );
+    assert!(
+        after.len() == 0 || after.len() == 2,
+        "schema must not be half-dropped; got rows: {after:?}",
+    );
+}
+
 /// Reproducer: DROP INDEX ghost pages after restart without explicit checkpoint.
 /// Session 1: create table + index + insert + checkpoint. Session 2: drop index. Session 3: reopen.
 #[test]
