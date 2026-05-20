@@ -1759,15 +1759,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     }
                 }
 
-                if mvcc_store
-                    .last_committed_schema_change_ts
-                    .load(Ordering::Acquire)
-                    > tx.begin_ts
-                {
-                    // Schema changes made after the transaction began always cause a [SchemaConflict] error and the tx must abort.
-                    return Err(LimboError::SchemaConflict);
-                }
-
                 // Atomically generate end_ts and publish Preparing(end_ts) while the
                 // clock lock is held. This closes the TOCTOU window
                 // Consider the example:
@@ -1780,13 +1771,82 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 //
                 // hence we want to guard the timestamp generation by a mutex, only allow next
                 // ts to generate when the previous one is used / discarded
+
+                let write_set_is_empty = tx.write_set.lock().is_empty();
+                let header_write = tx.header_dirty.load(Ordering::Acquire);
+                // Read only is not only exclusive to empty write set, we could be writing the
+                // database header here.
+                let read_only = write_set_is_empty && !header_write;
+
+                let mut schema_conflict = false;
+                let mut exclusive_conflict = false;
+
                 let end_ts = mvcc_store.get_commit_timestamp(|ts| {
                     turso_assert!(
                         ts > tx.begin_ts,
                         "end_ts must be strictly greater than begin_ts"
                     );
-                    tx.state.store(TransactionState::Preparing(ts));
+
+                    // First we check if there is exclusive conflict, if there is then we won't
+                    // commit txn.
+                    if !mvcc_store.is_exclusive_tx(&self.tx_id) && mvcc_store.has_exclusive_tx() {
+                        // A non-CONCURRENT transaction is holding the exclusive lock, we must abort.
+                        turso_assert_reachable!("commit aborted due to exclusive tx conflict");
+                        exclusive_conflict = true;
+                    }
+                    // Now check if we saw schema change which would require reprepare. Let's note
+                    // that we check this right after exlusive tx because we update this before we release
+                    // exclusive lock.
+                    let schema_updated = mvcc_store
+                        .last_committed_schema_change_ts
+                        .load(Ordering::Acquire)
+                        > tx.begin_ts;
+                    // last_committed_schema_ts is not enough, we need to check schema cookie
+                    // is the same because e.g:
+                    // T1 CREATE INDEX
+                    // T1 Yield somewhere in middle of commit
+                    // T1 end_ts = x
+                    // T2 BEGIN CONCURRENT; INSERT (same table); COMMIT
+                    // T2 begin_ts = x+1
+                    // T2 begin_ts > end_ts
+                    //
+                    // Therefore even if exclusive tx (T1) finishes right in time
+                    // we will see schema was not updated because we see an younger timestamp and
+                    // ours is older!
+                    //
+                    let our_cookie = tx.header.read().schema_cookie.get();
+                    let global_cookie = {
+                        let h = mvcc_store.global_header.read();
+                        let h = h.as_ref();
+                        turso_assert!(h.is_some(), "global_header should be initialized");
+                        h.unwrap().schema_cookie.get()
+                    };
+
+                    let header_dirty = tx.header_dirty.load(Ordering::Acquire);
+                    turso_assert!(!header_dirty || mvcc_store.is_exclusive_tx(&tx.tx_id), "header_dirty=true implies that tx is exclusive");
+                    if our_cookie != global_cookie && !header_dirty {
+                        tracing::debug!("cookie mismatch in CommitState::Initial tx({our_cookie}) != global(!{global_cookie})");
+                        schema_conflict = true;
+                    }
+
+                    if schema_updated {
+                        tracing::debug!("schema ts is older than our ts");
+                        // Schema changes made after the transaction began always cause a [SchemaConflict] error and the tx must abort.
+                        schema_conflict = true;
+                    }
+
+                    let can_commit_tx = !(exclusive_conflict || schema_conflict);
+                    if can_commit_tx || read_only {
+                        tx.state.store(TransactionState::Preparing(ts));
+                    }
                 });
+                // We allow reads from happening. Exlusive means there is a single writer.
+                if exclusive_conflict && !read_only {
+                    return Err(LimboError::WriteWriteConflict);
+                }
+                if schema_conflict && !read_only {
+                    return Err(LimboError::SchemaConflict);
+                }
                 tracing::trace!("prepare_tx(tx_id={}, end_ts={})", self.tx_id, end_ts);
                 /* In order to implement serializability, we need the following steps:
                 **
@@ -1871,9 +1931,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                  ** 2. Validate if there are no phantoms by walking the scans from scan_set
                  */
                 tracing::trace!("commit_tx(tx_id={})", self.tx_id);
-                let write_set_is_empty = tx.write_set.lock().is_empty();
                 // Header-only writes must not take this fast path; they need durable log records.
-                if write_set_is_empty && !tx.header_dirty.load(Ordering::Acquire) {
+                if read_only {
                     turso_assert!(
                         tx.commit_dep_set.lock().is_empty(),
                         "MVCC read only transaction should not have commit dependencies on other txns"
@@ -1913,11 +1972,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 Ok(TransitionResult::Continue)
             }
             CommitState::Commit { end_ts } => {
-                if !mvcc_store.is_exclusive_tx(&self.tx_id) && mvcc_store.has_exclusive_tx() {
-                    // A non-CONCURRENT transaction is holding the exclusive lock, we must abort.
-                    turso_assert_reachable!("commit aborted due to exclusive tx conflict");
-                    return Err(LimboError::WriteWriteConflict);
-                }
                 // Check for rowid conflicts before committing (pure optimistic, first-committer-wins)
                 // Ref: Hekaton paper Section 3.2 - validation uses end_ts comparison
                 let tx = mvcc_store
