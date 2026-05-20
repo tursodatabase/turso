@@ -1766,7 +1766,7 @@ fn emit_notnulls(
                         ),
                     });
                 }
-               
+
                 program.preassign_label_to_next_insn(skip_label);
             }
             // OR REPLACE but no DEFAULT, fall through to ABORT behavior
