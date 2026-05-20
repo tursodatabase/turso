@@ -4702,3 +4702,75 @@ fn test_update_replace_deferred_fk_multiple_children(tmp_db: TempDatabase) {
         "SELECT * FROM parent ORDER BY id",
     );
 }
+
+/// An UPDATE skipped by UNIQUE ON CONFLICT IGNORE must not reconcile an
+/// unrelated deferred FK violation created earlier in the transaction.
+#[turso_macros::test]
+fn test_update_ignore_preserves_deferred_fk_violation(tmp_db: TempDatabase) {
+    drop(tmp_db);
+    let label = "ignore_preserves_deferred_fk_violation";
+    let limbo_db = TempDatabase::builder()
+        .with_db_name(format!("{label}.db"))
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for sql in [
+        "PRAGMA foreign_keys=ON",
+        "CREATE TABLE parent(id UNIQUE ON CONFLICT IGNORE)",
+        "CREATE TABLE child(id PRIMARY KEY, pid, \
+         FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
+        "INSERT INTO parent VALUES (20)",
+        "INSERT INTO parent VALUES (24)",
+        "INSERT INTO child VALUES (1, 20)",
+        "BEGIN",
+        "INSERT INTO child VALUES (2, 276)",
+        "UPDATE parent SET id=20 WHERE id=24",
+    ] {
+        sqlite_try_exec(&sqlite_conn, sql).unwrap();
+        limbo_try_exec(&limbo_conn, sql).unwrap();
+    }
+
+    let sqlite_commit = sqlite_try_exec(&sqlite_conn, "COMMIT");
+    let limbo_commit = limbo_try_exec(&limbo_conn, "COMMIT");
+    assert!(
+        sqlite_commit.is_err(),
+        "[{label}] SQLite should reject COMMIT"
+    );
+    assert!(
+        limbo_commit.is_err(),
+        "[{label}] Limbo should reject COMMIT"
+    );
+}
+
+/// A parent UPDATE skipped by UNIQUE ON CONFLICT IGNORE must not increment the
+/// deferred FK counter for a parent key that was never changed.
+#[turso_macros::test]
+fn test_update_ignore_does_not_create_deferred_fk_violation(tmp_db: TempDatabase) {
+    drop(tmp_db);
+    let label = "ignore_does_not_create_deferred_fk_violation";
+    let limbo_db = TempDatabase::builder()
+        .with_db_name(format!("{label}.db"))
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for sql in [
+        "PRAGMA foreign_keys=ON",
+        "CREATE TABLE parent(id PRIMARY KEY ON CONFLICT IGNORE)",
+        "CREATE TABLE child(pid INT REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
+        "INSERT INTO parent VALUES (40)",
+        "INSERT INTO parent VALUES (195)",
+        "INSERT INTO child VALUES (195)",
+        "BEGIN",
+        "UPDATE parent SET id=40 WHERE id=195",
+    ] {
+        sqlite_try_exec(&sqlite_conn, sql).unwrap();
+        limbo_try_exec(&limbo_conn, sql).unwrap();
+    }
+
+    let sqlite_commit = sqlite_try_exec(&sqlite_conn, "COMMIT");
+    let limbo_commit = limbo_try_exec(&limbo_conn, "COMMIT");
+    assert!(sqlite_commit.is_ok(), "[{label}] SQLite should commit");
+    assert!(limbo_commit.is_ok(), "[{label}] Limbo should commit");
+}

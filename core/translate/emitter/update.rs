@@ -1477,15 +1477,15 @@ fn emit_update_insns<'a>(
     }
 
     let mut deferred_new_key_plans = Vec::new();
+    let updated_set_columns: ColumnMask = set_clauses
+        .iter()
+        .filter_map(|set_clause| {
+            (set_clause.column_index != ROWID_SENTINEL).then_some(set_clause.column_index)
+        })
+        .collect();
     if connection.foreign_keys_enabled() {
         let rowid_new_reg = effective_rowid_reg;
         if let Some(table_btree) = target_table.table.btree() {
-            let updated_set_columns: ColumnMask = set_clauses
-                .iter()
-                .filter_map(|set_clause| {
-                    (set_clause.column_index != ROWID_SENTINEL).then_some(set_clause.column_index)
-                })
-                .collect();
             stabilize_new_row_for_fk(
                 program,
                 &table_btree,
@@ -1497,38 +1497,6 @@ fn emit_update_insns<'a>(
             // Child-side FK checks are deferred to AFTER custom type encoding (see below).
             // This is because child FK checks probe the parent's index which contains
             // encoded values, so the NEW values must also be encoded.
-
-            // Parent-side NO ACTION/RESTRICT checks must happen BEFORE the update.
-            // This checks that no child rows reference the old parent key values.
-            // CASCADE/SET NULL actions are fired AFTER the update (see below after Insert).
-            if t_ctx.resolver.with_schema(update_database_id, |s| {
-                s.any_resolved_fks_referencing(table_name)
-            }) {
-                let new_key_probe_mode = if any_effective_replace(
-                    program.flags.has_statement_conflict(),
-                    or_conflict,
-                    table_btree.rowid_alias_conflict_clause,
-                    indexes_to_update.iter().map(|idx| idx.on_conflict),
-                ) {
-                    ParentKeyNewProbeMode::AfterReplace
-                } else {
-                    ParentKeyNewProbeMode::BeforeWrite
-                };
-                deferred_new_key_plans = emit_fk_update_parent_actions(
-                    program,
-                    &table_btree,
-                    indexes_to_update.iter(),
-                    target_table_cursor_id,
-                    beg,
-                    start,
-                    rowid_new_reg,
-                    rowid_set_clause_reg,
-                    &updated_set_columns,
-                    new_key_probe_mode,
-                    update_database_id,
-                    &t_ctx.resolver,
-                )?;
-            }
         }
     }
 
@@ -1784,27 +1752,6 @@ fn emit_update_insns<'a>(
                 skip_row_label,
                 Some(&check_constraint_tables),
             )?;
-        }
-    }
-
-    // Child-side FK checks must run AFTER custom type encoding so that NEW values
-    // being probed against the parent's index are encoded (matching the index contents).
-    if connection.foreign_keys_enabled() {
-        if let Some(table_btree) = target_table.table.btree() {
-            if t_ctx.resolver.schema().has_child_fks(table_name) {
-                emit_fk_child_update_counters(
-                    program,
-                    &table_btree,
-                    table_name,
-                    target_table_cursor_id,
-                    start,
-                    effective_rowid_reg,
-                    &affected_columns,
-                    update_database_id,
-                    &t_ctx.resolver,
-                    &layout,
-                )?;
-            }
         }
     }
 
@@ -2147,6 +2094,58 @@ fn emit_update_insns<'a>(
             rowid_reg: beg,
             target_pc: row_not_found_label,
         });
+    }
+
+    // FK counter maintenance must run only after constraints that can skip the
+    // row (for example UNIQUE ON CONFLICT IGNORE) have accepted this update.
+    // Parent-side checks still run before the row write; child-side checks run
+    // after type encoding so NEW values match the parent's index encoding.
+    if connection.foreign_keys_enabled() {
+        if let Some(table_btree) = target_table.table.btree() {
+            if t_ctx.resolver.with_schema(update_database_id, |s| {
+                s.any_resolved_fks_referencing(table_name)
+            }) {
+                let new_key_probe_mode = if any_effective_replace(
+                    program.flags.has_statement_conflict(),
+                    or_conflict,
+                    table_btree.rowid_alias_conflict_clause,
+                    indexes_to_update.iter().map(|idx| idx.on_conflict),
+                ) {
+                    ParentKeyNewProbeMode::AfterReplace
+                } else {
+                    ParentKeyNewProbeMode::BeforeWrite
+                };
+                deferred_new_key_plans = emit_fk_update_parent_actions(
+                    program,
+                    &table_btree,
+                    indexes_to_update.iter(),
+                    target_table_cursor_id,
+                    beg,
+                    start,
+                    effective_rowid_reg,
+                    rowid_set_clause_reg,
+                    &updated_set_columns,
+                    new_key_probe_mode,
+                    update_database_id,
+                    &t_ctx.resolver,
+                )?;
+            }
+
+            if t_ctx.resolver.schema().has_child_fks(table_name) {
+                emit_fk_child_update_counters(
+                    program,
+                    &table_btree,
+                    table_name,
+                    target_table_cursor_id,
+                    start,
+                    effective_rowid_reg,
+                    &affected_columns,
+                    update_database_id,
+                    &t_ctx.resolver,
+                    &layout,
+                )?;
+            }
+        }
     }
 
     // ---- Phase 2: Delete old index entries ----
