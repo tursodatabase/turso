@@ -206,6 +206,8 @@ pub struct Connection {
     pub(super) full_column_names: AtomicBool,
     /// Deprecated pragma: when ON (default), column refs use just the column name
     pub(super) short_column_names: AtomicBool,
+    /// Per-connection runtime extension loading flag.
+    pub(super) enable_load_extension: AtomicBool,
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
     /// Per-attached-database MVCC transactions.
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
@@ -1862,6 +1864,14 @@ impl Connection {
 
     pub fn get_auto_commit(&self) -> bool {
         self.auto_commit.load(Ordering::SeqCst)
+    }
+
+    pub fn set_load_extension_enabled(&self, enabled: bool) {
+        self.enable_load_extension.store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn can_load_extensions(&self) -> bool {
+        self.enable_load_extension.load(Ordering::Acquire)
     }
 
     pub fn reparse_schema_after_extension_load(self: &Arc<Connection>) -> Result<()> {
