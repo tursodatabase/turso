@@ -506,6 +506,10 @@ pub struct WindowRegisters {
     /// Start of the register array holding ORDER BY column values from the previous row.
     /// These are used to compare against the current row to determine peer relationships.
     pub prev_order_by_columns_start: Option<usize>,
+    /// Start of registers holding evaluated expression values for value window functions.
+    /// These are used during the main loop to evaluate function arguments, and some
+    /// are also used to store results (FIRST_VALUE, LAST_VALUE, NTH_VALUE).
+    pub value_func_regs_start: usize,
 }
 
 #[derive(Debug)]
@@ -514,6 +518,46 @@ pub struct WindowCursors {
     pub buffer_read: CursorID,
     /// Cursor used to write to the ephemeral buffer table
     pub buffer_write: CursorID,
+    /// Cursor used for random access to the buffer (LEAD/LAG)
+    pub buffer_random_read: Option<CursorID>,
+}
+
+/// Metadata for a value window function that needs expression evaluation.
+/// Covers FIRST_VALUE, LAST_VALUE, NTH_VALUE, LEAD, and LAG.
+#[derive(Debug)]
+pub struct ValueWindowFuncMeta {
+    /// Index of this function in `window.functions`
+    pub func_index: usize,
+    /// The kind of value window function
+    pub kind: ValueWindowFuncKind,
+}
+
+#[derive(Debug)]
+pub enum ValueWindowFuncKind {
+    /// FIRST_VALUE(expr): result stored in a register, set on first row only
+    FirstValue { result_reg: usize, expr_reg: usize },
+    /// LAST_VALUE(expr): result stored in a register, overwritten each row
+    LastValue { result_reg: usize, expr_reg: usize },
+    /// NTH_VALUE(expr, n): result stored in a register, set when row_counter == n
+    NthValue {
+        result_reg: usize,
+        expr_reg: usize,
+        n: i64,
+    },
+    /// LEAD(expr, offset, default): needs buffer extension for random access
+    Lead {
+        buffer_col_idx: usize,
+        offset: i64,
+        default_reg: usize,
+        expr_reg: usize,
+    },
+    /// LAG(expr, offset, default): needs buffer extension for random access
+    Lag {
+        buffer_col_idx: usize,
+        offset: i64,
+        default_reg: usize,
+        expr_reg: usize,
+    },
 }
 
 pub struct EmitWindow;
@@ -636,10 +680,12 @@ impl EmitWindow {
                 result_columns_start: reg_col_start,
                 prev_order_by_columns_start: alloc_optional_registers(program, order_by_len),
                 new_order_by_columns_start: alloc_optional_registers(program, order_by_len),
+                value_func_regs_start: program.alloc_register(),
             },
             cursors: WindowCursors {
                 buffer_read: cursor_buffer_read,
                 buffer_write: cursor_buffer_write,
+                buffer_random_read: None,
             },
             src_column_count,
             expressions_referencing_subquery,

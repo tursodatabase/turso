@@ -312,12 +312,22 @@ pub enum AggFunc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
 pub enum WindowFunc {
     RowNumber,
+    Lead,
+    Lag,
+    FirstValue,
+    LastValue,
+    NthValue,
 }
 
 impl WindowFunc {
     pub fn arities(&self) -> &'static [i32] {
         match self {
             Self::RowNumber => &[0],
+            Self::Lead => &[1, 2, 3],
+            Self::Lag => &[1, 2, 3],
+            Self::FirstValue => &[1],
+            Self::LastValue => &[1],
+            Self::NthValue => &[2],
         }
     }
 }
@@ -332,6 +342,11 @@ impl std::fmt::Display for WindowFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RowNumber => write!(f, "row_number"),
+            Self::Lead => write!(f, "lead"),
+            Self::Lag => write!(f, "lag"),
+            Self::FirstValue => write!(f, "first_value"),
+            Self::LastValue => write!(f, "last_value"),
+            Self::NthValue => write!(f, "nth_value"),
         }
     }
 }
@@ -1270,6 +1285,36 @@ impl Func {
                     crate::bail_parse_error!("wrong number of arguments to function {}()", name)
                 }
                 Ok(Some(Self::Window(WindowFunc::RowNumber)))
+            }
+            "lead" => {
+                if arg_count < 1 || arg_count > 3 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Some(Self::Window(WindowFunc::Lead)))
+            }
+            "lag" => {
+                if arg_count < 1 || arg_count > 3 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Some(Self::Window(WindowFunc::Lag)))
+            }
+            "first_value" => {
+                if arg_count != 1 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Some(Self::Window(WindowFunc::FirstValue)))
+            }
+            "last_value" => {
+                if arg_count != 1 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Some(Self::Window(WindowFunc::LastValue)))
+            }
+            "nth_value" => {
+                if arg_count != 2 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Some(Self::Window(WindowFunc::NthValue)))
             }
             "timediff" => {
                 if arg_count != 2 {
