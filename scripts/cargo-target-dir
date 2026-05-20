@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Print the directory cargo uses for build artefacts."""
+
+import json
+import subprocess
+import sys
+
+result = subprocess.run(
+    ["cargo", "metadata", "--format-version", "1", "--no-deps", "--offline"],
+    capture_output=True,
+    text=True,
+)
+if result.returncode != 0:
+    sys.exit(result.stderr.strip() or "cargo metadata failed")
+print(json.loads(result.stdout)["target_directory"])
