@@ -1471,7 +1471,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     /// Returns [LimboError::WriteWriteConflict] when another transaction committed or is
     /// preparing a conflicting version according to first-committer-wins.
     fn check_rowid_for_conflicts(
-        &self,
+        self_tx_id: TxID,
         rowid: &RowID,
         end_ts: u64,
         tx: &Transaction,
@@ -1486,7 +1486,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         let row_versions = row_versions.value();
         let row_versions = row_versions.read();
 
-        self.check_version_conflicts(end_ts, tx, mvcc_store, &row_versions)?;
+        Self::check_version_conflicts(self_tx_id, end_ts, tx, mvcc_store, &row_versions)?;
         Ok(())
     }
 
@@ -1495,7 +1495,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     /// Returns [LimboError::WriteWriteConflict] when another transaction committed or is
     /// preparing a conflicting index version according to first-committer-wins.
     fn check_index_for_conflicts(
-        &self,
+        self_tx_id: TxID,
         rowid: &RowID,
         end_ts: u64,
         tx: &Transaction,
@@ -1545,7 +1545,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             }
             let row_versions = entry.value();
             let row_versions = row_versions.read();
-            self.check_version_conflicts(end_ts, tx, mvcc_store, &row_versions)?;
+            Self::check_version_conflicts(self_tx_id, end_ts, tx, mvcc_store, &row_versions)?;
         }
 
         Ok(())
@@ -1557,7 +1557,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     /// 1. versions ended by concurrent commits (`end > tx.begin_ts`), and
     /// 2. live versions owned by concurrent transactions (state/ts tie-breaking).
     fn check_version_conflicts(
-        &self,
+        self_tx_id: TxID,
         end_ts: u64,
         tx: &Transaction,
         mvcc_store: &Arc<MvStore<Clock>>,
@@ -1589,7 +1589,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 // the check above at lines 1070-1074. Here we only need to check
                 // in-flight tombstones (end: TxID) from other transactions.
                 if let Some(TxTimestampOrID::TxID(other_tx_id)) = version.end {
-                    if other_tx_id != self.tx_id {
+                    if other_tx_id != self_tx_id {
                         let other_tx = mvcc_store.txs.get(&other_tx_id).expect(
                             "check_version_conflicts: tombstone end TxID not found in txn map",
                         );
@@ -1626,7 +1626,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 }
                 Some(TxTimestampOrID::TxID(end_tx_id)) => {
                     // Deletion not yet finalized; the deleting transaction may still be in Preparing.
-                    if end_tx_id == self.tx_id {
+                    if end_tx_id == self_tx_id {
                         // We deleted this version ourselves, so it cannot conflict with our commit.
                         continue;
                     }
@@ -1661,7 +1661,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             match version.begin {
                 Some(TxTimestampOrID::TxID(other_tx_id)) => {
                     // Skip our own version
-                    if other_tx_id == self.tx_id {
+                    if other_tx_id == self_tx_id {
                         continue;
                     }
                     // Another transaction's uncommitted version - check their state
@@ -2698,9 +2698,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 for (id, _chain) in tx.write_set.lock().iter() {
                     if id.row_id.is_int_key() {
-                        self.check_rowid_for_conflicts(id, *end_ts, tx, mvcc_store)?;
+                        Self::check_rowid_for_conflicts(self.tx_id, id, *end_ts, tx, mvcc_store)?;
                     } else {
-                        self.check_index_for_conflicts(id, *end_ts, tx, mvcc_store)?;
+                        Self::check_index_for_conflicts(self.tx_id, id, *end_ts, tx, mvcc_store)?;
                     }
                 }
 
@@ -4827,6 +4827,32 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         ));
         let state_machine = StateMachine::new(state);
         Ok(state_machine)
+    }
+
+    /// Read-only conflict check used as a pre-commit gate across attached databases:
+    /// detects committed write-write conflicts for `tx_id`'s pending writes so a
+    /// conflict on any DB aborts the multi-DB commit before any DB is finalized.
+    ///
+    /// Passes `end_ts = 0` to the underlying version checks so the lower-end_ts-wins
+    /// branch between two Preparing transactions can never trigger here (concurrent-
+    /// Preparing tie-breaking remains the job of the authoritative per-store
+    /// validation in [CommitState::Commit]).
+    pub fn precheck_write_conflicts(self: &Arc<Self>, tx_id: TxID) -> Result<()> {
+        if !self.is_exclusive_tx(&tx_id) && self.has_exclusive_tx() {
+            return Err(LimboError::WriteWriteConflict);
+        }
+        let Some(tx_entry) = self.txs.get(&tx_id) else {
+            return Ok(());
+        };
+        let tx = tx_entry.value();
+        for (id, _) in tx.write_set.lock().iter() {
+            if id.row_id.is_int_key() {
+                CommitStateMachine::<Clock>::check_rowid_for_conflicts(tx_id, id, 0, tx, self)?;
+            } else {
+                CommitStateMachine::<Clock>::check_index_for_conflicts(tx_id, id, 0, tx, self)?;
+            }
+        }
+        Ok(())
     }
 
     /// Returns true if the transaction can be rolled back (Active or Preparing).

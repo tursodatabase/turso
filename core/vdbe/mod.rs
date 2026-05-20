@@ -1974,11 +1974,12 @@ impl Program {
     /// 3. **Attached WAL** — flush dirty pages on attached databases that use WAL
     ///    (e.g. :memory: attached while main is MVCC).
     ///
-    /// **IMPORTANT**: This multi-phase commit is NOT atomic across databases.
-    /// A crash between phases can leave the main and attached databases in
-    /// inconsistent states (main committed, some attached DBs not committed).
-    /// This matches SQLite's WAL mode behavior — cross-file atomicity only
-    /// exists in legacy rollback journal mode, which we do not support.
+    /// **IMPORTANT**: This multi-phase commit is NOT atomic across databases
+    /// in the presence of a crash — a crash between phases can leave main and
+    /// attached DBs inconsistent (main committed, some attached not). Crash
+    /// atomicity across files only exists in SQLite's legacy rollback-journal
+    /// mode, which we do not support. We do however guarantee atomicity on
+    /// **conflict**: a conflict on any DB rolls back all DBs.
     fn commit_txn_mvcc(
         &self,
         pager: Arc<Pager>,
@@ -1992,7 +1993,39 @@ impl Program {
             return Ok(IOResult::Done(()));
         }
 
-        // Phase 1: Commit main DB MVCC transaction
+        // Phase 1: pre-validate WW conflicts across all participating MVCC stores so a
+        // conflict aborts the whole commit before any store has been finalized.
+        if matches!(program_state.commit_state, CommitState::Ready) {
+            let precheck = (|| -> Result<()> {
+                if let Some(tx_id) = conn.get_mv_tx_id() {
+                    mv_store.precheck_write_conflicts(tx_id)?;
+                }
+                let attached: Vec<(usize, u64)> = conn
+                    .attached_mv_txs
+                    .read()
+                    .iter()
+                    .map(|(&d, &(t, _))| (d, t))
+                    .collect();
+                for (db_id, tx_id) in attached {
+                    if let Some(store) = conn.mv_store_for_db(db_id) {
+                        store.precheck_write_conflicts(tx_id)?;
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(e) = precheck {
+                if let Some(tx_id) = conn.get_mv_tx_id() {
+                    mv_store.rollback_tx(tx_id, pager.clone(), &conn, crate::MAIN_DB_ID);
+                }
+                pager.end_read_tx();
+                conn.rollback_attached_mvcc_txs(true);
+                conn.rollback_attached_wal_txns();
+                conn.set_tx_state(TransactionState::None);
+                return Err(e);
+            }
+        }
+
+        // Phase 2: Commit main DB MVCC transaction
         if matches!(program_state.commit_state, CommitState::Ready) {
             if let Some(tx_id) = conn.get_mv_tx_id() {
                 let state_machine = mv_store.commit_tx(tx_id, &conn, crate::MAIN_DB_ID)?;
@@ -2024,7 +2057,7 @@ impl Program {
             }
         }
 
-        // Phase 2: Commit MVCC transactions on attached databases
+        // Phase 3: Commit MVCC transactions on attached databases
         // Resume an in-progress attached MVCC commit
         if matches!(
             program_state.commit_state,
@@ -2099,7 +2132,7 @@ impl Program {
             }
         }
 
-        // Phase 3: Commit WAL transactions on attached databases that don't use MVCC.
+        // Phase 4: Commit WAL transactions on attached databases that don't use MVCC.
         // When the main DB uses MVCC, we route through commit_txn_mvcc, but attached
         // DBs may use WAL mode and need their dirty pages committed via the WAL path.
         if matches!(program_state.commit_state, CommitState::CommittingAttached) {
