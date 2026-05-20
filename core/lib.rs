@@ -51,6 +51,8 @@ mod json;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod numeric;
 mod parameters;
+#[cfg(feature = "percentile")]
+mod percentile;
 mod pragma;
 mod progress;
 mod pseudo;

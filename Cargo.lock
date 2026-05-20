@@ -3198,14 +3198,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "limbo_percentile"
-version = "0.7.0-pre.1"
-dependencies = [
- "mimalloc",
- "turso_ext",
-]
-
-[[package]]
 name = "limbo_regexp"
 version = "0.7.0-pre.1"
 dependencies = [

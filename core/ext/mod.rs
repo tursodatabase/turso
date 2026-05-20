@@ -228,6 +228,8 @@ impl Database {
         crate::series::register_extension(&mut ext_api);
         #[cfg(feature = "time")]
         crate::time::register_extension(&mut ext_api);
+        #[cfg(feature = "percentile")]
+        crate::percentile::register_extension(&mut ext_api);
         crate::regexp::register_extension(&mut ext_api);
         #[cfg(feature = "fs")]
         {
