@@ -3161,6 +3161,23 @@ pub enum OpTransactionState {
     BeginStatement,
 }
 
+#[cfg(any(test, injected_yields))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TransactionYieldPoint {
+    BeforeStart,
+}
+
+#[cfg(any(test, injected_yields))]
+impl crate::mvcc::yield_hooks::YieldPointMarker for TransactionYieldPoint {
+    const POINT_COUNT: u8 = 1;
+
+    fn ordinal(self) -> u8 {
+        match self {
+            TransactionYieldPoint::BeforeStart => 0,
+        }
+    }
+}
+
 pub fn op_transaction(
     program: &Program,
     state: &mut ProgramState,
@@ -3368,6 +3385,20 @@ pub fn op_transaction_inner(
                 let mut started_secondary_tx = false;
                 if write && conn.is_readonly(*db) {
                     return Err(LimboError::ReadOnly);
+                }
+
+                #[cfg(any(test, injected_yields))]
+                {
+                    if let Some(IOResult::IO(io)) =
+                        crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                            conn.yield_injector().as_ref(),
+                            0,
+                            *db as u64,
+                            TransactionYieldPoint::BeforeStart,
+                        )
+                    {
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
                 }
 
                 // 1. We try to upgrade current version

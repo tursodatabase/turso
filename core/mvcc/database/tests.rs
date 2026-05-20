@@ -19,6 +19,7 @@ use crate::storage::sqlite3_ondisk::{
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
+use crate::vdbe::execute::TransactionYieldPoint;
 use crate::{
     Buffer, Completion, DatabaseOpts, EncryptionKey, LimboError, OpenFlags, StatementStatusCounter,
 };
@@ -2442,6 +2443,148 @@ fn test_integrity_check_after_checkpoint_io_yield_then_post_durable_failure_uses
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
     assert_eq!(&rows[0][1].to_string(), "a");
+}
+
+/// Steps:
+/// 1. Create an MVCC database with a table and unique index whose roots are still logical MVCC roots.
+/// 2. Prepare `PRAGMA integrity_check` on a second connection.
+/// 3. Start stepping it, then yield immediately before `OP_Transaction` opens the read transaction.
+/// 4. On the writer connection, insert a row and run `wal_checkpoint(TRUNCATE)` so checkpoint publishes physical roots.
+/// 5. Resume the stale statement; it must force one reprepare and then report `ok`.
+#[test]
+fn test_running_integrity_check_reprepares_after_checkpoint_root_publish() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+
+    let stale_conn = db.connect();
+    let injector = FixedYieldInjector::new([TransactionYieldPoint::BeforeStart.point()]);
+    stale_conn.set_yield_injector(Some(injector.clone()));
+    let mut stale_integrity_check = stale_conn.prepare("PRAGMA integrity_check").unwrap();
+    assert!(
+        matches!(stale_integrity_check.step().unwrap(), crate::StepResult::IO)
+            && injector.is_empty(),
+        "integrity_check should yield before opening its read transaction"
+    );
+
+    writer.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    stale_conn.set_yield_injector(None);
+
+    // The statement has already passed its public step-time schema refresh, but
+    // its transaction has not opened yet. Checkpoint root publication does not
+    // change SQLite's schema cookie, so OP_Transaction must still force a
+    // reprepare before stale bytecode can use the new header with old roots.
+    let rows = stale_integrity_check.run_collect_rows().unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+    assert_eq!(
+        stale_integrity_check.stmt_status(StatementStatusCounter::Reprepare),
+        1
+    );
+}
+
+/// Steps:
+/// 1. Create an MVCC database with a table and unique index whose roots are still logical MVCC roots.
+/// 2. Open a deferred transaction on a second connection without starting its MVCC read transaction yet.
+/// 3. Prepare `PRAGMA integrity_check` inside that deferred transaction.
+/// 4. Start stepping it, then yield immediately before `OP_Transaction` opens the read transaction.
+/// 5. On the writer connection, insert a row and run `wal_checkpoint(TRUNCATE)` so checkpoint publishes physical roots.
+/// 6. Resume the deferred statement; it must force one reprepare, report `ok`, and leave the transaction committable.
+#[test]
+fn test_deferred_begin_integrity_check_reprepares_after_checkpoint_root_publish() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+
+    let stale_conn = db.connect();
+    stale_conn.execute("BEGIN").unwrap();
+
+    let injector = FixedYieldInjector::new([TransactionYieldPoint::BeforeStart.point()]);
+    stale_conn.set_yield_injector(Some(injector.clone()));
+    let mut stale_integrity_check = stale_conn.prepare("PRAGMA integrity_check").unwrap();
+    assert!(
+        matches!(stale_integrity_check.step().unwrap(), crate::StepResult::IO)
+            && injector.is_empty(),
+        "integrity_check should yield before opening its read transaction"
+    );
+
+    writer.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    stale_conn.set_yield_injector(None);
+
+    let rows = stale_integrity_check.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+    assert_eq!(
+        stale_integrity_check.stmt_status(StatementStatusCounter::Reprepare),
+        1
+    );
+
+    stale_conn.execute("COMMIT").unwrap();
+}
+
+/// Steps:
+/// 1. Create an MVCC database with a table and unique index whose roots are still logical MVCC roots.
+/// 2. Prepare `PRAGMA integrity_check` on a second connection and record that it has not reprepared yet.
+/// 3. Record `PRAGMA schema_version` before the checkpoint.
+/// 4. Start stepping the stale statement, then yield immediately before `OP_Transaction` opens the read transaction.
+/// 5. On the writer connection, insert a row and run `wal_checkpoint(TRUNCATE)` so checkpoint publishes physical roots.
+/// 6. Assert the checkpoint did not bump SQLite's schema cookie.
+/// 7. Resume the stale statement; it must force one reprepare and then report `ok`.
+#[test]
+fn test_running_integrity_check_reprepares_without_schema_cookie_bump() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+
+    let stale_conn = db.connect();
+    let injector = FixedYieldInjector::new([TransactionYieldPoint::BeforeStart.point()]);
+    stale_conn.set_yield_injector(Some(injector.clone()));
+    let mut stale_integrity_check = stale_conn.prepare("PRAGMA integrity_check").unwrap();
+    assert_eq!(
+        stale_integrity_check.stmt_status(StatementStatusCounter::Reprepare),
+        0
+    );
+
+    let schema_version_before = get_rows(&writer, "PRAGMA schema_version")[0][0]
+        .as_int()
+        .unwrap();
+    assert!(
+        matches!(stale_integrity_check.step().unwrap(), crate::StepResult::IO)
+            && injector.is_empty(),
+        "integrity_check should yield before opening its read transaction"
+    );
+
+    writer.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let schema_version_after = get_rows(&writer, "PRAGMA schema_version")[0][0]
+        .as_int()
+        .unwrap();
+    assert_eq!(
+        schema_version_after, schema_version_before,
+        "checkpoint root publication must not change SQLite's schema cookie"
+    );
+
+    stale_conn.set_yield_injector(None);
+    let rows = stale_integrity_check.run_collect_rows().unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+    assert_eq!(
+        stale_integrity_check.stmt_status(StatementStatusCounter::Reprepare),
+        1
+    );
 }
 
 /// What this test checks: Auto-checkpoint post-commit failure does not invalidate committed transaction visibility on restart.
