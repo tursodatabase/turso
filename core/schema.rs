@@ -3500,6 +3500,12 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
             bail_parse_error!("bind parameters prohibited in generated columns");
         }
 
+        Expr::Literal(
+            ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp,
+        ) => {
+            bail_parse_error!("non-deterministic functions prohibited in generated columns");
+        }
+
         Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_) | Expr::InTable { .. } => {
             bail_parse_error!("subqueries prohibited in generated columns");
         }
@@ -5091,6 +5097,13 @@ impl Index {
                 return Ok(WalkControl::SkipChildren);
             }
             match e {
+                Expr::Literal(
+                    ast::Literal::CurrentDate
+                    | ast::Literal::CurrentTime
+                    | ast::Literal::CurrentTimestamp,
+                ) => {
+                    ok = false;
+                }
                 Expr::Literal(_) | Expr::RowId { .. } => {}
                 // Unqualified identifier: must be a column of the target table or ROWID
                 Expr::Id(n) => {

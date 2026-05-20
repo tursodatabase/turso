@@ -217,7 +217,7 @@ pub fn translate_create_index(
 
     if !idx.validate_where_expr(&table, resolver) {
         crate::bail_parse_error!(
-            "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
+            "Error: cannot use non-deterministic expressions, aggregate/window functions, subqueries, or references to other tables in WHERE clause of CREATE INDEX:\n {}",
             where_clause
                 .as_ref()
                 .expect("where expr has to exist in order to fail")
