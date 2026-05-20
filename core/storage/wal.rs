@@ -2562,7 +2562,7 @@ pub struct WalFile {
 
     io_ctx: RwLock<IOContext>,
 
-    /// Set when `write_frame_raw` appends frames without a commit marker
+    /// Set when this connection appends frames without a commit marker
     /// (`db_size == 0`), meaning the coordination backend's max_frame is
     /// behind our connection-local max_frame. Cleared once
     /// `finish_append_frames_commit` publishes the state.
@@ -3807,7 +3807,11 @@ impl Wal for WalFile {
         self.coordination.rollback_cache(cache_rollback_frame);
         *self.last_checksum.write() = last_checksum;
         self.max_frame.store(max_frame, Ordering::Release);
-        if !is_savepoint {
+        if is_savepoint {
+            self.has_unpublished_frames
+                .store(max_frame > snapshot.max_frame, Ordering::Release);
+        } else {
+            self.has_unpublished_frames.store(false, Ordering::Release);
             self.reset_internal_states();
         }
     }
@@ -4060,10 +4064,11 @@ impl Wal for WalFile {
                     )
                 } else if snapshot != local_state.snapshot {
                     if self.has_unpublished_frames.load(Ordering::Acquire) {
-                        // write_frame_raw appended frames without a commit
-                        // marker (db_size == 0), so the coordination backend's
-                        // max_frame is behind our local max_frame. Chain from
-                        // local state so we don't overwrite those frames.
+                        // write_frame_raw/cache spill appended frames without
+                        // a commit marker (db_size == 0), so the coordination
+                        // backend's max_frame is behind our local max_frame.
+                        // Chain from local state so we don't overwrite those
+                        // frames.
                         (
                             local_state.snapshot.last_checksum,
                             local_state.snapshot.max_frame + 1,
@@ -4180,6 +4185,10 @@ impl Wal for WalFile {
     /// as it prevents prematurely modifing WAL state before durability is ensured.
     fn append_frames_vectored(&self, pages: Vec<PageRef>, page_sz: PageSize) -> Result<Completion> {
         turso_assert!(
+            !pages.is_empty(),
+            "append_frames_vectored requires at least one page"
+        );
+        turso_assert!(
             pages.len() <= IOV_MAX,
             "we limit number of iovecs to IOV_MAX"
         );
@@ -4279,6 +4288,7 @@ impl Wal for WalFile {
         for (page, fid, csum) in &page_frame_and_checksum {
             self.complete_append_frame(page.get().id as u64, *fid, *csum);
         }
+        self.has_unpublished_frames.store(true, Ordering::Release);
 
         Ok(c)
     }
@@ -4877,6 +4887,7 @@ impl WalFile {
         self.min_frame.store(0, Ordering::Release);
         self.checkpoint_seq
             .store(snapshot.checkpoint_seq, Ordering::Release);
+        self.has_unpublished_frames.store(false, Ordering::Release);
     }
 
     // unlock shared read locks taken by RESTART/TRUNCATE checkpoint modes
@@ -6205,6 +6216,60 @@ pub mod test {
         assert!(page.is_dirty());
         assert!(!page.has_wal_tag());
         assert_eq!(page.get_contents().as_ptr()[17], 0xaa);
+    }
+
+    #[test]
+    fn append_frames_vectored_keeps_spill_frames_in_next_commit_chain() {
+        let page_size = 512;
+        let (io, buffer_pool, wal, _file) = make_initialized_hooked_wal(page_size);
+
+        // Spill/cacheflush frames have db_size=0, so they advance only the
+        // writer's local WAL state until the later commit frame publishes the
+        // transaction. The next commit must append after this private suffix.
+        let spilled = page_with_pattern(2, 0x20, &buffer_pool);
+        spilled.set_dirty();
+        spilled.set_write_pending();
+        let completion = wal
+            .append_frames_vectored(vec![spilled], PageSize::new(page_size).unwrap())
+            .unwrap();
+        io.wait_for_completion(completion).unwrap();
+
+        assert_eq!(wal.get_max_frame(), 1);
+        assert_eq!(wal.load_coordination_snapshot().max_frame, 0);
+
+        let committed = page_with_pattern(3, 0x30, &buffer_pool);
+        committed.set_dirty();
+        committed.set_write_pending();
+        let prepared = wal
+            .prepare_frames(
+                &[committed],
+                PageSize::new(page_size).unwrap(),
+                Some(99),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(prepared.offset, wal.frame_offset(2));
+        assert_eq!(prepared.final_max_frame, 2);
+
+        let file = wal.wal_file().unwrap();
+        let completion = file
+            .pwritev(
+                prepared.offset,
+                prepared.bufs.clone(),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap();
+        io.wait_for_completion(completion).unwrap();
+        wal.commit_prepared_frames(std::slice::from_ref(&prepared));
+        wal.finalize_committed_pages(std::slice::from_ref(&prepared));
+        wal.finish_append_frames_commit().unwrap();
+
+        assert_eq!(wal.load_coordination_snapshot().max_frame, 2);
+        assert_eq!(
+            wal.coordination.iter_latest_frames(0, 2),
+            vec![(2, 1), (3, 2)]
+        );
     }
 
     fn first_pragma_i64(conn: &Arc<Connection>, pragma: &str) -> i64 {
