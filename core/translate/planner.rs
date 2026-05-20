@@ -32,7 +32,6 @@ use crate::{
     vdbe::builder::ProgramBuilder,
 };
 use smallvec::SmallVec;
-use turso_parser::ast::Literal::Null;
 use turso_parser::ast::{
     self, As, Expr, FromClause, JoinType, Materialized, Over, QualifiedName, Select,
     TableInternalId, With,
@@ -1160,14 +1159,9 @@ fn transform_args_into_where_terms(
                 column: i,
                 is_rowid_alias: col.is_rowid_alias(),
             };
-            let expr = match arg_expr.as_ref() {
-                Expr::Literal(Null) => Expr::IsNull(Box::new(column_expr)),
-                other => Expr::Binary(
-                    column_expr.into(),
-                    ast::Operator::Equals,
-                    other.clone().into(),
-                ),
-            };
+            // Positional TVF arguments must stay equality constraints so NULL
+            // arguments are forwarded through VFilter instead of becoming residual predicates.
+            let expr = Expr::Binary(column_expr.into(), ast::Operator::Equals, arg_expr.clone());
             predicates.push(expr);
         }
     }
