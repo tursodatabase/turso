@@ -168,3 +168,29 @@ test('Session resets baton after HTTP error', async t => {
   // Baton should be null so the next request starts a fresh stream
   t.is(session['baton'], null);
 });
+
+test('Session.batch encodes named arguments for statement objects', async t => {
+  const session = new Session({ url: 'http://fake-host' });
+  const requests = [];
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (url, opts) => {
+    requests.push(JSON.parse(opts.body));
+    return new Response(
+      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 1 })}\n`,
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  };
+
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  await session.batch([
+    { sql: 'INSERT INTO users(name, age) VALUES(:name, :age)', args: { name: 'alice', age: 30 } }
+  ]);
+
+  t.deepEqual(requests[0].batch.steps[0].stmt.args, []);
+  t.deepEqual(requests[0].batch.steps[0].stmt.named_args, [
+    { name: 'name', value: { type: 'text', value: 'alice' } },
+    { name: 'age', value: { type: 'integer', value: '30' } },
+  ]);
+});

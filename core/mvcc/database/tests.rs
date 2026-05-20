@@ -5,6 +5,7 @@ use crate::io::PlatformIO;
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
+use crate::mvcc::database::CommitYieldPoint;
 use crate::mvcc::persistent_storage::logical_log::{
     ENCRYPTED_PAYLOAD_CHUNK_SIZE, FRAME_MAGIC, LOG_HDR_SIZE,
 };
@@ -18,7 +19,9 @@ use crate::storage::sqlite3_ondisk::{
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
-use crate::{Buffer, Completion, DatabaseOpts, EncryptionKey, LimboError, OpenFlags};
+use crate::{
+    Buffer, Completion, DatabaseOpts, EncryptionKey, LimboError, OpenFlags, StatementStatusCounter,
+};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use rand::{Rng, SeedableRng};
@@ -52,6 +55,10 @@ impl FixedYieldInjector {
             remaining: Mutex::new(points.into_iter().collect()),
         })
     }
+
+    fn is_empty(&self) -> bool {
+        self.remaining.lock().is_empty()
+    }
 }
 
 impl YieldInjector for FixedYieldInjector {
@@ -70,6 +77,10 @@ impl FixedFailureInjector {
         Arc::new(Self {
             remaining: Mutex::new(points.into_iter().collect()),
         })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remaining.lock().is_empty()
     }
 }
 
@@ -2258,6 +2269,181 @@ fn test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit() {
     );
 }
 
+/// What this test checks: ordinary prepared reads recompile when checkpoint publishes a table root page.
+/// Why this matters: root publication invalidates compiled bytecode generally, not only PRAGMA integrity_check.
+#[test]
+fn test_prepared_select_reprepares_after_checkpoint_root_publish() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    let mut stmt = conn.prepare("SELECT id, v FROM t ORDER BY id").unwrap();
+    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 0);
+
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(&rows[0][1].to_string(), "a");
+    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 1);
+}
+
+/// What this test checks: data-only MVCC checkpoints do not invalidate already-prepared statements.
+/// Why this matters: only root/drop publication should force reprepare; ordinary row checkpointing should leave prepared bytecode reusable.
+#[test]
+fn test_prepared_select_does_not_reprepare_after_data_only_checkpoint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mut stmt = conn.prepare("SELECT id, v FROM t ORDER BY id").unwrap();
+    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 0);
+
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(&rows[0][1].to_string(), "a");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(&rows[1][1].to_string(), "b");
+    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 0);
+}
+
+/// What this test checks: prepared index lookups recompile when checkpoint publishes an index root page.
+/// Why this matters: table and index roots are published independently, and stale index bytecode must not survive checkpoint.
+#[test]
+fn test_prepared_index_lookup_reprepares_after_checkpoint_root_publish() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, payload TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT id, payload FROM t INDEXED BY idx_t_v WHERE v = 'b'")
+        .unwrap();
+    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 0);
+
+    conn.execute("INSERT INTO t VALUES (1, 'a', 'one')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'b', 'two')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    assert_eq!(&rows[0][1].to_string(), "two");
+    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 1);
+}
+
+/// Runs an auto-checkpoint, forces it to yield, then injects an error after the
+/// pager commit has made the new root pages visible. Even though later checkpoint
+/// cleanup fails, prepared integrity_check statements must use the committed root
+/// pages and report a clean database.
+#[test]
+fn test_integrity_check_after_checkpoint_io_yield_then_post_durable_failure_uses_user_apis() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    let stale_schema_conn = db.connect();
+    let mut stale_integrity_check = stale_schema_conn.prepare("PRAGMA integrity_check").unwrap();
+    let schema_version = get_rows(&conn, "PRAGMA schema_version");
+    assert_eq!(schema_version.len(), 1);
+    let schema_version_before_checkpoint = schema_version[0][0].as_int().unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforeAcquireLock.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let failure_injector = FixedFailureInjector::new([(
+        CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
+        LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+    )]);
+    conn.set_failure_injector(Some(failure_injector.clone()));
+
+    let mut same_conn_stale_integrity_check = conn.prepare("PRAGMA integrity_check").unwrap();
+    let mut insert_stmt = conn.prepare("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let mut yielded_before_checkpoint_lock = false;
+    for _ in 0..10_000 {
+        match insert_stmt.step().unwrap() {
+            crate::StepResult::IO if injector.is_empty() => {
+                yielded_before_checkpoint_lock = true;
+                break;
+            }
+            crate::StepResult::IO => {}
+            crate::StepResult::Done => {
+                panic!("INSERT completed before checkpoint acquire-lock yield fired")
+            }
+            other => panic!("unexpected INSERT step result before yield: {other:?}"),
+        }
+    }
+    assert!(
+        yielded_before_checkpoint_lock,
+        "expected INSERT auto-checkpoint to yield before acquiring the checkpoint lock"
+    );
+
+    let mut completed_after_durable_boundary_failure = false;
+    for _ in 0..10_000 {
+        match insert_stmt.step() {
+            Ok(crate::StepResult::Done) if failure_injector.is_empty() => {
+                completed_after_durable_boundary_failure = true;
+                break;
+            }
+            Ok(crate::StepResult::Done) => {
+                panic!("INSERT completed before checkpoint durable-boundary failure fired")
+            }
+            Err(err) => panic!("unexpected INSERT error after yield: {err:?}"),
+            Ok(crate::StepResult::IO) => {}
+            Ok(other) => panic!("unexpected INSERT step result after yield: {other:?}"),
+        }
+    }
+    assert!(
+        completed_after_durable_boundary_failure,
+        "expected INSERT auto-checkpoint to observe durable-boundary failure and finish"
+    );
+
+    conn.set_yield_injector(None);
+    conn.set_failure_injector(None);
+
+    let schema_version = get_rows(&conn, "PRAGMA schema_version");
+    assert_eq!(schema_version.len(), 1);
+    assert_eq!(
+        schema_version[0][0].as_int().unwrap(),
+        schema_version_before_checkpoint
+    );
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    let rows = same_conn_stale_integrity_check.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    let rows = stale_integrity_check.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    let rows = get_rows(&stale_schema_conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(&rows[0][1].to_string(), "a");
+}
+
 /// What this test checks: Auto-checkpoint post-commit failure does not invalidate committed transaction visibility on restart.
 /// Why this matters: Commit contract must remain stable even when checkpoint cleanup fails mid-flight.
 #[test]
@@ -2535,6 +2721,237 @@ fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
     let integrity = get_rows(&conn, "PRAGMA integrity_check");
     assert_eq!(integrity.len(), 1);
     assert_eq!(&integrity[0][0].to_string(), "ok");
+}
+
+/// What this test checks: if one checkpoint makes a unique-index delete durable in the B-tree
+/// but fails before MVCC cleanup finishes, a later checkpoint retry must not try to delete that
+/// same unique key again.
+///
+/// Steps:
+/// 1. Disable automatic checkpoints.
+/// 2. Insert `(75, 'blue_river_906')`.
+/// 3. Checkpoint it so the blue key is durable in the B-tree.
+/// 4. Start and roll back a concurrent delete to leave stale MVCC state behind.
+/// 5. Update row `75` to `old_path_352`.
+/// 6. Run a checkpoint that commits pager changes and then fails after advancing the durable boundary.
+/// 7. Update row `75` again to `empty_path_27`, then to `shy_cloud_434`.
+/// 8. Retry checkpoint. Before the fix, this retried the old blue-key delete and hit
+///    `Corrupt("MVCC delete ... not found")`.
+#[test]
+fn test_checkpoint_retry_does_not_replay_checkpointed_btree_resident_unique_delete() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX idx_t_v ON t(v)").unwrap();
+    conn.execute("INSERT INTO t VALUES (75, 'blue_river_906')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 75").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("UPDATE t SET v = 'old_path_352' WHERE id = 75")
+        .unwrap();
+
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 'blue_river_906'");
+    assert!(
+        rows.is_empty(),
+        "old unique key should no longer be visible"
+    );
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 'old_path_352'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 75);
+
+    let ckpt = db.connect();
+    ckpt.set_failure_injector(Some(FixedFailureInjector::new([(
+        CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
+        LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+    )])));
+    let err = ckpt
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect_err("checkpoint should fail");
+    assert!(
+        matches!(err, LimboError::TxError(_)),
+        "expected injected checkpoint failure, got: {err:?}"
+    );
+
+    conn.execute("UPDATE t SET v = 'empty_path_27' WHERE id = 75")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("UPDATE t SET v = 'shy_cloud_434' WHERE id = 75")
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 'empty_path_27'");
+    assert!(
+        rows.is_empty(),
+        "intermediate unique key should not remain visible"
+    );
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 'shy_cloud_434'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 75);
+
+    let retry_conn = db.connect();
+    retry_conn
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("retry checkpoint should not replay the already-durable blue delete");
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t WHERE id = 75");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 75);
+    assert_eq!(rows[0][1].cast_text().unwrap(), "shy_cloud_434");
+
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 'blue_river_906'");
+    assert!(
+        rows.is_empty(),
+        "blue key should stay absent after checkpoint retry"
+    );
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 'old_path_352'");
+    assert!(
+        rows.is_empty(),
+        "old_path key should stay absent after checkpoint retry"
+    );
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 'empty_path_27'");
+    assert!(
+        rows.is_empty(),
+        "empty_path key should stay absent after checkpoint retry"
+    );
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE v = 'shy_cloud_434'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 75);
+
+    let integrity = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(&integrity[0][0].to_string(), "ok");
+}
+
+/// What this test checks: user-facing SQL plus a commit yield can produce out-of-order commit completion without lowering checkpoint metadata.
+#[test]
+fn test_checkpoint_stale_unique_index_delete_with_out_of_order_commit_yield() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO s VALUES (1, 'first')").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'second')").unwrap();
+    conn.execute("INSERT INTO t VALUES (75, 'blue_river_906')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let older = db.connect();
+    older.execute("BEGIN CONCURRENT").unwrap();
+    older
+        .execute("UPDATE s SET v = 'older_commit' WHERE id = 1")
+        .unwrap();
+    older.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    let mut older_commit = older.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(older_commit.step().unwrap(), StepResult::IO),
+        "older commit should yield after taking its commit timestamp"
+    );
+
+    let updater = db.connect();
+    updater.execute("BEGIN CONCURRENT").unwrap();
+    updater
+        .execute("UPDATE t SET v = 'old_path_352' WHERE id = 75")
+        .unwrap();
+    updater.execute("COMMIT").unwrap();
+
+    older_commit.run_ignore_rows().unwrap();
+    drop(older_commit);
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t WHERE id = 75");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 75);
+    assert_eq!(&rows[0][1].to_string(), "old_path_352");
+}
+
+/// What this test checks: SQL-only recovery must not replay a CREATE TABLE frame already made durable by checkpoint.
+/// Why this matters: a regressed checkpoint boundary can make recovery replay the pre-checkpoint schema row with its negative root page after WAL recovery has already installed the positive root page.
+///
+/// Steps:
+/// 1. Disable automatic checkpoints and create a baseline table.
+/// 2. Checkpoint the baseline state so the durable boundary is non-zero.
+/// 3. Start an older concurrent transaction and yield it after it commits, releases the
+///    commit lock, and is just about to update the committed timestamp watermark.
+/// 4. Commit a newer `CREATE TABLE` plus row insert through ordinary SQL.
+/// 5. Resume the older transaction; without a monotonic committed watermark this regresses
+///    the checkpoint boundary source.
+/// 6. Run a checkpoint that fails after pager commit, leaving WAL recovery to install the
+///    checkpointed schema row with its positive root page.
+/// 7. Restart and query the created table; recovery must not also replay the stale logical-log
+///    `CREATE TABLE` frame whose schema row still has the negative MVCC root page.
+#[test]
+fn test_checkpoint_stale_boundary_does_not_replay_checkpointed_create_table_after_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO s VALUES (1, 'first')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        let older = db.connect();
+        older.execute("BEGIN CONCURRENT").unwrap();
+        older
+            .execute("UPDATE s SET v = 'older_commit' WHERE id = 1")
+            .unwrap();
+        older.set_yield_injector(Some(FixedYieldInjector::new([
+            CommitYieldPoint::BeforeCommittedTimestampWatermarkUpdate.point(),
+        ])));
+        let mut older_commit = older.prepare("COMMIT").unwrap();
+        assert!(
+            matches!(older_commit.step().unwrap(), StepResult::IO),
+            "older commit should yield before updating the committed timestamp watermark"
+        );
+
+        let creator = db.connect();
+        creator
+            .execute("CREATE TABLE created_after_yield (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        creator
+            .execute("INSERT INTO created_after_yield VALUES (1, 'persisted')")
+            .unwrap();
+
+        older_commit.run_ignore_rows().unwrap();
+        drop(older_commit);
+
+        conn.set_failure_injector(Some(FixedFailureInjector::new([(
+            CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
+            LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+        )])));
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect_err("checkpoint should fail after pager commit");
+        conn.set_failure_injector(None);
+    };
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM created_after_yield ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(&rows[0][1].to_string(), "persisted");
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let rows = get_rows(&conn, "SELECT id, v FROM created_after_yield ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(&rows[0][1].to_string(), "persisted");
 }
 
 /// What this test checks: Replay gate uses metadata boundary and never applies frames at or below it.
@@ -3218,13 +3635,13 @@ fn test_future_row() {
 }
 
 use crate::mvcc::cursor::MvccLazyCursor;
+use crate::mvcc::database::CommitYieldPoint::LogRecordPrepared;
 use crate::mvcc::database::{MvStore, Row, RowID};
 use crate::types::Text;
 use crate::Value;
 use crate::{Database, StepResult};
 use crate::{MemoryIO, Statement};
 use crate::{ValueRef, DATABASE_MANAGER};
-
 // Simple atomic clock implementation for testing
 
 fn setup_test_db() -> (MvccTestDb, u64, MVTableId, i64) {
@@ -4652,6 +5069,67 @@ fn test_commit_dep_readonly_does_not_advance_timestamp() {
     );
 }
 
+/// What this test checks: the committed timestamp cache is a monotonic watermark even when independent commits finish out of timestamp order.
+/// Why this matters: checkpoints use this cache as a durable replay boundary; lowering it can make DB pages advance past MVCC metadata.
+#[test]
+fn test_last_committed_timestamp_is_monotonic_for_out_of_order_commits() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    setup.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a
+        .execute("UPDATE t SET v = 'a1' WHERE id = 1")
+        .unwrap();
+    let tx_a_id = conn_a.get_mv_tx_id().expect("tx_a should be active");
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(commit_a.step().unwrap(), StepResult::IO),
+        "tx_a should yield after getting its commit timestamp"
+    );
+    let tx_a_end_ts = match mvcc_store
+        .txs
+        .get(&tx_a_id)
+        .expect("tx_a should still be tracked")
+        .value()
+        .state
+        .load()
+    {
+        TransactionState::Preparing(ts) => ts,
+        state => panic!("expected tx_a to be Preparing, got {state:?}"),
+    };
+
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b
+        .execute("UPDATE t SET v = 'b1' WHERE id = 2")
+        .unwrap();
+    conn_b.execute("COMMIT").unwrap();
+    let tx_b_committed = mvcc_store.last_committed_tx_ts.load(Ordering::Acquire);
+    assert!(
+        tx_b_committed > tx_a_end_ts,
+        "tx_b should commit at a newer timestamp than the yielded tx_a"
+    );
+
+    commit_a.run_ignore_rows().unwrap();
+    let final_watermark = mvcc_store.last_committed_tx_ts.load(Ordering::Acquire);
+    assert_eq!(
+        final_watermark, tx_b_committed,
+        "finishing an older commit must not lower the committed timestamp watermark"
+    );
+}
+
 /// Test that a new transaction can still acquire the exclusive lock after a
 /// read-only dependent tx commits. Before the fix, the read-only tx would
 /// advance last_committed_tx_ts via CommitEnd, making acquire_exclusive_tx
@@ -4752,6 +5230,79 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
         "acquire_exclusive_tx should not return Busy after a read-only dependent committed: {acquire_result:?}",
     );
     mvcc_store.release_exclusive_tx(&exclusive_tx_id);
+}
+
+#[test]
+fn test_exclusive_tx_does_not_deadlock_behind_preparing_concurrent_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    conn_a
+        .execute("CREATE TABLE t (key TEXT PRIMARY KEY, value BLOB)")
+        .unwrap();
+
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a
+        .execute("INSERT INTO t VALUES ('a', zeroblob(16))")
+        .unwrap();
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(commit_a.step().unwrap(), StepResult::IO),
+        "first commit must pause after publishing Preparing and before taking the log lock",
+    );
+
+    let conn_b = db.connect();
+    let mut insert_b = conn_b
+        .prepare("INSERT INTO t VALUES ('b', zeroblob(16))")
+        .unwrap();
+    let mut saw_busy = false;
+    for _ in 0..64 {
+        match insert_b.step() {
+            Ok(StepResult::IO) => continue,
+            Ok(StepResult::Busy) | Err(LimboError::Busy) => {
+                saw_busy = true;
+                break;
+            }
+            Ok(StepResult::Done) => {
+                panic!("exclusive insert started while another tx was Preparing")
+            }
+            Ok(other) => panic!("unexpected insert step result: {other:?}"),
+            Err(err) => panic!("unexpected insert error: {err:?}"),
+        }
+    }
+    assert!(
+        saw_busy,
+        "exclusive insert should return Busy instead of waiting while holding the log lock",
+    );
+    insert_b.reset().unwrap();
+
+    let mut committed = false;
+    for _ in 0..1024 {
+        match commit_a.step().unwrap() {
+            StepResult::Done => {
+                committed = true;
+                break;
+            }
+            StepResult::IO => {}
+            other => panic!("unexpected commit step result: {other:?}"),
+        }
+    }
+    assert!(
+        committed,
+        "paused concurrent commit should finish after Busy"
+    );
+
+    conn_a.set_yield_injector(None);
+
+    let rows = get_rows(&conn_a, "SELECT key FROM t ORDER BY key");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_text().unwrap(), "a");
+
+    conn_a.close().unwrap();
+    conn_b.close().unwrap();
 }
 
 /// Insert a synthetic table and a single row via the MVCC store, then commit.
@@ -4954,6 +5505,83 @@ fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     })
     .unwrap();
     rows
+}
+
+/// Any ddl specially CREATE INDEX must cause SchemaUpdated errors on ongoing INSERTS because
+/// we shouldn't commit an insert without inserting rows to this new index that is being created.
+/// Here we test that case by injecting in the middle of CREATE INDEX's commit and then doing a
+/// regular concurrent insert that will not take into account new index.
+#[test]
+fn test_insert_in_middle_commit_of_create_index_returns_err() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let setup = db.connect();
+        setup
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c INTEGER)")
+            .unwrap();
+        setup.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        setup.close().unwrap();
+    }
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    // T1 (conn_a): CREATE INDEX, yielding at `LogRecordPrepared` — the
+    // point in the commit pipeline where `end_ts` has been assigned and the
+    // log record is built, but the global header and
+    // `last_committed_schema_change_ts` haven't been published yet.
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    let mut create_idx = conn_a.prepare("CREATE INDEX i ON t(c)").unwrap();
+    let mut yielded = false;
+    for _ in 0..200 {
+        match create_idx.step().unwrap() {
+            StepResult::IO => {
+                yielded = true;
+                break;
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert!(
+        yielded,
+        "CREATE INDEX should yield at CommitYieldPoint::LogRecordPrepared"
+    );
+
+    // T2 (conn_b): start a new tx now — its begin_ts will be > T1's end_ts,
+    // but the global schema view still doesn't know about the new index `i`.
+    // The INSERT compiles its bytecode against the stale schema and emits
+    // IdxInsert ops only for the indexes the stale schema knows about.
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+
+    // T1 finishes finalizing the CREATE INDEX. After this point, the global
+    // header carries the new schema_cookie and `last_committed_schema_change_ts`
+    // is bumped to T1's `end_ts`.
+    create_idx.run_ignore_rows().unwrap();
+    drop(create_idx);
+
+    // T2 commits. The schema-conflict check at `CommitState::Initial` compares
+    // `last_committed_schema_change_ts (= T1.end_ts) > tx_b.begin_ts (> T1.end_ts)`
+    // which is FALSE — so no conflict is raised and T2 commits cleanly, even
+    // though its writes never touched the new index.
+
+    let commit_result = conn_b.execute("COMMIT");
+
+    assert!(
+        matches!(
+            commit_result,
+            Err(LimboError::SchemaConflict | LimboError::SchemaUpdated)
+        ),
+        "BUG: tx_b's COMMIT returned {commit_result:?} but should have been \
+         aborted with SchemaConflict/SchemaUpdated. tx_b began with a stale \
+         schema (missing index `i`), so its INSERT silently skipped writing \
+         to that index. Allowing the commit leaves `i` permanently short the \
+         row tx_b wrote."
+    );
 }
 
 /// What this test checks: MVCC transaction visibility and conflict handling follow the intended isolation behavior.
@@ -5673,6 +6301,178 @@ fn test_mvcc_integrity_check() {
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
     ensure_integrity();
+}
+
+#[test]
+fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
+    fn run_pager_until_done<T>(
+        mut action: impl FnMut() -> Result<IOResult<T>>,
+        pager: &Pager,
+    ) -> Result<T> {
+        loop {
+            match action()? {
+                IOResult::Done(value) => return Ok(value),
+                IOResult::IO(io) => io.wait(pager.io.as_ref())?,
+            }
+        }
+    }
+
+    let db = MvccTestDb::new();
+    let pager = db.conn.pager.load().clone();
+    let index = crate::schema::Index {
+        name: "testindex".to_string(),
+        table_name: "test".to_string(),
+        root_page: 0,
+        columns: vec![crate::schema::IndexColumn {
+            name: "id".to_string(),
+            order: turso_parser::ast::SortOrder::Asc,
+            pos_in_table: 0,
+            collation: None,
+            default: None,
+            expr: None,
+        }],
+        unique: true,
+        ephemeral: false,
+        has_rowid: true,
+        where_clause: None,
+        index_method: None,
+        on_conflict: None,
+    };
+
+    pager.begin_read_tx().unwrap();
+    run_pager_until_done(
+        || pager.begin_write_tx(crate::storage::wal::WalAutoActions::all_enabled()),
+        pager.as_ref(),
+    )
+    .unwrap();
+    let root_page = pager
+        .io
+        .block(|| pager.btree_create(&crate::storage::pager::CreateBTreeFlags::new_index()))
+        .unwrap() as i64;
+    let cursor = Arc::new(RwLock::new(BTreeCursor::new_index(
+        pager.clone(),
+        root_page,
+        &index,
+        index.columns.len(),
+    )));
+
+    for key in 1..=600 {
+        let record = ImmutableRecord::from_values(&[Value::from_i64(key), Value::from_i64(key)], 2);
+        let seek_result = run_pager_until_done(
+            || {
+                cursor.write().seek(
+                    crate::types::SeekKey::IndexKey(&record),
+                    crate::types::SeekOp::GE { eq_only: true },
+                )
+            },
+            pager.as_ref(),
+        )
+        .unwrap();
+        if matches!(seek_result, SeekResult::TryAdvance) {
+            run_pager_until_done(|| cursor.write().next(), pager.as_ref()).unwrap();
+        }
+        run_pager_until_done(
+            || cursor.write().insert(&BTreeKey::new_index_key(&record)),
+            pager.as_ref(),
+        )
+        .unwrap();
+    }
+    run_pager_until_done(|| pager.commit_tx(&db.conn, true), pager.as_ref()).unwrap();
+
+    pager.begin_read_tx().unwrap();
+    let mut interior_key = None;
+    for key in 1..=600 {
+        let record = ImmutableRecord::from_values(&[Value::from_i64(key), Value::from_i64(key)], 2);
+        let seek_result = run_pager_until_done(
+            || {
+                cursor.write().seek(
+                    crate::types::SeekKey::IndexKey(&record),
+                    crate::types::SeekOp::GE { eq_only: true },
+                )
+            },
+            pager.as_ref(),
+        )
+        .unwrap();
+        if matches!(seek_result, SeekResult::TryAdvance) {
+            interior_key = Some(key);
+            break;
+        }
+    }
+    let interior_key = interior_key.expect("test setup should create an index interior key");
+    let count_before = run_pager_until_done(|| cursor.write().count(), pager.as_ref()).unwrap();
+
+    run_pager_until_done(
+        || pager.begin_write_tx(crate::storage::wal::WalAutoActions::all_enabled()),
+        pager.as_ref(),
+    )
+    .unwrap();
+    let index_info = Arc::new(IndexInfo::new_from_index(&index));
+    let record = ImmutableRecord::from_values(
+        &[Value::from_i64(interior_key), Value::from_i64(interior_key)],
+        2,
+    );
+    let row_key = SortableIndexKey::new_from_record(record, index_info);
+    let row = Row::new_index_row(
+        RowID::new(MVTableId::new(-42), RowKey::Record(row_key)),
+        index.columns.len(),
+    );
+    let mut write_row_sm = db
+        .mvcc_store
+        .write_row_to_pager(&row, cursor.clone(), true)
+        .unwrap();
+    loop {
+        match write_row_sm.step(&()).unwrap() {
+            IOResult::Done(()) => break,
+            IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
+        }
+    }
+    run_pager_until_done(|| pager.commit_tx(&db.conn, true), pager.as_ref()).unwrap();
+
+    pager.begin_read_tx().unwrap();
+    let count_after = run_pager_until_done(|| cursor.write().count(), pager.as_ref()).unwrap();
+    assert_eq!(
+        count_after, count_before,
+        "checkpoint index writer should overwrite an existing interior key, not insert a duplicate"
+    );
+}
+
+#[test]
+fn test_sql_checkpoint_reinsert_existing_interior_index_key_keeps_sqlite_integrity() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path.as_ref().unwrap().clone();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(payload BLOB, id INTEGER UNIQUE)")
+        .unwrap();
+
+    for id in 1..=600 {
+        conn.execute(format!(
+            "INSERT INTO t(rowid, payload, id) VALUES ({id}, x'70796c6f6164', {id})"
+        ))
+        .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    for id in 1..=600 {
+        conn.execute(format!("DELETE FROM t WHERE id = {id}"))
+            .unwrap();
+        conn.execute(format!(
+            "INSERT INTO t(rowid, payload, id) VALUES ({id}, x'7265696e73657274', {id})"
+        ))
+        .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
+
+    conn.close().unwrap();
+    force_close_for_artifact_tamper(&mut db);
+
+    let sqlite = rusqlite::Connection::open(db_path).unwrap();
+    let integrity: String = sqlite
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
 }
 
 /// Test that integrity_check passes after DROP TABLE but before checkpoint.
@@ -7658,6 +8458,117 @@ fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
     observer.close().unwrap();
 }
 
+/// `step_build_log_record` chunks the commit's write_set into batches of
+/// `MVCC_COMMIT_BATCH_SIZE` rowids and yields between batches so that a
+/// large commit (e.g. CREATE INDEX over millions of rows) can't monopolize
+/// the executor.
+///
+/// We bracket the chunked yields with two injected yield points:
+/// `BuildLogRecordStart` (fires once on first entry into BuildLogRecord) and
+/// `LogRecordPrepared` (fires once after both passes complete). The IOs
+/// observed strictly between these two are the chunked yields, so the count
+/// is exact.
+///
+/// With `n_rows = 3 * BATCH_SIZE`, both passes (schema-row + data-row) walk
+/// the full write_set, each yielding twice and then transitioning without a
+/// final yield. Expected: 4 chunked yields between Start and Prepared.
+#[test]
+fn test_build_log_record_yields_for_large_write_set() {
+    use super::MVCC_COMMIT_BATCH_SIZE;
+
+    /// Yields once at each of the bracketing points and toggles the
+    /// corresponding flag so the test can detect when the bracket opens
+    /// and closes.
+    #[derive(Debug)]
+    struct BracketingYieldInjector {
+        start: YieldPoint,
+        end: YieldPoint,
+        started: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+    }
+    impl YieldInjector for BracketingYieldInjector {
+        fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+            if point == self.start && !self.started.load(Ordering::SeqCst) {
+                self.started.store(true, Ordering::SeqCst);
+                return true;
+            }
+            if point == self.end && !self.finished.load(Ordering::SeqCst) {
+                self.finished.store(true, Ordering::SeqCst);
+                return true;
+            }
+            false
+        }
+    }
+
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    let n_rows = 3 * MVCC_COMMIT_BATCH_SIZE;
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    for i in 1..=n_rows {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'val')"))
+            .unwrap();
+    }
+
+    let started = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    conn.set_yield_injector(Some(Arc::new(BracketingYieldInjector {
+        start: CommitYieldPoint::BuildLogRecordStart.point(),
+        end: CommitYieldPoint::LogRecordPrepared.point(),
+        started: started.clone(),
+        finished: finished.clone(),
+    })));
+
+    let mut stmt = conn.prepare("COMMIT").unwrap();
+    let mut chunked_io_yields = 0;
+    let mut saw_start = false;
+    loop {
+        match stmt.step().unwrap() {
+            crate::StepResult::IO => {
+                if !saw_start {
+                    // Wait for the BuildLogRecordStart yield to open the bracket.
+                    // IOs before this came from earlier states (Initial → Commit
+                    // → WaitForDependencies); they don't count.
+                    if started.load(Ordering::SeqCst) {
+                        saw_start = true;
+                    }
+                    continue;
+                }
+                if finished.load(Ordering::SeqCst) {
+                    // The IO we just popped is the LogRecordPrepared injection
+                    // closing the bracket. Don't count it.
+                    break;
+                }
+                // Strictly between Start and Prepared: a chunked yield from
+                // `Completion::new_yield()` in step_build_log_record's loop.
+                chunked_io_yields += 1;
+            }
+            crate::StepResult::Done => break,
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+
+    assert!(
+        saw_start,
+        "BuildLogRecordStart yield never fired — BuildLogRecord state never reached"
+    );
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "LogRecordPrepared yield never fired — BuildLogRecord did not complete"
+    );
+    // n_rows = 3 * BATCH_SIZE → 2 yields per pass × 2 passes = 4 chunked yields.
+    assert_eq!(
+        chunked_io_yields, 4,
+        "with {n_rows} rows, expected exactly 4 chunked IO yields between \
+         BuildLogRecordStart and LogRecordPrepared, got {chunked_io_yields}"
+    );
+
+    drop(stmt);
+    conn.close().unwrap();
+}
+
 /// Regression guard for the `mv_store.txs` ↔ `connection.mv_tx_id` divergence
 /// originally observed in production as `Transaction <id> not found while
 /// releasing savepoint` (panic) and `NoSuchTransactionID(<id>)` (read-path
@@ -7908,6 +8819,60 @@ fn test_close_persists_drop_table() {
     let rows = get_rows(&conn, "PRAGMA integrity_check");
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_abandoned_drop() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let io = Arc::new(MemoryIO::new());
+    let path = ":memory:";
+    let db = Database::open_file(io.clone(), path).unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, row_number INTEGER, ts INTEGER)")
+        .unwrap();
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS t_index \
+         ON t (row_number) WHERE ts IS NULL",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    assert!(conn.get_auto_commit());
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CursorYieldPoint::NextStart.point()
+    ])));
+    conn.execute("BEGIN").unwrap();
+    let mut drop_stmt = conn.prepare("DROP TABLE t").unwrap();
+    match drop_stmt.step().unwrap() {
+        crate::StepResult::IO => {}
+        other => panic!("expected injected IO yield mid-DROP TABLE; got {other:?}"),
+    }
+    conn.set_yield_injector(None);
+
+    drop_stmt.reset().unwrap();
+    drop(drop_stmt);
+
+    conn.execute("COMMIT").unwrap();
+
+    drop(conn);
+    drop(db);
+
+    let db = Database::open_file(io, path).expect(
+        "reopen should not fail; abandoned DROP must not have committed its partial Delete",
+    );
+    let conn = db.connect().unwrap();
+    let after = get_rows(
+        &conn,
+        "SELECT type, name FROM sqlite_schema \
+         WHERE tbl_name = 't' ORDER BY rowid",
+    );
+    assert!(
+        after.len() == 2,
+        "schema must not be half-dropped; got rows: {after:?}",
+    );
 }
 
 /// Reproducer: DROP INDEX ghost pages after restart without explicit checkpoint.
@@ -10194,4 +11159,812 @@ fn test_read_lock_leak_deferred_then_concurrent() {
     // After the error, SELECT should work without panicking
     let rows = get_rows(&conn1, "SELECT * FROM t1");
     assert_eq!(rows.len(), 1);
+}
+
+/// Regression for #6754: dropping a Statement that paused mid-IO inside
+/// op_new_rowid leaks the per-table RowidAllocator lock. With the Drop
+/// impl on MvccLazyCursor, end_new_rowid runs on cursor teardown so the
+/// next INSERT into the same table from any connection makes progress.
+#[test]
+fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
+    use std::time::{Duration, Instant};
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let leaker = db.connect();
+    let victim = db.connect();
+
+    // Force the seek that runs from inside op_new_rowid's SeekingToLast
+    // to yield IO at SeekStart. At that moment the rowid allocator lock
+    // is held.
+    leaker.set_yield_injector(Some(FixedYieldInjector::new([
+        CursorYieldPoint::SeekStart.point()
+    ])));
+
+    let mut leak_stmt = leaker
+        .prepare("INSERT INTO t VALUES (NULL, 'leaker')")
+        .unwrap();
+    match leak_stmt.step().unwrap() {
+        crate::StepResult::IO => {}
+        other => panic!("expected IO yield from injected seek_start; got {other:?}"),
+    }
+
+    // Drop the statement without advancing past the yield. The Drop impl
+    // on MvccLazyCursor must release the rowid allocator lock.
+    drop(leak_stmt);
+    leaker.set_yield_injector(None);
+
+    // A different connection must now be able to INSERT into the same
+    // table within a small budget.
+    let mut victim_stmt = victim
+        .prepare("INSERT INTO t VALUES (NULL, 'victim')")
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if Instant::now() >= deadline {
+            panic!("victim INSERT did not complete within 5s — rowid allocator lock leaked");
+        }
+        match victim_stmt.step().unwrap() {
+            crate::StepResult::Done => break,
+            crate::StepResult::IO => continue,
+            other => panic!("unexpected step result on victim INSERT: {other:?}"),
+        }
+    }
+}
+
+// https://github.com/tursodatabase/turso/issues/6752
+#[test]
+fn exclusive_commit_failure_at_after_remove_tx_strands_exclusive_atom() {
+    let db = MvccTestDbNoConn::new();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    conn_a
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn_a.execute("BEGIN IMMEDIATE").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    conn_a.set_failure_injector(Some(FixedFailureInjector::new([(
+        CommitYieldPoint::AfterRemoveTx.point(),
+        LimboError::TxError("synthetic AfterRemoveTx failure".to_string()),
+    )])));
+
+    conn_a
+        .execute("COMMIT")
+        .expect_err("COMMIT must surface the injected TxError");
+
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+
+    let mut commit_b = conn_b.prepare("COMMIT").unwrap();
+    let step_result = loop {
+        match commit_b.step() {
+            Ok(StepResult::IO) => continue,
+            other => break other,
+        }
+    };
+
+    match step_result {
+        Ok(StepResult::Done) => {}
+        Ok(other) => panic!("stage 3: unexpected step result: {other:?}"),
+        Err(err) => panic!("INSERT after failed commit must not return error, got {err}"),
+    }
+}
+
+/// Regression for #6757: a Statement driving a CONCURRENT `COMMIT` that
+/// yields at `LogRecordPrepared` and is then dropped used to leave the tx
+/// in `Preparing`. The next statement on that connection would trip a
+/// `turso_assert_eq!(Active)` in `read_from_table_or_index` (process
+/// panic). The abort-side `cleanup_abandoned_mvcc_commit` hook now rolls
+/// back the orphan tx so a follow-up INSERT works against a fresh tx.
+#[test]
+fn dropped_concurrent_commit_does_not_strand_connection() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let conn = db.connect();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    let mv_store = db.get_mvcc_store();
+    let tx_id = conn
+        .get_mv_tx_id()
+        .expect("tx must be open after INSERT inside BEGIN CONCURRENT");
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            crate::StepResult::IO => {}
+            other => panic!("expected IO yield at LogRecordPrepared; got {other:?}"),
+        }
+    }
+    conn.set_yield_injector(None);
+
+    // Abort hook ran cleanup_abandoned_mvcc_commit → rollback_tx → tx is
+    // gone from `txs`, connection's mv_tx slot is cleared, AND
+    // transaction_state is reset to None so the next op_transaction takes
+    // the fresh-tx path instead of inheriting stale Write state.
+    assert!(
+        !mv_store.txs.contains_key(&tx_id),
+        "orphan tx must be rolled back by abort-side cleanup"
+    );
+    assert!(
+        conn.get_mv_tx_id().is_none(),
+        "connection's mv_tx slot must be cleared"
+    );
+    assert_eq!(
+        conn.get_tx_state(),
+        crate::connection::TransactionState::None,
+        "transaction_state must be reset after abort-side rollback"
+    );
+
+    // The next op must not panic on the would-be-Preparing tx — it should
+    // start a fresh autocommit tx instead.
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    let rows = get_rows(&conn, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+/// Regression for #6755: dropping a Statement driving an EXCLUSIVE
+/// (BEGIN IMMEDIATE) COMMIT at `LogRecordPrepared` used to leak both
+/// `pager_commit_lock` and the `exclusive_tx` atomic. With abort-side
+/// `cleanup_abandoned_mvcc_commit` calling `rollback_tx`, both are
+/// released and a second connection's BEGIN IMMEDIATE makes progress.
+#[test]
+fn dropped_exclusive_commit_releases_locks() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    conn_a.execute("BEGIN IMMEDIATE").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    let mv_store = db.get_mvcc_store();
+    let tx_a = conn_a
+        .get_mv_tx_id()
+        .expect("EXCLUSIVE tx_a must be open after INSERT");
+    assert!(
+        mv_store.is_exclusive_tx(&tx_a),
+        "EXCLUSIVE tx_a must own the exclusive_tx atomic"
+    );
+
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    {
+        let mut commit = conn_a.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            crate::StepResult::IO => {}
+            other => panic!("expected IO yield at LogRecordPrepared; got {other:?}"),
+        }
+    }
+    conn_a.set_yield_injector(None);
+
+    // After abort, exclusive_tx must be released.
+    assert!(
+        !mv_store.is_exclusive_tx(&tx_a),
+        "exclusive_tx must be released by abort-side cleanup"
+    );
+
+    // conn_b must be able to take the exclusive lock.
+    conn_b.execute("BEGIN IMMEDIATE").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    conn_b.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn_b, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+/// Regression for abandoned COMMIT cleanup with attached MVCC databases.
+/// Dropping the COMMIT while the main-db CommitStateMachine is paused must
+/// also roll back attached MVCC txs opened by the same SQL transaction.
+#[test]
+fn dropped_main_commit_rolls_back_attached_mvcc_txs() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir.path().join("aux.db");
+
+    let conn = db.connect();
+    conn.attach_database(aux_path.to_str().unwrap(), "aux")
+        .unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE aux.u (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'main')").unwrap();
+    conn.execute("INSERT INTO aux.u VALUES (1, 'aux')").unwrap();
+
+    let aux_db_id = conn.get_database_id_by_name("aux").unwrap();
+    let aux_mv_store = conn
+        .mv_store_for_db(aux_db_id)
+        .expect("attached aux database must be MVCC");
+    let aux_pager = conn.get_pager_from_database_index(&aux_db_id).unwrap();
+    let aux_tx_id = conn
+        .get_mv_tx_id_for_db(aux_db_id)
+        .expect("attached MVCC tx must be open after INSERT");
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            crate::StepResult::IO => {}
+            other => panic!("expected IO yield at LogRecordPrepared; got {other:?}"),
+        }
+    }
+    conn.set_yield_injector(None);
+
+    assert!(
+        conn.get_mv_tx_id_for_db(aux_db_id).is_none(),
+        "attached MVCC tx slot must be cleared when abandoned COMMIT is rolled back"
+    );
+    assert!(
+        !aux_mv_store.txs.contains_key(&aux_tx_id),
+        "attached MVCC tx must be removed from txs"
+    );
+    assert!(
+        !aux_pager.holds_read_lock(),
+        "attached pager read lock must be released"
+    );
+
+    let rows = get_rows(&conn, "SELECT id FROM aux.u ORDER BY id");
+    assert!(
+        rows.is_empty(),
+        "abandoned attached INSERT must not become visible"
+    );
+}
+
+/// Regression for abandoning COMMIT after it has advanced from the main
+/// MVCC phase into an attached MVCC CommitStateMachine.
+#[test]
+fn dropped_attached_commit_releases_attached_read_lock() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir.path().join("aux.db");
+
+    let conn = db.connect();
+    conn.attach_database(aux_path.to_str().unwrap(), "aux")
+        .unwrap();
+    conn.execute("CREATE TABLE aux.u (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO aux.u VALUES (1, 'aux')").unwrap();
+
+    let aux_db_id = conn.get_database_id_by_name("aux").unwrap();
+    let aux_mv_store = conn
+        .mv_store_for_db(aux_db_id)
+        .expect("attached aux database must be MVCC");
+    let aux_pager = conn.get_pager_from_database_index(&aux_db_id).unwrap();
+    let aux_tx_id = conn
+        .get_mv_tx_id_for_db(aux_db_id)
+        .expect("attached MVCC tx must be open after INSERT");
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            crate::StepResult::IO => {}
+            other => panic!("expected IO yield at attached LogRecordPrepared; got {other:?}"),
+        }
+    }
+    conn.set_yield_injector(None);
+
+    assert!(
+        conn.get_mv_tx_id_for_db(aux_db_id).is_none(),
+        "attached MVCC tx slot must be cleared"
+    );
+    assert!(
+        !aux_mv_store.txs.contains_key(&aux_tx_id),
+        "attached MVCC tx must be removed from txs"
+    );
+    assert!(
+        !aux_pager.holds_read_lock(),
+        "attached pager read lock must be released"
+    );
+}
+
+/// Regression for abandoning COMMIT while one attached MVCC database is
+/// paused mid-commit and another attached MVCC transaction is still pending.
+#[test]
+fn dropped_attached_commit_rolls_back_remaining_attached_mvcc_txs() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux1_path = aux_dir.path().join("aux1.db");
+    let aux2_path = aux_dir.path().join("aux2.db");
+
+    let conn = db.connect();
+    conn.attach_database(aux1_path.to_str().unwrap(), "aux1")
+        .unwrap();
+    conn.attach_database(aux2_path.to_str().unwrap(), "aux2")
+        .unwrap();
+    conn.execute("CREATE TABLE aux1.u (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE aux2.v (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO aux1.u VALUES (1, 'aux1')")
+        .unwrap();
+    conn.execute("INSERT INTO aux2.v VALUES (1, 'aux2')")
+        .unwrap();
+
+    let aux1_db_id = conn.get_database_id_by_name("aux1").unwrap();
+    let aux2_db_id = conn.get_database_id_by_name("aux2").unwrap();
+    let aux1_mv_store = conn
+        .mv_store_for_db(aux1_db_id)
+        .expect("attached aux1 database must be MVCC");
+    let aux2_mv_store = conn
+        .mv_store_for_db(aux2_db_id)
+        .expect("attached aux2 database must be MVCC");
+    let aux1_pager = conn.get_pager_from_database_index(&aux1_db_id).unwrap();
+    let aux2_pager = conn.get_pager_from_database_index(&aux2_db_id).unwrap();
+    let aux1_tx_id = conn
+        .get_mv_tx_id_for_db(aux1_db_id)
+        .expect("attached aux1 MVCC tx must be open after INSERT");
+    let aux2_tx_id = conn
+        .get_mv_tx_id_for_db(aux2_db_id)
+        .expect("attached aux2 MVCC tx must be open after INSERT");
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            crate::StepResult::IO => {}
+            other => panic!("expected IO yield at attached LogRecordPrepared; got {other:?}"),
+        }
+    }
+    conn.set_yield_injector(None);
+
+    assert!(
+        conn.get_mv_tx_id_for_db(aux1_db_id).is_none(),
+        "attached aux1 MVCC tx slot must be cleared"
+    );
+    assert!(
+        conn.get_mv_tx_id_for_db(aux2_db_id).is_none(),
+        "attached aux2 MVCC tx slot must be cleared"
+    );
+    assert!(
+        !aux1_mv_store.txs.contains_key(&aux1_tx_id),
+        "attached aux1 MVCC tx must be removed from txs"
+    );
+    assert!(
+        !aux2_mv_store.txs.contains_key(&aux2_tx_id),
+        "attached aux2 MVCC tx must be removed from txs"
+    );
+    assert!(
+        !aux1_pager.holds_read_lock(),
+        "attached aux1 pager read lock must be released"
+    );
+    assert!(
+        !aux2_pager.holds_read_lock(),
+        "attached aux2 pager read lock must be released"
+    );
+}
+
+/// DurableStorage::log_tx returning Busy should not leak pager_commit_lock.
+/// https://github.com/tursodatabase/turso/issues/6753.
+#[test]
+fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
+    use crate::io::FileSyncType;
+    use crate::mvcc;
+    use crate::mvcc::database::LogRecord;
+    use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
+    use crate::mvcc::persistent_storage::DurableStorage;
+    use crate::storage::encryption::EncryptionContext;
+    use crate::{CheckpointResult, File, Result, IO};
+    use std::time::Duration;
+
+    /// BusyOnLogTxStorage is a test double that can be stubbed to return [LimboError::Busy] from log_tx.
+    #[derive(Debug)]
+    struct BusyOnLogTxStorage {
+        inner: Arc<dyn DurableStorage>,
+        arm_log_tx_busy: AtomicBool,
+    }
+    impl BusyOnLogTxStorage {
+        fn new(inner: Arc<dyn DurableStorage>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                arm_log_tx_busy: AtomicBool::new(false),
+            })
+        }
+        fn arm(&self) {
+            self.arm_log_tx_busy.store(true, Ordering::Release);
+        }
+    }
+    impl DurableStorage for BusyOnLogTxStorage {
+        fn log_tx(
+            &self,
+            m: &LogRecord,
+            c: OnSerializationComplete<'_>,
+        ) -> Result<(Completion, u64)> {
+            if self.arm_log_tx_busy.swap(false, Ordering::AcqRel) {
+                return Err(LimboError::Busy);
+            }
+            self.inner.log_tx(m, c)
+        }
+        fn sync(&self, t: FileSyncType) -> Result<Completion> {
+            self.inner.sync(t)
+        }
+        fn update_header(&self) -> Result<Completion> {
+            self.inner.update_header()
+        }
+        fn truncate(&self) -> Result<Completion> {
+            self.inner.truncate()
+        }
+        fn get_logical_log_file(&self) -> Arc<dyn File> {
+            self.inner.get_logical_log_file()
+        }
+        fn should_checkpoint(&self) -> bool {
+            self.inner.should_checkpoint()
+        }
+        fn set_checkpoint_threshold(&self, t: i64) {
+            self.inner.set_checkpoint_threshold(t)
+        }
+        fn checkpoint_threshold(&self) -> i64 {
+            self.inner.checkpoint_threshold()
+        }
+        fn advance_logical_log_offset_after_success(&self, b: u64) {
+            self.inner.advance_logical_log_offset_after_success(b)
+        }
+        fn restore_logical_log_state_after_recovery(&self, o: u64, c: u32) {
+            self.inner.restore_logical_log_state_after_recovery(o, c)
+        }
+        fn set_header(&self, h: LogHeader) {
+            self.inner.set_header(h)
+        }
+        fn on_checkpoint_start(&self, m: u64) -> Result<()> {
+            self.inner.on_checkpoint_start(m)
+        }
+        fn on_checkpoint_end(&self, m: u64, r: Result<&CheckpointResult>) -> Result<()> {
+            self.inner.on_checkpoint_end(m, r)
+        }
+        fn encryption_ctx(&self) -> Option<EncryptionContext> {
+            self.inner.encryption_ctx()
+        }
+    }
+
+    fn drive_to_done_or_timeout(stmt: &mut Statement, budget: usize) {
+        for _ in 0..budget {
+            match stmt.step() {
+                Ok(StepResult::Done) => return,
+                Ok(StepResult::IO) => std::thread::sleep(Duration::from_millis(10)),
+                Ok(other) => panic!("unexpected step: {other:?}"),
+                Err(error) => panic!("received error: {error}"),
+            }
+        }
+        panic!("budged elapsed: {budget} iterations");
+    }
+
+    // Step 1: open normally so PRAGMA journal_mode=mvcc creates the logical log.
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}.db", rand::random::<u64>()));
+    let path_str = path.to_str().unwrap().to_string();
+    {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            &path_str,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+        DATABASE_MANAGER.lock().clear();
+    }
+
+    // Step 3: re-open with the busy-on-log_tx storage wrapper.
+    let log_path = path.with_extension("db-log");
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let log_file = io
+        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)
+        .unwrap();
+    let inner_storage: Arc<dyn DurableStorage> = Arc::new(mvcc::persistent_storage::Storage::new(
+        log_file,
+        io.clone(),
+        None,
+    ));
+    let busy_storage = BusyOnLogTxStorage::new(inner_storage);
+    let db = Database::open_file_with_flags_and_durable_storage(
+        io,
+        &path_str,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Some(busy_storage.clone() as Arc<dyn DurableStorage>),
+    )
+    .unwrap();
+
+    let conn_a = db.connect().unwrap();
+    let conn_b = db.connect().unwrap();
+    conn_a
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    let mv_store: Arc<MvStore<MvccClock>> = db.get_mv_store().clone().unwrap();
+
+    // Step 3: open a CONCURRENT tx, do an INSERT, then arm log_tx Busy.
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let tx_a = conn_a
+        .get_mv_tx_id()
+        .expect("tx_a must be open after INSERT");
+    assert!(
+        !mv_store.is_exclusive_tx(&tx_a),
+        "tx_a must be CONCURRENT (non-exclusive) so it goes through BeginCommitLogicalLog"
+    );
+    busy_storage.arm();
+
+    conn_a
+        .execute("COMMIT")
+        .expect_err("COMMIT must surface the injected Busy from log_tx");
+
+    // Step 4: from another CONCURRENT tx, do an INSERT; the INSERT should go through.
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+
+    let mut commit_b = conn_b.prepare("COMMIT").unwrap();
+    drive_to_done_or_timeout(&mut commit_b, 30); // this times out if pager_commit_lock is leaked
+}
+
+// https://github.com/tursodatabase/turso/issues/6757
+#[test]
+fn test_dropped_commit_corrupts_subsequent_insert() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    let conn = db.connect();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
+    conn.set_yield_injector(Some(FixedYieldInjector::new([LogRecordPrepared.point()])));
+
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            StepResult::IO | StepResult::Done => {}
+            other => panic!("unexpected step result: {other:?}"),
+        };
+    }
+
+    conn.execute("INSERT INTO t VALUES (2, 'second')").unwrap();
+}
+
+// https://github.com/tursodatabase/turso/issues/6755
+#[test]
+fn abandoned_exclusive_commit_should_not_block_subsequent_concurrent_writer() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    conn_a
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn_a.execute("BEGIN IMMEDIATE").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+
+    match conn_a.prepare("COMMIT").unwrap().step().unwrap() {
+        StepResult::IO => {} // tx will immediately hit injected yield point
+        other => panic!("tx should yield, got: {other:?}"),
+    }
+
+    assert!(
+        matches!(conn_a.prepare("COMMIT").unwrap().step().err().unwrap(),
+            LimboError::TxError(msg) if msg == "cannot commit - no transaction is active")
+    );
+
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    match conn_b.prepare("COMMIT").unwrap().step() {
+        Ok(StepResult::IO) => {}
+        Err(err) => panic!("conn_b COMMIT must not error; got: {err:?}"),
+        _ => {}
+    }
+}
+
+// https://github.com/tursodatabase/turso/issues/6751
+#[test]
+fn abandoned_commit_in_committed_state_should_not_block_subsequent_checkpoint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    conn_a
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn_a.execute("BEGIN IMMEDIATE").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeFinishCommittedTx.point(),
+    ])));
+
+    match conn_a.prepare("COMMIT").unwrap().step().unwrap() {
+        StepResult::IO => {}
+        other => panic!("tx should yield, got: {other:?}"),
+    }
+
+    let _ = conn_a.prepare("COMMIT").unwrap().step();
+
+    conn_b.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+}
+
+/// A concurrent explicit rowid insert must raise the allocator watermark before
+/// another transaction performs auto-rowid allocation. Otherwise later auto
+/// inserts can overwrite the explicit row and leave secondary indexes stale.
+#[test]
+fn test_concurrent_explicit_rowid_high_watermark_not_clobbered() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn0
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("INSERT INTO t(id, v) VALUES (1000, 'A-explicit')")
+        .unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t(v) VALUES ('B-auto')").unwrap();
+    conn2.execute("COMMIT").unwrap();
+    conn1.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn0, "SELECT rowid, v FROM t ORDER BY rowid");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1000);
+    assert_eq!(rows[0][1].to_string(), "A-explicit");
+    assert_eq!(rows[1][0].as_int().unwrap(), 1001);
+    assert_eq!(rows[1][1].to_string(), "B-auto");
+}
+
+#[test]
+fn test_concurrent_explicit_rowid_auto_rowid_does_not_walk_back_into_collision() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn0
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("INSERT INTO t(id, v) VALUES (5, 'A')")
+        .unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    for i in 0..5 {
+        conn2
+            .execute(format!("INSERT INTO t(v) VALUES ('B{i}')"))
+            .unwrap();
+    }
+    conn2.execute("COMMIT").unwrap();
+    conn1
+        .execute("COMMIT")
+        .expect("explicit rowid transaction should not conflict with auto rowids");
+
+    let rows = get_rows(&conn0, "SELECT rowid, v FROM t ORDER BY rowid");
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[0][0].as_int().unwrap(), 5);
+    assert_eq!(rows[0][1].to_string(), "A");
+    for i in 0..5 {
+        assert_eq!(rows[i + 1][0].as_int().unwrap(), 6 + i as i64);
+        assert_eq!(rows[i + 1][1].to_string(), format!("B{i}"));
+    }
+}
+
+#[test]
+fn test_concurrent_explicit_rowid_preserves_auto_rowid_watermark() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn1
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, k INTEGER)")
+        .unwrap();
+    conn1.execute("CREATE INDEX t_k ON t(k)").unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("INSERT INTO t(id, v, k) VALUES (5, 'A', 999)")
+        .unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("INSERT INTO t(v, k) VALUES ('B', 100)")
+        .unwrap();
+    conn2.execute("COMMIT").unwrap();
+    conn1.execute("COMMIT").unwrap();
+
+    for (v, k) in [("p2", 200), ("p3", 300), ("p4", 400), ("p5", 500)] {
+        conn1
+            .execute(format!("INSERT INTO t(v, k) VALUES ('{v}', {k})"))
+            .unwrap();
+    }
+
+    let integrity = get_rows(&conn1, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(
+        integrity[0][0].to_string(),
+        "ok",
+        "integrity_check should not report stale secondary index entries"
+    );
+
+    let indexed = get_rows(
+        &conn1,
+        "SELECT rowid, v, k FROM t INDEXED BY t_k WHERE k = 999",
+    );
+    assert_eq!(indexed.len(), 1);
+    assert_eq!(indexed[0][0].as_int().unwrap(), 5);
+    assert_eq!(indexed[0][1].to_string(), "A");
+    assert_eq!(indexed[0][2].as_int().unwrap(), 999);
+}
+
+#[test]
+fn test_auto_rowid_after_negative_explicit_rowid_uses_next_negative() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t(id, v) VALUES(-5, 'manual')")
+        .unwrap();
+    conn.execute("INSERT INTO t(v) VALUES('auto')").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), -5);
+    assert_eq!(rows[0][1].to_string(), "manual");
+    assert_eq!(rows[1][0].as_int().unwrap(), -4);
+    assert_eq!(rows[1][1].to_string(), "auto");
 }

@@ -196,6 +196,7 @@ pub struct Connection {
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     pub(super) query_only: AtomicBool,
+    pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
     /// SQLite DQS misfeature: when ON (default), unresolved double-quoted identifiers
@@ -1327,14 +1328,20 @@ impl Connection {
         if self.schema_reparse_in_progress() {
             return;
         }
-        let current_schema_version = self.schema.read().schema_version;
+        let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
         if matches!(self.get_tx_state(), TransactionState::None)
             && self.get_mv_tx().is_none()
             && self.next_attached_mv_tx().is_none()
-            && current_schema_version != schema.schema_version
+            // In MVCC, checkpoint root publication can replace Database::schema
+            // without changing SQLite's schema cookie. If this connection
+            // still holds an older Schema snapshot, prepared statements must be
+            // invalidated and recompiled against the current roots.
+            && (current_schema.schema_version != schema.schema_version
+                || (self.mvcc_enabled() && !Arc::ptr_eq(&current_schema, &schema)))
         {
             *self.schema.write() = schema.clone();
+            self.bump_prepare_context_generation();
         }
     }
 
@@ -1775,16 +1782,7 @@ impl Connection {
     }
 
     pub fn get_database_canonical_path(&self) -> String {
-        if self.db.is_in_memory_db() {
-            // For in-memory databases, SQLite shows empty string
-            String::new()
-        } else {
-            // For file databases, try show the full absolute path if that doesn't fail
-            match std::fs::canonicalize(&self.db.path) {
-                Ok(abs_path) => abs_path.to_string_lossy().to_string(),
-                Err(_) => self.db.path.to_string(),
-            }
-        }
+        self.db.get_database_canonical_path()
     }
 
     /// Check if a specific attached database is read only or not, by its index
@@ -2755,6 +2753,14 @@ impl Connection {
     pub fn set_query_only(&self, value: bool) {
         self.query_only.store(value, Ordering::SeqCst);
         self.bump_prepare_context_generation();
+    }
+
+    pub fn set_vdbe_trace(&self, value: bool) {
+        self.vdbe_trace.store(value, Ordering::SeqCst);
+    }
+
+    pub fn get_vdbe_trace(&self) -> bool {
+        self.vdbe_trace.load(Ordering::SeqCst)
     }
 
     pub fn get_dml_require_where(&self) -> bool {

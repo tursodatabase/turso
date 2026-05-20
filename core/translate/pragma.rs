@@ -752,6 +752,12 @@ fn update_pragma(
             connection.set_temp_store(temp_store);
             Ok(TransactionMode::None)
         }
+        PragmaName::VdbeTrace => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_vdbe_trace(enabled);
+            Ok(TransactionMode::None)
+        }
+
         PragmaName::FunctionList => query_pragma(
             PragmaName::FunctionList,
             resolver,
@@ -1452,6 +1458,7 @@ fn query_pragma(
 
             Ok(TransactionMode::None)
         }
+        PragmaName::VdbeTrace => Ok(TransactionMode::None),
         PragmaName::FreelistCount => {
             let value = pager.freepage_list();
             let register = program.alloc_register();

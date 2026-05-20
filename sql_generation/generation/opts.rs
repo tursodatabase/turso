@@ -41,6 +41,8 @@ pub struct TableOpts {
     /// Range of numbers of columns to generate
     #[garde(custom(range_struct_min(1)))]
     pub column_range: Range<u32>,
+    #[garde(dive)]
+    pub generated_columns: GeneratedColumnOpts,
 }
 
 impl Default for TableOpts {
@@ -50,6 +52,28 @@ impl Default for TableOpts {
             rowid_alias_prob: 0.05,
             // Up to 10 columns
             column_range: 1..11,
+            generated_columns: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
+#[serde(deny_unknown_fields, default)]
+pub struct GeneratedColumnOpts {
+    #[garde(skip)]
+    pub enable: bool,
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub generated_column_prob: f64,
+    #[garde(range(min = 1, max = 10))]
+    pub max_expr_depth: usize,
+}
+
+impl Default for GeneratedColumnOpts {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            generated_column_prob: 0.2,
+            max_expr_depth: 3,
         }
     }
 }

@@ -1,5 +1,6 @@
-﻿using System.Collections;
+using System.Collections;
 using System.ComponentModel;
+using System.Data;
 using System.Data.Common;
 using System.Globalization;
 using System.Runtime.CompilerServices;
@@ -13,11 +14,14 @@ public class TursoDataReader : DbDataReader
 {
     private readonly TursoCommand _command;
     private readonly TursoStatementHandle _statement;
+    private readonly CommandBehavior _behavior;
+    private bool _isClosed;
 
-    public TursoDataReader(TursoCommand command, TursoStatementHandle statement)
+    public TursoDataReader(TursoCommand command, TursoStatementHandle statement, CommandBehavior behavior)
     {
         _command = command;
         _statement = statement;
+        _behavior = behavior;
     }
 
     public override bool GetBoolean(int ordinal)
@@ -140,12 +144,12 @@ public class TursoDataReader : DbDataReader
         return TursoBindings.GetValue(_statement, ordinal).StringValue;
     }
 
-    public override object? GetValue(int ordinal)
+    public override object GetValue(int ordinal)
     {
         var value = TursoBindings.GetValue(_statement, ordinal);
         return value.ValueType switch
         {
-            TursoValueType.Null or TursoValueType.Empty => null,
+            TursoValueType.Null or TursoValueType.Empty => DBNull.Value,
             TursoValueType.Integer => value.IntValue,
             TursoValueType.Real => value.RealValue,
             TursoValueType.Text => value.StringValue,
@@ -186,22 +190,34 @@ public class TursoDataReader : DbDataReader
 
     public override int RecordsAffected => TursoBindings.RowsAffected(_statement);
     public override bool HasRows => TursoBindings.HasRows(_statement);
-    public override bool IsClosed => _statement.IsInvalid;
+    public override bool IsClosed => _isClosed || _statement.IsInvalid;
 
     public override bool NextResult()
     {
-        while (TursoBindings.Read(_statement)) ;
-        return true;
+        EnsureOpen();
+        while (TursoBindings.Read(_statement))
+        {
+        }
+
+        return false;
     }
 
     protected override void Dispose(bool disposing)
     {
+        if (disposing && !_isClosed)
+        {
+            _statement.Dispose();
+            if ((_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
+                _command.Connection?.Close();
+        }
+
+        _isClosed = true;
         base.Dispose(disposing);
-        _command.Dispose();
     }
 
     public override bool Read()
     {
+        EnsureOpen();
         return TursoBindings.Read(_statement);
     }
 
@@ -245,5 +261,11 @@ public class TursoDataReader : DbDataReader
             TursoValueType.Blob => "BLOB",
             _ => throw new InvalidEnumArgumentException(nameof(valueType))
         };
+    }
+
+    private void EnsureOpen()
+    {
+        if (IsClosed)
+            throw new InvalidOperationException("The data reader is closed.");
     }
 }

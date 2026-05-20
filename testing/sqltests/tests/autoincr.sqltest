@@ -126,6 +126,23 @@ expect {
     1235|2
 }
 
+# Test: Manually deleting a sequence row is allowed and the next insert recreates it.
+@cross-check-integrity
+test autoinc-manual-delete-from-sqlite-sequence {
+    CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT);
+    INSERT INTO t1 VALUES(NULL);
+    DELETE FROM sqlite_sequence WHERE name='t1';
+    SELECT name, seq FROM sqlite_sequence WHERE name='t1';
+    INSERT INTO t1 VALUES(NULL);
+    SELECT x FROM t1 ORDER BY x;
+    SELECT name, seq FROM sqlite_sequence WHERE name='t1';
+}
+expect {
+    1
+    2
+    t1|2
+}
+
 # Test: AUTOINCREMENT works for multiple tables independently.
 @cross-check-integrity
 test autoinc-multiple-tables {
@@ -199,6 +216,27 @@ test autoinc-rename-table-updates-sequence-entry {
 expect {
     t2|1
     t2|2
+}
+
+# Regression test for https://github.com/tursodatabase/turso/issues/6769
+@skip-if sqlite "ALTER COLUMN is a Turso extension"
+test autoinc-alter-column-clears-sequence-row {
+    CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT);
+    INSERT INTO t(b) VALUES('x'),('y');
+    ALTER TABLE t ALTER COLUMN a TO a2 TEXT;
+    SELECT COUNT(*) FROM sqlite_sequence WHERE name='t';
+    SELECT sql FROM sqlite_schema WHERE name='t';
+    INSERT INTO t(b) VALUES('z');
+    SELECT COUNT(*) FROM sqlite_sequence WHERE name='t';
+    SELECT a2, b FROM t ORDER BY rowid;
+}
+expect {
+    0
+    CREATE TABLE t (a2 TEXT, b TEXT)
+    0
+    1|x
+    2|y
+    |z
 }
 
 # Test: AUTOINCREMENT fails if the maximum rowid is reached. (Assumes 64-bit rowid)
@@ -327,4 +365,156 @@ test autoinc-expicit-negative-rowid-initializes-seq-table {
 	SELECT name, seq FROM sqlite_sequence WHERE name='t';
 } expect {
 	t|0
+}
+
+# Regression test for https://github.com/tursodatabase/turso/issues/6963
+@cross-check-integrity
+test autoinc-alter-drop-column-preserves-schema {
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        doomed INT,
+        v TEXT
+    );
+    INSERT INTO t(doomed, v) VALUES (9, 'a'), (8, 'b');
+    ALTER TABLE t DROP COLUMN doomed;
+    INSERT INTO t(v) VALUES ('c');
+    SELECT sql LIKE '%AUTOINCREMENT%' FROM sqlite_schema WHERE name='t';
+    SELECT name, seq FROM sqlite_sequence WHERE name='t';
+}
+expect {
+    1
+    t|3
+}
+
+# regression tests for https://github.com/tursodatabase/turso/issues/6969
+# Partial-numeric text.
+@cross-check-integrity
+test autoinc-seq-text-prefix-coercion {
+	CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT);
+	INSERT INTO t DEFAULT VALUES;
+	UPDATE sqlite_sequence SET seq='5abc' WHERE name='t';
+	INSERT INTO t DEFAULT VALUES;
+	SELECT a FROM t ORDER BY a;
+	SELECT typeof(seq), seq FROM sqlite_sequence WHERE name='t';
+}
+expect {
+	1
+	6
+	integer|6
+}
+
+# Exponent-bearing text.
+@cross-check-integrity
+test autoinc-seq-text-with-exponent-stops-at-e {
+	CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT);
+	INSERT INTO t DEFAULT VALUES;
+	UPDATE sqlite_sequence SET seq='1e10' WHERE name='t';
+	INSERT INTO t DEFAULT VALUES;
+	SELECT a FROM t ORDER BY a;
+	SELECT typeof(seq), seq FROM sqlite_sequence WHERE name='t';
+}
+expect {
+	1
+	2
+	integer|2
+}
+
+# Negative-exponent text.
+@cross-check-integrity
+test autoinc-seq-text-with-negative-exponent {
+	CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT);
+	INSERT INTO t DEFAULT VALUES;
+	UPDATE sqlite_sequence SET seq='5e-1' WHERE name='t';
+	INSERT INTO t DEFAULT VALUES;
+	SELECT a FROM t ORDER BY a;
+}
+expect {
+	1
+	6
+}
+
+# Blob input.
+@cross-check-integrity
+test autoinc-seq-blob-prefix-coercion {
+	CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT);
+	INSERT INTO t DEFAULT VALUES;
+	UPDATE sqlite_sequence SET seq=x'31653130' WHERE name='t';
+	INSERT INTO t DEFAULT VALUES;
+	SELECT a FROM t ORDER BY a;
+}
+expect {
+	1
+	2
+}
+
+# Blob input with leading vertical-tab whitespace.
+@cross-check-integrity
+test autoinc-seq-blob-leading-vtab-whitespace {
+	CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT);
+	INSERT INTO t DEFAULT VALUES;
+	UPDATE sqlite_sequence SET seq=x'0b35616263' WHERE name='t';
+	INSERT INTO t DEFAULT VALUES;
+	SELECT a FROM t ORDER BY a;
+}
+expect {
+	1
+	6
+}
+
+# sqlite_sequence.seq at i64::MAX.
+test autoinc-seq-text-at-i64-max-returns-full {
+	CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT);
+	INSERT INTO t DEFAULT VALUES;
+	UPDATE sqlite_sequence SET seq='9223372036854775807' WHERE name='t';
+	INSERT INTO t DEFAULT VALUES;
+}
+expect error {
+}
+
+# Explicit rowid below seq leaves sqlite_sequence unchanged.
+@cross-check-integrity
+test autoinc-explicit-rowid-below-text-prefix-preserves-row {
+	CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, v);
+	INSERT INTO t VALUES(1, 'first');
+	UPDATE sqlite_sequence SET seq='5abc' WHERE name='t';
+	INSERT INTO t VALUES(3, 'explicit');
+	SELECT a FROM t ORDER BY a;
+	SELECT typeof(seq), seq FROM sqlite_sequence WHERE name='t';
+}
+expect {
+	1
+	3
+	text|5abc
+}
+
+# Explicit rowid above seq updates sqlite_sequence.
+@cross-check-integrity
+test autoinc-explicit-rowid-above-text-prefix-advances {
+	CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, v);
+	INSERT INTO t VALUES(1, 'first');
+	UPDATE sqlite_sequence SET seq='5abc' WHERE name='t';
+	INSERT INTO t VALUES(10, 'explicit');
+	SELECT a FROM t ORDER BY a;
+	SELECT typeof(seq), seq FROM sqlite_sequence WHERE name='t';
+}
+expect {
+	1
+	10
+	integer|10
+}
+
+# Explicit rowid below blob seq leaves sqlite_sequence unchanged.
+@cross-check-integrity
+test autoinc-explicit-rowid-below-blob-prefix-preserves-row {
+	CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, v);
+	INSERT INTO t VALUES(1, 'first');
+	UPDATE sqlite_sequence SET seq=x'3561' WHERE name='t';
+	INSERT INTO t VALUES(3, 'explicit');
+	SELECT a FROM t ORDER BY a;
+	SELECT typeof(seq), seq FROM sqlite_sequence WHERE name='t';
+}
+expect {
+	1
+	3
+	blob|5a
 }

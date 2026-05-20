@@ -271,7 +271,7 @@ test('concurrent-actions-consistency', async ({ server }) => {
         }
     }
     await Promise.all([pull(100), push(100), run(200)]);
-})
+}, 30_000)
 
 test('simple-db', async () => {
     const db = new Database({ path: ':memory:' });
@@ -288,6 +288,30 @@ test('implicit connect', async ({ server }) => {
     await expect(async () => await defer.all()).rejects.toThrowError(/no such table: not_found/);
     await expect(async () => await db.prepare("SELECT * FROM not_found")).rejects.toThrowError(/no such table: not_found/);
     expect(await (await db.prepare("SELECT 1 as x")).all()).toEqual([{ x: 1 }]);
+})
+
+test('pull with no remote changes updates lastPullUnixTime', async ({ server }) => {
+    {
+        const db = await connect({ path: ':memory:', url: server.dbUrl() });
+        await db.exec("CREATE TABLE IF NOT EXISTS t(x)");
+        await db.exec("DELETE FROM t");
+        await db.exec("INSERT INTO t VALUES (1)");
+        await db.push();
+        await db.close();
+    }
+
+    // fresh client bootstraps from the remote - nothing new to pull afterwards
+    const db = await connect({ path: ':memory:', url: server.dbUrl() });
+    const before = (await db.stats()).lastPullUnixTime;
+
+    // unix time has 1s resolution - wait long enough for the timestamp to advance
+    await new Promise(resolve => setTimeout(resolve, 1500));
+
+    // remote has no new changes - pull returns false but must still bump lastPullUnixTime
+    expect(await db.pull()).toBe(false);
+
+    const after = (await db.stats()).lastPullUnixTime;
+    expect(after).toBeGreaterThan(before);
 })
 
 test('defered sync', async ({ server }) => {

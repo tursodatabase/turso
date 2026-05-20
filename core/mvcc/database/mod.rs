@@ -942,6 +942,11 @@ pub enum CommitState<Clock: LogicalClock> {
     WaitForDependencies {
         end_ts: u64,
     },
+    /// Build the committed log record incrementally, yielding every
+    /// `MVCC_COMMIT_BATCH_SIZE` rowids so that very large write sets
+    /// (e.g. CREATE INDEX on a multi-million row table) don't monopolize
+    /// the executor.
+    BuildLogRecord(BuildLogRecordCtx),
     BeginCommitLogicalLog {
         end_ts: u64,
         log_record: LogRecord,
@@ -960,12 +965,53 @@ pub enum CommitState<Clock: LogicalClock> {
     CommitEnd {
         end_ts: u64,
     },
+    /// Publish committed timestamps into the live MVCC chains in chunks
+    /// of `MVCC_COMMIT_BATCH_SIZE` rowids, yielding between chunks. The
+    /// transaction is already in the Committed state at this point, so
+    /// readers consult `txs[tx_id]` to resolve any TxID references that
+    /// haven't been rewritten yet.
+    RewriteLiveVersions(RewriteLiveVersionsCtx),
+    /// Final post-rewrite cleanup: drain commit dependents, release the
+    /// commit lock, update the global header, finish the tx, and start
+    /// auto-checkpoint if needed.
+    FinalizeCommit {
+        end_ts: u64,
+    },
 }
+
+/// Iteration state for the chunked `BuildLogRecord` step.
+#[derive(Debug)]
+pub struct BuildLogRecordCtx {
+    pub end_ts: u64,
+    pub log_record: LogRecord,
+    /// Index into `CommitStateMachine::write_set` for the current pass.
+    pub cursor: usize,
+    /// True while emitting schema rows (sqlite_schema), false during the
+    /// data-row pass. Schema rows are emitted first so log replay sees
+    /// CREATE TABLE before related INSERTs.
+    pub schema_process: bool,
+}
+
+/// Iteration state for the chunked `RewriteLiveVersions` step.
+#[derive(Debug)]
+pub struct RewriteLiveVersionsCtx {
+    pub end_ts: u64,
+    /// Index into `CommitStateMachine::write_set`.
+    pub cursor: usize,
+}
+
+/// How many rowids `BuildLogRecord` / `RewriteLiveVersions` process before
+/// yielding to the executor. Picked to amortize state-machine overhead
+/// while keeping a CREATE INDEX on a 2M-row table responsive.
+const MVCC_COMMIT_BATCH_SIZE: usize = 1024;
 
 #[derive(Debug)]
 pub enum WriteRowState {
     Initial,
     Seek,
+    /// After seek returns TryAdvance for an index key stored in an interior node,
+    /// advance the cursor to that interior cell so insert overwrites it.
+    Advance,
     Insert,
     /// Move to the next record in order to leave the cursor in the next position, this is used for inserting multiple rows for optimizations.
     Next,
@@ -990,7 +1036,13 @@ impl CommitCoordinator {
 pub(crate) enum CommitYieldPoint {
     CommitValidation,
     WaitForDependencies,
+    /// Fires once on the first entry into `step_build_log_record` (cursor=0,
+    /// schema_process=true), before any chunk processing. Pairs with
+    /// `LogRecordPrepared` to bracket the BuildLogRecord chunked yields.
+    BuildLogRecordStart,
     LogRecordPrepared,
+    BeforeCommittedTimestampWatermarkUpdate,
+    BeforeFinishCommittedTx,
     /// Boundary right after `remove_tx` runs but before the connection cache
     /// is cleared by the caller at vdbe/mod.rs. Used for failure injection
     /// to reproduce divergence between `mv_store.txs` and `connection.mv_tx_id`.
@@ -1032,6 +1084,7 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     yield_instance_id: u64,
     did_commit_schema_change: bool,
     tx_id: TxID,
+    mvcc_store: Arc<MvStore<Clock>>,
     connection: Arc<Connection>,
     /// Database index this commit is for (`MAIN_DB_ID` or an attached-db id).
     /// Threaded through so that `finish_committed_tx` can clear the matching
@@ -1053,6 +1106,12 @@ impl<Clock: LogicalClock> Debug for CommitStateMachine<Clock> {
             .field("state", &self.state)
             .field("is_finalized", &self.is_finalized)
             .finish()
+    }
+}
+
+impl<Clock: LogicalClock> Drop for CommitStateMachine<Clock> {
+    fn drop(&mut self) {
+        self.cleanup_unfinished_commit();
     }
 }
 
@@ -1092,9 +1151,11 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         state: CommitState<Clock>,
         tx_id: TxID,
+        mvcc_store: Arc<MvStore<Clock>>,
         connection: Arc<Connection>,
         db_id: usize,
         commit_coordinator: Arc<CommitCoordinator>,
@@ -1120,6 +1181,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             yield_instance_id: connection.next_yield_instance_id(),
             did_commit_schema_change: schema_did_change_from_tx,
             tx_id,
+            mvcc_store,
             connection,
             db_id,
             commit_coordinator,
@@ -1129,6 +1191,50 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             sync_mode,
             _phantom: PhantomData,
         }
+    }
+
+    fn cleanup_unfinished_commit(&mut self) {
+        if !self.is_finalized {
+            self.cleanup_mvcc_checkpoint_state();
+            if !matches!(self.state, CommitState::Checkpoint { .. }) {
+                self.mvcc_store.cleanup_dropped_commit(
+                    self.tx_id,
+                    self.connection.as_ref(),
+                    self.db_id,
+                );
+            }
+            self.end_read_tx_for_db();
+            if self.db_id == crate::MAIN_DB_ID {
+                self.connection
+                    .set_tx_state(crate::connection::TransactionState::None);
+            }
+        }
+
+        let tx_id = self.tx_id;
+        let db_id = self.db_id;
+        turso_assert!(
+            self.mvcc_store.txs.get(&tx_id).is_none(),
+            "MVCC tx should be removed from txs after a successful commit",
+            { "tx_id": tx_id }
+        );
+        turso_assert!(
+            !self.mvcc_store.is_exclusive_tx(&tx_id),
+            "MVCC tx should not still hold the exclusive slot after a successful commit",
+            { "tx_id": tx_id }
+        );
+        turso_assert!(
+            self.connection.get_mv_tx_id_for_db(db_id) != Some(tx_id),
+            "Connection should not still reference an MVCC tx after a successful commit",
+            { "tx_id": tx_id, "db_id": db_id }
+        );
+    }
+
+    fn end_read_tx_for_db(&self) {
+        if let Ok(pager) = self.connection.get_pager_from_database_index(&self.db_id) {
+            pager.end_read_tx();
+            return;
+        }
+        self.pager.end_read_tx();
     }
 
     /// Validates commit-time write-write conflicts for one table row key.
@@ -1379,25 +1485,45 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         Ok(())
     }
 
-    /// Build the committed image for the logical log without mutating the
-    /// live MVCC version chains, which must stay TxID-backed until CommitEnd.
-    fn build_committed_log_record(
+    /// Run one chunked step of `BuildLogRecord`. Processes up to
+    /// `MVCC_COMMIT_BATCH_SIZE` rowids per call, then yields. Schema rows
+    /// (table_id == SQLITE_SCHEMA_MVCC_TABLE_ID) are emitted before data rows
+    /// in two passes so that log replay sees CREATE TABLE before INSERTs.
+    fn step_build_log_record(
         &mut self,
         mvcc_store: &Arc<MvStore<Clock>>,
-        tx: &Transaction,
-        end_ts: u64,
-    ) -> LogRecord {
-        let mut log_record = LogRecord::new(end_ts);
-        if tx.header_dirty.load(Ordering::Acquire) {
-            // Persist the transaction-local header snapshot in the same logical-log frame.
-            log_record.header = Some(*tx.header.read());
+    ) -> Result<TransitionResult<()>> {
+        // First entry into BuildLogRecord (no chunk processed yet): a yield-
+        // point to bracket the chunked yields so tests can count them exactly.
+        // Must run before the `&mut self.state` re-bind below — the macro
+        // calls `self.yield_context()` which needs `&self`.
+        let is_first_entry = matches!(
+            self.state,
+            CommitState::BuildLogRecord(BuildLogRecordCtx {
+                cursor: 0,
+                schema_process: true,
+                ..
+            })
+        );
+        if is_first_entry {
+            inject_transition_yield!(self, CommitYieldPoint::BuildLogRecordStart);
         }
 
-        // Process schema rows (sqlite_schema) before data rows so that during log
-        // replay the table_id_to_rootpage map is populated before data row inserts
-        // reference it. `tx.write_set` is sorted by table_id descending (most
-        // negative first), which would otherwise place data table rows
-        // (e.g. table_id=-3) before schema rows (table_id=-1).
+        let tx_id = self.tx_id;
+        let tx_entry = mvcc_store.txs.get(&tx_id);
+        let tx = tx_entry
+            .as_ref()
+            .map(|entry| entry.value())
+            .ok_or_else(|| {
+                LimboError::NoSuchTransactionID(format!(
+                    "tx id {tx_id} not found in step_build_logical_record"
+                ))
+            })?;
+        let write_set_len = tx.write_set.lock().entries.len();
+        let CommitState::BuildLogRecord(ctx) = &mut self.state else {
+            unreachable!("step_build_log_record requires BuildLogRecord state")
+        };
+        let end_ts = ctx.end_ts;
 
         // Remap a table_id to its canonical form for the log. After checkpoint,
         // a table's in-memory table_id (e.g. -53) may differ from -(root_page)
@@ -1422,11 +1548,11 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         let our_committed_image = |row_version: &RowVersion| -> Option<RowVersion> {
             let our_begin = matches!(
                 row_version.begin,
-                Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id
+                Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
             );
             let our_end = matches!(
                 row_version.end,
-                Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id
+                Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
             );
             if !our_begin && !our_end {
                 // row_version belongs to another tx
@@ -1471,58 +1597,127 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             }
         };
 
-        {
-            let ws = tx.write_set.lock();
-            // First pass: schema rows only (ordering matters for recovery)
-            for (id, row_versions) in ws.iter() {
-                if id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                    collect_versions(row_versions, &mut log_record);
-                }
+        // Process schema rows (sqlite_schema) before data rows so that during log
+        // replay the table_id_to_rootpage map is populated before data row inserts
+        // reference it. `tx.write_set` is sorted by table_id descending (most
+        // negative first), which would otherwise place data table rows
+        // (e.g. table_id=-3) before schema rows (table_id=-1).
+        let mut iterations = 0;
+
+        let write_set = tx.write_set.lock();
+        while ctx.cursor < write_set_len && iterations < MVCC_COMMIT_BATCH_SIZE {
+            let (id, row_versions) = &write_set.entries[ctx.cursor];
+            let is_schema = id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
+            // schema_process=true: schema rows only, false: data rows only.
+            let process = if ctx.schema_process {
+                is_schema
+            } else {
+                !is_schema
+            };
+            if process {
+                collect_versions(row_versions, &mut ctx.log_record);
             }
-            // Second pass: all non-schema rows
-            for (id, row_versions) in ws.iter() {
-                if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                    collect_versions(row_versions, &mut log_record);
-                }
-            }
+            ctx.cursor += 1;
+            iterations += 1;
         }
-        log_record
+
+        if ctx.cursor < write_set_len {
+            // More work remains in the current pass: yield and resume.
+            return Ok(TransitionResult::Io(IOCompletions::Single(
+                Completion::new_yield(),
+            )));
+        }
+
+        if ctx.schema_process {
+            // Schema pass done; start the data pass from the top.
+            ctx.schema_process = false;
+            ctx.cursor = 0;
+            return Ok(TransitionResult::Continue);
+        }
+
+        // Both passes complete. Move the assembled log record out and
+        // transition to BeginCommitLogicalLog (or directly to CommitEnd
+        // if there is nothing to log).
+        let log_record = std::mem::replace(&mut ctx.log_record, LogRecord::new(end_ts));
+        tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
+
+        if log_record.row_versions.is_empty() && log_record.header.is_none() {
+            // Nothing to log. We still need to release the commit lock here
+            // if this is an exclusive tx, mirroring the pre-chunk path
+            // through WaitForDependencies.
+            if mvcc_store.is_exclusive_tx(&self.tx_id) {
+                if let Some(tx_entry) = mvcc_store.txs.get(&self.tx_id) {
+                    mvcc_store.unlock_commit_lock_if_held(tx_entry.value());
+                }
+            }
+            self.state = CommitState::CommitEnd { end_ts };
+        } else {
+            self.state = CommitState::BeginCommitLogicalLog { end_ts, log_record };
+        }
+        inject_transition_yield!(self, CommitYieldPoint::LogRecordPrepared);
+        Ok(TransitionResult::Continue)
     }
 
-    /// Publish committed timestamps into the live MVCC chains after the
-    /// transaction has been finalized as Committed(end_ts).
-    /// This must run as postprocessing step i.e. the txn is written to log and is durable
-    fn rewrite_live_versions_to_timestamps(&self, mvcc_store: &Arc<MvStore<Clock>>, end_ts: u64) {
-        let tx_entry = mvcc_store.txs.get(&self.tx_id);
-        let tx = tx_entry.as_ref().map(|entry| entry.value());
-        turso_assert!(
-            matches!(tx.map(|t| t.state.load()), Some(TransactionState::Committed(ts)) if ts == end_ts),
-            "rewrite_live_versions_to_timestamps requires a committed transaction state"
-        );
-        let Some(tx) = tx else { return };
-
-        let ws = tx.write_set.lock();
-        for (_id, row_versions) in ws.iter() {
+    /// Run one chunked step of `RewriteLiveVersions`. Processes up to
+    /// `MVCC_COMMIT_BATCH_SIZE` rowids per call, then yields. The transaction
+    /// is already in the Committed state at this point; un-rewritten TxID
+    /// references resolve via `txs[tx_id]` for visibility/conflict checks.
+    fn step_rewrite_live_versions(
+        &mut self,
+        mvcc_store: &Arc<MvStore<Clock>>,
+    ) -> Result<TransitionResult<()>> {
+        let tx_id = self.tx_id;
+        let tx_entry = mvcc_store.txs.get(&tx_id);
+        let tx = tx_entry
+            .as_ref()
+            .map(|entry| entry.value())
+            .ok_or_else(|| {
+                LimboError::NoSuchTransactionID(format!(
+                    "tx id {tx_id} not found in step_build_logical_record"
+                ))
+            })?;
+        let write_set = tx.write_set.lock();
+        let write_set_len = write_set.entries.len();
+        let CommitState::RewriteLiveVersions(ctx) = &mut self.state else {
+            unreachable!("step_rewrite_live_versions requires RewriteLiveVersions state")
+        };
+        let end_ts = ctx.end_ts;
+        if ctx.cursor == 0 {
+            let tx_state = mvcc_store
+                .txs
+                .get(&tx_id)
+                .map(|entry| entry.value().state.load());
+            turso_assert!(
+                matches!(tx_state, Some(TransactionState::Committed(ts)) if ts == end_ts),
+                "RewriteLiveVersions requires a committed transaction state"
+            );
+        }
+        let mut iterations = 0;
+        while ctx.cursor < write_set_len && iterations < MVCC_COMMIT_BATCH_SIZE {
+            let (_id, row_versions) = &write_set.entries[ctx.cursor];
             let mut row_versions = row_versions.write();
             for row_version in row_versions.iter_mut() {
-                if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
-                    if id == self.tx_id {
-                        // Publish the committed begin timestamp into the live
-                        // version chain only after CommitEnd has decided the
-                        // transaction's fate.
+                if let Some(TxTimestampOrID::TxID(rv_id)) = row_version.begin {
+                    if rv_id == tx_id {
                         row_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
                     }
                 }
-                if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
-                    if id == self.tx_id {
-                        // Publish the committed end timestamp into the live
-                        // version chain only after CommitEnd has decided the
-                        // transaction's fate.
+                if let Some(TxTimestampOrID::TxID(rv_id)) = row_version.end {
+                    if rv_id == tx_id {
                         row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
                     }
                 }
             }
+            ctx.cursor += 1;
+            iterations += 1;
         }
+        if ctx.cursor < write_set_len {
+            return Ok(TransitionResult::Io(IOCompletions::Single(
+                Completion::new_yield(),
+            )));
+        }
+        self.state = CommitState::FinalizeCommit { end_ts };
+        Ok(TransitionResult::Continue)
     }
 }
 
@@ -1564,15 +1759,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     }
                 }
 
-                if mvcc_store
-                    .last_committed_schema_change_ts
-                    .load(Ordering::Acquire)
-                    > tx.begin_ts
-                {
-                    // Schema changes made after the transaction began always cause a [SchemaConflict] error and the tx must abort.
-                    return Err(LimboError::SchemaConflict);
-                }
-
                 // Atomically generate end_ts and publish Preparing(end_ts) while the
                 // clock lock is held. This closes the TOCTOU window
                 // Consider the example:
@@ -1585,13 +1771,82 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 //
                 // hence we want to guard the timestamp generation by a mutex, only allow next
                 // ts to generate when the previous one is used / discarded
+
+                let write_set_is_empty = tx.write_set.lock().is_empty();
+                let header_write = tx.header_dirty.load(Ordering::Acquire);
+                // Read only is not only exclusive to empty write set, we could be writing the
+                // database header here.
+                let read_only = write_set_is_empty && !header_write;
+
+                let mut schema_conflict = false;
+                let mut exclusive_conflict = false;
+
                 let end_ts = mvcc_store.get_commit_timestamp(|ts| {
                     turso_assert!(
                         ts > tx.begin_ts,
                         "end_ts must be strictly greater than begin_ts"
                     );
-                    tx.state.store(TransactionState::Preparing(ts));
+
+                    // First we check if there is exclusive conflict, if there is then we won't
+                    // commit txn.
+                    if !mvcc_store.is_exclusive_tx(&self.tx_id) && mvcc_store.has_exclusive_tx() {
+                        // A non-CONCURRENT transaction is holding the exclusive lock, we must abort.
+                        turso_assert_reachable!("commit aborted due to exclusive tx conflict");
+                        exclusive_conflict = true;
+                    }
+                    // Now check if we saw schema change which would require reprepare. Let's note
+                    // that we check this right after exlusive tx because we update this before we release
+                    // exclusive lock.
+                    let schema_updated = mvcc_store
+                        .last_committed_schema_change_ts
+                        .load(Ordering::Acquire)
+                        > tx.begin_ts;
+                    // last_committed_schema_ts is not enough, we need to check schema cookie
+                    // is the same because e.g:
+                    // T1 CREATE INDEX
+                    // T1 Yield somewhere in middle of commit
+                    // T1 end_ts = x
+                    // T2 BEGIN CONCURRENT; INSERT (same table); COMMIT
+                    // T2 begin_ts = x+1
+                    // T2 begin_ts > end_ts
+                    //
+                    // Therefore even if exclusive tx (T1) finishes right in time
+                    // we will see schema was not updated because we see an younger timestamp and
+                    // ours is older!
+                    //
+                    let our_cookie = tx.header.read().schema_cookie.get();
+                    let global_cookie = {
+                        let h = mvcc_store.global_header.read();
+                        let h = h.as_ref();
+                        turso_assert!(h.is_some(), "global_header should be initialized");
+                        h.unwrap().schema_cookie.get()
+                    };
+
+                    let header_dirty = tx.header_dirty.load(Ordering::Acquire);
+                    turso_assert!(!header_dirty || mvcc_store.is_exclusive_tx(&tx.tx_id), "header_dirty=true implies that tx is exclusive");
+                    if our_cookie != global_cookie && !header_dirty {
+                        tracing::debug!("cookie mismatch in CommitState::Initial tx({our_cookie}) != global(!{global_cookie})");
+                        schema_conflict = true;
+                    }
+
+                    if schema_updated {
+                        tracing::debug!("schema ts is older than our ts");
+                        // Schema changes made after the transaction began always cause a [SchemaConflict] error and the tx must abort.
+                        schema_conflict = true;
+                    }
+
+                    let can_commit_tx = !(exclusive_conflict || schema_conflict);
+                    if can_commit_tx || read_only {
+                        tx.state.store(TransactionState::Preparing(ts));
+                    }
                 });
+                // We allow reads from happening. Exlusive means there is a single writer.
+                if exclusive_conflict && !read_only {
+                    return Err(LimboError::WriteWriteConflict);
+                }
+                if schema_conflict && !read_only {
+                    return Err(LimboError::SchemaConflict);
+                }
                 tracing::trace!("prepare_tx(tx_id={}, end_ts={})", self.tx_id, end_ts);
                 /* In order to implement serializability, we need the following steps:
                 **
@@ -1676,9 +1931,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                  ** 2. Validate if there are no phantoms by walking the scans from scan_set
                  */
                 tracing::trace!("commit_tx(tx_id={})", self.tx_id);
-                let write_set_is_empty = tx.write_set.lock().is_empty();
                 // Header-only writes must not take this fast path; they need durable log records.
-                if write_set_is_empty && !tx.header_dirty.load(Ordering::Acquire) {
+                if read_only {
                     turso_assert!(
                         tx.commit_dep_set.lock().is_empty(),
                         "MVCC read only transaction should not have commit dependencies on other txns"
@@ -1718,11 +1972,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 Ok(TransitionResult::Continue)
             }
             CommitState::Commit { end_ts } => {
-                if !mvcc_store.is_exclusive_tx(&self.tx_id) && mvcc_store.has_exclusive_tx() {
-                    // A non-CONCURRENT transaction is holding the exclusive lock, we must abort.
-                    turso_assert_reachable!("commit aborted due to exclusive tx conflict");
-                    return Err(LimboError::WriteWriteConflict);
-                }
                 // Check for rowid conflicts before committing (pure optimistic, first-committer-wins)
                 // Ref: Hekaton paper Section 3.2 - validation uses end_ts comparison
                 let tx = mvcc_store
@@ -1799,38 +2048,42 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Ok(TransitionResult::Done(()));
                 }
 
-                // All dependencies resolved. Build the committed image for the
-                // logical log, but keep live row versions on TxID references
-                // until CommitEnd so rollback of an abandoned commit can still
-                // match them.
-                let log_record = self.build_committed_log_record(mvcc_store, tx, end_ts);
-                tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
-
-                if log_record.row_versions.is_empty() && log_record.header.is_none() {
-                    if mvcc_store.is_exclusive_tx(&self.tx_id) {
-                        mvcc_store.unlock_commit_lock_if_held(tx);
-                    }
-                    // Nothing to do, just end commit.
-                    self.state = CommitState::CommitEnd { end_ts };
-                } else {
-                    self.state = CommitState::BeginCommitLogicalLog { end_ts, log_record };
+                // All dependencies resolved. Initialize the log record (just
+                // the header snapshot, if any) and hand off to BuildLogRecord
+                // which fills in row_versions in `MVCC_COMMIT_BATCH_SIZE`-sized
+                // chunks, yielding between chunks. Live row versions stay on
+                // TxID references until CommitEnd so rollback of an abandoned
+                // commit can still match them.
+                let mut log_record = LogRecord::new(end_ts);
+                if tx.header_dirty.load(Ordering::Acquire) {
+                    log_record.header = Some(*tx.header.read());
                 }
-                inject_transition_yield!(self, CommitYieldPoint::LogRecordPrepared);
+                self.state = CommitState::BuildLogRecord(BuildLogRecordCtx {
+                    end_ts,
+                    log_record,
+                    cursor: 0,
+                    schema_process: true,
+                });
                 return Ok(TransitionResult::Continue);
             }
+            // Chunked: yields every MVCC_COMMIT_BATCH_SIZE rowids. Pulled out
+            // to a helper because the arm body needs `&mut self` to mutate
+            // the cursor / pass / log_record inside the variant, which
+            // conflicts with the outer `&self.state` match borrow.
+            CommitState::BuildLogRecord(_) => self.step_build_log_record(mvcc_store),
             CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
                 if !mvcc_store.is_exclusive_tx(&self.tx_id) {
-                    // logical log needs to be serialized
+                    // logical log needs to be serialized.
+                    let tx = mvcc_store
+                        .txs
+                        .get(&self.tx_id)
+                        .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                     let locked = self.commit_coordinator.pager_commit_lock.write();
                     if !locked {
                         return Ok(TransitionResult::Io(IOCompletions::Single(
                             Completion::new_yield(),
                         )));
                     }
-                    let tx = mvcc_store
-                        .txs
-                        .get(&self.tx_id)
-                        .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                     tx.value()
                         .pager_commit_lock_held
                         .store(true, Ordering::Release);
@@ -1864,7 +2117,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 }
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
-                let connection = self.connection.clone();
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
@@ -1879,8 +2131,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .map(|header| header.schema_cookie.get())
                         != Some(tx_header.schema_cookie.get());
                 if schema_did_change {
-                    let schema = connection.schema.read().clone();
-                    connection.db.update_schema_if_newer(schema);
+                    let schema = self.connection.schema.read().clone();
+                    self.connection.db.update_schema_if_newer(schema);
                 }
                 self.header.write().replace(tx_header);
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
@@ -1891,7 +2143,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // Order of operations matters here:
                 // 1. Advance logical log writer offset (makes the written bytes "owned")
                 // 2. Mark transaction Committed
-                // 3. Rewrite live row versions from TxID to Timestamp
+                // 3. Rewrite live row versions from TxID to Timestamp (chunked
+                //    in `RewriteLiveVersions` so 2M-row write sets don't stall)
                 // 4. Notify dependents
                 // 5. Release commit lock (allows next committer)
                 // 6. Update cached global header
@@ -1927,7 +2180,24 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .state
                     .store(TransactionState::Committed(*end_ts));
 
-                self.rewrite_live_versions_to_timestamps(mvcc_store, *end_ts);
+                // Hand off to the chunked rewriter. Between chunks readers
+                // resolve any unwritten TxID refs via `txs[tx_id]` which now
+                // reports Committed(end_ts).
+                self.state = CommitState::RewriteLiveVersions(RewriteLiveVersionsCtx {
+                    end_ts: *end_ts,
+                    cursor: 0,
+                });
+                Ok(TransitionResult::Continue)
+            }
+            // Chunked: yields every MVCC_COMMIT_BATCH_SIZE rowids. Same
+            // helper-dispatch reason as BuildLogRecord above.
+            CommitState::RewriteLiveVersions(_) => self.step_rewrite_live_versions(mvcc_store),
+            CommitState::FinalizeCommit { end_ts } => {
+                let tx = mvcc_store
+                    .txs
+                    .get(&self.tx_id)
+                    .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
+                let tx_unlocked = tx.value();
 
                 // Hekaton Section 3.3: "The transaction then processes all outgoing
                 // commit dependencies listed in its CommitDepSet. If it committed, it
@@ -1950,13 +2220,23 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .write()
                     .replace(*tx_unlocked.header.read());
 
+                inject_transition_yield!(
+                    self,
+                    CommitYieldPoint::BeforeCommittedTimestampWatermarkUpdate
+                );
+
+                // Since we assign a commit timestamp and then we drive the commit to completion,
+                // it is totally possible for so an older transaction can finish after a newer one.
+                // In such case, we should not let older commit to set lower value than previous.
+                // This value is used in checkpointing as a watermark boundary, and an incorrect
+                // lower value can cause data loss / corruption.
                 mvcc_store
                     .last_committed_tx_ts
-                    .store(*end_ts, Ordering::Release);
+                    .fetch_max(*end_ts, Ordering::AcqRel);
                 if self.did_commit_schema_change {
                     mvcc_store
                         .last_committed_schema_change_ts
-                        .store(*end_ts, Ordering::Release);
+                        .fetch_max(*end_ts, Ordering::AcqRel);
                 }
 
                 // We have now updated all the versions with a reference to the
@@ -1964,12 +2244,17 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // transaction. Pair removal with the connection cache clear so
                 // an IO yield + abandon during the upcoming checkpoint cannot
                 // strand `conn.mv_tx_id` referencing a tx that's gone from `txs`.
-                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
-                inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
-
+                //
+                // Release `exclusive_tx` BEFORE `finish_committed_tx` /
+                // `inject_transition_failure!` so an Err at `AfterRemoveTx`
+                // cannot strand the atomic — matches the ordering at the
+                // two fast-path CommitEnd sites.
                 if mvcc_store.is_exclusive_tx(&self.tx_id) {
                     mvcc_store.release_exclusive_tx(&self.tx_id);
                 }
+                inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
+                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
+                inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                 if mvcc_store.storage.should_checkpoint() {
                     let state_machine = StateMachine::new(CheckpointStateMachine::new(
                         self.pager.clone(),
@@ -2057,12 +2342,37 @@ impl StateTransition for WriteRowStateMachine {
                     .write()
                     .seek(seek_key, SeekOp::GE { eq_only: true })?
                 {
-                    IOResult::Done(_) => {}
+                    IOResult::Done(seek_result) => {
+                        if self.row.is_index_row() && matches!(seek_result, SeekResult::TryAdvance)
+                        {
+                            self.state = WriteRowState::Advance;
+                            return Ok(TransitionResult::Continue);
+                        }
+                    }
                     IOResult::IO(io) => {
                         return Ok(TransitionResult::Io(io));
                     }
                 }
                 turso_assert_eq!(self.cursor.write().valid_state, CursorValidState::Valid);
+                self.state = WriteRowState::Insert;
+                Ok(TransitionResult::Continue)
+            }
+            WriteRowState::Advance => {
+                match self
+                    .cursor
+                    .write()
+                    .next()
+                    .map_err(|e: LimboError| LimboError::InternalError(e.to_string()))?
+                {
+                    IOResult::Done(_) => {}
+                    IOResult::IO(io) => {
+                        return Ok(TransitionResult::Io(io));
+                    }
+                }
+                turso_assert!(
+                    self.cursor.read().has_record(),
+                    "MVCC checkpoint index insert did not land on the matched interior record"
+                );
                 self.state = WriteRowState::Insert;
                 Ok(TransitionResult::Continue)
             }
@@ -3452,9 +3762,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 .inspect_err(|_| unlock_checkpoint_guard())?;
         }
 
-        let already_holds_commit_lock = maybe_existing_tx_id
-            .and_then(|existing_tx_id| self.txs.get(&existing_tx_id))
-            .is_some_and(|tx| tx.value().pager_commit_lock_held.load(Ordering::Acquire));
+        // Hoist: validate the existing tx still exists and snapshot the
+        // `pager_commit_lock_held` flag BEFORE acquiring `pager_commit_lock`,
+        // so a vanished tx cannot strand the lock (#6905).
+        let already_holds_commit_lock = match maybe_existing_tx_id {
+            Some(existing_tx_id) => {
+                let tx = self.txs.get(&existing_tx_id).ok_or_else(|| {
+                    if !already_exclusive {
+                        self.release_exclusive_tx(&tx_id);
+                    }
+                    unlock_checkpoint_guard();
+                    LimboError::NoSuchTransactionID(existing_tx_id.to_string())
+                })?;
+                tx.value().pager_commit_lock_held.load(Ordering::Acquire)
+            }
+            None => false,
+        };
 
         if !already_holds_commit_lock {
             let locked = self.commit_coordinator.pager_commit_lock.write();
@@ -3474,10 +3797,20 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let header = self.get_new_transaction_database_header(&pager);
 
         if let Some(existing_tx_id) = maybe_existing_tx_id {
-            let tx = self
-                .txs
-                .get(&existing_tx_id)
-                .ok_or_else(|| LimboError::NoSuchTransactionID(existing_tx_id.to_string()))?;
+            // Re-fetch the Ref now that all blocking I/O is done. If the tx
+            // vanished between the earlier validation and now (extraordinarily
+            // narrow window — only checkpoint can remove a tx and it cannot
+            // race a commit-lock holder), release what we acquired and bail.
+            let tx = self.txs.get(&existing_tx_id).ok_or_else(|| {
+                if !already_holds_commit_lock {
+                    self.commit_coordinator.pager_commit_lock.unlock();
+                }
+                if !already_exclusive {
+                    self.release_exclusive_tx(&tx_id);
+                }
+                unlock_checkpoint_guard();
+                LimboError::NoSuchTransactionID(existing_tx_id.to_string())
+            })?;
             tx.value()
                 .pager_commit_lock_held
                 .store(true, Ordering::Release);
@@ -3684,7 +4017,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ///
     /// * `tx_id` - The ID of the transaction to commit.
     pub fn commit_tx(
-        &self,
+        self: &Arc<Self>,
         tx_id: TxID,
         connection: &Arc<Connection>,
         db_id: usize,
@@ -3692,6 +4025,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let state = Box::new(CommitStateMachine::new(
             CommitState::Initial,
             tx_id,
+            self.clone(),
             connection.clone(),
             db_id,
             self.commit_coordinator.clone(),
@@ -3722,12 +4056,18 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// * `tx_id` - The ID of the transaction to abort.
     /// * `db` - The database index this transaction belongs to.
     pub fn rollback_tx(&self, tx_id: TxID, _pager: Arc<Pager>, connection: &Connection, db: usize) {
+        self.rollback_tx_inner(tx_id, Some(connection), db);
+    }
+
+    fn rollback_tx_inner(&self, tx_id: TxID, connection: Option<&Connection>, db: usize) {
         let tx_unlocked = self
             .txs
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx_unlocked.value();
-        connection.set_mv_tx_for_db(db, None);
+        if let Some(connection) = connection {
+            connection.set_mv_tx_for_db(db, None);
+        }
         turso_assert!(matches!(
             tx.state.load(),
             TransactionState::Active | TransactionState::Preparing(_)
@@ -3765,9 +4105,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         }
 
-        if connection.schema.read().schema_version > connection.db.schema.lock().schema_version {
-            // Connection made schema changes during tx and rolled back -> revert connection-local schema.
-            *connection.schema.write() = connection.db.clone_schema();
+        if let Some(connection) = connection {
+            if connection.schema.read().schema_version > connection.db.schema.lock().schema_version
+            {
+                // Connection made schema changes during tx and rolled back -> revert connection-local schema.
+                *connection.schema.write() = connection.db.clone_schema();
+            }
         }
 
         let tx = tx_unlocked.value();
@@ -3780,6 +4123,32 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // read lock), so no future txs.get() for this tx_id can come from a
         // speculative read path.
         self.remove_tx(tx_id);
+    }
+
+    fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
+        let tx_state = self.txs.get(&tx_id).map(|tx| tx.value().state.load());
+        match tx_state {
+            Some(TransactionState::Active | TransactionState::Preparing(_)) => {
+                self.rollback_tx_inner(tx_id, Some(connection), db_id);
+            }
+            Some(TransactionState::Committed(_)) => {
+                if let Some(tx) = self.txs.get(&tx_id) {
+                    self.unlock_commit_lock_if_held(tx.value());
+                }
+                if self.is_exclusive_tx(&tx_id) {
+                    self.release_exclusive_tx(&tx_id);
+                }
+                self.finish_committed_tx(tx_id, connection, db_id);
+            }
+            Some(TransactionState::Aborted | TransactionState::Terminated) | None => {
+                if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
+                    connection.set_mv_tx_for_db(db_id, None);
+                }
+                if self.is_exclusive_tx(&tx_id) {
+                    self.release_exclusive_tx(&tx_id);
+                }
+            }
+        }
     }
 
     fn unlock_commit_lock_if_held(&self, tx: &Transaction) {
@@ -4044,11 +4413,21 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.exclusive_tx.load(Ordering::Acquire) != NO_EXCLUSIVE_TX
     }
 
+    fn has_preparing_tx_other_than(&self, tx_id: TxID) -> bool {
+        self.txs.iter().any(|entry| {
+            *entry.key() != tx_id
+                && matches!(entry.value().state.load(), TransactionState::Preparing(_))
+        })
+    }
+
     /// Acquires the exclusive transaction lock to the given transaction ID.
     fn acquire_exclusive_tx(&self, tx_id: &TxID) -> Result<()> {
         if self.exclusive_tx.load(Ordering::Acquire) == *tx_id {
             // Re-entrant upgrade attempt for the same transaction.
             return Ok(());
+        }
+        if self.has_preparing_tx_other_than(*tx_id) {
+            return Err(LimboError::Busy);
         }
         if let Some(tx) = self.txs.get(tx_id) {
             let tx = tx.value();
@@ -4064,7 +4443,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if self.has_preparing_tx_other_than(*tx_id) {
+                    self.release_exclusive_tx(tx_id);
+                    return Err(LimboError::Busy);
+                }
+                Ok(())
+            }
             Err(_) => {
                 // Another transaction already holds the exclusive lock
                 Err(LimboError::Busy)
@@ -5263,7 +5648,18 @@ impl RowidAllocator {
     /// Initialize from btree max. Called once per table, under lock.
     pub fn initialize(&self, rowid: Option<i64>) {
         tracing::trace!("initialize({rowid:?})");
-        self.max_rowid.store(rowid.unwrap_or(0), Ordering::SeqCst);
+        let _ = self
+            .max_rowid
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                let next = match rowid {
+                    // max_rowid starts at 0, but a B-tree whose largest rowid is
+                    // negative still needs to seed automatic allocation from that value.
+                    Some(rowid) if cur == 0 => rowid,
+                    Some(rowid) => cur.max(rowid),
+                    None => cur,
+                };
+                (next != cur).then_some(next)
+            });
         self.initialized.store(true, Ordering::SeqCst);
     }
 
@@ -5674,6 +6070,7 @@ impl<Clock: LogicalClock> Debug for CommitState<Clock> {
                 .debug_struct("WaitForDependencies")
                 .field("end_ts", end_ts)
                 .finish(),
+            Self::BuildLogRecord(ctx) => f.debug_tuple("BuildLogRecord").field(ctx).finish(),
             Self::BeginCommitLogicalLog { end_ts, log_record } => f
                 .debug_struct("BeginCommitLogicalLog")
                 .field("end_ts", end_ts)
@@ -5691,6 +6088,13 @@ impl<Clock: LogicalClock> Debug for CommitState<Clock> {
             Self::CommitEnd { end_ts } => {
                 f.debug_struct("CommitEnd").field("end_ts", end_ts).finish()
             }
+            Self::RewriteLiveVersions(ctx) => {
+                f.debug_tuple("RewriteLiveVersions").field(ctx).finish()
+            }
+            Self::FinalizeCommit { end_ts } => f
+                .debug_struct("FinalizeCommit")
+                .field("end_ts", end_ts)
+                .finish(),
         }
     }
 }

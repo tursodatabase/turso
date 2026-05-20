@@ -31,7 +31,7 @@ fn validate_delete(
     // Check if this is a system table that should be protected from direct writes
     if !connection.is_nested_stmt()
         && !connection.is_mvcc_bootstrap_connection()
-        && crate::schema::is_system_table(tbl_name)
+        && !crate::schema::allow_user_dml(tbl_name)
     {
         crate::bail_parse_error!("table {tbl_name} may not be modified");
     }

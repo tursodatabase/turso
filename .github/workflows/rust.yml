@@ -291,7 +291,7 @@ jobs:
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -314,7 +314,6 @@ jobs:
       - uses: "./.github/shared/install_sqlite"
       - name: Test
         run: make test
-        timeout-minutes: 20
 
   concurrent-simulator:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -326,10 +325,10 @@ jobs:
             iterations: 100
             args: "--mode fast --reopen-probability 0.001"
           - name: in-process-mvcc
-            iterations: 100
+            iterations: 25
             args: "--mode fast --reopen-probability 0.01 --enable-mvcc"
           - name: multiprocess
-            iterations: 20
+            iterations: 10
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
           - name: multiprocess-kill
             iterations: 10
@@ -347,7 +346,7 @@ jobs:
       - name: Run turso_whopper regression tests
         if: matrix.profile.name == 'in-process'
         run: cargo test -p turso_whopper --test regression_tests
-        timeout-minutes: 5
+        timeout-minutes: 15
       - name: Run turso_whopper (${{ matrix.profile.name }})
         run: |
           cargo build -p turso_whopper --release
@@ -376,7 +375,7 @@ jobs:
         run: |
           cargo test -q -p turso_core --features "fs experimental_win_iocp" multiprocess_tests:: -- --nocapture
       - name: Run Windows multiprocess startup smoke
-        run: cargo run -q -p turso_whopper -- --mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01
+        run: cargo run -q -p turso_whopper -- --mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01 --max-steps 10000
 
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404

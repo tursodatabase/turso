@@ -807,6 +807,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 "wait_changes(path={}): no changes detected",
                 self.main_db_path
             );
+            self.update_meta(coro, |m| {
+                m.last_pull_unix_time = Some(now.secs);
+            })
+            .await?;
             return Ok(DbChangesStatus {
                 time: now,
                 revision: next_revision,

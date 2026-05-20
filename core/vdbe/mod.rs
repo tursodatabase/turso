@@ -204,9 +204,33 @@ impl CommitState {
             CommitState::Ready | CommitState::Committing | CommitState::CommittingAttached => {}
         }
     }
+
+    fn cleanup_abandoned_mvcc_commit(&mut self, connection: &Connection) {
+        match self {
+            CommitState::CommittingAttachedMvcc {
+                state_machine,
+                db_id: attached_db_id,
+                ..
+            } if !state_machine.is_finalized() => {
+                if connection
+                    .database_schemas()
+                    .write()
+                    .remove(attached_db_id)
+                    .is_some()
+                {
+                    connection.bump_prepare_context_generation();
+                }
+            }
+            CommitState::CommittingMvcc { state_machine } if !state_machine.is_finalized() => {}
+            _ => return, // no-op for already-finalized state machines and non-MVCC commit states
+        };
+
+        connection.rollback_attached_mvcc_txs(true);
+        connection.rollback_attached_wal_txns();
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Register {
     Value(Value),
     Aggregate(AggContext),
@@ -332,6 +356,10 @@ pub struct Row {
 pub enum TxnCleanup {
     None,
     RollbackTxn,
+    /// begin_statement was called and statement is participating in an interactive transaction.
+    /// If statement is abandoned and/or dropped without an apparent error, we should rollback statement
+    /// to previous savepoint.
+    RollbackSavepoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -600,6 +628,8 @@ pub struct ProgramState {
     pub(crate) cursors: Vec<Option<Cursor>>,
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
+    /// Trace state: register snapshot for diffing.
+    pre_op_registers: Option<Box<[Register]>>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seeks: Vec<Option<DeferredSeekState>>,
@@ -697,6 +727,7 @@ impl ProgramState {
             cursors,
             cursor_seqs,
             registers,
+            pre_op_registers: None,
             result_row: None,
             last_compare: None,
             deferred_seeks: vec![None; max_cursors],
@@ -1562,6 +1593,46 @@ impl Program {
                 trace_insn(self, state.pc as InsnReference, insn);
                 crate::stack::trace_remaining("program_step:opcode");
             }
+            if self.connection.get_vdbe_trace() {
+                // Diff registers from PREVIOUS opcode
+                // The last opcode (Halt) won't have its diff printed, but Halt
+                // doesn't write to any registers
+                if let Some(ref old) = state.pre_op_registers {
+                    for (i, (old_reg, new_reg)) in
+                        old.iter().zip(state.registers.iter()).enumerate()
+                    {
+                        if old_reg != new_reg {
+                            match new_reg {
+                                Register::Value(v) => eprintln!("R[{i}] = {v}"),
+                                Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
+                                Register::Record(_) => eprintln!("R[{i}] = <record>"),
+                            }
+                        }
+                    }
+                    state.pre_op_registers = None;
+                }
+
+                // Print CURRENT opcode
+                if matches!(insn, Insn::Init { .. }) {
+                    eprintln!("VDBE Trace:");
+                }
+                eprintln!(
+                    "{}",
+                    explain::insn_to_str(
+                        self,
+                        state.pc as InsnReference,
+                        insn,
+                        String::new(),
+                        self.comments
+                            .iter()
+                            .find(|(offset, _)| *offset == state.pc as InsnReference)
+                            .map(|(_, comment)| comment)
+                            .copied()
+                    )
+                );
+                // Snapshot for next iteration
+                state.pre_op_registers = Some(state.registers.clone());
+            }
             // Always increment VM steps for every loop iteration
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
@@ -2192,6 +2263,18 @@ impl Program {
         // state machine cannot run its own error cleanup. abort() is the first
         // statement cleanup path that still owns that commit_state.
         state.commit_state.cleanup_mvcc_checkpoint_state();
+        // If a CommitStateMachine was non-terminal when the program was
+        // aborted — Statement dropped mid-IO yield, or `?` propagated a Busy
+        // out of BeginCommitLogicalLog / SyncLogicalLog — release the locks
+        // it acquired (`pager_commit_lock`, `exclusive_tx`) and roll back the
+        // orphan tx. Without this the tx stays in `Preparing`, the next op on
+        // this connection trips a `turso_assert_eq!(Active)`, and any other
+        // writer parks forever on the leaked `pager_commit_lock`. The
+        // following err-match's no-rollback arms (Busy / TxError / etc.)
+        // would otherwise skip this cleanup.
+        state
+            .commit_state
+            .cleanup_abandoned_mvcc_commit(&self.connection);
 
         // VACUUM (and VACUUM INTO) state can own internal helper statements whose drop path
         // releases nested guards. Clean it before checking whether this program
@@ -2358,11 +2441,31 @@ impl Program {
                         "RaiseIgnore should be caught by op_program, not reach abort"
                     );
                 }
-                _ => {
-                    if state.auto_txn_cleanup != TxnCleanup::None || err.is_some() {
+                _ => match state.auto_txn_cleanup {
+                    TxnCleanup::RollbackTxn => {
                         self.rollback_current_txn(pager);
                     }
-                }
+                    TxnCleanup::RollbackSavepoint => {
+                        if err.is_none() && !pager.is_checkpointing() {
+                            if let Err(end_stmt_err) = state.end_statement(
+                                &self.connection,
+                                pager,
+                                EndStatement::RollbackSavepoint,
+                            ) {
+                                capture_abort_error(
+                                    &mut abort_error,
+                                    end_stmt_err,
+                                    "Failed to rollback statement savepoint during abort",
+                                );
+                            }
+                        }
+                    }
+                    TxnCleanup::None => {
+                        if err.is_some() {
+                            self.rollback_current_txn(pager);
+                        }
+                    }
+                },
             }
         }
         if state.uses_subjournal {

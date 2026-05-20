@@ -244,6 +244,51 @@ fn emit_rename_sqlite_sequence_entry(
     });
 }
 
+fn emit_delete_sqlite_sequence_entry(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    table_name_norm: &str,
+) {
+    let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
+    }) else {
+        return;
+    };
+
+    let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_sequence.clone()));
+    let sequence_name_reg = program.alloc_register();
+    let row_name_to_delete_reg = program.emit_string8_new_reg(table_name_norm.to_string());
+    program.mark_last_insn_constant();
+
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: seq_cursor_id,
+        root_page: RegisterOrLiteral::Literal(sqlite_sequence.root_page),
+        db: database_id,
+    });
+
+    program.cursor_loop(seq_cursor_id, |program, _rowid| {
+        program.emit_column_or_rowid(seq_cursor_id, 0, sequence_name_reg);
+
+        let continue_loop_label = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: sequence_name_reg,
+            rhs: row_name_to_delete_reg,
+            target_pc: continue_loop_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+
+        program.emit_insn(Insn::Delete {
+            cursor_id: seq_cursor_id,
+            table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+            is_part_of_update: false,
+        });
+
+        program.preassign_label_to_next_insn(continue_loop_label);
+    });
+}
+
 fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
     match literal {
         ast::Literal::Numeric(val) => parse_numeric_literal(val),
@@ -1651,6 +1696,12 @@ pub fn translate_alter_table(
                     (rewrites_physical_layout, Some(replacement_column))
                 }
             };
+            let clears_autoincrement_sequence = !rename
+                && btree.has_autoincrement
+                && btree.columns()[column_index].is_rowid_alias()
+                && replacement_column
+                    .as_ref()
+                    .is_some_and(|column| !column.is_rowid_alias());
 
             let is_making_column_generated = definition
                 .constraints
@@ -2037,6 +2088,11 @@ pub fn translate_alter_table(
                     connection,
                     database_id,
                 );
+            }
+
+            if clears_autoincrement_sequence {
+                let table_name_norm = normalize_ident(table_name);
+                emit_delete_sqlite_sequence_entry(program, resolver, database_id, &table_name_norm);
             }
 
             program.emit_insn(Insn::SetCookie {

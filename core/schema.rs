@@ -2943,6 +2943,9 @@ impl BTreeTable {
             }
             if needs_pk_inline && column.primary_key() {
                 sql.push_str(" PRIMARY KEY");
+                if self.has_autoincrement && column.is_rowid_alias() {
+                    sql.push_str(" AUTOINCREMENT");
+                }
             }
 
             if let Some(default) = &column.default {
@@ -5837,6 +5840,20 @@ mod tests {
         assert_eq!(
             reconstructed_sql,
             "CREATE TABLE test_normal (id INTEGER, name TEXT)"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_autoincrement_preserved_in_to_sql() -> Result<()> {
+        let sql = r#"CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, doomed INT, v TEXT)"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+
+        assert!(table.has_autoincrement);
+        assert_eq!(
+            table.to_sql(),
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, doomed INT, v TEXT)"
         );
 
         Ok(())

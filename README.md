@@ -422,28 +422,6 @@ EOF
 
 We'd love to have you contribute to Turso Database! Please check out the [contribution guide] to get started.
 
-### Found a data corruption bug? Get up to $1,000.00
-
-SQLite is loved because it is the most reliable database in the world. The next evolution of SQLite has
-to match or surpass this level of reliability. Turso is built with [Deterministic Simulation Testing](testing/simulator/README.md/)
-from the ground up, and is also tested by [Antithesis](https://antithesis.com).
-
-Even during Beta, if you find a bug that leads to a data corruption and demonstrate
-how our simulator failed to catch it, you can get up to $1,000.00. As the project matures we will
-increase the size of the prize, and the scope of the bugs.
-
-List of rewarded cases:
-
-* B-Tree interior cell replacement issue in btrees with depth >=3 ([#2106](https://github.com/tursodatabase/turso/issues/2106))
-* Don't allow autovacuum to be flipped on non-empty databases ([#3830](https://github.com/tursodatabase/turso/pull/3830))
-* Self-insert with nested subquery generates corrupt data ([#3436](https://github.com/tursodatabase/turso/pull/3436))
-* Ptrmap data corruption with pre-initialized autovacuum database ([#3894](https://github.com/tursodatabase/turso/pull/3894))
-* WAL corruption on statement rollback with constraint violation ([#4493](https://github.com/tursodatabase/turso/pull/4493))
-
-More details [here](https://turso.algora.io).
-
-Turso core staff are not eligible.
-
 ## FAQ
 
 ### Is Turso Database ready for production use?

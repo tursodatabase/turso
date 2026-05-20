@@ -1,4 +1,5 @@
-﻿using System.Data.Common;
+﻿using System.Data;
+using System.Data.Common;
 using AwesomeAssertions;
 using Turso.Raw.Public;
 using Turso.Raw.Public.Value;
@@ -166,6 +167,137 @@ public class TursoTests
         using var cmd = new TursoCommand(connection, "SELECT * FROM table_that_does_not_exist");
         cmd.Invoking(x => x.ExecuteReader()).Should().Throw<TursoException>()
             .WithMessage("Unable to prepare statement: Parse error: no such table: table_that_does_not_exist");
+    }
+
+    [Test]
+    public void TestProviderFactoryCreatesAdoNetObjects()
+    {
+        DbProviderFactory factory = TursoFactory.Instance;
+
+        factory.CreateConnection().Should().BeOfType<TursoConnection>();
+        factory.CreateCommand().Should().BeOfType<TursoCommand>();
+        factory.CreateParameter().Should().BeOfType<TursoParameter>();
+        factory.CreateConnectionStringBuilder().Should().BeOfType<TursoConnectionStringBuilder>();
+    }
+
+    [Test]
+    public void TestConnectionStringBuilderNormalizesSqliteAliases()
+    {
+        var builder = new TursoConnectionStringBuilder(
+            "Filename=:memory:;ForeignKeys=True;Command Timeout=7;EncryptionCipher=aegis256");
+
+        builder.DataSource.Should().Be(":memory:");
+        builder.ForeignKeys.Should().BeTrue();
+        builder.DefaultTimeout.Should().Be(7);
+        builder.EncryptionCipher.Should().Be("aegis256");
+        builder.ConnectionString.Should().Contain("Data Source=:memory:");
+        builder.ConnectionString.Should().Contain("Foreign Keys=True");
+        builder.ConnectionString.Should().Contain("Default Timeout=7");
+        builder.ContainsKey("DataSource").Should().BeTrue();
+    }
+
+    [Test]
+    public void TestCommandBehaviorCloseConnection()
+    {
+        using var connection = new TursoConnection();
+        connection.Open();
+
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT 1";
+
+        using (var reader = command.ExecuteReader(CommandBehavior.CloseConnection))
+        {
+            reader.Read().Should().BeTrue();
+            reader.GetInt32(0).Should().Be(1);
+        }
+
+        connection.State.Should().Be(ConnectionState.Closed);
+    }
+
+    [Test]
+    public void TestNextResultReturnsFalseForSingleStatement()
+    {
+        using var connection = new TursoConnection();
+        connection.Open();
+
+        using var command = new TursoCommand(connection, "SELECT 1");
+        using var reader = command.ExecuteReader();
+
+        reader.Read().Should().BeTrue();
+        reader.NextResult().Should().BeFalse();
+    }
+
+    [Test]
+    public void TestMissingParameterThrowsBeforeExecution()
+    {
+        using var connection = new TursoConnection();
+        connection.Open();
+
+        using var command = new TursoCommand(connection, "SELECT ?");
+
+        command.Invoking(x => x.ExecuteScalar())
+            .Should().Throw<InvalidOperationException>()
+            .WithMessage("Missing value for parameter ?1.");
+    }
+
+    [Test]
+    public void TestWrongNamedParameterThrowsBeforeExecution()
+    {
+        using var connection = new TursoConnection();
+        connection.Open();
+
+        using var command = new TursoCommand(connection, "SELECT :value");
+        command.Parameters.AddWithValue(":other", 1);
+
+        command.Invoking(x => x.ExecuteScalar())
+            .Should().Throw<InvalidOperationException>()
+            .WithMessage("Parameter :other was not found in the SQL statement.");
+    }
+
+    [Test]
+    public void TestDbNullRoundTripsAsDbNullValue()
+    {
+        using var connection = new TursoConnection();
+        connection.Open();
+
+        using var command = new TursoCommand(connection, "SELECT ?");
+        command.Parameters.Add(DBNull.Value);
+
+        using var reader = command.ExecuteReader();
+        reader.Read().Should().BeTrue();
+        reader.IsDBNull(0).Should().BeTrue();
+        reader.GetValue(0).Should().Be(DBNull.Value);
+    }
+
+    [Test]
+    public void TestCommandCanExecuteRepeatedlyWithNewParameters()
+    {
+        using var connection = new TursoConnection();
+        connection.Open();
+
+        using var command = new TursoCommand(connection, "SELECT ?");
+        command.Parameters.Add(1);
+        command.ExecuteScalar().Should().Be(1L);
+
+        command.Parameters.Clear();
+        command.Parameters.Add(2);
+        command.ExecuteScalar().Should().Be(2L);
+    }
+
+    [Test]
+    public void TestPreparedCommandUsesCurrentParameterValues()
+    {
+        using var connection = new TursoConnection();
+        connection.Open();
+
+        using var command = new TursoCommand(connection, "SELECT ?");
+        command.Parameters.Add(1);
+        command.Prepare();
+
+        command.Parameters.Clear();
+        command.Parameters.Add(2);
+
+        command.ExecuteScalar().Should().Be(2L);
     }
 
     [Test]

@@ -420,38 +420,42 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         let mut exists_in_db_file = false;
         // Iterate versions from oldest-to-newest to determine if the row exists in the database file and whether the newest version should be checkpointed.
         for version in versions.iter() {
-            // Rows marked btree_resident existed in the DB file before MVCC tracked them.
-            // This also applies to synthetic tombstones that use begin=None.
-            if version.btree_resident {
-                exists_in_db_file = true;
-            }
             // A row is in the database file if:
             // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
             // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
             let mut begin_ts = None;
             if let Some(TxTimestampOrID::Timestamp(b)) = version.begin {
                 begin_ts = Some(b);
-                // A row exists in the DB file if it was checkpointed in a previous checkpoint.
-                // For btree_resident rows we set exists_in_db_file above, regardless of begin encoding.
-                if self
-                    .durable_txid_max_old
-                    .is_some_and(|txid_max_old| b <= u64::from(txid_max_old))
-                {
-                    exists_in_db_file = true;
-                }
             }
             let mut end_ts = None;
             if let Some(TxTimestampOrID::Timestamp(e)) = version.end {
                 end_ts = Some(e);
-                if self
-                    .durable_txid_max_old
-                    .is_some_and(|txid_max_old| e <= u64::from(txid_max_old))
-                {
-                    exists_in_db_file = false;
-                }
             }
             if begin_ts.is_none() && end_ts.is_none() {
+                // Rolled-back garbage and active TxID-only placeholders are not part of
+                // the durable row history, so they must not influence DB-file existence.
                 continue;
+            }
+            // Rows marked btree_resident existed in the DB file before MVCC tracked them.
+            // This also applies to synthetic tombstones that use begin=None.
+            if version.btree_resident {
+                exists_in_db_file = true;
+            }
+            // A row exists in the DB file if it was checkpointed in a previous checkpoint.
+            // For btree_resident rows we seed exists_in_db_file above, regardless of begin encoding.
+            // These timestamp-derived transitions must run after the btree_resident seed so a
+            // checkpointed tombstone can clear DB-file existence on a retry checkpoint.
+            if self
+                .durable_txid_max_old
+                .is_some_and(|txid_max_old| begin_ts.is_some_and(|b| b <= u64::from(txid_max_old)))
+            {
+                exists_in_db_file = true;
+            }
+            if self
+                .durable_txid_max_old
+                .is_some_and(|txid_max_old| end_ts.is_some_and(|e| e <= u64::from(txid_max_old)))
+            {
+                exists_in_db_file = false;
             }
             // Should checkpoint the newest version if:
             // - It is not a delete and it hasn't been checkpointed yet OR (begin_ts > max_old)
@@ -685,6 +689,34 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         }
     }
 
+    #[cfg(any(test, debug_assertions))]
+    fn max_collected_version_timestamp(&self) -> u64 {
+        fn max_version_timestamp(version: &RowVersion) -> u64 {
+            [version.begin.as_ref(), version.end.as_ref()]
+                .into_iter()
+                .filter_map(|ts| match ts {
+                    Some(TxTimestampOrID::Timestamp(ts)) => Some(*ts),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or_default()
+        }
+
+        let table_max = self
+            .write_set
+            .iter()
+            .map(|(version, _)| max_version_timestamp(version))
+            .max()
+            .unwrap_or_default();
+        let index_max = self
+            .index_write_set
+            .iter()
+            .map(|(_, version, _)| max_version_timestamp(version))
+            .max()
+            .unwrap_or_default();
+        table_max.max(index_max)
+    }
+
     /// Get the current row version to write to the B-tree
     fn get_current_row_version(
         &self,
@@ -730,6 +762,113 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             IOResult::Done(result) => Ok(IOResult::Done(result)),
             IOResult::IO(io) => Ok(IOResult::IO(io)),
         }
+    }
+
+    fn has_unpublished_schema_changes(&self) -> bool {
+        let schema = self.connection.db.schema.lock();
+        !schema.dropped_root_pages.is_empty()
+            || schema
+                .tables
+                .values()
+                .any(|table| table.btree().is_some_and(|btree| btree.root_page < 0))
+            || schema
+                .indexes
+                .values()
+                .flatten()
+                .any(|index| index.root_page < 0)
+    }
+
+    fn has_pending_root_publication(&self) -> bool {
+        !self.created_btrees.is_empty() || self.has_unpublished_schema_changes()
+    }
+
+    fn publish_checkpointed_schema_roots(&mut self) {
+        if !self.has_pending_root_publication() {
+            return;
+        }
+
+        // Patch sqlite_schema in MV Store to contain positive rootpages instead of negative ones
+        // for tables and indexes that were flushed to the physical database.
+        for (sqlite_schema_rowid, (_, row_version)) in self.created_btrees.drain() {
+            let key = RowID {
+                table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
+                row_id: RowKey::Int(sqlite_schema_rowid),
+            };
+            let sqlite_schema_row = self
+                .mvstore
+                .rows
+                .get(&key)
+                .expect("sqlite_schema row not found");
+            let mut row_versions = sqlite_schema_row.value().write();
+            // row_version is a clone of the original with only the root
+            // page column patched, so it shares the same version id. We
+            // must replace the original in-place rather than append,
+            // otherwise the version chain ends up with two entries that
+            // have identical (id, begin, end). A later DELETE only marks
+            // one of them as ended (it returns after the first match),
+            // leaving the other as a phantom current version that causes
+            // spurious write-write conflicts at commit time.
+            let vid = row_version.id;
+            if let Some(existing) = row_versions.iter_mut().find(|rv| rv.id == vid) {
+                *existing = row_version;
+            } else {
+                self.mvstore
+                    .insert_version_raw(&mut row_versions, row_version);
+            }
+        }
+
+        if !self.has_unpublished_schema_changes() {
+            return;
+        }
+
+        // Patch in-memory schema to do the same. This must happen as soon as the
+        // pager commit succeeds because the committed root pages are then visible
+        // through WAL even if the later WAL checkpoint/log truncation is busy.
+        let mut schema_ref = self.connection.db.schema.lock();
+        let schema = Arc::make_mut(&mut *schema_ref);
+        for table in schema.tables.values_mut() {
+            let table = Arc::get_mut(table).expect("this should be the only reference");
+            let Some(btree_table) = table.btree_mut() else {
+                continue;
+            };
+            let btree_table = Arc::make_mut(btree_table);
+            if btree_table.root_page < 0 {
+                let table_id = MVTableId::from(btree_table.root_page);
+                let entry = self
+                    .mvstore
+                    .table_id_to_rootpage
+                    .get(&table_id)
+                    .expect("we should have checkpointed table with table_id {table_id:?}");
+                let value = entry
+                    .value()
+                    .expect("table with id {table_id:?} should have a mapping");
+                btree_table.root_page = value as i64;
+            }
+        }
+        for table_index_list in schema.indexes.values_mut() {
+            for index in table_index_list.iter_mut() {
+                if index.root_page < 0 {
+                    let table_id = MVTableId::from(index.root_page);
+                    let entry = self
+                        .mvstore
+                        .table_id_to_rootpage
+                        .get(&table_id)
+                        .expect("we should have checkpointed index with table_id {table_id:?}");
+                    let value = entry
+                        .value()
+                        .expect("index with id {table_id:?} should have a mapping");
+                    let index = Arc::make_mut(index);
+                    index.root_page = value as i64;
+                }
+            }
+        }
+
+        // Clear dropped root pages now that the pager commit contains the btree frees.
+        // integrity_check should now follow the committed freelist state instead.
+        schema.dropped_root_pages.clear();
+        drop(schema_ref);
+        *self.connection.schema.write() = self.connection.db.clone_schema();
+        self.connection.bump_prepare_context_generation();
     }
 
     /// Garbage-collect row versions for rows that were just checkpointed.
@@ -864,7 +1003,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             CheckpointState::AcquireLock => {
                 inject_transition_yield!(self, CheckpointYieldPoint::BeforeAcquireLock);
 
-                tracing::info!("Acquiring blocking checkpoint lock");
+                tracing::debug!("Acquiring blocking checkpoint lock");
                 let locked = self.checkpoint_lock.write();
                 if !locked {
                     return Err(crate::LimboError::Busy);
@@ -877,15 +1016,24 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.refresh_checkpoint_bounds();
 
                 self.collect_committed_table_row_versions();
-                tracing::info!("Collected {} committed versions", self.write_set.len());
+                tracing::debug!("Collected {} committed versions", self.write_set.len());
 
                 self.collect_committed_index_row_versions();
-                tracing::info!("Collected {} index row changes", self.index_write_set.len());
+                tracing::debug!("Collected {} index row changes", self.index_write_set.len());
                 // Checkpoint boundary is derived from a stable snapshot under the blocking lock:
                 // old durable boundary plus the latest committed tx watermark. This covers both
                 // row/index commits and header-only commits.
                 let durable_old = self.durable_txid_max_old.map(u64::from).unwrap_or_default();
                 let committed_max = self.mvstore.last_committed_tx_ts.load(Ordering::Acquire);
+                #[cfg(any(test, debug_assertions))]
+                {
+                    let collected_max = self.max_collected_version_timestamp();
+                    turso_assert!(
+                        committed_max >= collected_max,
+                        "MVCC checkpoint collected version timestamp above committed watermark",
+                        { "collected_max": collected_max, "committed_max": committed_max }
+                    );
+                }
                 self.durable_txid_max_new = durable_old.max(committed_max);
                 self.maybe_stage_mvcc_metadata_write()?;
 
@@ -902,7 +1050,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 Ok(TransitionResult::Continue)
             }
             CheckpointState::BeginPagerTxn => {
-                tracing::info!("Beginning pager transaction");
+                tracing::debug!("Beginning pager transaction");
                 // Start a pager transaction to write committed versions to B-tree
                 let read_tx_active = self
                     .pager
@@ -1448,7 +1596,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // the pager transaction. durable_txid_max is NOT advanced (only happens
                 // on success below), so a retry will re-stage from the previous boundary.
                 // The logical log is also unaffected — its offset is not advanced here.
-                tracing::info!("Committing pager transaction");
+                tracing::debug!("Committing pager transaction");
                 let result = self
                     .pager
                     .commit_tx(&self.connection, self.update_transaction_state)?;
@@ -1471,7 +1619,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             )
                         })?;
                         self.mvstore.global_header.write().replace(header);
+                        self.publish_checkpointed_schema_roots();
                         inject_transition_failure!(
+                            self,
+                            CheckpointYieldPoint::AfterDurableBoundaryAdvanced
+                        );
+                        inject_transition_yield!(
                             self,
                             CheckpointYieldPoint::AfterDurableBoundaryAdvanced
                         );
@@ -1482,7 +1635,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
 
             CheckpointState::TruncateLogicalLog => {
-                tracing::info!("Truncating logical log file");
+                tracing::debug!("Truncating logical log file");
                 let c = self.truncate_logical_log()?;
                 self.state = CheckpointState::FsyncLogicalLog;
                 // if Completion Completed without errors we can continue
@@ -1512,7 +1665,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
 
             CheckpointState::CheckpointWal => {
-                tracing::info!("Performing TRUNCATE checkpoint on WAL");
+                tracing::debug!("Performing TRUNCATE checkpoint on WAL");
                 match self.checkpoint_wal()? {
                     IOResult::Done(result) => {
                         self.checkpoint_result = Some(result);
@@ -1550,7 +1703,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     return Ok(TransitionResult::Continue);
                 }
 
-                tracing::info!("Fsyncing database file before WAL truncation");
+                tracing::debug!("Fsyncing database file before WAL truncation");
                 let c = self
                     .pager
                     .db_file
@@ -1580,90 +1733,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
 
             CheckpointState::Finalize => {
-                tracing::info!("Releasing blocking checkpoint lock");
-                // Patch sqlite_schema in MV Store to contain positive rootpages instead of negative ones
-                // for tables and indexes that were flushed to the physical database
-                for (sqlite_schema_rowid, (_, row_version)) in self.created_btrees.drain() {
-                    let key = RowID {
-                        table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
-                        row_id: RowKey::Int(sqlite_schema_rowid),
-                    };
-                    let sqlite_schema_row = self
-                        .mvstore
-                        .rows
-                        .get(&key)
-                        .expect("sqlite_schema row not found");
-                    let mut row_versions = sqlite_schema_row.value().write();
-                    // row_version is a clone of the original with only the root
-                    // page column patched, so it shares the same version id. We
-                    // must replace the original in-place rather than append,
-                    // otherwise the version chain ends up with two entries that
-                    // have identical (id, begin, end). A later DELETE only marks
-                    // one of them as ended (it returns after the first match),
-                    // leaving the other as a phantom current version that causes
-                    // spurious write-write conflicts at commit time.
-                    let vid = row_version.id;
-                    if let Some(existing) = row_versions.iter_mut().find(|rv| rv.id == vid) {
-                        *existing = row_version;
-                    } else {
-                        self.mvstore
-                            .insert_version_raw(&mut row_versions, row_version);
-                    }
-                }
-
-                // Patch in-memory schema to do the same
-                self.connection.db.with_schema_mut(|schema| {
-                    for table in schema.tables.values_mut() {
-                        let table = Arc::get_mut(table).expect("this should be the only reference");
-                        let Some(btree_table) = table.btree_mut() else {
-                            continue;
-                        };
-                        let btree_table = Arc::make_mut(btree_table);
-                        if btree_table.root_page < 0 {
-                            let table_id = MVTableId::from(btree_table.root_page);
-                            let entry = self.mvstore.table_id_to_rootpage.get(&table_id).expect(
-                                "we should have checkpointed table with table_id {table_id:?}",
-                            );
-                            let value = entry
-                                .value()
-                                .expect("table with id {table_id:?} should have a mapping");
-                            btree_table.root_page = value as i64;
-                        }
-                    }
-                    for table_index_list in schema.indexes.values_mut() {
-                        for index in table_index_list.iter_mut() {
-                            if index.root_page < 0 {
-                                let table_id = MVTableId::from(index.root_page);
-                                let entry = self
-                                    .mvstore
-                                    .table_id_to_rootpage
-                                    .get(&table_id)
-                                    .expect(
-                                    "we should have checkpointed index with table_id {table_id:?}",
-                                );
-                                let value = entry
-                                    .value()
-                                    .expect("index with id {table_id:?} should have a mapping");
-                                let index = Arc::make_mut(index);
-                                index.root_page = value as i64;
-                            }
-                        }
-                    }
-
-                    schema.schema_version += 1;
-                    // Clear dropped root pages now that the checkpoint has completed.
-                    // The btree pages for dropped tables have been freed, so integrity_check
-                    // no longer needs to track them.
-                    schema.dropped_root_pages.clear();
-                    let _ = self.pager.io.block(|| {
-                        self.pager.with_header_mut(|header| {
-                            header.schema_cookie = schema.schema_version.into();
-                            self.mvstore.global_header.write().replace(*header);
-                            IOResult::Done(())
-                        })
-                    })?;
-                    Ok(())
-                })?;
+                tracing::debug!("Releasing blocking checkpoint lock");
+                turso_assert!(
+                    !self.has_pending_root_publication(),
+                    "checkpoint finalized after pager writes without publishing schema changes"
+                );
 
                 self.mvstore
                     .durable_txid_max
@@ -1693,7 +1767,7 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
                 self.mvstore
                     .storage
                     .on_checkpoint_end(self.durable_txid_max_new, Err(err.clone()))?;
-                tracing::info!("Error in checkpoint state machine: {err}");
+                tracing::debug!("Error in checkpoint state machine: {err}");
                 self.cleanup_after_external_io_error();
                 res
             }
@@ -1719,6 +1793,11 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mvcc::database::tests::MvccTestDbNoConn;
+    use crate::mvcc::database::SortableIndexKey;
+    use crate::translate::collate::CollationSeq;
+    use crate::types::{IndexInfo, KeyInfo};
+    use turso_parser::ast::SortOrder;
 
     fn sqlite_schema_row_version(
         rowid: i64,
@@ -1826,5 +1905,94 @@ mod tests {
 
         assert_eq!(sqlite_schema_btree_identity(&tombstone), None);
         assert!(!is_schema_metadata_only_rewrite(&tombstone, None));
+    }
+
+    fn index_row_version(
+        index_id: MVTableId,
+        key_text: &str,
+        rowid: i64,
+        version_id: u64,
+        begin: Option<u64>,
+        end: Option<u64>,
+        btree_resident: bool,
+    ) -> (Arc<SortableIndexKey>, RowVersion) {
+        let index_info = Arc::new(IndexInfo {
+            key_info: vec![
+                KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation: CollationSeq::Binary,
+                    nulls_order: None,
+                },
+                KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation: CollationSeq::Binary,
+                    nulls_order: None,
+                },
+            ],
+            has_rowid: true,
+            num_cols: 2,
+            is_unique: true,
+        });
+        let key_record = ImmutableRecord::from_values(
+            &[
+                Value::Text(crate::types::Text::new(key_text.to_string())),
+                Value::from_i64(rowid),
+            ],
+            2,
+        );
+        let sortable_key = SortableIndexKey::new_from_record(key_record, index_info);
+        let key_arc = Arc::new(sortable_key.clone());
+        let row = Row::new_index_row(RowID::new(index_id, RowKey::Record(sortable_key)), 2);
+        let row_version = RowVersion {
+            id: version_id,
+            begin: begin.map(TxTimestampOrID::Timestamp),
+            end: end.map(TxTimestampOrID::Timestamp),
+            row,
+            btree_resident,
+        };
+        (key_arc, row_version)
+    }
+
+    #[test]
+    fn checkpoint_retry_does_not_replay_checkpointed_btree_resident_delete() {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        let mvstore = db.get_mvcc_store();
+        let pager = conn.pager.load().clone();
+        let mut checkpoint = CheckpointStateMachine::new(
+            pager,
+            mvstore.clone(),
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+        );
+        checkpoint.durable_txid_max_old = std::num::NonZeroU64::new(10);
+        checkpoint.durable_txid_max_new = 10;
+
+        let index_id = MVTableId::from(-42);
+        let (garbage_key, garbage_version) =
+            index_row_version(index_id, "blue_river_906", 75, 1, None, None, true);
+        let (_, tombstone_version) =
+            index_row_version(index_id, "blue_river_906", 75, 2, None, Some(10), true);
+
+        mvstore.insert_index_version(index_id, garbage_key, garbage_version);
+        let entry = mvstore
+            .index_rows
+            .get(&index_id)
+            .expect("index entry should exist after first insert");
+        let tombstone_key = entry
+            .value()
+            .front()
+            .expect("key bucket should exist after first insert")
+            .key()
+            .clone();
+        mvstore.insert_index_version(index_id, tombstone_key, tombstone_version);
+
+        checkpoint.collect_committed_index_row_versions();
+
+        assert!(
+            checkpoint.index_write_set.is_empty(),
+            "a retry checkpoint must not replay a delete whose btree_resident tombstone was already made durable"
+        );
     }
 }

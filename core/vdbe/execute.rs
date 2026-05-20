@@ -6,7 +6,7 @@ use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, Schema, Table, SCHEMA_TABLE_NAME,
+    render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
     SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
@@ -34,7 +34,7 @@ use crate::util::{
     trigger_still_references_renamed_column, trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
-    apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
+    apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
 };
 use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
@@ -3490,7 +3490,9 @@ pub fn op_transaction_inner(
                                 "nested stmt should not begin a new read transaction"
                             );
                             pager.begin_read_tx()?;
-                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                            if conn.get_auto_commit() {
+                                state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                            }
                         }
                         // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
                         pager.mvcc_refresh_if_db_changed();
@@ -3607,7 +3609,11 @@ pub fn op_transaction_inner(
                             "nested stmt should not begin a new read transaction"
                         );
                         pager.begin_read_tx()?;
-                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                        // https://github.com/tursodatabase/turso/issues/7106 : If auto-commit is turned off,
+                        // then we shouldn't be setting the auto_txn_cleanup, this will cause errors in case the client explicitly calls commit post a drop of the statement struct
+                        if conn.get_auto_commit() {
+                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                        }
                     }
 
                     if !is_secondary_db
@@ -3784,6 +3790,9 @@ pub fn op_transaction_inner(
                         .n_active_writes
                         .fetch_add(1, Ordering::SeqCst);
                     state.is_active_write = true;
+                    if state.has_stmt_transaction {
+                        state.auto_txn_cleanup = TxnCleanup::RollbackSavepoint;
+                    }
                 }
                 state.pc += 1;
                 state.active_op_state.clear();
@@ -4786,6 +4795,7 @@ pub fn op_seek_rowid(
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
     }
+    invalidate_deferred_seeks_for_cursor(state, *cursor_id);
     let (pc, did_seek) = {
         let cursor = get_cursor!(state, *cursor_id);
 
@@ -11676,13 +11686,17 @@ pub fn op_add_imm(
         Register::Record(_) => &Value::Null,
     };
 
-    let int_val = match current_value {
-        Value::Numeric(Numeric::Integer(i)) => i + value,
-        Value::Numeric(Numeric::Float(f)) => (f64::from(*f) as i64) + value,
-        Value::Text(s) => s.as_str().parse::<i64>().unwrap_or(0) + value,
-        Value::Blob(_) => *value, // BLOB becomes the added value
-        Value::Null => *value,    // NULL becomes the added value
+    // SQLite coerces the register to an integer before adding.
+    let lhs = match current_value {
+        Value::Numeric(Numeric::Integer(i)) => *i,
+        Value::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(*f)),
+        Value::Text(s) => crate::numeric::str_to_i64(s.as_str()).unwrap_or(0),
+        Value::Blob(b) => {
+            crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
+        }
+        Value::Null => 0,
     };
+    let int_val = lhs.wrapping_add(*value);
 
     state.registers[*register].set_int(int_val);
     state.pc += 1;
@@ -12820,7 +12834,9 @@ pub fn op_drop_column(
             for index in indexes {
                 let index = Arc::get_mut(index).expect("this should be the only strong reference");
                 for index_column in index.columns.iter_mut() {
-                    if index_column.pos_in_table > *column_index {
+                    if index_column.pos_in_table != EXPR_INDEX_SENTINEL
+                        && index_column.pos_in_table > *column_index
+                    {
                         index_column.pos_in_table -= 1;
                     }
                     if let Some(ref mut expr) = index_column.expr {
@@ -13030,6 +13046,14 @@ pub fn op_alter_column(
                 }
             }
         }
+        let clears_autoincrement_sequence = !*rename
+            && btree.has_autoincrement
+            && btree
+                .columns()
+                .get(*column_index)
+                .is_some_and(|column| column.is_rowid_alias())
+            && !new_column.is_rowid_alias();
+
         if *rename {
             btree.columns_mut()[*column_index].name = Some(new_name.clone());
 
@@ -13082,6 +13106,9 @@ pub fn op_alter_column(
         if !*rename {
             // recompute alias from `new_column`
             btree.columns_mut()[*column_index].set_rowid_alias(new_column.is_rowid_alias());
+            if clears_autoincrement_sequence {
+                btree.has_autoincrement = false;
+            }
         }
 
         // Update this table's OWN foreign keys
@@ -14287,32 +14314,16 @@ fn execute_turso_version(version_integer: i64) -> String {
     format!("{major}.{minor}.{release}")
 }
 
+/// Coerce a value to i64 using the same non-NULL conversion rules as
+/// SQLite's OP_AddImm.
 pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
     let value = value.as_value_ref();
     match value {
         ValueRef::Numeric(Numeric::Integer(i)) => i,
-        ValueRef::Numeric(Numeric::Float(f)) => {
-            let f = f64::from(f);
-            // Use sqlite3RealToI64 equivalent
-            if f < -9223372036854774784.0 {
-                i64::MIN
-            } else if f > 9223372036854774784.0 {
-                i64::MAX
-            } else {
-                f as i64
-            }
-        }
-        ValueRef::Text(t) => {
-            // Try to parse as integer, return 0 if failed
-            t.as_str().parse::<i64>().unwrap_or(0)
-        }
+        ValueRef::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(f)),
+        ValueRef::Text(t) => crate::numeric::str_to_i64(t.as_str()).unwrap_or(0),
         ValueRef::Blob(b) => {
-            // Try to parse blob as string then as integer
-            if let Ok(s) = std::str::from_utf8(b) {
-                s.parse::<i64>().unwrap_or(0)
-            } else {
-                0
-            }
+            crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
         }
         ValueRef::Null => 0,
     }
