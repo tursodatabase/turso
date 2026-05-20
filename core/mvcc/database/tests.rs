@@ -8793,7 +8793,7 @@ fn test_abandoned_drop() {
          WHERE tbl_name = 't' ORDER BY rowid",
     );
     assert!(
-        after.len() == 0 || after.len() == 2,
+        after.len() == 2,
         "schema must not be half-dropped; got rows: {after:?}",
     );
 }
