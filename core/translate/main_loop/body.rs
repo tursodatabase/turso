@@ -398,6 +398,48 @@ fn emit_loop_source<'a>(
                 })?;
             }
 
+            // HAVING-without-GROUP-BY: the entire table is one implicit group, and
+            // HAVING is evaluated once after aggregation. Any bare column references
+            // inside HAVING must be captured while the cursor is positioned on a
+            // valid row; after the loop completes the cursor is past-end and Column
+            // would return NULL, which would suppress the single aggregate row.
+            if let Some(group_by) = &plan.group_by {
+                if group_by.exprs.is_empty() {
+                    if let Some(having) = &group_by.having {
+                        for expr in having.iter() {
+                            walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
+                                match expr {
+                                    Expr::Column { .. } | Expr::RowId { .. } => {
+                                        let reg = program.alloc_register();
+                                        translate_expr(
+                                            program,
+                                            Some(&plan.table_references),
+                                            expr,
+                                            reg,
+                                            &t_ctx.resolver,
+                                        )?;
+                                        t_ctx.resolver.cache_scalar_expr_reg(
+                                            Cow::Owned(expr.clone()),
+                                            reg,
+                                            false,
+                                            &plan.table_references,
+                                        )?;
+                                        Ok(WalkControl::SkipChildren)
+                                    }
+                                    _ => {
+                                        if plan.aggregates.iter().any(|a| a.original_expr == *expr)
+                                        {
+                                            return Ok(WalkControl::SkipChildren);
+                                        }
+                                        Ok(WalkControl::Continue)
+                                    }
+                                }
+                            })?;
+                        }
+                    }
+                }
+            }
+
             if let Some(label) = label_emit_nonagg_only_once {
                 program.preassign_label_to_next_insn(label);
                 let flag = t_ctx.reg_nonagg_emit_once_flag.unwrap();
