@@ -5,7 +5,7 @@
 There is a deterministic MVCC/yield-injection reproducer for this corruption:
 
 ```text
-sqlite_schema contains index for missing table 'repro_target': rootpage=37 sql=CREATE UNIQUE INDEX IF NOT EXISTS idx_repro_target_c0 ON repro_target (c0) WHERE c1 IS NULL
+sqlite_schema contains index for missing table 'repro_target': rootpage=3 sql=CREATE UNIQUE INDEX IF NOT EXISTS idx_repro_target_c0 ON repro_target (c0) WHERE c1 IS NULL
 ```
 
 The reproducer shows that an interrupted `DROP TABLE repro_target` can delete
@@ -36,7 +36,7 @@ cargo test -p turso_core test_interrupted_drop_table_rolls_back_schema_table_and
 On the buggy code, it fails at reopen with:
 
 ```text
-Corrupt("sqlite_schema contains index for missing table 'repro_target': rootpage=37 sql=CREATE UNIQUE INDEX IF NOT EXISTS idx_repro_target_c0 ON repro_target (c0) WHERE c1 IS NULL")
+Corrupt("sqlite_schema contains index for missing table 'repro_target': rootpage=3 sql=CREATE UNIQUE INDEX IF NOT EXISTS idx_repro_target_c0 ON repro_target (c0) WHERE c1 IS NULL")
 ```
 
 ## Reproducer Shape
@@ -46,14 +46,13 @@ The test uses a named `:memory:` database with shared `MemoryIO`.
 It performs these steps:
 
 1. Enable MVCC.
-2. Create 17 dummy table/index pairs so the target index lands on rootpage 37.
-3. Create the target table:
+2. Create the target table:
 
    ```sql
    CREATE TABLE repro_target(c0 INTEGER, c1 REAL);
    ```
 
-4. Create the target partial index:
+3. Create the target partial index:
 
    ```sql
    CREATE UNIQUE INDEX IF NOT EXISTS idx_repro_target_c0
@@ -61,43 +60,43 @@ It performs these steps:
      WHERE c1 IS NULL;
    ```
 
-5. Run `PRAGMA wal_checkpoint(TRUNCATE)` so the schema rows are checkpointed
+4. Run `PRAGMA wal_checkpoint(TRUNCATE)` so the schema rows are checkpointed
    and have positive rootpages:
 
    ```text
-   table repro_target rootpage=36
-   index idx_repro_target_c0 rootpage=37
+   table repro_target rootpage=2
+   index idx_repro_target_c0 rootpage=3
    ```
 
-6. Prepare and step:
+5. Prepare and step:
 
    ```sql
    DROP TABLE repro_target;
    ```
 
-7. Inject a yield at the 35th `CursorYieldPoint::NextStart`, which lands after
-   the `repro_target` table row has been deleted from `sqlite_schema`, but
-   before the `idx_repro_target_c0` row is deleted.
+6. Inject a yield at `CursorYieldPoint::NextStart`, which lands after the
+   `repro_target` table row has been deleted from `sqlite_schema`, but before
+   the `idx_repro_target_c0` row is deleted.
 
-8. Run another same-connection statement:
+7. Run another same-connection statement:
 
    ```sql
    SELECT 1;
    ```
 
-9. Drop the suspended `DROP TABLE` statement.
-10. Drop the connection/database handles, then reopen the named `:memory:` DB.
+8. Drop the suspended `DROP TABLE` statement.
+9. Drop the connection/database handles, then reopen the named `:memory:` DB.
 
 The reopen fails because schema reconstruction sees this state:
 
 ```text
-index|idx_repro_target_c0|repro_target|37|CREATE UNIQUE INDEX IF NOT EXISTS idx_repro_target_c0 ON repro_target (c0) WHERE c1 IS NULL
+index|idx_repro_target_c0|repro_target|3|CREATE UNIQUE INDEX IF NOT EXISTS idx_repro_target_c0 ON repro_target (c0) WHERE c1 IS NULL
 ```
 
 with no matching:
 
 ```text
-table|repro_target|repro_target|36|...
+table|repro_target|repro_target|2|...
 ```
 
 ## Important Controls

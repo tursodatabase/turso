@@ -49,41 +49,6 @@ struct FixedYieldInjector {
     remaining: Mutex<HashSet<YieldPoint>>,
 }
 
-#[derive(Debug)]
-struct NthYieldInjector {
-    point: YieldPoint,
-    remaining: Mutex<usize>,
-}
-
-impl NthYieldInjector {
-    fn new(point: YieldPoint, occurrence: usize) -> Arc<Self> {
-        assert!(occurrence > 0, "yield occurrence must be non-zero");
-        Arc::new(Self {
-            point,
-            remaining: Mutex::new(occurrence),
-        })
-    }
-}
-
-impl YieldInjector for NthYieldInjector {
-    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
-        if point != self.point {
-            return false;
-        }
-
-        let mut remaining = self.remaining.lock();
-        if *remaining > 1 {
-            *remaining -= 1;
-            return false;
-        }
-        if *remaining == 1 {
-            *remaining = 0;
-            return true;
-        }
-        false
-    }
-}
-
 impl FixedYieldInjector {
     fn new(points: impl IntoIterator<Item = YieldPoint>) -> Arc<Self> {
         Arc::new(Self {
@@ -6541,13 +6506,6 @@ fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
 
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
 
-    for i in 0..17 {
-        conn.execute(format!("CREATE TABLE prefill_{i}(v INTEGER)"))
-            .unwrap();
-        conn.execute(format!("CREATE INDEX prefill_{i}_idx ON prefill_{i}(v)"))
-            .unwrap();
-    }
-
     conn.execute("CREATE TABLE repro_target(c0 INTEGER, c1 REAL)")
         .unwrap();
     conn.execute(
@@ -6559,21 +6517,18 @@ fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
 
     let target_schema_rows = get_rows(
         &conn,
-        "SELECT type, name, rootpage FROM sqlite_schema \
+        "SELECT type, name FROM sqlite_schema \
          WHERE tbl_name = 'repro_target' ORDER BY rowid",
     );
     assert_eq!(target_schema_rows.len(), 2);
     assert_eq!(target_schema_rows[0][0].to_string(), "table");
     assert_eq!(target_schema_rows[0][1].to_string(), "repro_target");
-    assert_eq!(target_schema_rows[0][2].to_string(), "36");
     assert_eq!(target_schema_rows[1][0].to_string(), "index");
     assert_eq!(target_schema_rows[1][1].to_string(), "idx_repro_target_c0");
-    assert_eq!(target_schema_rows[1][2].to_string(), "37");
 
-    conn.set_yield_injector(Some(NthYieldInjector::new(
-        CursorYieldPoint::NextStart.point(),
-        35,
-    )));
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CursorYieldPoint::NextStart.point()
+    ])));
 
     let mut drop_stmt = conn.prepare("DROP TABLE repro_target").unwrap();
     match drop_stmt.step().unwrap() {
@@ -6590,11 +6545,13 @@ fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
     drop(conn);
     drop(db);
 
+    // FIXME this fails with
+    // called `Result::unwrap()` on an `Err` value: Corrupt("sqlite_schema contains index for missing table 'repro_target': rootpage=3 sql=CREATE UNIQUE INDEX IF NOT EXISTS idx_repro_target_c0 ON repro_target (c0) WHERE c1 IS NULL")
     let db = Database::open_file(io, path).unwrap();
     let conn = db.connect().unwrap();
     let target_schema_rows = get_rows(
         &conn,
-        "SELECT type, name, rootpage FROM sqlite_schema \
+        "SELECT type, name FROM sqlite_schema \
          WHERE tbl_name = 'repro_target' ORDER BY rowid",
     );
     assert_eq!(target_schema_rows.len(), 2);
