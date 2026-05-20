@@ -11440,6 +11440,52 @@ fn dropped_main_commit_rolls_back_attached_mvcc_txs() {
     );
 }
 
+#[test]
+fn dropped_main_commit_rolls_back_temp_schema_changes() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'main')").unwrap();
+    conn.execute("CREATE TEMP TABLE temp_only (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX temp_only_v_idx ON temp_only(v)")
+        .unwrap();
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            crate::StepResult::IO => {}
+            other => panic!("expected IO yield at LogRecordPrepared; got {other:?}"),
+        }
+    }
+    conn.set_yield_injector(None);
+
+    let temp_err = match conn.prepare("SELECT * FROM temp_only") {
+        Ok(_) => {
+            panic!("abandoned COMMIT must roll back temp schema created inside the transaction")
+        }
+        Err(err) => err,
+    };
+    assert!(
+        temp_err.to_string().contains("no such table"),
+        "expected rolled-back temp table to be absent, got {temp_err}",
+    );
+    let rows = get_rows(&conn, "SELECT id FROM t ORDER BY id");
+    assert!(
+        rows.is_empty(),
+        "abandoned COMMIT must roll back main MVCC writes too",
+    );
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
 /// Regression for abandoning COMMIT after it has advanced from the main
 /// MVCC phase into an attached MVCC CommitStateMachine.
 #[test]
