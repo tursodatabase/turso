@@ -621,6 +621,8 @@ pub enum SchemaObjectType {
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
+    #[cfg(feature = "conn_raw_api")]
+    pub(crate) table_names_by_root_page: HashMap<i64, String>,
 
     /// Track which tables are actually materialized views
     pub materialized_view_names: HashSet<String>,
@@ -766,6 +768,8 @@ impl Schema {
         }
         Ok(Self {
             tables,
+            #[cfg(feature = "conn_raw_api")]
+            table_names_by_root_page: HashMap::default(),
             materialized_view_names,
             materialized_view_sql,
             incremental_views,
@@ -1170,6 +1174,9 @@ impl Schema {
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
         self.check_object_name_conflict(&table.name)?;
         let name = normalize_ident(&table.name);
+        #[cfg(feature = "conn_raw_api")]
+        self.table_names_by_root_page
+            .insert(table.root_page, name.clone());
         self.tables.insert(name, Table::BTree(table).into());
         Ok(())
     }
@@ -1186,8 +1193,21 @@ impl Schema {
         self.tables.get(&name).cloned()
     }
 
+    #[cfg(feature = "conn_raw_api")]
+    pub fn table_name_for_root_page(&self, root_page: i64) -> Option<&str> {
+        self.table_names_by_root_page
+            .get(&root_page)
+            .map(String::as_str)
+    }
+
     pub fn remove_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
+        #[cfg(feature = "conn_raw_api")]
+        if let Some(table) = self.tables.get(&name) {
+            if let Table::BTree(table) = table.as_ref() {
+                self.table_names_by_root_page.remove(&table.root_page);
+            }
+        }
         self.tables.remove(&name);
         self.analyze_stats.remove_table(&name);
 
@@ -1195,6 +1215,21 @@ impl Schema {
         if self.materialized_view_names.remove(&name) {
             self.incremental_views.remove(&name);
             self.materialized_view_sql.remove(&name);
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn register_table_root_page(&mut self, name: &str, table: &Table) {
+        if let Table::BTree(table) = table {
+            self.table_names_by_root_page
+                .insert(table.root_page, normalize_ident(name));
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn unregister_table_root_page(&mut self, table: &Table) {
+        if let Table::BTree(table) = table {
+            self.table_names_by_root_page.remove(&table.root_page);
         }
     }
 
@@ -2222,6 +2257,8 @@ impl Clone for Schema {
         let incompatible_views = self.incompatible_views.clone();
         Self {
             tables,
+            #[cfg(feature = "conn_raw_api")]
+            table_names_by_root_page: self.table_names_by_root_page.clone(),
             materialized_view_names,
             materialized_view_sql,
             incremental_views,

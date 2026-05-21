@@ -187,6 +187,15 @@ pub struct Connection {
     /// because rotating the WAL header invalidates their published
     /// watermarks.
     pub(super) wal_auto_actions: AtomicU8,
+    /// Whether MVCC commits should include portable logical-change metadata in
+    /// the logical log.
+    ///
+    /// This is off by default because the metadata is only useful for raw-log
+    /// consumers such as sync clients.
+    #[cfg(feature = "conn_raw_api")]
+    pub(super) portable_logical_changes_enabled: AtomicBool,
+    #[cfg(feature = "conn_raw_api")]
+    pub(super) mvcc_log_metadata: RwLock<HashMap<String, String>>,
     pub(super) capture_data_changes: RwLock<Option<CaptureDataChangesInfo>>,
     /// CDC v2: transaction ID for grouping CDC records by transaction.
     /// -1 means unset (will be assigned on first CDC write in the transaction).
@@ -927,6 +936,7 @@ impl Connection {
         if db_schema_version == on_disk_schema_version {
             return Ok(());
         }
+
         // start read transaction manually, because we will read schema cookie once again and
         // we must be sure that it will consistent with schema content
         //
@@ -1680,6 +1690,7 @@ impl Connection {
                 self.set_tx_state(TransactionState::None);
             }
         }
+        self.clear_mvcc_log_meta();
 
         let is_memory_db = is_memory_like(&self.db.path);
         let should_checkpoint_on_close = pager
@@ -1714,6 +1725,74 @@ impl Connection {
             return WalAutoActions::empty();
         }
         WalAutoActions::from_bits_truncate(self.wal_auto_actions.load(Ordering::SeqCst))
+    }
+
+    /// Enable or disable writing portable logical-change metadata into MVCC
+    /// logical-log frames.
+    pub fn set_portable_logical_changes_enabled(&self, enabled: bool) {
+        #[cfg(feature = "conn_raw_api")]
+        {
+            self.portable_logical_changes_enabled
+                .store(enabled, Ordering::Release);
+        }
+        let _ = enabled;
+    }
+
+    pub fn portable_logical_changes_enabled(&self) -> bool {
+        #[cfg(feature = "conn_raw_api")]
+        {
+            self.portable_logical_changes_enabled
+                .load(Ordering::Acquire)
+        }
+        #[cfg(not(feature = "conn_raw_api"))]
+        {
+            false
+        }
+    }
+
+    pub fn set_mvcc_log_meta(&self, key: String, value: Option<String>) {
+        #[cfg(feature = "conn_raw_api")]
+        {
+            let mut metadata = self.mvcc_log_metadata.write();
+            match value {
+                Some(value) => {
+                    metadata.insert(key, value);
+                    self.portable_logical_changes_enabled
+                        .store(true, Ordering::Release);
+                }
+                None => {
+                    metadata.remove(&key);
+                }
+            }
+        }
+        #[cfg(not(feature = "conn_raw_api"))]
+        {
+            let _ = (key, value);
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub(crate) fn take_mvcc_log_meta(&self) -> HashMap<String, String> {
+        std::mem::take(&mut *self.mvcc_log_metadata.write())
+    }
+
+    pub(crate) fn clear_mvcc_log_meta(&self) {
+        #[cfg(feature = "conn_raw_api")]
+        {
+            self.mvcc_log_metadata.write().clear();
+        }
+    }
+
+    pub fn mvcc_log_meta(&self, key: &str) -> Option<String> {
+        #[cfg(feature = "conn_raw_api")]
+        {
+            return self.mvcc_log_metadata.read().get(key).cloned();
+        }
+        #[cfg(not(feature = "conn_raw_api"))]
+        {
+            let _ = key;
+            None
+        }
     }
 
     #[cfg(feature = "simulator")]
