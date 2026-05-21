@@ -1330,17 +1330,54 @@ impl Connection {
         }
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
-        if matches!(self.get_tx_state(), TransactionState::None)
-            && self.get_mv_tx().is_none()
-            && self.next_attached_mv_tx().is_none()
-            // In MVCC, checkpoint root publication can replace Database::schema
-            // without changing SQLite's schema cookie. If this connection
-            // still holds an older Schema snapshot, prepared statements must be
-            // invalidated and recompiled against the current roots.
+        // MVCC checkpoint can publish physical btree roots into the shared
+        // schema without changing SQLite's schema cookie. If this connection
+        // still has the older schema snapshot, prepared statements must be
+        // invalidated and recompiled with the published roots.
+        if self.has_no_open_transaction_state()
             && (current_schema.schema_version != schema.schema_version
-                || (self.mvcc_enabled() && !Arc::ptr_eq(&current_schema, &schema)))
+                || self
+                    .has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema))
         {
             *self.schema.write() = schema.clone();
+            self.bump_prepare_context_generation();
+        }
+    }
+
+    fn has_no_open_transaction_state(&self) -> bool {
+        matches!(self.get_tx_state(), TransactionState::None)
+            && self.get_mv_tx().is_none()
+            && self.next_attached_mv_tx().is_none()
+    }
+
+    fn has_mvcc_schema_snapshot_changed_with_same_version(
+        &self,
+        current_schema: &Arc<Schema>,
+        schema: &Arc<Schema>,
+    ) -> bool {
+        self.mvcc_enabled()
+            && current_schema.schema_version == schema.schema_version
+            && !Arc::ptr_eq(current_schema, schema)
+    }
+
+    pub(crate) fn mvcc_schema_requires_reprepare_before_tx(&self) -> bool {
+        if !self.has_no_open_transaction_state() {
+            return false;
+        }
+        let current_schema = self.schema.read().clone();
+        let schema = self.db.schema.lock();
+        self.has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema)
+    }
+
+    pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {
+        let current_schema = self.schema.read().clone();
+        let schema = self.db.schema.lock().clone();
+        if current_schema.schema_version < schema.schema_version
+            || (self.has_no_open_transaction_state()
+                && self
+                    .has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema))
+        {
+            *self.schema.write() = schema;
             self.bump_prepare_context_generation();
         }
     }
