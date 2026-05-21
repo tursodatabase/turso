@@ -947,3 +947,104 @@ test order-by-on-middle-arm-of-three-way {
 expect error {
     ORDER BY clause should come after UNION ALL not before
 }
+
+# ===== Table-qualified ORDER BY in compound SELECT =====
+#
+# Mirrors sqlite3 select4-4.1.2 (`ORDER BY t1.log`): a `table.col` reference in
+# the ORDER BY of a compound SELECT must resolve against the underlying
+# columns of the constituent SELECTs, not just bare result-set names.
+
+@setup schema
+test compound-order-by-qualified-name {
+    SELECT a FROM t1
+    UNION ALL
+    SELECT a FROM t2
+    ORDER BY t1.a;
+}
+expect {
+    1
+    2
+    2
+    3
+    4
+    4
+    5
+    6
+    7
+    8
+}
+
+@setup schema
+test compound-order-by-qualified-name-desc {
+    SELECT a FROM t1
+    UNION ALL
+    SELECT a FROM t2
+    ORDER BY t1.a DESC;
+}
+expect {
+    8
+    7
+    6
+    5
+    4
+    4
+    3
+    2
+    2
+    1
+}
+
+@setup schema
+test compound-order-by-schema-qualified-name {
+    SELECT a FROM t1
+    UNION ALL
+    SELECT a FROM t2
+    ORDER BY main.t1.a;
+}
+expect {
+    1
+    2
+    2
+    3
+    4
+    4
+    5
+    6
+    7
+    8
+}
+
+# Reproduces the exact shape of sqlite3 select4-4.1.2: a three-arm compound
+# (UNION ALL ... INTERSECT) ordered by a table-qualified column from the
+# leftmost arm.
+setup t1_log {
+    CREATE TABLE t1_log (n INTEGER, log INTEGER);
+    INSERT INTO t1_log VALUES (1, 5);
+    INSERT INTO t1_log VALUES (2, 6);
+    INSERT INTO t1_log VALUES (5, 3);
+    INSERT INTO t1_log VALUES (6, 3);
+}
+
+@setup t1_log
+test compound-order-by-qualified-three-arm {
+    SELECT DISTINCT log FROM t1_log
+    UNION ALL
+    SELECT 6
+    INTERSECT
+    SELECT n FROM t1_log WHERE log=3
+    ORDER BY t1_log.log;
+}
+expect {
+    5
+    6
+}
+
+# A qualified reference whose table identifier is not present in any arm must
+# still be rejected with the standard "does not match" error.
+@setup schema
+test compound-order-by-qualified-unknown-table {
+    SELECT a FROM t1 UNION SELECT a FROM t2 ORDER BY zzz.a;
+}
+expect error {
+    1st ORDER BY term does not match any column in the result set
+}
