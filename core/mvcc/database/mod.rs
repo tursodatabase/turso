@@ -990,6 +990,13 @@ pub struct BuildLogRecordCtx {
     /// data-row pass. Schema rows are emitted first so log replay sees
     /// CREATE TABLE before related INSERTs.
     pub schema_process: bool,
+    /// B-tree ids created and dropped by this transaction before commit.
+    /// Their schema rows and contents have no durable net effect unless a
+    /// same-transaction schema row for the same btree survives.
+    pub created_deleted_btree_ids: HashSet<MVTableId>,
+    /// B-tree ids with a same-transaction schema row that survives commit.
+    /// These disqualify earlier insert/delete schema rewrites for the same id.
+    pub created_live_btree_ids: HashSet<MVTableId>,
 }
 
 fn version_begin_is_tx(row_version: &RowVersion, tx_id: TxID) -> bool {
@@ -1004,6 +1011,53 @@ fn version_end_is_tx(row_version: &RowVersion, tx_id: TxID) -> bool {
         row_version.end,
         Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
     )
+}
+
+fn uncheckpointed_schema_btree_id(row_version: &RowVersion) -> Option<MVTableId> {
+    if row_version.row.id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+        return None;
+    }
+
+    let payload = row_version.row.payload();
+    if payload.is_empty() {
+        return None;
+    }
+
+    let record = ImmutableRecord::from_bin_record(payload.to_vec());
+    let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
+        return None;
+    };
+    if !matches!(row_type.as_str(), "table" | "index") {
+        return None;
+    }
+
+    let Some(ValueRef::Numeric(Numeric::Integer(root_page))) = record.get_value_opt(3) else {
+        return None;
+    };
+    if root_page < 0 {
+        Some(MVTableId::from(root_page))
+    } else {
+        None
+    }
+}
+
+fn track_schema_btree_lifetime(
+    tx_id: TxID,
+    row_version: &RowVersion,
+    created_deleted_btree_ids: &mut HashSet<MVTableId>,
+    created_live_btree_ids: &mut HashSet<MVTableId>,
+) {
+    let Some(btree_id) = uncheckpointed_schema_btree_id(row_version) else {
+        return;
+    };
+    if !version_begin_is_tx(row_version, tx_id) {
+        return;
+    }
+    if version_end_is_tx(row_version, tx_id) {
+        created_deleted_btree_ids.insert(btree_id);
+    } else {
+        created_live_btree_ids.insert(btree_id);
+    }
 }
 
 /// Iteration state for the chunked `RewriteLiveVersions` step.
@@ -1602,15 +1656,39 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             Some(committed)
         };
 
-        let collect_versions = |row_versions: &Arc<RwLock<Vec<RowVersion>>>,
-                                log_record: &mut LogRecord| {
-            for row_version in row_versions.read().iter() {
-                if let Some(mut committed_version) = our_committed_image(row_version) {
-                    canonicalize_table_id(&mut committed_version);
-                    mvcc_store.insert_version_raw(&mut log_record.row_versions, committed_version);
+        let collect_versions =
+            |row_versions: &Arc<RwLock<Vec<RowVersion>>>,
+             log_record: &mut LogRecord,
+             schema_process: bool,
+             created_deleted_btree_ids: &mut HashSet<MVTableId>,
+             created_live_btree_ids: &mut HashSet<MVTableId>| {
+                for row_version in row_versions.read().iter() {
+                    if schema_process {
+                        track_schema_btree_lifetime(
+                            tx_id,
+                            row_version,
+                            created_deleted_btree_ids,
+                            created_live_btree_ids,
+                        );
+                    }
+                    if let Some(mut committed_version) = our_committed_image(row_version) {
+                        let btree_created_and_dropped = created_deleted_btree_ids
+                            .contains(&committed_version.row.id.table_id)
+                            && !created_live_btree_ids.contains(&committed_version.row.id.table_id);
+                        if btree_created_and_dropped {
+                            turso_assert!(
+                                !committed_version.btree_resident,
+                                "same-transaction created/dropped btree row cannot be btree-resident",
+                                { "row_id": &committed_version.row.id }
+                            );
+                            continue;
+                        }
+                        canonicalize_table_id(&mut committed_version);
+                        mvcc_store
+                            .insert_version_raw(&mut log_record.row_versions, committed_version);
+                    }
                 }
-            }
-        };
+            };
 
         // Process schema rows (sqlite_schema) before data rows so that during log
         // replay the table_id_to_rootpage map is populated before data row inserts
@@ -1630,7 +1708,13 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 !is_schema
             };
             if process {
-                collect_versions(row_versions, &mut ctx.log_record);
+                collect_versions(
+                    row_versions,
+                    &mut ctx.log_record,
+                    ctx.schema_process,
+                    &mut ctx.created_deleted_btree_ids,
+                    &mut ctx.created_live_btree_ids,
+                );
             }
             ctx.cursor += 1;
             iterations += 1;
@@ -2078,6 +2162,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     log_record,
                     cursor: 0,
                     schema_process: true,
+                    created_deleted_btree_ids: HashSet::default(),
+                    created_live_btree_ids: HashSet::default(),
                 });
                 return Ok(TransitionResult::Continue);
             }
