@@ -606,7 +606,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             referenced_tables.mark_column_used(tbl_id, col_idx);
                         } else {
                             return Err(LimboError::ParseError(format!(
-                                "no such column or database: {db_name_str}.{tbl_name_str}.{col_name_str}"
+                                "no such column: {db_name_str}.{tbl_name_str}.{col_name_str}"
                             )));
                         }
                     }
