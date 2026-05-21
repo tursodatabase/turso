@@ -892,6 +892,26 @@ mod tests {
     }
 
     #[test]
+    fn test_sqlite3_column_blob_zero_length_returns_null() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, c"SELECT x''".as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert!(sqlite3_column_blob(stmt, 0).is_null());
+            assert_eq!(sqlite3_column_bytes(stmt, 0), 0);
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
     fn test_sqlite3_column_type() {
         unsafe {
             let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
