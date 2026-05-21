@@ -109,48 +109,6 @@ pub enum ValueType {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ContextValueType {
-    Null,
-    Integer,
-    Float,
-    Text,
-    Blob,
-    Error,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ContextValueBytes {
-    pub ptr: *const u8,
-    pub len: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union ContextValueData {
-    pub int: i64,
-    pub float: f64,
-    pub bytes: ContextValueBytes,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ContextValue {
-    pub value_type: ContextValueType,
-    pub value: ContextValueData,
-}
-
-impl ContextValue {
-    pub fn null() -> Self {
-        Self {
-            value_type: ContextValueType::Null,
-            value: ContextValueData { int: 0 },
-        }
-    }
-}
-
-#[repr(C)]
 pub struct Value {
     value_type: ValueType,
     value: ValueData,

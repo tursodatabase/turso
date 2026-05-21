@@ -28,7 +28,12 @@ pub fn scalar(attr: TokenStream, input: TokenStream) -> TokenStream {
             (api.register_scalar_function)(
                 api.ctx,
                 alias_c_name.as_ptr(),
+                -1,
+                false,
+                0,
                 #fn_name,
+                None,
+                None,
             );
         }
     } else {
@@ -50,7 +55,12 @@ pub fn scalar(attr: TokenStream, input: TokenStream) -> TokenStream {
             (api.register_scalar_function)(
                 api.ctx,
                 c_name.as_ptr(),
+                -1,
+                false,
+                0,
                 #fn_name,
+                None,
+                None,
             );
             #alias_check
             ::turso_ext::ResultCode::OK
@@ -58,6 +68,7 @@ pub fn scalar(attr: TokenStream, input: TokenStream) -> TokenStream {
 
         #[no_mangle]
         pub unsafe extern "C" fn #fn_name(
+            _context: usize,
             argc: i32,
             argv: *const ::turso_ext::Value
         ) -> ::turso_ext::Value {

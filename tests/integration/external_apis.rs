@@ -10,8 +10,7 @@ use std::{
 };
 use turso_core::{Connection, LimboError, StepResult};
 use turso_ext::{
-    ContextDestructor, ContextScalarFunction, ContextValue, ContextValueBytes, ContextValueData,
-    ContextValueDestructor, ContextValueType, ResultCode, Value as ExtValue,
+    ContextDestructor, ResultCode, ScalarFunction, Value as ExtValue, ValueDestructor,
     ValueType as ExtValueType,
 };
 
@@ -88,38 +87,7 @@ struct ScalarContext {
     counters: Arc<CallbackCounters>,
 }
 
-fn integer_result(value: i64) -> ContextValue {
-    ContextValue {
-        value_type: ContextValueType::Integer,
-        value: ContextValueData { int: value },
-    }
-}
-
-fn float_result(value: f64) -> ContextValue {
-    ContextValue {
-        value_type: ContextValueType::Float,
-        value: ContextValueData { float: value },
-    }
-}
-
-fn bytes_result(value_type: ContextValueType, bytes: &'static [u8]) -> ContextValue {
-    ContextValue {
-        value_type,
-        value: ContextValueData {
-            bytes: ContextValueBytes {
-                ptr: bytes.as_ptr(),
-                len: bytes.len(),
-            },
-        },
-    }
-}
-
-unsafe extern "C" fn managed_score(
-    context: usize,
-    argc: i32,
-    argv: *const ExtValue,
-    result: *mut ContextValue,
-) {
+unsafe extern "C" fn managed_score(context: usize, argc: i32, argv: *const ExtValue) -> ExtValue {
     let ctx = unsafe { &*(context as *const ScalarContext) };
     ctx.counters.calls.fetch_add(1, AtomicOrdering::SeqCst);
     let args = if argc <= 0 || argv.is_null() {
@@ -152,19 +120,12 @@ unsafe extern "C" fn managed_score(
         .filter(|arg| arg.value_type() == ExtValueType::Null)
         .count() as i64;
 
-    unsafe {
-        *result = integer_result(
-            (int_value + float_value + text_len + blob_len + null_count) * ctx.multiplier,
-        );
-    }
+    ExtValue::from_integer(
+        (int_value + float_value + text_len + blob_len + null_count) * ctx.multiplier,
+    )
 }
 
-unsafe extern "C" fn managed_result(
-    context: usize,
-    argc: i32,
-    argv: *const ExtValue,
-    result: *mut ContextValue,
-) {
+unsafe extern "C" fn managed_result(context: usize, argc: i32, argv: *const ExtValue) -> ExtValue {
     let ctx = unsafe { &*(context as *const ScalarContext) };
     ctx.counters.calls.fetch_add(1, AtomicOrdering::SeqCst);
     let args = if argc <= 0 || argv.is_null() {
@@ -174,15 +135,13 @@ unsafe extern "C" fn managed_result(
     };
     let mode = args.first().and_then(ExtValue::to_text).unwrap_or_default();
 
-    unsafe {
-        *result = match mode {
-            "null" => ContextValue::null(),
-            "text" => bytes_result(ContextValueType::Text, b"managed-text"),
-            "blob" => bytes_result(ContextValueType::Blob, b"\x01\x02\xFE"),
-            "float" => float_result(3.25),
-            "error" => bytes_result(ContextValueType::Error, b"managed failure"),
-            _ => bytes_result(ContextValueType::Error, b"unexpected mode"),
-        };
+    match mode {
+        "null" => ExtValue::null(),
+        "text" => ExtValue::from_text("managed-text".to_string()),
+        "blob" => ExtValue::from_blob(vec![0x01, 0x02, 0xFE]),
+        "float" => ExtValue::from_float(3.25),
+        "error" => ExtValue::error_with_message("managed failure".to_string()),
+        _ => ExtValue::error_with_message("unexpected mode".to_string()),
     }
 }
 
@@ -190,8 +149,7 @@ unsafe extern "C" fn managed_variadic_score(
     context: usize,
     argc: i32,
     argv: *const ExtValue,
-    result: *mut ContextValue,
-) {
+) -> ExtValue {
     let ctx = unsafe { &*(context as *const ScalarContext) };
     ctx.counters.calls.fetch_add(1, AtomicOrdering::SeqCst);
     let args = if argc <= 0 || argv.is_null() {
@@ -225,9 +183,7 @@ unsafe extern "C" fn managed_variadic_score(
             .map(|blob| blob.len())
             .unwrap_or_default() as i64
         + null_count;
-    unsafe {
-        *result = integer_result(score * ctx.multiplier);
-    }
+    ExtValue::from_integer(score * ctx.multiplier)
 }
 
 unsafe extern "C" fn drop_scalar_context(context: usize) {
@@ -238,7 +194,10 @@ unsafe extern "C" fn drop_scalar_context(context: usize) {
         .fetch_add(1, AtomicOrdering::SeqCst);
 }
 
-unsafe extern "C" fn count_scalar_value_drop(_result: *mut ContextValue) {
+unsafe extern "C" fn count_scalar_value_drop(result: *mut ExtValue) {
+    if !result.is_null() {
+        unsafe { std::ptr::read(result).__free_internal_type() };
+    }
     SCALAR_VALUE_DROPS.fetch_add(1, AtomicOrdering::SeqCst);
 }
 
@@ -256,14 +215,14 @@ fn register_context_scalar(
     argc: i32,
     deterministic: bool,
     context: usize,
-    callback: ContextScalarFunction,
+    callback: ScalarFunction,
     context_destructor: Option<ContextDestructor>,
-    value_destructor: Option<ContextValueDestructor>,
+    value_destructor: Option<ValueDestructor>,
 ) -> anyhow::Result<()> {
     let name = CString::new(name)?;
     let api = unsafe { conn._build_turso_ext() };
     let result = unsafe {
-        (api.register_context_scalar_function)(
+        (api.register_scalar_function)(
             api.ctx,
             name.as_ptr(),
             argc,

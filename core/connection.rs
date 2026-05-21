@@ -2921,8 +2921,7 @@ impl Connection {
                 let is_agg = f.func.is_aggregate();
                 let argc = match &f.func {
                     function::ExtFunc::Aggregate { argc, .. } => *argc as i32,
-                    function::ExtFunc::ContextScalar { argc, .. } => *argc,
-                    function::ExtFunc::Scalar(_) => -1,
+                    function::ExtFunc::Scalar { argc, .. } => *argc,
                 };
                 (
                     f.name.clone(),

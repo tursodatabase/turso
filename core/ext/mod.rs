@@ -27,8 +27,8 @@ use std::{
     sync::Arc,
 };
 use turso_ext::{
-    ContextDestructor, ContextScalarFunction, ContextValueDestructor, ExtensionApi,
-    InitAggFunction, ResultCode, ScalarFunction, VTabKind, VTabModuleImpl,
+    ContextDestructor, ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind,
+    VTabModuleImpl, ValueDestructor,
 };
 pub use turso_ext::{FinalizeFunction, StepFunction, Value as ExtValue, ValueType as ExtValueType};
 pub use vtab_xconnect::{execute, prepare_stmt};
@@ -95,41 +95,23 @@ pub struct VTabImpl {
     pub implementation: Arc<VTabModuleImpl>,
 }
 
-pub(crate) unsafe extern "C" fn register_scalar_function(
+pub(crate) unsafe fn register_scalar_function(
     ctx: *mut c_void,
     name: *const c_char,
     func: ScalarFunction,
 ) -> ResultCode {
-    let c_str = unsafe { CStr::from_ptr(name) };
-    let name_str = match c_str.to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return ResultCode::InvalidArgs,
-    };
-    if ctx.is_null() {
-        return ResultCode::Error;
-    }
-    let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
-    unsafe {
-        (*ext_ctx.syms).functions.insert(
-            name_str.clone(),
-            Arc::new(ExternalFunc::new_scalar(name_str, func)),
-        );
-        if !ext_ctx.prepare_context_generation.is_null() {
-            (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
-        }
-    }
-    ResultCode::OK
+    unsafe { register_scalar_function_with_options(ctx, name, -1, false, 0, func, None, None) }
 }
 
-pub(crate) unsafe extern "C" fn register_context_scalar_function(
+pub(crate) unsafe extern "C" fn register_scalar_function_with_options(
     ctx: *mut c_void,
     name: *const c_char,
     argc: i32,
     deterministic: bool,
     context: usize,
-    callback: ContextScalarFunction,
+    callback: ScalarFunction,
     context_destructor: Option<ContextDestructor>,
-    value_destructor: Option<ContextValueDestructor>,
+    value_destructor: Option<ValueDestructor>,
 ) -> ResultCode {
     if ctx.is_null() || name.is_null() || argc < -1 {
         return ResultCode::InvalidArgs;
@@ -143,7 +125,7 @@ pub(crate) unsafe extern "C" fn register_context_scalar_function(
     unsafe {
         (*ext_ctx.syms).functions.insert(
             name_str.clone(),
-            Arc::new(ExternalFunc::new_context_scalar(
+            Arc::new(ExternalFunc::new_scalar(
                 name_str,
                 argc,
                 deterministic,
@@ -275,8 +257,7 @@ impl Database {
         #[allow(unused)]
         let mut ext_api = ExtensionApi {
             ctx: ctx as *mut c_void,
-            register_scalar_function,
-            register_context_scalar_function,
+            register_scalar_function: register_scalar_function_with_options,
             register_aggregate_function,
             unregister_function,
             register_vtab_module,
@@ -338,8 +319,7 @@ impl Connection {
         let ctx = Box::into_raw(Box::new(ctx)) as *mut c_void;
         ExtensionApi {
             ctx,
-            register_scalar_function,
-            register_context_scalar_function,
+            register_scalar_function: register_scalar_function_with_options,
             register_aggregate_function,
             unregister_function,
             register_vtab_module,
