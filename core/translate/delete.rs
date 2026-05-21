@@ -91,7 +91,7 @@ pub fn translate_delete(
     )?;
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
 
     let mut delete_plan = prepare_delete_plan(
         program,

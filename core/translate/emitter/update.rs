@@ -1,5 +1,6 @@
 use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
+use crate::alloc::TursoIteratorExt;
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
@@ -1151,7 +1152,7 @@ fn emit_update_insns<'a>(
     let updated_column_indices: ColumnMask = set_clauses
         .iter()
         .map(|set_clause| set_clause.column_index)
-        .collect();
+        .try_collect()?;
     let has_any_update_triggers = if let Some(btree_table) = target_table.table.btree() {
         has_triggers_including_temp(
             &t_ctx.resolver,
@@ -1485,7 +1486,7 @@ fn emit_update_insns<'a>(
                 .filter_map(|set_clause| {
                     (set_clause.column_index != ROWID_SENTINEL).then_some(set_clause.column_index)
                 })
-                .collect();
+                .try_collect()?;
             stabilize_new_row_for_fk(
                 program,
                 &table_btree,
@@ -1691,7 +1692,7 @@ fn emit_update_insns<'a>(
             let set_col_indices: ColumnMask = set_clauses
                 .iter()
                 .map(|set_clause| set_clause.column_index)
-                .collect();
+                .try_collect()?;
 
             // Pre-encode TypeCheck: validate SET column input types.
             // Non-SET columns hold encoded values from disk, so skip them (ANY).
@@ -1703,7 +1704,7 @@ fn emit_update_insns<'a>(
                     &btree_table,
                     t_ctx.resolver.schema(),
                     Some(&set_col_indices),
-                ),
+                )?,
             });
 
             // Encode only SET clause columns. Non-SET columns were read from disk

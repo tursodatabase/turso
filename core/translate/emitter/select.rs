@@ -1,4 +1,5 @@
 use crate::{
+    alloc::{TursoFromIterator, TursoIteratorExt},
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
@@ -334,7 +335,7 @@ pub(crate) fn emit_materialized_build_inputs(
     for table in plan.table_references.joined_tables().iter() {
         if let Operation::HashJoin(hash_join_op) = &table.op {
             let build_table = &plan.table_references.joined_tables()[hash_join_op.build_table_idx];
-            hash_tables_to_keep_open.set(build_table.internal_id.into());
+            hash_tables_to_keep_open.set(build_table.internal_id.into())?;
         }
     }
 
@@ -349,7 +350,7 @@ pub(crate) fn emit_materialized_build_inputs(
             {
                 continue;
             }
-            seen_build_tables.set(hash_join_op.build_table_idx);
+            seen_build_tables.set(hash_join_op.build_table_idx)?;
 
             let probe_table_idx = hash_join_op.probe_table_idx;
             let probe_pos = plan
@@ -584,7 +585,7 @@ fn prune_join_order_for_materialized_inputs(
     for member in plan.join_order.iter() {
         let table = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table.op {
-            build_tables_in_plan.set(hash_join_op.build_table_idx);
+            build_tables_in_plan.set(hash_join_op.build_table_idx)?;
         }
     }
 
@@ -594,7 +595,7 @@ fn prune_join_order_for_materialized_inputs(
             continue;
         }
         if matches!(input.mode, MaterializedBuildInputMode::KeyPayload { .. }) {
-            tables_to_remove.extend(input.prefix_tables.iter());
+            tables_to_remove.try_extend(input.prefix_tables.iter())?;
         }
     }
 
@@ -677,11 +678,14 @@ fn materialization_prefix(
         });
     }
 
-    let mut included_tables: TableMask = prefix_join_order.iter().map(|m| m.original_idx).collect();
+    let mut included_tables: TableMask = prefix_join_order
+        .iter()
+        .map(|m| m.original_idx)
+        .try_collect()?;
     for member in prefix_join_order.iter() {
         let table_ref = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table_ref.op {
-            included_tables.set(hash_join_op.build_table_idx);
+            included_tables.set(hash_join_op.build_table_idx)?;
         }
     }
     Ok((prefix_join_order, included_tables))
@@ -785,7 +789,7 @@ fn build_materialized_build_input_plan(
     // Bitmask of tables that are actually in the prefix join order for
     // this materialization subplan. Anything that depends on other tables
     // cannot be evaluated during those table scans.
-    let join_prefix_mask: TableMask = join_order.iter().map(|m| m.original_idx).collect();
+    let join_prefix_mask: TableMask = join_order.iter().map(|m| m.original_idx).try_collect()?;
 
     // Clone WHERE terms for the materialization subplan. We cannot reuse the
     // parent plan's consumed flags because the optimizer may have consumed

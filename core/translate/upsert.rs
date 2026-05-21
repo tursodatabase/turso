@@ -5,6 +5,7 @@ use std::sync::Arc;
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::compute_virtual_columns;
+use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
@@ -173,7 +174,7 @@ fn collect_changed_cols(
             if c.is_rowid_alias() {
                 rowid_changed = true;
             } else {
-                cols_changed.set(*col_idx);
+                cols_changed.set(*col_idx).expect("TODO: alloc error");
             }
         }
     }
@@ -212,7 +213,7 @@ fn referenced_index_cols(idx: &Index, table: &Table) -> crate::Result<ColumnMask
         if let Some(expr) = &ic.expr {
             index_expression_cols(table, &mut referenced_cols, expr);
         } else {
-            referenced_cols.set(ic.pos_in_table);
+            referenced_cols.set(ic.pos_in_table)?;
         }
     }
     match table.btree() {
@@ -228,7 +229,7 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
         match e {
             Expr::Id(n) => {
                 if let Some((i, _)) = table.get_column_by_name(&normalize_ident(n.as_str())) {
-                    out.set(i);
+                    out.set(i)?;
                 } else if ROWID_STRS
                     .iter()
                     .any(|r| r.eq_ignore_ascii_case(n.as_str()))
@@ -237,7 +238,7 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
                         .btree()
                         .and_then(|t| t.get_rowid_alias_column().map(|(p, _)| p))
                     {
-                        out.set(rowid_pos);
+                        out.set(rowid_pos)?;
                     }
                 }
             }
@@ -246,11 +247,11 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
                 let tname = normalize_ident(table.get_name());
                 if nsn.eq_ignore_ascii_case(&tname) {
                     if let Some((i, _)) = table.get_column_by_name(&normalize_ident(c.as_str())) {
-                        out.set(i);
+                        out.set(i)?;
                     }
                 }
             }
-            Expr::Column { column, .. } => out.set(*column),
+            Expr::Column { column, .. } => out.set(*column)?,
             _ => {}
         }
         Ok(WalkControl::Continue)
@@ -322,7 +323,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
         }
 
         if let Some(i) = found {
-            matched.set(i);
+            matched.set(i).expect("TODO: alloc error");
         } else {
             return false;
         }
@@ -618,7 +619,7 @@ pub fn emit_upsert(
                     &bt,
                     resolver.schema(),
                     None,
-                ),
+                )?,
             });
 
             // Encode ALL columns. Both non-SET columns (decoded from disk above)
@@ -686,8 +687,10 @@ pub fn emit_upsert(
     // Fire BEFORE UPDATE triggers
     let upsert_database_id = ctx.database_id;
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table.btree() {
-        let updated_column_indices: ColumnMask =
-            set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
+        let updated_column_indices: ColumnMask = set_pairs
+            .iter()
+            .map(|(col_idx, _)| *col_idx)
+            .try_collect()?;
         let relevant_before_update_triggers = get_triggers_including_temp(
             resolver,
             upsert_database_id,
@@ -798,7 +801,10 @@ pub fn emit_upsert(
     } else {
         None
     };
-    let updated_positions: ColumnMask = set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
+    let updated_positions: ColumnMask = set_pairs
+        .iter()
+        .map(|(col_idx, _)| *col_idx)
+        .try_collect()?;
     if let Some(bt) = table.btree() {
         if connection.foreign_keys_enabled() {
             let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
@@ -1231,8 +1237,10 @@ pub fn emit_upsert(
 
     // Fire AFTER UPDATE triggers
     if let (Some(btree_table), Some(old_regs)) = (table.btree(), preserved_old_registers) {
-        let updated_column_indices: ColumnMask =
-            set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
+        let updated_column_indices: ColumnMask = set_pairs
+            .iter()
+            .map(|(col_idx, _)| *col_idx)
+            .try_collect()?;
         let relevant_triggers = get_triggers_including_temp(
             resolver,
             upsert_database_id,

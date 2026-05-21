@@ -647,7 +647,7 @@ pub fn try_capture_parameters_column_agnostic(
                 continue;
             }
             if exprs_are_equivalent(pattern_col, query_col) {
-                matched_pattern_indices.set(i);
+                matched_pattern_indices.set(i).expect("TODO: alloc error");
                 found_match = true;
                 break;
             }
@@ -4978,8 +4978,7 @@ pub mod tests {
 
     #[test]
     fn test_rewrite_trigger_cmd_table_refs_expr_subquery_branch() {
-        let sql =
-            "CREATE TEMP TRIGGER trg AFTER INSERT ON temp.old BEGIN SELECT EXISTS(SELECT 1 FROM temp.old); END";
+        let sql = "CREATE TEMP TRIGGER trg AFTER INSERT ON temp.old BEGIN SELECT EXISTS(SELECT 1 FROM temp.old); END";
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser
             .next_cmd()

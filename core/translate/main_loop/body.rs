@@ -462,8 +462,8 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
     let has_gosub = gosub.is_some();
     let allowed_tables = {
         let mut m = TableMask::default();
-        m.set(build_table_idx);
-        m.set(probe_table_idx);
+        m.set(build_table_idx)?;
+        m.set(probe_table_idx)?;
         // When there's a gosub wrapping inner tables, we must also allow
         // conditions that reference outer tables (those appearing before the
         // hash join probe in the join order), since their cursors are valid
@@ -475,7 +475,7 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
                 .position(|j| j.original_idx == probe_table_idx)
                 .expect("probe table must be in join order");
             for join in &plan.join_order[..probe_pos] {
-                m.set(join.original_idx);
+                m.set(join.original_idx)?;
             }
         }
         m

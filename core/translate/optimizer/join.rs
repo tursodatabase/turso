@@ -1,4 +1,4 @@
-use crate::{turso_assert_eq, turso_assert_greater_than};
+use crate::{alloc::TryReserveError, turso_assert_eq, turso_assert_greater_than};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
@@ -12,6 +12,7 @@ use super::{
     order::OrderTarget,
     AvailableIndexes, IndexMethodCandidate,
 };
+use crate::alloc::TursoIteratorExt;
 use crate::{
     schema::Schema,
     stats::AnalyzeStats,
@@ -204,8 +205,10 @@ pub fn join_lhs_and_rhs<'a>(
     {
         if constraint_refs.is_empty() {
             // Check if there are usable constraints that will create an ephemeral index
-            let lhs_mask_for_ephemeral: TableMask =
-                lhs.map_or_else(TableMask::default, |l| l.table_numbers().collect());
+            let lhs_mask_for_ephemeral: TableMask = match lhs {
+                Some(l) => l.table_numbers().try_collect()?,
+                None => TableMask::default(),
+            };
             let has_usable_constraints = rhs_constraints.constraints.iter().any(|c| {
                 c.usable
                     && c.table_col_pos.is_some()
@@ -226,13 +229,16 @@ pub fn join_lhs_and_rhs<'a>(
     let mut best_access_method = method;
 
     // Reuse for hash cost and output cardinality computation
-    let lhs_mask = lhs.map_or_else(TableMask::default, |l| l.table_numbers().collect());
+    let lhs_mask = match lhs {
+        Some(l) => l.table_numbers().try_collect()?,
+        None => TableMask::default(),
+    };
 
     // Self-constraints are conditions comparing columns within the same table
     // (e.g., t.col1 < t.col2). Include them in selectivity since they filter rows.
     let rhs_self_mask = {
         let mut m = TableMask::default();
-        m.set(rhs_table_number);
+        m.set(rhs_table_number)?;
         m
     };
 
@@ -271,7 +277,7 @@ pub fn join_lhs_and_rhs<'a>(
     if let Some(lhs) = lhs {
         let rhs_table_idx = join_order.last().unwrap().original_idx;
         let last_lhs_table_idx = join_order[join_order.len() - 2].original_idx;
-        let lhs_table_numbers: TableMask = lhs.table_numbers().collect();
+        let lhs_table_numbers: TableMask = lhs.table_numbers().try_collect()?;
 
         let rhs_has_selective_seek = matches!(
             best_access_method.params,
@@ -394,7 +400,7 @@ pub fn join_lhs_and_rhs<'a>(
                             }
                         })
                     })
-                    .collect()
+                    .try_collect()?
             };
 
             let build_has_prior_constraints = {
@@ -835,7 +841,10 @@ fn build_self_constraint_selectivity(
     build_constraints: &TableConstraints,
     build_table_idx: usize,
 ) -> f64 {
-    let build_only_mask: TableMask = [build_table_idx].into_iter().collect();
+    let build_only_mask: TableMask = [build_table_idx]
+        .into_iter()
+        .try_collect()
+        .expect("does not heap allocate with just a single value");
     let mut selectivity = 1.0;
     let mut saw_constraint = false;
     for constraint in build_constraints.constraints.iter() {
@@ -1041,7 +1050,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // there were no other tables.
     for i in 0..num_tables {
         let mut mask = TableMask::default();
-        mask.set(i);
+        mask.set(i)?;
         let table_ref = &joined_tables[i];
         join_order[0] = JoinOrderMember {
             table_id: table_ref.internal_id,
@@ -1107,10 +1116,10 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     {
                         // bitwise OR the masks
                         if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
-                            illegal_lhs.set(j);
+                            illegal_lhs.set(j)?;
                         } else {
                             let mut mask = TableMask::default();
-                            mask.set(j);
+                            mask.set(j)?;
                             left_join_illegal_map.insert(i, mask);
                         }
                     }
@@ -1124,6 +1133,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // Try to join each single table to each other table.
     for subset_size in 2..=num_tables {
         for mask in generate_join_bitmasks(num_tables, subset_size) {
+            let mask = mask?;
             // Keep track of the best way to join this subset of tables per possible last table.
             // This preserves alternative join orders that may be more expensive for the subset
             // but enable cheaper joins when adding more tables.
@@ -1166,7 +1176,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                 };
 
                 // Stable iteration keeps tie-breaks consistent across runs.
-                let lhs_keys: TableMask = lhs_variants.keys().copied().collect();
+                let lhs_keys: TableMask = lhs_variants.keys().copied().try_collect()?;
                 for lhs_key in &lhs_keys {
                     let lhs = &lhs_variants[&lhs_key];
                     // Build a JoinOrder out of the table bitmask under consideration.
@@ -1382,18 +1392,18 @@ pub fn compute_greedy_join_order<'a>(
         .map(|(j, _)| {
             let mut required = TableMask::default();
             for k in 0..j {
-                required.set(k);
+                required.set(k)?;
             }
-            (j, required)
+            Ok((j, required))
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
-    let mut remaining: TableMask = (0..num_tables).collect();
+    let mut remaining: TableMask = (0..num_tables).try_collect()?;
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
 
     // Pick starting table: prefer tables with high "hub score" (referenced by many constraints).
     let first_idx =
-        find_best_starting_table(num_tables, constraints, base_table_rows, &left_join_deps);
+        find_best_starting_table(num_tables, constraints, base_table_rows, &left_join_deps)?;
     let first_table = &joined_tables[first_idx];
     join_order.push(JoinOrderMember {
         table_id: first_table.internal_id,
@@ -1433,7 +1443,7 @@ pub fn compute_greedy_join_order<'a>(
 
     // Greedily add remaining tables, always picking lowest marginal cost.
     while !remaining.is_empty() {
-        let current_mask: TableMask = join_order.iter().map(|m| m.original_idx).collect();
+        let current_mask: TableMask = join_order.iter().map(|m| m.original_idx).try_collect()?;
 
         // Placeholder for candidate evaluation (avoids cloning)
         join_order.push(JoinOrderMember::default());
@@ -1556,7 +1566,7 @@ fn find_best_starting_table(
     constraints: &[TableConstraints],
     base_table_rows: &[RowCountEstimate],
     left_join_deps: &HashMap<usize, TableMask>,
-) -> usize {
+) -> Result<usize> {
     // hub_score[t] = count of usable constraints on OTHER tables that reference t.
     // If we join t first, each such constraint becomes usable for an index lookup.
     let mut hub_score = vec![0usize; num_tables];
@@ -1581,7 +1591,7 @@ fn find_best_starting_table(
         // Self-constraints compare columns within the same table (e.g., t.col1 < t.col2).
         let self_mask = {
             let mut m = TableMask::default();
-            m.set(t);
+            m.set(t)?;
             m
         };
 
@@ -1601,7 +1611,7 @@ fn find_best_starting_table(
     }
 
     // Table 0 can never be outer join RHS, so best is always Some.
-    best.expect("no valid starting table").0
+    Ok(best.expect("no valid starting table").0)
 }
 
 /// Specialized version of [compute_best_join_order] that just joins tables in the order they are given
@@ -1752,14 +1762,17 @@ impl JoinBitmaskIter {
 }
 
 impl Iterator for JoinBitmaskIter {
-    type Item = TableMask;
+    type Item = Result<TableMask, TryReserveError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current >= self.max_exclusive {
             return None;
         }
 
-        let result = self.current.into();
+        let result = match TableMask::try_from(self.current) {
+            Ok(res) => res,
+            Err(e) => return Some(Err(e)),
+        };
 
         // Gosper's hack: compute next k-bit combination in lexicographic order
         let c = self.current & (!self.current + 1); // rightmost set bit
@@ -1768,7 +1781,7 @@ impl Iterator for JoinBitmaskIter {
         let ones = (ones >> 2) / c; // right-adjust shifted bits
         self.current = r | ones; // form the next combination
 
-        Some(result)
+        Some(Ok(result))
     }
 }
 
@@ -1814,14 +1827,15 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_bitmasks() {
-        let bitmasks = generate_join_bitmasks(4, 2).collect::<Vec<_>>();
-        assert!(bitmasks.contains(&0b0011.into())); // {0,1}
-        assert!(bitmasks.contains(&0b0101.into())); // {0,2}
-        assert!(bitmasks.contains(&0b0110.into())); // {1,2}
-        assert!(bitmasks.contains(&0b1001.into())); // {0,3}
-        assert!(bitmasks.contains(&0b1010.into())); // {1,3}
-        assert!(bitmasks.contains(&0b1100.into())); // {2,3}
+    fn test_generate_bitmasks() -> std::result::Result<(), TryReserveError> {
+        let bitmasks = generate_join_bitmasks(4, 2).collect::<std::result::Result<Vec<_>, _>>()?;
+        assert!(bitmasks.contains(&TableMask::try_from(0b0011u128)?)); // {0,1}
+        assert!(bitmasks.contains(&TableMask::try_from(0b0101u128)?)); // {0,2}
+        assert!(bitmasks.contains(&TableMask::try_from(0b0110u128)?)); // {1,2}
+        assert!(bitmasks.contains(&TableMask::try_from(0b1001u128)?)); // {0,3}
+        assert!(bitmasks.contains(&TableMask::try_from(0b1010u128)?)); // {1,3}
+        assert!(bitmasks.contains(&TableMask::try_from(0b1100u128)?)); // {2,3}
+        Ok(())
     }
 
     #[test]

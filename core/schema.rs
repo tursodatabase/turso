@@ -1,3 +1,4 @@
+use crate::alloc::TursoFromIterator;
 use crate::function::{Deterministic, Func};
 use crate::incremental::view::IncrementalView;
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, operator::create_dbsp_state_index};
@@ -1508,7 +1509,13 @@ impl Schema {
             let mut pk_index_added = false;
             for unique_set in &table.unique_sets {
                 if unique_set.is_primary_key {
-                    assert!(table.primary_key_columns.len() == unique_set.columns.len(), "trying to add a {}-column primary key index for table {}, but the table has {} primary key columns", unique_set.columns.len(), table.name, table.primary_key_columns.len());
+                    assert!(
+                        table.primary_key_columns.len() == unique_set.columns.len(),
+                        "trying to add a {}-column primary key index for table {}, but the table has {} primary key columns",
+                        unique_set.columns.len(),
+                        table.name,
+                        table.primary_key_columns.len()
+                    );
                     // Add composite primary key index
                     assert!(
                         !pk_index_added,
@@ -1584,7 +1591,11 @@ impl Schema {
             // In MVCC mode during recovery, not all automatic index schema rows might be visible yet
             // during incremental schema reparsing, so we may have extra entries
             if !mvcc_enabled {
-                assert!(automatic_indexes.is_empty(), "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain", automatic_indexes.len());
+                assert!(
+                    automatic_indexes.is_empty(),
+                    "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain",
+                    automatic_indexes.len()
+                );
             }
         }
         Ok(())
@@ -1749,7 +1760,9 @@ impl Schema {
                                     // This will cause populate_materialized_views to skip this view
                                     tracing::warn!(
                                         "Skipping materialized view '{}' - has version {} but current version is {}. DROP and recreate the view to use it.",
-                                        view_name, stored_version, DBSP_CIRCUIT_VERSION
+                                        view_name,
+                                        stored_version,
+                                        DBSP_CIRCUIT_VERSION
                                     );
                                     // We can't track incompatible views here since we're in handle_schema_row
                                     // which doesn't have mutable access to self
@@ -2558,10 +2571,10 @@ impl GeneratedColGraph {
                     col.name.as_deref().unwrap_or("?")
                 );
             }
-            let direct_mask: ColumnMask = ColumnMask::from_iter(direct.iter());
-            direct_deps[j].union_with(&direct_mask);
+            let direct_mask: ColumnMask = ColumnMask::try_from_iter(direct.iter())?;
+            direct_deps[j].union_with(&direct_mask)?;
             for i in direct.iter() {
-                direct_dependents[i].set(j);
+                direct_dependents[i].set(j)?;
                 in_degree[j] += 1;
             }
         }
@@ -2597,7 +2610,7 @@ impl GeneratedColGraph {
             dependencies[j] = direct_deps[j].clone();
             for i in direct_deps[j].iter() {
                 let snapshot = dependencies[i].clone();
-                dependencies[j].union_with(&snapshot);
+                dependencies[j].union_with(&snapshot)?;
             }
         }
 
@@ -2607,7 +2620,7 @@ impl GeneratedColGraph {
             dependents[i] = direct_dependents[i].clone();
             for j in direct_dependents[i].iter() {
                 let snapshot = dependents[j].clone();
-                dependents[i].union_with(&snapshot);
+                dependents[i].union_with(&snapshot)?;
             }
         }
 
@@ -2749,31 +2762,33 @@ impl BTreeTable {
         table: &Arc<BTreeTable>,
         schema: &Schema,
         only_columns: Option<&ColumnMask>,
-    ) -> Arc<BTreeTable> {
+    ) -> Result<Arc<BTreeTable>> {
         let has_virtual = table.has_virtual_columns();
         let has_custom = table
             .columns
             .iter()
             .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
         if !has_custom && !has_virtual {
-            return Arc::clone(table);
+            return Ok(Arc::clone(table));
         }
         let mut modified = (**table).clone();
         let remapped_only_columns = if has_virtual {
-            let remapped = only_columns.map(|only| {
-                let mut new_set = ColumnMask::default();
-                let mut physical = 0usize;
-                for (orig, col) in modified.columns.iter().enumerate() {
-                    if col.is_virtual_generated() {
-                        continue;
+            let remapped = only_columns
+                .map(|only| {
+                    let mut new_set = ColumnMask::default();
+                    let mut physical = 0usize;
+                    for (orig, col) in modified.columns.iter().enumerate() {
+                        if col.is_virtual_generated() {
+                            continue;
+                        }
+                        if only.get(orig) {
+                            new_set.set(physical)?;
+                        }
+                        physical += 1;
                     }
-                    if only.get(orig) {
-                        new_set.set(physical);
-                    }
-                    physical += 1;
-                }
-                new_set
-            });
+                    Ok::<_, LimboError>(new_set)
+                })
+                .transpose()?;
             modified.columns.retain(|c| !c.is_virtual_generated());
             modified.has_virtual_columns = false;
             remapped
@@ -2796,7 +2811,7 @@ impl BTreeTable {
                 col.ty_str = type_def.value_input_type().to_uppercase();
             }
         }
-        Arc::new(modified)
+        Ok(Arc::new(modified))
     }
 
     /// Override column type metadata for custom type columns so that
@@ -3234,10 +3249,10 @@ impl BTreeTable {
         let graph = self.column_graph()?;
         let mut affected = ColumnMask::default();
         for i in updated_cols {
-            affected.set(i);
+            affected.set(i)?;
             if i < graph.dependents.len() {
                 let snapshot = graph.dependents[i].clone();
-                affected.union_with(&snapshot);
+                affected.union_with(&snapshot)?;
             }
         }
         Ok(affected)
@@ -3251,12 +3266,12 @@ impl BTreeTable {
         let mut deps = ColumnMask::default();
         for j in targets {
             if !self.columns[j].is_virtual_generated() {
-                deps.set(j);
+                deps.set(j)?;
                 continue;
             }
             for i in graph.dependencies[j].iter() {
                 if !self.columns[i].is_virtual_generated() {
-                    deps.set(i);
+                    deps.set(i)?;
                 }
             }
         }
@@ -3403,16 +3418,16 @@ fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &
     let _ = walk_expr(expr, &mut |e| {
         match e {
             Expr::Column { table, column, .. } if table.is_self_table() => {
-                out.set(*column);
+                out.set(*column)?;
             }
             Expr::Id(name) | Expr::Name(name) => {
                 if let Some(idx) = find_column_index_by_name(columns, name.as_str()) {
-                    out.set(idx);
+                    out.set(idx)?;
                 }
             }
             Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
                 if let Some(idx) = find_column_index_by_name(columns, col.as_str()) {
-                    out.set(idx);
+                    out.set(idx)?;
                 }
             }
             Expr::Subquery(_)
@@ -6140,7 +6155,7 @@ mod tests {
         )?;
         let mut expected = t.columns_affected_by_update([0])?;
         let b_mask = t.columns_affected_by_update([1])?;
-        expected.union_with(&b_mask);
+        expected.union_with(&b_mask).unwrap();
         let union_mask = t.columns_affected_by_update([0, 1])?;
         assert_eq!(indices(&union_mask), indices(&expected));
         Ok(())

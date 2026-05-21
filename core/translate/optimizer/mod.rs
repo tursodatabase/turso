@@ -8,6 +8,7 @@ use super::{
         WhereTerm,
     },
 };
+use crate::alloc::TursoIteratorExt;
 use crate::schema::GeneratedType;
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
@@ -985,7 +986,7 @@ fn update_write_set_reason(
             .set_clauses
             .iter()
             .map(|set_clause| set_clause.column_index)
-            .collect();
+            .try_collect()?;
         let database_id = table_ref.database_id;
         if has_triggers_including_temp(
             resolver,
@@ -1087,7 +1088,7 @@ fn collect_subquery_ids_from_exprs<'a>(
     let mut ids = BitSet::<turso_parser::ast::TableInternalId>::default();
     let mut collector = |e: &ast::Expr| -> Result<WalkControl> {
         if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
-            ids.set(*subquery_id);
+            ids.set(*subquery_id)?;
         }
         Ok(WalkControl::Continue)
     };
@@ -1112,7 +1113,7 @@ fn collect_update_phase_subquery_ids(
         plan.returning
             .iter()
             .flat_map(|returning| returning.iter().map(|column| &column.expr)),
-    )?);
+    )?)?;
     Ok(ids)
 }
 
@@ -2113,7 +2114,7 @@ fn optimize_table_access(
                     }
                 })
             })
-            .unzip();
+            .try_unzip()?;
     #[cfg(debug_assertions)]
     {
         let mut probe_tables: TableMask = TableMask::default();
@@ -2145,7 +2146,7 @@ fn optimize_table_access(
                         "hash join build/probe tables are not adjacent in join order"
                     );
                 }
-                probe_tables.set(*probe_table_idx);
+                probe_tables.set(*probe_table_idx)?;
                 build_tables.insert(*build_table_idx, *materialize_build_input);
             }
         }
@@ -2162,7 +2163,7 @@ fn optimize_table_access(
     let hash_join_build_only_tables: TableMask = hash_join_build_tables
         .iter()
         .filter(|table_idx| !hash_join_probe_tables.get(*table_idx))
-        .collect();
+        .try_collect()?;
 
     let best_join_order: Vec<JoinOrderMember> = best_table_numbers
         .iter()
@@ -2267,7 +2268,7 @@ fn optimize_table_access(
                     let unique_col_positions: BitSet = usable
                         .iter()
                         .map(|(_, c)| c.table_col_pos.expect("table_col_pos was Some above"))
-                        .collect();
+                        .try_collect()?;
                     // Map each usable constraint to a ConstraintRef.
                     // Multiple constraints with the same table_col_pos share the same index_col_pos.
                     let mut temp_constraint_refs: Vec<ConstraintRef> = usable
@@ -2289,7 +2290,7 @@ fn optimize_table_access(
                         &table_constraints.constraints,
                         &temp_constraint_refs,
                         &best_join_order[..=join_order_pos],
-                    );
+                    )?;
 
                     if usable_constraint_refs.is_empty() {
                         table_references.joined_tables_mut()[table_idx].op =
@@ -2599,12 +2600,12 @@ fn optimize_table_access(
         let prior_mask = best_join_order[..probe_pos]
             .iter()
             .map(|member| member.original_idx)
-            .collect();
+            .try_collect()?;
         let join_key_indices: BitSet = hash_join_op
             .join_keys
             .iter()
             .map(|key| key.where_clause_idx)
-            .collect();
+            .try_collect()?;
         let build_constraints = &constraints_per_table[hash_join_op.build_table_idx];
         let mut has_prior_constraints = false;
         for constraint in build_constraints.constraints.iter() {
