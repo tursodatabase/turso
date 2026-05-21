@@ -1,6 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_camel_case_types)]
 
+use std::collections::BTreeMap;
 use std::ffi::{self, CStr, CString};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -88,6 +89,43 @@ pub const SQLITE_CHECKPOINT_FULL: ffi::c_int = 1;
 pub const SQLITE_CHECKPOINT_RESTART: ffi::c_int = 2;
 pub const SQLITE_CHECKPOINT_TRUNCATE: ffi::c_int = 3;
 
+const SQLITE_TRANSIENT_DESTRUCTOR: *const ffi::c_void = usize::MAX as *const ffi::c_void;
+
+fn sqlite3_stmt_bind_ready(stmt: &sqlite3_stmt) -> bool {
+    let state = stmt.stmt.execution_state();
+    !state.is_running() && !state.is_terminal()
+}
+
+fn sqlite3_bind_destructor_callback(
+    destructor: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
+) -> Option<unsafe extern "C" fn(*mut ffi::c_void)> {
+    let destructor_fn = destructor?;
+    let ptr_val = destructor_fn as *const ffi::c_void;
+    (ptr_val != SQLITE_TRANSIENT_DESTRUCTOR).then_some(destructor_fn)
+}
+
+unsafe fn sqlite3_call_bind_destructor_on_failure(
+    data: *const ffi::c_void,
+    destructor: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
+) {
+    if let Some(destructor_fn) = sqlite3_bind_destructor_callback(destructor) {
+        destructor_fn(data as *mut ffi::c_void);
+    }
+}
+
+unsafe fn sqlite3_stmt_release_bind_destructor_slot(stmt: &mut sqlite3_stmt, slot: usize) {
+    if let Some(destructor) = stmt.bind_destructors.remove(&slot) {
+        (destructor.func)(destructor.ptr);
+    }
+}
+
+unsafe fn sqlite3_stmt_release_all_bind_destructors(stmt: &mut sqlite3_stmt) {
+    let destructors = std::mem::take(&mut stmt.bind_destructors);
+    for (_, destructor) in destructors {
+        (destructor.func)(destructor.ptr);
+    }
+}
+
 pub const SQLITE_INTEGER: ffi::c_int = 1;
 pub const SQLITE_FLOAT: ffi::c_int = 2;
 pub const SQLITE_TEXT: ffi::c_int = 3;
@@ -151,11 +189,7 @@ impl sqlite3 {
 pub struct sqlite3_stmt {
     pub(crate) db: *mut sqlite3,
     pub(crate) stmt: turso_core::Statement,
-    pub(crate) destructors: Vec<(
-        usize,
-        Option<unsafe extern "C" fn(*mut ffi::c_void)>,
-        *mut ffi::c_void,
-    )>,
+    pub(crate) bind_destructors: BTreeMap<usize, BindDestructor>,
     pub(crate) next: *mut sqlite3_stmt,
     pub(crate) text_cache: Vec<Vec<u8>>,
     /// Cached ExtValue instances for sqlite3_column_value().
@@ -171,13 +205,18 @@ pub struct sqlite3_backup {
     _private: [u8; 0],
 }
 
+struct BindDestructor {
+    func: unsafe extern "C" fn(*mut ffi::c_void),
+    ptr: *mut ffi::c_void,
+}
+
 impl sqlite3_stmt {
     pub fn new(db: *mut sqlite3, stmt: turso_core::Statement) -> Self {
         let n_cols = stmt.num_columns();
         Self {
             db,
             stmt,
-            destructors: Vec::new(),
+            bind_destructors: BTreeMap::new(),
             next: std::ptr::null_mut(),
             text_cache: vec![vec![]; n_cols],
             value_cache: (0..n_cols).map(|_| None).collect(),
@@ -902,9 +941,6 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
     // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
     // (this is necessary because queries like INSERT INTO t VALUES (1), (2), (3) RETURNING id return values within a transaction)
     let result = stmt_run_to_completion(stmt);
-    if result != SQLITE_OK {
-        return result;
-    }
 
     if !stmt_ref.db.is_null() {
         let db = &mut *stmt_ref.db;
@@ -925,14 +961,10 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
         }
     }
 
-    for (_idx, destructor_opt, ptr) in stmt_ref.destructors.drain(..) {
-        if let Some(destructor_fn) = destructor_opt {
-            destructor_fn(ptr);
-        }
-    }
+    sqlite3_stmt_release_all_bind_destructors(stmt_ref);
     stmt_ref.clear_text_cache();
     let _ = Box::from_raw(stmt);
-    SQLITE_OK
+    result
 }
 
 #[no_mangle]
@@ -1548,6 +1580,17 @@ fn sqlite3_bind_index_in_range(stmt: &sqlite3_stmt, idx: ffi::c_int) -> Option<N
     }
 }
 
+#[inline]
+fn sqlite3_column_index_in_range(stmt: &sqlite3_stmt, idx: ffi::c_int) -> Option<usize> {
+    let idx = usize::try_from(idx).ok()?;
+    let max = stmt.stmt.num_columns();
+    if idx >= max {
+        None
+    } else {
+        Some(idx)
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_parameter_name(
     stmt: *mut sqlite3_stmt,
@@ -1595,10 +1638,15 @@ pub unsafe extern "C" fn sqlite3_bind_null(stmt: *mut sqlite3_stmt, idx: ffi::c_
     }
 
     let stmt = &mut *stmt;
+    if !sqlite3_stmt_bind_ready(stmt) {
+        return SQLITE_MISUSE;
+    }
     let Some(index) = sqlite3_bind_index_in_range(stmt, idx) else {
         return SQLITE_RANGE;
     };
+    let slot = index.get() - 1;
 
+    sqlite3_stmt_release_bind_destructor_slot(stmt, slot);
     stmt.stmt.bind_at(index, Value::Null);
     SQLITE_OK
 }
@@ -1622,10 +1670,15 @@ pub unsafe extern "C" fn sqlite3_bind_int64(
         return SQLITE_MISUSE;
     }
     let stmt = &mut *stmt;
+    if !sqlite3_stmt_bind_ready(stmt) {
+        return SQLITE_MISUSE;
+    }
     let Some(index) = sqlite3_bind_index_in_range(stmt, idx) else {
         return SQLITE_RANGE;
     };
+    let slot = index.get() - 1;
 
+    sqlite3_stmt_release_bind_destructor_slot(stmt, slot);
     stmt.stmt.bind_at(index, Value::from_i64(val));
 
     SQLITE_OK
@@ -1641,10 +1694,15 @@ pub unsafe extern "C" fn sqlite3_bind_double(
         return SQLITE_MISUSE;
     }
     let stmt = &mut *stmt;
+    if !sqlite3_stmt_bind_ready(stmt) {
+        return SQLITE_MISUSE;
+    }
     let Some(index) = sqlite3_bind_index_in_range(stmt, idx) else {
         return SQLITE_RANGE;
     };
+    let slot = index.get() - 1;
 
+    sqlite3_stmt_release_bind_destructor_slot(stmt, slot);
     stmt.stmt.bind_at(index, Value::from_f64(val));
 
     SQLITE_OK
@@ -1658,52 +1716,52 @@ pub unsafe extern "C" fn sqlite3_bind_text(
     len: ffi::c_int,
     destructor: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
 ) -> ffi::c_int {
+    let fail = |rc| {
+        sqlite3_call_bind_destructor_on_failure(text as *const ffi::c_void, destructor);
+        rc
+    };
+
     if stmt.is_null() {
-        return SQLITE_MISUSE;
+        return fail(SQLITE_MISUSE);
     }
     let stmt_ref = &mut *stmt;
+    if !sqlite3_stmt_bind_ready(stmt_ref) {
+        return fail(SQLITE_MISUSE);
+    }
     let Some(index) = sqlite3_bind_index_in_range(stmt_ref, idx) else {
-        return SQLITE_RANGE;
+        return fail(SQLITE_RANGE);
     };
+    let slot = index.get() - 1;
     if text.is_null() {
+        sqlite3_stmt_release_bind_destructor_slot(stmt_ref, slot);
         stmt_ref.stmt.bind_at(index, Value::Null);
         return SQLITE_OK;
     }
 
-    let static_ptr = std::ptr::null();
-    let transient_ptr = -1isize as usize as *const ffi::c_void;
-    let ptr_val = destructor
-        .map(|f| f as *const ffi::c_void)
-        .unwrap_or(static_ptr);
+    sqlite3_stmt_release_bind_destructor_slot(stmt_ref, slot);
 
     let str_value = if len < 0 {
         match CStr::from_ptr(text).to_str() {
             Ok(s) => s.to_owned(),
-            Err(_) => return SQLITE_ERROR,
+            Err(_) => return fail(SQLITE_ERROR),
         }
     } else {
         let slice = std::slice::from_raw_parts(text as *const u8, len as usize);
         match std::str::from_utf8(slice) {
             Ok(s) => s.to_owned(),
-            Err(_) => return SQLITE_ERROR,
+            Err(_) => return fail(SQLITE_ERROR),
         }
     };
 
-    if ptr_val == transient_ptr {
-        let val = Value::from_text(str_value);
-        stmt_ref.stmt.bind_at(index, val);
-    } else if ptr_val == static_ptr {
-        let slice = std::slice::from_raw_parts(text as *const u8, str_value.len());
-        let val = Value::from_text(std::str::from_utf8(slice).unwrap());
-        stmt_ref.stmt.bind_at(index, val);
-    } else {
-        let slice = std::slice::from_raw_parts(text as *const u8, str_value.len());
-        let val = Value::from_text(std::str::from_utf8(slice).unwrap());
-        stmt_ref.stmt.bind_at(index, val);
-
-        stmt_ref
-            .destructors
-            .push((idx as usize, destructor, text as *mut ffi::c_void));
+    stmt_ref.stmt.bind_at(index, Value::from_text(str_value));
+    if let Some(destructor_fn) = sqlite3_bind_destructor_callback(destructor) {
+        stmt_ref.bind_destructors.insert(
+            slot,
+            BindDestructor {
+                func: destructor_fn,
+                ptr: text as *mut ffi::c_void,
+            },
+        );
     }
 
     SQLITE_OK
@@ -1717,32 +1775,46 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
     len: ffi::c_int,
     destructor: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
 ) -> ffi::c_int {
+    let fail = |rc| {
+        sqlite3_call_bind_destructor_on_failure(blob, destructor);
+        rc
+    };
+
     if stmt.is_null() {
-        return SQLITE_MISUSE;
+        return fail(SQLITE_MISUSE);
     }
     let stmt_ref = &mut *stmt;
+    if !sqlite3_stmt_bind_ready(stmt_ref) {
+        return fail(SQLITE_MISUSE);
+    }
     let Some(index) = sqlite3_bind_index_in_range(stmt_ref, idx) else {
-        return SQLITE_RANGE;
+        return fail(SQLITE_RANGE);
     };
+    let slot = index.get() - 1;
     if blob.is_null() {
+        sqlite3_stmt_release_bind_destructor_slot(stmt_ref, slot);
         stmt_ref.stmt.bind_at(index, Value::Null);
         return SQLITE_OK;
     }
+    if len < 0 {
+        return SQLITE_MISUSE;
+    }
+
+    sqlite3_stmt_release_bind_destructor_slot(stmt_ref, slot);
 
     let slice_blob = std::slice::from_raw_parts(blob as *const u8, len as usize).to_vec();
 
     let val_blob = Value::from_blob(slice_blob);
-
     stmt_ref.stmt.bind_at(index, val_blob);
 
-    if let Some(destructor_fn) = destructor {
-        let ptr_val = destructor_fn as *const ffi::c_void;
-        let static_ptr = std::ptr::null();
-        let transient_ptr = usize::MAX as *const ffi::c_void;
-
-        if ptr_val != static_ptr && ptr_val != transient_ptr {
-            destructor_fn(blob as *mut _);
-        }
+    if let Some(destructor_fn) = sqlite3_bind_destructor_callback(destructor) {
+        stmt_ref.bind_destructors.insert(
+            slot,
+            BindDestructor {
+                func: destructor_fn,
+                ptr: blob as *mut ffi::c_void,
+            },
+        );
     }
 
     SQLITE_OK
@@ -1755,6 +1827,7 @@ pub unsafe extern "C" fn sqlite3_clear_bindings(stmt: *mut sqlite3_stmt) -> ffi:
     }
 
     let stmt_ref = &mut *stmt;
+    sqlite3_stmt_release_all_bind_destructors(stmt_ref);
     stmt_ref.stmt.clear_bindings();
 
     SQLITE_OK
@@ -1765,13 +1838,21 @@ pub unsafe extern "C" fn sqlite3_column_type(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> ffi::c_int {
-    let stmt = &mut *stmt;
-    let row = stmt
-        .stmt
-        .row()
-        .expect("Function should only be called after `SQLITE_ROW`");
+    if stmt.is_null() {
+        return SQLITE_NULL;
+    }
+    let stmt = &*stmt;
+    let Some(idx) = sqlite3_column_index_in_range(stmt, idx) else {
+        return SQLITE_NULL;
+    };
+    let Some(row) = stmt.stmt.row() else {
+        return SQLITE_NULL;
+    };
+    if idx >= row.len() {
+        return SQLITE_NULL;
+    }
 
-    match row.get::<&Value>(idx as usize) {
+    match row.get::<&Value>(idx) {
         Ok(turso_core::Value::Numeric(turso_core::Numeric::Integer(_))) => SQLITE_INTEGER,
         Ok(turso_core::Value::Text(_)) => SQLITE_TEXT,
         Ok(turso_core::Value::Numeric(turso_core::Numeric::Float(_))) => SQLITE_FLOAT,
@@ -1806,8 +1887,13 @@ pub unsafe extern "C" fn sqlite3_column_name(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
-    let idx = idx.try_into().unwrap();
-    let stmt = &mut *stmt;
+    if stmt.is_null() {
+        return std::ptr::null();
+    }
+    let stmt = &*stmt;
+    let Some(idx) = sqlite3_column_index_in_range(stmt, idx) else {
+        return std::ptr::null();
+    };
 
     let binding = stmt.stmt.get_column_name(idx).into_owned();
     let val = binding.as_str();
@@ -1825,8 +1911,13 @@ pub unsafe extern "C" fn sqlite3_column_table_name(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
-    let idx = idx.try_into().unwrap();
-    let stmt = &mut *stmt;
+    if stmt.is_null() {
+        return std::ptr::null();
+    }
+    let stmt = &*stmt;
+    let Some(idx) = sqlite3_column_index_in_range(stmt, idx) else {
+        return std::ptr::null();
+    };
 
     let binding = stmt
         .stmt
@@ -1845,14 +1936,20 @@ pub unsafe extern "C" fn sqlite3_column_table_name(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_int64(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> i64 {
-    // Attempt to convert idx to usize
-    let idx = idx.try_into().unwrap();
-    let stmt = &mut *stmt;
-    let row = stmt
-        .stmt
-        .row()
-        .expect("Function should only be called after `SQLITE_ROW`");
-    row.get(idx).unwrap()
+    if stmt.is_null() {
+        return 0;
+    }
+    let stmt = &*stmt;
+    let Some(idx) = sqlite3_column_index_in_range(stmt, idx) else {
+        return 0;
+    };
+    let Some(row) = stmt.stmt.row() else {
+        return 0;
+    };
+    if idx >= row.len() {
+        return 0;
+    }
+    row.get(idx).unwrap_or(0)
 }
 
 #[no_mangle]
@@ -1865,13 +1962,20 @@ pub unsafe extern "C" fn sqlite3_column_int(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_double(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> f64 {
-    let idx = idx.try_into().unwrap();
-    let stmt = &mut *stmt;
-    let row = stmt
-        .stmt
-        .row()
-        .expect("Function should only be called after `SQLITE_ROW`");
-    row.get(idx).unwrap()
+    if stmt.is_null() {
+        return 0.0;
+    }
+    let stmt = &*stmt;
+    let Some(idx) = sqlite3_column_index_in_range(stmt, idx) else {
+        return 0.0;
+    };
+    let Some(row) = stmt.stmt.row() else {
+        return 0.0;
+    };
+    if idx >= row.len() {
+        return 0.0;
+    }
+    row.get(idx).unwrap_or(0.0)
 }
 
 #[no_mangle]
@@ -1879,13 +1983,20 @@ pub unsafe extern "C" fn sqlite3_column_blob(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_void {
-    let stmt = &mut *stmt;
-    let row = stmt.stmt.row();
-    let row = match row.as_ref() {
-        Some(row) => row,
-        None => return std::ptr::null(),
+    if stmt.is_null() {
+        return std::ptr::null();
+    }
+    let stmt = &*stmt;
+    let Some(idx) = sqlite3_column_index_in_range(stmt, idx) else {
+        return std::ptr::null();
     };
-    match row.get::<&Value>(idx as usize) {
+    let Some(row) = stmt.stmt.row() else {
+        return std::ptr::null();
+    };
+    if idx >= row.len() {
+        return std::ptr::null();
+    }
+    match row.get::<&Value>(idx) {
         Ok(turso_core::Value::Blob(blob)) if !blob.is_empty() => {
             blob.as_ptr() as *const ffi::c_void
         }
@@ -1898,13 +2009,20 @@ pub unsafe extern "C" fn sqlite3_column_bytes(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> ffi::c_int {
-    let stmt = &mut *stmt;
-    let row = stmt.stmt.row();
-    let row = match row.as_ref() {
-        Some(row) => row,
-        None => return 0,
+    if stmt.is_null() {
+        return 0;
+    }
+    let stmt = &*stmt;
+    let Some(idx) = sqlite3_column_index_in_range(stmt, idx) else {
+        return 0;
     };
-    match row.get::<&Value>(idx as usize) {
+    let Some(row) = stmt.stmt.row() else {
+        return 0;
+    };
+    if idx >= row.len() {
+        return 0;
+    }
+    match row.get::<&Value>(idx) {
         Ok(turso_core::Value::Text(text)) => text.as_str().len() as ffi::c_int,
         Ok(turso_core::Value::Blob(blob)) => blob.len() as ffi::c_int,
         _ => 0,
