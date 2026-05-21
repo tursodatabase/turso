@@ -166,6 +166,11 @@ pub struct sqlite3_stmt {
     pub(crate) prev_search_count: i64,
 }
 
+#[repr(C)]
+pub struct sqlite3_backup {
+    _private: [u8; 0],
+}
+
 impl sqlite3_stmt {
     pub fn new(db: *mut sqlite3, stmt: turso_core::Statement) -> Self {
         let n_cols = stmt.num_columns();
@@ -1477,30 +1482,30 @@ pub unsafe extern "C" fn sqlite3_backup_init(
     _dest_name: *const ffi::c_char,
     _source_db: *mut sqlite3,
     _source_name: *const ffi::c_char,
-) -> *mut ffi::c_void {
+) -> *mut sqlite3_backup {
     stub!();
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_backup_step(
-    _backup: *mut ffi::c_void,
+    _backup: *mut sqlite3_backup,
     _n_pages: ffi::c_int,
 ) -> ffi::c_int {
     stub!();
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_backup_remaining(_backup: *mut ffi::c_void) -> ffi::c_int {
+pub unsafe extern "C" fn sqlite3_backup_remaining(_backup: *mut sqlite3_backup) -> ffi::c_int {
     stub!();
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_backup_pagecount(_backup: *mut ffi::c_void) -> ffi::c_int {
+pub unsafe extern "C" fn sqlite3_backup_pagecount(_backup: *mut sqlite3_backup) -> ffi::c_int {
     stub!();
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_backup_finish(_backup: *mut ffi::c_void) -> ffi::c_int {
+pub unsafe extern "C" fn sqlite3_backup_finish(_backup: *mut sqlite3_backup) -> ffi::c_int {
     stub!();
 }
 

@@ -61,6 +61,7 @@ typedef void (*sqlite3_destructor_type)(void*);
 typedef struct sqlite3 sqlite3;
 
 typedef struct sqlite3_stmt sqlite3_stmt;
+typedef struct sqlite3_backup sqlite3_backup;
 typedef int64_t sqlite3_int64;
 typedef sqlite3_int64 sqlite_int64;
 
@@ -171,15 +172,15 @@ const char *sqlite3_errstr(int _err);
 
 void *sqlite3_user_data(void *_context);
 
-void *sqlite3_backup_init(sqlite3 *_dest_db, const char *_dest_name, sqlite3 *_source_db, const char *_source_name);
+sqlite3_backup *sqlite3_backup_init(sqlite3 *_dest_db, const char *_dest_name, sqlite3 *_source_db, const char *_source_name);
 
-int sqlite3_backup_step(void *_backup, int _n_pages);
+int sqlite3_backup_step(sqlite3_backup *_backup, int _n_pages);
 
-int sqlite3_backup_remaining(void *_backup);
+int sqlite3_backup_remaining(sqlite3_backup *_backup);
 
-int sqlite3_backup_pagecount(void *_backup);
+int sqlite3_backup_pagecount(sqlite3_backup *_backup);
 
-int sqlite3_backup_finish(void *_backup);
+int sqlite3_backup_finish(sqlite3_backup *_backup);
 
 char *sqlite3_expanded_sql(sqlite3_stmt *_stmt);
 
