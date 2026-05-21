@@ -194,6 +194,8 @@ int sqlite3_bind_parameter_index(sqlite3_stmt *_stmt, const char *_name);
 
 int sqlite3_bind_null(sqlite3_stmt *_stmt, int _idx);
 
+int sqlite3_bind_int(sqlite3_stmt *_stmt, int _idx, int _val);
+
 int sqlite3_bind_int64(sqlite3_stmt *_stmt, int _idx, int64_t _val);
 
 int sqlite3_bind_double(sqlite3_stmt *_stmt, int _idx, double _val);
@@ -215,6 +217,8 @@ const char *sqlite3_column_name(sqlite3_stmt *_stmt, int _idx);
 const char *sqlite3_column_table_name(sqlite3_stmt *_stmt, int _idx);
 
 int64_t sqlite3_column_int64(sqlite3_stmt *_stmt, int _idx);
+
+int sqlite3_column_int(sqlite3_stmt *_stmt, int _idx);
 
 double sqlite3_column_double(sqlite3_stmt *_stmt, int _idx);
 
