@@ -78,12 +78,14 @@ Add a family-specific `*_yield_key(...) -> u64` helper. Mix stable logical ident
 
 Before adding a hook, prove re-entry is safe. A synthetic yield returns `StepResult::IO`; the same statement/state machine may be stepped again immediately later. On re-entry, it must resume from an explicit state, not repeat non-idempotent work.
 
-Resume-ability rules:
+Rules:
 
 - Mutate the state machine into the resumable state before yielding.
 - Do not put a hook before a `push`, `insert`, counter increment, lock acquisition, or cleanup action unless repeating that action is harmless or explicitly guarded by state.
 - If a lock/guard is held across the yield, test both resume and drop-at-yield paths.
 - For abandonment tests, dropping the statement at the yield must restore invariants through Drop/abort cleanup.
+- When adding a new yield point, always add it at the last position in the enum to preserve existing ordinals.
+- Do not reorder variants in existing `YieldPointMarker` enums, unless absolutely required. Reordering changes the meaning of existing ordinals and can break reproducibility of CI seeds and bisects.
 
 Checklist:
 
