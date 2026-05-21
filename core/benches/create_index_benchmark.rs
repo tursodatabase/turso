@@ -41,6 +41,23 @@ use turso_core::{Database, PlatformIO, StepResult};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(not(feature = "codspeed"))]
+macro_rules! iter_custom_or_iter {
+    ($b:expr, |$iters:ident| $body:block) => {
+        $b.iter_custom(|$iters| $body)
+    };
+}
+
+#[cfg(feature = "codspeed")]
+macro_rules! iter_custom_or_iter {
+    ($b:expr, |$iters:ident| $body:block) => {
+        $b.iter(|| {
+            let $iters = 1;
+            $body
+        })
+    };
+}
+
 /// Step a statement to completion, draining IO callbacks.
 fn run_to_completion(
     stmt: &mut turso_core::Statement,
@@ -164,6 +181,10 @@ fn row_counts() -> Vec<usize> {
     v
 }
 
+fn should_bench_create_index_turso(row_count: usize) -> bool {
+    !(cfg!(feature = "codspeed") && row_count > 100_000)
+}
+
 /// Benchmark CREATE INDEX on an already-populated table.
 ///
 /// Indexes the non-monotonic `val` column to force a real sort + B-tree build
@@ -206,49 +227,51 @@ fn bench_create_index(criterion: &mut Criterion) {
         group.warm_up_time(warm_up);
         group.measurement_time(measurement);
 
-        // ---- Turso total latency ----
-        {
-            let temp_dir = tempfile::tempdir().unwrap();
-            let (db, conn) = open_turso(&temp_dir);
-            populate_turso(&db, &conn, row_count);
+        if should_bench_create_index_turso(row_count) {
+            // ---- Turso total latency ----
+            {
+                let temp_dir = tempfile::tempdir().unwrap();
+                let (db, conn) = open_turso(&temp_dir);
+                populate_turso(&db, &conn, row_count);
 
-            group.bench_function(BenchmarkId::new("turso_total", row_count), |b| {
-                b.iter_custom(|iters| {
-                    let mut total = std::time::Duration::ZERO;
-                    for _ in 0..iters {
-                        let start = std::time::Instant::now();
-                        exec_turso(&conn, &db, "BEGIN");
-                        exec_turso(&conn, &db, "CREATE INDEX idx_val ON t(val)");
-                        exec_turso(&conn, &db, "COMMIT");
-                        total += start.elapsed();
-                        // Restore the un-indexed state for the next sample.
-                        exec_turso(&conn, &db, "DROP INDEX idx_val");
-                    }
-                    total
+                group.bench_function(BenchmarkId::new("turso_total", row_count), |b| {
+                    iter_custom_or_iter!(b, |iters| {
+                        let mut total = std::time::Duration::ZERO;
+                        for _ in 0..iters {
+                            let start = std::time::Instant::now();
+                            exec_turso(&conn, &db, "BEGIN");
+                            exec_turso(&conn, &db, "CREATE INDEX idx_val ON t(val)");
+                            exec_turso(&conn, &db, "COMMIT");
+                            total += start.elapsed();
+                            // Restore the un-indexed state for the next sample.
+                            exec_turso(&conn, &db, "DROP INDEX idx_val");
+                        }
+                        total
+                    });
                 });
-            });
-        }
+            }
 
-        // ---- Turso commit latency ----
-        {
-            let temp_dir = tempfile::tempdir().unwrap();
-            let (db, conn) = open_turso(&temp_dir);
-            populate_turso(&db, &conn, row_count);
+            // ---- Turso commit latency ----
+            {
+                let temp_dir = tempfile::tempdir().unwrap();
+                let (db, conn) = open_turso(&temp_dir);
+                populate_turso(&db, &conn, row_count);
 
-            group.bench_function(BenchmarkId::new("turso_commit_only", row_count), |b| {
-                b.iter_custom(|iters| {
-                    let mut total = std::time::Duration::ZERO;
-                    for _ in 0..iters {
-                        exec_turso(&conn, &db, "BEGIN");
-                        exec_turso(&conn, &db, "CREATE INDEX idx_val ON t(val)");
-                        let start = std::time::Instant::now();
-                        exec_turso(&conn, &db, "COMMIT");
-                        total += start.elapsed();
-                        exec_turso(&conn, &db, "DROP INDEX idx_val");
-                    }
-                    total
+                group.bench_function(BenchmarkId::new("turso_commit_only", row_count), |b| {
+                    iter_custom_or_iter!(b, |iters| {
+                        let mut total = std::time::Duration::ZERO;
+                        for _ in 0..iters {
+                            exec_turso(&conn, &db, "BEGIN");
+                            exec_turso(&conn, &db, "CREATE INDEX idx_val ON t(val)");
+                            let start = std::time::Instant::now();
+                            exec_turso(&conn, &db, "COMMIT");
+                            total += start.elapsed();
+                            exec_turso(&conn, &db, "DROP INDEX idx_val");
+                        }
+                        total
+                    });
                 });
-            });
+            }
         }
 
         // ---- sqlite ----
@@ -258,7 +281,7 @@ fn bench_create_index(criterion: &mut Criterion) {
             populate_rusqlite(&conn, row_count);
 
             group.bench_function(BenchmarkId::new("sqlite", row_count), |b| {
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
@@ -288,6 +311,10 @@ fn bench_create_index_commit(criterion: &mut Criterion) {
     group.sampling_mode(SamplingMode::Flat);
 
     for &row_count in &row_counts() {
+        if !should_bench_create_index_turso(row_count) {
+            continue;
+        }
+
         group.throughput(Throughput::Elements(row_count as u64));
         let samples = match row_count {
             n if n <= 10_000 => 30,
@@ -320,7 +347,7 @@ fn bench_create_index_commit(criterion: &mut Criterion) {
             group.bench_function(
                 BenchmarkId::new("turso_create_index_commit", row_count),
                 |b| {
-                    b.iter_custom(|iters| {
+                    iter_custom_or_iter!(b, |iters| {
                         let mut total = std::time::Duration::ZERO;
                         for _ in 0..iters {
                             let start = std::time::Instant::now();
@@ -345,7 +372,7 @@ fn bench_create_index_commit(criterion: &mut Criterion) {
             populate_rusqlite(&conn, row_count);
 
             group.bench_function(BenchmarkId::new("sqlite", row_count), |b| {
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();

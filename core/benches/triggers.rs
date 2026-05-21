@@ -16,6 +16,23 @@ use turso_core::{Database, PlatformIO, StepResult};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(not(feature = "codspeed"))]
+macro_rules! iter_custom_or_iter {
+    ($b:expr, |$iters:ident| $body:block) => {
+        $b.iter_custom(|$iters| $body)
+    };
+}
+
+#[cfg(feature = "codspeed")]
+macro_rules! iter_custom_or_iter {
+    ($b:expr, |$iters:ident| $body:block) => {
+        $b.iter(|| {
+            let $iters = 1;
+            $body
+        })
+    };
+}
+
 fn run_to_completion(
     stmt: &mut turso_core::Statement,
     db: &Arc<Database>,
@@ -104,7 +121,7 @@ fn bench_multirow_insert_with_trigger(criterion: &mut Criterion) {
                 let mut insert_stmt = conn.prepare(&values).unwrap();
                 let mut del_src = conn.query("DELETE FROM src").unwrap().unwrap();
                 let mut del_audit = conn.query("DELETE FROM audit").unwrap().unwrap();
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
@@ -130,7 +147,7 @@ fn bench_multirow_insert_with_trigger(criterion: &mut Criterion) {
                 BenchmarkId::new("sqlite", format!("{row_count}_rows")),
                 |b| {
                     let mut stmt = sqlite_conn.prepare(&values).unwrap();
-                    b.iter_custom(|iters| {
+                    iter_custom_or_iter!(b, |iters| {
                         let mut total = std::time::Duration::ZERO;
                         for _ in 0..iters {
                             let start = std::time::Instant::now();
@@ -203,7 +220,7 @@ fn bench_wide_table_sparse_trigger(criterion: &mut Criterion) {
                 let mut insert_stmt = conn.prepare(&values).unwrap();
                 let mut del1 = conn.query("DELETE FROM wide").unwrap().unwrap();
                 let mut del2 = conn.query("DELETE FROM audit_wide").unwrap().unwrap();
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
@@ -229,7 +246,7 @@ fn bench_wide_table_sparse_trigger(criterion: &mut Criterion) {
                 BenchmarkId::new("sqlite", format!("{col_count}_cols")),
                 |b| {
                     let mut stmt = sqlite_conn.prepare(&values).unwrap();
-                    b.iter_custom(|iters| {
+                    iter_custom_or_iter!(b, |iters| {
                         let mut total = std::time::Duration::ZERO;
                         for _ in 0..iters {
                             let start = std::time::Instant::now();
@@ -332,7 +349,7 @@ fn bench_multiple_triggers(criterion: &mut Criterion) {
                     .iter()
                     .map(|t| conn.query(format!("DELETE FROM {t}")).unwrap().unwrap())
                     .collect();
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
@@ -358,7 +375,7 @@ fn bench_multiple_triggers(criterion: &mut Criterion) {
                 BenchmarkId::new("sqlite", format!("{trigger_count}_triggers")),
                 |b| {
                     let mut stmt = sqlite_conn.prepare(&values).unwrap();
-                    b.iter_custom(|iters| {
+                    iter_custom_or_iter!(b, |iters| {
                         let mut total = std::time::Duration::ZERO;
                         for _ in 0..iters {
                             let start = std::time::Instant::now();
@@ -423,7 +440,7 @@ fn bench_trigger_overhead(criterion: &mut Criterion) {
             } else {
                 None
             };
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
@@ -453,7 +470,7 @@ fn bench_trigger_overhead(criterion: &mut Criterion) {
                 } else {
                     "DELETE FROM src"
                 };
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
@@ -507,7 +524,7 @@ fn bench_before_trigger(criterion: &mut Criterion) {
             |b| {
                 let mut insert_stmt = conn.prepare(&values).unwrap();
                 let mut del = conn.query("DELETE FROM src").unwrap().unwrap();
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
@@ -531,7 +548,7 @@ fn bench_before_trigger(criterion: &mut Criterion) {
                 BenchmarkId::new("sqlite", format!("{row_count}_rows")),
                 |b| {
                     let mut stmt = sqlite_conn.prepare(&values).unwrap();
-                    b.iter_custom(|iters| {
+                    iter_custom_or_iter!(b, |iters| {
                         let mut total = std::time::Duration::ZERO;
                         for _ in 0..iters {
                             let start = std::time::Instant::now();
