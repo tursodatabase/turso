@@ -1597,9 +1597,9 @@ pub unsafe extern "C" fn sqlite3_bind_null(stmt: *mut sqlite3_stmt, idx: ffi::c_
 pub unsafe extern "C" fn sqlite3_bind_int(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
-    val: i64,
+    val: ffi::c_int,
 ) -> ffi::c_int {
-    sqlite3_bind_int64(stmt, idx, val)
+    sqlite3_bind_int64(stmt, idx, val as i64)
 }
 
 #[no_mangle]
