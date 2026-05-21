@@ -9367,6 +9367,52 @@ fn test_schema_rewrites_do_not_drop_table_versions_from_recovery_log() {
     }
 }
 
+#[test]
+fn test_checkpoint_skips_uncheckpointed_view_and_trigger_deletes_after_recovery() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b TEXT)")
+            .unwrap();
+        conn.execute("CREATE VIEW v_t AS SELECT id, b FROM t")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr_t_ai AFTER INSERT ON t
+             BEGIN
+               UPDATE t SET b = NEW.b || '_tr' WHERE id = NEW.id;
+             END",
+        )
+        .unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    {
+        db.get_mvcc_store().set_checkpoint_threshold(-1);
+        let conn = db.connect();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("DROP VIEW v_t").unwrap();
+        conn.execute("DROP TRIGGER tr_t_ai").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(
+        &conn,
+        "SELECT type, name FROM sqlite_schema WHERE name NOT LIKE '__turso%' ORDER BY rowid",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "table");
+    assert_eq!(rows[0][1].to_string(), "t");
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
 /// Updating a row that already exists in the db file creates an MVCC
 /// replacement version. If the same transaction deletes that row, recovery must
 /// not replay both the old-row delete and a second delete for the replacement:
