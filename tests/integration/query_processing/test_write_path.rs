@@ -1664,7 +1664,7 @@ pub fn test_mvcc_reader_stale_snapshot_after_schema_updated_returns_ok() {
     conn1.execute("SELECT * FROM t").unwrap();
     // conn2: Modify schema while conn1's CONCURRENT transaction is active
     conn2.execute("CREATE TABLE t2 (x)").unwrap();
-    // conn1: Try to COMMIT - should fail with SchemaConflict
+    // conn1: A read-only transaction can commit even though the schema changed.
     let commit_result = conn1.execute("COMMIT");
     assert!(matches!(commit_result, Ok(())));
 
@@ -1673,12 +1673,11 @@ pub fn test_mvcc_reader_stale_snapshot_after_schema_updated_returns_ok() {
         .execute("INSERT INTO t VALUES ('test_key', 'test_value')")
         .unwrap();
 
-    // conn1: Start a new CONCURRENT transaction
-    // BUG: This should get a fresh MVCC snapshot, but it reuses the old one
+    // conn1: Start a new CONCURRENT transaction. It must get a fresh
+    // snapshot after the earlier transaction committed.
     conn1.execute("BEGIN CONCURRENT").unwrap();
 
-    // conn1: SELECT should see the row inserted by conn2
-    // BUG: Due to stale snapshot, this returns empty result
+    // conn1: SELECT should see the row inserted by conn2.
     let rows: Vec<(String, String)> = conn1.exec_rows("SELECT * FROM t WHERE key = 'test_key'");
 
     assert_eq!(
@@ -1711,9 +1710,9 @@ pub fn test_mvcc_writer_stale_snapshot_after_schema_updated() {
     conn1
         .execute("INSERT INTO t VALUES ('foo', 'var')")
         .unwrap();
-    // conn2: Modify schema while conn1's CONCURRENT transaction is active
+    // conn2: Modify schema while conn1's CONCURRENT transaction is active.
     conn2.execute("CREATE TABLE t2 (x)").unwrap();
-    // conn1: Try to COMMIT - should fail with SchemaConflict
+    // conn1: COMMIT should fail because its writer snapshot predates the schema change.
     let commit_result = conn1.execute("COMMIT");
     assert!(matches!(commit_result, Err(LimboError::SchemaConflict)));
 
@@ -1722,12 +1721,11 @@ pub fn test_mvcc_writer_stale_snapshot_after_schema_updated() {
         .execute("INSERT INTO t VALUES ('test_key', 'test_value')")
         .unwrap();
 
-    // conn1: Start a new CONCURRENT transaction
-    // BUG: This should get a fresh MVCC snapshot, but it reuses the old one
+    // conn1: Start a new CONCURRENT transaction. It must get a fresh
+    // snapshot after the earlier transaction committed.
     conn1.execute("BEGIN CONCURRENT").unwrap();
 
-    // conn1: SELECT should see the row inserted by conn2
-    // BUG: Due to stale snapshot, this returns empty result
+    // conn1: SELECT should see the row inserted by conn2.
     let rows: Vec<(String, String)> = conn1.exec_rows("SELECT * FROM t WHERE key = 'test_key'");
 
     assert_eq!(
