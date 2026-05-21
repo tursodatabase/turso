@@ -3807,6 +3807,10 @@ impl Wal for WalFile {
         self.coordination.rollback_cache(cache_rollback_frame);
         *self.last_checksum.write() = last_checksum;
         self.max_frame.store(max_frame, Ordering::Release);
+        // Savepoint rollback only rewinds part of the transaction. Frames
+        // before the savepoint can still be private to this connection, so the
+        // next commit must keep appending after them. Full rollback discards
+        // the whole transaction, so no private frames remain.
         if is_savepoint {
             self.has_unpublished_frames
                 .store(max_frame > snapshot.max_frame, Ordering::Release);
@@ -3913,6 +3917,8 @@ impl Wal for WalFile {
             last_checksum,
             transaction_count,
         });
+        // The commit published our local WAL frames to the shared state, so
+        // they are no longer private to this connection.
         self.has_unpublished_frames.store(false, Ordering::Release);
         Ok(())
     }
@@ -4283,6 +4289,8 @@ impl Wal for WalFile {
         for (page, fid, csum) in &page_frame_and_checksum {
             self.complete_append_frame(page.get().id as u64, *fid, *csum);
         }
+        // Spilled frames have no commit marker, so only this connection knows
+        // about them until commit publishes the WAL state.
         self.has_unpublished_frames.store(true, Ordering::Release);
 
         Ok(c)
@@ -4882,7 +4890,6 @@ impl WalFile {
         self.min_frame.store(0, Ordering::Release);
         self.checkpoint_seq
             .store(snapshot.checkpoint_seq, Ordering::Release);
-        self.has_unpublished_frames.store(false, Ordering::Release);
     }
 
     // unlock shared read locks taken by RESTART/TRUNCATE checkpoint modes
