@@ -11,11 +11,17 @@
 
 #define SQLITE_BUSY 5
 
+#define SQLITE_LOCKED 6
+
 #define SQLITE_NOMEM 7
+
+#define SQLITE_READONLY 8
 
 #define SQLITE_INTERRUPT 9
 
 #define SQLITE_NOTFOUND 12
+
+#define SQLITE_FULL 13
 
 #define SQLITE_CANTOPEN 14
 
@@ -27,11 +33,11 @@
 
 #define SQLITE_ABORT_ROLLBACK (SQLITE_ABORT | (2 << 8))
 
+#define SQLITE_STATE_BUSY 109
+
 #define SQLITE_STATE_OPEN 118
 
 #define SQLITE_STATE_SICK 186
-
-#define SQLITE_STATE_BUSY 109
 
 #define SQLITE_CHECKPOINT_PASSIVE 0
 
@@ -43,10 +49,10 @@
 
 #define SQLITE_INTEGER  1
 #define SQLITE_FLOAT    2
+#define SQLITE_TEXT     3
+#define SQLITE3_TEXT    3
 #define SQLITE_BLOB     4
 #define SQLITE_NULL     5
-#define SQLITE_TEXT     3
-#define SQLITE3_TEXT     3
 
 typedef void (*sqlite3_destructor_type)(void*);
 #define SQLITE_STATIC    ((sqlite3_destructor_type)0)

@@ -79,9 +79,9 @@ pub const SQLITE_DONE: ffi::c_int = 101; /* sqlite3_step() has finished executin
 /* extended error-codes */
 pub const SQLITE_ABORT_ROLLBACK: ffi::c_int = SQLITE_ABORT | (2 << 8);
 
+pub const SQLITE_STATE_BUSY: u8 = 0x6d;
 pub const SQLITE_STATE_OPEN: u8 = 0x76;
 pub const SQLITE_STATE_SICK: u8 = 0xba;
-pub const SQLITE_STATE_BUSY: u8 = 0x6d;
 
 pub const SQLITE_CHECKPOINT_PASSIVE: ffi::c_int = 0;
 pub const SQLITE_CHECKPOINT_FULL: ffi::c_int = 1;

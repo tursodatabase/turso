@@ -180,10 +180,11 @@ extern "C" {
 
 const SQLITE_OK: i32 = 0;
 const SQLITE_ERROR: i32 = 1;
+const SQLITE_ABORT: i32 = 4;
+const SQLITE_INTERRUPT: i32 = 9;
+const SQLITE_CANTOPEN: i32 = 14;
 const SQLITE_MISUSE: i32 = 21;
 const SQLITE_RANGE: i32 = 25;
-const SQLITE_CANTOPEN: i32 = 14;
-const SQLITE_INTERRUPT: i32 = 9;
 const SQLITE_ROW: i32 = 100;
 const SQLITE_DONE: i32 = 101;
 const SQLITE_PREPARE_PERSISTENT: u32 = 0x01;
@@ -194,7 +195,6 @@ const SQLITE_CHECKPOINT_RESTART: i32 = 2;
 const SQLITE_CHECKPOINT_TRUNCATE: i32 = 3;
 const SQLITE_INTEGER: i32 = 1;
 const SQLITE_FLOAT: i32 = 2;
-const SQLITE_ABORT: i32 = 4;
 const SQLITE_TEXT: i32 = 3;
 const SQLITE3_TEXT: i32 = 3;
 const SQLITE_BLOB: i32 = 4;
