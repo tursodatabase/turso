@@ -990,6 +990,13 @@ pub struct BuildLogRecordCtx {
     /// data-row pass. Schema rows are emitted first so log replay sees
     /// CREATE TABLE before related INSERTs.
     pub schema_process: bool,
+    /// B-tree ids created and dropped by this transaction before commit.
+    /// Their schema rows and contents have no durable net effect unless a
+    /// same-transaction schema row for the same btree survives.
+    pub created_deleted_btree_ids: HashSet<MVTableId>,
+    /// B-tree ids with a same-transaction schema row that survives commit.
+    /// These disqualify earlier insert/delete schema rewrites for the same id.
+    pub created_live_btree_ids: HashSet<MVTableId>,
 }
 
 fn version_begin_is_tx(row_version: &RowVersion, tx_id: TxID) -> bool {
@@ -1004,6 +1011,100 @@ fn version_end_is_tx(row_version: &RowVersion, tx_id: TxID) -> bool {
         row_version.end,
         Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
     )
+}
+
+// Extract the MVCC B-tree id from a sqlite_schema row version.
+//
+// This only returns Some(id) when all of the following are true:
+// - the row belongs to sqlite_schema;
+// - the row has a payload;
+// - sqlite_schema.type is "table" or "index";
+// - sqlite_schema.rootpage is a negative integer.
+//
+// A negative rootpage means the table/index exists only as an MVCC logical
+// B-tree id and has not yet been checkpointed into a real positive root page
+// in the database file.
+//
+// For example, this sqlite_schema row:
+//
+//   type = "index"
+//   name = "idx_t_v"
+//   tbl_name = "t"
+//   rootpage = -4
+//   sql = "CREATE INDEX idx_t_v ON t(v)"
+//
+// returns Some(MVTableId(-4)).
+//
+// A normal checkpointed schema row with rootpage = 7 returns None, because
+// this fix only concerns never-checkpointed transient B-trees.
+fn uncheckpointed_schema_btree_id(row_version: &RowVersion) -> Option<MVTableId> {
+    if row_version.row.id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+        return None;
+    }
+
+    let payload = row_version.row.payload();
+    if payload.is_empty() {
+        return None;
+    }
+
+    let record = ImmutableRecord::from_bin_record(payload.to_vec());
+    let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
+        return None;
+    };
+    if !matches!(row_type.as_str(), "table" | "index") {
+        return None;
+    }
+
+    let Some(ValueRef::Numeric(Numeric::Integer(root_page))) = record.get_value_opt(3) else {
+        return None;
+    };
+    if root_page < 0 {
+        Some(MVTableId::from(root_page))
+    } else {
+        None
+    }
+}
+
+// Track whether this transaction's uncheckpointed schema B-tree survives commit.
+//
+// Example:
+//
+//   BEGIN;
+//   CREATE INDEX idx_t_v ON t(v); -- sqlite_schema.rootpage = -4
+//   DROP INDEX idx_t_v;
+//   COMMIT;
+//
+// The index schema row has begin=TxID(tx_id) and end=TxID(tx_id), so -4 is added
+// to created_deleted_btree_ids. Later in BuildLogRecord, index content rows with
+// table_id -4 are skipped because the B-tree has no surviving schema row.
+//
+// For a metadata rewrite that keeps the same B-tree alive, such as:
+//
+//   BEGIN;
+//   CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); -- rootpage = -3
+//   ALTER TABLE t RENAME TO t2;
+//   COMMIT;
+//
+// one schema version for -3 may be created and ended, while another same-tx
+// schema version for -3 survives. That puts -3 in created_live_btree_ids too,
+// preventing data rows for the surviving B-tree from being skipped.
+fn track_schema_btree_lifetime(
+    tx_id: TxID,
+    row_version: &RowVersion,
+    created_deleted_btree_ids: &mut HashSet<MVTableId>,
+    created_live_btree_ids: &mut HashSet<MVTableId>,
+) {
+    let Some(btree_id) = uncheckpointed_schema_btree_id(row_version) else {
+        return;
+    };
+    if !version_begin_is_tx(row_version, tx_id) {
+        return;
+    }
+    if version_end_is_tx(row_version, tx_id) {
+        created_deleted_btree_ids.insert(btree_id);
+    } else {
+        created_live_btree_ids.insert(btree_id);
+    }
 }
 
 /// Iteration state for the chunked `RewriteLiveVersions` step.
@@ -1602,15 +1703,54 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             Some(committed)
         };
 
-        let collect_versions = |row_versions: &Arc<RwLock<Vec<RowVersion>>>,
-                                log_record: &mut LogRecord| {
-            for row_version in row_versions.read().iter() {
-                if let Some(mut committed_version) = our_committed_image(row_version) {
-                    canonicalize_table_id(&mut committed_version);
-                    mvcc_store.insert_version_raw(&mut log_record.row_versions, committed_version);
+        // During the schema pass, collect lifetime information only from
+        // sqlite_schema row-version chains already selected by `process`.
+        // For example, CREATE INDEX idx_t_v followed by DROP INDEX idx_t_v
+        // records the index rootpage/id in created_deleted_btree_ids before
+        // the later data pass sees any index content rows for that id.
+        let track_schema_btree_lifetimes =
+            |row_versions: &Arc<RwLock<Vec<RowVersion>>>,
+             created_deleted_btree_ids: &mut HashSet<MVTableId>,
+             created_live_btree_ids: &mut HashSet<MVTableId>| {
+                for row_version in row_versions.read().iter() {
+                    track_schema_btree_lifetime(
+                        tx_id,
+                        row_version,
+                        created_deleted_btree_ids,
+                        created_live_btree_ids,
+                    );
                 }
-            }
-        };
+            };
+
+        // Emit committed row versions for the current pass. The transient
+        // B-tree sets are complete before the data pass starts, so index rows
+        // created by CREATE INDEX idx_t_v and invalidated by DROP INDEX idx_t_v
+        // can be skipped even though DROP INDEX does not mark every index row
+        // with an end timestamp.
+        let collect_versions =
+            |row_versions: &Arc<RwLock<Vec<RowVersion>>>,
+             log_record: &mut LogRecord,
+             created_deleted_btree_ids: &HashSet<MVTableId>,
+             created_live_btree_ids: &HashSet<MVTableId>| {
+                for row_version in row_versions.read().iter() {
+                    if let Some(mut committed_version) = our_committed_image(row_version) {
+                        let btree_created_and_dropped = created_deleted_btree_ids
+                            .contains(&committed_version.row.id.table_id)
+                            && !created_live_btree_ids.contains(&committed_version.row.id.table_id);
+                        if btree_created_and_dropped {
+                            turso_assert!(
+                                !committed_version.btree_resident,
+                                "same-transaction created/dropped btree row cannot be btree-resident",
+                                { "row_id": &committed_version.row.id }
+                            );
+                            continue;
+                        }
+                        canonicalize_table_id(&mut committed_version);
+                        mvcc_store
+                            .insert_version_raw(&mut log_record.row_versions, committed_version);
+                    }
+                }
+            };
 
         // Process schema rows (sqlite_schema) before data rows so that during log
         // replay the table_id_to_rootpage map is populated before data row inserts
@@ -1630,7 +1770,19 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 !is_schema
             };
             if process {
-                collect_versions(row_versions, &mut ctx.log_record);
+                if ctx.schema_process {
+                    track_schema_btree_lifetimes(
+                        row_versions,
+                        &mut ctx.created_deleted_btree_ids,
+                        &mut ctx.created_live_btree_ids,
+                    );
+                }
+                collect_versions(
+                    row_versions,
+                    &mut ctx.log_record,
+                    &ctx.created_deleted_btree_ids,
+                    &ctx.created_live_btree_ids,
+                );
             }
             ctx.cursor += 1;
             iterations += 1;
@@ -2078,6 +2230,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     log_record,
                     cursor: 0,
                     schema_process: true,
+                    created_deleted_btree_ids: HashSet::default(),
+                    created_live_btree_ids: HashSet::default(),
                 });
                 return Ok(TransitionResult::Continue);
             }
