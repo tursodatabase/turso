@@ -2220,25 +2220,22 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 inject_transition_yield!(self, CommitYieldPoint::BeforeGlobalHeaderUpdate);
 
-                // Since we assign a commit timestamp and then we drive the commit to completion,
-                // it is totally possible for so an older transaction can finish after a newer one.
-                // In such case, we should not let older commit to set lower value than previous.
-                // This value is used in checkpointing as a watermark boundary, and an incorrect
-                // lower value can cause data loss / corruption.
-                let prev_committed_ts = mvcc_store
-                    .last_committed_tx_ts
-                    .fetch_max(*end_ts, Ordering::AcqRel);
-                // Guard the global_header write with the same monotonicity rule.
-                // Out-of-order completion (older end_ts finishing after a newer one) would
-                // otherwise regress global_header.schema_cookie below the latest committed
-                // value, breaking later `maybe_reparse_schema` cookie comparisons against
-                // `db.schema` and stranding readers in a redundant disk-reparse loop that
-                // takes commit deps on still-Preparing writers.
-                if prev_committed_ts <= *end_ts {
-                    mvcc_store
-                        .global_header
-                        .write()
-                        .replace(*tx_unlocked.header.read());
+                let tx_header = *tx_unlocked.header.read();
+                {
+                    // Hold the header lock across the watermark update and header
+                    // publish so the guard decision and replacement are serialized.
+                    let mut global_header = mvcc_store.global_header.write();
+                    // Since we assign a commit timestamp and then we drive the commit to completion,
+                    // it is totally possible for so an older transaction can finish after a newer one.
+                    // In such case, we should not let older commit to set lower value than previous.
+                    // This value is used in checkpointing as a watermark boundary, and an incorrect
+                    // lower value can cause data loss / corruption.
+                    let last_committed_ts = mvcc_store
+                        .last_committed_tx_ts
+                        .fetch_max(*end_ts, Ordering::AcqRel);
+                    if last_committed_ts <= *end_ts {
+                        global_header.replace(tx_header);
+                    }
                 }
                 if self.did_commit_schema_change {
                     mvcc_store
