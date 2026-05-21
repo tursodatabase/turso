@@ -9872,6 +9872,28 @@ pub fn op_new_rowid(
     })
 }
 
+fn read_autoincrement_max(state: &ProgramState, prev_largest_reg: usize) -> Result<Option<i64>> {
+    if prev_largest_reg == 0 {
+        return Ok(None);
+    }
+    match state.registers[prev_largest_reg].get_value() {
+        Value::Numeric(Numeric::Integer(value)) => Ok(Some(*value)),
+        Value::Null => Ok(Some(0)),
+        value => Err(LimboError::InternalError(format!(
+            "NewRowid P3 register must contain an integer or NULL, got {value:?}"
+        ))),
+    }
+}
+
+fn allocate_autoincrement_rowid(current_max: Option<i64>, autoinc_max: i64) -> Result<i64> {
+    if current_max == Some(i64::MAX) || autoinc_max == i64::MAX {
+        return Err(LimboError::DatabaseFull(
+            "database or disk is full".to_string(),
+        ));
+    }
+    Ok(current_max.unwrap_or(0).max(autoinc_max) + 1)
+}
+
 fn new_rowid_inner(
     program: &Program,
     state: &mut ProgramState,
@@ -9893,6 +9915,7 @@ fn new_rowid_inner(
     loop {
         match *state.active_op_state.new_rowid() {
             OpNewRowidState::Start => {
+                let autoinc_max = read_autoincrement_max(state, *prev_largest_reg)?;
                 if mv_store.is_some() {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
@@ -9908,12 +9931,23 @@ fn new_rowid_inner(
                                 new_rowid,
                                 prev_rowid,
                             } => {
+                                let mut autoinc_rowid = None;
+                                let new_rowid = if let Some(autoinc_max) = autoinc_max {
+                                    let chosen =
+                                        allocate_autoincrement_rowid(prev_rowid, autoinc_max)?;
+                                    if chosen > new_rowid {
+                                        mvcc_cursor.bump_max_rowid(chosen);
+                                    }
+                                    autoinc_rowid = Some(chosen);
+                                    chosen
+                                } else {
+                                    new_rowid
+                                };
                                 // Allocator already initialized — release lock immediately
                                 mvcc_cursor.end_new_rowid();
                                 state.registers[*rowid_reg].set_int(new_rowid);
-                                if *prev_largest_reg > 0 {
-                                    state.registers[*prev_largest_reg]
-                                        .set_int(prev_rowid.unwrap_or(0));
+                                if let Some(autoinc_rowid) = autoinc_rowid {
+                                    state.registers[*prev_largest_reg].set_int(autoinc_rowid);
                                 }
                                 *state.active_op_state.new_rowid() =
                                     OpNewRowidState::SeekingToLast {
@@ -9922,6 +9956,11 @@ fn new_rowid_inner(
                             }
                             NextRowidResult::FindRandom => {
                                 mvcc_cursor.end_new_rowid();
+                                if *prev_largest_reg > 0 {
+                                    return Err(LimboError::DatabaseFull(
+                                        "database or disk is full".to_string(),
+                                    ));
+                                }
                                 *state.active_op_state.new_rowid() =
                                     OpNewRowidState::GeneratingRandom { attempts: 0 };
                             }
@@ -9972,20 +10011,31 @@ fn new_rowid_inner(
                 };
 
                 if mv_store.is_some() {
+                    let autoinc_max = read_autoincrement_max(state, *prev_largest_reg)?;
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
                         // Initialize the monotonic counter from the btree max.
                         // The allocator lock is held, so no other thread can
                         // race between this read and initialize.
-                        mvcc_cursor.initialize_max_rowid(current_max)?;
+                        let seed_rowid = if let Some(autoinc_max) = autoinc_max {
+                            if current_max == Some(MAX_ROWID) || autoinc_max == MAX_ROWID {
+                                mvcc_cursor.end_new_rowid();
+                                return Err(LimboError::DatabaseFull(
+                                    "database or disk is full".to_string(),
+                                ));
+                            }
+                            Some(current_max.unwrap_or(0).max(autoinc_max))
+                        } else {
+                            current_max
+                        };
+                        mvcc_cursor.initialize_max_rowid(seed_rowid)?;
                         // Allocate the first rowid from the freshly initialized counter.
                         match mvcc_cursor.allocate_next_rowid() {
-                            Some((new_rowid, prev_rowid)) => {
+                            Some((new_rowid, _prev_rowid)) => {
                                 state.registers[*rowid_reg].set_int(new_rowid);
                                 if *prev_largest_reg > 0 {
-                                    state.registers[*prev_largest_reg]
-                                        .set_int(prev_rowid.unwrap_or(0));
+                                    state.registers[*prev_largest_reg].set_int(new_rowid);
                                 }
                                 tracing::trace!("new_rowid={}", new_rowid);
                                 *state.active_op_state.new_rowid() = OpNewRowidState::GoNext;
@@ -10002,8 +10052,13 @@ fn new_rowid_inner(
                 }
 
                 // Non-MVCC path (or ephemeral cursor in MVCC mode)
-                if *prev_largest_reg > 0 {
-                    state.registers[*prev_largest_reg].set_int(current_max.unwrap_or(0));
+                if let Some(autoinc_max) = read_autoincrement_max(state, *prev_largest_reg)? {
+                    let new_rowid = allocate_autoincrement_rowid(current_max, autoinc_max)?;
+                    state.registers[*rowid_reg].set_int(new_rowid);
+                    state.registers[*prev_largest_reg].set_int(new_rowid);
+                    tracing::trace!("new_rowid={}", new_rowid);
+                    *state.active_op_state.new_rowid() = OpNewRowidState::GoNext;
+                    continue;
                 }
                 match current_max {
                     Some(rowid) if rowid < MAX_ROWID => {
@@ -10026,6 +10081,11 @@ fn new_rowid_inner(
             }
 
             OpNewRowidState::GeneratingRandom { attempts } => {
+                if *prev_largest_reg > 0 {
+                    return Err(LimboError::DatabaseFull(
+                        "database or disk is full".to_string(),
+                    ));
+                }
                 if attempts >= MAX_ATTEMPTS {
                     return Err(LimboError::DatabaseFull("Unable to find an unused rowid after 100 attempts - database is probably full".to_string()));
                 }

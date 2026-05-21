@@ -491,6 +491,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         allocator.get_next_rowid()
     }
 
+    pub fn bump_max_rowid(&self, rowid: i64) {
+        let allocator = self.db.get_rowid_allocator(&self.table_id);
+        allocator.insert_row_id_maybe_update(rowid);
+    }
+
     pub fn end_new_rowid(&mut self) {
         tracing::trace!(
             "end_new_rowid creating_new_rowid={}",

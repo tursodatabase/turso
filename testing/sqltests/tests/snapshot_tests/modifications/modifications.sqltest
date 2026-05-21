@@ -68,11 +68,23 @@ setup schema {
     CREATE INDEX idx_inventory_warehouse ON inventory(warehouse);
 }
 
+setup autoincrement {
+    CREATE TABLE t (
+        a INTEGER PRIMARY KEY AUTOINCREMENT,
+        b
+    );
+}
+
 # INSERT single row - VALUES clause
 @setup schema
 snapshot insert-single-row {
     INSERT INTO products (id, name, price, quantity, category)
     VALUES (1, 'Widget', 19.99, 100, 'Electronics');
+}
+
+@setup autoincrement
+snapshot insert-autoincrement-generated-rowid {
+    INSERT INTO t(b) VALUES (1);
 }
 
 # INSERT multiple rows - batch insert
