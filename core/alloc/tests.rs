@@ -44,7 +44,7 @@ fn try_extend_accepts_iterators_without_upper_bounds() {
 
 #[test]
 fn hash_map_try_insert_and_extend_reserve_before_mutation() {
-    let mut values: HashMap<&str, usize> = TursoAllocExt::new();
+    let mut values: HashMap<&str, usize> = HashMap::default();
 
     assert_eq!(
         TursoHashMapExt::try_insert(&mut values, "one", 1).unwrap(),
@@ -63,7 +63,7 @@ fn hash_map_try_insert_and_extend_reserve_before_mutation() {
 
 #[test]
 fn hash_set_try_insert_and_extend_reserve_before_mutation() {
-    let mut values: HashSet<usize> = TursoAllocExt::new();
+    let mut values: HashSet<usize> = HashSet::default();
 
     assert!(TursoHashSetExt::try_insert(&mut values, 1).unwrap());
     assert!(!TursoHashSetExt::try_insert(&mut values, 1).unwrap());
@@ -105,6 +105,15 @@ fn binary_heap_try_push_and_extend_reserve_before_mutation() {
 #[test]
 fn iterator_try_collect_builds_turso_vec() {
     let values: Vec<_> = [1, 2, 3].into_iter().try_collect().unwrap();
+
+    assert_eq!(values.as_slice(), &[1, 2, 3]);
+}
+
+#[test]
+fn try_extend_extends_existing_collection() {
+    let mut values = try_vec![1].unwrap();
+
+    values.try_extend([2, 3]).unwrap();
 
     assert_eq!(values.as_slice(), &[1, 2, 3]);
 }
@@ -197,6 +206,51 @@ fn iterator_try_collect_accepts_try_vec_results() {
 
     assert_eq!(values[0].as_slice(), &[false]);
     assert_eq!(values[1].as_slice(), &[false, false]);
+}
+
+#[test]
+fn tuple_try_extend_extends_both_collections() {
+    let mut values: (Vec<_>, VecDeque<_>) = (Vec::new(), VecDeque::new());
+
+    values
+        .try_extend([(1, "one"), (2, "two"), (3, "three")])
+        .unwrap();
+
+    assert_eq!(values.0.as_slice(), &[1, 2, 3]);
+    assert_eq!(
+        values.1.into_iter().collect::<std::vec::Vec<_>>(),
+        ["one", "two", "three"]
+    );
+}
+
+#[test]
+fn tuple_try_collect_builds_three_collections() {
+    let (numbers, words, flags): (Vec<_>, VecDeque<_>, Vec<_>) =
+        [(1, "one", true), (2, "two", false), (3, "three", true)]
+            .into_iter()
+            .try_collect()
+            .unwrap();
+
+    assert_eq!(numbers.as_slice(), &[1, 2, 3]);
+    assert_eq!(
+        words.into_iter().collect::<std::vec::Vec<_>>(),
+        ["one", "two", "three"]
+    );
+    assert_eq!(flags.as_slice(), &[true, false, true]);
+}
+
+#[test]
+fn iterator_try_unzip_builds_turso_collections() {
+    let (numbers, words): (Vec<_>, VecDeque<_>) = [(1, "one"), (2, "two"), (3, "three")]
+        .into_iter()
+        .try_unzip()
+        .unwrap();
+
+    assert_eq!(numbers.as_slice(), &[1, 2, 3]);
+    assert_eq!(
+        words.into_iter().collect::<std::vec::Vec<_>>(),
+        ["one", "two", "three"]
+    );
 }
 
 #[test]

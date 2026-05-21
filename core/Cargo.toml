@@ -195,6 +195,10 @@ harness = false
 required-features = ["bench"]
 
 [[bench]]
+name = "alloc_collections"
+harness = false
+
+[[bench]]
 name = "hash_spill_benchmark"
 harness = false
 required-features = ["bench"]

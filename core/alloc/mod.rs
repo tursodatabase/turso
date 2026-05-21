@@ -1,8 +1,7 @@
 //! Turso-owned allocation namespace.
 //!
-//! Stable builds use `allocator-api2` where it has allocator-aware types and
-//! fall back to `std` for collections that do not have stable allocator-aware
-//! equivalents. Builds compiled with `--cfg nightly` use Rust's unstable
+//! Stable builds use `std` collections where allocator parameters are not
+//! available. Builds compiled with `--cfg nightly` use Rust's unstable
 //! `allocator_api` collection parameters.
 
 use std::fmt;
@@ -54,7 +53,7 @@ pub type Box<T> = allocator_api2::boxed::Box<T, TursoAllocator>;
 pub type Box<T> = std::boxed::Box<T, TursoAllocator>;
 
 #[cfg(not(nightly))]
-pub type Vec<T> = allocator_api2::vec::Vec<T, TursoAllocator>;
+pub type Vec<T> = std::vec::Vec<T>;
 #[cfg(nightly)]
 pub type Vec<T> = std::vec::Vec<T, TursoAllocator>;
 
