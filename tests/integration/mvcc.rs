@@ -1006,6 +1006,37 @@ fn test_create_drop_index_same_tx_recover(db: TempDatabase) -> anyhow::Result<()
     Ok(())
 }
 
+/// Same-tx CREATE INDEX + DROP INDEX followed by recovery and a checkpoint.
+/// Replay must not turn the transient sqlite_schema row into a durable delete
+/// for a row that was never checkpointed to the btree.
+#[turso_macros::test]
+fn test_create_drop_index_same_tx_recover_then_checkpoint(db: TempDatabase) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        conn.execute("pragma journal_mode = 'mvcc'")?;
+        conn.execute("create table t(id integer primary key, v text)")?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+        conn.execute("begin")?;
+        conn.execute("create index idx_t_v on t(v)")?;
+        conn.execute("drop index idx_t_v")?;
+        conn.execute("commit")?;
+    }
+    drop(db);
+
+    let db = Database::open_file(io, path.to_str().unwrap())?;
+    let conn = db.connect()?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    let rows: Vec<(i64,)> = conn.exec_rows("select count(*) from t");
+    assert_eq!(rows, vec![(0,)]);
+
+    Ok(())
+}
+
 /// Same-tx create + insert + drop: data rows reference a table_id whose schema
 /// entry is created and destroyed in the same transaction.
 #[turso_macros::test]
@@ -1126,6 +1157,53 @@ fn test_mvcc_update_btree_only_row_after_truncate_checkpoint(
 
     let rows: Vec<(String, i64)> = conn.exec_rows("SELECT key, length(value) FROM quint_corrupt");
     assert_eq!(rows, vec![("k0".to_string(), 32)]);
+
+    Ok(())
+}
+
+/// Upserting then deleting a B-tree-resident row in one transaction must log the
+/// delete, otherwise recovery resurrects the old pager row.
+#[turso_macros::test]
+fn test_mvcc_upsert_then_delete_btree_resident_row_recover(db: TempDatabase) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        conn.pragma_update("journal_mode", "'mvcc'")?;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+        conn.execute("INSERT INTO t VALUES (1, 'original')")?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    }
+    drop(db);
+
+    {
+        let db = Database::open_file(io.clone(), path.to_str().unwrap())?;
+        let conn = db.connect()?;
+        conn.pragma_update("journal_mode", "'mvcc'")?;
+        let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t");
+        assert_eq!(rows, vec![(1, "original".to_string())]);
+        conn.execute("BEGIN")?;
+        conn.execute(
+            "INSERT INTO t VALUES (1, 'updated') \
+             ON CONFLICT(id) DO UPDATE SET v = excluded.v",
+        )?;
+        conn.execute("DELETE FROM t WHERE id = 1")?;
+        conn.execute("COMMIT")?;
+    }
+
+    {
+        let db = Database::open_file(io.clone(), path.to_str().unwrap())?;
+        let conn = db.connect()?;
+        let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t");
+        assert_eq!(rows, Vec::<(i64, String)>::new());
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    }
+
+    let db = Database::open_file(io, path.to_str().unwrap())?;
+    let conn = db.connect()?;
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t");
+    assert_eq!(rows, Vec::<(i64, String)>::new());
 
     Ok(())
 }
