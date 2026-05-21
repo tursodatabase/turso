@@ -71,8 +71,7 @@ class JDBC4StatementTest {
     try (JDBC4Connection connection = new JDBC4Connection(url, filePath, properties)) {
       execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB);");
       execute(
-          connection,
-          "INSERT INTO t SELECT value, randomblob(4096) FROM generate_series(1, 64);");
+          connection, "INSERT INTO t SELECT value, randomblob(4096) FROM generate_series(1, 64);");
       execute(connection, "DELETE FROM t WHERE id > 8;");
 
       drainRows(connection, "PRAGMA wal_checkpoint(TRUNCATE);");
