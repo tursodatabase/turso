@@ -1041,7 +1041,10 @@ pub(crate) enum CommitYieldPoint {
     /// `LogRecordPrepared` to bracket the BuildLogRecord chunked yields.
     BuildLogRecordStart,
     LogRecordPrepared,
-    BeforeCommittedTimestampWatermarkUpdate,
+    /// Fires after commit dependencies are released and the commit lock is
+    /// dropped, but before publishing the cached global header / committed
+    /// timestamp watermark.
+    BeforeGlobalHeaderUpdate,
     BeforeFinishCommittedTx,
     /// Boundary right after `remove_tx` runs but before the connection cache
     /// is cleared by the caller at vdbe/mod.rs. Used for failure injection
@@ -2215,10 +2218,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 mvcc_store.unlock_commit_lock_if_held(tx_unlocked);
 
-                inject_transition_yield!(
-                    self,
-                    CommitYieldPoint::BeforeCommittedTimestampWatermarkUpdate
-                );
+                inject_transition_yield!(self, CommitYieldPoint::BeforeGlobalHeaderUpdate);
 
                 // Since we assign a commit timestamp and then we drive the commit to completion,
                 // it is totally possible for so an older transaction can finish after a newer one.
