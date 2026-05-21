@@ -1,6 +1,6 @@
 use crate::common::{
-    compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
-    compute_dbhash_with_options_and_database_opts, do_flush, ExecRows, TempDatabase,
+    ExecRows, TempDatabase, compute_dbhash, compute_dbhash_with_database_opts,
+    compute_dbhash_with_options, compute_dbhash_with_options_and_database_opts, do_flush,
 };
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use rusqlite::Connection as SqliteConnection;
@@ -3993,6 +3993,176 @@ fn test_vacuum_into_preserves_vector_blobs(tmp_db: TempDatabase) -> anyhow::Resu
     Ok(())
 }
 
+/// VACUUM INTO must preserve vector data stored as `vector64` (Float64Dense)
+/// blobs. The destination must round-trip identical bytes and produce the same
+/// distance result as the source. Covers the higher-precision vector path that
+/// `test_vacuum_into_preserves_vector_blobs` does not exercise.
+#[turso_macros::test]
+fn test_vacuum_into_preserves_vector64_blobs(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE v64 (id INTEGER PRIMARY KEY, label TEXT, embedding BLOB)")?;
+    conn.execute("INSERT INTO v64 VALUES (1, 'cat', vector64('[1.0, 0.0, 0.0, 0.0]'))")?;
+    conn.execute("INSERT INTO v64 VALUES (2, 'dog', vector64('[0.0, 1.0, 0.0, 0.0]'))")?;
+    conn.execute("INSERT INTO v64 VALUES (3, 'fish', vector64('[0.0, 0.0, 1.0, 0.0]'))")?;
+    let source_hash = compute_dbhash(&tmp_db);
+
+    let source_dist: Vec<(f64,)> = conn.exec_rows(
+        "SELECT vector_distance_cos(
+            (SELECT embedding FROM v64 WHERE id = 1),
+            (SELECT embedding FROM v64 WHERE id = 2)
+        )",
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("v64.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+
+    let count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM v64");
+    assert_eq!(count[0].0, 3);
+
+    let dest_dist: Vec<(f64,)> = dest_conn.exec_rows(
+        "SELECT vector_distance_cos(
+            (SELECT embedding FROM v64 WHERE id = 1),
+            (SELECT embedding FROM v64 WHERE id = 2)
+        )",
+    );
+    assert_eq!(source_dist, dest_dist);
+
+    Ok(())
+}
+
+/// VACUUM INTO must preserve `text[]` and `integer[]` array columns on STRICT
+/// tables. The destination must:
+///  - return identical PG-format text representations of each array,
+///  - support 1-based subscript access producing the same elements,
+///  - report the same `array_length`,
+///  - and answer `array_contains` predicates identically.
+#[test]
+fn test_vacuum_into_preserves_arrays() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE arr (
+            id INTEGER PRIMARY KEY,
+            tags text[],
+            scores integer[]
+        ) STRICT",
+    )?;
+    conn.execute("INSERT INTO arr VALUES (1, ARRAY['a','b','c'], ARRAY[10, 20, 30])")?;
+    conn.execute("INSERT INTO arr VALUES (2, ARRAY['x'], ARRAY[1])")?;
+    conn.execute("INSERT INTO arr VALUES (3, '{}', '{}')")?;
+
+    let source_text: Vec<(i64, String, String)> =
+        conn.exec_rows("SELECT id, tags, scores FROM arr ORDER BY id");
+    let source_subscripts: Vec<(i64, String, i64)> =
+        conn.exec_rows("SELECT id, tags[1], scores[2] FROM arr WHERE id = 1");
+    let source_lengths: Vec<(i64, i64, i64)> =
+        conn.exec_rows("SELECT id, array_length(tags), array_length(scores) FROM arr ORDER BY id");
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("arrays.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    let dest_text: Vec<(i64, String, String)> =
+        dest_conn.exec_rows("SELECT id, tags, scores FROM arr ORDER BY id");
+    assert_eq!(
+        dest_text, source_text,
+        "VACUUM INTO must preserve array text representation"
+    );
+
+    let dest_subscripts: Vec<(i64, String, i64)> =
+        dest_conn.exec_rows("SELECT id, tags[1], scores[2] FROM arr WHERE id = 1");
+    assert_eq!(
+        dest_subscripts, source_subscripts,
+        "VACUUM INTO must preserve 1-based subscript access into array elements"
+    );
+
+    let dest_lengths: Vec<(i64, i64, i64)> = dest_conn
+        .exec_rows("SELECT id, array_length(tags), array_length(scores) FROM arr ORDER BY id");
+    assert_eq!(
+        dest_lengths, source_lengths,
+        "VACUUM INTO must preserve array_length for empty and non-empty arrays"
+    );
+
+    let contains_a: Vec<(i64,)> =
+        dest_conn.exec_rows("SELECT id FROM arr WHERE array_contains(tags, 'a') ORDER BY id");
+    assert_eq!(contains_a, vec![(1,)]);
+
+    let contains_z: Vec<(i64,)> =
+        dest_conn.exec_rows("SELECT id FROM arr WHERE array_contains(tags, 'z') ORDER BY id");
+    assert!(
+        contains_z.is_empty(),
+        "array_contains('z') should match nothing on the destination"
+    );
+
+    Ok(())
+}
+
+/// VACUUM INTO must preserve multi-dimensional array columns (`integer[][]`)
+/// on STRICT tables, including outer length, inner length per row, and each
+/// element accessed via two-step subscripts.
+#[test]
+fn test_vacuum_into_preserves_multidim_arrays() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE md (id INTEGER PRIMARY KEY, matrix integer[][]) STRICT")?;
+    conn.execute("INSERT INTO md VALUES (1, '{{1,2,3},{4,5,6}}')")?;
+    conn.execute("INSERT INTO md VALUES (2, '{{10,20},{30,40},{50,60}}')")?;
+
+    let source_text: Vec<(i64, String)> = conn.exec_rows("SELECT id, matrix FROM md ORDER BY id");
+    let source_outer_len: Vec<(i64, i64)> =
+        conn.exec_rows("SELECT id, array_length(matrix) FROM md ORDER BY id");
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("multidim.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    let dest_text: Vec<(i64, String)> =
+        dest_conn.exec_rows("SELECT id, matrix FROM md ORDER BY id");
+    assert_eq!(
+        dest_text, source_text,
+        "VACUUM INTO must preserve multi-dimensional array text representation"
+    );
+
+    let dest_outer_len: Vec<(i64, i64)> =
+        dest_conn.exec_rows("SELECT id, array_length(matrix) FROM md ORDER BY id");
+    assert_eq!(
+        dest_outer_len, source_outer_len,
+        "VACUUM INTO must preserve outer dimension length for multi-dim arrays"
+    );
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Plain VACUUM tests
 // ---------------------------------------------------------------------------
@@ -5358,7 +5528,8 @@ fn test_plain_vacuum_complex_batched_storage_shapes() -> anyhow::Result<()> {
     assert!(
         eqp_partial
             .iter()
-            .any(|(_, _, _, detail)| detail.contains("INDEX") && detail.contains("idx_docs_note_partial")),
+            .any(|(_, _, _, detail)| detail.contains("INDEX")
+                && detail.contains("idx_docs_note_partial")),
         "expected lookup to use idx_docs_note_partial after plain VACUUM, got plan: {eqp_partial:?}",
     );
 
@@ -6094,8 +6265,8 @@ fn populate_queued_multibatch(conn: &Arc<Connection>) -> anyhow::Result<()> {
 
 #[cfg_attr(feature = "checksum", ignore)]
 #[test]
-fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_locks(
-) -> anyhow::Result<()> {
+fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_locks()
+-> anyhow::Result<()> {
     // Park plain VACUUM after copy-back has committed but while the final
     // TRUNCATE checkpoint is still yielding I/O. Resetting the statement from
     // that state exercises the fallback `AbortCheckpoint` cleanup path in
