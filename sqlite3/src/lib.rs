@@ -1524,9 +1524,11 @@ pub unsafe extern "C" fn sqlite3_expanded_sql(_stmt: *mut sqlite3_stmt) -> *mut 
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_data_count(stmt: *mut sqlite3_stmt) -> ffi::c_int {
+    if stmt.is_null() {
+        return 0;
+    }
     let stmt = &*stmt;
-    let row = stmt.stmt.row().unwrap();
-    row.len() as ffi::c_int
+    stmt.stmt.row().map_or(0, |row| row.len() as ffi::c_int)
 }
 
 #[no_mangle]

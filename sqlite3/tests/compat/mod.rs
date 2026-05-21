@@ -98,6 +98,7 @@ extern "C" {
     fn sqlite3_column_bytes(stmt: *mut sqlite3_stmt, idx: i32) -> i64;
     fn sqlite3_column_blob(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_void;
     fn sqlite3_column_type(stmt: *mut sqlite3_stmt, idx: i32) -> i32;
+    fn sqlite3_data_count(stmt: *mut sqlite3_stmt) -> i32;
     fn sqlite3_column_decltype(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_char;
     fn sqlite3_get_autocommit(db: *mut sqlite3) -> i32;
     fn sqlite3_changes(db: *mut sqlite3) -> i32;
@@ -946,6 +947,30 @@ mod tests {
             assert_eq!(sqlite3_column_type(stmt, 2), SQLITE_TEXT);
             assert_eq!(sqlite3_column_type(stmt, 3), SQLITE_BLOB);
             assert_eq!(sqlite3_column_type(stmt, 4), SQLITE_NULL);
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_data_count_row_and_done_states() {
+        unsafe {
+            assert_eq!(sqlite3_data_count(ptr::null_mut()), 0);
+
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, c"SELECT 1, 2".as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_data_count(stmt), 0);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_data_count(stmt), 2);
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_data_count(stmt), 0);
 
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
