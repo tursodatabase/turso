@@ -3391,7 +3391,7 @@ pub fn op_transaction_inner(
                 // shared schema, force reprepare before opening any transaction state.
                 if *db == crate::MAIN_DB_ID
                     && mv_store.is_some()
-                    && conn.has_stale_mvcc_shared_schema_before_transaction()
+                    && conn.mvcc_schema_requires_reprepare_before_tx()
                 {
                     tracing::debug!(
                         "MVCC shared schema changed without a schema-cookie change; force reprepare"
@@ -3564,7 +3564,7 @@ pub fn op_transaction_inner(
                                 Ok(tx_id) => {
                                     // Check again in case checkpoint published roots after the
                                     // previous check and before this transaction was protected.
-                                    if conn.has_stale_mvcc_shared_schema_before_transaction() {
+                                    if conn.mvcc_schema_requires_reprepare_before_tx() {
                                         tracing::debug!(
                                             "MVCC shared schema changed while starting transaction; force reprepare"
                                         );

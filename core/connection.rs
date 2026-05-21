@@ -1330,9 +1330,14 @@ impl Connection {
         }
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
+        // MVCC checkpoint can publish physical btree roots into the shared
+        // schema without changing SQLite's schema cookie. If this connection
+        // still has the older schema snapshot, prepared statements must be
+        // invalidated and recompiled with the published roots.
         if self.has_no_open_transaction_state()
             && (current_schema.schema_version != schema.schema_version
-                || self.is_same_version_mvcc_shared_schema_replacement(&current_schema, &schema))
+                || self
+                    .has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema))
         {
             *self.schema.write() = schema.clone();
             self.bump_prepare_context_generation();
@@ -1345,7 +1350,7 @@ impl Connection {
             && self.next_attached_mv_tx().is_none()
     }
 
-    fn is_same_version_mvcc_shared_schema_replacement(
+    fn has_mvcc_schema_snapshot_changed_with_same_version(
         &self,
         current_schema: &Arc<Schema>,
         schema: &Arc<Schema>,
@@ -1355,13 +1360,13 @@ impl Connection {
             && !Arc::ptr_eq(current_schema, schema)
     }
 
-    pub(crate) fn has_stale_mvcc_shared_schema_before_transaction(&self) -> bool {
+    pub(crate) fn mvcc_schema_requires_reprepare_before_tx(&self) -> bool {
         if !self.has_no_open_transaction_state() {
             return false;
         }
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
-        self.is_same_version_mvcc_shared_schema_replacement(&current_schema, &schema)
+        self.has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema)
     }
 
     pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {
@@ -1369,7 +1374,8 @@ impl Connection {
         let schema = self.db.schema.lock().clone();
         if current_schema.schema_version < schema.schema_version
             || (self.has_no_open_transaction_state()
-                && self.is_same_version_mvcc_shared_schema_replacement(&current_schema, &schema))
+                && self
+                    .has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema))
         {
             *self.schema.write() = schema;
             self.bump_prepare_context_generation();
