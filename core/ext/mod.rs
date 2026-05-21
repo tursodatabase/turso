@@ -27,7 +27,8 @@ use std::{
     sync::Arc,
 };
 use turso_ext::{
-    ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind, VTabModuleImpl,
+    ContextDestructor, ContextScalarFunction, ContextValueDestructor, ExtensionApi,
+    InitAggFunction, ResultCode, ScalarFunction, VTabKind, VTabModuleImpl,
 };
 pub use turso_ext::{FinalizeFunction, StepFunction, Value as ExtValue, ValueType as ExtValueType};
 pub use vtab_xconnect::{execute, prepare_stmt};
@@ -113,6 +114,69 @@ pub(crate) unsafe extern "C" fn register_scalar_function(
             name_str.clone(),
             Arc::new(ExternalFunc::new_scalar(name_str, func)),
         );
+        if !ext_ctx.prepare_context_generation.is_null() {
+            (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
+        }
+    }
+    ResultCode::OK
+}
+
+pub(crate) unsafe extern "C" fn register_context_scalar_function(
+    ctx: *mut c_void,
+    name: *const c_char,
+    argc: i32,
+    deterministic: bool,
+    context: usize,
+    callback: ContextScalarFunction,
+    context_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ContextValueDestructor>,
+) -> ResultCode {
+    if ctx.is_null() || name.is_null() || argc < -1 {
+        return ResultCode::InvalidArgs;
+    }
+    let c_str = unsafe { CStr::from_ptr(name) };
+    let name_str = match c_str.to_str() {
+        Ok(s) => crate::util::normalize_ident(s),
+        Err(_) => return ResultCode::InvalidArgs,
+    };
+    let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
+    unsafe {
+        (*ext_ctx.syms).functions.insert(
+            name_str.clone(),
+            Arc::new(ExternalFunc::new_context_scalar(
+                name_str,
+                argc,
+                deterministic,
+                context,
+                callback,
+                context_destructor,
+                value_destructor,
+            )),
+        );
+        if !ext_ctx.prepare_context_generation.is_null() {
+            (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
+        }
+    }
+    ResultCode::OK
+}
+
+pub(crate) unsafe extern "C" fn unregister_function(
+    ctx: *mut c_void,
+    name: *const c_char,
+) -> ResultCode {
+    if ctx.is_null() || name.is_null() {
+        return ResultCode::InvalidArgs;
+    }
+    let c_str = unsafe { CStr::from_ptr(name) };
+    let name_str = match c_str.to_str() {
+        Ok(s) => crate::util::normalize_ident(s),
+        Err(_) => return ResultCode::InvalidArgs,
+    };
+    let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
+    unsafe {
+        if (*ext_ctx.syms).functions.remove(&name_str).is_none() {
+            return ResultCode::NotFound;
+        }
         if !ext_ctx.prepare_context_generation.is_null() {
             (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
         }
@@ -212,7 +276,9 @@ impl Database {
         let mut ext_api = ExtensionApi {
             ctx: ctx as *mut c_void,
             register_scalar_function,
+            register_context_scalar_function,
             register_aggregate_function,
+            unregister_function,
             register_vtab_module,
             #[cfg(feature = "fs")]
             vfs_interface: turso_ext::VfsInterface {
@@ -273,7 +339,9 @@ impl Connection {
         ExtensionApi {
             ctx,
             register_scalar_function,
+            register_context_scalar_function,
             register_aggregate_function,
+            unregister_function,
             register_vtab_module,
             #[cfg(feature = "fs")]
             vfs_interface: turso_ext::VfsInterface {

@@ -128,10 +128,6 @@ use util::parse_schema_rows;
 pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use error::{io_error, CompletionError, LimboError};
-pub use function::{
-    ContextDestructor, ContextScalarFunction, ContextValue, ContextValueBytes, ContextValueData,
-    ContextValueDestructor, ContextValueType,
-};
 #[cfg(all(feature = "fs", target_family = "unix", not(miri)))]
 pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring", not(miri)))]

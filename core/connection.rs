@@ -2934,43 +2934,6 @@ impl Connection {
             .collect()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn register_external_scalar_function(
-        &self,
-        name: String,
-        argc: i32,
-        deterministic: bool,
-        context: usize,
-        callback: crate::ContextScalarFunction,
-        context_destructor: Option<crate::ContextDestructor>,
-        value_destructor: Option<crate::ContextValueDestructor>,
-    ) {
-        assert!(
-            argc >= -1,
-            "managed scalar argument count must be -1 (variadic) or non-negative"
-        );
-        let normalized_name = crate::util::normalize_ident(&name);
-        self.syms.write().functions.insert(
-            normalized_name.clone(),
-            Arc::new(function::ExternalFunc::new_context_scalar(
-                normalized_name,
-                argc,
-                deterministic,
-                context,
-                callback,
-                context_destructor,
-                value_destructor,
-            )),
-        );
-        self.bump_prepare_context_generation();
-    }
-
-    pub fn unregister_external_function(&self, name: &str) {
-        let normalized_name = crate::util::normalize_ident(name);
-        self.syms.write().functions.remove(&normalized_name);
-        self.bump_prepare_context_generation();
-    }
-
     pub(crate) fn database_ptr(&self) -> usize {
         Arc::as_ptr(&self.db) as usize
     }

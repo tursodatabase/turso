@@ -8213,9 +8213,9 @@ pub fn op_function(
                 } else {
                     ext_values.as_ptr()
                 };
-                let mut result = crate::function::ContextValue::null();
+                let mut result = turso_ext::ContextValue::null();
                 unsafe { callback(context, arg_count as i32, argv_ptr, &mut result) };
-                let value = result.into_value();
+                let value = crate::function::context_value_to_value(result);
                 if let Some(value_destructor) = value_destructor {
                     unsafe { value_destructor(&mut result) };
                 }

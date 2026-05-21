@@ -1,14 +1,19 @@
 use crate::common::{limbo_exec_rows, ExecRows, TempDatabase};
 use rusqlite::types::Value as SqliteValue;
 use serial_test::serial;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering as AtomicOrdering},
-    Arc,
+use std::{
+    ffi::CString,
+    sync::{
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        Arc,
+    },
 };
-use turso_core::{
-    ContextValue, ContextValueBytes, ContextValueData, ContextValueType, LimboError, StepResult,
+use turso_core::{Connection, LimboError, StepResult};
+use turso_ext::{
+    ContextDestructor, ContextScalarFunction, ContextValue, ContextValueBytes, ContextValueData,
+    ContextValueDestructor, ContextValueType, ResultCode, Value as ExtValue,
+    ValueType as ExtValueType,
 };
-use turso_ext::{Value as ExtValue, ValueType as ExtValueType};
 
 #[turso_macros::test]
 fn sql_extension_loading_is_disabled_by_default(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -244,6 +249,49 @@ fn boxed_scalar_context(multiplier: i64, counters: Arc<CallbackCounters>) -> usi
     })) as usize
 }
 
+#[allow(clippy::too_many_arguments)]
+fn register_context_scalar(
+    conn: &Connection,
+    name: &str,
+    argc: i32,
+    deterministic: bool,
+    context: usize,
+    callback: ContextScalarFunction,
+    context_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ContextValueDestructor>,
+) -> anyhow::Result<()> {
+    let name = CString::new(name)?;
+    let api = unsafe { conn._build_turso_ext() };
+    let result = unsafe {
+        (api.register_context_scalar_function)(
+            api.ctx,
+            name.as_ptr(),
+            argc,
+            deterministic,
+            context,
+            callback,
+            context_destructor,
+            value_destructor,
+        )
+    };
+    unsafe { conn._free_extension_ctx(api) };
+    if result != ResultCode::OK {
+        anyhow::bail!("managed scalar registration failed: {result}");
+    }
+    Ok(())
+}
+
+fn unregister_extension_function(conn: &Connection, name: &str) -> anyhow::Result<()> {
+    let name = CString::new(name)?;
+    let api = unsafe { conn._build_turso_ext() };
+    let result = unsafe { (api.unregister_function)(api.ctx, name.as_ptr()) };
+    unsafe { conn._free_extension_ctx(api) };
+    if result != ResultCode::OK {
+        anyhow::bail!("extension function unregister failed: {result}");
+    }
+    Ok(())
+}
+
 #[turso_macros::test]
 #[serial]
 fn managed_scalar_callbacks_cover_fixed_args_metadata_and_invalidation(
@@ -252,15 +300,16 @@ fn managed_scalar_callbacks_cover_fixed_args_metadata_and_invalidation(
     let counters = Arc::new(CallbackCounters::default());
     let conn = tmp_db.connect_limbo();
 
-    conn.register_external_scalar_function(
-        "managed_score".to_string(),
+    register_context_scalar(
+        &conn,
+        "managed_score",
         5,
         true,
         boxed_scalar_context(1, counters.clone()),
         managed_score,
         Some(drop_scalar_context),
         None,
-    );
+    )?;
 
     let score: Vec<(i64,)> = conn.exec_rows("SELECT managed_score(2, 3.5, 'hi', x'010203', NULL)");
     assert_eq!(score, vec![(11,)]);
@@ -276,15 +325,16 @@ fn managed_scalar_callbacks_cover_fixed_args_metadata_and_invalidation(
     assert_ne!(managed_score_metadata.5 & 0x800, 0);
 
     let mut prepared = conn.prepare("SELECT managed_score(1, 2.0, 'a', x'00', NULL)")?;
-    conn.register_external_scalar_function(
-        "managed_score".to_string(),
+    register_context_scalar(
+        &conn,
+        "managed_score",
         5,
         true,
         boxed_scalar_context(10, counters.clone()),
         managed_score,
         Some(drop_scalar_context),
         None,
-    );
+    )?;
     match prepared.step()? {
         StepResult::Row => {}
         other => panic!("expected row from managed_score, got {other:?}"),
@@ -300,7 +350,7 @@ fn managed_scalar_callbacks_cover_fixed_args_metadata_and_invalidation(
     assert_eq!(counters.context_drops.load(AtomicOrdering::SeqCst), 1);
 
     assert!(conn.prepare("SELECT managed_score(1)").is_err());
-    conn.unregister_external_function("managed_score");
+    unregister_extension_function(&conn, "managed_score")?;
     let err = conn
         .prepare("SELECT managed_score(1, 2.0, 'a', x'00', NULL)")
         .unwrap_err();
@@ -319,15 +369,16 @@ fn managed_scalar_callbacks_convert_results_and_propagate_errors(
     let counters = Arc::new(CallbackCounters::default());
     let conn = tmp_db.connect_limbo();
 
-    conn.register_external_scalar_function(
-        "managed_result".to_string(),
+    register_context_scalar(
+        &conn,
+        "managed_result",
         1,
         false,
         boxed_scalar_context(1, counters.clone()),
         managed_result,
         Some(drop_scalar_context),
         Some(count_scalar_value_drop),
-    );
+    )?;
 
     assert_eq!(
         limbo_exec_rows(&conn, "SELECT managed_result('null')"),
@@ -349,7 +400,7 @@ fn managed_scalar_callbacks_convert_results_and_propagate_errors(
     assert!(err.to_string().contains("managed failure"));
     assert_eq!(SCALAR_VALUE_DROPS.load(AtomicOrdering::SeqCst), 5);
 
-    conn.unregister_external_function("managed_result");
+    unregister_extension_function(&conn, "managed_result")?;
     assert_eq!(counters.context_drops.load(AtomicOrdering::SeqCst), 1);
     assert_eq!(counters.calls.load(AtomicOrdering::SeqCst), 5);
     Ok(())
@@ -363,15 +414,16 @@ fn managed_scalar_variadic_callbacks_receive_callsite_arguments(
     let counters = Arc::new(CallbackCounters::default());
     let conn = tmp_db.connect_limbo();
 
-    conn.register_external_scalar_function(
-        "managed_variadic_score".to_string(),
+    register_context_scalar(
+        &conn,
+        "managed_variadic_score",
         -1,
         true,
         boxed_scalar_context(1, counters.clone()),
         managed_variadic_score,
         Some(drop_scalar_context),
         None,
-    );
+    )?;
 
     let score: Vec<(i64,)> =
         conn.exec_rows("SELECT managed_variadic_score(1, 3.5, 'A', x'7E57', NULL)");
@@ -380,7 +432,7 @@ fn managed_scalar_variadic_callbacks_receive_callsite_arguments(
     let no_args: Vec<(i64,)> = conn.exec_rows("SELECT managed_variadic_score()");
     assert_eq!(no_args, vec![(0,)]);
 
-    conn.unregister_external_function("managed_variadic_score");
+    unregister_extension_function(&conn, "managed_variadic_score")?;
     assert_eq!(counters.context_drops.load(AtomicOrdering::SeqCst), 1);
     assert_eq!(counters.calls.load(AtomicOrdering::SeqCst), 2);
     Ok(())

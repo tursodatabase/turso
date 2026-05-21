@@ -4,14 +4,18 @@ mod types;
 mod vfs_modules;
 mod vtabs;
 pub use functions::{
-    AggCtx, AggFunc, FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction,
+    AggCtx, AggFunc, ContextDestructor, ContextScalarFunction, ContextValueDestructor,
+    FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction,
 };
-use functions::{RegisterAggFn, RegisterScalarFn};
+use functions::{RegisterAggFn, RegisterContextScalarFn, RegisterScalarFn, UnregisterFunctionFn};
 use std::os::raw::c_void;
 #[cfg(feature = "vfs")]
 pub use turso_macros::VfsDerive;
 pub use turso_macros::{register_extension, scalar, AggregateDerive, VTabModuleDerive};
-pub use types::{ResultCode, StepResult, Value, ValueType};
+pub use types::{
+    ContextValue, ContextValueBytes, ContextValueData, ContextValueType, ResultCode, StepResult,
+    Value, ValueType,
+};
 #[cfg(feature = "vfs")]
 pub use vfs_modules::{
     BufferRef, Callback, IOCallback, RegisterVfsFn, SendPtr, VfsExtension, VfsFile, VfsFileImpl,
@@ -32,7 +36,9 @@ pub type ExtensionEntryPoint = unsafe extern "C" fn(api: *const ExtensionApi) ->
 pub struct ExtensionApi {
     pub ctx: *mut c_void,
     pub register_scalar_function: RegisterScalarFn,
+    pub register_context_scalar_function: RegisterContextScalarFn,
     pub register_aggregate_function: RegisterAggFn,
+    pub unregister_function: UnregisterFunctionFn,
     pub register_vtab_module: RegisterModuleFn,
     #[cfg(feature = "vfs")]
     pub vfs_interface: VfsInterface,

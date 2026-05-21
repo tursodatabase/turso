@@ -3,96 +3,46 @@ use std::fmt;
 use std::fmt::{Debug, Display};
 use strum::IntoEnumIterator;
 use turso_ext::{
-    FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction, Value as ExtValue,
+    ContextDestructor, ContextScalarFunction, ContextValue, ContextValueDestructor,
+    ContextValueType, FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction,
 };
 
 use crate::{LimboError, Value};
 
-pub type ContextScalarFunction = unsafe extern "C" fn(
-    context: usize,
-    argc: i32,
-    argv: *const ExtValue,
-    result: *mut ContextValue,
-);
-pub type ContextDestructor = unsafe extern "C" fn(context: usize);
-pub type ContextValueDestructor = unsafe extern "C" fn(result: *mut ContextValue);
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ContextValueType {
-    Null,
-    Integer,
-    Float,
-    Text,
-    Blob,
-    Error,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ContextValueBytes {
-    pub ptr: *const u8,
-    pub len: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union ContextValueData {
-    pub int: i64,
-    pub float: f64,
-    pub bytes: ContextValueBytes,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ContextValue {
-    pub value_type: ContextValueType,
-    pub value: ContextValueData,
-}
-
-impl ContextValue {
-    pub fn null() -> Self {
-        Self {
-            value_type: ContextValueType::Null,
-            value: ContextValueData { int: 0 },
+pub(crate) fn context_value_to_value(value: ContextValue) -> Result<Value, LimboError> {
+    // Text/blob/error payloads are callback-owned; copy them before the
+    // caller invokes the registered value destructor.
+    match value.value_type {
+        ContextValueType::Null => Ok(Value::Null),
+        ContextValueType::Integer => Ok(Value::from_i64(unsafe { value.value.int })),
+        ContextValueType::Float => Ok(Value::from_f64(unsafe { value.value.float })),
+        ContextValueType::Text => {
+            let bytes = unsafe { value.value.bytes };
+            if bytes.ptr.is_null() {
+                return Ok(Value::Null);
+            }
+            let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+            let text = std::str::from_utf8(slice)
+                .map_err(|err| LimboError::ExtensionError(err.to_string()))?;
+            Ok(Value::build_text(text.to_string()))
         }
-    }
-
-    pub fn into_value(self) -> Result<Value, LimboError> {
-        // Text/blob/error payloads are callback-owned; copy them before the
-        // caller invokes the registered value destructor.
-        match self.value_type {
-            ContextValueType::Null => Ok(Value::Null),
-            ContextValueType::Integer => Ok(Value::from_i64(unsafe { self.value.int })),
-            ContextValueType::Float => Ok(Value::from_f64(unsafe { self.value.float })),
-            ContextValueType::Text => {
-                let bytes = unsafe { self.value.bytes };
-                if bytes.ptr.is_null() {
-                    return Ok(Value::Null);
-                }
-                let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
-                let text = std::str::from_utf8(slice)
-                    .map_err(|err| LimboError::ExtensionError(err.to_string()))?;
-                Ok(Value::build_text(text.to_string()))
+        ContextValueType::Blob => {
+            let bytes = unsafe { value.value.bytes };
+            if bytes.ptr.is_null() {
+                return Ok(Value::Blob(Vec::new()));
             }
-            ContextValueType::Blob => {
-                let bytes = unsafe { self.value.bytes };
-                if bytes.ptr.is_null() {
-                    return Ok(Value::Blob(Vec::new()));
-                }
-                let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
-                Ok(Value::Blob(slice.to_vec()))
+            let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+            Ok(Value::Blob(slice.to_vec()))
+        }
+        ContextValueType::Error => {
+            let bytes = unsafe { value.value.bytes };
+            if bytes.ptr.is_null() {
+                return Err(LimboError::ExtensionError(String::new()));
             }
-            ContextValueType::Error => {
-                let bytes = unsafe { self.value.bytes };
-                if bytes.ptr.is_null() {
-                    return Err(LimboError::ExtensionError(String::new()));
-                }
-                let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
-                let message = std::str::from_utf8(slice)
-                    .map_err(|err| LimboError::ExtensionError(err.to_string()))?;
-                Err(LimboError::ExtensionError(message.to_string()))
-            }
+            let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+            let message = std::str::from_utf8(slice)
+                .map_err(|err| LimboError::ExtensionError(err.to_string()))?;
+            Err(LimboError::ExtensionError(message.to_string()))
         }
     }
 }
