@@ -159,6 +159,8 @@ void sqlite3_sleep(int _ms);
 
 int sqlite3_limit(sqlite3 *_db, int _id, int _new_value);
 
+void *sqlite3_malloc(int _n);
+
 void *sqlite3_malloc64(int _n);
 
 void sqlite3_free(void *_ptr);
@@ -198,6 +200,8 @@ int sqlite3_bind_double(sqlite3_stmt *_stmt, int _idx, double _val);
 int sqlite3_bind_text(sqlite3_stmt *_stmt, int _idx, const char *_text, int _len, void *_destroy);
 
 int sqlite3_bind_blob(sqlite3_stmt *_stmt, int _idx, const void *_blob, int _len, void *_destroy);
+
+int sqlite3_clear_bindings(sqlite3_stmt *_stmt);
 
 int sqlite3_column_type(sqlite3_stmt *_stmt, int _idx);
 
