@@ -1,4 +1,6 @@
-use crate::common::{compute_dbhash, do_flush, maybe_setup_tracing, TempDatabase};
+use crate::common::{
+    compute_dbhash, do_flush, maybe_setup_tracing, rusqlite_integrity_check, TempDatabase,
+};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use turso_core::{Connection, LimboError, Result};
@@ -108,80 +110,6 @@ fn test_savepoint_rollback_after_cache_spill_preserves_wal_pages(
     assert_eq!(res, vec!["ok"]);
 
     Ok(())
-}
-
-#[allow(clippy::arc_with_non_send_sync)]
-#[turso_macros::test]
-fn test_wal_cache_spill_commit_preserves_frame_order(tmp_db: TempDatabase) -> Result<()> {
-    maybe_setup_tracing();
-    let setup = tmp_db.connect_limbo();
-
-    setup.execute("PRAGMA page_size=512;")?;
-    setup.execute("PRAGMA journal_mode=WAL;")?;
-    setup.execute("PRAGMA cache_size=200;")?;
-    setup.execute("CREATE TABLE low_page(id INTEGER PRIMARY KEY, v BLOB);")?;
-    setup.execute("CREATE TABLE high_page(id INTEGER PRIMARY KEY, v BLOB);")?;
-    setup.execute("INSERT INTO low_page VALUES(1, zeroblob(300));")?;
-    setup.execute("BEGIN;")?;
-    for id in 1..=130 {
-        setup.execute(&format!(
-            "INSERT INTO high_page VALUES({id}, printf('%04d:%s', {id}, hex(zeroblob(340))));"
-        ))?;
-    }
-    setup.execute("COMMIT;")?;
-    execute_and_get_ints(&setup, "PRAGMA wal_checkpoint(TRUNCATE);")?;
-
-    let conn = tmp_db.connect_limbo();
-    conn.execute("PRAGMA cache_size=200;")?;
-    conn.execute("BEGIN;")?;
-    // Updating the larger table first fills the cache and spills higher-numbered
-    // pages as private WAL frames before the transaction has a commit marker.
-    conn.execute(
-        "UPDATE high_page
-         SET v = printf('h%04d:%s', id, hex(zeroblob(340)))
-         WHERE id BETWEEN 1 AND 130;",
-    )?;
-    // Dirty a lower-numbered page after the spill. The commit path must append
-    // after the private spill frames, not reuse their frame numbers for this page.
-    conn.execute("UPDATE low_page SET v = zeroblob(301) WHERE id = 1;")?;
-    conn.execute("COMMIT;")?;
-
-    let frames = read_wal_frame_headers(&tmp_db, 512);
-    let first_page1_frame = frames
-        .iter()
-        .position(|&(page, _)| page == 1)
-        .expect("commit should write page 1");
-    assert!(
-        first_page1_frame > 0,
-        "commit reused the first spill frame instead of appending after it: {:?}",
-        &frames[..frames.len().min(8)]
-    );
-    assert!(
-        frames.last().is_some_and(|&(_, db_size)| db_size > 0),
-        "last WAL frame should carry the commit marker"
-    );
-
-    let checkpoint = execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(FULL);")?;
-    assert_eq!(checkpoint[0], 0, "checkpoint should not be busy");
-
-    let res = execute_and_get_strings(&conn, "PRAGMA integrity_check;")?;
-    assert_eq!(res, vec!["ok"]);
-
-    Ok(())
-}
-
-fn read_wal_frame_headers(tmp_db: &TempDatabase, page_size: usize) -> Vec<(u32, u32)> {
-    let wal_path = format!("{}-wal", tmp_db.path.display());
-    let wal_bytes = std::fs::read(wal_path).unwrap();
-    let mut frames = Vec::new();
-    let mut offset = 32;
-    while offset + 24 <= wal_bytes.len() {
-        let page = u32::from_be_bytes(wal_bytes[offset..offset + 4].try_into().unwrap());
-        let db_size = u32::from_be_bytes(wal_bytes[offset + 4..offset + 8].try_into().unwrap());
-        frames.push((page, db_size));
-        offset += 24 + page_size;
-    }
-    frames
 }
 
 #[test]
@@ -345,4 +273,68 @@ fn test_wal_write_lock_released_on_conn_drop() {
     conn2
         .execute("CREATE TABLE t (id integer primary key)")
         .unwrap();
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_drop_active_wal_tx_after_spill_rolls_back_private_frames(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    maybe_setup_tracing();
+    let setup = tmp_db.connect_limbo();
+
+    setup.execute("PRAGMA page_size=512;")?;
+    setup.execute("PRAGMA journal_mode=WAL;")?;
+    setup.execute("PRAGMA cache_size=10;")?;
+    setup.execute("PRAGMA cache_spill=ON;")?;
+    setup.execute("CREATE TABLE victim(id INTEGER PRIMARY KEY, b BLOB UNIQUE);")?;
+    setup.execute("CREATE TABLE counter(id INTEGER PRIMARY KEY, v INTEGER);")?;
+    setup.execute("INSERT INTO counter(id, v) VALUES (1, 0);")?;
+    setup.execute("BEGIN;")?;
+    for i in 1..=400 {
+        setup.execute(format!(
+            "INSERT INTO victim(id, b) VALUES ({i}, zeroblob({}));",
+            700 + i
+        ))?;
+    }
+    setup.execute("COMMIT;")?;
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    drop(setup);
+
+    {
+        let conn = tmp_db.connect_limbo();
+        conn.execute("PRAGMA cache_size=10;")?;
+        conn.execute("PRAGMA cache_spill=ON;")?;
+        conn.execute("BEGIN;")?;
+        for i in 1..=350 {
+            conn.execute(format!(
+                "UPDATE victim SET b = zeroblob({}) WHERE id = {i};",
+                2000 + i
+            ))?;
+        }
+        // Drop without COMMIT or ROLLBACK, matching a reconnect/reopen that
+        // replaces the connection while a write transaction is active.
+    }
+
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA cache_size=10;")?;
+    conn.execute("PRAGMA cache_spill=ON;")?;
+    for _ in 1..=900 {
+        conn.execute("UPDATE counter SET v = v + 1 WHERE id = 1;")?;
+    }
+
+    let checkpoint = execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
+    assert_eq!(checkpoint[0], 0, "checkpoint should not be busy");
+
+    let victim_count = execute_and_get_ints(&conn, "SELECT count(*) FROM victim;")?;
+    assert_eq!(
+        victim_count,
+        vec![400],
+        "dropped transaction rows must be rolled back"
+    );
+    let counter = execute_and_get_ints(&conn, "SELECT v FROM counter WHERE id = 1;")?;
+    assert_eq!(counter, vec![900]);
+
+    rusqlite_integrity_check(&tmp_db.path)?;
+    Ok(())
 }

@@ -289,27 +289,48 @@ crate::assert::assert_send_sync!(Connection);
 impl Drop for Connection {
     fn drop(&mut self) {
         if !self.is_closed() {
-            // Roll back any active MVCC transactions so that MvStore entries
-            // don't leak and block future checkpoints.  The tx may have
-            // already been committed/aborted externally (e.g. by tests that
-            // manipulate MvStore directly), so only rollback if still active.
-            if let Some(mv_store) = self.db.get_mv_store().as_ref() {
-                if let Some(tx_id) = self.get_mv_tx_id() {
-                    let pager = self.pager.load();
-                    if mv_store.is_tx_rollbackable(tx_id) {
-                        mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
-                    } else {
-                        self.set_mv_tx(None);
+            let pager = self.pager.load();
+
+            if self.get_tx_state() != TransactionState::None {
+                if self.mvcc_enabled() {
+                    if let Some(mv_store) = self.db.get_mv_store().as_ref() {
+                        if let Some(tx_id) = self.get_mv_tx_id() {
+                            if mv_store.is_tx_rollbackable(tx_id) {
+                                mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+                            } else {
+                                self.set_mv_tx(None);
+                            }
+                        }
                     }
                     pager.end_read_tx();
+                } else {
+                    pager.rollback_tx(self);
                 }
+                self.rollback_attached_mvcc_txs(false);
+                self.rollback_attached_wal_txns();
+                self.set_tx_state(TransactionState::None);
+            } else {
+                // Roll back any active MVCC transactions so that MvStore entries
+                // don't leak and block future checkpoints.  The tx may have
+                // already been committed/aborted externally (e.g. by tests that
+                // manipulate MvStore directly), so only rollback if still active.
+                if let Some(mv_store) = self.db.get_mv_store().as_ref() {
+                    if let Some(tx_id) = self.get_mv_tx_id() {
+                        if mv_store.is_tx_rollbackable(tx_id) {
+                            mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+                        } else {
+                            self.set_mv_tx(None);
+                        }
+                        pager.end_read_tx();
+                    }
+                }
+                self.rollback_attached_mvcc_txs(false);
+                self.rollback_attached_wal_txns();
             }
-            self.rollback_attached_mvcc_txs(false);
 
             // Release any WAL locks the connection might be holding.
             // This prevents deadlocks if a connection is dropped (e.g., due to a panic)
             // while holding a read or write lock.
-            let pager = self.pager.load();
             if let Some(wal) = &pager.wal {
                 if wal.holds_write_lock() {
                     wal.end_write_tx();
