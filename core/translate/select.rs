@@ -1138,7 +1138,7 @@ fn resolve_compound_order_by_expr(
                 if column_number == 0 || column_number > num_result_columns {
                     crate::bail_parse_error!(
                         "{} ORDER BY term out of range - should be between 1 and {}",
-                        column_number,
+                        ordinal(term_number),
                         num_result_columns
                     );
                 }
