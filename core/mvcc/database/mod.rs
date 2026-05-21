@@ -992,6 +992,20 @@ pub struct BuildLogRecordCtx {
     pub schema_process: bool,
 }
 
+fn version_begin_is_tx(row_version: &RowVersion, tx_id: TxID) -> bool {
+    matches!(
+        row_version.begin,
+        Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
+    )
+}
+
+fn version_end_is_tx(row_version: &RowVersion, tx_id: TxID) -> bool {
+    matches!(
+        row_version.end,
+        Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
+    )
+}
+
 /// Iteration state for the chunked `RewriteLiveVersions` step.
 #[derive(Debug)]
 pub struct RewriteLiveVersionsCtx {
@@ -1546,16 +1560,17 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
 
         // Returns Some(row_version) if our tx contributed to it and if we must therefore log it.
         let our_committed_image = |row_version: &RowVersion| -> Option<RowVersion> {
-            let our_begin = matches!(
-                row_version.begin,
-                Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
-            );
-            let our_end = matches!(
-                row_version.end,
-                Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
-            );
+            let our_begin = version_begin_is_tx(row_version, tx_id);
+            let our_end = version_end_is_tx(row_version, tx_id);
             if !our_begin && !our_end {
                 // row_version belongs to another tx
+                return None;
+            }
+            if our_begin && our_end && !row_version.btree_resident {
+                // This non-B-tree-resident version was born and died in this
+                // transaction, so it has no durable row-level effect. Logging
+                // it as a delete would lose the begin side and make recovery
+                // think an older row was removed.
                 return None;
             }
             let mut committed = row_version.clone();
