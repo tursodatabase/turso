@@ -2912,7 +2912,7 @@ fn test_checkpoint_stale_boundary_does_not_replay_checkpointed_create_table_afte
             .execute("UPDATE s SET v = 'older_commit' WHERE id = 1")
             .unwrap();
         older.set_yield_injector(Some(FixedYieldInjector::new([
-            CommitYieldPoint::BeforeCommittedTimestampWatermarkUpdate.point(),
+            CommitYieldPoint::BeforeGlobalHeaderUpdate.point(),
         ])));
         let mut older_commit = older.prepare("COMMIT").unwrap();
         assert!(
@@ -11968,38 +11968,13 @@ fn test_auto_rowid_after_negative_explicit_rowid_uses_next_negative() {
     assert_eq!(rows[1][0].as_int().unwrap(), -4);
     assert_eq!(rows[1][1].to_string(), "auto");
 }
-/// Regression: out-of-order MVCC commit completion must not regress
-/// `mvcc_store.global_header.schema_cookie`.
+/// Regression: out-of-order MVCC commit finalization must not let an older
+/// transaction replace `global_header` with a stale header.
 ///
-/// `CommitStateMachine::FinalizeCommit` writes `global_header` with the
-/// committing tx's header. Two commits that interleave (older end_ts
-/// reaches FinalizeCommit *after* a newer one with a bumped cookie)
-/// would otherwise overwrite the latest cookie with a stale value.
-///
-/// Once `global_header.schema_cookie` regresses below
-/// `db.schema.schema_version`, `maybe_reparse_schema`'s early-exit fails
-/// on every subsequent statement — it triggers a disk reparse, the inner
-/// `SELECT * FROM sqlite_schema` speculatively reads any still-Preparing
-/// writer's row (Hekaton §2.7), registers a commit dependency, and the
-/// single-threaded reparse loop in `Statement::run_with_row_callback`
-/// parks in `WaitForDependencies` forever. This is the deadlock seed
-/// 4729871996470817193 hit in whopper MVCC soak.
-///
-/// Repro shape:
-/// - tx_a: CONCURRENT update, pinned at `LogRecordPrepared` (in
-///   BuildLogRecord state, end_ts already assigned but commit not yet
-///   logged).
-/// - tx_b: exclusive DDL (CREATE TABLE) ran end-to-end while tx_a is
-///   paused. tx_b acquired a newer end_ts and bumped the cookie; its
-///   `FinalizeCommit` writes the new cookie into `global_header`.
-/// - tx_a resumes, runs through to `FinalizeCommit`. Its tx_header
-///   carries the OLD cookie. Without the guard,
-///   `global_header.write().replace(...)` regresses the cookie.
-///
-/// The fix in `FinalizeCommit` reorders
-/// `last_committed_tx_ts.fetch_max(end_ts)` before the `global_header`
-/// write and only writes when `prev_committed_ts <= *end_ts` — i.e. only
-/// when our commit is still the most recent.
+/// tx_a is paused in FinalizeCommit after it has been marked Committed but
+/// before publishing its header/watermark. tx_b then commits newer DDL and
+/// publishes a bumped schema cookie. When tx_a resumes, its older header must
+/// not move `global_header.schema_cookie` backward.
 #[test]
 fn test_global_header_cookie_no_regression_on_out_of_order_finalize() {
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -12033,7 +12008,7 @@ fn test_global_header_cookie_no_regression_on_out_of_order_finalize() {
     let tx_a_id = conn_a.get_mv_tx_id().expect("tx_a should be active");
 
     conn_a.set_yield_injector(Some(FixedYieldInjector::new([
-        CommitYieldPoint::BeforeCommittedTimestampWatermarkUpdate.point(),
+        CommitYieldPoint::BeforeGlobalHeaderUpdate.point(),
     ])));
     let mut commit_a = conn_a.prepare("COMMIT").unwrap();
     let mut yielded = false;
@@ -12049,7 +12024,7 @@ fn test_global_header_cookie_no_regression_on_out_of_order_finalize() {
     }
     assert!(
         yielded,
-        "tx_a's COMMIT should yield at BeforeCommittedTimestampWatermarkUpdate"
+        "tx_a's COMMIT should yield before publishing global_header"
     );
     assert!(
         matches!(
@@ -12097,4 +12072,77 @@ fn test_global_header_cookie_no_regression_on_out_of_order_finalize() {
     );
 }
 
+/// Regression: the same stale `global_header` overwrite can lose user-visible
+/// database-header state, not just regress the internal schema cookie.
+///
+/// `PRAGMA user_version` is committed through the MVCC header path. If an older
+/// transaction resumes after that newer header-only commit and overwrites
+/// `global_header` with its stale header snapshot, users observe the committed
+/// user_version move backward.
+#[test]
+fn test_global_header_regression_would_lose_committed_user_version() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let setup = db.connect();
+        setup
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        setup.execute("PRAGMA user_version = 7").unwrap();
+        setup
+            .execute("INSERT INTO t VALUES (1, 'initial')")
+            .unwrap();
+        setup.close().unwrap();
+    }
 
+    let older = db.connect();
+    let header_writer = db.connect();
+    let observer = db.connect();
+
+    older.execute("BEGIN CONCURRENT").unwrap();
+    older
+        .execute("UPDATE t SET v = 'older' WHERE id = 1")
+        .unwrap();
+    older.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeGlobalHeaderUpdate.point(),
+    ])));
+    let mut older_commit = older.prepare("COMMIT").unwrap();
+    let mut yielded_older = false;
+    for _ in 0..200 {
+        match older_commit.step().unwrap() {
+            StepResult::IO => {
+                yielded_older = true;
+                break;
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert!(
+        yielded_older,
+        "older COMMIT should yield before publishing global_header"
+    );
+
+    header_writer.execute("BEGIN").unwrap();
+    header_writer.execute("PRAGMA user_version = 42").unwrap();
+    header_writer.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&observer, "PRAGMA user_version");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        42,
+        "newer header-only commit should publish user_version before older resumes"
+    );
+
+    older.set_yield_injector(None);
+    older_commit.run_ignore_rows().unwrap();
+    drop(older_commit);
+
+    let rows = get_rows(&observer, "PRAGMA user_version");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        42,
+        "older out-of-order FinalizeCommit regressed committed PRAGMA user_version"
+    );
+}
