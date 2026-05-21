@@ -20,8 +20,9 @@ use crate::{
         plan::{
             plan_has_outer_scope_dependency, plan_is_correlated,
             select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinOrderMember,
-            NonFromClauseSubquery, OuterQueryReference, Plan, SetOperation, SubqueryEvalPhase,
-            SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
+            NonFromClauseSubquery, OuterQueryReference, OuterResultAlias, Plan, SetOperation,
+            SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences,
+            WhereTerm,
         },
         select::prepare_select_plan,
     },
@@ -294,6 +295,17 @@ pub fn plan_subqueries_from_select_plan(
     // ORDER BY
     {
         crate::stack::trace_stack!("select_order_by");
+        // Expose this SELECT's result-column aliases to identifier resolution
+        // inside ORDER BY subqueries (SQLite-compatible: ORDER BY runs after
+        // the SELECT list, so aliases like `x` in `SELECT 1 AS x ORDER BY
+        // (SELECT x)` must resolve to the outer alias).
+        let _alias_scope =
+            resolver.push_outer_result_aliases(plan.result_columns.iter().filter_map(|rc| {
+                rc.alias.as_ref().map(|name| OuterResultAlias {
+                    name: name.clone(),
+                    expr: rc.expr.clone(),
+                })
+            }));
         plan_subqueries_with_outer_query_access(
             program,
             &mut plan.non_from_clause_subqueries,

@@ -56,6 +56,20 @@ fn infer_type_from_expr(
     }
 }
 
+/// A result-column alias from an enclosing SELECT that is visible to identifier
+/// resolution inside a nested subquery. Currently used for SQLite-compatible
+/// alias visibility in ORDER BY subqueries: in
+/// `SELECT 123 AS x ORDER BY (SELECT x ORDER BY 1)`, the inner `x` resolves to
+/// the outer alias because ORDER BY runs after the SELECT list.
+#[derive(Debug, Clone)]
+pub struct OuterResultAlias {
+    pub name: String,
+    /// Already-bound expression that the alias refers to. When the inner
+    /// subquery's identifier resolution matches this alias, the inner
+    /// reference is rewritten in-place by cloning this expression.
+    pub expr: ast::Expr,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
     /// `a + 1` in `SELECT a + 1 FROM t`

@@ -223,6 +223,18 @@ pub fn bind_and_rewrite_expr<'a>(
                         return Ok(WalkControl::Continue);
                     }
 
+                    // Fall back to result-column aliases from enclosing scopes
+                    // (e.g. SQLite's ORDER BY subqueries: ORDER BY runs after the
+                    // SELECT list, so the outer alias is in scope inside the
+                    // subquery). The matched expression is already bound in the
+                    // outer scope, so we inline a clone and mark any embedded
+                    // column references on this scope's outer query refs.
+                    if let Some(alias_expr) = resolver.find_outer_result_alias(&normalized_id) {
+                        mark_outer_columns_used(&alias_expr, referenced_tables);
+                        *expr = alias_expr;
+                        return Ok(WalkControl::Continue);
+                    }
+
                     if binding_behavior == BindingBehavior::TryCanonicalColumnsFirst {
                         if let Some(result_columns) = result_columns {
                             for result_column in result_columns.iter() {
@@ -690,6 +702,42 @@ pub fn bind_and_rewrite_expr<'a>(
         },
     )?;
     Ok(())
+}
+
+/// Walk a pre-bound expression that was inlined from an outer-scope alias and
+/// mark any column/rowid references against this scope's table references.
+///
+/// The expression was bound in an outer scope; whatever tables it touches now
+/// appear in this scope's `outer_query_refs`, so we still need to register the
+/// usage here. Tables that don't appear in this scope are silently ignored —
+/// this can happen when the alias expression refers to a still-deeper outer
+/// scope's tables, which will be picked up further down the call chain.
+fn mark_outer_columns_used(expr: &ast::Expr, referenced_tables: &mut TableReferences) {
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::Column { table, column, .. } => {
+                if referenced_tables
+                    .find_outer_query_ref_by_internal_id(*table)
+                    .is_some()
+                    || referenced_tables
+                        .find_joined_table_by_internal_id(*table)
+                        .is_some()
+                {
+                    referenced_tables.mark_column_used(*table, *column);
+                }
+            }
+            ast::Expr::RowId { table, .. } => {
+                if referenced_tables
+                    .find_outer_query_ref_by_internal_id(*table)
+                    .is_some()
+                {
+                    referenced_tables.mark_rowid_referenced(*table);
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
 }
 
 /// Extract a string literal value from an expression that has already been
