@@ -7,6 +7,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.sql.BatchUpdateException;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -64,21 +66,67 @@ class JDBC4StatementTest {
     Properties properties = new Properties();
     properties.setProperty("experimental_features", "vacuum");
 
-    try (JDBC4Connection connection = new JDBC4Connection(url, filePath, properties);
-        Statement statement = connection.createStatement()) {
-      statement.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);");
-      statement.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');");
-      statement.execute("DELETE FROM t WHERE id = 2;");
+    long beforePageCount;
+    long beforeSize;
+    try (JDBC4Connection connection = new JDBC4Connection(url, filePath, properties)) {
+      execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB);");
+      execute(
+          connection,
+          "INSERT INTO t SELECT value, randomblob(4096) FROM generate_series(1, 64);");
+      execute(connection, "DELETE FROM t WHERE id > 8;");
 
-      assertFalse(statement.execute("VACUUM;"));
+      drainRows(connection, "PRAGMA wal_checkpoint(TRUNCATE);");
+      beforePageCount = scalarLong(connection, "PRAGMA page_count;");
+      long beforeFreelistCount = scalarLong(connection, "PRAGMA freelist_count;");
+      beforeSize = Files.size(Paths.get(filePath));
+      assertTrue(beforeFreelistCount > 0);
+    }
 
-      ResultSet count = statement.executeQuery("SELECT COUNT(*) FROM t;");
-      assertTrue(count.next());
-      assertEquals(2, count.getInt(1));
+    try (JDBC4Connection connection = new JDBC4Connection(url, filePath, properties)) {
+      assertFalse(execute(connection, "VACUUM;"));
+      drainRows(connection, "PRAGMA wal_checkpoint(TRUNCATE);");
+    }
 
-      ResultSet integrity = statement.executeQuery("PRAGMA integrity_check;");
-      assertTrue(integrity.next());
-      assertEquals("ok", integrity.getString(1));
+    try (JDBC4Connection connection = new JDBC4Connection(url, filePath, properties)) {
+      assertTrue(scalarLong(connection, "PRAGMA page_count;") < beforePageCount);
+      assertEquals(0, scalarLong(connection, "PRAGMA freelist_count;"));
+      assertTrue(Files.size(Paths.get(filePath)) < beforeSize);
+
+      assertEquals(8, scalarLong(connection, "SELECT COUNT(*) FROM t;"));
+      assertEquals("ok", scalarString(connection, "PRAGMA integrity_check;"));
+    }
+  }
+
+  private static boolean execute(JDBC4Connection connection, String sql) throws SQLException {
+    try (Statement statement = connection.createStatement()) {
+      return statement.execute(sql);
+    }
+  }
+
+  private static long scalarLong(JDBC4Connection connection, String sql) throws SQLException {
+    try (Statement statement = connection.createStatement();
+        ResultSet result = statement.executeQuery(sql)) {
+      assertTrue(result.next());
+      long value = result.getLong(1);
+      while (result.next()) {}
+      return value;
+    }
+  }
+
+  private static String scalarString(JDBC4Connection connection, String sql) throws SQLException {
+    try (Statement statement = connection.createStatement();
+        ResultSet result = statement.executeQuery(sql)) {
+      assertTrue(result.next());
+      String value = result.getString(1);
+      while (result.next()) {}
+      return value;
+    }
+  }
+
+  private static void drainRows(JDBC4Connection connection, String sql) throws SQLException {
+    try (Statement statement = connection.createStatement();
+        ResultSet result = statement.executeQuery(sql)) {
+      while (result.next()) {}
     }
   }
 

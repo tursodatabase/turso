@@ -725,6 +725,29 @@ mod tests {
         turso_statement_deinit(statement);
     }
 
+    unsafe fn scalar_i64(connection: *mut c::turso_connection_t, sql: &str) -> i64 {
+        let sql = CString::new(sql).unwrap();
+        let mut statement = std::ptr::null_mut();
+        let status = turso_connection_prepare_single(
+            connection,
+            sql.as_ptr(),
+            &mut statement,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(status, turso_status_code_t::TURSO_OK);
+        assert_eq!(
+            turso_statement_step(statement, std::ptr::null_mut()),
+            turso_status_code_t::TURSO_ROW
+        );
+        let value = value_from_c_value(statement, 0).as_int().unwrap();
+        assert_eq!(
+            turso_statement_step(statement, std::ptr::null_mut()),
+            turso_status_code_t::TURSO_DONE
+        );
+        turso_statement_deinit(statement);
+        value
+    }
+
     #[test]
     pub fn test_version() {
         unsafe {
@@ -765,10 +788,10 @@ mod tests {
     }
 
     #[test]
-    pub fn test_db_vacuum_smoke() {
+    pub fn test_db_vacuum_reclaims_free_pages() {
         unsafe {
             let temp_dir = tempfile::TempDir::new().unwrap();
-            let db_path = temp_dir.path().join("vacuum-smoke.db");
+            let db_path = temp_dir.path().join("vacuum-reclaims.db");
             let path = CString::new(db_path.to_str().unwrap()).unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
@@ -788,14 +811,25 @@ mod tests {
 
             execute_sql(
                 connection,
-                "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)",
             );
             execute_sql(
                 connection,
-                "INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+                "INSERT INTO t SELECT value, randomblob(4096) FROM generate_series(1, 64)",
             );
-            execute_sql(connection, "DELETE FROM t WHERE id = 2");
+            execute_sql(connection, "DELETE FROM t WHERE id > 8");
+            execute_sql(connection, "PRAGMA wal_checkpoint(TRUNCATE)");
+            let before_page_count = scalar_i64(connection, "PRAGMA page_count");
+            let before_freelist_count = scalar_i64(connection, "PRAGMA freelist_count");
+            let before_size = std::fs::metadata(&db_path).unwrap().len();
+            assert!(before_freelist_count > 0);
+
             execute_sql(connection, "VACUUM");
+            execute_sql(connection, "PRAGMA wal_checkpoint(TRUNCATE)");
+
+            assert!(scalar_i64(connection, "PRAGMA page_count") < before_page_count);
+            assert_eq!(scalar_i64(connection, "PRAGMA freelist_count"), 0);
+            assert!(std::fs::metadata(&db_path).unwrap().len() < before_size);
 
             let sql = c"SELECT COUNT(*) FROM t";
             let mut statement = std::ptr::null_mut();
@@ -812,7 +846,7 @@ mod tests {
             );
             assert_eq!(
                 value_from_c_value(statement, 0),
-                turso_core::Value::from_i64(2)
+                turso_core::Value::from_i64(8)
             );
             assert_eq!(
                 turso_statement_step(statement, std::ptr::null_mut()),

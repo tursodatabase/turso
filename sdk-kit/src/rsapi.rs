@@ -609,7 +609,7 @@ impl TursoDatabase {
                 Some(vfs) => {
                     return Err(TursoError::Error(format!(
                         "unsupported VFS backend: '{vfs}'"
-                    )))
+                    )));
                 }
                 None => match self.config.path.as_str() {
                     ":memory:" => Arc::new(turso_core::MemoryIO::new()),
@@ -1290,9 +1290,23 @@ impl TursoStatement {
 #[cfg(test)]
 mod tests {
     use crate::rsapi::{
-        TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR,
+        TursoConnection, TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode,
+        FINALIZED_ERR,
     };
     use turso_core::Value;
+
+    fn execute_done(conn: &TursoConnection, sql: &str) {
+        let mut stmt = conn.prepare_single(sql).unwrap();
+        assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+    }
+
+    fn scalar_i64(conn: &TursoConnection, sql: &str) -> i64 {
+        let mut stmt = conn.prepare_single(sql).unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+        let value = stmt.row_value(0).unwrap().as_int().unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Done);
+        value
+    }
 
     #[test]
     pub fn test_db_concurrent_use() {
@@ -1380,9 +1394,9 @@ mod tests {
     }
 
     #[test]
-    pub fn test_db_rsapi_vacuum_smoke() {
+    pub fn test_db_rsapi_vacuum_reclaims_free_pages() {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("vacuum-smoke.db");
+        let db_path = temp_dir.path().join("vacuum-reclaims.db");
         let db = TursoDatabase::new(TursoDatabaseConfig {
             path: db_path.to_str().unwrap().to_string(),
             experimental_features: Some("vacuum".to_string()),
@@ -1397,18 +1411,28 @@ mod tests {
         let conn = db.connect().unwrap();
 
         for sql in [
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)",
-            "INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')",
-            "DELETE FROM t WHERE id = 2",
-            "VACUUM",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)",
+            "INSERT INTO t SELECT value, randomblob(4096) FROM generate_series(1, 64)",
+            "DELETE FROM t WHERE id > 8",
         ] {
-            let mut stmt = conn.prepare_single(sql).unwrap();
-            assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+            execute_done(&conn, sql);
         }
+        execute_done(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+        let before_page_count = scalar_i64(&conn, "PRAGMA page_count");
+        let before_freelist_count = scalar_i64(&conn, "PRAGMA freelist_count");
+        let before_size = std::fs::metadata(&db_path).unwrap().len();
+        assert!(before_freelist_count > 0);
+
+        execute_done(&conn, "VACUUM");
+        execute_done(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+
+        assert!(scalar_i64(&conn, "PRAGMA page_count") < before_page_count);
+        assert_eq!(scalar_i64(&conn, "PRAGMA freelist_count"), 0);
+        assert!(std::fs::metadata(&db_path).unwrap().len() < before_size);
 
         let mut count_stmt = conn.prepare_single("SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(count_stmt.step(None).unwrap(), TursoStatusCode::Row);
-        assert_eq!(count_stmt.row_value(0).unwrap().as_int(), Some(2));
+        assert_eq!(count_stmt.row_value(0).unwrap().as_int(), Some(8));
         assert_eq!(count_stmt.step(None).unwrap(), TursoStatusCode::Done);
 
         let mut integrity_stmt = conn.prepare_single("PRAGMA integrity_check").unwrap();

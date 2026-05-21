@@ -33,6 +33,29 @@ func openMem(t *testing.T) *sql.DB {
 	return db
 }
 
+func vacuumQueryInt(t *testing.T, db *sql.DB, query string) int64 {
+	t.Helper()
+
+	var value int64
+	require.NoError(t, db.QueryRow(query).Scan(&value))
+	return value
+}
+
+func vacuumCheckpoint(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	_, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	require.NoError(t, err)
+}
+
+func vacuumFileSize(t *testing.T, path string) int64 {
+	t.Helper()
+
+	stat, err := os.Stat(path)
+	require.NoError(t, err)
+	return stat.Size()
+}
+
 func TestVacuum(t *testing.T) {
 	tmp := t.TempDir()
 	dbPath := path.Join(tmp, "vacuum.db")
@@ -41,19 +64,30 @@ func TestVacuum(t *testing.T) {
 	defer conn.Close()
 
 	require.NoError(t, conn.Ping())
-	_, err = conn.Exec("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")
+	_, err = conn.Exec("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)")
 	require.NoError(t, err)
-	_, err = conn.Exec("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+	_, err = conn.Exec("INSERT INTO t SELECT value, randomblob(4096) FROM generate_series(1, 64)")
 	require.NoError(t, err)
-	_, err = conn.Exec("DELETE FROM t WHERE id = 2")
+	_, err = conn.Exec("DELETE FROM t WHERE id > 8")
 	require.NoError(t, err)
+
+	vacuumCheckpoint(t, conn)
+	beforePageCount := vacuumQueryInt(t, conn, "PRAGMA page_count")
+	beforeFreelistCount := vacuumQueryInt(t, conn, "PRAGMA freelist_count")
+	beforeSize := vacuumFileSize(t, dbPath)
+	require.Greater(t, beforeFreelistCount, int64(0))
 
 	_, err = conn.Exec("VACUUM")
 	require.NoError(t, err)
+	vacuumCheckpoint(t, conn)
+
+	require.Less(t, vacuumQueryInt(t, conn, "PRAGMA page_count"), beforePageCount)
+	require.Equal(t, int64(0), vacuumQueryInt(t, conn, "PRAGMA freelist_count"))
+	require.Less(t, vacuumFileSize(t, dbPath), beforeSize)
 
 	var count int
 	require.NoError(t, conn.QueryRow("SELECT COUNT(*) FROM t").Scan(&count))
-	require.Equal(t, 2, count)
+	require.Equal(t, 8, count)
 	var integrity string
 	require.NoError(t, conn.QueryRow("PRAGMA integrity_check").Scan(&integrity))
 	require.Equal(t, "ok", integrity)

@@ -10,20 +10,40 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 
 @pytest.mark.asyncio
-async def test_vacuum_smoke(tmp_path):
-    db_file = tmp_path / "vacuum-smoke-async.db"
+async def test_vacuum_reclaims_free_pages(tmp_path):
+    db_file = tmp_path / "vacuum-reclaims-async.db"
     conn = await turso.aio.connect(str(db_file), experimental_features="vacuum")
     try:
         cur = conn.cursor()
-        await cur.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")
-        await cur.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
-        await cur.execute("DELETE FROM t WHERE id = 2")
+        await cur.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)")
+        await cur.execute("INSERT INTO t SELECT value, randomblob(4096) FROM generate_series(1, 64)")
+        await cur.execute("DELETE FROM t WHERE id > 8")
         await conn.commit()
 
+        await cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        await cur.fetchall()
+        await cur.execute("PRAGMA page_count")
+        before_page_count = (await cur.fetchone())[0]
+        await cur.execute("PRAGMA freelist_count")
+        before_freelist_count = (await cur.fetchone())[0]
+        before_size = db_file.stat().st_size
+        assert before_freelist_count > 0
+
         await cur.execute("VACUUM")
+        await cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        await cur.fetchall()
+
+        await cur.execute("PRAGMA page_count")
+        after_page_count = (await cur.fetchone())[0]
+        await cur.execute("PRAGMA freelist_count")
+        after_freelist_count = (await cur.fetchone())[0]
+        after_size = db_file.stat().st_size
+        assert after_page_count < before_page_count
+        assert after_freelist_count == 0
+        assert after_size < before_size
 
         await cur.execute("SELECT COUNT(*) FROM t")
-        assert await cur.fetchone() == (2,)
+        assert await cur.fetchone() == (8,)
         await cur.execute("PRAGMA integrity_check")
         assert await cur.fetchone() == ("ok",)
     finally:

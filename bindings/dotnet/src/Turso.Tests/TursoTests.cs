@@ -147,16 +147,28 @@ public class TursoTests
             using var connection = new TursoConnection($"Data Source={dbPath};Experimental Features=vacuum");
             connection.Open();
 
-            connection.ExecuteNonQuery("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)");
-            connection.ExecuteNonQuery("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')");
-            connection.ExecuteNonQuery("DELETE FROM t WHERE id = 2");
+            connection.ExecuteNonQuery("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)");
+            connection.ExecuteNonQuery("INSERT INTO t SELECT value, randomblob(4096) FROM generate_series(1, 64)");
+            connection.ExecuteNonQuery("DELETE FROM t WHERE id > 8");
+
+            DrainRows(connection, "PRAGMA wal_checkpoint(TRUNCATE)");
+            var beforePageCount = ExecuteInt64(connection, "PRAGMA page_count");
+            var beforeFreelistCount = ExecuteInt64(connection, "PRAGMA freelist_count");
+            var beforeSize = new System.IO.FileInfo(dbPath).Length;
+            beforeFreelistCount.Should().BeGreaterThan(0);
+
             connection.ExecuteNonQuery("VACUUM");
+            DrainRows(connection, "PRAGMA wal_checkpoint(TRUNCATE)");
+
+            ExecuteInt64(connection, "PRAGMA page_count").Should().BeLessThan(beforePageCount);
+            ExecuteInt64(connection, "PRAGMA freelist_count").Should().Be(0);
+            new System.IO.FileInfo(dbPath).Length.Should().BeLessThan(beforeSize);
 
             using var countCmd = new TursoCommand(connection, "SELECT COUNT(*) FROM t");
             using (var reader = countCmd.ExecuteReader())
             {
                 reader.Read().Should().BeTrue();
-                reader.GetInt32(0).Should().Be(2);
+                reader.GetInt32(0).Should().Be(8);
                 reader.Read().Should().BeFalse();
             }
 
@@ -170,6 +182,21 @@ public class TursoTests
         {
             System.IO.File.Delete(dbPath);
             System.IO.File.Delete($"{dbPath}-wal");
+        }
+    }
+
+    private static long ExecuteInt64(TursoConnection connection, string sql)
+    {
+        using var command = new TursoCommand(connection, sql);
+        return System.Convert.ToInt64(command.ExecuteScalar());
+    }
+
+    private static void DrainRows(TursoConnection connection, string sql)
+    {
+        using var command = new TursoCommand(connection, sql);
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
         }
     }
 

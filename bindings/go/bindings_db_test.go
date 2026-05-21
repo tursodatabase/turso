@@ -1,6 +1,7 @@
 package turso
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -11,6 +12,7 @@ import (
 type dbConn struct {
 	db   TursoDatabase
 	conn TursoConnection
+	path string
 }
 
 func openInMemory(t *testing.T) (*dbConn, func()) {
@@ -61,7 +63,7 @@ func openFileWithExperimental(t *testing.T, experimentalFeatures string) (*dbCon
 		turso_connection_deinit(conn)
 		turso_database_deinit(db)
 	}
-	return &dbConn{db: db, conn: conn}, cleanup
+	return &dbConn{db: db, conn: conn, path: dbPath}, cleanup
 }
 
 func prepExec(t *testing.T, conn TursoConnection, sql string) uint64 {
@@ -95,6 +97,54 @@ func stepRow(t *testing.T, stmt TursoStatement) bool {
 	return false
 }
 
+func scalarInt(t *testing.T, conn TursoConnection, sql string) int64 {
+	t.Helper()
+
+	stmt := prepStmt(t, conn, sql)
+	defer func() {
+		_ = turso_statement_finalize(stmt)
+		turso_statement_deinit(stmt)
+	}()
+	require.True(t, stepRow(t, stmt))
+	value := turso_statement_row_value_int(stmt, 0)
+	require.False(t, stepRow(t, stmt))
+	return value
+}
+
+func scalarText(t *testing.T, conn TursoConnection, sql string) string {
+	t.Helper()
+
+	stmt := prepStmt(t, conn, sql)
+	defer func() {
+		_ = turso_statement_finalize(stmt)
+		turso_statement_deinit(stmt)
+	}()
+	require.True(t, stepRow(t, stmt))
+	value := turso_statement_row_value_text(stmt, 0)
+	require.False(t, stepRow(t, stmt))
+	return value
+}
+
+func drainRows(t *testing.T, conn TursoConnection, sql string) {
+	t.Helper()
+
+	stmt := prepStmt(t, conn, sql)
+	defer func() {
+		_ = turso_statement_finalize(stmt)
+		turso_statement_deinit(stmt)
+	}()
+	for stepRow(t, stmt) {
+	}
+}
+
+func dbFileSize(t *testing.T, path string) int64 {
+	t.Helper()
+
+	stat, err := os.Stat(path)
+	require.NoError(t, err)
+	return stat.Size()
+}
+
 func TestSetupAndOpenMemory(t *testing.T) {
 	conn, cleanup := openInMemory(t)
 	defer cleanup()
@@ -111,26 +161,25 @@ func TestVacuumBindings(t *testing.T) {
 	conn, cleanup := openFileWithExperimental(t, "vacuum")
 	defer cleanup()
 
-	prepExec(t, conn.conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")
-	prepExec(t, conn.conn, "INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
-	prepExec(t, conn.conn, "DELETE FROM t WHERE id = 2")
+	prepExec(t, conn.conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)")
+	prepExec(t, conn.conn, "INSERT INTO t SELECT value, randomblob(4096) FROM generate_series(1, 64)")
+	prepExec(t, conn.conn, "DELETE FROM t WHERE id > 8")
+
+	drainRows(t, conn.conn, "PRAGMA wal_checkpoint(TRUNCATE)")
+	beforePageCount := scalarInt(t, conn.conn, "PRAGMA page_count")
+	beforeFreelistCount := scalarInt(t, conn.conn, "PRAGMA freelist_count")
+	beforeSize := dbFileSize(t, conn.path)
+	require.Greater(t, beforeFreelistCount, int64(0))
+
 	prepExec(t, conn.conn, "VACUUM")
+	drainRows(t, conn.conn, "PRAGMA wal_checkpoint(TRUNCATE)")
 
-	stmt := prepStmt(t, conn.conn, "SELECT COUNT(*) FROM t")
-	require.True(t, stepRow(t, stmt))
-	assert.Equal(t, int64(2), turso_statement_row_value_int(stmt, 0))
-	require.False(t, stepRow(t, stmt))
-	_ = turso_statement_finalize(stmt)
-	turso_statement_deinit(stmt)
+	require.Less(t, scalarInt(t, conn.conn, "PRAGMA page_count"), beforePageCount)
+	require.Equal(t, int64(0), scalarInt(t, conn.conn, "PRAGMA freelist_count"))
+	require.Less(t, dbFileSize(t, conn.path), beforeSize)
 
-	stmt = prepStmt(t, conn.conn, "PRAGMA integrity_check")
-	defer func() {
-		_ = turso_statement_finalize(stmt)
-		turso_statement_deinit(stmt)
-	}()
-	require.True(t, stepRow(t, stmt))
-	assert.Equal(t, "ok", turso_statement_row_value_text(stmt, 0))
-	require.False(t, stepRow(t, stmt))
+	assert.Equal(t, int64(8), scalarInt(t, conn.conn, "SELECT COUNT(*) FROM t"))
+	assert.Equal(t, "ok", scalarText(t, conn.conn, "PRAGMA integrity_check"))
 }
 
 func TestPrepareFirstMultipleStatements(t *testing.T) {

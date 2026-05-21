@@ -37,6 +37,14 @@ proc assert_ne {label not_want got} {
     }
 }
 
+proc assert_gt {label got minimum} {
+    if {$got > $minimum} { ok $label } else { fail $label "greater than $minimum" $got }
+}
+
+proc assert_lt {label got maximum} {
+    if {$got < $maximum} { ok $label } else { fail $label "less than $maximum" $got }
+}
+
 # ---------------------------------------------------------------------------
 # Load the native extension.
 # ---------------------------------------------------------------------------
@@ -118,13 +126,27 @@ set vacuum_db [file join $here vacuum-probe-[pid].db]
 file delete -force $vacuum_db ${vacuum_db}-wal ${vacuum_db}-shm
 sqlite3 vac $vacuum_db
 vac eval {
-    CREATE TABLE tv(id INTEGER PRIMARY KEY, payload TEXT);
-    INSERT INTO tv VALUES (1, 'one'), (2, 'two'), (3, 'three');
-    DELETE FROM tv WHERE id = 2;
-    VACUUM;
+    CREATE TABLE tv(id INTEGER PRIMARY KEY, payload BLOB);
+    INSERT INTO tv SELECT value, randomblob(4096) FROM generate_series(1, 64);
+    DELETE FROM tv WHERE id > 8;
 }
+vac eval {PRAGMA wal_checkpoint(TRUNCATE);}
+set before_page_count [lindex [vac eval {PRAGMA page_count;}] 0]
+set before_freelist_count [lindex [vac eval {PRAGMA freelist_count;}] 0]
+set before_size [file size $vacuum_db]
+assert_gt "vacuum workload creates free pages" $before_freelist_count 0
+
+vac eval {VACUUM;}
+vac eval {PRAGMA wal_checkpoint(TRUNCATE);}
+set after_page_count [lindex [vac eval {PRAGMA page_count;}] 0]
+set after_freelist_count [lindex [vac eval {PRAGMA freelist_count;}] 0]
+set after_size [file size $vacuum_db]
+assert_lt "vacuum reduces page count" $after_page_count $before_page_count
+assert_eq "vacuum clears freelist" 0 $after_freelist_count
+assert_lt "vacuum shrinks database file" $after_size $before_size
+
 assert_eq "vacuum keeps data and integrity" \
-    {2 ok} [vac eval {SELECT count(*) FROM tv; PRAGMA integrity_check;}]
+    {8 ok} [vac eval {SELECT count(*) FROM tv; PRAGMA integrity_check;}]
 vac close
 file delete -force $vacuum_db ${vacuum_db}-wal ${vacuum_db}-shm
 

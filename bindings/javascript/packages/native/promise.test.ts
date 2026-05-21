@@ -1,4 +1,4 @@
-import { existsSync, unlinkSync } from "node:fs";
+import { existsSync, statSync, unlinkSync } from "node:fs";
 import { expect, test } from 'vitest'
 import { Database, connect } from './promise.js'
 import { sql } from 'drizzle-orm';
@@ -8,6 +8,15 @@ function unlinkIfExists(path: string) {
     if (existsSync(path)) {
         unlinkSync(path);
     }
+}
+
+async function scalarNumber(db: Database, sql: string, column: string): Promise<number> {
+    const row = await (await db.prepare(sql)).get() as Record<string, number>;
+    return row[column];
+}
+
+async function checkpoint(db: Database): Promise<void> {
+    await (await db.prepare("PRAGMA wal_checkpoint(TRUNCATE)")).all();
 }
 
 test('drizzle-orm', async () => {
@@ -76,13 +85,27 @@ test('vacuum', async () => {
     let db: Database | undefined;
     try {
         db = await connect(path, { experimental: ["vacuum"] });
-        await db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)");
-        await db.exec("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')");
-        await db.exec("DELETE FROM t WHERE id = 2");
+        await db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)");
+        await db.exec("INSERT INTO t SELECT value, randomblob(4096) FROM generate_series(1, 64)");
+        await db.exec("DELETE FROM t WHERE id > 8");
+
+        await checkpoint(db);
+        const beforePageCount = await scalarNumber(db, "PRAGMA page_count", "page_count");
+        const beforeFreelistCount = await scalarNumber(db, "PRAGMA freelist_count", "freelist_count");
+        const beforeSize = statSync(path).size;
+        expect(beforeFreelistCount).toBeGreaterThan(0);
 
         await db.exec("VACUUM");
+        await checkpoint(db);
 
-        expect(await (await db.prepare("SELECT COUNT(*) as cnt FROM t")).get()).toEqual({ cnt: 2 });
+        const afterPageCount = await scalarNumber(db, "PRAGMA page_count", "page_count");
+        const afterFreelistCount = await scalarNumber(db, "PRAGMA freelist_count", "freelist_count");
+        const afterSize = statSync(path).size;
+        expect(afterPageCount).toBeLessThan(beforePageCount);
+        expect(afterFreelistCount).toBe(0);
+        expect(afterSize).toBeLessThan(beforeSize);
+
+        expect(await (await db.prepare("SELECT COUNT(*) as cnt FROM t")).get()).toEqual({ cnt: 8 });
         expect(await (await db.prepare("PRAGMA integrity_check")).get()).toEqual({ integrity_check: "ok" });
     } finally {
         db?.close();
