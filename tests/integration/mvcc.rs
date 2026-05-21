@@ -1037,6 +1037,78 @@ fn test_create_drop_index_same_tx_recover_then_checkpoint(db: TempDatabase) -> a
     Ok(())
 }
 
+/// Same-tx CREATE INDEX + DROP INDEX on an already-populated table.
+/// The transient index contents must not be replayed after its schema row is
+/// removed before commit.
+#[turso_macros::test]
+fn test_create_drop_populated_index_same_tx_recover_then_checkpoint(
+    db: TempDatabase,
+) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        conn.execute("pragma journal_mode = 'mvcc'")?;
+        conn.execute("create table t(id integer primary key, v text)")?;
+        conn.execute("insert into t values (1, 'one'), (2, 'two')")?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+        conn.execute("begin")?;
+        conn.execute("create index idx_t_v on t(v)")?;
+        conn.execute("drop index idx_t_v")?;
+        conn.execute("commit")?;
+    }
+    drop(db);
+
+    let db = Database::open_file(io, path.to_str().unwrap())?;
+    let conn = db.connect()?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    let rows: Vec<(i64, String)> = conn.exec_rows("select id, v from t order by id");
+    assert_eq!(rows, vec![(1, "one".to_string()), (2, "two".to_string())]);
+
+    Ok(())
+}
+
+/// CREATE TABLE followed by RENAME in the same transaction creates and deletes
+/// a schema row for a B-tree id that still survives under a new schema row.
+/// Rows for the surviving table must remain durable after recovery.
+#[turso_macros::test]
+fn test_create_rename_insert_same_tx_recover_then_checkpoint(
+    db: TempDatabase,
+) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        conn.execute("pragma journal_mode = 'mvcc'")?;
+
+        conn.execute("begin")?;
+        conn.execute("create table t(id integer primary key, v text)")?;
+        conn.execute("alter table t rename to t2")?;
+        conn.execute("insert into t2 values (1, 'one'), (2, 'two')")?;
+        conn.execute("commit")?;
+    }
+    drop(db);
+
+    {
+        let db = Database::open_file(io.clone(), path.to_str().unwrap())?;
+        let conn = db.connect()?;
+        let rows: Vec<(i64, String)> = conn.exec_rows("select id, v from t2 order by id");
+        assert_eq!(rows, vec![(1, "one".to_string()), (2, "two".to_string())]);
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    }
+
+    let db = Database::open_file(io, path.to_str().unwrap())?;
+    let conn = db.connect()?;
+    let rows: Vec<(i64, String)> = conn.exec_rows("select id, v from t2 order by id");
+    assert_eq!(rows, vec![(1, "one".to_string()), (2, "two".to_string())]);
+
+    Ok(())
+}
+
 /// Same-tx create + insert + drop: data rows reference a table_id whose schema
 /// entry is created and destroyed in the same transaction.
 #[turso_macros::test]
