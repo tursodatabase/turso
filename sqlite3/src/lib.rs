@@ -826,6 +826,14 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
             .position(|&b| b == 0)
             .map_or(bounded, |i| &bounded[..i])
     };
+    if sql_bytes.is_empty() {
+        // SQLite specifies that nByte=0 generates no prepared statement.
+        *out_stmt = std::ptr::null_mut();
+        if !tail.is_null() {
+            *tail = sql;
+        }
+        return SQLITE_OK;
+    }
     let sql_str = match std::str::from_utf8(sql_bytes) {
         Ok(s) => s,
         Err(_) => {

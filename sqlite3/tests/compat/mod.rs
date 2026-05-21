@@ -311,6 +311,24 @@ mod tests {
     }
 
     #[test]
+    fn test_prepare_v2_zero_n_byte_returns_ok_null_stmt() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            let mut tail = ptr::null();
+            let sql = c"SELECT 1";
+            let rc = sqlite3_prepare_v2(db, sql.as_ptr(), 0, &mut stmt, &mut tail);
+
+            assert_eq!(rc, SQLITE_OK);
+            assert!(stmt.is_null());
+            assert_eq!(tail, sql.as_ptr());
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
     fn test_prepare_v2_n_byte_negative_uses_nul() {
         // Regression: n_byte = -1 path must still read until NUL terminator.
         unsafe {
