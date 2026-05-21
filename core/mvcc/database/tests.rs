@@ -8845,6 +8845,608 @@ fn test_alter_table_rename_with_unique_constraint_panics_on_restart() {
     }
 }
 
+/// Reproducer for "sqlite_schema contains index for missing table 't'".
+///
+/// A single transaction deletes a row from t and then runs
+/// `ALTER TABLE t ADD COLUMN`. The deleted row already exists in the db file,
+/// and idx already has an entry for it. The log therefore contains a
+/// DELETE_INDEX op for that one idx entry; it is not deleting idx itself.
+/// ADD COLUMN is used because it is a small way to get the general shape that
+/// matters here: a schema-row DELETE plus a replacement schema-row UPSERT in the
+/// same transaction as table/index row changes.
+///
+/// The old BuildLogRecord path inserted every committed version into one log
+/// vector with `insert_version_raw`. That helper is only valid for one entry in
+/// the MVCC maps, but the log vector is replayed in serialized order. Since the
+/// old sqlite_schema row for t is already in the db file, ALTER TABLE logs its
+/// DELETE with `begin=None` and its replacement UPSERT with `begin=end_ts`.
+/// Sorting every touched entry together could replay the schema DELETE, row
+/// DELETE, and index-entry DELETE before the schema UPSERT for t's new CREATE
+/// TABLE text.
+///
+/// During replay, the table schema DELETE removes t from `schema_rows` and sets
+/// `needs_schema_rebuild=true`. The following DELETE_INDEX op calls
+/// `get_index_info` to resolve idx's key format before the table schema UPSERT
+/// has been decoded. `get_index_info` sees `needs_schema_rebuild=true` and calls
+/// `rebuild_schema(&schema_rows)`, so `populate_indices` sees t missing while
+/// the btree-loaded idx schema row is still present and reports
+/// "sqlite_schema contains index for missing table".
+///
+/// Recovery must decode index ops with schema metadata chosen for the whole
+/// transaction frame, not with a schema rebuilt halfway through the frame.
+#[test]
+fn test_alter_add_column_with_index_dml_does_not_corrupt_on_reopen() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(v INTEGER)").unwrap();
+        conn.execute("CREATE INDEX idx ON t(v)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    {
+        db.get_mvcc_store().set_checkpoint_threshold(-1);
+        let conn = db.connect();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("DELETE FROM t").unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN x INTEGER").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+    db.restart();
+    let conn = db.connect();
+    let names: Vec<String> = get_rows(&conn, "SELECT name FROM sqlite_schema ORDER BY rowid")
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect();
+    assert!(
+        names.contains(&"t".to_string()),
+        "'t' table missing from sqlite_schema after reopen; got {names:?}"
+    );
+    assert!(
+        names.contains(&"idx".to_string()),
+        "index missing from sqlite_schema after reopen; got {names:?}"
+    );
+}
+
+/// Reproducer for `Index with root page ... not found in schema`.
+///
+/// A single transaction deletes a row from t and then drops idx. The deleted row
+/// already exists in the db file, and idx already has an entry for it. The log
+/// therefore contains a DELETE_INDEX op for that one idx entry, plus a
+/// sqlite_schema DELETE for idx itself.
+///
+/// This is the opposite side of the ALTER TABLE ADD COLUMN case above. The
+/// index-entry DELETE needs the old idx schema row in order to decode the index
+/// key. If BuildLogRecord writes the sqlite_schema DELETE before the
+/// DELETE_INDEX op, recovery removes idx from `schema_rows`, rebuilds
+/// `connection.schema`, then cannot resolve idx's root page when decoding the
+/// later DELETE_INDEX op.
+///
+/// This is why frame recovery chooses schema metadata from the whole frame.
+/// CREATE INDEX insert ops need the final schema; DROP INDEX delete ops need
+/// the old schema for entries that existed before the transaction.
+#[test]
+fn test_delete_then_drop_index_with_index_dml_replays_on_reopen() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(v INTEGER)").unwrap();
+        conn.execute("CREATE INDEX idx ON t(v)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    {
+        db.get_mvcc_store().set_checkpoint_threshold(-1);
+        let conn = db.connect();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("DELETE FROM t").unwrap();
+        conn.execute("DROP INDEX idx").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+    db.restart();
+    let conn = db.connect();
+    let names: Vec<String> = get_rows(&conn, "SELECT name FROM sqlite_schema ORDER BY rowid")
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect();
+    assert!(
+        names.contains(&"t".to_string()),
+        "'t' table missing from sqlite_schema after reopen; got {names:?}"
+    );
+    assert!(
+        !names.contains(&"idx".to_string()),
+        "dropped index still present in sqlite_schema after reopen; got {names:?}"
+    );
+    let rows = get_rows(&conn, "SELECT v FROM t");
+    assert!(
+        rows.is_empty(),
+        "deleted row should stay deleted after reopen; got {rows:?}"
+    );
+}
+
+/// A transient index created and dropped in one transaction should leave no
+/// logical-log index work behind.
+///
+/// CREATE INDEX writes sqlite_schema and index entries with `begin=tx_id`.
+/// DROP INDEX ends those same versions before commit. Those entries never
+/// reached the db file, so recovery cannot depend on their schema existing
+/// before or after the frame. The writer must omit them instead of logging a
+/// log op for an index that has no durable schema row.
+#[test]
+fn test_create_then_drop_index_in_one_tx_replays_on_reopen() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(v INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    {
+        db.get_mvcc_store().set_checkpoint_threshold(-1);
+        let conn = db.connect();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("CREATE INDEX idx ON t(v)").unwrap();
+        conn.execute("DROP INDEX idx").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+    db.restart();
+    let conn = db.connect();
+    let names: Vec<String> = get_rows(&conn, "SELECT name FROM sqlite_schema ORDER BY rowid")
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect();
+    assert!(
+        names.contains(&"t".to_string()),
+        "'t' table missing from sqlite_schema after reopen; got {names:?}"
+    );
+    assert!(
+        !names.contains(&"idx".to_string()),
+        "transient index should not remain in sqlite_schema after reopen; got {names:?}"
+    );
+    let rows = get_rows(&conn, "SELECT v FROM t ORDER BY v");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// These cases came from an adversarial DDL/DML matrix. They did not find a
+/// failure, but they cover schema-before/schema-after combinations that the
+/// frame-level recovery code must keep working: dropped indexes, newly-created
+/// indexes, table recreation, and both checkpointed and uncheckpointed base
+/// schemas.
+#[test]
+fn test_schema_frame_recovery_drop_index_with_remaining_index_matrix() {
+    for checkpoint_base in [false, true] {
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        {
+            let conn = db.connect();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_a ON t(a)").unwrap();
+            conn.execute("CREATE INDEX idx_b ON t(b)").unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 10, 100)").unwrap();
+            conn.execute("INSERT INTO t VALUES (2, 20, 200)").unwrap();
+            conn.execute("INSERT INTO t VALUES (3, 30, 300)").unwrap();
+            if checkpoint_base {
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            }
+            conn.close().unwrap();
+        }
+        {
+            db.get_mvcc_store().set_checkpoint_threshold(-1);
+            let conn = db.connect();
+            conn.execute("BEGIN").unwrap();
+            conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+            conn.execute("DROP INDEX idx_a").unwrap();
+            conn.execute("UPDATE t SET b = 250 WHERE id = 2").unwrap();
+            conn.execute("INSERT INTO t VALUES (4, 40, 400)").unwrap();
+            conn.execute("COMMIT").unwrap();
+            conn.close().unwrap();
+        }
+
+        db.restart();
+        let conn = db.connect();
+        let names: Vec<String> = get_rows(
+            &conn,
+            "SELECT name FROM sqlite_schema WHERE tbl_name = 't' ORDER BY rowid",
+        )
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect();
+        assert!(names.contains(&"t".to_string()), "table missing: {names:?}");
+        assert!(
+            !names.contains(&"idx_a".to_string()),
+            "dropped idx_a still present after reopen: {names:?}"
+        );
+        assert!(
+            names.contains(&"idx_b".to_string()),
+            "remaining idx_b missing after reopen: {names:?}"
+        );
+        let rows = get_rows(
+            &conn,
+            "SELECT id, b FROM t INDEXED BY idx_b WHERE b >= 250 ORDER BY b",
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0].as_int().unwrap(), 2);
+        assert_eq!(rows[0][1].as_int().unwrap(), 250);
+        assert_eq!(rows[1][0].as_int().unwrap(), 3);
+        assert_eq!(rows[1][1].as_int().unwrap(), 300);
+        assert_eq!(rows[2][0].as_int().unwrap(), 4);
+        assert_eq!(rows[2][1].as_int().unwrap(), 400);
+        let rows = get_rows(&conn, "PRAGMA integrity_check");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(&rows[0][0].to_string(), "ok");
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+
+        db.restart();
+        let conn = db.connect();
+        let rows = get_rows(
+            &conn,
+            "SELECT id, b FROM t INDEXED BY idx_b WHERE b >= 250 ORDER BY b",
+        );
+        assert_eq!(rows.len(), 3);
+    }
+}
+
+#[test]
+fn test_schema_frame_recovery_create_index_with_mixed_dml_matrix() {
+    for checkpoint_base in [false, true] {
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        {
+            let conn = db.connect();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_a ON t(a)").unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 10, 100)").unwrap();
+            conn.execute("INSERT INTO t VALUES (2, 20, 200)").unwrap();
+            conn.execute("INSERT INTO t VALUES (3, 30, 300)").unwrap();
+            if checkpoint_base {
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            }
+            conn.close().unwrap();
+        }
+        {
+            db.get_mvcc_store().set_checkpoint_threshold(-1);
+            let conn = db.connect();
+            conn.execute("BEGIN").unwrap();
+            conn.execute("UPDATE t SET a = 21 WHERE id = 2").unwrap();
+            conn.execute("INSERT INTO t VALUES (4, 40, 400)").unwrap();
+            conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+            conn.execute("CREATE INDEX idx_b ON t(b)").unwrap();
+            conn.execute("UPDATE t SET b = 333 WHERE id = 3").unwrap();
+            conn.execute("COMMIT").unwrap();
+            conn.close().unwrap();
+        }
+
+        db.restart();
+        let conn = db.connect();
+        let names: Vec<String> = get_rows(
+            &conn,
+            "SELECT name FROM sqlite_schema WHERE tbl_name = 't' ORDER BY rowid",
+        )
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect();
+        assert!(
+            names.contains(&"idx_a".to_string()),
+            "idx_a missing: {names:?}"
+        );
+        assert!(
+            names.contains(&"idx_b".to_string()),
+            "idx_b missing: {names:?}"
+        );
+        let rows = get_rows(
+            &conn,
+            "SELECT id, b FROM t INDEXED BY idx_b WHERE b >= 200 ORDER BY b",
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0].as_int().unwrap(), 2);
+        assert_eq!(rows[0][1].as_int().unwrap(), 200);
+        assert_eq!(rows[1][0].as_int().unwrap(), 3);
+        assert_eq!(rows[1][1].as_int().unwrap(), 333);
+        assert_eq!(rows[2][0].as_int().unwrap(), 4);
+        assert_eq!(rows[2][1].as_int().unwrap(), 400);
+        let rows = get_rows(&conn, "PRAGMA integrity_check");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(&rows[0][0].to_string(), "ok");
+    }
+}
+
+#[test]
+fn test_schema_frame_recovery_drop_recreate_table_indexes_matrix() {
+    for checkpoint_base in [false, true] {
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        {
+            let conn = db.connect();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_a ON t(a)").unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+            conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+            if checkpoint_base {
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            }
+            conn.close().unwrap();
+        }
+        {
+            db.get_mvcc_store().set_checkpoint_threshold(-1);
+            let conn = db.connect();
+            conn.execute("BEGIN").unwrap();
+            conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+            conn.execute("DROP TABLE t").unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b TEXT, c INTEGER)")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_c ON t(c)").unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'new', 30)").unwrap();
+            conn.execute("INSERT INTO t VALUES (2, 'next', 40)")
+                .unwrap();
+            conn.execute("UPDATE t SET c = 45 WHERE id = 2").unwrap();
+            conn.execute("COMMIT").unwrap();
+            conn.close().unwrap();
+        }
+
+        db.restart();
+        let conn = db.connect();
+        let names: Vec<String> = get_rows(
+            &conn,
+            "SELECT name FROM sqlite_schema WHERE tbl_name = 't' ORDER BY rowid",
+        )
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect();
+        assert!(names.contains(&"t".to_string()), "table missing: {names:?}");
+        assert!(
+            !names.contains(&"idx_a".to_string()),
+            "old idx_a still present after recreate: {names:?}"
+        );
+        assert!(
+            names.contains(&"idx_c".to_string()),
+            "new idx_c missing after recreate: {names:?}"
+        );
+        let rows = get_rows(&conn, "SELECT id, b, c FROM t INDEXED BY idx_c ORDER BY c");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].as_int().unwrap(), 1);
+        assert_eq!(rows[0][1].to_string(), "new");
+        assert_eq!(rows[0][2].as_int().unwrap(), 30);
+        assert_eq!(rows[1][0].as_int().unwrap(), 2);
+        assert_eq!(rows[1][1].to_string(), "next");
+        assert_eq!(rows[1][2].as_int().unwrap(), 45);
+        let rows = get_rows(&conn, "PRAGMA integrity_check");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(&rows[0][0].to_string(), "ok");
+    }
+}
+
+#[test]
+fn test_schema_frame_recovery_same_name_partial_index_redefinition() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_common ON t(a) WHERE a >= 20")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10, 100)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 20, 200)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 30, 300)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    {
+        db.get_mvcc_store().set_checkpoint_threshold(-1);
+        let conn = db.connect();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("UPDATE t SET a = 25 WHERE id = 2").unwrap();
+        conn.execute("DROP INDEX idx_common").unwrap();
+        conn.execute("CREATE INDEX idx_common ON t(b) WHERE b >= 250")
+            .unwrap();
+        conn.execute("UPDATE t SET b = 275 WHERE id = 2").unwrap();
+        conn.execute("INSERT INTO t VALUES (4, 40, 400)").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let sql_rows = get_rows(
+        &conn,
+        "SELECT sql FROM sqlite_schema WHERE name = 'idx_common'",
+    );
+    assert_eq!(sql_rows.len(), 1);
+    let index_sql = sql_rows[0][0].to_string();
+    assert!(
+        index_sql.contains("ON t (b)") && index_sql.contains("WHERE b >= 250"),
+        "idx_common should be recreated on b with the partial predicate; got {index_sql}"
+    );
+    let rows = get_rows(
+        &conn,
+        "SELECT id, b FROM t INDEXED BY idx_common WHERE b >= 250 ORDER BY b",
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    assert_eq!(rows[0][1].as_int().unwrap(), 275);
+    assert_eq!(rows[1][0].as_int().unwrap(), 3);
+    assert_eq!(rows[1][1].as_int().unwrap(), 300);
+    assert_eq!(rows[2][0].as_int().unwrap(), 4);
+    assert_eq!(rows[2][1].as_int().unwrap(), 400);
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_schema_rewrites_do_not_drop_table_versions_from_recovery_log() {
+    for checkpoint_base in [false, true] {
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        {
+            let conn = db.connect();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, note TEXT)")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_a ON t(a)").unwrap();
+            conn.execute("CREATE INDEX idx_b ON t(b)").unwrap();
+            conn.execute("CREATE UNIQUE INDEX idx_note ON t(note)")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(1, 10, 100, 'n1')")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(2, 20, 200, 'n2')")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(3, 30, 300, 'n3')")
+                .unwrap();
+            if checkpoint_base {
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            }
+            conn.close().unwrap();
+        }
+
+        db.restart();
+        {
+            db.get_mvcc_store().set_checkpoint_threshold(-1);
+            let conn = db.connect();
+            conn.execute("BEGIN").unwrap();
+            conn.execute("ALTER TABLE t RENAME TO tt").unwrap();
+            conn.execute("ALTER TABLE tt RENAME COLUMN note TO label")
+                .unwrap();
+            conn.execute("UPDATE tt SET a = a + 12 WHERE id = 1")
+                .unwrap();
+            conn.execute("ALTER TABLE tt ADD COLUMN c INTEGER DEFAULT 5")
+                .unwrap();
+            conn.execute("UPDATE tt SET c = a + b WHERE id = 2")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_label ON tt(label)").unwrap();
+            conn.execute(
+                "INSERT INTO tt(id,a,b,label,c) VALUES(4, 40, 472, 'n4', 912)
+                 ON CONFLICT(id) DO UPDATE
+                 SET a = excluded.a, b = excluded.b, label = excluded.label, c = excluded.c",
+            )
+            .unwrap();
+            conn.execute("DROP INDEX idx_b").unwrap();
+            conn.execute("COMMIT").unwrap();
+            conn.close().unwrap();
+        }
+
+        db.restart();
+        let conn = db.connect();
+        let table_rows = get_rows(&conn, "SELECT id, a, b, label, c FROM tt ORDER BY id");
+        assert_eq!(table_rows.len(), 4, "checkpoint_base={checkpoint_base}");
+        assert_eq!(table_rows[0][0].as_int().unwrap(), 1);
+        assert_eq!(table_rows[0][1].as_int().unwrap(), 22);
+        assert_eq!(table_rows[0][4].as_int().unwrap(), 5);
+        assert_eq!(table_rows[1][0].as_int().unwrap(), 2);
+        assert_eq!(table_rows[1][2].as_int().unwrap(), 200);
+        assert_eq!(table_rows[1][4].as_int().unwrap(), 220);
+        assert_eq!(table_rows[2][0].as_int().unwrap(), 3);
+        assert_eq!(table_rows[2][4].as_int().unwrap(), 5);
+        assert_eq!(table_rows[3][0].as_int().unwrap(), 4);
+        assert_eq!(table_rows[3][1].as_int().unwrap(), 40);
+        assert_eq!(table_rows[3][3].to_string(), "n4");
+        assert_eq!(table_rows[3][4].as_int().unwrap(), 912);
+
+        let indexed_rows = get_rows(
+            &conn,
+            "SELECT id, label FROM tt INDEXED BY idx_label WHERE label >= 'n1' ORDER BY label, id",
+        );
+        assert_eq!(indexed_rows.len(), 4, "checkpoint_base={checkpoint_base}");
+        assert_eq!(indexed_rows[3][0].as_int().unwrap(), 4);
+        assert_eq!(indexed_rows[3][1].to_string(), "n4");
+
+        let rows = get_rows(&conn, "PRAGMA integrity_check");
+        assert_eq!(rows.len(), 1, "checkpoint_base={checkpoint_base}");
+        assert_eq!(&rows[0][0].to_string(), "ok");
+    }
+}
+
+/// Updating a row that already exists in the db file creates an MVCC
+/// replacement version. If the same transaction deletes that row, recovery must
+/// not replay both the old-row delete and a second delete for the replacement:
+/// only the old row ever existed in the db file.
+#[test]
+fn test_btree_resident_update_then_delete_checkpoints_after_reopen() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    {
+        db.get_mvcc_store().set_checkpoint_threshold(-1);
+        let conn = db.connect();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("UPDATE t SET v = 15 WHERE id = 1").unwrap();
+        conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t INDEXED BY idx_v ORDER BY v");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    assert_eq!(rows[0][1].as_int().unwrap(), 20);
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+}
+
+#[test]
+fn test_schema_frame_recovery_rename_column_then_drop_index_checkpoints_after_reopen() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX i_b ON t(b)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    {
+        db.get_mvcc_store().set_checkpoint_threshold(-1);
+        let conn = db.connect();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("ALTER TABLE t RENAME COLUMN b TO bb").unwrap();
+        conn.execute("DROP INDEX i_b").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let schema_rows = get_rows(
+        &conn,
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name NOT LIKE '__turso%' ORDER BY rowid",
+    );
+    assert_eq!(schema_rows.len(), 1);
+    assert_eq!(schema_rows[0][0].to_string(), "table");
+    assert_eq!(schema_rows[0][1].to_string(), "t");
+    assert_eq!(schema_rows[0][2].to_string(), "t");
+    assert_eq!(
+        schema_rows[0][3].to_string(),
+        "CREATE TABLE t (a INTEGER PRIMARY KEY, bb TEXT)"
+    );
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+}
+
 /// Reproducer: DROP TABLE ghost data after restart without explicit checkpoint.
 /// Session 1: create + insert + checkpoint. Session 2: drop. Session 3: reopen.
 #[test]

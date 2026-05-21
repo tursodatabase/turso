@@ -1263,12 +1263,51 @@ impl StreamingLogicalLogReader {
         self.last_valid_offset = LOG_HDR_SIZE;
     }
 
+    /// Reads the next complete transaction frame.
+    ///
+    /// Recovery needs the whole frame so it can decide which schema snapshot
+    /// should decode each index op. `next_record` keeps the older one-op-at-a-time
+    /// API for tests and other callers. This is only a different API shape over
+    /// the same parser: `parse_next_transaction` still owns EOF handling,
+    /// torn-tail detection, `last_valid_offset`, and the chained CRC update.
+    ///
+    /// Empty parsed frames are skipped, so callers that receive Some(frame) can
+    /// rely on `frame` being non-empty.
+    pub(crate) fn next_frame(&mut self, io: &Arc<dyn crate::IO>) -> Result<Option<Vec<ParsedOp>>> {
+        if !self.pending_ops.is_empty() {
+            return Err(LimboError::InternalError(
+                "next_frame cannot be mixed with next_record on the same reader".to_string(),
+            ));
+        }
+
+        loop {
+            match self.state {
+                StreamingState::NeedTransactionStart => {
+                    if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
+                        return Ok(None);
+                    }
+
+                    let ops = match self.parse_next_transaction(io)? {
+                        ParseResult::Ops(ops) => ops,
+                        ParseResult::Eof | ParseResult::InvalidFrame => return Ok(None),
+                    };
+
+                    if ops.is_empty() {
+                        continue;
+                    }
+                    return Ok(Some(ops));
+                }
+            }
+        }
+    }
+
     /// Reads next record in log.
     pub fn next_record(
         &mut self,
         io: &Arc<dyn crate::IO>,
         mut get_index_info: impl FnMut(MVTableId) -> Result<Arc<IndexInfo>>,
     ) -> Result<StreamingResult> {
+        let mut get_index_info = |index_id, _op_kind| get_index_info(index_id);
         if let Some(op) = self.pending_ops.pop_front() {
             return self.parsed_op_to_streaming(op, &mut get_index_info);
         }
@@ -1945,10 +1984,10 @@ impl StreamingLogicalLogReader {
         Ok(ParseResult::Ops(parsed_ops))
     }
 
-    fn parsed_op_to_streaming(
+    pub(crate) fn parsed_op_to_streaming(
         &self,
         parsed_op: ParsedOp,
-        get_index_info: &mut impl FnMut(MVTableId) -> Result<Arc<IndexInfo>>,
+        get_index_info: &mut impl FnMut(MVTableId, IndexOpKind) -> Result<Arc<IndexInfo>>,
     ) -> Result<StreamingResult> {
         match parsed_op {
             ParsedOp::UpsertTable {
@@ -1992,7 +2031,7 @@ impl StreamingLogicalLogReader {
             } => {
                 let key_record = crate::types::ImmutableRecord::from_bin_record(payload);
                 let column_count = key_record.column_count();
-                let index_info = get_index_info(table_id)?;
+                let index_info = get_index_info(table_id, IndexOpKind::Upsert)?;
                 let key = SortableIndexKey::new_from_record(key_record, index_info);
                 let rowid = RowID::new(table_id, RowKey::Record(key));
                 let row = Row::new_index_row(rowid.clone(), column_count);
@@ -2011,7 +2050,7 @@ impl StreamingLogicalLogReader {
             } => {
                 let key_record = crate::types::ImmutableRecord::from_bin_record(payload);
                 let column_count = key_record.column_count();
-                let index_info = get_index_info(table_id)?;
+                let index_info = get_index_info(table_id, IndexOpKind::Delete)?;
                 let key = SortableIndexKey::new_from_record(key_record, index_info);
                 let rowid = RowID::new(table_id, RowKey::Record(key));
                 let row = Row::new_index_row(rowid.clone(), column_count);
@@ -2278,7 +2317,7 @@ enum ParseResult {
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-enum ParsedOp {
+pub(crate) enum ParsedOp {
     UpsertTable {
         table_id: MVTableId,
         rowid: RowID,
@@ -2307,6 +2346,12 @@ enum ParsedOp {
         header: DatabaseHeader,
         commit_ts: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum IndexOpKind {
+    Upsert,
+    Delete,
 }
 
 #[cfg(test)]
