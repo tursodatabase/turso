@@ -3181,6 +3181,23 @@ pub enum OpTransactionState {
     BeginStatement,
 }
 
+#[cfg(any(test, injected_yields))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TransactionYieldPoint {
+    BeforeStart,
+}
+
+#[cfg(any(test, injected_yields))]
+impl crate::mvcc::yield_hooks::YieldPointMarker for TransactionYieldPoint {
+    const POINT_COUNT: u8 = 1;
+
+    fn ordinal(self) -> u8 {
+        match self {
+            TransactionYieldPoint::BeforeStart => 0,
+        }
+    }
+}
+
 pub fn op_transaction(
     program: &Program,
     state: &mut ProgramState,
@@ -3390,6 +3407,31 @@ pub fn op_transaction_inner(
                     return Err(LimboError::ReadOnly);
                 }
 
+                // Fast path: if checkpoint root publication already replaced the
+                // shared schema, force reprepare before opening any transaction state.
+                if *db == crate::MAIN_DB_ID
+                    && mv_store.is_some()
+                    && conn.mvcc_schema_requires_reprepare_before_tx()
+                {
+                    tracing::debug!(
+                        "MVCC shared schema changed without a schema-cookie change; force reprepare"
+                    );
+                    return Err(LimboError::SchemaUpdated);
+                }
+                #[cfg(any(test, injected_yields))]
+                {
+                    if let Some(IOResult::IO(io)) =
+                        crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                            conn.yield_injector().as_ref(),
+                            0,
+                            *db as u64,
+                            TransactionYieldPoint::BeforeStart,
+                        )
+                    {
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                }
+
                 // 1. We try to upgrade current version
                 let current_state = conn.get_tx_state();
                 let is_secondary_db = *db != crate::MAIN_DB_ID;
@@ -3538,6 +3580,19 @@ pub fn op_transaction_inner(
                         if !has_existing_mv_tx {
                             match begin_mvcc_tx(mv_store, &pager, tx_mode, None) {
                                 Ok(tx_id) => {
+                                    // Check again in case checkpoint published roots after the
+                                    // previous check and before this transaction was protected.
+                                    if conn.mvcc_schema_requires_reprepare_before_tx() {
+                                        tracing::debug!(
+                                            "MVCC shared schema changed while starting transaction; force reprepare"
+                                        );
+                                        mv_store.rollback_tx(tx_id, pager.clone(), &conn, *db);
+                                        if started_read_tx {
+                                            pager.end_read_tx();
+                                            state.auto_txn_cleanup = TxnCleanup::None;
+                                        }
+                                        return Err(LimboError::SchemaUpdated);
+                                    }
                                     program
                                         .connection
                                         .set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
