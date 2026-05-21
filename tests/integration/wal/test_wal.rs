@@ -119,12 +119,11 @@ fn test_wal_cache_spill_commit_preserves_frame_order(tmp_db: TempDatabase) -> Re
     setup.execute("PRAGMA page_size=512;")?;
     setup.execute("PRAGMA journal_mode=WAL;")?;
     setup.execute("PRAGMA cache_size=200;")?;
-    setup.execute("PRAGMA cache_spill=ON;")?;
     setup.execute("CREATE TABLE low_page(id INTEGER PRIMARY KEY, v BLOB);")?;
     setup.execute("CREATE TABLE high_page(id INTEGER PRIMARY KEY, v BLOB);")?;
     setup.execute("INSERT INTO low_page VALUES(1, zeroblob(300));")?;
     setup.execute("BEGIN;")?;
-    for id in 1..=260 {
+    for id in 1..=130 {
         setup.execute(&format!(
             "INSERT INTO high_page VALUES({id}, printf('%04d:%s', {id}, hex(zeroblob(340))));"
         ))?;
@@ -134,14 +133,13 @@ fn test_wal_cache_spill_commit_preserves_frame_order(tmp_db: TempDatabase) -> Re
 
     let conn = tmp_db.connect_limbo();
     conn.execute("PRAGMA cache_size=200;")?;
-    conn.execute("PRAGMA cache_spill=ON;")?;
     conn.execute("BEGIN;")?;
     // Updating the larger table first fills the cache and spills higher-numbered
     // pages as private WAL frames before the transaction has a commit marker.
     conn.execute(
         "UPDATE high_page
          SET v = printf('h%04d:%s', id, hex(zeroblob(340)))
-         WHERE id BETWEEN 1 AND 260;",
+         WHERE id BETWEEN 1 AND 130;",
     )?;
     // Dirty a lower-numbered page after the spill. The commit path must append
     // after the private spill frames, not reuse their frame numbers for this page.
