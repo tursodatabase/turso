@@ -35,6 +35,7 @@ thiserror = { workspace = true }
 tracing-subscriber.workspace = true
 tracing.workspace = true
 mimalloc = { workspace = true, optional = true }
+futures-timer = "3"
 
 hyper = { version = "1.8.1", features = ["http1"], optional = true }
 tokio = { workspace = true, features = ["full"], optional = true }
@@ -45,6 +46,9 @@ hyper-util = { version = "0.1.19", features = [
 ], optional = true }
 http-body-util = { version = "0.1.3", optional = true }
 bytes = { version = "1.11.1", optional = true }
+
+[target.'cfg(shuttle)'.dependencies]
+shuttle = { workspace = true }
 
 [[example]]
 name = "sync_example"

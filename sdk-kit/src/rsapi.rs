@@ -1182,6 +1182,17 @@ impl TursoStatement {
         stmt._io().step()?;
         Ok(())
     }
+
+    /// Returns the remaining delay before the busy handler timeout expires.
+    ///
+    /// This is used by async callers to schedule a proper sleep instead of
+    /// busy-spinning. Returns `None` if there is no pending busy timeout.
+    pub fn get_busy_delay(&self) -> Option<Duration> {
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle.as_ref()?;
+        stmt.get_busy_delay()
+    }
+
     /// get row value as an owned Value
     #[inline]
     pub fn row_value(&self, index: usize) -> Result<turso_core::Value, TursoError> {
