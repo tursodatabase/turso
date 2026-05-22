@@ -1566,7 +1566,15 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 let mut schema_roots_present_before_tx: HashSet<i64> = HashSet::default();
                 let mut schema_roots_present_after_tx: HashSet<i64> = HashSet::default();
 
-                for (_, row_versions) in &write_set.entries {
+                for (id, row_versions) in &write_set.entries {
+                    // Only sqlite_schema entries can yield a btree identity. The
+                    // common path (CREATE INDEX on a populated table, bulk DML)
+                    // has tens of thousands of write_set entries that are NOT
+                    // sqlite_schema; locking each and parsing every version was
+                    // the dominant cost of MVCC commit on this branch.
+                    if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                        continue;
+                    }
                     for row_version in row_versions.read().iter() {
                         let Some(identity) = sqlite_schema_btree_identity(row_version) else {
                             continue;
