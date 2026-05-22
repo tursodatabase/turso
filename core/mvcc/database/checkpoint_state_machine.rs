@@ -467,11 +467,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 });
             // - It is a delete, AND some version of the row exists in the database file.
             let is_delete_and_exists_in_db_file = end_ts.is_some() && exists_in_db_file;
-            // - It is a delete of a sqlite_schema row that hasn't been checkpointed yet. We need to
-            //   return these even if they don't exist in the DB file so we can track destroyed
-            //   tables/indexes and skip their data rows.
+            // - It is a delete of an uncheckpointed sqlite_schema row for a
+            //   table or index. The schema row itself is not in the DB file, but
+            //   checkpoint still needs it so it can remember that the table or
+            //   index was destroyed and skip that object's data/index rows.
+            //   Views and triggers have rootpage=0, so their uncheckpointed
+            //   deletes can be ignored here: there is no B-tree to destroy, and
+            //   deleting a missing sqlite_schema row would be wrong.
             let is_schema_delete = table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
                 && !exists_in_db_file
+                && sqlite_schema_btree_identity(version).is_some()
                 && self
                     .durable_txid_max_old
                     .is_none_or(|txid_max_old| end_ts.is_some_and(|e| e > u64::from(txid_max_old)));
