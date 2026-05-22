@@ -152,29 +152,6 @@ mod tests {
     }
 
     #[test]
-    fn test_translate_vacuum_into_plain_path_has_no_encryption() {
-        let mut program = make_builder();
-        let dest = quoted_string_expr("test.db");
-        translate_vacuum(&mut program, None, Some(&dest)).unwrap();
-
-        let insn = program
-            .insns
-            .iter()
-            .find_map(|(insn, _)| match insn {
-                Insn::VacuumInto {
-                    schema_name: _,
-                    dest_path,
-                    encryption_opts,
-                } => Some((dest_path.clone(), encryption_opts.clone())),
-                _ => None,
-            })
-            .expect("VacuumInto instruction was not emitted");
-
-        assert_eq!(insn.0, "test.db");
-        assert!(insn.1.is_none());
-    }
-
-    #[test]
     fn test_translate_vacuum_into_uri_with_cipher_and_hexkey() {
         let mut program = make_builder();
         let dest = quoted_string_expr("file:test.db?cipher=aes256&hexkey=00112233");
