@@ -6242,6 +6242,12 @@ fn test_vacuum_into_encrypts_destination(tmp_db: TempDatabase) -> anyhow::Result
         "encrypted VACUUM INTO destination leaked plaintext sentinel"
     );
 
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(
+        integrity_result, "ok",
+        "Destination database with index should pass integrity check"
+    );
+
     Ok(())
 }
 
