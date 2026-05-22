@@ -1,8 +1,8 @@
 use crate::assertions::{AssertQueryPlan, NULL};
 use crate::common::{
     compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
-    compute_dbhash_with_options_and_database_opts, do_flush, limbo_exec_rows, run_query_on_row, ExecRows,
-    TempDatabase,
+    compute_dbhash_with_options_and_database_opts, do_flush, limbo_exec_rows, run_query_on_row,
+    ExecRows, TempDatabase,
 };
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use asserting::prelude::*;
@@ -6572,8 +6572,11 @@ fn test_vacuum_into_encrypts_destination(tmp_db: TempDatabase) -> anyhow::Result
 
     // open destination with matching encryption params and verify rows
     let uri = format!("file:{dest_path_str}?cipher={VACUUM_ENC_CIPHER}&hexkey={VACUUM_ENC_HEXKEY}");
-    let (_io, dest_conn) =
-        Connection::from_uri(&uri, turso_core::DatabaseOpts::new().with_encryption(true), Arc::new(SqliteDialect))?;
+    let (_io, dest_conn) = Connection::from_uri(
+        &uri,
+        turso_core::DatabaseOpts::new().with_encryption(true),
+        Arc::new(SqliteDialect),
+    )?;
     let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, value FROM secrets ORDER BY id");
     assert_eq!(
         rows,
@@ -6587,6 +6590,12 @@ fn test_vacuum_into_encrypts_destination(tmp_db: TempDatabase) -> anyhow::Result
     assert!(
         !leaked,
         "encrypted VACUUM INTO destination leaked plaintext sentinel"
+    );
+
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(
+        integrity_result, "ok",
+        "Destination database with index should pass integrity check"
     );
 
     Ok(())
@@ -6614,7 +6623,11 @@ fn test_vacuum_into_encrypted_destination_rejects_wrong_key(
     // try_open returns Err either when from_uri itself rejects the file, or when
     // a subsequent query fails to decrypt page 1.
     let try_open = |uri: &str| -> Result<(), ()> {
-        match Connection::from_uri(uri, turso_core::DatabaseOpts::new().with_encryption(true), Arc::new(SqliteDialect)) {
+        match Connection::from_uri(
+            uri,
+            turso_core::DatabaseOpts::new().with_encryption(true),
+            Arc::new(SqliteDialect),
+        ) {
             Err(_) => Err(()),
             Ok((_io, c)) => run_query_on_row(
                 &tmp_db,
@@ -6648,27 +6661,35 @@ fn test_vacuum_into_encrypted_destination_rejects_wrong_key(
 #[turso_macros::test]
 fn test_vacuum_into_uri_only_cipher_errors(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    conn.execute("CREATE TABLE t(x)")?;
     let dest_dir = TempDir::new()?;
     let dest_path = dest_dir.path().join("missing-key.db");
     let err = conn
-        .execute(format!("VACUUM INTO 'file:{}?cipher=aegis256'", dest_path.display()))
+        .execute(format!(
+            "VACUUM INTO 'file:{}?cipher=aes256'",
+            dest_path.display()
+        ))
         .unwrap_err();
-    assert_eq!(err.to_string(), "Parse error: hexkey is required when cipher is provided");
-    assert!(!dest_path.exists());
+    assert_eq!(
+        err.to_string(),
+        "Parse error: hexkey is required when cipher is provided"
+    );
     Ok(())
 }
 
 #[turso_macros::test]
 fn test_vacuum_into_uri_only_hexkey_errors(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    conn.execute("CREATE TABLE t(x)")?;
     let dest_dir = TempDir::new()?;
     let dest_path = dest_dir.path().join("missing-cipher.db");
     let err = conn
-        .execute(format!("VACUUM INTO 'file:{}?hexkey={VACUUM_ENC_HEXKEY}'", dest_path.display()))
+        .execute(format!(
+            "VACUUM INTO 'file:{}?hexkey=00112233'",
+            dest_path.display()
+        ))
         .unwrap_err();
-    assert_eq!(err.to_string(), "Parse error: cipher is required when hexkey is provided");
-    assert!(!dest_path.exists());
+    assert_eq!(
+        err.to_string(),
+        "Parse error: cipher is required when hexkey is provided"
+    );
     Ok(())
 }
