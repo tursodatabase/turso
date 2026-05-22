@@ -1,4 +1,8 @@
 use super::*;
+use crate::schema::SEQ_BACKING_TABLE_PREFIX;
+use crate::translate::sequence::emit_sequence_descriptor_literals;
+use crate::vdbe::builder::CursorType;
+use crate::vdbe::insn::{to_u16, InsertFlags, RegisterOrLiteral};
 
 /// The base logic for translating LIKE and GLOB expressions.
 /// The logic for handling "NOT LIKE" is different depending on whether the expression
@@ -180,4 +184,197 @@ pub(super) fn wrap_eval_jump_expr_zero_or_null(
         dest: target_register,
     });
     program.preassign_label_to_next_insn(if_true_label);
+}
+
+/// Translate nextval/setval with disk-only backing-table state.
+///
+/// ## Persistence design
+///
+/// The backing table (`__turso_internal_seq_<name>`) is the sole source of
+/// truth for the sequence's runtime state. There is no in-memory atomic.
+/// Every nextval/setval reads the current watermark from the table inside
+/// the executing transaction, computes the new value, and writes it back.
+///
+/// **NextVal**: seek to the watermark row (Last for ascending sequences,
+/// Rewind for descending), read its (value, is_called); the
+/// `SequenceComputeNext` opcode applies start/increment/cycle/exhaustion
+/// logic to derive the next value; the standard MakeRecord+Insert pattern
+/// writes a new row keyed by that value. The backing table may transiently
+/// hold multiple rows (one per nextval in a long transaction); checkpoint
+/// compacts to a single watermark row.
+///
+/// **SetVal**: validate the arguments (Function still runs for type-check
+/// and per-connection currval update), DELETE every existing row, INSERT a
+/// new single watermark row at the user-supplied value.
+///
+/// Cross-process correctness: under WAL the write lock serializes the
+/// disk read+write; the next holder reads the latest committed watermark.
+/// Under MVCC the autonomous-tx wrapper (handled at the opcode dispatch
+/// layer) serializes via WriteWriteConflict + bounded retry.
+pub(super) fn translate_sequence_function(
+    program: &mut ProgramBuilder,
+    args: &[Box<ast::Expr>],
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+    target_register: usize,
+    func_ctx: FuncCtx,
+) -> Result<usize> {
+    let is_nextval = matches!(&func_ctx.func, Func::Scalar(ScalarFunc::NextVal));
+
+    let seq_name_raw = extract_string_literal(&args[0])?;
+    let (database_id, normalized_name) = if let Some((schema, name)) = seq_name_raw.split_once('.')
+    {
+        let schema_norm = normalize_ident(schema);
+        let db_id = match schema_norm.as_str() {
+            "main" => crate::MAIN_DB_ID,
+            "temp" => crate::TEMP_DB_ID,
+            _ => resolver
+                .get_attached_database(&schema_norm)
+                .map(|(idx, _)| idx)
+                .ok_or_else(|| {
+                    LimboError::InvalidArgument(format!("no such database: {schema_norm}"))
+                })?,
+        };
+        (db_id, normalize_ident(name))
+    } else {
+        (crate::MAIN_DB_ID, normalize_ident(&seq_name_raw))
+    };
+
+    let backing_table_name = format!("{SEQ_BACKING_TABLE_PREFIX}{normalized_name}");
+    let backing_table =
+        resolver.with_schema(database_id, |s| s.get_btree_table(&backing_table_name));
+    if backing_table.is_none() {
+        crate::bail_parse_error!("sequence \"{}\" does not exist", seq_name_raw);
+    }
+
+    // Fetch the immutable sequence descriptor — start/inc/min/max/cycle are
+    // baked into the bytecode as literal Integers since they never change
+    // for a given sequence object.
+    let seq_arc = resolver
+        .with_schema(database_id, |s| s.get_sequence(&normalized_name).cloned())
+        .ok_or_else(|| {
+            LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist"))
+        })?;
+
+    let start_reg = program.alloc_registers(args.len());
+    for (i, arg) in args.iter().enumerate() {
+        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
+    }
+
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie)?;
+
+    if is_nextval {
+        // Reuse `start_reg` (the user's raw arg, possibly schema-qualified
+        // such as `'aux.my_seq'`) as the seq-name register so per-session
+        // `currval` stays keyed by the user's original spelling. The
+        // runtime handler strips the schema prefix when looking up the
+        // sequence object; the opcode's `db` field already encodes the
+        // correct database id resolved here.
+        crate::translate::sequence::emit_disk_read_nextval(
+            program,
+            resolver,
+            database_id,
+            &normalized_name,
+            &seq_arc,
+            target_register,
+            Some(start_reg),
+        )?;
+    } else {
+        // setval keeps its own cursor lifecycle: open the backing table,
+        // validate the user-supplied value via the Function handler,
+        // DELETE every existing row, then INSERT one at the requested
+        // value with the descriptor suffix.
+        let backing_table = backing_table.unwrap();
+        let root_page = backing_table.root_page;
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(backing_table));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id,
+            root_page: RegisterOrLiteral::Literal(root_page),
+            db: database_id,
+        });
+
+        // Function instruction performs argument validation and writes the
+        // user-visible result into target_register. The handler no longer
+        // mutates any in-memory atomic.
+        program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg,
+            dest: target_register,
+            func: func_ctx,
+        });
+
+        let empty_label = program.allocate_label();
+        let loop_label = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id,
+            pc_if_empty: empty_label,
+        });
+        program.preassign_label_to_next_insn(loop_label);
+        program.emit_insn(Insn::Delete {
+            cursor_id,
+            table_name: normalized_name.clone(),
+            is_part_of_update: false,
+        });
+        program.emit_insn(Insn::Next {
+            cursor_id,
+            pc_if_next: loop_label,
+        });
+        program.preassign_label_to_next_insn(empty_label);
+
+        let col_base = program.alloc_registers(7);
+        program.emit_insn(Insn::Copy {
+            src_reg: start_reg + 1,
+            dst_reg: col_base,
+            extra_amount: 0,
+        });
+        if args.len() > 2 {
+            program.emit_insn(Insn::Copy {
+                src_reg: start_reg + 2,
+                dst_reg: col_base + 1,
+                extra_amount: 0,
+            });
+        } else {
+            program.emit_insn(Insn::Integer {
+                dest: col_base + 1,
+                value: 1,
+            });
+        }
+        emit_sequence_descriptor_literals(program, &seq_arc, col_base + 2);
+
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u16(col_base),
+            count: 7,
+            dest_reg: to_u16(record_reg),
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: cursor_id,
+            key_reg: start_reg + 1,
+            record_reg,
+            flag: InsertFlags::new().require_seek(),
+            table_name: normalized_name.clone(),
+        });
+        program.emit_insn(Insn::SetSequenceCurrval {
+            seq_name_reg: start_reg,
+            value_reg: start_reg + 1,
+        });
+        program.emit_insn(Insn::Close { cursor_id });
+        // For AUTOINCREMENT-backing sequences, also mirror the new
+        // watermark into `sqlite_sequence` so the SQLite-compat row
+        // tracks `setval()` without waiting for a checkpoint. Matches
+        // the inline sync the nextval / advance_past paths emit; see
+        // `emit_autoincrement_sqlite_sequence_sync` for the rationale.
+        crate::translate::sequence::emit_autoincrement_sqlite_sequence_sync(
+            program,
+            resolver,
+            database_id,
+            &normalized_name,
+            start_reg + 1,
+        )?;
+    }
+
+    Ok(target_register)
 }

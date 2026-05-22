@@ -5,8 +5,8 @@ use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, BTreeCharacteristics, BTreeTable, ColDef,
-    Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
-    TURSO_TYPES_TABLE_NAME,
+    Column, SchemaObjectType, Table, Type, AUTOINCREMENT_SEQ_PREFIX, RESERVED_TABLE_PREFIXES,
+    SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -1227,12 +1227,6 @@ pub fn translate_create_table(
         }
     }
 
-    if has_autoincrement && connection.mv_store_for_db(database_id).is_some() {
-        bail_parse_error!(
-            "AUTOINCREMENT is not supported in MVCC mode (journal_mode=experimental_mvcc)"
-        );
-    }
-
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
 
     let create_btree_label = program.allocate_label();
@@ -1395,6 +1389,34 @@ pub fn translate_create_table(
                 &normalized_tbl_name,
                 index_reg,
                 None,
+            )?;
+        }
+    }
+
+    // Create the backing table for the hidden AUTOINCREMENT sequence. The
+    // `__turso_internal_autoincrement_` prefix identifies the sequence object;
+    // `sequence_backing_table_name` then maps it to the physical
+    // `__turso_internal_seq_<sequence-name>` table.
+    // Skip if it already exists (e.g. VACUUM INTO copies all tables first).
+    if has_autoincrement {
+        let autoinc_seq_name = format!("{AUTOINCREMENT_SEQ_PREFIX}{normalized_tbl_name}");
+        let backing_table_name =
+            crate::translate::sequence::sequence_backing_table_name(&autoinc_seq_name);
+        let already_exists = resolver.with_schema(database_id, |s| {
+            s.get_btree_table(&backing_table_name).is_some()
+        });
+        if !already_exists {
+            crate::translate::sequence::emit_sequence_backing_table(
+                program,
+                resolver,
+                database_id,
+                sqlite_schema_cursor_id,
+                &autoinc_seq_name,
+                1,        // start
+                1,        // increment
+                1,        // min
+                i64::MAX, // max
+                false,    // cycle
             )?;
         }
     }

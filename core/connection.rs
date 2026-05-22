@@ -18,11 +18,10 @@ use crate::Page;
 use crate::{
     ast, function,
     io::{MemoryIO, IO},
-    parse_schema_rows,
     progress::{ProgressHandler, ProgressHandlerCallback},
     refresh_analyze_stats, translate,
     translate::collate::CollationSeq,
-    util::IOExt,
+    util::{parse_schema_rows, IOExt},
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
     BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
@@ -125,6 +124,17 @@ pub(crate) struct NamedSavepointFrame {
     pub(crate) name: String,
     pub(crate) starts_transaction: bool,
     pub(crate) deferred_fk_violations: isize,
+    /// Snapshot of `conn.schema` taken at SAVEPOINT begin. Used by
+    /// ROLLBACK TO to restore the in-memory main schema without re-
+    /// reading sqlite_schema from disk — disk reparse from inside a
+    /// vdbe opcode would block on cursor I/O (and additionally, for
+    /// sequences, on `prepare_internal + run_with_row_callback`),
+    /// violating the vdbe async contract. Cheap to capture: bumps
+    /// the `Arc<Schema>` refcount. DDL after SAVEPOINT goes through
+    /// `Connection::with_schema_mut` which uses `Arc::make_mut`, so
+    /// the snapshot keeps pointing to the pre-DDL schema even when
+    /// the current schema diverges.
+    pub(crate) main_schema_snapshot: Arc<Schema>,
     /// Snapshot of `temp_db.db.schema` taken at SAVEPOINT begin. `None`
     /// when the temp database had not been initialized yet. Used by
     /// ROLLBACK TO to restore the in-memory temp schema after the
@@ -139,6 +149,7 @@ pub(crate) struct NamedSavepointFrame {
 /// Info returned by `rollback_named_savepoint_frame` so callers can
 /// restore in-memory schema state after the pager has rolled back.
 pub(crate) struct RollbackFrameInfo {
+    pub(crate) main_schema_snapshot: Arc<Schema>,
     pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
 }
@@ -219,6 +230,17 @@ pub struct Connection {
     pub(super) short_column_names: AtomicBool,
     /// Per-connection runtime extension loading flag.
     pub(super) enable_load_extension: AtomicBool,
+    /// Cumulative count of autonomous sequence inner-tx retries (each
+    /// `WriteWriteConflict` / `BusySnapshot` / `Conflict` that
+    /// `op_sequence_commit_inner_tx` absorbs via its retry budget bumps
+    /// this). Lives on the connection rather than `ProgramState` because
+    /// autocommit nextval/setval allocates a fresh `ProgramState` per
+    /// statement — the per-state counter resets on every Step and can't
+    /// witness across-statement contention. Tests use this counter to
+    /// assert the hot path is conflict-free: any non-zero increment on
+    /// a non-CYCLE nextval means inline backing-table compaction
+    /// (or another contended write) was reintroduced.
+    pub(crate) sequence_inner_retries: AtomicU64,
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
     /// Per-attached-database MVCC transactions.
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
@@ -293,6 +315,8 @@ pub struct Connection {
     /// MUST be incremented whenever any setting that affects PrepareContext changes,
     /// and this is not currently centralized; each setter bumps the generation individually.
     pub(crate) prepare_context_generation: AtomicU64,
+    /// Per-connection last-returned value for each sequence (for currval()).
+    pub(crate) sequence_currvals: RwLock<HashMap<String, i64>>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -971,7 +995,35 @@ impl Connection {
         self.reparse_schema_with_cookie(cookie)
     }
 
+    /// VACUUM-only reparse that grafts a caller-supplied sequence-
+    /// descriptor map onto the freshly parsed schema rather than re-
+    /// reading the backing tables from disk. VACUUM preserves every
+    /// sequence's definition (start/inc/min/max/cycle) — only physical
+    /// page locations change — so the source connection's pre-VACUUM
+    /// sequences map is still valid for the post-VACUUM image.
+    ///
+    /// This variant exists because the standard `reparse_schema_with_cookie`
+    /// runs `populate_sequences_via_sql` (which drives a SELECT via
+    /// `prepare_internal + run_with_row_callback`) — the surrounding
+    /// statement-execution loop is fine in any normal caller, but
+    /// VACUUM's state machine cannot host a nested statement.
+    pub(crate) fn reparse_schema_with_cookie_keeping_sequences(
+        self: &Arc<Connection>,
+        cookie: u32,
+        sequences: rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>,
+    ) -> Result<()> {
+        self.reparse_schema_inner(cookie, Some(sequences))
+    }
+
     pub(crate) fn reparse_schema_with_cookie(self: &Arc<Connection>, cookie: u32) -> Result<()> {
+        self.reparse_schema_inner(cookie, None)
+    }
+
+    fn reparse_schema_inner(
+        self: &Arc<Connection>,
+        cookie: u32,
+        preserved_sequences: Option<rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>>,
+    ) -> Result<()> {
         let _reparse_guard = self.schema_reparse_guard();
         self.pager.load().set_schema_cookie(Some(cookie));
         // create fresh schema as some objects can be deleted
@@ -982,20 +1034,21 @@ impl Connection {
         // Capture built-in table-valued functions (e.g. generate_series, json_each)
         // before dropping the old schema. These are registered programmatically and
         // don't survive re-parsing from sqlite_schema alone.
-        let table_valued_functions: Vec<_> = self
-            .schema
-            .read()
-            .tables
-            .values()
-            .filter_map(|table| match table.as_ref() {
-                crate::schema::Table::Virtual(vtab)
-                    if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) =>
-                {
-                    Some(vtab.clone())
-                }
-                _ => None,
-            })
-            .collect();
+        let table_valued_functions = {
+            let schema = self.schema.read();
+            schema
+                .tables
+                .values()
+                .filter_map(|table| match table.as_ref() {
+                    crate::schema::Table::Virtual(vtab)
+                        if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) =>
+                    {
+                        Some(vtab.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
 
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
@@ -1038,6 +1091,29 @@ impl Connection {
                 .tables
                 .entry(normalized)
                 .or_insert_with(|| Arc::new(crate::schema::Table::Virtual(vtab.clone())));
+        }
+
+        // Sequence descriptors: either graft a caller-supplied map or
+        // walk every backing table via SQL and recover its descriptor.
+        // The caller-supplied path is used by VACUUM, which preserves
+        // every sequence's definition (only physical page locations
+        // change). The SQL path runs through the normal statement
+        // execution helpers, so it cannot regress the engine's
+        // async-IO contract — no `io.block` / `wait_for_completion`.
+        match preserved_sequences {
+            Some(sequences) => {
+                fresh.sequences = sequences;
+                self.with_schema_mut(|schema| {
+                    *schema = fresh.clone();
+                });
+            }
+            None => {
+                self.with_schema_mut(|schema| {
+                    *schema = fresh.clone();
+                });
+                self.populate_sequences_via_sql(&mut fresh)?;
+                self.with_schema_mut(|schema| schema.sequences.clone_from(&fresh.sequences));
+            }
         }
 
         // Load custom types from __turso_internal_types if the table exists
@@ -2940,6 +3016,265 @@ impl Connection {
         self.bump_prepare_context_generation();
     }
 
+    /// Find a sequence by name, supporting optional schema qualification.
+    ///
+    /// - `"my_seq"` → searches main database only
+    /// - `"aux.my_seq"` → searches the attached database named `aux`
+    pub fn find_sequence(&self, name: &str) -> Result<Arc<crate::schema::Sequence>> {
+        let (db_id, seq_name) = if let Some((schema, seq)) = name.split_once('.') {
+            let db_id = self.get_database_id_by_name(schema)?;
+            (db_id, crate::util::normalize_ident(seq))
+        } else {
+            (MAIN_DB_ID, crate::util::normalize_ident(name))
+        };
+
+        self.with_schema(db_id, |schema| {
+            schema.get_sequence(&seq_name).map(Arc::clone)
+        })
+        .ok_or_else(|| LimboError::ParseError(format!("sequence \"{name}\" does not exist")))
+    }
+
+    /// Record that this connection has seen a value from the named sequence (for currval).
+    pub fn set_sequence_currval(&self, name: &str, value: i64) {
+        let normalized = crate::util::normalize_ident(name);
+        self.sequence_currvals.write().insert(normalized, value);
+    }
+
+    /// Get the last value returned by nextval/setval for the named sequence on this connection.
+    pub fn get_sequence_currval(&self, name: &str) -> Option<i64> {
+        let normalized = crate::util::normalize_ident(name);
+        self.sequence_currvals.read().get(&normalized).copied()
+    }
+
+    /// Total times this connection's autonomous sequence inner-tx ran into
+    /// a transient conflict (`WriteWriteConflict` / `BusySnapshot` /
+    /// `Conflict(_)`) and was retried by `op_sequence_commit_inner_tx`.
+    /// A non-CYCLE nextval on a non-contended seq must keep this at zero —
+    /// the regression test for "no inline backing-table compaction"
+    /// asserts the delta is 0 across the concurrent-nextval scenario.
+    pub fn sequence_inner_retries(&self) -> u64 {
+        self.sequence_inner_retries
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reset the inner-tx retry counter. Test-only helper so a setup
+    /// phase (priming the backing table, etc.) doesn't pollute the
+    /// counter the assertion phase observes.
+    #[doc(hidden)]
+    pub fn reset_sequence_inner_retries(&self) {
+        self.sequence_inner_retries
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Bootstrap-time sequence descriptor loader. Used by MVCC bootstrap
+    /// after log recovery and by ATTACH: walks `__turso_internal_seq_*`
+    /// tables and registers a pure descriptor for each into the active
+    /// schema. No atomic state is seeded — the runtime watermark is
+    /// always read from disk by nextval/setval.
+    pub(crate) fn load_sequence_descriptors_via_sql(self: &Arc<Connection>) -> Result<()> {
+        // Walk schema.tables in-memory rather than issuing a SELECT against
+        // sqlite_master — avoids the side-effects of running a fresh
+        // statement here, which can leave the connection's mv_tx in a
+        // non-exclusive state and cause the next DDL to trip the
+        // exclusive-tx guard in op_open_write.
+        let backing_tables = self.with_schema(MAIN_DB_ID, |s| s.sequence_backing_table_names());
+        for (backing_table_name, seq_name) in backing_tables {
+            let normalized = crate::util::normalize_ident(&seq_name);
+            let already_present =
+                self.with_schema(MAIN_DB_ID, |s| s.get_sequence(&normalized).is_some());
+            if already_present {
+                continue;
+            }
+            let seq = self.read_sequence_descriptor_via_sql(&backing_table_name, &seq_name)?;
+            self.with_database_schema_mut(MAIN_DB_ID, |schema| {
+                schema.sequences.insert(normalized.clone(), Arc::new(seq));
+            });
+        }
+        Ok(())
+    }
+
+    /// Read the descriptor (start/inc/min/max/cycle) of a single sequence
+    /// from its backing-table first row. The backing table is internal
+    /// (`__turso_internal_seq_*`); a missing or malformed descriptor row
+    /// is on-disk corruption, not "the sequence doesn't exist", so this
+    /// surfaces `LimboError::Corrupt` on any failure — silently dropping
+    /// the sequence would manifest as a misleading "sequence does not
+    /// exist" error on the next nextval that masks the real problem.
+    fn read_sequence_descriptor_via_sql(
+        self: &Arc<Connection>,
+        backing_table_name: &str,
+        seq_name: &str,
+    ) -> Result<crate::schema::Sequence> {
+        let escaped = backing_table_name.replace('"', "\"\"");
+        let sql = format!("SELECT start, inc, min, max, cycle FROM \"{escaped}\" LIMIT 1");
+        let mut stmt = self.prepare_internal(sql).map_err(|err| {
+            LimboError::Corrupt(format!(
+                "internal sequence backing table \"{backing_table_name}\" for sequence \
+                 \"{seq_name}\": cannot prepare descriptor SELECT: {err}"
+            ))
+        })?;
+        let mut metadata: Option<(i64, i64, i64, i64, bool)> = None;
+        stmt.run_with_row_callback(|row| {
+            let start = row.get::<i64>(0)?;
+            let inc = row.get::<i64>(1)?;
+            let min = row.get::<i64>(2)?;
+            let max = row.get::<i64>(3)?;
+            let cycle = row.get::<i64>(4)? != 0;
+            metadata = Some((start, inc, min, max, cycle));
+            Ok(())
+        })
+        .map_err(|err| {
+            LimboError::Corrupt(format!(
+                "internal sequence backing table \"{backing_table_name}\" for sequence \
+                 \"{seq_name}\": descriptor row read failed: {err}"
+            ))
+        })?;
+        let (start, inc, min, max, cycle) = metadata.ok_or_else(|| {
+            LimboError::Corrupt(format!(
+                "internal sequence backing table \"{backing_table_name}\" for sequence \
+                 \"{seq_name}\" is empty; the descriptor metadata row must always be present"
+            ))
+        })?;
+        crate::schema::Sequence::new(
+            seq_name.to_string(),
+            Some(start),
+            Some(inc),
+            Some(min),
+            Some(max),
+            cycle,
+        )
+        .map_err(|err| {
+            LimboError::Corrupt(format!(
+                "internal sequence backing table \"{backing_table_name}\" for sequence \
+                 \"{seq_name}\" descriptor is invalid: {err}"
+            ))
+        })
+    }
+
+    /// Sync AUTOINCREMENT backing-table watermarks from `sqlite_sequence`.
+    ///
+    /// Covers the WAL→MVCC mode-switch compatibility path: a WAL-mode
+    /// database with AUTOINCREMENT tables tracks the high-water mark in
+    /// `sqlite_sequence` (legacy SQLite contract) and never writes to
+    /// the backing table created by CREATE TABLE bytecode. The MVCC
+    /// AUTOINCREMENT path reads the backing table to compute the next
+    /// rowid, so without a sync step the next INSERT would regress to
+    /// start_value and collide with the existing rowid.
+    ///
+    /// For each `name` in `sqlite_sequence`, locate the backing table
+    /// `__turso_internal_seq___turso_internal_autoincrement_<name>` and,
+    /// if its current MAX(value) is below the sqlite_sequence value,
+    /// INSERT a new watermark row to advance it. This is the same
+    /// pattern the translator emits for `emit_disk_advance_past`,
+    /// expressed as statement-level SQL so it can run at bootstrap.
+    ///
+    /// Tables whose backing table is missing are skipped — that
+    /// indicates the table was never an AUTOINCREMENT under Turso's
+    /// CREATE TABLE bytecode (i.e. it predates this engine touching
+    /// the DB), and synthesising a backing table here would forge data
+    /// the user did not author. Importing a foreign SQLite database is
+    /// out of scope for this helper.
+    pub(crate) fn sync_autoincrement_backing_tables_from_sqlite_sequence(
+        self: &Arc<Connection>,
+    ) -> Result<()> {
+        use crate::schema::{
+            AUTOINCREMENT_SEQ_PREFIX, SEQ_BACKING_TABLE_PREFIX, SQLITE_SEQUENCE_TABLE_NAME,
+        };
+
+        let has_seq_table = self.with_schema(MAIN_DB_ID, |s| {
+            s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME).is_some()
+        });
+        if !has_seq_table {
+            return Ok(());
+        }
+
+        // Each step here is on the correctness path documented above —
+        // a silent failure leaves MVCC AUTOINCREMENT able to re-emit a
+        // rowid already in use after a WAL→MVCC mode switch. Propagate
+        // the errors so the bootstrap caller can fail the open rather
+        // than continue into a state where the next INSERT NULL
+        // collides on disk.
+        let mut rows: Vec<(String, i64)> = Vec::new();
+        let mut stmt = self.prepare_internal(format!(
+            "SELECT name, seq FROM {SQLITE_SEQUENCE_TABLE_NAME}"
+        ))?;
+        stmt.run_with_row_callback(|row| {
+            let name = row.get::<&str>(0)?.to_string();
+            let seq = row.get::<i64>(1)?;
+            rows.push((name, seq));
+            Ok(())
+        })?;
+
+        for (table_name, watermark) in rows {
+            let backing_table_name =
+                format!("{SEQ_BACKING_TABLE_PREFIX}{AUTOINCREMENT_SEQ_PREFIX}{table_name}");
+            let has_backing = self.with_schema(MAIN_DB_ID, |s| {
+                s.get_btree_table(&backing_table_name).is_some()
+            });
+            if !has_backing {
+                continue;
+            }
+            let escaped = backing_table_name.replace('"', "\"\"");
+            // Read current backing watermark; only insert if we'd actually
+            // be advancing it (avoids unnecessary writes on every boot).
+            let mut current_max: Option<i64> = None;
+            let mut read_stmt =
+                self.prepare_internal(format!("SELECT MAX(value) FROM \"{escaped}\""))?;
+            read_stmt.run_with_row_callback(|row| {
+                if let crate::Value::Numeric(crate::Numeric::Integer(v)) = row.get_value(0) {
+                    current_max = Some(*v);
+                }
+                Ok(())
+            })?;
+            // Skip only when the backing table is already strictly ahead;
+            // an equal value is NOT enough because the initial row written
+            // by CREATE TABLE bytecode is (value=1, is_called=false), which
+            // would cause the next nextval to re-emit value=1 and collide
+            // with the rowid that was already inserted in WAL mode. We
+            // always upsert here with is_called=1 so the next nextval
+            // computes watermark+1 like sqlite_sequence semantics demand.
+            if matches!(current_max, Some(c) if c > watermark) {
+                continue;
+            }
+            // Standard AUTOINCREMENT descriptor columns (start=1, inc=1,
+            // min=1, max=i64::MAX, cycle=0) — these mirror what the
+            // translator emits when CREATE TABLE bytecode creates the
+            // backing table for an AUTOINCREMENT column.
+            let insert_sql = format!(
+                "INSERT OR REPLACE INTO \"{escaped}\"\
+                 (value, is_called, start, inc, min, max, cycle) \
+                 VALUES ({watermark}, 1, 1, 1, 1, {}, 0)",
+                i64::MAX
+            );
+            let mut insert_stmt = self.prepare_internal(insert_sql)?;
+            insert_stmt.run_with_row_callback(|_| Ok(()))?;
+        }
+
+        Ok(())
+    }
+
+    /// SQL-based fallback for sequence-descriptor reconstruction. The
+    /// pager-backed `Schema::populate_sequences` only sees checkpointed
+    /// pages; under MVCC, backing tables created within still-uncommitted-
+    /// to-pager transactions live in the MVCC layer with negative root
+    /// page identifiers that the pager cannot read. This function walks
+    /// every `__turso_internal_seq_*` table in the schema and issues a
+    /// SELECT through the normal query path (which goes through MVCC),
+    /// reading one row to recover the immutable descriptor
+    /// (start/inc/min/max/cycle). The runtime watermark is never read
+    /// here — it's always fetched on demand by nextval.
+    fn populate_sequences_via_sql(self: &Arc<Connection>, fresh: &mut Schema) -> Result<()> {
+        for (backing_table_name, seq_name) in fresh.sequence_backing_table_names() {
+            let normalized = crate::util::normalize_ident(&seq_name);
+            if fresh.sequences.contains_key(&normalized) {
+                continue;
+            }
+            let seq = self.read_sequence_descriptor_via_sql(&backing_table_name, &seq_name)?;
+            fresh.sequences.insert(normalized, Arc::new(seq));
+        }
+        Ok(())
+    }
+
     /// Create a `TempDir` honoring `TURSO_TMPDIR` and `SQLITE_TMPDIR`,
     /// falling back to the OS default (`env::temp_dir()`).
     ///
@@ -3392,13 +3727,16 @@ impl Connection {
         self.named_savepoints.write().push(frame);
     }
 
-    /// Snapshot the in-memory non-main schemas for a savepoint frame so
-    /// ROLLBACK TO can restore them after the pager rolls back the
-    /// underlying pages.
-    pub(crate) fn with_snapshot_non_main_schemas<F, T>(&self, f: F) -> T
+    /// Snapshot the in-memory schemas (main, temp, attached) for a
+    /// savepoint frame so ROLLBACK TO can restore them without re-
+    /// reading sqlite_schema from disk. Disk reparse from inside the
+    /// vdbe ROLLBACK TO opcode would block on cursor I/O and violate
+    /// the vdbe async contract.
+    pub(crate) fn with_savepoint_schema_snapshot<F, T>(&self, f: F) -> T
     where
-        F: FnOnce(Option<Arc<Schema>>, HashMap<usize, Arc<Schema>>) -> T,
+        F: FnOnce(Arc<Schema>, Option<Arc<Schema>>, HashMap<usize, Arc<Schema>>) -> T,
     {
+        let main_schema_snapshot = self.schema.read().clone();
         let temp_schema_snapshot = self
             .temp
             .database
@@ -3406,7 +3744,11 @@ impl Connection {
             .as_ref()
             .map(|temp_db| temp_db.db.schema.lock().clone());
         let staged_schema_snapshot = self.database_schemas.read().clone();
-        f(temp_schema_snapshot, staged_schema_snapshot)
+        f(
+            main_schema_snapshot,
+            temp_schema_snapshot,
+            staged_schema_snapshot,
+        )
     }
 
     pub(crate) fn release_named_savepoint_frame(&self, name: &str) -> SavepointResult {
@@ -3431,6 +3773,7 @@ impl Connection {
             .rposition(|savepoint| savepoint.name == name)?;
         let frame = &savepoints[target_idx];
         let info = RollbackFrameInfo {
+            main_schema_snapshot: frame.main_schema_snapshot.clone(),
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
             staged_schema_snapshot: frame.staged_schema_snapshot.clone(),
         };
@@ -3988,5 +4331,33 @@ mod tests {
 
         assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM main.dst"), 1);
         assert_eq!(query_single_i64(&conn, "SELECT SUM(z) FROM main.audit"), 7);
+    }
+
+    /// A committed `setval(X, false)` stores an unconsumed sequence value.
+    /// After sequence initialization reloads persisted state, the in-memory
+    /// sequence must still represent that value as unconsumed, so the next
+    /// `nextval()` returns `X` rather than advancing past it.
+    /// Disk-only sequence design: setval(value, is_called=false) must be
+    /// observable as the next nextval() result. Previously this exercised
+    /// the in-memory-atomic reseeding path; that path no longer exists,
+    /// but the user-visible contract still holds because every nextval
+    /// reads the backing-table watermark and applies is_called semantics
+    /// in op_sequence_compute_next.
+    #[test]
+    fn test_setval_uncalled_emits_stored_value_as_next() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("seq_init.db");
+        let conn = open_connection_with_opts(&path, DatabaseOpts::new());
+
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE SEQUENCE s START 1 INCREMENT 3")?;
+        conn.execute("SELECT setval('s', 13, 0)")?;
+
+        let next_val = query_single_i64(&conn, "SELECT nextval('s')");
+        assert_eq!(
+            next_val, 13,
+            "setval(13, false) committed: next nextval must return 13"
+        );
+        Ok(())
     }
 }

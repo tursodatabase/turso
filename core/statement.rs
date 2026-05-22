@@ -297,7 +297,9 @@ impl Statement {
                 .fetch_add(1, Ordering::SeqCst);
             self.counted_as_active_root = true;
         }
-        if matches!(self.state.execution_state, ProgramExecutionState::Init) {
+        if matches!(self.state.execution_state, ProgramExecutionState::Init)
+            && self.origin != StatementOrigin::InternalHelper
+        {
             if self.program.connection.mvcc_enabled() {
                 // MVCC checkpoints can publish internal schema roots without changing
                 // SQLite's schema cookie, so refresh before deciding whether to reprepare.
@@ -417,6 +419,18 @@ impl Statement {
             && (matches!(res, Ok(StepResult::Done | StepResult::Interrupt)) || res.is_err())
         {
             self.release_active_root_if_counted();
+        }
+
+        // If the bytecode aborted between SequenceBeginInnerTx and
+        // SequenceCommitInnerTx, the connection's mv_tx is still pointing
+        // at the orphan inner; subsequent statements (e.g. reparse_schema
+        // SELECTs from _step's own reprepare path) would inherit it and
+        // deadlock in commit_txn's WaitForDependencies. Roll back and
+        // restore the outer eagerly here — reset_internal alone is not
+        // enough because callers do not always reset on error before
+        // running another statement.
+        if res.is_err() {
+            self.cleanup_orphaned_seq_inner_tx();
         }
 
         res
@@ -844,6 +858,41 @@ impl Statement {
         self.reset_internal(None, None, false)
     }
 
+    /// If `Insn::SequenceBeginInnerTx` swapped the connection's mv_tx to
+    /// an inner tx and the statement aborted before `SequenceCommitInnerTx`
+    /// could clean it up, roll back the inner and restore the outer
+    /// mv_tx. Otherwise the inner is leaked: it stays in `mv_store.txs`
+    /// (so subsequent `commit_dep_counter` walks may wait on it forever)
+    /// and the connection's mv_tx points to a dead tx, breaking the
+    /// next statement that runs on the connection.
+    fn cleanup_orphaned_seq_inner_tx(&mut self) {
+        let Some(pending) = self.state.sequence_inner_tx_pending.take() else {
+            return;
+        };
+        let conn = self.program.connection.clone();
+        let Some(mv_store) = conn.mv_store_for_db(pending.db) else {
+            return;
+        };
+        if mv_store.is_tx_rollbackable(pending.inner_tx_id) {
+            mv_store.rollback_tx(pending.inner_tx_id, self.pager.clone(), &conn, pending.db);
+        }
+        conn.set_mv_tx_for_db(pending.db, pending.saved_outer);
+        // When the inner tx aborted via the vdbe's catch-all error path
+        // (e.g. DatabaseFull on sequence exhaustion), rollback_current_txn_state
+        // rolled back what mv_tx pointed at — the inner — and set
+        // auto_commit=true under the assumption it was the only live tx.
+        // Restoring mv_tx to the outer without also restoring auto_commit=false
+        // leaves the connection in an inconsistent state where auto_commit=true
+        // but mv_tx points to a live outer tx, which causes subsequent BEGINs
+        // to silently no-op and pins the caller to the outer's stale snapshot.
+        if pending.saved_outer.is_some() {
+            conn.auto_commit.store(false, Ordering::SeqCst);
+        }
+        // The commit-state-machine, if any was in flight, is now dead:
+        // the inner tx it was committing is gone.
+        self.state.sequence_inner_commit = None;
+    }
+
     pub fn reset_best_effort(&mut self) {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.reset())) {
             Ok(Ok(())) => {}
@@ -861,6 +910,7 @@ impl Statement {
     /// already handled trigger execution tracking. Only resets ProgramState
     /// fields so the subprogram can run again from the beginning.
     pub fn reset_for_subprogram_reuse(&mut self) {
+        self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(None, None);
         self.state
             .n_change
@@ -1001,6 +1051,7 @@ impl Statement {
         if self.counted_as_active_root && !preserve_active_root_count {
             self.release_active_root_if_counted();
         }
+        self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
         self.busy_handler_state = None;

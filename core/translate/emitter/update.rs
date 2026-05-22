@@ -1,7 +1,7 @@
 use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
 use crate::alloc::TursoIteratorExt;
-use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
+use crate::schema::{Column, ColumnLayout, GeneratedType, Table, AUTOINCREMENT_SEQ_PREFIX};
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
@@ -2319,6 +2319,49 @@ fn emit_update_insns<'a>(
                 },
                 table_name: target_table.identifier.clone(),
             });
+
+            // MVCC AUTOINCREMENT: an UPDATE that moves the rowid forward
+            // must advance the implicit sequence past the new rowid, just
+            // like an explicit-rowid INSERT does — otherwise the next
+            // `INSERT … DEFAULT VALUES` would emit a value smaller than
+            // the manually-set rowid and either collide with it or
+            // produce a non-monotonic id.
+            //
+            // emit_disk_advance_past emits a direction-aware seek + a
+            // value comparison + a conditional INSERT into the backing
+            // table. The INSERT key is the value itself (rowid alias),
+            // so two concurrent writers either pick distinct values
+            // (safe) or collide on the watermark key (resolved by the
+            // standard MVCC conflict path).
+            //
+            // WAL mode follows the SQLite contract: UPDATE does not
+            // bump `sqlite_sequence`. The next AUTOINCREMENT INSERT
+            // takes the max of `sqlite_sequence.seq` and `MAX(rowid)`
+            // (see the AUTOINCREMENT allocator in insert.rs) and so
+            // automatically skips past any manually-advanced rowid.
+            if updates_rowid
+                && table.has_autoincrement
+                && connection.mv_store_for_db(update_database_id).is_some()
+            {
+                let seq_name = format!("{AUTOINCREMENT_SEQ_PREFIX}{}", target_table.identifier);
+                let seq = t_ctx
+                    .resolver
+                    .with_schema(update_database_id, |s| s.get_sequence(&seq_name).cloned())
+                    .ok_or_else(|| {
+                        crate::LimboError::InternalError(format!(
+                            "missing implicit sequence for AUTOINCREMENT table \"{}\"",
+                            target_table.identifier
+                        ))
+                    })?;
+                crate::translate::sequence::emit_disk_advance_past(
+                    program,
+                    &t_ctx.resolver,
+                    update_database_id,
+                    &seq_name,
+                    &seq,
+                    effective_rowid_reg,
+                )?;
+            }
 
             if connection.foreign_keys_enabled() {
                 emit_fk_parent_deferred_new_key_probes(

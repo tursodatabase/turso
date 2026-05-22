@@ -302,7 +302,7 @@ fn execute_sql_inner(conn: &Arc<Connection>, sql: &str) -> WorkerResponse {
             Err(e) => {
                 return WorkerResponse::Error {
                     error_kind: protocol::limbo_error_to_kind(&e).to_string(),
-                    message: e.to_string(),
+                    message: protocol::limbo_error_to_message(&e),
                 };
             }
         };
@@ -389,7 +389,7 @@ fn execute_sql_inner(conn: &Arc<Connection>, sql: &str) -> WorkerResponse {
                     }
                     break WorkerResponse::Error {
                         error_kind: protocol::limbo_error_to_kind(&e).to_string(),
-                        message: e.to_string(),
+                        message: protocol::limbo_error_to_message(&e),
                     };
                 }
             }

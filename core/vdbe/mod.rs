@@ -225,6 +225,16 @@ impl CommitState {
             _ => return, // no-op for already-finalized state machines and non-MVCC commit states
         };
 
+        // Replace the live CommitState with Ready so the abandoned state machine
+        // drops here. CommitStateMachine::Drop -> cleanup_unfinished_commit ->
+        // cleanup_dropped_commit ultimately calls rollback_tx_inner on a tx left
+        // in Active/Preparing. Without this, the orphan tx stays Preparing
+        // forever — any other transaction that took a commit dependency on it
+        // (Hekaton §2.7 speculative read) deadlocks in WaitForDependencies.
+        // The locks/exclusive slot the SM acquired are released by the same
+        // cleanup path on drop.
+        *self = CommitState::Ready;
+
         connection.rollback_attached_mvcc_txs(true);
         connection.rollback_attached_wal_txns();
         connection.rollback_temp_schema();
@@ -633,6 +643,21 @@ impl Default for VacuumOpState {
 }
 
 /// The program state describes the environment in which the program executes.
+/// Bookkeeping for an in-flight sequence inner-tx wrap. The
+/// `SequenceBeginInnerTx` opcode populates this on the Wrapped path
+/// so a subsequent reset / unwind can roll back the inner tx and
+/// restore `conn.mv_tx_for_db(db)` even when the statement aborts
+/// before reaching `SequenceCommitInnerTx`.
+#[derive(Clone)]
+pub struct SequenceInnerTxState {
+    pub db: usize,
+    pub inner_tx_id: crate::mvcc::database::TxID,
+    pub saved_outer: Option<(
+        crate::mvcc::database::TxID,
+        crate::translate::emitter::TransactionMode,
+    )>,
+}
+
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
@@ -655,6 +680,31 @@ pub struct ProgramState {
     pub query_deadline: Option<crate::MonotonicInstant>,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
+    /// In-flight commit-state-machine for an autonomous sequence
+    /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
+    /// entry and drives it one step per opcode call, yielding
+    /// `InsnFunctionStepResult::IO` between steps. Cleared on terminal
+    /// outcome (Done / Conflict / Err) and on statement reset.
+    pub sequence_inner_commit: Option<StateMachine<Box<CommitStateMachine<MvccClock>>>>,
+    /// State for a pending sequence inner-tx wrap, set by
+    /// `Insn::SequenceBeginInnerTx` (Wrapped path only) and cleared
+    /// by `Insn::SequenceCommitInnerTx` on any terminal outcome.
+    /// Tracked here (rather than in registers) so that statement
+    /// reset can roll back an orphaned inner tx and restore the
+    /// connection's mv_tx — registers are wiped on reset, but the
+    /// orphaned inner would otherwise linger in `mv_store.txs` and
+    /// pollute the connection's mv_tx slot, breaking subsequent
+    /// commits with phantom dependencies.
+    pub sequence_inner_tx_pending: Option<SequenceInnerTxState>,
+    /// Consecutive conflict-retry count for the in-progress sequence
+    /// inner-tx wrap. Incremented on each `WriteWriteConflict` /
+    /// `BusySnapshot` from `SequenceCommitInnerTx`; reset on the next
+    /// successful commit. When it exceeds
+    /// `SEQUENCE_INNER_TX_RETRY_BUDGET` the opcode returns
+    /// `LimboError::Busy` directly instead of routing a phony
+    /// `SQLITE_BUSY` halt through `op_halt`, which would mis-wrap it as
+    /// a constraint error.
+    pub sequence_inner_retry_count: u32,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     active_op_state: ActiveOpStateSlot,
@@ -749,6 +799,9 @@ impl ProgramState {
             query_deadline: None,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
+            sequence_inner_commit: None,
+            sequence_inner_tx_pending: None,
+            sequence_inner_retry_count: 0,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
             active_op_state: ActiveOpStateSlot::default(),
@@ -878,6 +931,12 @@ impl ProgramState {
         self.seek_state = OpSeekState::Start;
         self.current_collation = None;
         self.commit_state = CommitState::Ready;
+        // Drop any in-flight sequence inner-tx commit-state-machine. If
+        // it was mid-step the inner mv_tx has already been swapped back
+        // (we handle that on every code path inside
+        // `op_sequence_commit_inner_tx`) so dropping the state machine
+        // here only releases its references.
+        self.sequence_inner_commit = None;
         self.op_vacuum_state = VacuumOpState::None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
@@ -2345,6 +2404,39 @@ impl Program {
         // entry from the executing_triggers stack.
         if self.is_trigger_subprogram() && state.execution_state.is_running() {
             self.connection.end_trigger_execution();
+        }
+        // Roll back any in-flight autonomous sequence inner-tx and restore
+        // the connection's `mv_tx` slot to the saved outer tx BEFORE the
+        // statement-savepoint rollback path runs below. Without this, the
+        // savepoint rollback below reads `connection.get_mv_tx_id()` and
+        // gets the now-dead inner tx id — there is no savepoint on the
+        // inner tx, so the outer tx's statement-level changes (rows
+        // inserted before the failing nextval) never get rolled back.
+        // Roll back the statement-level MVCC savepoint on the OUTER tx
+        // before any downstream cleanup re-targets `connection.mv_tx`.
+        // The savepoint was opened by `begin_statement` against the outer
+        // tx; if a `SequenceBeginInnerTx` swap happened mid-statement the
+        // connection's `mv_tx` slot now points at the (failed) inner tx,
+        // and `end_statement`'s `rollback_first_savepoint` would walk the
+        // wrong tx — leaving the outer tx's pre-error writes durable on
+        // commit. Use `saved_outer` from the pending inner-tx record to
+        // pick the right tx id, run the savepoint rollback explicitly,
+        // and let the existing `Statement::cleanup_orphaned_seq_inner_tx`
+        // (called from `Statement::step` after this abort returns)
+        // perform the inner-tx rollback + mv_tx restoration.
+        if err.is_some() && !pager.is_checkpointing() {
+            if let Some(pending) = state.sequence_inner_tx_pending.as_ref() {
+                if let Some((outer_tx_id, _)) = pending.saved_outer {
+                    if let Some(mv_store) = self.connection.mv_store_for_db(pending.db) {
+                        if let Err(e) = mv_store.rollback_first_savepoint(outer_tx_id) {
+                            tracing::error!(
+                                "Failed to rollback outer-tx savepoint after sequence \
+                                 inner-tx aborted: {e}"
+                            );
+                        }
+                    }
+                }
+            }
         }
         // Errors from nested statements are handled by the parent statement.
         if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {

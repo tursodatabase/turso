@@ -262,13 +262,21 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     println!("{}", progress_stages[progress_index]);
     progress_index += 1;
 
+    let mut loop_err: Option<anyhow::Error> = None;
     while !whopper.is_done() {
         if whopper.rng.random_bool(reopen_probability) {
-            whopper.reopen().unwrap();
+            if let Err(e) = whopper.reopen() {
+                loop_err = Some(e);
+                break;
+            }
         }
-        match whopper.step()? {
-            StepResult::Ok => {}
-            StepResult::WalSizeLimitExceeded => break,
+        match whopper.step() {
+            Ok(StepResult::Ok) => {}
+            Ok(StepResult::WalSizeLimitExceeded) => break,
+            Err(e) => {
+                loop_err = Some(e);
+                break;
+            }
         }
 
         if progress_interval > 0 && whopper.current_step % progress_interval == 0 {
@@ -279,11 +287,20 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         }
     }
 
-    whopper.finalize_properties()?;
+    let prop_result = if loop_err.is_none() {
+        whopper.finalize_properties()
+    } else {
+        Ok(())
+    };
 
     if args.dump_db {
-        whopper.dump_db_files()?;
+        let _ = whopper.dump_db_files();
     }
+
+    if let Some(e) = loop_err {
+        return Err(e);
+    }
+    prop_result?;
 
     if args.elle.is_some() {
         println!("\nElle history exported to: {}", args.elle_output);
@@ -359,6 +376,16 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             (15, Box::new(DeleteWorkload)),
             (2, Box::new(CreateIndexWorkload)),
             (2, Box::new(DropIndexWorkload)),
+            (5, Box::new(CreateSequenceWorkload)),
+            (15, Box::new(NextValWorkload)),
+            (5, Box::new(CurrValWorkload)),
+            (5, Box::new(SetValWorkload)),
+            (2, Box::new(DropSequenceWorkload)),
+            (3, Box::new(CreateTableWithSeqDefaultWorkload)),
+            (8, Box::new(InsertSeqDefaultWorkload)),
+            (10, Box::new(AutoincInsertWorkload)),
+            (5, Box::new(AutoincUpdateRowidWorkload)),
+            (3, Box::new(AutoincDeleteWorkload)),
             (30, Box::new(BeginWorkload)),
             (10, Box::new(CommitWorkload)),
             (10, Box::new(RollbackWorkload)),
@@ -367,6 +394,8 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
         let p: Vec<Box<dyn Property>> = vec![
             Box::new(IntegrityCheckProperty),
             Box::new(SimpleKeysDoNotDisappear::new()),
+            Box::new(SequenceCorrectnessProperty::new()),
+            Box::new(AutoincWatermarkMonotonicity::new()),
         ];
 
         (w, p, vec![], vec![])
@@ -417,8 +446,12 @@ fn format_stats(stats: &turso_whopper::Stats, elle_mode: bool) -> String {
         format!("{}/{}", stats.elle_writes, stats.elle_reads)
     } else {
         format!(
-            "{}/{}/{}/{}",
-            stats.inserts, stats.updates, stats.deletes, stats.integrity_checks
+            "{}/{}/{}/{}/{}",
+            stats.inserts,
+            stats.updates,
+            stats.deletes,
+            stats.integrity_checks,
+            stats.sequence_nextvals
         )
     }
 }
@@ -428,7 +461,7 @@ fn progress_art(elle_mode: bool) -> [&'static str; 11] {
         if elle_mode {
             "       .             W/R"
         } else {
-            "       .             I/U/D/C"
+            "       .             I/U/D/C/S"
         },
         "       .             ",
         "       .             ",

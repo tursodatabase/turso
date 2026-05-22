@@ -97,11 +97,23 @@ CREATE TABLE events (
 );
 ```
 
-Without `AUTOINCREMENT`, Turso may reuse rowid values after rows are deleted. With `AUTOINCREMENT`, the rowid is guaranteed to be greater than any rowid that has ever existed in the table, even if rows have been deleted.
+Without `AUTOINCREMENT`, Turso may reuse rowid values after rows are deleted. With `AUTOINCREMENT`, automatically generated rowids are greater than any rowid that has ever existed in a committed row for the table, even if rows have been deleted.
 
 <Info>
-`AUTOINCREMENT` adds minor overhead because it updates the `sqlite_sequence` table on every insert. Only use it when you require strictly monotonically increasing identifiers.
+`AUTOINCREMENT` adds minor overhead because it maintains a committed high-water mark. Rolled-back inserts do not have to permanently burn their generated rowids, but gaps are still possible when concurrent transactions commit later generated values.
 </Info>
+
+<Warning>
+**AUTOINCREMENT under MVCC (`journal_mode=experimental_mvcc`)**: `sqlite_sequence` is updated lazily — only when the WAL is checkpointed. Between checkpoints it may lag the actual high-water mark or be empty for a freshly-created AUTOINCREMENT table. Do **not** rely on `sqlite_sequence` to recover the current value in MVCC mode. Instead, query the internal sequence backing table directly:
+
+```sql
+SELECT MAX(value) FROM "__turso_internal_seq___turso_internal_autoincrement_<table_name>";
+```
+
+This row is updated immediately by every committed (and durably-burnt) `nextval`. After `PRAGMA wal_checkpoint(TRUNCATE)`, `sqlite_sequence` is coalesced to a single row per AUTOINCREMENT table and is then safe to read with normal SQLite-compatible queries.
+
+Note also that MVCC autoincrement does **not** un-burn rolled-back rowids — a `ROLLBACK` after `INSERT` leaves a gap rather than recycling the rowid. SQLite WAL mode and Turso's WAL mode both un-burn on rollback; only MVCC mode keeps them burnt.
+</Warning>
 
 ### NOT NULL
 

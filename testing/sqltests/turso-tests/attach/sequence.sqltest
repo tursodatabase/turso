@@ -1,0 +1,102 @@
+@database :memory:
+
+# Schema-qualified nextval resolves to the correct database
+test sequence-schema-qualified-nextval {
+    CREATE SEQUENCE my_seq;
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE SEQUENCE aux.my_seq;
+    -- Unqualified resolves to main
+    SELECT nextval('my_seq');
+    -- Schema-qualified resolves to aux
+    SELECT nextval('aux.my_seq');
+    -- Main advances independently
+    SELECT nextval('my_seq');
+    -- Aux advances independently
+    SELECT nextval('aux.my_seq');
+}
+expect {
+    1
+    1
+    2
+    2
+}
+
+# Schema-qualified setval targets the correct database
+test sequence-schema-qualified-setval {
+    CREATE SEQUENCE s1;
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE SEQUENCE aux.s1;
+    SELECT setval('s1', 100);
+    SELECT setval('aux.s1', 200);
+    SELECT nextval('s1');
+    SELECT nextval('aux.s1');
+}
+expect {
+    100
+    200
+    101
+    201
+}
+
+# currval returns per-session value scoped to the correct database
+test sequence-schema-qualified-currval {
+    CREATE SEQUENCE s1;
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE SEQUENCE aux.s1;
+    SELECT nextval('s1');
+    SELECT nextval('aux.s1');
+    -- currval returns the value from the correct database
+    SELECT currval('s1');
+    SELECT currval('aux.s1');
+    -- advancing one doesn't affect the other's currval
+    SELECT nextval('s1');
+    SELECT currval('s1');
+    SELECT currval('aux.s1');
+}
+expect {
+    1
+    1
+    1
+    1
+    2
+    2
+    1
+}
+
+# setval on attached db doesn't affect main's currval
+test sequence-schema-qualified-setval-currval-isolation {
+    CREATE SEQUENCE s1;
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE SEQUENCE aux.s1;
+    SELECT nextval('s1');
+    SELECT setval('aux.s1', 50);
+    -- main's currval unchanged
+    SELECT currval('s1');
+    -- aux's currval updated by setval
+    SELECT currval('aux.s1');
+    SELECT nextval('aux.s1');
+}
+expect {
+    1
+    50
+    1
+    50
+    51
+}
+
+# Error on nonexistent schema
+test sequence-nonexistent-schema-errors {
+    SELECT nextval('bogus.my_seq');
+}
+expect error {
+    no such database: bogus
+}
+
+# Error on nonexistent sequence in valid schema
+test sequence-nonexistent-in-valid-schema-errors {
+    ATTACH DATABASE ':memory:' AS aux;
+    SELECT nextval('aux.no_such_seq');
+}
+expect error {
+    sequence "aux.no_such_seq" does not exist
+}

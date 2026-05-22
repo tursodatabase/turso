@@ -2921,7 +2921,20 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     let schema = self.connection.schema.read().clone();
                     self.connection.db.update_schema_if_newer(schema);
                 }
-                self.header.write().replace(tx_header);
+                // Guard the global_header write against out-of-order
+                // completion. An exclusive tx can bypass `pager_commit_lock`
+                // (the conditional at the top of BeginCommitLogicalLog) and
+                // race past us into EndCommitLogicalLog; if its end_ts is
+                // higher, its header has already been published, and our
+                // older write would regress `global_header.schema_cookie`
+                // below the latest committed value. The same monotonicity
+                // applies in FinalizeCommit below.
+                let prev_hdr_ts = mvcc_store
+                    .last_global_header_ts
+                    .fetch_max(*end_ts, Ordering::AcqRel);
+                if prev_hdr_ts <= *end_ts {
+                    self.header.write().replace(tx_header);
+                }
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
                 self.state = CommitState::CommitEnd { end_ts: *end_ts };
                 return Ok(TransitionResult::Continue);
@@ -3411,6 +3424,15 @@ pub struct MvStore<Clock: LogicalClock> {
     /// If there are two concurrent BEGIN (non-CONCURRENT) transactions, and one tries to promote
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
     last_committed_tx_ts: AtomicU64,
+    /// `end_ts` of the most recent tx whose header was written into
+    /// `global_header`. Used to gate header writes at both
+    /// `EndCommitLogicalLog` and `FinalizeCommit` so an older commit
+    /// finishing after a newer one cannot regress
+    /// `global_header.schema_cookie` below the latest committed value
+    /// — which would break `maybe_reparse_schema`'s cookie-mismatch
+    /// early-exit and strand readers in a reparse-WaitForDependencies
+    /// deadlock.
+    last_global_header_ts: AtomicU64,
     table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
 }
 
@@ -3485,6 +3507,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             durable_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
+            last_global_header_ts: AtomicU64::new(0),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
         }
     }
@@ -3781,6 +3804,32 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         // Recovery is done, switch back to regular MVCC reads.
         bootstrap_conn.promote_to_regular_connection();
+
+        // After log replay, recover sequence descriptors from each backing
+        // table. The pre-replay reparse at the top of bootstrap missed
+        // backing tables created by committed-but-not-checkpointed CREATE
+        // SEQUENCE statements; this pass goes through the normal SQL path
+        // (MVCC-aware) to register pure descriptors. The runtime watermark
+        // is never read — every nextval queries disk on demand.
+        //
+        // `load_sequence_descriptors_via_sql` classifies any read failure
+        // on an internal backing table as `LimboError::Corrupt`; bootstrap
+        // must fail rather than swallow that — opening a database whose
+        // sequence backing table is unreadable would leave the engine
+        // reporting "sequence does not exist" on the next nextval, hiding
+        // real on-disk corruption.
+        bootstrap_conn.load_sequence_descriptors_via_sql()?;
+        // Compatibility sync for AUTOINCREMENT tables created in WAL mode
+        // (where the watermark lives in sqlite_sequence) and then reopened
+        // in MVCC mode (where the new disk-only allocation path reads
+        // backing tables). Without this, the next MVCC AUTOINCREMENT
+        // INSERT would regress to start_value and collide with existing
+        // rowids — so a failure here cannot be downgraded to a warning;
+        // the inner helper now propagates I/O / corruption errors and
+        // we surface them to the caller as a hard bootstrap failure.
+        bootstrap_conn.sync_autoincrement_backing_tables_from_sqlite_sequence()?;
+        *bootstrap_conn.db.schema.lock() = bootstrap_conn.schema.read().clone();
+
         if self.global_header.read().is_none() {
             let pager = bootstrap_conn.pager.load();
             let header = pager

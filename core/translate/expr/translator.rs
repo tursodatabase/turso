@@ -1962,6 +1962,22 @@ pub fn translate_expr(
                                 [src_reg <- 0],
                                 Insn::StructField { src_reg, field_index, dest: target_register })
                         }
+                        ScalarFunc::NextVal | ScalarFunc::SetVal => translate_sequence_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        ),
+                        ScalarFunc::CurrVal => translate_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        ),
                     }
                 }
                 Func::Math(math_func) => match math_func.arity() {

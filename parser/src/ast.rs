@@ -333,6 +333,30 @@ pub enum Stmt {
         /// index name (None means optimize all indexes)
         idx_name: Option<QualifiedName>,
     },
+    /// `CREATE SEQUENCE`
+    CreateSequence {
+        /// `IF NOT EXISTS`
+        if_not_exists: bool,
+        /// sequence name
+        seq_name: QualifiedName,
+        /// start value
+        start: Option<i64>,
+        /// increment by
+        increment: Option<i64>,
+        /// minimum value
+        min_value: Option<i64>,
+        /// maximum value
+        max_value: Option<i64>,
+        /// cycle on overflow
+        cycle: bool,
+    },
+    /// `DROP SEQUENCE`
+    DropSequence {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// sequence name
+        seq_name: QualifiedName,
+    },
 }
 
 #[repr(transparent)]

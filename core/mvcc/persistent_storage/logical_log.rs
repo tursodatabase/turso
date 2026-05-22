@@ -7053,9 +7053,17 @@ mod tests {
             );
             append_encrypted_tx(&mut log, &io, tx);
 
-            // Flip a byte in the ciphertext (after log header + TX header).
+            // Tamper a 16-byte window in the ciphertext (after log header
+            // + TX header). A single-byte overwrite with 0xFF can be a no-op
+            // when the cipher output at that offset already equals 0xFF
+            // (~1/256 per run); tampering a 16-byte run with a fixed
+            // alternating pattern makes the no-op probability 1/256^16,
+            // which is effectively never.
             let corrupt_offset = (LOG_HDR_SIZE + TX_HEADER_SIZE + 1) as u64;
-            let byte_buf = Arc::new(Buffer::new(vec![0xFF]));
+            let pattern: Vec<u8> = (0..16)
+                .map(|i| if i & 1 == 0 { 0x00 } else { 0xFF })
+                .collect();
+            let byte_buf = Arc::new(Buffer::new(pattern));
             let c = Completion::new_write(move |_| {});
             io.wait_for_completion(file.pwrite(corrupt_offset, byte_buf, c).unwrap())
                 .unwrap();

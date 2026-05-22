@@ -275,6 +275,81 @@ impl Display for ReleaseSavepoint {
     }
 }
 
+/// Create a new sequence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSequence {
+    pub name: String,
+    pub start: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+}
+
+/// Drop a sequence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DropSequence {
+    pub name: String,
+}
+
+/// Advance a sequence and return its next value
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Nextval {
+    pub name: String,
+}
+
+/// Set a sequence's current value
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Setval {
+    pub name: String,
+    pub value: i64,
+    pub is_called: bool,
+}
+
+impl Display for CreateSequence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // IF NOT EXISTS: the random name generator can pick the same
+        // `seq_<n>` twice (small N) and connections can race on CREATE
+        // SEQUENCE without seeing each other's commit yet. Treating the
+        // second emission as a no-op rather than a parse error matches
+        // the model's behaviour (model's apply_state_changes already
+        // tolerates duplicate creations) and keeps the simulation from
+        // aborting on a benign duplicate.
+        write!(
+            f,
+            "CREATE SEQUENCE IF NOT EXISTS {} START WITH {} INCREMENT BY {} MINVALUE {} MAXVALUE {}{}",
+            self.name,
+            self.start,
+            self.increment,
+            self.min_value,
+            self.max_value,
+            if self.cycle { " CYCLE" } else { "" }
+        )
+    }
+}
+
+impl Display for DropSequence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DROP SEQUENCE {}", self.name)
+    }
+}
+
+impl Display for Nextval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SELECT nextval('{}')", self.name)
+    }
+}
+
+impl Display for Setval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SELECT setval('{}', {}, {})",
+            self.name, self.value, self.is_called
+        )
+    }
+}
+
 // This type represents the potential queries on the database.
 #[derive(Debug, Clone, Serialize, Deserialize, strum::EnumDiscriminants)]
 #[strum_discriminants(derive(Serialize, Deserialize))]
@@ -288,6 +363,10 @@ pub enum Query {
     CreateIndex(CreateIndex),
     AlterTable(AlterTable),
     DropIndex(DropIndex),
+    CreateSequence(CreateSequence),
+    DropSequence(DropSequence),
+    Nextval(Nextval),
+    Setval(Setval),
     Begin(Begin),
     Commit(Commit),
     Rollback(Rollback),
@@ -343,7 +422,11 @@ impl Query {
             | Query::DropIndex(DropIndex {
                 table_name: table, ..
             }) => IndexSet::from_iter([table.clone()]),
-            Query::Begin(_)
+            Query::CreateSequence(_)
+            | Query::DropSequence(_)
+            | Query::Nextval(_)
+            | Query::Setval(_)
+            | Query::Begin(_)
             | Query::Commit(_)
             | Query::Rollback(_)
             | Query::Savepoint(_)
@@ -374,6 +457,10 @@ impl Query {
             | Query::DropIndex(DropIndex {
                 table_name: table, ..
             }) => vec![table.clone()],
+            Query::CreateSequence(_)
+            | Query::DropSequence(_)
+            | Query::Nextval(_)
+            | Query::Setval(_) => vec![],
             Query::Begin(..) | Query::Commit(..) | Query::Rollback(..) => vec![],
             Query::Savepoint(..) | Query::RollbackToSavepoint(..) | Query::ReleaseSavepoint(..) => {
                 vec![]
@@ -405,6 +492,8 @@ impl Query {
                 | Self::Drop(..)
                 | Self::AlterTable(..)
                 | Self::DropIndex(..)
+                | Self::CreateSequence(..)
+                | Self::DropSequence(..)
         )
     }
 
@@ -422,6 +511,17 @@ impl Query {
     pub fn is_select(&self) -> bool {
         matches!(self, Self::Select(_))
     }
+
+    /// Statements that, in MVCC mode, must run inside an exclusive write
+    /// transaction (autocommit / BEGIN / BEGIN IMMEDIATE) and are rejected
+    /// inside BEGIN CONCURRENT. This covers DDL only — setval no longer
+    /// requires exclusive tx under the disk-only sequence design (its
+    /// DELETE-all + INSERT pattern is just data, conflict-resolved by the
+    /// normal MVCC path).
+    #[inline]
+    pub fn requires_exclusive_tx(&self) -> bool {
+        self.is_ddl()
+    }
 }
 
 impl Display for Query {
@@ -436,6 +536,10 @@ impl Display for Query {
             Self::CreateIndex(create_index) => write!(f, "{create_index}"),
             Self::AlterTable(alter_table) => write!(f, "{alter_table}"),
             Self::DropIndex(drop_index) => write!(f, "{drop_index}"),
+            Self::CreateSequence(cs) => write!(f, "{cs}"),
+            Self::DropSequence(ds) => write!(f, "{ds}"),
+            Self::Nextval(nv) => write!(f, "{nv}"),
+            Self::Setval(sv) => write!(f, "{sv}"),
             Self::Begin(begin) => write!(f, "{begin}"),
             Self::Commit(commit) => write!(f, "{commit}"),
             Self::Rollback(rollback) => write!(f, "{rollback}"),
@@ -465,6 +569,10 @@ impl Shadow for Query {
             Query::CreateIndex(create_index) => Ok(create_index.shadow(env)),
             Query::AlterTable(alter_table) => alter_table.shadow(env),
             Query::DropIndex(drop_index) => drop_index.shadow(env),
+            Query::CreateSequence(cs) => cs.shadow(env),
+            Query::DropSequence(ds) => ds.shadow(env),
+            Query::Nextval(nv) => nv.shadow(env),
+            Query::Setval(sv) => sv.shadow(env),
             Query::Begin(begin) => Ok(begin.shadow(env)),
             Query::Commit(commit) => Ok(commit.shadow(env)),
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
@@ -489,6 +597,7 @@ bitflags! {
         const CREATE_INDEX = 1 << 6;
         const ALTER_TABLE = 1 << 7;
         const DROP_INDEX = 1 << 8;
+        const SEQUENCE = 1 << 9;
     }
 }
 
@@ -519,6 +628,10 @@ impl From<QueryDiscriminants> for QueryCapabilities {
             QueryDiscriminants::CreateIndex => Self::CREATE_INDEX,
             QueryDiscriminants::AlterTable => Self::ALTER_TABLE,
             QueryDiscriminants::DropIndex => Self::DROP_INDEX,
+            QueryDiscriminants::CreateSequence
+            | QueryDiscriminants::DropSequence
+            | QueryDiscriminants::Nextval
+            | QueryDiscriminants::Setval => Self::SEQUENCE,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback
@@ -547,6 +660,10 @@ impl QueryDiscriminants {
         QueryDiscriminants::AlterTable,
         QueryDiscriminants::DropIndex,
         QueryDiscriminants::Pragma,
+        QueryDiscriminants::CreateSequence,
+        QueryDiscriminants::DropSequence,
+        QueryDiscriminants::Nextval,
+        QueryDiscriminants::Setval,
     ];
 }
 
@@ -1414,5 +1531,46 @@ impl Shadow for DropIndex {
             .indexes
             .retain(|index| index.index_name != self.index_name);
         Ok(vec![])
+    }
+}
+
+impl Shadow for CreateSequence {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        tables.create_sequence(
+            self.name.clone(),
+            self.start,
+            self.increment,
+            self.min_value,
+            self.max_value,
+            self.cycle,
+        )
+    }
+}
+
+impl Shadow for DropSequence {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        tables.drop_sequence(&self.name)
+    }
+}
+
+impl Shadow for Nextval {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        let value = tables.nextval(&self.name)?;
+        Ok(vec![vec![SimValue(Value::from_i64(value))]])
+    }
+}
+
+impl Shadow for Setval {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        let value = tables.setval(&self.name, self.value, self.is_called)?;
+        Ok(vec![vec![SimValue(Value::from_i64(value))]])
     }
 }
