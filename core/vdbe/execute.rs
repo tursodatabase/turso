@@ -192,7 +192,7 @@ use super::{Program, ProgramState, Register};
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
 use crate::vdbe::builder::CursorTypeExt;
-use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
+use crate::{bail_constraint_error, must_be_btree_cursor, EncryptionKey, MvStore, Pager, Result};
 
 type MvccCheckpointStateMachine = CheckpointStateMachine<MvccClock, DynAllocator>;
 
@@ -20553,22 +20553,23 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                         source_db.dialect(),
                     )?,
                 };
+                let (encryption_key, reserved_bytes) =
+                    if let Some(EncryptionOpts { cipher, hexkey }) = encryption_opts {
+                        let cipher_mode = CipherMode::try_from(cipher.as_str())?;
+                        (
+                            Some(EncryptionKey::from_hex_string(&hexkey)?),
+                            cipher_mode.metadata_size() as u8,
+                        )
+                    } else {
+                        (None, reserved_space)
+                    };
                 let output_conn = match page_codec {
                     Some(codec) => output_db.connect(ConnectOpts::new().with_page_codec(codec))?,
-                    None => output_db.connect(ConnectOpts::new())?,
+                    None => output_db
+                        .connect(ConnectOpts::new().with_encryption_key(encryption_key))?,
                 };
                 output_conn.reset_page_size(MAIN_DB_ID, page_size)?;
-                // set reserved_space on output to match source
-                // this is important for databases using encryption or checksums
-                // must be set before page 1 is allocated (before any schema operations)
-                if let Some(EncryptionOpts { cipher, hexkey }) = encryption_opts {
-                    let cipher_mode = CipherMode::try_from(cipher.as_str())?;
-                    output_conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
-                    output_conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
-                    output_conn.set_reserved_bytes(cipher_mode.metadata_size() as u8)?;
-                } else {
-                    output_conn.set_reserved_bytes(reserved_space)?;
-                }
+                output_conn.set_reserved_bytes(reserved_bytes)?;
 
                 mirror_symbols(&program.connection, &output_conn);
                 let source_custom_types = capture_custom_types(&program.connection, source_db_id);
