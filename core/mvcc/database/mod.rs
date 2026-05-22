@@ -22,9 +22,9 @@ use crate::translate::plan::IterationDirection;
 use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
+use crate::types::ImmutableRecord;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
-use crate::types::ImmutableRecord;
 use crate::File;
 use crate::IOExt;
 use crate::LimboError;
@@ -1694,7 +1694,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             // - append those versions to `log_record.row_versions` without sorting
             //   them against versions from other write-set entries.
 
-            let mut per_entry_versions: Vec<RowVersion> = Vec::new();
+            let entry_start = log_record.row_versions.len();
             let row_versions = row_versions.read();
 
             // A tombstone over a row that was already in the B-tree before this
@@ -1780,7 +1780,8 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                     continue;
                 };
                 canonicalize_table_id(&mut committed_version);
-                let replaces_last = per_entry_versions.last().is_some_and(|last| {
+                let entry_slice = &log_record.row_versions[entry_start..];
+                let replaces_last = entry_slice.last().is_some_and(|last| {
                     last.row.id == committed_version.row.id
                         && matches!(
                             (&last.begin, &committed_version.begin),
@@ -1791,7 +1792,8 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                         )
                 });
                 if replaces_last {
-                    *per_entry_versions
+                    *log_record
+                        .row_versions
                         .last_mut()
                         .expect("last version checked above") = committed_version;
                     continue;
@@ -1809,13 +1811,14 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                             )
                     };
                     turso_assert!(
-                        !per_entry_versions.iter().any(same_row_and_begin),
+                        !log_record.row_versions[entry_start..]
+                            .iter()
+                            .any(same_row_and_begin),
                         "one write-set entry produced non-adjacent log versions with the same row id and commit timestamp"
                     );
                 }
-                per_entry_versions.push(committed_version);
+                log_record.row_versions.push(committed_version);
             }
-            log_record.row_versions.append(&mut per_entry_versions);
         };
 
         // Process schema rows (sqlite_schema) before data/index rows so that
