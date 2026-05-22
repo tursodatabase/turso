@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.1 -- 2026-05-22
+
+### Fixed
+
+* Apply virtual gen-col affinity in OLD probe and NEW key (Mikaël Francoeur)
+* core/mvcc: make MVCC integrity_check reprepare after checkpoint root publication (Avinash Sajjanshetty)
+* core/mvcc: rollback savepoint on abandoned statement (Pere Diaz Bou)
+* core/mvcc: check schema cookie during get_commit_timestamp (Pere Diaz Bou)
+* core/mvcc: yield on big serialization of transaction (Pere Diaz Bou)
+* core/mvcc: preserve rowid allocator watermark (Avinash Sajjanshetty)
+* core/mvcc: Rollback abandoned MVCC commits on cleanup (Mikaël Francoeur)
+* core/mvcc: fix MVCC checkpoint duplicate index entries for interior index keys (Avinash Sajjanshetty)
+
 ## 0.6.0 -- 2026-05-14
 
 ### Added
