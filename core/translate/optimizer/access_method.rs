@@ -1148,8 +1148,11 @@ pub fn try_hash_join_access_method(
         "hash-join equi-join keys"
     );
 
-    // Need at least one equi-join condition
-    if join_keys.is_empty() {
+    // A hash join normally needs at least one equi-join condition. A FULL OUTER
+    // JOIN is the exception: it has no nested-loop form, so when the ON clause has
+    // no equality (e.g. `a.x < b.x`) we still build a single-bucket hash join and
+    // let the predicate apply as a residual, rather than rejecting the query.
+    if join_keys.is_empty() && hash_join_type != HashJoinType::FullOuter {
         return None;
     }
 
