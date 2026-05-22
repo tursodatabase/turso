@@ -5514,14 +5514,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     _ => {}
                 }
             }
+            // schema_rows_after is Some if the frame changes the schema
+            let schema_rows_after = schema_rows_after;
 
-            let frame_changes_schema = schema_rows_after.is_some();
             let schema_after = match schema_rows_after.as_ref() {
                 Some(schema_rows_after) => Some(build_schema(schema_rows_after)?),
                 None => None,
             };
 
-            if frame_changes_schema {
+            if schema_rows_after.is_some() {
                 // Cached IndexInfo values are tied to a specific schema. Clear
                 // before decoding a schema-changing frame so this frame chooses
                 // from its own before/after schema pair.
@@ -5530,16 +5531,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
             {
                 let should_skip_index_op = |parsed_op: &ParsedOp| -> bool {
-                    if !frame_changes_schema {
+                    let Some(schema_after) = schema_after.as_ref() else {
                         return false;
-                    }
+                    };
 
                     match parsed_op {
                         ParsedOp::UpsertIndex { table_id, .. } => {
                             let root_page = root_page_for_index(*table_id);
-                            let Some(schema_after) = schema_after.as_ref() else {
-                                return false;
-                            };
                             !schema_has_index_root(schema_after, root_page)
                         }
                         ParsedOp::DeleteIndex { table_id, .. } => {
@@ -5921,7 +5919,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 }
             }
 
-            if frame_changes_schema {
+            if schema_rows_after.is_some() {
                 // Now that all table and index ops from this transaction have
                 // been replayed, publish the frame's final schema. No later index
                 // op from this frame can observe a half-applied sqlite_schema.
