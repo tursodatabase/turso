@@ -75,9 +75,10 @@ use crate::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
-    CaptureDataChangesInfo, CdcVersion, CheckpointMode, CipherMode, Clock, Completion, ConnectOpts, Connection,
-    Database, DatabaseStorage, EncryptionOpts, IOExt, MonotonicInstant, MvCursor, NonNan, OpenFlags, QueryMode,
-    Statement, TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
+    CaptureDataChangesInfo, CdcVersion, CheckpointMode, CipherMode, Clock, Completion, ConnectOpts,
+    Connection, Database, DatabaseStorage, EncryptionOpts, IOExt, MonotonicInstant, MvCursor,
+    NonNan, OpenFlags, QueryMode, Statement, TransactionState, ValueRef, WalAutoActions,
+    WallClockInstant, MAIN_DB_ID,
 };
 use crate::{
     error::{
@@ -19350,6 +19351,9 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                         source_db.dialect(),
                     )?,
                 };
+                // set reserved_space on destination to match source or use encryption parameters,
+                // if specified. This is important for databases using encryption or checksums.
+                // Must be set before page 1 is allocated (before any schema operations)
                 let (encryption_key, reserved_bytes) =
                     if let Some(EncryptionOpts { cipher, hexkey }) = encryption_opts {
                         let cipher_mode = CipherMode::try_from(cipher.as_str())?;
@@ -19364,7 +19368,8 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     Some(codec) => output_db
                         .connect(ConnectOpts::new(SessionRole::Superuser).with_page_codec(codec))?,
                     None => output_db.connect(
-                        ConnectOpts::new(SessionRole::Superuser).with_encryption_key(encryption_key),
+                        ConnectOpts::new(SessionRole::Superuser)
+                            .with_encryption_key(encryption_key),
                     )?,
                 };
                 output_conn.reset_page_size(MAIN_DB_ID, page_size)?;
