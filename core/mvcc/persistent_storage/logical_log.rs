@@ -1265,13 +1265,8 @@ impl StreamingLogicalLogReader {
 
     /// Reads the next complete transaction frame.
     ///
-    /// Recovery needs the whole frame so it can decide which schema snapshot
-    /// should decode each index op. `next_record` keeps the older one-op-at-a-time
-    /// API for tests and other callers. This is only a different API shape over
-    /// the same parser: `parse_next_transaction` still owns EOF handling,
-    /// torn-tail detection, `last_valid_offset`, and the chained CRC update.
-    ///
-    /// Empty parsed frames are skipped, so callers that receive Some(frame) can
+    /// Recovery needs the whole frame so it can decide which schema snapshot should decode each
+    /// index op. Empty parsed frames are skipped, so callers that receive Some(frame) can
     /// rely on `frame` being non-empty.
     pub(crate) fn next_frame(&mut self, io: &Arc<dyn crate::IO>) -> Result<Option<Vec<ParsedOp>>> {
         if !self.pending_ops.is_empty() {
@@ -1302,6 +1297,10 @@ impl StreamingLogicalLogReader {
     }
 
     /// Reads next record in log.
+    ///
+    /// This is a test-only version of [Self::next_frame], and it could eventually be replaced
+    /// in tests by [Self::next_frame], which didn't exist when [Self::next_record] was written.
+    #[cfg(test)]
     pub fn next_record(
         &mut self,
         io: &Arc<dyn crate::IO>,
