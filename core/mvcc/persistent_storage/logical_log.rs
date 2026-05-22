@@ -1961,8 +1961,7 @@ impl StreamingLogicalLogReader {
                 // Compute column_count from the serialized record so recovered rows keep
                 // the same shape metadata as non-recovered rows.
                 let column_count =
-                    crate::types::ImmutableRecord::from_bin_record(record_bytes.clone())
-                        .column_count();
+                    crate::types::ImmutableRecordRef::from_bin_record(&record_bytes).column_count();
                 let row = Row::new_table_row(
                     RowID::new(table_id, rowid.row_id.clone()),
                     record_bytes,
@@ -2332,7 +2331,7 @@ mod tests {
         storage::sqlite3_ondisk::{
             read_varint, read_varint_partial, varint_len, write_varint, DatabaseHeader,
         },
-        types::{ImmutableRecord, IndexInfo, Text},
+        types::{ImmutableRecord, ImmutableRecordRef, IndexInfo, Text},
         Buffer, Completion, LimboError, Value, ValueRef,
     };
 
@@ -2543,7 +2542,7 @@ mod tests {
             .read(tx, &RowID::new((-100).into(), RowKey::Int(1)))
             .unwrap()
             .unwrap();
-        let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
+        let record = ImmutableRecordRef::from_bin_record(row.payload());
         let foo = record.iter().unwrap().next().unwrap().unwrap();
         let ValueRef::Text(foo) = foo else {
             unreachable!()
@@ -2621,7 +2620,7 @@ mod tests {
         for (rowid, value) in &values {
             let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
             let row = mvcc_store.read(tx, rowid).unwrap().unwrap();
-            let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
+            let record = ImmutableRecordRef::from_bin_record(row.payload());
             let foo = record.iter().unwrap().next().unwrap().unwrap();
             let ValueRef::Text(foo) = foo else {
                 unreachable!()
@@ -2740,7 +2739,7 @@ mod tests {
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
         for present_rowid in present_rowids {
             let row = mvcc_store.read(tx, &present_rowid).unwrap().unwrap();
-            let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
+            let record = ImmutableRecordRef::from_bin_record(row.payload());
             let foo = record.iter().unwrap().next().unwrap().unwrap();
             let ValueRef::Text(foo) = foo else {
                 unreachable!()
@@ -2820,7 +2819,7 @@ mod tests {
                 .read(tx, &RowID::new(table_id, RowKey::Int(row_id)))
                 .unwrap()
                 .expect("Table row should exist");
-            let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
+            let record = ImmutableRecordRef::from_bin_record(row.payload());
             let values = record.get_values().unwrap();
             let data_value = values.get(1).expect("Should have data column");
             let ValueRef::Text(data_text) = data_value else {

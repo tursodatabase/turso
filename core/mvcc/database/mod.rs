@@ -22,9 +22,9 @@ use crate::translate::plan::IterationDirection;
 use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
-use crate::types::ImmutableRecord;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
+use crate::types::{ImmutableRecord, ImmutableRecordRef};
 use crate::File;
 use crate::IOExt;
 use crate::LimboError;
@@ -5240,8 +5240,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     }
                     let is_schema_row = rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
                     if is_schema_row {
-                        let row_data = row.payload().to_vec();
-                        let record = ImmutableRecord::from_bin_record(row_data);
+                        let record = ImmutableRecordRef::from_bin_record(row.payload());
                         if record.column_count() < 5 {
                             return Err(LimboError::Corrupt(format!(
                                 "sqlite_schema row must have at least 5 columns, got {}",
@@ -5310,7 +5309,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             )));
                         }
                         let rowid_int = rowid.row_id.to_int_or_panic();
-                        schema_rows.insert(rowid_int, record);
+                        schema_rows.insert(
+                            rowid_int,
+                            ImmutableRecord::from_bin_record(row.payload().to_vec()),
+                        );
                         needs_schema_rebuild.set(true);
                     } else if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
                         // Data row references a table_id not yet in the map. This can happen
