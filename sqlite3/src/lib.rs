@@ -258,7 +258,13 @@ unsafe fn dispatch_func_bridge(slot_id: usize, argc: i32, argv: *const ExtValue)
 // Each bridges turso_core's ScalarFunction ABI to the C sqlite3_create_function_v2 callback.
 macro_rules! func_bridge {
     ($id:literal, $name:ident) => {
-        unsafe extern "C" fn $name(_context: usize, argc: i32, argv: *const ExtValue) -> ExtValue {
+        unsafe extern "C" fn $name(
+            _context: usize,
+            argc: i32,
+            argv: *const ExtValue,
+            _context_destructor: Option<turso_ext::ContextDestructor>,
+            _value_destructor: Option<turso_ext::ValueDestructor>,
+        ) -> ExtValue {
             dispatch_func_bridge($id, argc, argv)
         }
     };

@@ -4,10 +4,15 @@ use std::{
     fmt::Display,
 };
 
-pub type ScalarFunction =
-    unsafe extern "C" fn(context: usize, argc: i32, argv: *const Value) -> Value;
 pub type ContextDestructor = unsafe extern "C" fn(context: usize);
 pub type ValueDestructor = unsafe extern "C" fn(result: *mut Value);
+pub type ScalarFunction = unsafe extern "C" fn(
+    context: usize,
+    argc: i32,
+    argv: *const Value,
+    context_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ValueDestructor>,
+) -> Value;
 
 pub type RegisterScalarFn = unsafe extern "C" fn(
     ctx: *mut c_void,

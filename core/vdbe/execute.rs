@@ -8167,6 +8167,7 @@ pub fn op_function(
             ExtFunc::Scalar {
                 context,
                 callback,
+                context_destructor,
                 value_destructor,
                 ..
             } => {
@@ -8182,7 +8183,15 @@ pub fn op_function(
                 } else {
                     ext_values.as_ptr()
                 };
-                let mut result = unsafe { callback(context, arg_count as i32, argv_ptr) };
+                let mut result = unsafe {
+                    callback(
+                        context,
+                        arg_count as i32,
+                        argv_ptr,
+                        context_destructor,
+                        value_destructor,
+                    )
+                };
                 let value = Value::from_ffi_ref(&result);
                 if let Some(value_destructor) = value_destructor {
                     unsafe { value_destructor(&mut result) };

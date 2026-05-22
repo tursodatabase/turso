@@ -11,7 +11,7 @@ mod vfs_derive;
 mod vtab_derive;
 pub use agg_derive::derive_agg_func;
 pub use match_ignore_ascii_case::match_ignore_ascci_case;
-pub use scalars::scalar;
+pub use scalars::{scalar, scalar_context};
 pub use vfs_derive::derive_vfs_module;
 pub use vtab_derive::derive_vtab_module;
 

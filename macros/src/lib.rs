@@ -320,6 +320,24 @@ pub fn scalar(attr: TokenStream, input: TokenStream) -> TokenStream {
     ext::scalar(attr, input)
 }
 
+/// Declare a context-aware scalar function for your extension.
+/// ```ignore
+/// use turso_ext::{scalar_context, ContextDestructor, Value, ValueDestructor};
+/// #[scalar_context(name = "context_double")]
+/// fn context_double(
+///     ctx: usize,
+///     args: &[Value],
+///     context_destructor: Option<ContextDestructor>,
+///     value_destructor: Option<ValueDestructor>,
+/// ) -> Value {
+///     Value::from_integer(ctx as i64 + args[0].to_integer().unwrap_or_default())
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn scalar_context(attr: TokenStream, input: TokenStream) -> TokenStream {
+    ext::scalar_context(attr, input)
+}
+
 /// Define an aggregate function for your extension by deriving
 /// AggregateDerive on a struct that implements the AggFunc trait.
 /// ```ignore

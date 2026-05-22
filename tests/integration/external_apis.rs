@@ -87,7 +87,13 @@ struct ScalarContext {
     counters: Arc<CallbackCounters>,
 }
 
-unsafe extern "C" fn managed_score(context: usize, argc: i32, argv: *const ExtValue) -> ExtValue {
+unsafe extern "C" fn managed_score(
+    context: usize,
+    argc: i32,
+    argv: *const ExtValue,
+    _context_destructor: Option<ContextDestructor>,
+    _value_destructor: Option<ValueDestructor>,
+) -> ExtValue {
     let ctx = unsafe { &*(context as *const ScalarContext) };
     ctx.counters.calls.fetch_add(1, AtomicOrdering::SeqCst);
     let args = if argc <= 0 || argv.is_null() {
@@ -125,7 +131,13 @@ unsafe extern "C" fn managed_score(context: usize, argc: i32, argv: *const ExtVa
     )
 }
 
-unsafe extern "C" fn managed_result(context: usize, argc: i32, argv: *const ExtValue) -> ExtValue {
+unsafe extern "C" fn managed_result(
+    context: usize,
+    argc: i32,
+    argv: *const ExtValue,
+    _context_destructor: Option<ContextDestructor>,
+    _value_destructor: Option<ValueDestructor>,
+) -> ExtValue {
     let ctx = unsafe { &*(context as *const ScalarContext) };
     ctx.counters.calls.fetch_add(1, AtomicOrdering::SeqCst);
     let args = if argc <= 0 || argv.is_null() {
@@ -149,6 +161,8 @@ unsafe extern "C" fn managed_variadic_score(
     context: usize,
     argc: i32,
     argv: *const ExtValue,
+    _context_destructor: Option<ContextDestructor>,
+    _value_destructor: Option<ValueDestructor>,
 ) -> ExtValue {
     let ctx = unsafe { &*(context as *const ScalarContext) };
     ctx.counters.calls.fetch_add(1, AtomicOrdering::SeqCst);
@@ -184,6 +198,24 @@ unsafe extern "C" fn managed_variadic_score(
             .unwrap_or_default() as i64
         + null_count;
     ExtValue::from_integer(score * ctx.multiplier)
+}
+
+#[turso_ext::scalar_context(name = "managed_macro_score")]
+fn managed_macro_score(
+    context: usize,
+    args: &[ExtValue],
+    context_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ValueDestructor>,
+) -> ExtValue {
+    let ctx = unsafe { &*(context as *const ScalarContext) };
+    ctx.counters.calls.fetch_add(1, AtomicOrdering::SeqCst);
+    let destructor_bonus =
+        i64::from(context_destructor.is_some()) + i64::from(value_destructor.is_some());
+    let arg = args
+        .first()
+        .and_then(ExtValue::to_integer)
+        .unwrap_or_default();
+    ExtValue::from_integer((arg * ctx.multiplier) + destructor_bonus)
 }
 
 unsafe extern "C" fn drop_scalar_context(context: usize) {
@@ -248,6 +280,36 @@ fn unregister_extension_function(conn: &Connection, name: &str) -> anyhow::Resul
     if result != ResultCode::OK {
         anyhow::bail!("extension function unregister failed: {result}");
     }
+    Ok(())
+}
+
+#[turso_macros::test]
+#[serial]
+fn managed_scalar_context_macro_uses_extension_api_fields(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    SCALAR_VALUE_DROPS.store(0, AtomicOrdering::SeqCst);
+    let counters = Arc::new(CallbackCounters::default());
+    let conn = tmp_db.connect_limbo();
+
+    register_context_scalar(
+        &conn,
+        "managed_macro_score",
+        1,
+        true,
+        boxed_scalar_context(10, counters.clone()),
+        managed_macro_score,
+        Some(drop_scalar_context),
+        Some(count_scalar_value_drop),
+    )?;
+
+    let score: Vec<(i64,)> = conn.exec_rows("SELECT managed_macro_score(4)");
+    assert_eq!(score, vec![(42,)]);
+    assert_eq!(SCALAR_VALUE_DROPS.load(AtomicOrdering::SeqCst), 1);
+
+    unregister_extension_function(&conn, "managed_macro_score")?;
+    assert_eq!(counters.context_drops.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(counters.calls.load(AtomicOrdering::SeqCst), 1);
     Ok(())
 }
 
