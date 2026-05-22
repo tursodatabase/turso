@@ -2341,6 +2341,13 @@ impl Program {
                 // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
                 // and the caller is expected to handle transaction cleanup explicitly if needed.
                 Some(LimboError::SchemaUpdated) => {}
+                Some(LimboError::WriteWriteConflict | LimboError::SchemaConflict) => {
+                    // These MVCC errors mean the current transaction cannot
+                    // commit. Roll it back even if this statement opened a
+                    // statement savepoint, as DDL does.
+                    self.rollback_current_txn(pager);
+                    self.connection.set_changes_without_total(0);
+                }
                 // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
                 // FK errors always behave like ABORT: rollback statement,
                 // rollback transaction in autocommit mode.

@@ -16,7 +16,7 @@ use crate::storage::sqlite3_ondisk::{
     checksum_wal, read_varint, write_varint, DatabaseHeader, WalHeader, WAL_FRAME_HEADER_SIZE,
     WAL_HEADER_SIZE,
 };
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
 use crate::vdbe::execute::TransactionYieldPoint;
@@ -11478,6 +11478,156 @@ fn test_read_lock_leak_deferred_then_concurrent() {
     // After the error, SELECT should work without panicking
     let rows = get_rows(&conn1, "SELECT * FROM t1");
     assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn test_schema_change_succeeds_while_concurrent_writer_aborts_at_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
+    setup.close().unwrap();
+
+    let ddl = db.connect();
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer
+        .execute("UPDATE t SET c = 'writer' WHERE id = 1")
+        .unwrap();
+
+    ddl.execute("ALTER TABLE t ADD COLUMN extra INTEGER")
+        .unwrap();
+
+    let commit_err = writer
+        .execute("COMMIT")
+        .expect_err("writer snapshot predates committed schema change");
+    assert!(matches!(commit_err, LimboError::SchemaConflict));
+    assert!(
+        writer.get_auto_commit(),
+        "SchemaConflict should roll back the stale writer transaction"
+    );
+
+    let verify = db.connect();
+    let columns = get_rows(&verify, "PRAGMA table_info(t)");
+    let column_names: Vec<String> = columns.iter().map(|row| row[1].to_string()).collect();
+    assert_eq!(column_names, vec!["id", "c", "extra"]);
+    let rows = get_rows(&verify, "SELECT id, c, extra FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1].to_string(), "a");
+    assert!(matches!(&rows[0][2], crate::types::Value::Null));
+}
+
+#[test]
+fn test_create_index_succeeds_while_concurrent_writer_aborts_at_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT, keep INTEGER)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES(1, 'a', 10)").unwrap();
+    setup.execute("INSERT INTO t VALUES(2, 'b', 20)").unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES(3, 'c', 30)").unwrap();
+
+    let ddl = db.connect();
+    ddl.execute("CREATE INDEX idx_t_c ON t(c)").unwrap();
+
+    let commit_err = writer
+        .execute("COMMIT")
+        .expect_err("writer snapshot predates committed schema change");
+    assert!(matches!(commit_err, LimboError::SchemaConflict));
+    assert!(writer.get_auto_commit());
+
+    let verify = db.connect();
+    let rows = get_rows(&verify, "SELECT id, c, keep FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    let indexes = get_rows(
+        &verify,
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'idx_t_c'",
+    );
+    assert_eq!(indexes.len(), 1);
+    let rows = get_rows(&verify, "PRAGMA integrity_check");
+    assert_eq!(rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_exclusive_update_conflicts_with_concurrent_delete_without_replacing_marker() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, text TEXT)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t VALUES(1, 'original')")
+        .unwrap();
+    setup.close().unwrap();
+
+    let concurrent = db.connect();
+    let exclusive = db.connect();
+    concurrent.execute("BEGIN CONCURRENT").unwrap();
+    concurrent.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    let update_err = exclusive
+        .execute("UPDATE t SET text = 'exclusive' WHERE id = 1")
+        .expect_err("exclusive writer must not replace another transaction's delete marker");
+    assert!(matches!(update_err, LimboError::WriteWriteConflict));
+    assert!(exclusive.get_auto_commit());
+
+    let rows = get_rows(&concurrent, "SELECT * FROM t");
+    assert!(
+        rows.is_empty(),
+        "concurrent tx should still see its own delete"
+    );
+    concurrent.execute("COMMIT").unwrap();
+    assert!(
+        concurrent.get_auto_commit(),
+        "concurrent transaction should remain usable after rejected exclusive write"
+    );
+
+    let rows = get_rows(&exclusive, "SELECT id, text FROM t");
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn test_explicit_delete_conflicts_with_concurrent_delete_without_replacing_marker() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, text TEXT)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t VALUES(1, 'original')")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES(2, 'keep')").unwrap();
+    setup.close().unwrap();
+
+    let concurrent = db.connect();
+    let exclusive = db.connect();
+    concurrent.execute("BEGIN CONCURRENT").unwrap();
+    concurrent.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    exclusive.execute("BEGIN").unwrap();
+    let rows = get_rows(&exclusive, "SELECT * FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    let delete_err = exclusive
+        .execute("DELETE FROM t WHERE id = 1")
+        .expect_err("exclusive delete must conflict instead of stealing row marker");
+    assert!(matches!(delete_err, LimboError::WriteWriteConflict));
+    assert!(exclusive.get_auto_commit());
+
+    let rows = get_rows(&concurrent, "SELECT * FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    concurrent.execute("COMMIT").unwrap();
+    let rows = get_rows(&exclusive, "SELECT id, text FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
 }
 
 /// Regression for #6754: dropping a Statement that paused mid-IO inside
