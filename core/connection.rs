@@ -1757,8 +1757,6 @@ impl Connection {
             match value {
                 Some(value) => {
                     metadata.insert(key, value);
-                    self.portable_logical_changes_enabled
-                        .store(true, Ordering::Release);
                 }
                 None => {
                     metadata.remove(&key);
@@ -1772,8 +1770,8 @@ impl Connection {
     }
 
     #[cfg(feature = "conn_raw_api")]
-    pub(crate) fn take_mvcc_log_meta(&self) -> HashMap<String, String> {
-        std::mem::take(&mut *self.mvcc_log_metadata.write())
+    pub(crate) fn mvcc_log_meta_snapshot(&self) -> HashMap<String, String> {
+        self.mvcc_log_metadata.read().clone()
     }
 
     pub(crate) fn clear_mvcc_log_meta(&self) {

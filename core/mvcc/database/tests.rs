@@ -13,7 +13,7 @@ use crate::mvcc::persistent_storage::logical_log::{
 };
 #[cfg(feature = "conn_raw_api")]
 use crate::mvcc::portable_logical::{
-    encode_schema_logical_op, PortableSchemaRow, LOGICAL_SCHEMA_CREATE, LOGICAL_SCHEMA_REFRESH,
+    PortableLogicalBuilder, PortableSchemaRow, LOGICAL_SCHEMA_CREATE, LOGICAL_SCHEMA_REFRESH,
 };
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
@@ -11177,16 +11177,18 @@ fn assert_log_payloads_decrypt(
         let op_count = u32::from_le_bytes(log_bytes[offset + 12..offset + 16].try_into().unwrap());
         let commit_ts = u64::from_le_bytes(log_bytes[offset + 16..offset + 24].try_into().unwrap());
 
+        let encrypted_plaintext_size = payload_size + extension_size;
         let mut payload_offset = offset + header_size;
-        let chunk_count = if payload_size == 0 {
+        let chunk_count = if encrypted_plaintext_size == 0 {
             0
         } else {
-            payload_size.div_ceil(ENCRYPTED_PAYLOAD_CHUNK_SIZE)
+            encrypted_plaintext_size.div_ceil(ENCRYPTED_PAYLOAD_CHUNK_SIZE)
         };
 
         let mut frame_complete = true;
         for chunk_index in 0..chunk_count {
-            let chunk_plaintext_len = (payload_size - chunk_index * ENCRYPTED_PAYLOAD_CHUNK_SIZE)
+            let chunk_plaintext_len = (encrypted_plaintext_size
+                - chunk_index * ENCRYPTED_PAYLOAD_CHUNK_SIZE)
                 .min(ENCRYPTED_PAYLOAD_CHUNK_SIZE);
             let chunk_on_disk_size = chunk_plaintext_len + tag_size + nonce_size;
             if payload_offset + chunk_on_disk_size + TX_TRAILER_SIZE > log_bytes.len() {
@@ -11201,7 +11203,7 @@ fn assert_log_payloads_decrypt(
             let mut aad = [0u8; 32];
             aad[..8].copy_from_slice(&salt.to_le_bytes());
             if chunk_index + 1 == chunk_count {
-                aad[8..16].copy_from_slice(&(payload_size as u64).to_le_bytes());
+                aad[8..16].copy_from_slice(&(encrypted_plaintext_size as u64).to_le_bytes());
             }
             aad[16..20].copy_from_slice(&op_count.to_le_bytes());
             aad[20..28].copy_from_slice(&commit_ts.to_le_bytes());
@@ -11222,7 +11224,7 @@ fn assert_log_payloads_decrypt(
         }
 
         frame_count += 1;
-        offset = payload_offset + extension_size + TX_TRAILER_SIZE; // skip extension block and trailer
+        offset = payload_offset + TX_TRAILER_SIZE; // skip encrypted body and trailer
     }
 
     assert!(
@@ -11240,6 +11242,28 @@ fn collect_mvcc_portable_change_bytes(conn: &Arc<Connection>) -> Vec<u8> {
         .clone();
     let io = conn.get_pager().io.clone();
     let mut reader = StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), None);
+    reader.read_header(&io).unwrap();
+
+    let mut portable_changes = Vec::new();
+    while let Some(frame) = reader.next_portable_changes(&io).unwrap() {
+        portable_changes.extend_from_slice(&frame.payload);
+    }
+    portable_changes
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn collect_mvcc_portable_change_bytes_with_encryption(
+    conn: &Arc<Connection>,
+    encryption_ctx: crate::storage::encryption::EncryptionContext,
+) -> Vec<u8> {
+    let mv_store = conn
+        .mv_store()
+        .as_ref()
+        .expect("test database must be in MVCC mode")
+        .clone();
+    let io = conn.get_pager().io.clone();
+    let mut reader =
+        StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), Some(encryption_ctx));
     reader.read_header(&io).unwrap();
 
     let mut portable_changes = Vec::new();
@@ -11268,6 +11292,8 @@ struct DecodedPortableOp {
     user_version: Option<u64>,
     application_id: Option<u64>,
     stable_table_id: Option<u64>,
+    mv_table_id: Option<i64>,
+    record_len: usize,
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -11286,6 +11312,11 @@ fn read_proto_varint(bytes: &[u8], offset: &mut usize) -> u64 {
 }
 
 #[cfg(feature = "conn_raw_api")]
+fn decode_proto_sint64(value: u64) -> i64 {
+    ((value >> 1) as i64) ^ (-((value & 1) as i64))
+}
+
+#[cfg(feature = "conn_raw_api")]
 fn skip_proto_field(bytes: &[u8], offset: &mut usize, wire_type: u64) {
     match wire_type {
         0 => {
@@ -11300,7 +11331,56 @@ fn skip_proto_field(bytes: &[u8], offset: &mut usize, wire_type: u64) {
 }
 
 #[cfg(feature = "conn_raw_api")]
-fn decode_portable_op(bytes: &[u8]) -> DecodedPortableOp {
+#[derive(Clone, Debug)]
+struct DecodedObjectMap {
+    stable_table_id: u64,
+    name: String,
+    sql: String,
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn decode_object_map(bytes: &[u8], strings: &[String]) -> Option<(i64, DecodedObjectMap)> {
+    let mut offset = 0usize;
+    let mut mv_table_id = None;
+    let mut stable_table_id = None;
+    let mut name = String::new();
+    let mut sql = String::new();
+    while offset < bytes.len() {
+        let key = read_proto_varint(bytes, &mut offset);
+        let field = key >> 3;
+        let wire_type = key & 7;
+        match (field, wire_type) {
+            (1, 0) => {
+                mv_table_id = Some(decode_proto_sint64(read_proto_varint(bytes, &mut offset)))
+            }
+            (2, 0) => stable_table_id = Some(read_proto_varint(bytes, &mut offset)),
+            (4, 0) => {
+                let idx = read_proto_varint(bytes, &mut offset) as usize;
+                name = strings.get(idx).cloned().unwrap_or_default();
+            }
+            (6, 0) => {
+                let idx = read_proto_varint(bytes, &mut offset) as usize;
+                sql = strings.get(idx).cloned().unwrap_or_default();
+            }
+            _ => skip_proto_field(bytes, &mut offset, wire_type),
+        }
+    }
+    Some((
+        mv_table_id?,
+        DecodedObjectMap {
+            stable_table_id: stable_table_id?,
+            name,
+            sql,
+        },
+    ))
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn decode_portable_op(
+    bytes: &[u8],
+    strings: &[String],
+    object_maps: &std::collections::HashMap<i64, DecodedObjectMap>,
+) -> DecodedPortableOp {
     let mut op = DecodedPortableOp {
         op_type: u64::MAX,
         schema_action: None,
@@ -11311,6 +11391,8 @@ fn decode_portable_op(bytes: &[u8]) -> DecodedPortableOp {
         user_version: None,
         application_id: None,
         stable_table_id: None,
+        mv_table_id: None,
+        record_len: 0,
     };
     let mut offset = 0usize;
     while offset < bytes.len() {
@@ -11323,6 +11405,22 @@ fn decode_portable_op(bytes: &[u8]) -> DecodedPortableOp {
             (7, 0) => op.application_id = Some(read_proto_varint(bytes, &mut offset)),
             (8, 0) => op.schema_action = Some(read_proto_varint(bytes, &mut offset)),
             (9, 0) => op.schema_kind = Some(read_proto_varint(bytes, &mut offset)),
+            (12, 0) => {
+                op.mv_table_id = Some(decode_proto_sint64(read_proto_varint(bytes, &mut offset)));
+            }
+            (13, 0) => {
+                let idx = read_proto_varint(bytes, &mut offset) as usize;
+                op.sql = strings.get(idx).cloned().unwrap_or_default();
+            }
+            (14, 0) => {
+                let idx = read_proto_varint(bytes, &mut offset) as usize;
+                op.schema_name = strings.get(idx).cloned().unwrap_or_default();
+            }
+            (4, 2) => {
+                let len = read_proto_varint(bytes, &mut offset) as usize;
+                op.record_len = len;
+                offset += len;
+            }
             (2, 2) => {
                 let len = read_proto_varint(bytes, &mut offset) as usize;
                 op.table_name = String::from_utf8(bytes[offset..offset + len].to_vec()).unwrap();
@@ -11342,6 +11440,15 @@ fn decode_portable_op(bytes: &[u8]) -> DecodedPortableOp {
             _ => skip_proto_field(bytes, &mut offset, wire_type),
         }
     }
+    if let Some(mv_table_id) = op.mv_table_id {
+        if let Some(object) = object_maps.get(&mv_table_id) {
+            op.table_name = object.name.clone();
+            op.stable_table_id = Some(object.stable_table_id);
+            if op.sql.is_empty() {
+                op.sql = object.sql.clone();
+            }
+        }
+    }
     op
 }
 
@@ -11355,6 +11462,34 @@ fn decode_portable_change_ops(portable_changes: &[u8]) -> Vec<DecodedPortableOp>
         let txn = &portable_changes[offset..txn_end];
         offset = txn_end;
 
+        let mut strings = Vec::new();
+        let mut object_blobs = Vec::new();
+        let mut scan_offset = 0usize;
+        while scan_offset < txn.len() {
+            let key = read_proto_varint(txn, &mut scan_offset);
+            let field = key >> 3;
+            let wire_type = key & 7;
+            match (field, wire_type) {
+                (12, 2) => {
+                    let len = read_proto_varint(txn, &mut scan_offset) as usize;
+                    strings.push(
+                        String::from_utf8(txn[scan_offset..scan_offset + len].to_vec()).unwrap(),
+                    );
+                    scan_offset += len;
+                }
+                (13, 2) => {
+                    let len = read_proto_varint(txn, &mut scan_offset) as usize;
+                    object_blobs.push(txn[scan_offset..scan_offset + len].to_vec());
+                    scan_offset += len;
+                }
+                _ => skip_proto_field(txn, &mut scan_offset, wire_type),
+            }
+        }
+        let object_maps = object_blobs
+            .iter()
+            .filter_map(|object| decode_object_map(object, &strings))
+            .collect::<std::collections::HashMap<_, _>>();
+
         let mut txn_offset = 0usize;
         while txn_offset < txn.len() {
             let key = read_proto_varint(txn, &mut txn_offset);
@@ -11362,7 +11497,11 @@ fn decode_portable_change_ops(portable_changes: &[u8]) -> Vec<DecodedPortableOp>
             let wire_type = key & 7;
             if field == 3 && wire_type == 2 {
                 let op_len = read_proto_varint(txn, &mut txn_offset) as usize;
-                ops.push(decode_portable_op(&txn[txn_offset..txn_offset + op_len]));
+                ops.push(decode_portable_op(
+                    &txn[txn_offset..txn_offset + op_len],
+                    &strings,
+                    &object_maps,
+                ));
                 txn_offset += op_len;
             } else {
                 skip_proto_field(txn, &mut txn_offset, wire_type);
@@ -11409,21 +11548,23 @@ fn test_mvcc_portable_changes_encoder_matches_logical_op_wire_golden() {
         rootpage: 0,
         sql: Some("CREATE VIEW v AS SELECT 1".to_string()),
     };
-    let mut encoded = Vec::new();
-
-    encode_schema_logical_op(LOGICAL_SCHEMA_CREATE, &row, None, &mut encoded);
+    let mut builder = PortableLogicalBuilder::new();
+    builder.encode_schema_logical_op(LOGICAL_SCHEMA_CREATE, &row, None);
+    let encoded = builder.finish(None);
 
     assert_eq!(
         encoded,
         vec![
-            0x1a, 0x24, // PortableLogicalTxn.ops, length 36
-            0x08, 0x02, // LogicalOp.op_type = Schema
-            0x2a, 0x19, // LogicalOp.sql, length 25
+            0x62, 0x01, b'v', // PortableLogicalTxn.string_table[0] = "v"
+            0x62, 0x19, // PortableLogicalTxn.string_table[1] = SQL
             b'C', b'R', b'E', b'A', b'T', b'E', b' ', b'V', b'I', b'E', b'W', b' ', b'v', b' ',
-            b'A', b'S', b' ', b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1', 0x40,
-            0x00, // LogicalOp.schema_action = Create
+            b'A', b'S', b' ', b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1', 0x1a,
+            0x0a, // PortableLogicalTxn.ops, length 10
+            0x08, 0x02, // LogicalOp.op_type = Schema
+            0x40, 0x00, // LogicalOp.schema_action = Create
             0x48, 0x03, // LogicalOp.schema_kind = View
-            0x52, 0x01, b'v', // LogicalOp.schema_name = "v"
+            0x68, 0x01, // LogicalOp.sql_ref = 1
+            0x70, 0x00, // LogicalOp.schema_name_ref = 0
         ]
     );
 }
@@ -11571,7 +11712,7 @@ fn test_mvcc_portable_changes_emit_drop_and_create_for_drop_recreate_same_name()
 
 #[cfg(feature = "conn_raw_api")]
 #[test]
-fn test_mvcc_portable_changes_omit_row_table_name_after_schema_identity_in_same_txn() {
+fn test_mvcc_portable_changes_resolve_rows_through_object_map_in_same_txn() {
     let db = MvccTestDb::new();
     db.conn.execute("BEGIN").unwrap();
     db.conn
@@ -11594,7 +11735,8 @@ fn test_mvcc_portable_changes_omit_row_table_name_after_schema_identity_in_same_
         .find(|op| op.op_type == 0 && op.stable_table_id == Some(schema_id))
         .expect("row op should carry matching stable table id");
 
-    assert!(row_op.table_name.is_empty());
+    assert_eq!(row_op.table_name, "items");
+    assert!(row_op.mv_table_id.is_some());
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -11810,6 +11952,28 @@ fn test_mvcc_portable_changes_emit_ddl_and_backfill_rows_in_same_transaction() {
 
 #[cfg(feature = "conn_raw_api")]
 #[test]
+fn test_mvcc_portable_changes_delete_carries_old_record_for_primary_key_derivation() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE items(id TEXT PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES ('item-a', 'alpha')")
+        .unwrap();
+    db.conn
+        .execute("DELETE FROM items WHERE id = 'item-a'")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let ops = decode_portable_change_ops(&portable_changes);
+
+    assert!(ops
+        .iter()
+        .any(|op| op.op_type == 1 && op.table_name == "items" && op.record_len > 0));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
 fn test_mvcc_portable_changes_do_not_infer_origin_from_application_table() {
     let db = MvccTestDb::new();
     db.conn
@@ -11841,6 +12005,68 @@ fn test_mvcc_portable_changes_do_not_infer_origin_from_application_table() {
     assert!(ops
         .iter()
         .any(|op| op.op_type == 0 && op.table_name == "items"));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_metadata_does_not_auto_enable_or_get_consumed() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:").unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.set_mvcc_log_meta("client".to_string(), Some("client-a".to_string()));
+    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO items VALUES (1, 'alpha')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&conn);
+    assert!(portable_changes.is_empty());
+
+    conn.set_portable_logical_changes_enabled(true);
+    conn.execute("INSERT INTO items VALUES (2, 'beta')")
+        .unwrap();
+    conn.execute("INSERT INTO items VALUES (3, 'gamma')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&conn);
+    let origins = decode_portable_change_origins(&portable_changes);
+    assert_eq!(
+        origins,
+        vec!["client-a".to_string(), "client-a".to_string()]
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_are_encrypted_with_log_body() {
+    use crate::storage::encryption::{CipherMode, EncryptionContext};
+
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let conn = db.connect();
+    conn.set_portable_logical_changes_enabled(true);
+    conn.execute("CREATE TABLE secret_items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO secret_items VALUES (1, 'secret-alpha')")
+        .unwrap();
+
+    let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
+    let log_bytes = std::fs::read(log_path).unwrap();
+    assert!(!bytes_contain(&log_bytes, b"secret_items"));
+    assert!(!bytes_contain(&log_bytes, b"secret-alpha"));
+
+    let key = EncryptionKey::from_hex_string(hex_key).unwrap();
+    let enc_ctx = EncryptionContext::new(CipherMode::Aes256Gcm, &key, 4096).unwrap();
+    let portable_changes = collect_mvcc_portable_change_bytes_with_encryption(&conn, enc_ctx);
+    let ops = decode_portable_change_ops(&portable_changes);
+
+    assert!(ops
+        .iter()
+        .any(|op| op.op_type == 2 && op.schema_name == "secret_items"));
+    assert!(ops
+        .iter()
+        .any(|op| op.op_type == 0 && op.table_name == "secret_items"));
 }
 
 /// Encrypted version of test_recovery_checkpoint_then_more_writes.

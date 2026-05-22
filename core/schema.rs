@@ -742,6 +742,8 @@ impl Schema {
 
     pub fn with_options(enable_custom_types: bool) -> crate::Result<Self> {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
+        #[cfg(feature = "conn_raw_api")]
+        let mut table_names_by_root_page = HashMap::default();
         let has_indexes = HashSet::default();
         let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
         #[allow(clippy::arc_with_non_send_sync)]
@@ -749,6 +751,8 @@ impl Schema {
             SCHEMA_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(sqlite_schema_table().into())),
         );
+        #[cfg(feature = "conn_raw_api")]
+        table_names_by_root_page.insert(1, SCHEMA_TABLE_NAME.to_string());
         for function in VirtualTable::builtin_functions(enable_custom_types) {
             tables.insert(
                 function.name.to_owned(),
@@ -769,7 +773,7 @@ impl Schema {
         Ok(Self {
             tables,
             #[cfg(feature = "conn_raw_api")]
-            table_names_by_root_page: HashMap::default(),
+            table_names_by_root_page,
             materialized_view_names,
             materialized_view_sql,
             incremental_views,
@@ -954,6 +958,8 @@ impl Schema {
         let name = normalize_ident(view.name());
 
         // Add to tables (so it appears as a regular table)
+        #[cfg(feature = "conn_raw_api")]
+        self.register_table_root_page(&name, table.as_ref());
         self.tables.insert(name.clone(), table);
 
         // Track that this is a materialized view
@@ -1009,11 +1015,11 @@ impl Schema {
             Ok(())
         } else if self.materialized_view_names.contains(&name) {
             // Remove from tables
-            self.tables.remove(&name);
+            self.remove_table(&name);
 
             // Remove DBSP state table and its indexes from in-memory schema
             let dbsp_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{name}");
-            self.tables.remove(&dbsp_table_name);
+            self.remove_table(&dbsp_table_name);
             self.remove_indices_for_table(&dbsp_table_name);
 
             // Remove from materialized view tracking
@@ -1203,12 +1209,15 @@ impl Schema {
     pub fn remove_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
         #[cfg(feature = "conn_raw_api")]
-        if let Some(table) = self.tables.get(&name) {
-            if let Table::BTree(table) = table.as_ref() {
-                self.table_names_by_root_page.remove(&table.root_page);
+        {
+            if let Some(table) = self.tables.remove(&name) {
+                self.unregister_table_root_page(&table);
             }
         }
-        self.tables.remove(&name);
+        #[cfg(not(feature = "conn_raw_api"))]
+        {
+            self.tables.remove(&name);
+        }
         self.analyze_stats.remove_table(&name);
 
         // If this was a materialized view, also clean up the metadata

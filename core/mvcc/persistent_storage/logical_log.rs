@@ -52,12 +52,13 @@
 //!     └─────────────────────────────────────────┘
 //! ```
 //!
-//! When encryption is enabled, only the payload is encrypted. The log header,
-//! TX header, and TX trailer are always written in plaintext. The log header's salt and TX header
-//! fields (op_count, commit_ts, and the final chunk's payload_size) are bound to the ciphertext
-//! as AEAD additional data, so tampering with them will cause decryption to fail.
-//! The CRC in the trailer covers the TX header and the payload as written on disk
-//! (i.e. the ciphertext when encrypted).
+//! When encryption is enabled, the recovery payload and any extension block are
+//! encrypted together. The log header, TX header, and TX trailer are always
+//! written in plaintext. The log header's salt and TX header fields (op_count,
+//! commit_ts, and the final chunk's encrypted plaintext size) are bound to the
+//! ciphertext as AEAD additional data, so tampering with them will cause
+//! decryption to fail. The CRC in the trailer covers the TX header and the body
+//! as written on disk (i.e. the ciphertext when encrypted).
 //!
 //! ### Header fields (56 bytes, little-endian)
 //! - `magic: u32` (`LOG_MAGIC`)
@@ -86,13 +87,14 @@
 //!   - `table_id: i32` (must be negative)
 //!   - `payload_len: sqlite varint`
 //!   - `payload: [u8; payload_len]`
-//! - When **encrypted**: payload is split into fixed-size plaintext chunks
+//! - When **encrypted**: recovery payload plus extension block is split into
+//!   fixed-size plaintext chunks
 //!   (`ENCRYPTED_PAYLOAD_CHUNK_SIZE`, except the final remainder chunk)
 //!   - each chunk is written as `ciphertext(chunk_plain_len + tag_size) | nonce(nonce_size)`
 //!   - AEAD additional data:
-//!     `salt(8) || payload_size_or_zero(8) || op_count(4) || commit_ts(8) || chunk_index(4)` (little-endian)
-//!     where the payload-size slot is zero for non-final chunks and carries the real payload size
-//!     only in the final chunk
+//!     `salt(8) || plaintext_size_or_zero(8) || op_count(4) || commit_ts(8) || chunk_index(4)` (little-endian)
+//!     where the plaintext-size slot is zero for non-final chunks and carries the encrypted
+//!     plaintext size only in the final chunk
 //!
 //! ### TX Trailer (`TX_TRAILER_SIZE = 8`)
 //! - `crc32c: u32` (chained CRC32C: `crc32c_append(prev_frame_crc, tx_header || payload)`;
@@ -172,10 +174,10 @@
 //! Each chunk encrypted with AAD (32B):
 //! ```text
 //! ┌────────┬────────────────────┬──────────┬────────────┬─────────────┐
-//! │salt (8)│payload_size_or_0(8)│op_cnt (4)│commit_ts(8)│chunk_idx (4)│
+//! │salt (8)│plaintext_size_or_0 │op_cnt (4)│commit_ts(8)│chunk_idx (4)│
 //! └────────┴────────────────────┴──────────┴────────────┴─────────────┘
 //!           ↑
-//!           └── payload_size only in final chunk; zero for all others
+//!           └── encrypted plaintext size only in final chunk; zero for all others
 //! ```
 //!
 //! ### How Plaintext Payload Is Split Into Chunks
@@ -602,10 +604,61 @@ impl LogicalLog {
             self.header = Some(header);
         }
 
+        #[cfg(feature = "conn_raw_api")]
+        let has_portable_changes = !tx.portable_changes.is_empty();
+        #[cfg(not(feature = "conn_raw_api"))]
+        let has_portable_changes = false;
+        if has_portable_changes {
+            tx.buf.splice(
+                LOG_RECORD_PREFIX_SIZE..LOG_RECORD_PREFIX_SIZE,
+                [0u8; TX_EXT_HEADER_SIZE - TX_HEADER_SIZE],
+            );
+        }
+
+        let tx_header_size = if has_portable_changes {
+            TX_EXT_HEADER_SIZE
+        } else {
+            TX_HEADER_SIZE
+        };
+        let frame_payload_start = LOG_HDR_SIZE + tx_header_size;
+
+        #[cfg(feature = "conn_raw_api")]
+        let extension_block = if !has_portable_changes {
+            Vec::new()
+        } else {
+            let encryption_overhead = self
+                .encryption_ctx
+                .as_ref()
+                .map(|enc_ctx| (enc_ctx.tag_size(), enc_ctx.nonce_size()));
+            let portable_changes = encode_portable_change_payload_with_stable_end_offset(
+                PortableEndOffsetCtx {
+                    write_offset: self.offset,
+                    includes_log_header: is_first_write,
+                    tx_header_size,
+                    recovery_payload_size: payload_size,
+                    encrypted_payload_chunk_size: self.encrypted_payload_chunk_size,
+                    encryption_overhead,
+                },
+                tx.tx_timestamp,
+                &tx.portable_changes,
+            )?;
+            encode_extension_record(EXTENSION_TYPE_PORTABLE_CHANGES, 0, &portable_changes)?
+        };
+        #[cfg(not(feature = "conn_raw_api"))]
+        let extension_block = Vec::new();
+
+        let extension_size = u64::try_from(extension_block.len()).map_err(|_| {
+            LimboError::InternalError("Logical log extension size exceeds u64".to_string())
+        })?;
+        if !extension_block.is_empty() {
+            tx.buf.extend_from_slice(&extension_block);
+        }
+        let plaintext_size = tx.buf.len() - frame_payload_start;
+        let plaintext_size_u64 = plaintext_size as u64;
+
         // 2. Build the on-disk payload. Unencrypted is the zero-shift fast
-        // path: the plaintext is already at LOG_RECORD_PREFIX_SIZE. Encrypted
-        // has to re-emit the payload because its on-disk size differs from
-        // the plaintext size after chunked encryption.
+        // path: plaintext is already after the TX header. Encrypted frames
+        // encrypt recovery ops and extension records as one authenticated body.
         if let Some(enc_ctx) = &self.encryption_ctx {
             let salt = self
                 .header
@@ -613,21 +666,21 @@ impl LogicalLog {
                 .expect("log header must be set before writing")
                 .salt;
             let on_disk_payload_size = encrypted_payload_blob_size(
-                payload_size,
+                plaintext_size,
                 self.encrypted_payload_chunk_size,
                 enc_ctx.tag_size(),
                 enc_ctx.nonce_size(),
             )?;
-            let total = LOG_RECORD_PREFIX_SIZE + on_disk_payload_size + TX_TRAILER_SIZE;
+            let total = frame_payload_start + on_disk_payload_size + TX_TRAILER_SIZE;
             // Move the plaintext out (`split_off` returns the tail past the
-            // framing prefix; `tx.buf` is left with just the 80-byte prefix
+            // framing prefix; `tx.buf` is left with just the header prefix
             // to grow back into with encrypted chunks).
-            let plaintext = tx.buf.split_off(LOG_RECORD_PREFIX_SIZE);
-            debug_assert_eq!(plaintext.len(), payload_size);
+            let plaintext = tx.buf.split_off(frame_payload_start);
+            debug_assert_eq!(plaintext.len(), plaintext_size);
             tx.buf.reserve(total - tx.buf.len());
 
             let chunk_count =
-                encrypted_payload_chunk_count(payload_size, self.encrypted_payload_chunk_size);
+                encrypted_payload_chunk_count(plaintext_size, self.encrypted_payload_chunk_size);
             let payload_start = tx.buf.len();
             for (chunk_index, plaintext_chunk) in plaintext
                 .chunks(self.encrypted_payload_chunk_size)
@@ -636,7 +689,7 @@ impl LogicalLog {
                 let is_last_chunk = chunk_index + 1 == chunk_count;
                 let aad = build_encrypted_chunk_aad(
                     salt,
-                    is_last_chunk.then_some(payload_size_u64),
+                    is_last_chunk.then_some(plaintext_size_u64),
                     op_count,
                     commit_ts,
                     u32::try_from(chunk_index).map_err(|_| {
@@ -666,51 +719,7 @@ impl LogicalLog {
             );
             // `plaintext` is dropped here, freeing its allocation before pwrite.
         }
-        // Unencrypted: payload bytes are already in place at
-        // [LOG_RECORD_PREFIX_SIZE ..].
-
-        #[cfg(feature = "conn_raw_api")]
-        let has_portable_changes = !tx.portable_changes.is_empty();
-        #[cfg(not(feature = "conn_raw_api"))]
-        let has_portable_changes = false;
-        if has_portable_changes {
-            tx.buf.splice(
-                LOG_RECORD_PREFIX_SIZE..LOG_RECORD_PREFIX_SIZE,
-                [0u8; TX_EXT_HEADER_SIZE - TX_HEADER_SIZE],
-            );
-        }
-
-        #[cfg(feature = "conn_raw_api")]
-        let extension_block = if !has_portable_changes {
-            Vec::new()
-        } else {
-            let bytes_before_portable_changes = tx
-                .buf
-                .len()
-                .checked_sub(if is_first_write { 0 } else { LOG_HDR_SIZE })
-                .and_then(|value| value.checked_add(EXTENSION_RECORD_HEADER_SIZE))
-                .ok_or_else(|| {
-                    LimboError::InternalError(
-                        "logical log portable-change prefix length overflow".to_string(),
-                    )
-                })?;
-            let portable_changes = encode_portable_change_payload_with_stable_end_offset(
-                self.offset,
-                bytes_before_portable_changes,
-                tx.tx_timestamp,
-                &tx.portable_changes,
-            )?;
-            encode_extension_record(EXTENSION_TYPE_PORTABLE_CHANGES, 0, &portable_changes)?
-        };
-        #[cfg(not(feature = "conn_raw_api"))]
-        let extension_block = Vec::new();
-
-        let extension_size = u64::try_from(extension_block.len()).map_err(|_| {
-            LimboError::InternalError("Logical log extension size exceeds u64".to_string())
-        })?;
-        if !extension_block.is_empty() {
-            tx.buf.extend_from_slice(&extension_block);
-        }
+        // Unencrypted: plaintext bytes are already in place after the TX header.
 
         // 3. Backfill TX HEADER at offset LOG_HDR_SIZE:
         //    FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
@@ -1046,27 +1055,65 @@ fn encode_portable_change_payload(end_offset: u64, commit_ts: u64, encoded_ops: 
 /// `end_offset` is part of the raw-log replay cursor, but its varint width can
 /// change the payload length. The fixed-point loop converges after the varint
 /// width stops changing.
-fn encode_portable_change_payload_with_stable_end_offset(
+struct PortableEndOffsetCtx {
     write_offset: u64,
-    bytes_before_portable_changes: usize,
+    includes_log_header: bool,
+    tx_header_size: usize,
+    recovery_payload_size: usize,
+    encrypted_payload_chunk_size: usize,
+    encryption_overhead: Option<(usize, usize)>,
+}
+
+fn encode_portable_change_payload_with_stable_end_offset(
+    ctx: PortableEndOffsetCtx,
     tx_timestamp: u64,
     portable_changes: &[u8],
 ) -> Result<Vec<u8>> {
-    let mut end_offset = write_offset
-        .checked_add(bytes_before_portable_changes as u64)
-        .and_then(|value| value.checked_add(TX_TRAILER_SIZE as u64))
-        .ok_or_else(|| {
-            LimboError::InternalError("portable logical frame offset overflow".to_string())
-        })?;
-    loop {
-        let payload = encode_portable_change_payload(end_offset, tx_timestamp, portable_changes);
-        let next_end_offset = write_offset
-            .checked_add(bytes_before_portable_changes as u64)
-            .and_then(|value| value.checked_add(payload.len() as u64))
-            .and_then(|value| value.checked_add(TX_TRAILER_SIZE as u64))
+    let frame_end_offset = |portable_payload_len: usize| -> Result<u64> {
+        let extension_size = EXTENSION_RECORD_HEADER_SIZE
+            .checked_add(portable_payload_len)
+            .ok_or_else(|| {
+                LimboError::InternalError("portable logical extension size overflow".to_string())
+            })?;
+        let plaintext_size = ctx
+            .recovery_payload_size
+            .checked_add(extension_size)
+            .ok_or_else(|| {
+                LimboError::InternalError("portable logical plaintext size overflow".to_string())
+            })?;
+        let body_size = if let Some((tag_size, nonce_size)) = ctx.encryption_overhead {
+            encrypted_payload_blob_size(
+                plaintext_size,
+                ctx.encrypted_payload_chunk_size,
+                tag_size,
+                nonce_size,
+            )?
+        } else {
+            plaintext_size
+        };
+        let prefix_size = if ctx.includes_log_header {
+            LOG_HDR_SIZE
+        } else {
+            0
+        };
+        let frame_bytes = prefix_size
+            .checked_add(ctx.tx_header_size)
+            .and_then(|value| value.checked_add(body_size))
+            .and_then(|value| value.checked_add(TX_TRAILER_SIZE))
+            .ok_or_else(|| {
+                LimboError::InternalError("portable logical frame size overflow".to_string())
+            })?;
+        ctx.write_offset
+            .checked_add(frame_bytes as u64)
             .ok_or_else(|| {
                 LimboError::InternalError("portable logical frame offset overflow".to_string())
-            })?;
+            })
+    };
+
+    let mut end_offset = frame_end_offset(0)?;
+    loop {
+        let payload = encode_portable_change_payload(end_offset, tx_timestamp, portable_changes);
+        let next_end_offset = frame_end_offset(payload.len())?;
         if next_end_offset == end_offset {
             return Ok(payload);
         }
@@ -1148,7 +1195,7 @@ fn find_extension_payload(
 
 /// Parse all ops from a decrypted plaintext buffer.
 /// Validates that `plaintext.len() == payload_size` and that every byte is consumed.
-fn parse_ops_from_plaintext(
+pub(crate) fn parse_ops_from_plaintext(
     plaintext: &[u8],
     payload_size: usize,
     op_count: u32,
@@ -1982,6 +2029,59 @@ impl StreamingLogicalLogReader {
         Ok(PayloadParseResult::Ok(parsed_ops, running_crc))
     }
 
+    fn read_encrypted_plaintext(
+        &mut self,
+        io: &Arc<dyn crate::IO>,
+        plaintext_size: usize,
+        op_count: u32,
+        commit_ts: u64,
+        running_crc: u32,
+    ) -> Result<Option<(Vec<u8>, u32)>> {
+        let (nonce_size, tag_size) = {
+            let enc = self
+                .encryption_ctx
+                .as_ref()
+                .expect("encryption_ctx must be set for encrypted payload");
+            (enc.nonce_size(), enc.tag_size())
+        };
+        let salt = self
+            .header
+            .as_ref()
+            .expect("log header must be read before parsing")
+            .salt;
+        let payload_ctx = EncryptedPayloadReadContext {
+            payload_size: plaintext_size,
+            op_count,
+            commit_ts,
+            salt,
+            nonce_size,
+            tag_size,
+        };
+        let chunk_count =
+            encrypted_payload_chunk_count(plaintext_size, self.encrypted_payload_chunk_size);
+        let mut running_crc = running_crc;
+        let mut plaintext = Vec::with_capacity(plaintext_size);
+        for chunk_index in 0..chunk_count {
+            running_crc = match self.read_and_decrypt_encrypted_chunk(
+                io,
+                &payload_ctx,
+                chunk_index,
+                running_crc,
+            )? {
+                EncryptedChunkReadResult::Ok { running_crc } => running_crc,
+                EncryptedChunkReadResult::Eof => return Ok(None),
+            };
+            plaintext.extend_from_slice(&self.decrypt_scratch);
+        }
+        if plaintext.len() != plaintext_size {
+            return Err(LimboError::Corrupt(format!(
+                "encrypted plaintext size mismatch: expected {plaintext_size}, got {}",
+                plaintext.len()
+            )));
+        }
+        Ok(Some((plaintext, running_crc)))
+    }
+
     /// Parse an unencrypted payload via field-by-field streaming IO reads.
     fn parse_streaming_payload(
         &mut self,
@@ -2284,44 +2384,98 @@ impl StreamingLogicalLogReader {
         // 2. Parse payload — branches for encrypted vs unencrypted.
         //    Corrupt errors from payload parsing are treated as an invalid frame
         //    (stop scanning, keep previously validated frames).
-        let (parsed_ops, running_crc) = match if self.encryption_ctx.is_some() {
-            self.parse_encrypted_payload(io, op_count, payload_size, commit_ts, running_crc)
+        let encrypted_extension_size = if self.encryption_ctx.is_some() {
+            extension_size
         } else {
-            self.parse_streaming_payload(io, op_count, payload_size, commit_ts, running_crc)
-        } {
-            Ok(PayloadParseResult::Ok(ops, crc)) => (ops, crc),
-            Ok(PayloadParseResult::Eof) => return Ok(ParseResult::Eof),
-            Err(LimboError::Corrupt(msg)) => {
-                tracing::warn!("corrupt payload: {msg}");
-                self.last_valid_offset = frame_start;
-                return Ok(ParseResult::InvalidFrame);
-            }
-            Err(e) => return Err(e),
+            0
         };
-
-        let (portable_changes, running_crc) = if extension_size > 0 {
-            match self.try_consume_bytes(io, extension_size)? {
-                Some(bytes) => {
-                    let running_crc = crc32c::crc32c_append(running_crc, &bytes);
-                    let portable_changes = match find_extension_payload(
-                        &bytes,
-                        extension_record_count,
-                        EXTENSION_TYPE_PORTABLE_CHANGES,
-                    ) {
-                        Ok(payload) => payload,
-                        Err(LimboError::Corrupt(msg)) => {
-                            tracing::warn!("corrupt extension block: {msg}");
-                            self.last_valid_offset = frame_start;
-                            return Ok(ParseResult::InvalidFrame);
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    (portable_changes, running_crc)
+        let (parsed_ops, portable_changes, running_crc) = if encrypted_extension_size > 0 {
+            let plaintext_size = payload_size
+                .checked_add(encrypted_extension_size)
+                .ok_or_else(|| {
+                    LimboError::Corrupt(
+                        "encrypted payload plus extension size overflows usize".into(),
+                    )
+                })?;
+            let Some((plaintext, running_crc)) = self.read_encrypted_plaintext(
+                io,
+                plaintext_size,
+                op_count,
+                commit_ts,
+                running_crc,
+            )?
+            else {
+                return Ok(ParseResult::Eof);
+            };
+            let parsed_ops = match parse_ops_from_plaintext(
+                &plaintext[..payload_size],
+                payload_size,
+                op_count,
+                commit_ts,
+            ) {
+                Ok(ops) => ops,
+                Err(LimboError::Corrupt(msg)) => {
+                    tracing::warn!("corrupt payload: {msg}");
+                    self.last_valid_offset = frame_start;
+                    return Ok(ParseResult::InvalidFrame);
                 }
-                None => return Ok(ParseResult::Eof),
-            }
+                Err(e) => return Err(e),
+            };
+            let portable_changes = match find_extension_payload(
+                &plaintext[payload_size..],
+                extension_record_count,
+                EXTENSION_TYPE_PORTABLE_CHANGES,
+            ) {
+                Ok(payload) => payload,
+                Err(LimboError::Corrupt(msg)) => {
+                    tracing::warn!("corrupt extension block: {msg}");
+                    self.last_valid_offset = frame_start;
+                    return Ok(ParseResult::InvalidFrame);
+                }
+                Err(e) => return Err(e),
+            };
+            (parsed_ops, portable_changes, running_crc)
         } else {
-            (Vec::new(), running_crc)
+            let (parsed_ops, running_crc) = match if self.encryption_ctx.is_some() {
+                self.parse_encrypted_payload(io, op_count, payload_size, commit_ts, running_crc)
+            } else {
+                self.parse_streaming_payload(io, op_count, payload_size, commit_ts, running_crc)
+            } {
+                Ok(PayloadParseResult::Ok(ops, crc)) => (ops, crc),
+                Ok(PayloadParseResult::Eof) => return Ok(ParseResult::Eof),
+                Err(LimboError::Corrupt(msg)) => {
+                    tracing::warn!("corrupt payload: {msg}");
+                    self.last_valid_offset = frame_start;
+                    return Ok(ParseResult::InvalidFrame);
+                }
+                Err(e) => return Err(e),
+            };
+
+            let (portable_changes, running_crc) = if extension_size > 0 {
+                match self.try_consume_bytes(io, extension_size)? {
+                    Some(bytes) => {
+                        let running_crc = crc32c::crc32c_append(running_crc, &bytes);
+                        let portable_changes = match find_extension_payload(
+                            &bytes,
+                            extension_record_count,
+                            EXTENSION_TYPE_PORTABLE_CHANGES,
+                        ) {
+                            Ok(payload) => payload,
+                            Err(LimboError::Corrupt(msg)) => {
+                                tracing::warn!("corrupt extension block: {msg}");
+                                self.last_valid_offset = frame_start;
+                                return Ok(ParseResult::InvalidFrame);
+                            }
+                            Err(e) => return Err(e),
+                        };
+                        (portable_changes, running_crc)
+                    }
+                    None => return Ok(ParseResult::Eof),
+                }
+            } else {
+                (Vec::new(), running_crc)
+            };
+            (parsed_ops, portable_changes, running_crc)
         };
 
         // 3. TX TRAILER layout (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
@@ -2459,6 +2613,12 @@ impl StreamingLogicalLogReader {
             header_bytes[10],
             header_bytes[11],
         ]);
+        let op_count = u32::from_le_bytes([
+            header_bytes[12],
+            header_bytes[13],
+            header_bytes[14],
+            header_bytes[15],
+        ]);
         let commit_ts = u64::from_le_bytes([
             header_bytes[16],
             header_bytes[17],
@@ -2527,7 +2687,20 @@ impl StreamingLogicalLogReader {
         };
 
         let running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
-        let payload_on_disk_size = match self.encrypted_payload_on_disk_size(payload_size) {
+        let encrypted_extension_size = if self.encryption_ctx.is_some() {
+            extension_size
+        } else {
+            0
+        };
+        let payload_on_disk_size = match self.encrypted_payload_on_disk_size(
+            payload_size
+                .checked_add(encrypted_extension_size)
+                .ok_or_else(|| {
+                    LimboError::Corrupt(
+                        "payload plus encrypted extension size overflows usize".to_string(),
+                    )
+                })?,
+        ) {
             Ok(size) => size,
             Err(LimboError::Corrupt(msg)) => {
                 tracing::warn!("corrupt payload size: {msg}");
@@ -2536,35 +2709,68 @@ impl StreamingLogicalLogReader {
             }
             Err(e) => return Err(e),
         };
-        let Some(running_crc) =
-            self.consume_and_crc_bytes(io, payload_on_disk_size, running_crc)?
-        else {
-            return Ok(ParseResult::Eof);
-        };
-
-        let (portable_changes, running_crc) = if extension_size > 0 {
-            match self.try_consume_bytes(io, extension_size)? {
-                Some(bytes) => {
-                    let running_crc = crc32c::crc32c_append(running_crc, &bytes);
-                    let portable_changes = match find_extension_payload(
-                        &bytes,
-                        extension_record_count,
-                        EXTENSION_TYPE_PORTABLE_CHANGES,
-                    ) {
-                        Ok(payload) => payload,
-                        Err(LimboError::Corrupt(msg)) => {
-                            tracing::warn!("corrupt extension block: {msg}");
-                            self.last_valid_offset = frame_start;
-                            return Ok(ParseResult::InvalidFrame);
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    (portable_changes, running_crc)
+        let (portable_changes, running_crc) = if encrypted_extension_size > 0 {
+            let plaintext_size = payload_size
+                .checked_add(encrypted_extension_size)
+                .ok_or_else(|| {
+                    LimboError::Corrupt(
+                        "encrypted payload plus extension size overflows usize".into(),
+                    )
+                })?;
+            let Some((plaintext, running_crc)) = self.read_encrypted_plaintext(
+                io,
+                plaintext_size,
+                op_count,
+                commit_ts,
+                running_crc,
+            )?
+            else {
+                return Ok(ParseResult::Eof);
+            };
+            let portable_changes = match find_extension_payload(
+                &plaintext[payload_size..],
+                extension_record_count,
+                EXTENSION_TYPE_PORTABLE_CHANGES,
+            ) {
+                Ok(payload) => payload,
+                Err(LimboError::Corrupt(msg)) => {
+                    tracing::warn!("corrupt extension block: {msg}");
+                    self.last_valid_offset = frame_start;
+                    return Ok(ParseResult::InvalidFrame);
                 }
-                None => return Ok(ParseResult::Eof),
-            }
+                Err(e) => return Err(e),
+            };
+            (portable_changes, running_crc)
         } else {
-            (Vec::new(), running_crc)
+            let Some(running_crc) =
+                self.consume_and_crc_bytes(io, payload_on_disk_size, running_crc)?
+            else {
+                return Ok(ParseResult::Eof);
+            };
+            if extension_size > 0 {
+                match self.try_consume_bytes(io, extension_size)? {
+                    Some(bytes) => {
+                        let running_crc = crc32c::crc32c_append(running_crc, &bytes);
+                        let portable_changes = match find_extension_payload(
+                            &bytes,
+                            extension_record_count,
+                            EXTENSION_TYPE_PORTABLE_CHANGES,
+                        ) {
+                            Ok(payload) => payload,
+                            Err(LimboError::Corrupt(msg)) => {
+                                tracing::warn!("corrupt extension block: {msg}");
+                                self.last_valid_offset = frame_start;
+                                return Ok(ParseResult::InvalidFrame);
+                            }
+                            Err(e) => return Err(e),
+                        };
+                        (portable_changes, running_crc)
+                    }
+                    None => return Ok(ParseResult::Eof),
+                }
+            } else {
+                (Vec::new(), running_crc)
+            }
         };
 
         let trailer_bytes = match self.try_consume_fixed::<TX_TRAILER_SIZE>(io)? {
