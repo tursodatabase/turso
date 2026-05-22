@@ -52,7 +52,9 @@ use tracing::instrument;
 use tracing::Level;
 
 pub mod checkpoint_state_machine;
-pub use checkpoint_state_machine::{CheckpointState, CheckpointStateMachine};
+pub use checkpoint_state_machine::{
+    sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
+};
 
 use super::persistent_storage::logical_log::{
     HeaderReadResult, IndexOpKind, ParsedOp, StreamingLogicalLogReader, StreamingResult,
@@ -1532,36 +1534,6 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         // times for an existing root page. We only treat a root page as
         // transaction-local when it has no schema row before the transaction and
         // no schema row after it.
-        let schema_btree_root_page = |row_version: &RowVersion| -> Result<Option<i64>> {
-            let record = ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
-            if record.column_count() < 5 {
-                return Err(LimboError::Corrupt(format!(
-                    "sqlite_schema row must have at least 5 columns, got {}",
-                    record.column_count()
-                )));
-            }
-            let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
-                return Err(LimboError::Corrupt(
-                    "sqlite_schema type must be text".to_string(),
-                ));
-            };
-            if !matches!(row_type.as_str(), "table" | "index") {
-                return Ok(None);
-            }
-            let Some(ValueRef::Numeric(Numeric::Integer(root_page))) = record.get_value_opt(3)
-            else {
-                turso_assert_reachable!(
-                    "malformed sqlite_schema root_page while committing MVCC logical log"
-                );
-                return Err(LimboError::Corrupt(
-                    "sqlite_schema root_page must be integer".to_string(),
-                ));
-            };
-            if root_page == 0 {
-                return Ok(None);
-            }
-            Ok(Some(root_page))
-        };
 
         let is_our_begin = |row_version: &RowVersion| {
             matches!(
@@ -1594,27 +1566,24 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 let mut schema_roots_present_before_tx: HashSet<i64> = HashSet::default();
                 let mut schema_roots_present_after_tx: HashSet<i64> = HashSet::default();
 
-                for (id, row_versions) in &write_set.entries {
-                    if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                        continue;
-                    }
+                for (_, row_versions) in &write_set.entries {
                     for row_version in row_versions.read().iter() {
-                        let Some(root_page) = schema_btree_root_page(row_version)? else {
+                        let Some(identity) = sqlite_schema_btree_identity(row_version) else {
                             continue;
                         };
                         let our_begin = is_our_begin(row_version);
                         let our_end = is_our_end(row_version);
                         if !our_begin {
-                            schema_roots_present_before_tx.insert(root_page);
+                            schema_roots_present_before_tx.insert(identity.root_page);
                         }
                         if our_end {
-                            schema_roots_deleted_by_tx.insert(root_page);
+                            schema_roots_deleted_by_tx.insert(identity.root_page);
                         }
                         if !our_end {
-                            schema_roots_present_after_tx.insert(root_page);
+                            schema_roots_present_after_tx.insert(identity.root_page);
                         }
                         if our_begin && our_end && !row_version.btree_resident {
-                            schema_roots_created_and_deleted_in_tx.insert(root_page);
+                            schema_roots_created_and_deleted_in_tx.insert(identity.root_page);
                         }
                     }
                 }
@@ -1654,74 +1623,6 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                     }
                 }
             }
-        };
-
-        // Returns Some(row_version) if our tx contributed to it and if we must therefore log it.
-        let our_committed_image = |row_version: &RowVersion| -> Option<RowVersion> {
-            let our_begin = matches!(
-                row_version.begin,
-                Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
-            );
-            let our_end = matches!(
-                row_version.end,
-                Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
-            );
-            if !our_begin && !our_end {
-                // row_version belongs to another tx
-                return None;
-            }
-            if btree_ids_created_and_dropped_in_tx.contains(&row_version.row.id.table_id) {
-                // This table or index has no sqlite_schema row before the
-                // transaction and no sqlite_schema row after it. It was created
-                // and dropped inside this commit, so its table/index entries do
-                // not change durable state.
-                return None;
-            }
-            if btree_ids_removed_from_schema_by_tx.contains(&row_version.row.id.table_id)
-                && our_begin
-                && !our_end
-            {
-                // This transaction created or rewrote an entry for a table or
-                // index that is gone from sqlite_schema by COMMIT. Example:
-                // UPDATE writes a new entry into idx_old, then DROP INDEX
-                // idx_old runs before COMMIT. Keep deletes for entries that
-                // existed before the transaction, but do not log new entries
-                // that cannot exist after the transaction.
-                return None;
-            }
-            if our_begin && our_end && !row_version.btree_resident {
-                // This entry was created and deleted by this transaction before it
-                // ever reached the database file. Replaying it after restart would
-                // have no durable effect.
-                return None;
-            }
-            let mut committed = row_version.clone();
-            if our_begin {
-                // New version is valid STARTING FROM the committing
-                // transaction's end timestamp. See Hekaton page 299.
-                committed.begin = Some(TxTimestampOrID::Timestamp(end_ts));
-
-                if !our_end {
-                    // A version row_version we inserted may have row_version.end == tx_b.tx_id,
-                    // where tx_b is a concurrent tx. This is because when a tx transitions to
-                    // Preparing, its row_version becomes *speculatively updatable*, and a tx tx_b
-                    // is allowed to change row_version.end from None to tx_b.tx_id to delete it
-                    // (see the Hekaton paper, §3.1, heading "check updatability").
-                    //
-                    // That deletion is tx_b's contribution, and tx_b will log it on its own commit.
-                    // Our log record must capture our own contribution, but if the `end` field is
-                    // set, it will be serialized as a OP_DELETE_* in the logical log, so we unset
-                    // it so that it will be serialized as an OP_UPSERT_*. tx_b will take care of
-                    // logging the deletion.
-                    committed.end = None;
-                }
-            }
-            if our_end {
-                // Old version is valid UNTIL the committing
-                // transaction's end timestamp. See Hekaton page 299.
-                committed.end = Some(TxTimestampOrID::Timestamp(end_ts));
-            }
-            Some(committed)
         };
 
         let collect_versions = |row_versions: &Arc<RwLock<Vec<RowVersion>>>,
@@ -1784,69 +1685,127 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             //   sqlite_schema row, or index entry;
             // - append those versions to `log_record.row_versions` without sorting
             //   them against versions from other write-set entries.
+
             let mut per_entry_versions: Vec<RowVersion> = Vec::new();
             let row_versions = row_versions.read();
-            let has_delete_for_db_file_row = row_versions.iter().any(|row_version| {
-                let our_begin = matches!(
-                    row_version.begin,
-                    Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
-                );
-                let our_end = matches!(
-                    row_version.end,
-                    Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
-                );
-                !our_begin && our_end && row_version.btree_resident
+
+            // A tombstone over a row that was already in the B-tree before this
+            // tx (begin=None, end=tx_id, btree_resident=true) is the canonical
+            // log record for deleting that durable row. If the same entry also
+            // contains a version this tx both began and ended over a B-tree row
+            // (e.g. DELETE; INSERT; DELETE on a btree-resident rowid), the
+            // tombstone already covers the durable delete and the begun+ended
+            // version must be suppressed to avoid logging the same delete twice.
+            let has_tombstone_for_btree_row = row_versions.iter().any(|row_version| {
+                !is_our_begin(row_version) && is_our_end(row_version) && row_version.btree_resident
             });
-            for row_version in row_versions.iter() {
-                let our_begin = matches!(
-                    row_version.begin,
-                    Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
-                );
-                let our_end = matches!(
-                    row_version.end,
-                    Some(TxTimestampOrID::TxID(vid)) if vid == tx_id
-                );
-                if has_delete_for_db_file_row && our_begin && our_end && row_version.btree_resident
+
+            // Helper that returns Some(row_version) if our tx contributed to it and if we must therefore log it.
+            let our_committed_image = |row_version: &RowVersion| -> Option<RowVersion> {
+                let our_begin = is_our_begin(row_version);
+                let our_end = is_our_end(row_version);
+                if !our_begin && !our_end {
+                    // row_version belongs to another tx
+                    return None;
+                }
+                if btree_ids_created_and_dropped_in_tx.contains(&row_version.row.id.table_id) {
+                    // This table or index has no sqlite_schema row before the
+                    // transaction and no sqlite_schema row after it. It was created
+                    // and dropped inside this commit, so its table/index entries do
+                    // not change durable state.
+                    return None;
+                }
+                if btree_ids_removed_from_schema_by_tx.contains(&row_version.row.id.table_id)
+                    && our_begin
+                    && !our_end
                 {
+                    // This transaction created or rewrote an entry for a table or
+                    // index that is gone from sqlite_schema by COMMIT. Example:
+                    // UPDATE writes a new entry into idx_old, then DROP INDEX
+                    // idx_old runs before COMMIT. Keep deletes for entries that
+                    // existed before the transaction, but do not log new entries
+                    // that cannot exist after the transaction.
+                    return None;
+                }
+                if our_begin && our_end {
+                    // A begun+ended version is purely in-memory unless it
+                    // shadows a B-tree row (insert_btree_resident_to_table_or_index
+                    // then delete). For btree_resident=true we still need to log
+                    // the delete of the durable row, UNLESS a sibling tombstone
+                    // in this same entry already covers it.
+                    if !row_version.btree_resident || has_tombstone_for_btree_row {
+                        return None;
+                    }
+                }
+
+                let mut committed = row_version.clone();
+                if our_begin {
+                    // New version is valid STARTING FROM the committing
+                    // transaction's end timestamp. See Hekaton page 299.
+                    committed.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+
+                    if !our_end {
+                        // A version row_version we inserted may have row_version.end == tx_b.tx_id,
+                        // where tx_b is a concurrent tx. This is because when a tx transitions to
+                        // Preparing, its row_version becomes *speculatively updatable*, and a tx tx_b
+                        // is allowed to change row_version.end from None to tx_b.tx_id to delete it
+                        // (see the Hekaton paper, §3.1, heading "check updatability").
+                        //
+                        // That deletion is tx_b's contribution, and tx_b will log it on its own commit.
+                        // Our log record must capture our own contribution, but if the `end` field is
+                        // set, it will be serialized as a OP_DELETE_* in the logical log, so we unset
+                        // it so that it will be serialized as an OP_UPSERT_*. tx_b will take care of
+                        // logging the deletion.
+                        committed.end = None;
+                    }
+                }
+                if our_end {
+                    // Old version is valid UNTIL the committing
+                    // transaction's end timestamp. See Hekaton page 299.
+                    committed.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                }
+                Some(committed)
+            };
+
+            for row_version in row_versions.iter() {
+                let Some(mut committed_version) = our_committed_image(row_version) else {
+                    continue;
+                };
+                canonicalize_table_id(&mut committed_version);
+                let replaces_last = per_entry_versions.last().is_some_and(|last| {
+                    last.row.id == committed_version.row.id
+                        && matches!(
+                            (&last.begin, &committed_version.begin),
+                            (
+                                Some(TxTimestampOrID::Timestamp(existing)),
+                                Some(TxTimestampOrID::Timestamp(new))
+                            ) if existing == new
+                        )
+                });
+                if replaces_last {
+                    *per_entry_versions
+                        .last_mut()
+                        .expect("last version checked above") = committed_version;
                     continue;
                 }
-                if let Some(mut committed_version) = our_committed_image(row_version) {
-                    canonicalize_table_id(&mut committed_version);
-                    let replaces_last = per_entry_versions.last().is_some_and(|last| {
-                        last.row.id == committed_version.row.id
+                #[cfg(debug_assertions)]
+                {
+                    let same_row_and_begin = |existing: &RowVersion| {
+                        existing.row.id == committed_version.row.id
                             && matches!(
-                                (&last.begin, &committed_version.begin),
+                                (&existing.begin, &committed_version.begin),
                                 (
                                     Some(TxTimestampOrID::Timestamp(existing)),
                                     Some(TxTimestampOrID::Timestamp(new))
                                 ) if existing == new
                             )
-                    });
-                    if replaces_last {
-                        *per_entry_versions
-                            .last_mut()
-                            .expect("last version checked above") = committed_version;
-                        continue;
-                    }
-                    #[cfg(debug_assertions)]
-                    {
-                        let same_row_and_begin = |existing: &RowVersion| {
-                            existing.row.id == committed_version.row.id
-                                && matches!(
-                                    (&existing.begin, &committed_version.begin),
-                                    (
-                                        Some(TxTimestampOrID::Timestamp(existing)),
-                                        Some(TxTimestampOrID::Timestamp(new))
-                                    ) if existing == new
-                                )
-                        };
-                        turso_assert!(
-                            !per_entry_versions.iter().any(same_row_and_begin),
-                            "one write-set entry produced non-adjacent log versions with the same row id and commit timestamp"
-                        );
-                    }
-                    per_entry_versions.push(committed_version);
+                    };
+                    turso_assert!(
+                        !per_entry_versions.iter().any(same_row_and_begin),
+                        "one write-set entry produced non-adjacent log versions with the same row id and commit timestamp"
+                    );
                 }
+                per_entry_versions.push(committed_version);
             }
             log_record.row_versions.append(&mut per_entry_versions);
         };
@@ -5854,19 +5813,17 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                         record.column_count()
                                     )));
                                 }
-                                let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
+                                let (
+                                    ValueRef::Text(row_type),
+                                    ValueRef::Numeric(Numeric::Integer(root_page)),
+                                ) = record.get_two_values(0, 3)?
+                                else {
                                     return Err(LimboError::Corrupt(
-                                        "sqlite_schema type must be text".to_string(),
+                                        "sqlite_schema type and root_page must be text and integer"
+                                            .to_string(),
                                     ));
                                 };
                                 let row_type = row_type.as_str();
-                                let Some(ValueRef::Numeric(Numeric::Integer(root_page))) =
-                                    record.get_value_opt(3)
-                                else {
-                                    return Err(LimboError::Corrupt(
-                                        "sqlite_schema root_page must be integer".to_string(),
-                                    ));
-                                };
                                 if (row_type == "table" || row_type == "index") && root_page > 0 {
                                     dropped_root_pages.insert(root_page);
                                 }

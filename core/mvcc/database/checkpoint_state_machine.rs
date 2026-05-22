@@ -209,15 +209,15 @@ enum SqliteSchemaBtreeKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SqliteSchemaBtreeIdentity {
+pub struct SqliteSchemaBtreeIdentity {
     kind: SqliteSchemaBtreeKind,
-    root_page: i64,
+    pub root_page: i64,
 }
 
 /// Identity of a sqlite_schema row version that refers to a B-tree-backed object.
 /// Schema rewrites that preserve this identity are metadata-only and should not be
 /// treated as create/drop lifecycle changes.
-fn sqlite_schema_btree_identity(version: &RowVersion) -> Option<SqliteSchemaBtreeIdentity> {
+pub fn sqlite_schema_btree_identity(version: &RowVersion) -> Option<SqliteSchemaBtreeIdentity> {
     if version.row.id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
         return None;
     }
