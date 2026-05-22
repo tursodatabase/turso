@@ -137,7 +137,7 @@ use super::{make_record, Program, ProgramState, Register};
 
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
-use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
+use crate::{bail_constraint_error, must_be_btree_cursor, EncryptionKey, MvStore, Pager, Result};
 
 type MvccCheckpointStateMachine = CheckpointStateMachine<MvccClock, DynAllocator>;
 
@@ -16525,19 +16525,22 @@ fn op_vacuum_into_inner(
                     output_opts,
                     encryption_opts.clone(),
                 )?;
-                let output_conn = output_db.connect()?;
-                output_conn.reset_page_size(page_size)?;
                 // set reserved_space on destination to match source or use encryption parameters,
                 // if specified. This is important for databases using encryption or checksums.
                 // Must be set before page 1 is allocated (before any schema operations)
-                if let Some(EncryptionOpts { cipher, hexkey }) = encryption_opts {
-                    let cipher_mode = CipherMode::try_from(cipher.as_str())?;
-                    output_conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
-                    output_conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
-                    output_conn.set_reserved_bytes(cipher_mode.metadata_size() as u8)?;
-                } else {
-                    output_conn.set_reserved_bytes(reserved_space)?;
-                }
+                let (encryption_key, reserved_bytes) =
+                    if let Some(EncryptionOpts { cipher, hexkey }) = encryption_opts {
+                        let cipher_mode = CipherMode::try_from(cipher.as_str())?;
+                        (
+                            Some(EncryptionKey::from_hex_string(hexkey)?),
+                            cipher_mode.metadata_size() as u8,
+                        )
+                    } else {
+                        (None, reserved_space)
+                    };
+                let output_conn = output_db.connect_with_encryption(encryption_key)?;
+                output_conn.reset_page_size(page_size)?;
+                output_conn.set_reserved_bytes(reserved_bytes)?;
 
                 mirror_symbols(&program.connection, &output_conn);
                 let source_custom_types = capture_custom_types(&program.connection, source_db_id);
