@@ -1191,6 +1191,18 @@ fn resolve_compound_order_by_expr(
             resolve_compound_order_by_qualified(all_plans, table_name, col_name, term_number)
         }
         _ => {
+            // Case 5: Arbitrary expression. SQLite matches such a term against the
+            // result expressions of the constituent SELECTs by structural
+            // equivalence, so e.g. `ORDER BY count(*)` in
+            //     SELECT log, count(*) FROM t1 GROUP BY log UNION ...
+            // resolves to the second column of the leftmost SELECT.
+            for plan in all_plans {
+                for (i, rc) in plan.result_columns.iter().enumerate() {
+                    if exprs_are_equivalent(&rc.expr, expr) {
+                        return Ok(i);
+                    }
+                }
+            }
             crate::bail_parse_error!(
                 "{} ORDER BY term does not match any column in the result set",
                 ordinal(term_number)
