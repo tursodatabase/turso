@@ -106,7 +106,7 @@ fn extract_path_from_expr(expr: &Expr) -> Result<String> {
 mod tests {
     use super::*;
     use crate::vdbe::builder::ProgramBuilderOpts;
-    use crate::QueryMode;
+    use crate::{DatabaseOpts, QueryMode};
 
     #[test]
     fn test_extract_path_from_string_literal() {
@@ -155,7 +155,9 @@ mod tests {
     fn test_translate_vacuum_into_uri_with_cipher_and_hexkey() {
         let mut program = make_builder();
         let dest = quoted_string_expr("file:test.db?cipher=aes256&hexkey=00112233");
-        translate_vacuum(&mut program, None, Some(&dest)).unwrap();
+        let (_, connection) = Connection::from_uri(":memory:", DatabaseOpts::new())
+            .expect("in-memory connection should succeed");
+        translate_vacuum(&mut program, None, Some(&dest), connection).unwrap();
 
         let (dest_path, encryption_opts) = program
             .insns
@@ -181,7 +183,9 @@ mod tests {
     fn test_translate_vacuum_into_uri_only_cipher_errors() {
         let mut program = make_builder();
         let dest = quoted_string_expr("file:test.db?cipher=aes256");
-        let err = translate_vacuum(&mut program, None, Some(&dest)).unwrap_err();
+        let (_, connection) = Connection::from_uri(":memory:", DatabaseOpts::new())
+            .expect("in-memory connection should succeed");
+        let err = translate_vacuum(&mut program, None, Some(&dest), connection).unwrap_err();
         assert!(
             err.to_string().contains("hexkey is required"),
             "unexpected error: {err}"
@@ -192,7 +196,9 @@ mod tests {
     fn test_translate_vacuum_into_uri_only_hexkey_errors() {
         let mut program = make_builder();
         let dest = quoted_string_expr("file:test.db?hexkey=00112233");
-        let err = translate_vacuum(&mut program, None, Some(&dest)).unwrap_err();
+        let (_, connection) = Connection::from_uri(":memory:", DatabaseOpts::new())
+            .expect("in-memory connection should succeed");
+        let err = translate_vacuum(&mut program, None, Some(&dest), connection).unwrap_err();
         assert!(
             err.to_string().contains("cipher is required"),
             "unexpected error: {err}"
@@ -203,7 +209,9 @@ mod tests {
     fn test_translate_vacuum_into_uri_without_encryption_params() {
         let mut program = make_builder();
         let dest = quoted_string_expr("file:test.db");
-        translate_vacuum(&mut program, None, Some(&dest)).unwrap();
+        let (_, connection) = Connection::from_uri(":memory:", DatabaseOpts::new())
+            .expect("in-memory connection should succeed");
+        translate_vacuum(&mut program, None, Some(&dest), connection).unwrap();
 
         let (dest_path, encryption_opts) = program
             .insns
