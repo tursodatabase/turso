@@ -1753,7 +1753,7 @@ pub(crate) fn emit_columns_and_dependencies(
         };
         (col, reg)
     });
-    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs, Some(rowid_reg));
     debug_assert!(targets
         .windows(2)
         .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));

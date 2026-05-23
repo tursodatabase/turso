@@ -359,7 +359,7 @@ pub(crate) fn emit_dml_expr_index_value(
 
     let pairs = columns.iter().zip(column_regs.iter().copied());
     let ctx = SelfTableContext::ForDML {
-        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs),
+        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs, None),
         table: Arc::clone(table),
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {

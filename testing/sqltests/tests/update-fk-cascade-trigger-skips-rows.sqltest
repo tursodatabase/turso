@@ -260,3 +260,98 @@ expect {
     20|2|2
 }
 
+@cross-check-integrity
+test update-fk-cascade-virtual-gencol-dependency-before-key-decoy {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(
+        v INTEGER GENERATED ALWAYS AS (x * 10) VIRTUAL,
+        key INTEGER UNIQUE,
+        x INTEGER
+    );
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER REFERENCES parent(key) ON UPDATE CASCADE);
+    INSERT INTO parent(key, x) VALUES (1, 100), (100, 200);
+    INSERT INTO child VALUES (10, 1), (20, 100);
+    UPDATE parent SET key = 99 WHERE key = 1;
+    SELECT id, pkey FROM child ORDER BY id;
+    SELECT 'orphans', count(*)
+        FROM child LEFT JOIN parent ON child.pkey = parent.key
+        WHERE parent.key IS NULL;
+}
+expect {
+    10|99
+    20|100
+    orphans|0
+}
+
+@cross-check-integrity
+test update-fk-set-null-virtual-gencol-dependency-before-key-decoy {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(
+        v INTEGER GENERATED ALWAYS AS (x * 10) VIRTUAL,
+        key INTEGER UNIQUE,
+        x INTEGER
+    );
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER REFERENCES parent(key) ON UPDATE SET NULL);
+    INSERT INTO parent(key, x) VALUES (1, 100), (100, 200);
+    INSERT INTO child VALUES (10, 1), (20, 100);
+    UPDATE parent SET key = 99 WHERE key = 1;
+    SELECT id, ifnull(pkey, 'NULL') FROM child ORDER BY id;
+    SELECT 'orphans', count(*)
+        FROM child LEFT JOIN parent ON child.pkey = parent.key
+        WHERE child.pkey IS NOT NULL AND parent.key IS NULL;
+}
+expect {
+    10|NULL
+    20|100
+    orphans|0
+}
+
+@cross-check-integrity
+test update-fk-set-default-virtual-gencol-dependency-before-key-decoy {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(
+        v INTEGER GENERATED ALWAYS AS (x * 10) VIRTUAL,
+        key INTEGER UNIQUE,
+        x INTEGER
+    );
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER DEFAULT 0 REFERENCES parent(key) ON UPDATE SET DEFAULT);
+    INSERT INTO parent(key, x) VALUES (0, 0), (1, 100), (100, 200);
+    INSERT INTO child VALUES (10, 1), (20, 100);
+    UPDATE parent SET key = 99 WHERE key = 1;
+    SELECT id, pkey FROM child ORDER BY id;
+    SELECT 'orphans', count(*)
+        FROM child LEFT JOIN parent ON child.pkey = parent.key
+        WHERE parent.key IS NULL;
+}
+expect {
+    10|0
+    20|100
+    orphans|0
+}
+
+@cross-check-integrity
+test update-fk-cascade-virtual-gencol-no-key-change-decoy {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(
+        v INTEGER GENERATED ALWAYS AS (x * 10) VIRTUAL,
+        key INTEGER UNIQUE,
+        x INTEGER
+    );
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER REFERENCES parent(key) ON UPDATE CASCADE);
+    INSERT INTO parent(key, x) VALUES (1, 100), (100, 200);
+    INSERT INTO child VALUES (10, 1), (20, 100);
+    UPDATE parent SET x = 101 WHERE key = 1;
+    SELECT id, pkey FROM child ORDER BY id;
+    SELECT 'orphans', count(*)
+        FROM child LEFT JOIN parent ON child.pkey = parent.key
+        WHERE parent.key IS NULL;
+}
+expect {
+    10|1
+    20|100
+    orphans|0
+}

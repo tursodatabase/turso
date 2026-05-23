@@ -1136,14 +1136,21 @@ pub fn emit_upsert(
                 s.any_resolved_fks_referencing(bt.name.as_str())
             })
         {
+            let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+            let old_row_ctx = DmlColumnContext::layout(
+                table.columns(),
+                current_start,
+                ctx.conflict_rowid_reg,
+                layout.clone(),
+            );
+            let new_row_ctx =
+                DmlColumnContext::layout(table.columns(), new_start, new_rowid, layout.clone());
             fire_fk_update_actions(
                 program,
                 resolver,
                 bt.name.as_str(),
-                ctx.conflict_rowid_reg, // old_rowid_reg
-                current_start,          // old_values_start
-                new_start,              // new_values_start
-                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
+                &old_row_ctx,
+                &new_row_ctx,
                 connection,
                 upsert_database_id,
             )?;

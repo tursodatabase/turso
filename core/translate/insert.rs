@@ -514,8 +514,8 @@ pub fn translate_insert(
         &btree_table,
     );
 
-    let dml_ctx =
-        DmlColumnContext::from_column_reg_mapping(insertion.col_mappings.iter().map(|cm| {
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(
+        insertion.col_mappings.iter().map(|cm| {
             (
                 cm.column,
                 if cm.column.is_rowid_alias() {
@@ -524,7 +524,9 @@ pub fn translate_insert(
                     cm.register
                 },
             )
-        }));
+        }),
+        Some(insertion.key_register()),
+    );
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {

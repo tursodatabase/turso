@@ -2317,18 +2317,22 @@ fn emit_update_insns<'a>(
                     s.any_resolved_fks_referencing(table_name)
                 })
             {
-                // OLD column values are stored in preserved_old_registers (contiguous registers)
-                let old_values_start = preserved_old_registers
+                let old_regs = preserved_old_registers
                     .as_ref()
-                    .expect("FK check requires OLD values")[0];
+                    .expect("FK check requires OLD values");
+                let columns = target_table.table.columns();
+                let old_row_ctx = DmlColumnContext::from_column_reg_mapping(
+                    columns.iter().zip(old_regs.iter().copied()),
+                    Some(beg),
+                );
+                let new_row_ctx =
+                    DmlColumnContext::layout(columns, start, effective_rowid_reg, layout.clone());
                 fire_fk_update_actions(
                     program,
                     &mut t_ctx.resolver,
                     table_name,
-                    beg, // old_rowid_reg
-                    old_values_start,
-                    start, // new_values_start
-                    effective_rowid_reg,
+                    &old_row_ctx,
+                    &new_row_ctx,
                     connection,
                     update_database_id,
                 )?;
@@ -2367,7 +2371,7 @@ fn emit_update_insns<'a>(
                     if let Some(ref old_regs) = preserved_old_registers {
                         let pairs = columns.iter().zip(old_regs.iter().copied());
                         //TODO only emit required virtual columns
-                        let old_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
+                        let old_ctx = DmlColumnContext::from_column_reg_mapping(pairs, Some(beg));
                         compute_virtual_columns(
                             program,
                             &btree_table.columns_topo_sort()?,

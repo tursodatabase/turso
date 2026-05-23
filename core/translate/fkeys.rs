@@ -1263,29 +1263,25 @@ fn decode_fk_key_registers(
     Ok(())
 }
 
-/// Copy key values from value registers into destination registers.
-/// Handles rowid aliasing for columns that are rowid aliases.
-fn copy_key_from_values(
+/// Copy key values from a row image into destination registers.
+/// Handles explicit rowid names and rowid-alias columns.
+fn copy_key_from_context(
     program: &mut ProgramBuilder,
     parent_bt: &BTreeTable,
     parent_cols: &[String],
-    values_start: usize,
-    layout: &ColumnLayout,
-    rowid_reg: usize,
+    dml_ctx: &DmlColumnContext,
     dest_start: usize,
 ) -> Result<()> {
     for (i, pcol) in parent_cols.iter().enumerate() {
         let src = if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) {
-            rowid_reg
+            dml_ctx
+                .rowid_reg()
+                .ok_or_else(|| LimboError::InternalError("FK row image missing rowid".into()))?
         } else {
-            let (pos, col) = parent_bt
+            let (pos, _) = parent_bt
                 .get_column(pcol)
                 .ok_or_else(|| LimboError::InternalError(format!("col {pcol} missing")))?;
-            if col.is_rowid_alias() {
-                rowid_reg
-            } else {
-                layout.to_register(values_start, pos)
-            }
+            dml_ctx.to_column_reg(pos)
         };
         program.emit_insn(Insn::Copy {
             src_reg: src,
@@ -1737,13 +1733,17 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                             let skip = program.allocate_label();
                             let changed = program.allocate_label();
                             let new_key_start = program.alloc_registers(ncols);
-                            copy_key_from_values(
+                            let replace_ctx = DmlColumnContext::layout(
+                                parent_bt.columns(),
+                                replace_values_start,
+                                replace_rowid_reg,
+                                ColumnLayout::from_btree(&parent_bt),
+                            );
+                            copy_key_from_context(
                                 program,
                                 &parent_bt,
                                 parent_cols,
-                                replace_values_start,
-                                &ColumnLayout::from_btree(&parent_bt),
-                                replace_rowid_reg,
+                                &replace_ctx,
                                 new_key_start,
                             )?;
                             emit_key_change_check(
@@ -1867,29 +1867,18 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
 
 /// Fire FK actions for UPDATE on parent table using Program opcode.
 /// This is called after the UPDATE is performed but before AFTER triggers.
-/// `old_values_start` is the register where OLD column values are stored (loaded before Delete+Insert).
-#[allow(clippy::too_many_arguments)]
 pub fn fire_fk_update_actions(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     parent_table_name: &str,
-    old_rowid_reg: usize,
-    old_values_start: usize,
-    new_values_start: usize,
-    new_rowid_reg: usize,
+    old_row_ctx: &DmlColumnContext,
+    new_row_ctx: &DmlColumnContext,
     connection: &Arc<Connection>,
     database_id: usize,
 ) -> Result<()> {
     let parent_bt = resolver
         .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
         .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
-
-    // OLD-image registers are allocated one-per-schema-column in declaration order; the NEW image
-    // lives in the UPDATE's packed DML layout (non-virtual first, virtual after).
-    let old_image_layout = ColumnLayout::Identity {
-        column_count: parent_bt.columns().len(),
-    };
-    let new_image_layout = ColumnLayout::from_btree(&parent_bt);
 
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(parent_table_name)
@@ -1899,26 +1888,10 @@ pub fn fire_fk_update_actions(
 
         // Copy OLD and NEW parent key values using the helper
         let old_key_start = program.alloc_registers(ncols);
-        copy_key_from_values(
-            program,
-            &parent_bt,
-            parent_cols,
-            old_values_start,
-            &old_image_layout,
-            old_rowid_reg,
-            old_key_start,
-        )?;
+        copy_key_from_context(program, &parent_bt, parent_cols, old_row_ctx, old_key_start)?;
 
         let new_key_start = program.alloc_registers(ncols);
-        copy_key_from_values(
-            program,
-            &parent_bt,
-            parent_cols,
-            new_values_start,
-            &new_image_layout,
-            new_rowid_reg,
-            new_key_start,
-        )?;
+        copy_key_from_context(program, &parent_bt, parent_cols, new_row_ctx, new_key_start)?;
 
         // Decode encoded values so they match the subprogram's decoded column reads
         decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, old_key_start)?;

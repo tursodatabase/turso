@@ -2144,6 +2144,183 @@ expect {
     10|100
 }
 
+@cross-check-integrity
+test fk-upsert-update-cascade-virtual-gencol-before-key-decoy {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(
+        v INTEGER GENERATED ALWAYS AS (k * 10) VIRTUAL,
+        k INTEGER UNIQUE,
+        x INTEGER
+    );
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER REFERENCES parent(k) ON UPDATE CASCADE);
+    INSERT INTO parent(k, x) VALUES (1, 100), (100, 200);
+    INSERT INTO child VALUES (10, 1), (20, 100);
+    INSERT INTO parent(k, x) VALUES (1, 101)
+        ON CONFLICT(k) DO UPDATE SET k = 99;
+    SELECT id, pkey FROM child ORDER BY id;
+    SELECT 'orphans', count(*)
+        FROM child LEFT JOIN parent ON child.pkey = parent.k
+        WHERE parent.k IS NULL;
+}
+expect {
+    10|99
+    20|100
+    orphans|0
+}
+
+@cross-check-integrity
+test fk-upsert-update-setnull-virtual-gencol-before-key-decoy {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(
+        v INTEGER GENERATED ALWAYS AS (k * 10) VIRTUAL,
+        k INTEGER UNIQUE,
+        x INTEGER
+    );
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER REFERENCES parent(k) ON UPDATE SET NULL);
+    INSERT INTO parent(k, x) VALUES (1, 100), (100, 200);
+    INSERT INTO child VALUES (10, 1), (20, 100);
+    INSERT INTO parent(k, x) VALUES (1, 101)
+        ON CONFLICT(k) DO UPDATE SET k = 99;
+    SELECT id, ifnull(pkey, 'NULL') FROM child ORDER BY id;
+    SELECT 'orphans', count(*)
+        FROM child LEFT JOIN parent ON child.pkey = parent.k
+        WHERE child.pkey IS NOT NULL AND parent.k IS NULL;
+}
+expect {
+    10|NULL
+    20|100
+    orphans|0
+}
+
+@cross-check-integrity
+test fk-upsert-update-setdefault-virtual-gencol-before-key-decoy {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(
+        v INTEGER GENERATED ALWAYS AS (k * 10) VIRTUAL,
+        k INTEGER UNIQUE,
+        x INTEGER
+    );
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER DEFAULT 0 REFERENCES parent(k) ON UPDATE SET DEFAULT);
+    INSERT INTO parent(k, x) VALUES (0, 0), (1, 100), (100, 200);
+    INSERT INTO child VALUES (10, 1), (20, 100);
+    INSERT INTO parent(k, x) VALUES (1, 101)
+        ON CONFLICT(k) DO UPDATE SET k = 99;
+    SELECT id, pkey FROM child ORDER BY id;
+    SELECT 'orphans', count(*)
+        FROM child LEFT JOIN parent ON child.pkey = parent.k
+        WHERE parent.k IS NULL;
+}
+expect {
+    10|0
+    20|100
+    orphans|0
+}
+
+@cross-check-integrity
+test fk-upsert-update-cascade-composite-virtual-gencol-before-key-decoy {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(
+        v INTEGER GENERATED ALWAYS AS (a + b) VIRTUAL,
+        a INTEGER,
+        b INTEGER,
+        x INTEGER,
+        UNIQUE(a, b)
+    );
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       ca INTEGER,
+                       cb INTEGER,
+                       FOREIGN KEY(ca, cb) REFERENCES parent(a, b) ON UPDATE CASCADE);
+    INSERT INTO parent(a, b, x) VALUES (1, 2, 100), (2, 100, 200);
+    INSERT INTO child VALUES (10, 1, 2), (20, 2, 100);
+    INSERT INTO parent(a, b, x) VALUES (1, 2, 101)
+        ON CONFLICT(a, b) DO UPDATE SET a = 99, b = 88;
+    SELECT id, ca, cb FROM child ORDER BY id;
+    SELECT 'orphans', count(*)
+        FROM child LEFT JOIN parent ON child.ca = parent.a AND child.cb = parent.b
+        WHERE parent.a IS NULL;
+}
+expect {
+    10|99|88
+    20|2|100
+    orphans|0
+}
+
+@cross-check-integrity
+test fk-upsert-update-cascade-virtual-gencol-no-key-change-decoy {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(
+        v INTEGER GENERATED ALWAYS AS (x * 10) VIRTUAL,
+        k INTEGER UNIQUE,
+        x INTEGER
+    );
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER REFERENCES parent(k) ON UPDATE CASCADE);
+    INSERT INTO parent(k, x) VALUES (1, 100), (100, 200);
+    INSERT INTO child VALUES (10, 1), (20, 100);
+    INSERT INTO parent(k, x) VALUES (1, 101)
+        ON CONFLICT(k) DO UPDATE SET x = 101;
+    SELECT id, pkey FROM child ORDER BY id;
+    SELECT 'orphans', count(*)
+        FROM child LEFT JOIN parent ON child.pkey = parent.k
+        WHERE parent.k IS NULL;
+}
+expect {
+    10|1
+    20|100
+    orphans|0
+}
+
+@cross-check-integrity
+test fk-upsert-update-cascade-virtual-parent-key-dependency-change {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(
+        x INTEGER UNIQUE,
+        v INTEGER GENERATED ALWAYS AS (x * 10) VIRTUAL UNIQUE,
+        y INTEGER
+    );
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER REFERENCES parent(v) ON UPDATE CASCADE);
+    INSERT INTO parent(x, y) VALUES (1, 5);
+    INSERT INTO child VALUES (10, 10);
+    INSERT INTO parent(x, y) VALUES (1, 6)
+        ON CONFLICT(x) DO UPDATE SET x = 2;
+    SELECT id, pkey FROM child ORDER BY id;
+    SELECT 'orphans', count(*)
+        FROM child LEFT JOIN parent ON child.pkey = parent.v
+        WHERE parent.v IS NULL;
+}
+expect {
+    10|20
+    orphans|0
+}
+
+@cross-check-integrity
+test fk-upsert-update-cascade-virtual-parent-key-unchanged {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(
+        x INTEGER UNIQUE,
+        v INTEGER GENERATED ALWAYS AS (x * 10) VIRTUAL UNIQUE,
+        y INTEGER
+    );
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER REFERENCES parent(v) ON UPDATE CASCADE);
+    INSERT INTO parent(x, y) VALUES (1, 5);
+    INSERT INTO child VALUES (10, 10);
+    INSERT INTO parent(x, y) VALUES (1, 6)
+        ON CONFLICT(x) DO UPDATE SET y = 6;
+    SELECT id, pkey FROM child ORDER BY id;
+    SELECT 'orphans', count(*)
+        FROM child LEFT JOIN parent ON child.pkey = parent.v
+        WHERE parent.v IS NULL;
+}
+expect {
+    10|10
+    orphans|0
+}
+
 # ON DELETE RESTRICT should fail when child references the parent row
 @cross-check-integrity
 test fk-delete-restrict-fails {
