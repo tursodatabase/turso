@@ -1298,6 +1298,10 @@ fn emit_update_insns<'a>(
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
     let mut has_before_triggers = false;
     let mut has_after_triggers = false;
+    let has_parent_fk_actions = connection.foreign_keys_enabled()
+        && t_ctx.resolver.with_schema(update_database_id, |s| {
+            s.any_resolved_fks_referencing(table_name)
+        });
     let preserved_old_registers: Option<Vec<usize>> =
         if let Some(btree_table) = target_table.table.btree() {
             let relevant_before_update_triggers = get_triggers_including_temp(
@@ -1316,13 +1320,9 @@ fn emit_update_insns<'a>(
                 &btree_table,
             );
 
-            let has_fk_cascade = connection.foreign_keys_enabled()
-                && t_ctx.resolver.with_schema(update_database_id, |s| {
-                    s.any_resolved_fks_referencing(table_name)
-                });
-
             has_before_triggers = !relevant_before_update_triggers.is_empty();
-            let needs_old_registers = has_before_triggers || has_after_triggers || has_fk_cascade;
+            let needs_old_registers =
+                has_before_triggers || has_after_triggers || has_parent_fk_actions;
 
             // Only read OLD row values when triggers or FK cascades need them
             let columns = target_table.table.columns();
@@ -1581,6 +1581,7 @@ fn emit_update_insns<'a>(
         if update_affects_virtual_columns
             || has_before_triggers
             || has_after_triggers
+            || has_parent_fk_actions
             || has_returning
             || has_check_constraints
             || index_references_virtual_column

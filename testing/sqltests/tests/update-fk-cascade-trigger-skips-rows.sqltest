@@ -355,3 +355,49 @@ expect {
     20|100
     orphans|0
 }
+
+@cross-check-integrity
+test update-fk-cascade-virtual-parent-key-dependency-change {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(
+        x INTEGER,
+        v INTEGER GENERATED ALWAYS AS (x * 10) VIRTUAL UNIQUE,
+        y INTEGER
+    );
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER REFERENCES parent(v) ON UPDATE CASCADE);
+    INSERT INTO parent(x, y) VALUES (1, 5);
+    INSERT INTO child VALUES (10, 10);
+    UPDATE parent SET x = 2 WHERE x = 1;
+    SELECT id, pkey FROM child ORDER BY id;
+    SELECT 'orphans', count(*)
+        FROM child LEFT JOIN parent ON child.pkey = parent.v
+        WHERE parent.v IS NULL;
+}
+expect {
+    10|20
+    orphans|0
+}
+
+@cross-check-integrity
+test update-fk-cascade-virtual-parent-key-unchanged {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(
+        x INTEGER,
+        v INTEGER GENERATED ALWAYS AS (x * 10) VIRTUAL UNIQUE,
+        y INTEGER
+    );
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER REFERENCES parent(v) ON UPDATE CASCADE);
+    INSERT INTO parent(x, y) VALUES (1, 5);
+    INSERT INTO child VALUES (10, 10);
+    UPDATE parent SET y = 6 WHERE x = 1;
+    SELECT id, pkey FROM child ORDER BY id;
+    SELECT 'orphans', count(*)
+        FROM child LEFT JOIN parent ON child.pkey = parent.v
+        WHERE parent.v IS NULL;
+}
+expect {
+    10|10
+    orphans|0
+}
