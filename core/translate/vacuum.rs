@@ -31,7 +31,8 @@ pub fn translate_vacuum(
             // VACUUM INTO 'path' - create compacted copy at destination
             let dest = extract_path_from_expr(dest_expr)?;
             let opts = OpenOptions::parse(dest.as_str())?;
-            // Do we need to throw error if nonsense options like mode=ro are passed?
+            // TODO: Handle all URI parameters, including throwing errors for nonsense ones like
+            // mode=ro
             match (opts.cipher, opts.hexkey) {
                 (Some(cipher), Some(hexkey)) => program.emit_insn(Insn::VacuumInto {
                     schema_name,
@@ -186,9 +187,9 @@ mod tests {
         let (_, connection) = Connection::from_uri(":memory:", DatabaseOpts::new())
             .expect("in-memory connection should succeed");
         let err = translate_vacuum(&mut program, None, Some(&dest), connection).unwrap_err();
-        assert!(
-            err.to_string().contains("hexkey is required"),
-            "unexpected error: {err}"
+        assert_eq!(
+            err.to_string(),
+            "Parse error: hexkey is required when cipher is provided"
         );
     }
 
@@ -199,9 +200,9 @@ mod tests {
         let (_, connection) = Connection::from_uri(":memory:", DatabaseOpts::new())
             .expect("in-memory connection should succeed");
         let err = translate_vacuum(&mut program, None, Some(&dest), connection).unwrap_err();
-        assert!(
-            err.to_string().contains("cipher is required"),
-            "unexpected error: {err}"
+        assert_eq!(
+            err.to_string(),
+            "Parse error: cipher is required when hexkey is provided"
         );
     }
 
