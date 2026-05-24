@@ -1477,6 +1477,56 @@ fn emit_update_insns<'a>(
         )?;
     }
 
+    let update_affects_virtual_columns = affected_columns.count() > updated_column_indices.count();
+    let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
+    if let Table::BTree(ref btree) = target_table.table {
+        let has_check_constraints = !btree.check_constraints.is_empty();
+        let cols = btree.columns();
+        let virtual_col_names: HashSet<String> = cols
+            .iter()
+            .filter(|c| c.is_virtual_generated())
+            .filter_map(|c| c.name.as_ref().map(|n| normalize_ident(n)))
+            .collect();
+        let expr_references_virtual = |expr: &ast::Expr| {
+            !virtual_col_names.is_empty()
+                && !collect_column_dependencies_of_expr(expr, cols).is_disjoint(&virtual_col_names)
+        };
+        let index_references_virtual_column = indexes_to_update.iter().any(|idx| {
+            idx.columns.iter().any(|col| {
+                if col.pos_in_table != EXPR_INDEX_SENTINEL {
+                    cols[col.pos_in_table].is_virtual_generated()
+                } else {
+                    col.expr.as_deref().is_some_and(expr_references_virtual)
+                }
+            }) || idx
+                .where_clause
+                .as_deref()
+                .is_some_and(expr_references_virtual)
+        });
+
+        if update_affects_virtual_columns
+            || has_before_triggers
+            || has_after_triggers
+            || has_parent_fk_actions
+            || has_returning
+            || has_check_constraints
+            || index_references_virtual_column
+        {
+            let columns = target_table.table.columns();
+
+            //TODO don't emit all virtual columns
+            let dml_ctx =
+                DmlColumnContext::layout(columns, start, effective_rowid_reg, layout.clone());
+            compute_virtual_columns(
+                program,
+                &btree.columns_topo_sort()?,
+                &dml_ctx,
+                &t_ctx.resolver,
+                btree,
+            )?;
+        }
+    }
+
     let mut deferred_new_key_plans = Vec::new();
     if connection.foreign_keys_enabled() {
         let rowid_new_reg = effective_rowid_reg;
@@ -1549,56 +1599,6 @@ fn emit_update_insns<'a>(
             .resolver
             .register_affinities
             .insert(effective_rowid_reg, Affinity::Integer);
-    }
-
-    let update_affects_virtual_columns = affected_columns.count() > updated_column_indices.count();
-    let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
-    if let Table::BTree(ref btree) = target_table.table {
-        let has_check_constraints = !btree.check_constraints.is_empty();
-        let cols = btree.columns();
-        let virtual_col_names: HashSet<String> = cols
-            .iter()
-            .filter(|c| c.is_virtual_generated())
-            .filter_map(|c| c.name.as_ref().map(|n| normalize_ident(n)))
-            .collect();
-        let expr_references_virtual = |expr: &ast::Expr| {
-            !virtual_col_names.is_empty()
-                && !collect_column_dependencies_of_expr(expr, cols).is_disjoint(&virtual_col_names)
-        };
-        let index_references_virtual_column = indexes_to_update.iter().any(|idx| {
-            idx.columns.iter().any(|col| {
-                if col.pos_in_table != EXPR_INDEX_SENTINEL {
-                    cols[col.pos_in_table].is_virtual_generated()
-                } else {
-                    col.expr.as_deref().is_some_and(expr_references_virtual)
-                }
-            }) || idx
-                .where_clause
-                .as_deref()
-                .is_some_and(expr_references_virtual)
-        });
-
-        if update_affects_virtual_columns
-            || has_before_triggers
-            || has_after_triggers
-            || has_parent_fk_actions
-            || has_returning
-            || has_check_constraints
-            || index_references_virtual_column
-        {
-            let columns = target_table.table.columns();
-
-            //TODO don't emit all virtual columns
-            let dml_ctx =
-                DmlColumnContext::layout(columns, start, effective_rowid_reg, layout.clone());
-            compute_virtual_columns(
-                program,
-                &btree.columns_topo_sort()?,
-                &dml_ctx,
-                &t_ctx.resolver,
-                btree,
-            )?;
-        }
     }
 
     let target_is_strict = target_table
@@ -2359,7 +2359,12 @@ fn emit_update_insns<'a>(
                             "UPDATE on virtual table has no btree".into(),
                         )
                     })?;
-                    let new_ctx = DmlColumnContext::layout(columns, start, beg, layout.clone());
+                    let new_ctx = DmlColumnContext::layout(
+                        columns,
+                        start,
+                        effective_rowid_reg,
+                        layout.clone(),
+                    );
                     compute_virtual_columns(
                         program,
                         &btree_table.columns_topo_sort()?,
