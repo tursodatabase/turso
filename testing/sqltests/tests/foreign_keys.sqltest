@@ -1173,6 +1173,27 @@ test fk-deferred-child-update-rowid-alias-composite-old-probe {
 expect error {
 }
 
+# Composite child FK whose second component is an INTEGER PRIMARY KEY rowid alias.
+# This covers the non-leading alias case for OLD child key materialization.
+@cross-check-integrity
+test fk-deferred-child-update-rowid-alias-composite-old-probe-second-component {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INT, b INT, UNIQUE(a,b));
+    CREATE TABLE child(
+        x INT,
+        id INTEGER PRIMARY KEY,
+        FOREIGN KEY(x,id) REFERENCES parent(a,b) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES(2,1),(3,1);
+    INSERT INTO child(x,id) VALUES(2,1);
+    BEGIN;
+    INSERT INTO child(x,id) VALUES(9,9);
+    UPDATE child SET x=3 WHERE id=1;
+    COMMIT;
+}
+expect error {
+}
+
 # TX: NULL in child FK -> never a violation
 @cross-check-integrity
 test fk-deferred-null-fk-never-violates {
