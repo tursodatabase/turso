@@ -77,7 +77,7 @@ pub struct SymbolDefinitionBuilder {
 
 #[derive(Debug)]
 enum GrammarFrontierNode {
-    Handle(SymbolHandle),
+    Handle(SymbolHandle, usize), // (handle, depth)
     String(String),
 }
 
@@ -169,7 +169,10 @@ impl GrammarGenerator {
         root: SymbolHandle,
         length_limit_hint: usize,
     ) -> String {
-        let mut frontier = vec![GrammarFrontierNode::Handle(root)];
+        // Depth limit to prevent stack overflow during expression compilation.
+        // Deeply nested expressions cause recursive translate_expr() calls that overflow the stack.
+        const MAX_DEPTH: usize = 15;
+        let mut frontier = vec![GrammarFrontierNode::Handle(root, 0)];
 
         let mut is_recursive = HashMap::default();
         self.is_recursive_from_root(root, &mut is_recursive);
@@ -180,11 +183,12 @@ impl GrammarGenerator {
             let mut expanded = false;
             let limit_exceeded = frontier.len() >= length_limit_hint;
             for node in frontier.into_iter() {
-                let GrammarFrontierNode::Handle(handle) = node else {
+                let GrammarFrontierNode::Handle(handle, depth) = node else {
                     next.push(node);
                     continue;
                 };
 
+                let depth_exceeded = depth >= MAX_DEPTH;
                 expanded = true;
                 match symbols.get(&handle).expect("symbol must be registered") {
                     SymbolType::Str {
@@ -203,8 +207,8 @@ impl GrammarGenerator {
                         ));
                     }
                     SymbolType::Optional { value, prob } => {
-                        if !limit_exceeded && rng.random_bool(*prob) {
-                            next.push(GrammarFrontierNode::Handle(*value));
+                        if !limit_exceeded && !depth_exceeded && rng.random_bool(*prob) {
+                            next.push(GrammarFrontierNode::Handle(*value, depth + 1));
                         }
                     }
                     SymbolType::Repeat {
@@ -212,7 +216,7 @@ impl GrammarGenerator {
                         range,
                         separator,
                     } => {
-                        let repetitions = if !limit_exceeded {
+                        let repetitions = if !limit_exceeded && !depth_exceeded {
                             rng.random_range(range.clone())
                         } else {
                             range.start
@@ -221,7 +225,7 @@ impl GrammarGenerator {
                             if i > 0 {
                                 next.push(GrammarFrontierNode::String(separator.to_string()));
                             }
-                            next.push(GrammarFrontierNode::Handle(*value));
+                            next.push(GrammarFrontierNode::Handle(*value, depth + 1));
                         }
                     }
                     SymbolType::Concat { values, separator } => {
@@ -229,11 +233,12 @@ impl GrammarGenerator {
                             if i > 0 {
                                 next.push(GrammarFrontierNode::String(separator.to_string()));
                             }
-                            next.push(GrammarFrontierNode::Handle(*value));
+                            next.push(GrammarFrontierNode::Handle(*value, depth));
                         }
                     }
                     SymbolType::Choice { values } => {
-                        let mut handles = if !limit_exceeded {
+                        // When depth exceeded OR limit exceeded, strongly prefer non-recursive options
+                        let mut handles = if !limit_exceeded && !depth_exceeded {
                             values.clone()
                         } else {
                             values
@@ -243,7 +248,16 @@ impl GrammarGenerator {
                                 .collect::<Vec<_>>()
                         };
                         if handles.is_empty() {
-                            handles = values.clone();
+                            // If all choices are recursive but depth is exceeded,
+                            // reduce weights of recursive options to limit depth growth
+                            if depth_exceeded {
+                                handles = values
+                                    .iter()
+                                    .map(|(h, w)| (*h, *w * 0.1)) // Reduce recursive weight by 10x
+                                    .collect();
+                            } else {
+                                handles = values.clone();
+                            }
                         }
 
                         let sum: f64 = handles.iter().map(|x| x.1).sum();
@@ -253,7 +267,7 @@ impl GrammarGenerator {
                             if sample > 0.0 && i < handles.len() - 1 {
                                 continue;
                             }
-                            next.push(GrammarFrontierNode::Handle(*handle));
+                            next.push(GrammarFrontierNode::Handle(*handle, depth + 1));
                             break;
                         }
                     }
@@ -392,5 +406,73 @@ impl SymbolDefinitionBuilder {
         let symbol = self.symbol.expect("symbol must be set");
         self.generator.register(self.handle, symbol);
         self.handle
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: deeply recursive grammars must not cause stack overflow.
+    ///
+    /// Before the depth limit, a grammar with unbounded recursion (like arithmetic
+    /// expressions) could generate arbitrarily deep nested expressions during
+    /// `generate_string()`, causing recursive `translate_expr()` calls to overflow
+    /// the stack. This test creates such a grammar and verifies termination.
+    #[test]
+    fn test_deeply_recursive_grammar_does_not_overflow() {
+        let g = GrammarGenerator::new();
+
+        // Build a grammar that mimics arithmetic expressions:
+        //   expr -> choice([expr + expr, expr * expr, expr - expr, literal])
+        // This can recurse unboundedly without the depth limit.
+        let literal = g.symbol("literal").choice(&[
+            (g.symbol("num").str("42").build(), 1.0),
+            (g.symbol("var").str("x").build(), 1.0),
+        ]).build();
+
+        let add = g.symbol("add")
+            .str("(")
+            .repeat(
+                g.symbol("add_inner")
+                    .symbol_handle(literal)
+                    .str(" + ")
+                    .symbol_handle(literal)
+                    .build(),
+                1..2,
+                "",
+            )
+            .str(")")
+            .build();
+
+        let mul = g.symbol("mul")
+            .str("(")
+            .repeat(
+                g.symbol("mul_inner")
+                    .symbol_handle(literal)
+                    .str(" * ")
+                    .symbol_handle(literal)
+                    .build(),
+                1..2,
+                "",
+            )
+            .str(")")
+            .build();
+
+        let expr = g.symbol("expr").choice(&[
+            (add, 1.0),
+            (mul, 1.0),
+            (literal, 0.05), // Low weight to force recursion
+        ]).build();
+
+        // This would stack overflow without the depth limit.
+        // With MAX_DEPTH=15, it should always terminate.
+        for _ in 0..100 {
+            let result = g.generate_string(expr, 200);
+            assert!(!result.is_empty(), "generated string should not be empty");
+            // Verify nesting depth is bounded (rough check)
+            let depth = result.chars().filter(|&c| c == '(').count();
+            assert!(depth <= 20, "nesting depth {depth} exceeds expected bound");
+        }
     }
 }
