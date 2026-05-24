@@ -7435,7 +7435,7 @@ pub fn op_function(
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             ScalarFunc::LoadExtension => {
-                if !program.connection.db.can_load_extensions() {
+                if !program.connection.can_load_extensions() {
                     crate::bail_parse_error!("runtime extension loading is disabled");
                 }
                 let extension = &state.registers[*start_reg];
