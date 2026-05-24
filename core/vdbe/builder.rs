@@ -166,6 +166,9 @@ impl DmlColumnContext {
                 rowid_alias_col = Some(idx);
             }
         }
+        if let (Some(alias_idx), Some(rowid_reg)) = (rowid_alias_col, rowid_reg) {
+            column_regs[alias_idx] = rowid_reg;
+        }
         Self {
             registers: DmlColumnRegisters::Indexed { column_regs },
             rowid_alias_col,
@@ -174,14 +177,14 @@ impl DmlColumnContext {
     }
 
     pub fn to_column_reg(&self, col_idx: usize) -> usize {
-        if self.rowid_alias_col == Some(col_idx) {
-            if let Some(rowid_reg) = self.rowid_reg {
-                return rowid_reg;
-            }
-        }
         match &self.registers {
             DmlColumnRegisters::Layout { base_reg, layout } => {
-                layout.to_register(*base_reg, col_idx)
+                if self.rowid_alias_col == Some(col_idx) {
+                    self.rowid_reg
+                        .expect("layout row images must carry an explicit rowid register")
+                } else {
+                    layout.to_register(*base_reg, col_idx)
+                }
             }
             DmlColumnRegisters::Indexed { column_regs } => column_regs[col_idx],
         }
