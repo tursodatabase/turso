@@ -131,8 +131,7 @@ impl MemorySimFile {
     }
 
     fn insert_op(&self, op: OperationType) {
-        // FIXME: currently avoid any fsync faults until we correctly define the expected behaviour in the simulator
-        let fault = self.fault.get() && !matches!(op, OperationType::Sync { .. });
+        let fault = self.fault.get();
         if fault {
             let mut io_tracker = self.io_tracker.borrow_mut();
             match &op {

@@ -819,8 +819,6 @@ impl InteractionType {
                 .collect();
 
             loop {
-                let syncing = env.io.syncing();
-
                 // Decide faults independently per database
                 let main_fault = env.rng.random_bool(current_prob);
                 let aux_prob = (current_prob * 0.5).min(1.0);
@@ -831,8 +829,7 @@ impl InteractionType {
                 }
                 let any_fault = fault_pairs.iter().any(|(_, f)| *f);
 
-                // TODO: avoid for now injecting faults when syncing
-                if any_fault && !syncing {
+                if any_fault {
                     env.io.inject_fault_selective(&fault_pairs);
                 }
 
