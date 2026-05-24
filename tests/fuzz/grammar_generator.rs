@@ -77,7 +77,7 @@ pub struct SymbolDefinitionBuilder {
 
 #[derive(Debug)]
 enum GrammarFrontierNode {
-    Handle(SymbolHandle),
+    Handle(SymbolHandle, usize), // (handle, depth)
     String(String),
 }
 
@@ -169,7 +169,10 @@ impl GrammarGenerator {
         root: SymbolHandle,
         length_limit_hint: usize,
     ) -> String {
-        let mut frontier = vec![GrammarFrontierNode::Handle(root)];
+        // Depth limit to prevent stack overflow during expression compilation.
+        // Deeply nested expressions cause recursive translate_expr() calls that overflow the stack.
+        const MAX_DEPTH: usize = 15;
+        let mut frontier = vec![GrammarFrontierNode::Handle(root, 0)];
 
         let mut is_recursive = HashMap::default();
         self.is_recursive_from_root(root, &mut is_recursive);
@@ -180,11 +183,12 @@ impl GrammarGenerator {
             let mut expanded = false;
             let limit_exceeded = frontier.len() >= length_limit_hint;
             for node in frontier.into_iter() {
-                let GrammarFrontierNode::Handle(handle) = node else {
+                let GrammarFrontierNode::Handle(handle, depth) = node else {
                     next.push(node);
                     continue;
                 };
 
+                let depth_exceeded = depth >= MAX_DEPTH;
                 expanded = true;
                 match symbols.get(&handle).expect("symbol must be registered") {
                     SymbolType::Str {
@@ -203,8 +207,8 @@ impl GrammarGenerator {
                         ));
                     }
                     SymbolType::Optional { value, prob } => {
-                        if !limit_exceeded && rng.random_bool(*prob) {
-                            next.push(GrammarFrontierNode::Handle(*value));
+                        if !limit_exceeded && !depth_exceeded && rng.random_bool(*prob) {
+                            next.push(GrammarFrontierNode::Handle(*value, depth + 1));
                         }
                     }
                     SymbolType::Repeat {
@@ -212,7 +216,7 @@ impl GrammarGenerator {
                         range,
                         separator,
                     } => {
-                        let repetitions = if !limit_exceeded {
+                        let repetitions = if !limit_exceeded && !depth_exceeded {
                             rng.random_range(range.clone())
                         } else {
                             range.start
@@ -221,7 +225,7 @@ impl GrammarGenerator {
                             if i > 0 {
                                 next.push(GrammarFrontierNode::String(separator.to_string()));
                             }
-                            next.push(GrammarFrontierNode::Handle(*value));
+                            next.push(GrammarFrontierNode::Handle(*value, depth + 1));
                         }
                     }
                     SymbolType::Concat { values, separator } => {
@@ -229,11 +233,12 @@ impl GrammarGenerator {
                             if i > 0 {
                                 next.push(GrammarFrontierNode::String(separator.to_string()));
                             }
-                            next.push(GrammarFrontierNode::Handle(*value));
+                            next.push(GrammarFrontierNode::Handle(*value, depth));
                         }
                     }
                     SymbolType::Choice { values } => {
-                        let mut handles = if !limit_exceeded {
+                        // When depth exceeded OR limit exceeded, strongly prefer non-recursive options
+                        let mut handles = if !limit_exceeded && !depth_exceeded {
                             values.clone()
                         } else {
                             values
@@ -243,7 +248,16 @@ impl GrammarGenerator {
                                 .collect::<Vec<_>>()
                         };
                         if handles.is_empty() {
-                            handles = values.clone();
+                            // If all choices are recursive but depth is exceeded,
+                            // reduce weights of recursive options to limit depth growth
+                            if depth_exceeded {
+                                handles = values
+                                    .iter()
+                                    .map(|(h, w)| (*h, *w * 0.1)) // Reduce recursive weight by 10x
+                                    .collect();
+                            } else {
+                                handles = values.clone();
+                            }
                         }
 
                         let sum: f64 = handles.iter().map(|x| x.1).sum();
@@ -253,7 +267,7 @@ impl GrammarGenerator {
                             if sample > 0.0 && i < handles.len() - 1 {
                                 continue;
                             }
-                            next.push(GrammarFrontierNode::Handle(*handle));
+                            next.push(GrammarFrontierNode::Handle(*handle, depth + 1));
                             break;
                         }
                     }
