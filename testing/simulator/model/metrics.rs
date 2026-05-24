@@ -73,7 +73,7 @@ impl Remaining {
             .unwrap_or_default();
 
         let mut remaining_drop_index = total_drop_index
-            .checked_sub(stats.alter_table_count)
+            .checked_sub(stats.drop_index_count)
             .unwrap_or_default();
 
         if mvcc {
