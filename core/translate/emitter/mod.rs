@@ -1695,18 +1695,13 @@ pub(crate) fn init_limit(
     Ok(())
 }
 
-/// Emits  `target_columns`, plus the stored columns needed by `target_columns`, into compact
-/// registers. This takes into account stored columns, and any stored columns required
-/// by virtual columns in `target_columns`.
+/// Emits `target_columns`, plus the stored columns needed by `target_columns`, into a
+/// DML row context. This takes into account stored columns, and any stored columns
+/// required by virtual columns in `target_columns`.
 ///
-/// Target columns are guaranteed to be in a contiguous block, in the given order, at the start of
-/// registers. The following postcondition holds:
-///
-/// ```text
-/// dml_ctx.to_column_reg(target_columns[i]) == dml_ctx.to_column_reg(target_columns[0]) + i
-/// ```
-///
-/// This way, target_columns[0] can be used as a base for opcodes that require unpacked records.
+/// Non-rowid target columns are allocated in target order. Rowid-alias columns resolve
+/// to `rowid_reg`, so callers that need an unpacked contiguous key or record must
+/// materialize one from `DmlColumnContext::to_column_reg`.
 pub(crate) fn emit_columns_and_dependencies(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
@@ -1754,9 +1749,14 @@ pub(crate) fn emit_columns_and_dependencies(
         (col, reg)
     });
     let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs, Some(rowid_reg));
-    debug_assert!(targets
-        .windows(2)
-        .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));
+    if targets
+        .iter()
+        .all(|&idx| !table.columns()[idx].is_rowid_alias())
+    {
+        debug_assert!(targets
+            .windows(2)
+            .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));
+    }
 
     let table_arc = Arc::new(table.clone());
     gencol::compute_virtual_columns(

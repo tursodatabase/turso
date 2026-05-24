@@ -197,6 +197,34 @@ fn copy_with_affinity(
     dst
 }
 
+/// Build an unpacked key for opcodes that require adjacent registers; rowid aliases
+/// may resolve outside the compact column block.
+#[inline]
+fn copy_context_columns_with_affinity(
+    program: &mut ProgramBuilder,
+    dml_ctx: &DmlColumnContext,
+    column_positions: &[usize],
+    idx: &Index,
+    aff_from_tbl: &BTreeTable,
+) -> usize {
+    let dst = program.alloc_registers(column_positions.len());
+    for (i, pos) in column_positions.iter().enumerate() {
+        program.emit_insn(Insn::Copy {
+            src_reg: dml_ctx.to_column_reg(*pos),
+            dst_reg: dst + i,
+            extra_amount: 0,
+        });
+    }
+    if let Some(count) = NonZeroUsize::new(column_positions.len()) {
+        program.emit_insn(Insn::Affinity {
+            start_reg: dst,
+            count,
+            affinities: build_index_affinity_string(idx, aff_from_tbl),
+        });
+    }
+    dst
+}
+
 /// Issue an index probe using `Found`/`NotFound` and route to `on_found`/`on_not_found`.
 pub fn index_probe<F, G>(
     program: &mut ProgramBuilder,
@@ -869,10 +897,13 @@ pub fn emit_fk_child_update_counters(
                         .expect("parent unique index required");
                     let icur = open_read_index(program, idx, database_id);
 
-                    // this is safe because emit_columns_and_dependencies
-                    // guarantees target columns are contiguous.
-                    let old_start = dml_ctx.to_column_reg(fk_col_positions[0]);
-                    let probe = copy_with_affinity(program, old_start, ncols, idx, &parent_tbl);
+                    let probe = copy_context_columns_with_affinity(
+                        program,
+                        &dml_ctx,
+                        &fk_col_positions,
+                        idx,
+                        &parent_tbl,
+                    );
                     // Found: nothing; Not found: guarded decrement
                     index_probe(
                         program,

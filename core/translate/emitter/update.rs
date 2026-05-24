@@ -1295,7 +1295,7 @@ fn emit_update_insns<'a>(
         }
     }
 
-    // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
+    // Fire BEFORE UPDATE triggers and preserve OLD row registers for later trigger/FK work.
     let mut has_before_triggers = false;
     let mut has_after_triggers = false;
     let has_parent_fk_actions = connection.foreign_keys_enabled()
@@ -1324,7 +1324,7 @@ fn emit_update_insns<'a>(
             let needs_old_registers =
                 has_before_triggers || has_after_triggers || has_parent_fk_actions;
 
-            // Only read OLD row values when triggers or FK cascades need them
+            // Only read OLD row values when triggers or parent-side FK work needs them.
             let columns = target_table.table.columns();
             let old_registers: Option<Vec<usize>> = if needs_old_registers {
                 let mut regs = Vec::with_capacity(col_len + 1);
@@ -2311,8 +2311,8 @@ fn emit_update_insns<'a>(
                 )?;
             }
 
-            // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
-            // This ensures the new parent key exists when cascade actions update child rows
+            // Fire FK CASCADE/SET NULL/SET DEFAULT actions after the parent row is updated.
+            // This ensures the new parent key exists when cascade actions update child rows.
             if connection.foreign_keys_enabled()
                 && t_ctx.resolver.with_schema(update_database_id, |s| {
                     s.any_resolved_fks_referencing(table_name)
