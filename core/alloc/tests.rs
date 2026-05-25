@@ -275,7 +275,7 @@ fn try_clone_builds_independent_alloc_collections() {
     assert_eq!(cloned.as_slice(), values.as_slice());
     assert_ne!(cloned.as_ptr(), values.as_ptr());
 
-    let boxed = Box::try_new(String::from("turso")).unwrap();
+    let boxed: Box<_> = TursoTryNewExt::try_new(String::from("turso")).unwrap();
     let cloned = boxed.try_clone().unwrap();
     assert_eq!(&*cloned, &*boxed);
 
