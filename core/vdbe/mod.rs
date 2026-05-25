@@ -2867,7 +2867,9 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                         }
                     }
                     _ => {
-                        dest.set_text(Text::new(text_str.to_string()));
+                        if let Err(err) = dest.set_text(Text::new(text_str.to_string())) {
+                            return Some(Err(err));
+                        }
                     }
                 }
             }

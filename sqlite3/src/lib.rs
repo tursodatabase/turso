@@ -1533,6 +1533,20 @@ fn sqlite3_bind_index_in_range(stmt: &sqlite3_stmt, idx: ffi::c_int) -> Option<N
     }
 }
 
+unsafe fn sqlite3_bind_result(
+    stmt: &mut sqlite3_stmt,
+    result: Result<(), LimboError>,
+) -> ffi::c_int {
+    match result {
+        Ok(()) => SQLITE_OK,
+        Err(err) => {
+            let db = &mut *stmt.db;
+            let mut inner = db.inner.lock().unwrap();
+            set_db_err(&mut inner, err)
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_parameter_name(
     stmt: *mut sqlite3_stmt,
@@ -1584,8 +1598,8 @@ pub unsafe extern "C" fn sqlite3_bind_null(stmt: *mut sqlite3_stmt, idx: ffi::c_
         return SQLITE_RANGE;
     };
 
-    stmt.stmt.bind_at(index, Value::Null);
-    SQLITE_OK
+    let result = stmt.stmt.bind_at(index, Value::Null);
+    sqlite3_bind_result(stmt, result)
 }
 
 #[no_mangle]
@@ -1611,9 +1625,8 @@ pub unsafe extern "C" fn sqlite3_bind_int64(
         return SQLITE_RANGE;
     };
 
-    stmt.stmt.bind_at(index, Value::from_i64(val));
-
-    SQLITE_OK
+    let result = stmt.stmt.bind_at(index, Value::from_i64(val));
+    sqlite3_bind_result(stmt, result)
 }
 
 #[no_mangle]
@@ -1630,9 +1643,8 @@ pub unsafe extern "C" fn sqlite3_bind_double(
         return SQLITE_RANGE;
     };
 
-    stmt.stmt.bind_at(index, Value::from_f64(val));
-
-    SQLITE_OK
+    let result = stmt.stmt.bind_at(index, Value::from_f64(val));
+    sqlite3_bind_result(stmt, result)
 }
 
 #[no_mangle]
@@ -1651,8 +1663,8 @@ pub unsafe extern "C" fn sqlite3_bind_text(
         return SQLITE_RANGE;
     };
     if text.is_null() {
-        stmt_ref.stmt.bind_at(index, Value::Null);
-        return SQLITE_OK;
+        let result = stmt_ref.stmt.bind_at(index, Value::Null);
+        return sqlite3_bind_result(stmt_ref, result);
     }
 
     let static_ptr = std::ptr::null();
@@ -1676,15 +1688,27 @@ pub unsafe extern "C" fn sqlite3_bind_text(
 
     if ptr_val == transient_ptr {
         let val = Value::from_text(str_value);
-        stmt_ref.stmt.bind_at(index, val);
+        let result = stmt_ref.stmt.bind_at(index, val);
+        let rc = sqlite3_bind_result(stmt_ref, result);
+        if rc != SQLITE_OK {
+            return rc;
+        }
     } else if ptr_val == static_ptr {
         let slice = std::slice::from_raw_parts(text as *const u8, str_value.len());
         let val = Value::from_text(std::str::from_utf8(slice).unwrap());
-        stmt_ref.stmt.bind_at(index, val);
+        let result = stmt_ref.stmt.bind_at(index, val);
+        let rc = sqlite3_bind_result(stmt_ref, result);
+        if rc != SQLITE_OK {
+            return rc;
+        }
     } else {
         let slice = std::slice::from_raw_parts(text as *const u8, str_value.len());
         let val = Value::from_text(std::str::from_utf8(slice).unwrap());
-        stmt_ref.stmt.bind_at(index, val);
+        let result = stmt_ref.stmt.bind_at(index, val);
+        let rc = sqlite3_bind_result(stmt_ref, result);
+        if rc != SQLITE_OK {
+            return rc;
+        }
 
         stmt_ref
             .destructors
@@ -1710,15 +1734,19 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
         return SQLITE_RANGE;
     };
     if blob.is_null() {
-        stmt_ref.stmt.bind_at(index, Value::Null);
-        return SQLITE_OK;
+        let result = stmt_ref.stmt.bind_at(index, Value::Null);
+        return sqlite3_bind_result(stmt_ref, result);
     }
 
     let slice_blob = std::slice::from_raw_parts(blob as *const u8, len as usize).to_vec();
 
     let val_blob = Value::from_blob(slice_blob);
 
-    stmt_ref.stmt.bind_at(index, val_blob);
+    let result = stmt_ref.stmt.bind_at(index, val_blob);
+    let rc = sqlite3_bind_result(stmt_ref, result);
+    if rc != SQLITE_OK {
+        return rc;
+    }
 
     if let Some(destructor_fn) = destructor {
         let ptr_val = destructor_fn as *const ffi::c_void;

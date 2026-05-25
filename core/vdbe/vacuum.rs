@@ -789,7 +789,7 @@ pub(crate) fn vacuum_target_build_step(
                     for (i, value) in row.get_values().cloned().enumerate() {
                         let index =
                             std::num::NonZero::new(i + 1).expect("i + 1 is always non-zero");
-                        target_insert_stmt.bind_at(index, value);
+                        target_insert_stmt.bind_at(index, value)?;
                     }
 
                     state.phase = VacuumTargetBuildPhase::StepTargetInsert {

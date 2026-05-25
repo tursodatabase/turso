@@ -2165,7 +2165,7 @@ pub fn op_array_decode(
             return Ok(InsnFunctionStepResult::Step);
         }
     };
-    state.registers[*reg].set_text(Text::new(text));
+    state.registers[*reg].set_text(Text::new(text))?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -4493,7 +4493,7 @@ pub fn op_program(
                     let value = state.registers[parent_reg].get_value().clone();
                     let param_index = NonZero::<usize>::new(param_idx + 1)
                         .expect("param_idx + 1 should be non-zero");
-                    statement.bind_at(param_index, value);
+                    statement.bind_at(param_index, value)?;
                 }
 
                 *state.active_op_state.program() = OpProgramState::Step {
@@ -4644,7 +4644,7 @@ pub fn op_string8(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(String8 { value, dest }, insn);
-    state.registers[*dest].set_text(Text::new(value.clone()));
+    state.registers[*dest].set_text(Text::new(value.clone()))?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -4656,7 +4656,7 @@ pub fn op_blob(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Blob { value, dest }, insn);
-    state.registers[*dest].set_blob(value.clone());
+    state.registers[*dest].set_blob(value.clone())?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -6346,21 +6346,21 @@ pub fn op_agg_final(
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonGroupArray => {
-                    state.registers[dest_reg].set_text(Text::json("[]".to_string()));
+                    state.registers[dest_reg].set_text(Text::json("[]".to_string()))?;
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupArray => {
                     state.registers[dest_reg]
-                        .set_blob(json::jsonb::Jsonb::make_empty_array(1).data());
+                        .set_blob(json::jsonb::Jsonb::make_empty_array(1).data())?;
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonGroupObject => {
-                    state.registers[dest_reg].set_text(Text::json("{}".to_string()));
+                    state.registers[dest_reg].set_text(Text::json("{}".to_string()))?;
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupObject => {
                     state.registers[dest_reg]
-                        .set_blob(json::jsonb::Jsonb::make_empty_obj(1).data());
+                        .set_blob(json::jsonb::Jsonb::make_empty_obj(1).data())?;
                 }
                 _ => {}
             }
@@ -7400,18 +7400,18 @@ pub fn op_function(
             }
             ScalarFunc::TursoVersion => {
                 if !program.connection.is_db_initialized() {
-                    state.registers[*dest].set_text(Text::new(info::build::PKG_VERSION));
+                    state.registers[*dest].set_text(Text::new(info::build::PKG_VERSION))?;
                 } else {
                     let version_integer =
                         return_if_io!(pager.with_header(|header| header.version_number)).get()
                             as i64;
                     let version = execute_turso_version(version_integer);
-                    state.registers[*dest].set_text(Text::new(version));
+                    state.registers[*dest].set_text(Text::new(version))?;
                 }
             }
             ScalarFunc::SqliteVersion => {
                 let version = execute_sqlite_version();
-                state.registers[*dest].set_text(Text::new(version));
+                state.registers[*dest].set_text(Text::new(version))?;
             }
             ScalarFunc::SqliteSourceId => {
                 let src_id = format!(
@@ -7419,7 +7419,7 @@ pub fn op_function(
                     info::build::BUILT_TIME_SQLITE,
                     info::build::GIT_COMMIT_HASH.unwrap_or("unknown")
                 );
-                state.registers[*dest].set_text(Text::new(src_id));
+                state.registers[*dest].set_text(Text::new(src_id))?;
             }
             ScalarFunc::Replace => {
                 assert_eq!(arg_count, 3);
@@ -8827,12 +8827,12 @@ pub fn op_function(
             };
 
             state.registers[*dest].set_value(r#type.clone());
-            state.registers[*dest + 1].set_text(Text::from(new_name));
-            state.registers[*dest + 2].set_text(Text::from(new_tbl_name));
+            state.registers[*dest + 1].set_text(Text::from(new_name))?;
+            state.registers[*dest + 2].set_text(Text::from(new_tbl_name))?;
             state.registers[*dest + 3].set_int(*root_page);
 
             if let Some(new_sql) = new_sql {
-                state.registers[*dest + 4].set_text(Text::from(new_sql));
+                state.registers[*dest + 4].set_text(Text::from(new_sql))?;
             } else {
                 state.registers[*dest + 4].set_value(sql.clone());
             }
@@ -8931,7 +8931,7 @@ pub fn op_function(
                             &before_str,
                             &after_str,
                         );
-                        state.registers[*dest].set_text(Text::new(highlighted));
+                        state.registers[*dest].set_text(Text::new(highlighted))?;
                     }
                 }
             }
@@ -14515,7 +14515,7 @@ fn op_journal_mode_inner(
                 // If no new mode specified, just return current mode
                 let Some(mode_str) = new_mode else {
                     let ret: &'static str = prev_mode.into();
-                    state.registers[*dest].set_text(Text::new(ret));
+                    state.registers[*dest].set_text(Text::new(ret))?;
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
                 };
@@ -14526,7 +14526,7 @@ fn op_journal_mode_inner(
                     Ok(mode) if mode.supported() => mode,
                     _ => {
                         let ret: &'static str = prev_mode.into();
-                        state.registers[*dest].set_text(Text::new(ret));
+                        state.registers[*dest].set_text(Text::new(ret))?;
                         state.pc += 1;
                         return Ok(InsnFunctionStepResult::Step);
                     }
@@ -14535,14 +14535,14 @@ fn op_journal_mode_inner(
                 // If same mode, just return
                 if prev_mode == new_mode {
                     let ret: &'static str = new_mode.into();
-                    state.registers[*dest].set_text(Text::new(ret));
+                    state.registers[*dest].set_text(Text::new(ret))?;
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
                 }
 
                 if *db != crate::MAIN_DB_ID {
                     let ret: &'static str = prev_mode.into();
-                    state.registers[*dest].set_text(Text::new(ret));
+                    state.registers[*dest].set_text(Text::new(ret))?;
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
                 }
@@ -14678,7 +14678,7 @@ fn op_journal_mode_inner(
 
                 // Return result
                 let ret: &'static str = new_mode.into();
-                state.registers[*dest].set_text(Text::new(ret));
+                state.registers[*dest].set_text(Text::new(ret))?;
                 state.pc += 1;
 
                 return Ok(InsnFunctionStepResult::Step);
