@@ -287,9 +287,9 @@ int64_t
 turso_statement_parameters_count(const turso_statement_t *self);
 
 /** Return the name of the parameter at 1-based index, including the SQL prefix.
- * Returns NULL for positional-only parameters or out-of-range indices.
- * The caller must free the returned string with turso_str_deinit.
- */
+Returns NULL for positional-only parameters or out-of-range indices.
+The caller must free the returned string with turso_str_deinit.
+*/
 const char *
 turso_statement_parameter_name(const turso_statement_t *self, int64_t index);
 

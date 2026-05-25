@@ -3126,6 +3126,18 @@ expect {
     5|100
 }
 
+setup gencol_drop_virtual_setup {
+    CREATE TABLE t (a);
+    ALTER TABLE t ADD COLUMN b AS (a);
+    INSERT INTO t (a) VALUES (1), (2), (3);
+}
+
+@setup gencol_drop_virtual_setup
+@skip-if mvcc "MVCC updates sqlite_schema using Delete then Insert, so the snapshot is slightly different"
+snapshot gencol_drop_virtual_column_no_row_rewrite {
+    ALTER TABLE t DROP COLUMN b;
+}
+
 # Only non-generated column — rejected before dependency check
 test gencol_drop_only_regular_column_error {
     CREATE TABLE t1(a INT, b AS (a * 2));
@@ -3424,6 +3436,21 @@ test rename_then_drop_keeps_renamed_column {
 }
 expect {
     CREATE TABLE t (a REAL AS (ee), c INTEGER, f INTEGER AS (c * ee), ee REAL)
+}
+
+test gencol_drop_column_shifts_index_expr {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER, d INTEGER AS (b + c));
+    INSERT INTO t (a, b, c) VALUES (1, 10, 20);
+    CREATE INDEX idx ON t (d);
+    ALTER TABLE t DROP COLUMN a;
+    INSERT INTO t (b, c) VALUES (100, 200);
+    SELECT * FROM t ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    10|20|30
+    100|200|300
+    ok
 }
 
 # =============================================================================
@@ -4880,4 +4907,73 @@ test update-expression-index-references-virtual-gencol {
 } expect {
     1|aaaaaa
     ok
+}
+
+@cross-check-integrity
+test gencol-virtual-affinity-applied-to-index {
+    CREATE TABLE t (a INTEGER, b INTEGER, v REAL AS (a + b));
+    INSERT INTO t (a, b) VALUES (5000000000000001, 5000000000000002);
+    INSERT INTO t (a, b) VALUES (1, 2);
+    CREATE INDEX idx_v ON t (v);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@cross-check-integrity
+test gencol-virtual-real-affinity-applied-to-index {
+    CREATE TABLE t (a INTEGER, b INTEGER, v REAL AS (a + b));
+    INSERT INTO t (a, b) VALUES (5000000000000001, 5000000000000002);
+    INSERT INTO t (a, b) VALUES (1, 2);
+    CREATE INDEX idx_v ON t (v);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@cross-check-integrity
+test gencol-update-old-image-real-affinity-applied-to-index {
+    CREATE TABLE t (
+        a INTEGER,
+        b INTEGER,
+        c BLOB,
+        v1 INTEGER AS (a + b),
+        v2 REAL AS (-a - v1)
+    );
+    CREATE INDEX i ON t (c, v1, v2);
+    INSERT INTO t (a, b, c) VALUES (-2929861166669336, -5586410532100113, X'0102');
+    UPDATE t SET c = X'0303';
+    SELECT a, b, quote(c), v1, v2 FROM t INDEXED BY i;
+    PRAGMA integrity_check;
+}
+expect {
+    -2929861166669336|-5586410532100113|X'0303'|-8516271698769449|1.14461328654388e+16
+    ok
+}
+expect @js {
+    -2929861166669336|-5586410532100113|X'0303'|-8516271698769449|11446132865438784
+    ok
+}
+
+# UPDATE with an OR-decomposed WHERE that mixes a virtual gencol
+# predicate and a unique-column range predicate
+test update-or-virtual-deferred-seek-no-panic-implicit-index {
+    CREATE TABLE t (a TEXT UNIQUE, b INTEGER AS (395) VIRTUAL);
+    INSERT INTO t (a) VALUES ('u1'), ('u2');
+    UPDATE t SET a = 'q' WHERE (b = 395 AND a = 'u1') OR (a < 'z');
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+test update-or-virtual-deferred-seek-no-panic-explicit-index {
+    CREATE TABLE t (a TEXT UNIQUE, b INTEGER AS (395) VIRTUAL);
+    CREATE INDEX t_idx ON t (a DESC, b DESC);
+    INSERT INTO t (a) VALUES ('u1'), ('u2');
+    UPDATE t SET a = 'q' WHERE (b = 395 AND a = 'u1') OR (a < 'z');
+}
+expect error {
+    UNIQUE constraint failed
 }

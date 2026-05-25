@@ -6,6 +6,7 @@
 //! union/intersection-specific decomposition, costing, and residual handling on
 //! top.
 
+use crate::alloc::TursoIteratorExt;
 use crate::schema::{Index, Schema};
 use crate::stats::AnalyzeStats;
 use crate::translate::expr::expr_references_any_subquery;
@@ -22,14 +23,15 @@ use crate::translate::optimizer::cost::{
     AnalyzeCtx, Cost, IndexInfo, RowCountEstimate,
 };
 use crate::translate::optimizer::cost_params::CostModelParams;
+use crate::translate::optimizer::AvailableIndexes;
 use crate::translate::plan::{
     BitSet, InSeekSource, JoinedTable, NonFromClauseSubquery, SetOperation, TableReferences,
     UnionBranchPrePostFilters, WhereTerm,
 };
 use crate::translate::planner::{table_mask_from_expr, TableMask};
-use rustc_hash::FxHashMap as HashMap;
+use crate::Result;
 use smallvec::SmallVec;
-use std::{collections::VecDeque, sync::Arc};
+use std::sync::Arc;
 use turso_macros::turso_assert_eq;
 use turso_parser::ast::{self, TableInternalId};
 
@@ -147,7 +149,7 @@ fn get_table_local_constraints_for_branch(
     from_outer_join: Option<TableInternalId>,
     table_reference: &JoinedTable,
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
@@ -330,11 +332,11 @@ fn choose_multi_index_branch_access(
     lhs_mask: &TableMask,
     rhs_idx: usize,
     schema: &Schema,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     base_row_count: RowCountEstimate,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
-) -> crate::Result<Option<MultiIdxBranch>> {
+) -> Result<Option<MultiIdxBranch>> {
     let chosen_seek = choose_best_btree_candidate(
         rhs_table,
         table_constraints,
@@ -347,7 +349,7 @@ fn choose_multi_index_branch_access(
         1.0,
         base_row_count,
         params,
-    );
+    )?;
 
     let mut best_branch = chosen_seek
         .as_ref()
@@ -447,7 +449,7 @@ fn partition_residual_multi_or_exprs(
     lhs_mask: &TableMask,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
-) -> Option<MultiOrResidualPrePostFilters> {
+) -> Result<Option<MultiOrResidualPrePostFilters>> {
     let mut consumed = vec![false; branch_terms.len()];
     match access {
         MultiIdxBranchAccess::Seek {
@@ -480,22 +482,22 @@ fn partition_residual_multi_or_exprs(
         }
         let expr = &term.expr;
         if expr_references_any_subquery(expr) {
-            return None;
+            return Ok(None);
         }
-        let mask = table_mask_from_expr(expr, table_references, subqueries).ok()?;
+        let mask = table_mask_from_expr(expr, table_references, subqueries)?;
         if lhs_mask.contains_all_set_bits_of(&mask) {
             pre_filter_exprs.push(expr.clone());
         } else {
-            post_mask |= &mask;
+            post_mask.union_with(&mask)?;
             post_filter_exprs.push(expr.clone());
         }
     }
 
-    Some(MultiOrResidualPrePostFilters {
+    Ok(Some(MultiOrResidualPrePostFilters {
         pre_filter_exprs,
         post_filter_exprs,
         post_mask,
-    })
+    }))
 }
 
 /// Estimate selectivity for a residual predicate that remains after a branch
@@ -509,7 +511,7 @@ fn estimate_residual_expr_selectivity(
     expr: &ast::Expr,
     rhs_table: &JoinedTable,
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
@@ -604,7 +606,7 @@ fn estimate_multi_or_residual_selectivity(
     residual_exprs: &[ast::Expr],
     rhs_table: &JoinedTable,
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
@@ -635,7 +637,7 @@ fn evaluate_multi_index_branches(
     where_term_idx: usize,
     rhs_table: &JoinedTable,
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     base_row_count: RowCountEstimate,
@@ -758,15 +760,14 @@ fn evaluate_multi_index_branches(
 fn analyze_and_terms_for_multi_index(
     table_reference: &JoinedTable,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
 ) -> Option<AndClauseDecomposition> {
     let table_id = table_reference.internal_id;
-    let table_name = table_reference.table.get_name();
-    let indexes = available_indexes.get(table_name);
+    let indexes = available_indexes.indexes_for_table(table_reference.internal_id);
     let rowid_alias_column = table_reference
         .columns()
         .iter()
@@ -871,7 +872,6 @@ fn analyze_and_terms_for_multi_index(
                 table_reference,
                 indexes,
                 rowid_alias_column,
-                available_indexes,
                 table_references,
                 subqueries,
                 schema,
@@ -905,7 +905,7 @@ fn analyze_and_terms_for_multi_index(
 pub fn consider_multi_index_union(
     rhs_table: &JoinedTable,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
@@ -915,7 +915,7 @@ pub fn consider_multi_index_union(
     best_cost: Cost,
     lhs_mask: &TableMask,
     analyze_stats: &AnalyzeStats,
-) -> Option<AccessMethod> {
+) -> Result<Option<AccessMethod>> {
     for (where_term_idx, term) in where_clause.iter().enumerate() {
         if term.consumed {
             continue;
@@ -938,22 +938,22 @@ pub fn consider_multi_index_union(
         else {
             continue;
         };
-        allowed_mask.set(rhs_idx);
+        allowed_mask.set(rhs_idx)?;
 
         // Each disjunct is replanned with branch-local `TableConstraints`, so
         // compound conjuncts can reuse the same compound-seek analysis as
         // ordinary btree access.
-        let branches: Option<Vec<_>> = disjuncts
+        let branches = disjuncts
             .into_iter()
             .map(|disjunct_expr| {
                 let Ok(disjunct_expr) = crate::translate::expr::unwrap_parens(disjunct_expr) else {
-                    return None;
+                    return Ok(None);
                 };
                 let conjuncts = flatten_and_expr(disjunct_expr)
                     .into_iter()
                     .cloned()
                     .collect::<Vec<_>>();
-                let (synthetic_where_terms, table_constraints) =
+                let Some((synthetic_where_terms, table_constraints)) =
                     get_table_local_constraints_for_branch(
                         &conjuncts,
                         term.from_outer_join,
@@ -964,8 +964,11 @@ pub fn consider_multi_index_union(
                         schema,
                         params,
                     )
-                    .ok()?;
-                let mut chosen = choose_multi_index_branch_access(
+                    .ok()
+                else {
+                    return Ok(None);
+                };
+                let Some(mut chosen) = choose_multi_index_branch_access(
                     rhs_table,
                     &table_constraints,
                     &synthetic_where_terms,
@@ -976,30 +979,35 @@ pub fn consider_multi_index_union(
                     base_row_count,
                     analyze_stats,
                     params,
-                )
-                .ok()??;
+                )?
+                else {
+                    return Ok(None);
+                };
                 // Partition residuals in a single pass: pre-filters reference
                 // only outer (lhs) tables and can short-circuit the branch
                 // before the index seek; post-filters reference the target
                 // table and are evaluated after the seek.
-                let partitioned_pre_post = partition_residual_multi_or_exprs(
+                let Some(partitioned_pre_post) = partition_residual_multi_or_exprs(
                     &synthetic_where_terms,
                     &chosen.access,
                     lhs_mask,
                     table_references,
                     subqueries,
-                )?;
+                )?
+                else {
+                    return Ok(None);
+                };
                 if !allowed_mask.contains_all_set_bits_of(&partitioned_pre_post.post_mask) {
-                    return None;
+                    return Ok(None);
                 }
                 chosen.union_prepost_filters = Some(UnionBranchPrePostFilters {
                     requires_table_cursor: partitioned_pre_post.post_mask.get(rhs_idx),
                     pre_filter_exprs: partitioned_pre_post.pre_filter_exprs,
                     post_filter_exprs: partitioned_pre_post.post_filter_exprs,
                 });
-                Some(chosen)
+                Ok(Some(chosen))
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         let Some(branches) = branches else {
             continue;
@@ -1019,11 +1027,11 @@ pub fn consider_multi_index_union(
             params,
             best_cost,
         ) {
-            return Some(access_method);
+            return Ok(Some(access_method));
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Analyze top-level AND terms for AND-by-intersection optimization.
@@ -1035,7 +1043,7 @@ pub fn consider_multi_index_union(
 pub fn consider_multi_index_intersection(
     rhs_table: &JoinedTable,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
@@ -1045,8 +1053,8 @@ pub fn consider_multi_index_intersection(
     best_cost: Cost,
     lhs_mask: &TableMask,
     analyze_stats: &AnalyzeStats,
-) -> Option<AccessMethod> {
-    let decomposition = analyze_and_terms_for_multi_index(
+) -> Result<Option<AccessMethod>> {
+    let Some(decomposition) = analyze_and_terms_for_multi_index(
         rhs_table,
         where_clause,
         available_indexes,
@@ -1054,10 +1062,12 @@ pub fn consider_multi_index_intersection(
         subqueries,
         schema,
         params,
-    )?;
+    ) else {
+        return Ok(None);
+    };
 
     if decomposition.branches.len() < 2 {
-        return None;
+        return Ok(None);
     }
 
     let all_usable = decomposition
@@ -1065,7 +1075,7 @@ pub fn consider_multi_index_intersection(
         .iter()
         .all(|b| lhs_mask.contains_all_set_bits_of(&b.constraint.lhs_mask));
     if !all_usable {
-        return None;
+        return Ok(None);
     }
 
     let branches: Vec<_> = decomposition
@@ -1114,10 +1124,14 @@ pub fn consider_multi_index_intersection(
         .collect();
 
     let where_term_idx = decomposition.term_indices[0];
-    let additional_consumed_terms: BitSet =
-        decomposition.term_indices.iter().skip(1).copied().collect();
+    let additional_consumed_terms: BitSet = decomposition
+        .term_indices
+        .iter()
+        .skip(1)
+        .copied()
+        .try_collect()?;
 
-    evaluate_multi_index_branches(
+    Ok(evaluate_multi_index_branches(
         branches,
         SetOperation::Intersection {
             additional_consumed_terms,
@@ -1132,7 +1146,7 @@ pub fn consider_multi_index_intersection(
         input_cardinality,
         params,
         best_cost,
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -1141,6 +1155,7 @@ mod tests {
         consider_multi_index_intersection, consider_multi_index_union, AnalyzeStats,
         MultiIndexBranchParams,
     };
+    use crate::alloc::TursoIteratorExt;
     use crate::{
         schema::{
             BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table,
@@ -1151,6 +1166,7 @@ mod tests {
                 access_method::AccessMethodParams,
                 cost::{Cost, RowCountEstimate},
                 cost_params::DEFAULT_PARAMS,
+                AvailableIndexes,
             },
             plan::{
                 ColumnUsedMask, JoinInfo, JoinType, JoinedTable, Operation, TableReferences,
@@ -1161,7 +1177,6 @@ mod tests {
         vdbe::builder::TableRefIdCounter,
         MAIN_DB_ID,
     };
-    use rustc_hash::FxHashMap as HashMap;
     use std::{collections::VecDeque, sync::Arc};
     use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
 
@@ -1311,9 +1326,10 @@ mod tests {
         const ITEM: usize = 1;
         const META: usize = 2;
 
-        let mut available_indexes = HashMap::default();
-        available_indexes.insert(
-            "item".to_string(),
+        let mut available_indexes = AvailableIndexes::default();
+        available_indexes.insert_for_table_name(
+            &joined_tables,
+            "item",
             VecDeque::from([Arc::new(Index {
                 name: "idx_item_id".to_string(),
                 table_name: "item".to_string(),
@@ -1419,7 +1435,7 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
-        let lhs_mask: TableMask = [LINK].into_iter().collect();
+        let lhs_mask: TableMask = [LINK].into_iter().try_collect().unwrap();
 
         let access_method = consider_multi_index_union(
             &table_references.joined_tables()[ITEM],
@@ -1434,7 +1450,8 @@ mod tests {
             Cost(f64::INFINITY),
             &lhs_mask,
             &AnalyzeStats::default(),
-        );
+        )
+        .unwrap();
 
         assert!(
             access_method.is_none(),
@@ -1460,9 +1477,10 @@ mod tests {
         let joined_tables = vec![create_table_reference(item, None, table_id_counter.next())];
         let item_id = joined_tables[0].internal_id;
 
-        let mut available_indexes = HashMap::default();
-        available_indexes.insert(
-            "item".to_string(),
+        let mut available_indexes = AvailableIndexes::default();
+        available_indexes.insert_for_table_name(
+            &joined_tables,
+            "item",
             VecDeque::from([Arc::new(Index {
                 name: "idx_item_a".to_string(),
                 table_name: "item".to_string(),
@@ -1522,6 +1540,7 @@ mod tests {
             &TableMask::default(),
             &AnalyzeStats::default(),
         )
+        .unwrap()
         .expect("rowid and secondary-index terms should be eligible for intersection");
 
         let branches = assert_is_multi_index(&access_method);
@@ -1573,9 +1592,10 @@ mod tests {
         const LINK: usize = 0;
         const ITEM: usize = 1;
 
-        let mut available_indexes = HashMap::default();
-        available_indexes.insert(
-            "item".to_string(),
+        let mut available_indexes = AvailableIndexes::default();
+        available_indexes.insert_for_table_name(
+            &joined_tables,
+            "item",
             VecDeque::from([Arc::new(Index {
                 name: "idx_item_id_kind".to_string(),
                 table_name: "item".to_string(),
@@ -1693,7 +1713,7 @@ mod tests {
         }];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let lhs_mask = [LINK].into_iter().collect();
+        let lhs_mask = [LINK].into_iter().try_collect().unwrap();
         let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
 
         let access_method = consider_multi_index_union(
@@ -1710,6 +1730,7 @@ mod tests {
             &lhs_mask,
             &AnalyzeStats::default(),
         )
+        .unwrap()
         .expect("compound OR branches should produce a multi-index union");
 
         let branches = assert_is_multi_index(&access_method);
@@ -1769,9 +1790,10 @@ mod tests {
         let link_id = joined_tables[LINK].internal_id;
         let item_id = joined_tables[ITEM].internal_id;
 
-        let mut available_indexes = HashMap::default();
-        available_indexes.insert(
-            "item".to_string(),
+        let mut available_indexes = AvailableIndexes::default();
+        available_indexes.insert_for_table_name(
+            &joined_tables,
+            "item",
             VecDeque::from([Arc::new(Index {
                 name: "idx_item_id".to_string(),
                 table_name: "item".to_string(),
@@ -1835,7 +1857,7 @@ mod tests {
         };
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let lhs_mask = [LINK].into_iter().collect();
+        let lhs_mask = [LINK].into_iter().try_collect().unwrap();
         let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
 
         let without_residual = consider_multi_index_union(
@@ -1852,6 +1874,7 @@ mod tests {
             &lhs_mask,
             &AnalyzeStats::default(),
         )
+        .unwrap()
         .expect("plain OR branches should produce a multi-index union");
 
         let with_residual = consider_multi_index_union(
@@ -1868,6 +1891,7 @@ mod tests {
             &lhs_mask,
             &AnalyzeStats::default(),
         )
+        .unwrap()
         .expect("residual-filtered OR branches should still produce a multi-index union");
 
         assert!(

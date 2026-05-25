@@ -123,3 +123,23 @@ test.serial('error handling works correctly', async t => {
   );
   t.regex(error.message, /SQLite error.*no such table|no such table|HTTP error/);
 });
+
+test.serial('transaction.concurrent uses BEGIN CONCURRENT', async t => {
+  const localClient = connect({ url: 'http://localhost:0' });
+  const calls = [];
+
+  localClient.exec = async sql => {
+    calls.push(sql);
+  };
+  localClient.session.close = async () => {};
+
+  try {
+    const txn = localClient.transaction(async () => {
+      calls.push('body');
+    }).concurrent;
+    await txn();
+    t.deepEqual(calls, ['BEGIN CONCURRENT', 'body', 'COMMIT']);
+  } finally {
+    await localClient.close();
+  }
+});

@@ -1,5 +1,5 @@
 // Turso serverless driver entry point
-export { Connection, connect, type Config } from './connection.js';
+export { Connection, connect, type Config, type BatchStatement } from './connection.js';
 export { Statement } from './statement.js';
 export { Session, type SessionConfig } from './session.js';
 export { DatabaseError, TimeoutError } from './error.js';

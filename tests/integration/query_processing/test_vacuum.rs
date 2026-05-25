@@ -2553,6 +2553,13 @@ fn test_vacuum_into_preserves_mvcc_after_reopen(tmp_db: TempDatabase) -> anyhow:
     let source_hash =
         compute_dbhash_with_options_and_database_opts(&tmp_db, &hash_opts, tmp_db.db_opts);
 
+    let db_log = tmp_db.path.with_extension("db-log");
+    let db_log_size = std::fs::metadata(&db_log).unwrap().len();
+    assert!(
+        db_log_size > 0,
+        "MVCC log file should be non-empty at {db_log:?} before VACUUM INTO (size={db_log_size})"
+    );
+
     let dest_dir = TempDir::new()?;
     let dest_path = dest_dir.path().join("vacuumed_mvcc.db");
     conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
@@ -5110,7 +5117,6 @@ fn test_plain_vacuum_copy_batch_page_count_boundaries() -> anyhow::Result<()> {
 /// may be no user schema pages to copy, but VACUUM still must leave the file
 /// usable and folded.
 #[test]
-#[ignore = "ignoring for now vaccum is experimental, should be fixed later."]
 fn test_plain_vacuum_empty_schema_physical_contract() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_empty();
     let conn = tmp_db.connect_limbo();
@@ -5122,7 +5128,7 @@ fn test_plain_vacuum_empty_schema_physical_contract() -> anyhow::Result<()> {
         .expect_err("VACUUM on an uninitialized database should return an error");
     assert_eq!(
         err.to_string(),
-        "Internal error: begin_blocking_tx can be done on an initialized database (page 1 must already be allocated)",
+        "Internal error: begin_vacuum_blocking_tx can be done on an initialized database (page 1 must already be allocated)",
         "expected initialization error, got: {err}"
     );
     Ok(())
@@ -5131,13 +5137,6 @@ fn test_plain_vacuum_empty_schema_physical_contract() -> anyhow::Result<()> {
 /// Initialized DB whose user schema has been fully torn down — page 1 exists,
 /// but there are no user tables or indexes. VACUUM must succeed and leave the
 /// DB queryable at the minimum page count.
-///
-/// FIXME: currently ignored because Turso's VACUUM does not reclaim the root
-/// page of the dropped table. SQLite produces page_count=1 for the same
-/// sequence; Turso produces page_count > 1. The integrity_check passes, so
-/// this is a compaction/correctness gap in the target-pager rebuild rather
-/// than a data-loss bug.
-#[ignore = "VACUUM does not reclaim dropped-table root pages (diverges from SQLite)"]
 #[test]
 fn test_plain_vacuum_initialized_but_empty_schema() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_empty();
@@ -5841,7 +5840,6 @@ fn assert_mvcc_multi_object_vacuum_workload(conn: &Arc<Connection>) -> anyhow::R
 }
 
 #[test]
-#[ignore = "ignoring for now vaccum is experimental, should be fixed later."]
 fn test_mvcc_plain_vacuum_multi_object_rootpage_reset() -> anyhow::Result<()> {
     let tmp_db =
         TempDatabase::new_with_mvcc("test_mvcc_plain_vacuum_multi_object_rootpage_reset.db");
@@ -5897,7 +5895,6 @@ fn test_mvcc_plain_vacuum_multi_object_rootpage_reset() -> anyhow::Result<()> {
 }
 
 #[test]
-#[ignore = "ignoring for now vaccum is experimental, should be fixed later."]
 fn test_mvcc_plain_vacuum_discards_reused_index_rootpage_state() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_with_mvcc(
         "test_mvcc_plain_vacuum_discards_reused_index_rootpage_state.db",

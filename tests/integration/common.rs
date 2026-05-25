@@ -69,8 +69,8 @@ impl IO for TestIo {
     fn cancel(&self, c: &[turso_core::Completion]) -> turso_core::Result<()> {
         self.io.cancel(c)
     }
-    fn drain(&self) -> turso_core::Result<()> {
-        self.io.drain()
+    fn drain_completions(&self, completions: &[turso_core::Completion]) -> turso_core::Result<()> {
+        self.io.drain_completions(completions)
     }
     fn fill_bytes(&self, dest: &mut [u8]) {
         self.io.fill_bytes(dest);
@@ -170,7 +170,7 @@ impl TempDatabaseBuilder {
         let mut opts = self
             .opts
             .unwrap_or_else(|| turso_core::DatabaseOpts::new().with_encryption(true));
-        opts = opts.with_vacuum(true);
+        opts = opts.with_vacuum(true).with_without_rowid(true);
 
         if self.enable_views {
             opts = opts.with_views(true);

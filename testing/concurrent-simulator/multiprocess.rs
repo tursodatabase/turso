@@ -1374,10 +1374,14 @@ mod tests {
     }
 
     fn history_output_path(label: &str) -> std::path::PathBuf {
+        let thread_name = std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .replace(':', "_");
         std::env::temp_dir().join(format!(
             "turso-whopper-history-{label}-{}-{}.jsonl",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            thread_name,
         ))
     }
 

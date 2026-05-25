@@ -6,7 +6,7 @@ use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, Schema, Table, SCHEMA_TABLE_NAME,
+    render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
     SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
@@ -34,7 +34,7 @@ use crate::util::{
     trigger_still_references_renamed_column, trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
-    apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
+    apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
 };
 use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
@@ -2870,6 +2870,7 @@ pub fn halt(
 ) -> Result<InsnFunctionStepResult> {
     let mv_store = program.connection.mv_store();
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
+    let owns_auto_txn = state.owns_auto_txn();
 
     // Check if we're resuming from a FAIL commit I/O wait.
     // If pending_fail_error is set, we were in the middle of committing partial changes
@@ -2945,7 +2946,7 @@ pub fn halt(
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
         // Note: ON CONFLICT FAIL does NOT apply to FK violations, so we check for those first.
-        if program.resolve_type == ResolveType::Fail && auto_commit {
+        if program.resolve_type == ResolveType::Fail && owns_auto_txn {
             // Check for immediate FK violations - FK errors don't respect ON CONFLICT
             if program.connection.foreign_keys_enabled()
                 && state.get_fk_immediate_violations_during_stmt() > 0
@@ -2976,7 +2977,11 @@ pub fn halt(
         return Err(error);
     }
 
-    tracing::trace!("halt(auto_commit={})", auto_commit);
+    tracing::trace!(
+        "halt(auto_commit={}, owns_auto_txn={})",
+        auto_commit,
+        owns_auto_txn
+    );
 
     // Check for immediate foreign key violations.
     // Any immediate violation causes the statement subtransaction to roll back.
@@ -2995,7 +3000,7 @@ pub fn halt(
     if auto_commit {
         // In autocommit mode, a statement that leaves deferred violations must fail here,
         // and it also ends the transaction.
-        if program.connection.foreign_keys_enabled() {
+        if owns_auto_txn && program.connection.foreign_keys_enabled() {
             let deferred_violations = program
                 .connection
                 .fk_deferred_violations
@@ -3017,19 +3022,34 @@ pub fn halt(
             }
         }
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
-        vtab_commit_all(&program.connection)?;
-        index_method_pre_commit_all(state, pager)?;
-        let result = program
-            .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
-            .map(Into::into);
-        // Apply deferred CDC state and reset CDC txn ID after successful commit
-        if matches!(result, Ok(InsnFunctionStepResult::Done)) {
+        if owns_auto_txn {
+            vtab_commit_all(&program.connection)?;
+            index_method_pre_commit_all(state, pager)?;
+            let result = program
+                .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
+                .map(Into::into);
+            // Apply deferred CDC state and reset CDC txn ID after successful commit
+            if matches!(result, Ok(InsnFunctionStepResult::Done)) {
+                if let Some(cdc_info) = state.pending_cdc_info.take() {
+                    program.connection.set_capture_data_changes_info(cdc_info);
+                }
+                program.connection.set_cdc_transaction_id(-1);
+            }
+            result
+        } else {
+            // Another root statement may own the implicit autocommit
+            // transaction. This statement can finish, but must not commit or
+            // roll back connection-level state it did not start.
             if let Some(cdc_info) = state.pending_cdc_info.take() {
                 program.connection.set_capture_data_changes_info(cdc_info);
             }
-            program.connection.set_cdc_transaction_id(-1);
+            if program.change_cnt_on {
+                program
+                    .connection
+                    .set_changes(state.n_change.load(Ordering::SeqCst));
+            }
+            Ok(InsnFunctionStepResult::Done)
         }
-        result
     } else {
         // Even if deferred violations are present, the statement subtransaction completes successfully when
         // it is part of an interactive transaction.
@@ -3159,6 +3179,23 @@ pub enum OpTransactionState {
     BeginNamedSavepoints,
     CheckSchemaCookie,
     BeginStatement,
+}
+
+#[cfg(any(test, injected_yields))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TransactionYieldPoint {
+    BeforeStart,
+}
+
+#[cfg(any(test, injected_yields))]
+impl crate::mvcc::yield_hooks::YieldPointMarker for TransactionYieldPoint {
+    const POINT_COUNT: u8 = 1;
+
+    fn ordinal(self) -> u8 {
+        match self {
+            TransactionYieldPoint::BeforeStart => 0,
+        }
+    }
 }
 
 pub fn op_transaction(
@@ -3370,6 +3407,31 @@ pub fn op_transaction_inner(
                     return Err(LimboError::ReadOnly);
                 }
 
+                // Fast path: if checkpoint root publication already replaced the
+                // shared schema, force reprepare before opening any transaction state.
+                if *db == crate::MAIN_DB_ID
+                    && mv_store.is_some()
+                    && conn.mvcc_schema_requires_reprepare_before_tx()
+                {
+                    tracing::debug!(
+                        "MVCC shared schema changed without a schema-cookie change; force reprepare"
+                    );
+                    return Err(LimboError::SchemaUpdated);
+                }
+                #[cfg(any(test, injected_yields))]
+                {
+                    if let Some(IOResult::IO(io)) =
+                        crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                            conn.yield_injector().as_ref(),
+                            0,
+                            *db as u64,
+                            TransactionYieldPoint::BeforeStart,
+                        )
+                    {
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                }
+
                 // 1. We try to upgrade current version
                 let current_state = conn.get_tx_state();
                 let is_secondary_db = *db != crate::MAIN_DB_ID;
@@ -3490,7 +3552,9 @@ pub fn op_transaction_inner(
                                 "nested stmt should not begin a new read transaction"
                             );
                             pager.begin_read_tx()?;
-                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                            if conn.get_auto_commit() {
+                                state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                            }
                         }
                         // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
                         pager.mvcc_refresh_if_db_changed();
@@ -3518,6 +3582,19 @@ pub fn op_transaction_inner(
                         if !has_existing_mv_tx {
                             match begin_mvcc_tx(mv_store, &pager, tx_mode, None) {
                                 Ok(tx_id) => {
+                                    // Check again in case checkpoint published roots after the
+                                    // previous check and before this transaction was protected.
+                                    if conn.mvcc_schema_requires_reprepare_before_tx() {
+                                        tracing::debug!(
+                                            "MVCC shared schema changed while starting transaction; force reprepare"
+                                        );
+                                        mv_store.rollback_tx(tx_id, pager.clone(), &conn, *db);
+                                        if started_read_tx {
+                                            pager.end_read_tx();
+                                            state.auto_txn_cleanup = TxnCleanup::None;
+                                        }
+                                        return Err(LimboError::SchemaUpdated);
+                                    }
                                     program
                                         .connection
                                         .set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
@@ -3607,7 +3684,11 @@ pub fn op_transaction_inner(
                             "nested stmt should not begin a new read transaction"
                         );
                         pager.begin_read_tx()?;
-                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                        // https://github.com/tursodatabase/turso/issues/7106 : If auto-commit is turned off,
+                        // then we shouldn't be setting the auto_txn_cleanup, this will cause errors in case the client explicitly calls commit post a drop of the statement struct
+                        if conn.get_auto_commit() {
+                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                        }
                     }
 
                     if !is_secondary_db
@@ -3784,6 +3865,9 @@ pub fn op_transaction_inner(
                         .n_active_writes
                         .fetch_add(1, Ordering::SeqCst);
                     state.is_active_write = true;
+                    if state.has_stmt_transaction {
+                        state.auto_txn_cleanup = TxnCleanup::RollbackSavepoint;
+                    }
                 }
                 state.pc += 1;
                 state.active_op_state.clear();
@@ -4786,6 +4870,7 @@ pub fn op_seek_rowid(
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
     }
+    invalidate_deferred_seeks_for_cursor(state, *cursor_id);
     let (pc, did_seek) = {
         let cursor = get_cursor!(state, *cursor_id);
 
@@ -7350,7 +7435,7 @@ pub fn op_function(
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             ScalarFunc::LoadExtension => {
-                if !program.connection.db.can_load_extensions() {
+                if !program.connection.can_load_extensions() {
                     crate::bail_parse_error!("runtime extension loading is disabled");
                 }
                 let extension = &state.registers[*start_reg];
@@ -11676,13 +11761,17 @@ pub fn op_add_imm(
         Register::Record(_) => &Value::Null,
     };
 
-    let int_val = match current_value {
-        Value::Numeric(Numeric::Integer(i)) => i + value,
-        Value::Numeric(Numeric::Float(f)) => (f64::from(*f) as i64) + value,
-        Value::Text(s) => s.as_str().parse::<i64>().unwrap_or(0) + value,
-        Value::Blob(_) => *value, // BLOB becomes the added value
-        Value::Null => *value,    // NULL becomes the added value
+    // SQLite coerces the register to an integer before adding.
+    let lhs = match current_value {
+        Value::Numeric(Numeric::Integer(i)) => *i,
+        Value::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(*f)),
+        Value::Text(s) => crate::numeric::str_to_i64(s.as_str()).unwrap_or(0),
+        Value::Blob(b) => {
+            crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
+        }
+        Value::Null => 0,
     };
+    let int_val = lhs.wrapping_add(*value);
 
     state.registers[*register].set_int(int_val);
     state.pc += 1;
@@ -12812,20 +12901,37 @@ pub fn op_drop_column(
         Ok(())
     })?;
 
-    // Update index.pos_in_table for all indexes.
-    // For example, if the dropped column had index 2, then anything that was indexed on column 3 or higher should be decremented by 1.
-    conn.with_database_schema_mut(*db, |schema| {
+    // Shift left pos_in_table in all indexes, and self-table placeholders in generated column
+    // expressions, to account for the dropped column. For example, if the dropped column had index
+    // 2, then anything that was indexed on column 3 or higher should be decremented by 1.
+    conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
                 let index = Arc::get_mut(index).expect("this should be the only strong reference");
                 for index_column in index.columns.iter_mut() {
-                    if index_column.pos_in_table > *column_index {
+                    if index_column.pos_in_table != EXPR_INDEX_SENTINEL
+                        && index_column.pos_in_table > *column_index
+                    {
                         index_column.pos_in_table -= 1;
+                    }
+                    if let Some(ref mut expr) = index_column.expr {
+                        crate::translate::expr::walk_expr_mut(expr, &mut |e| {
+                            if let ast::Expr::Column {
+                                table, column: c, ..
+                            } = e
+                            {
+                                if table.is_self_table() && *c > *column_index {
+                                    *c -= 1;
+                                }
+                            }
+                            Ok(crate::translate::expr::WalkControl::Continue)
+                        })?;
                     }
                 }
             }
         }
-    });
+        Ok(())
+    })?;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
         for (view_name, view) in schema.views.iter() {
@@ -13015,6 +13121,14 @@ pub fn op_alter_column(
                 }
             }
         }
+        let clears_autoincrement_sequence = !*rename
+            && btree.has_autoincrement
+            && btree
+                .columns()
+                .get(*column_index)
+                .is_some_and(|column| column.is_rowid_alias())
+            && !new_column.is_rowid_alias();
+
         if *rename {
             btree.columns_mut()[*column_index].name = Some(new_name.clone());
 
@@ -13022,11 +13136,13 @@ pub fn op_alter_column(
             let column_count = btree.columns().len();
             for i in 0..column_count {
                 let cols_view = btree.columns();
-                cols_view[i]
+                if let Some(new_sql) = cols_view[i]
                     .generated_expr()
                     .map(|expr| render_gencol_expr_sql_with_new_names(expr, cols_view))
                     .transpose()?
-                    .map(|new_sql| btree.columns_mut()[i].set_generated_original_sql(new_sql));
+                {
+                    btree.columns_mut()[i].set_generated_original_sql(new_sql)
+                }
             }
         } else {
             btree.columns_mut()[*column_index] = new_column.clone();
@@ -13065,6 +13181,9 @@ pub fn op_alter_column(
         if !*rename {
             // recompute alias from `new_column`
             btree.columns_mut()[*column_index].set_rowid_alias(new_column.is_rowid_alias());
+            if clears_autoincrement_sequence {
+                btree.has_autoincrement = false;
+            }
         }
 
         // Update this table's OWN foreign keys
@@ -14270,32 +14389,16 @@ fn execute_turso_version(version_integer: i64) -> String {
     format!("{major}.{minor}.{release}")
 }
 
+/// Coerce a value to i64 using the same non-NULL conversion rules as
+/// SQLite's OP_AddImm.
 pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
     let value = value.as_value_ref();
     match value {
         ValueRef::Numeric(Numeric::Integer(i)) => i,
-        ValueRef::Numeric(Numeric::Float(f)) => {
-            let f = f64::from(f);
-            // Use sqlite3RealToI64 equivalent
-            if f < -9223372036854774784.0 {
-                i64::MIN
-            } else if f > 9223372036854774784.0 {
-                i64::MAX
-            } else {
-                f as i64
-            }
-        }
-        ValueRef::Text(t) => {
-            // Try to parse as integer, return 0 if failed
-            t.as_str().parse::<i64>().unwrap_or(0)
-        }
+        ValueRef::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(f)),
+        ValueRef::Text(t) => crate::numeric::str_to_i64(t.as_str()).unwrap_or(0),
         ValueRef::Blob(b) => {
-            // Try to parse blob as string then as integer
-            if let Ok(s) = std::str::from_utf8(b) {
-                s.parse::<i64>().unwrap_or(0)
-            } else {
-                0
-            }
+            crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
         }
         ValueRef::Null => 0,
     }

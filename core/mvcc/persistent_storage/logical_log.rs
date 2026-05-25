@@ -556,8 +556,7 @@ impl LogicalLog {
     }
 
     /// Serializes a transaction into `write_buf`, optionally calls
-    /// `on_serialization_complete` with a zero-copy reference to the frame bytes,
-    /// then writes to disk. `write_buf` retains its allocation across calls.
+    /// `on_serialization_complete` with a zero-copy reference to the frame bytes.
     ///
     /// `advance_offset_immediately`: when true, the writer offset advances right
     /// after the pwrite (checkpoint path). When false, the offset stays behind
@@ -623,8 +622,11 @@ impl LogicalLog {
             cb(&self.write_buf, crc)?;
         }
 
-        // 7. Copy write_buf into an I/O buffer and pwrite. write_buf keeps its allocation.
-        let buffer = Arc::new(Buffer::new(self.write_buf.to_vec()));
+        // 7. Hand off the populated buffer to the I/O layer without copying.
+        // `to_vec()` would allocate a second N-byte buffer and memcpy, briefly
+        // holding two full copies in memory — fatal for million-row commits.
+        // `take` swaps in a fresh empty Vec; the next call grows from zero.
+        let buffer = Arc::new(Buffer::new(std::mem::take(&mut self.write_buf)));
         let c = Completion::new_write({
             let buffer_len = buffer.len();
             move |res: Result<i32, CompletionError>| {
@@ -1261,12 +1263,50 @@ impl StreamingLogicalLogReader {
         self.last_valid_offset = LOG_HDR_SIZE;
     }
 
+    /// Reads the next complete transaction frame.
+    ///
+    /// Recovery needs the whole frame so it can decide which schema snapshot should decode each
+    /// index op. Empty parsed frames are skipped, so callers that receive Some(frame) can
+    /// rely on `frame` being non-empty.
+    pub(crate) fn next_frame(&mut self, io: &Arc<dyn crate::IO>) -> Result<Option<Vec<ParsedOp>>> {
+        if !self.pending_ops.is_empty() {
+            return Err(LimboError::InternalError(
+                "next_frame cannot be mixed with next_record on the same reader".to_string(),
+            ));
+        }
+
+        loop {
+            match self.state {
+                StreamingState::NeedTransactionStart => {
+                    if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
+                        return Ok(None);
+                    }
+
+                    let ops = match self.parse_next_transaction(io)? {
+                        ParseResult::Ops(ops) => ops,
+                        ParseResult::Eof | ParseResult::InvalidFrame => return Ok(None),
+                    };
+
+                    if ops.is_empty() {
+                        continue;
+                    }
+                    return Ok(Some(ops));
+                }
+            }
+        }
+    }
+
     /// Reads next record in log.
+    ///
+    /// This is a test-only version of [Self::next_frame], and it could eventually be replaced
+    /// in tests by [Self::next_frame], which didn't exist when [Self::next_record] was written.
+    #[cfg(test)]
     pub fn next_record(
         &mut self,
         io: &Arc<dyn crate::IO>,
         mut get_index_info: impl FnMut(MVTableId) -> Result<Arc<IndexInfo>>,
     ) -> Result<StreamingResult> {
+        let mut get_index_info = |index_id, _op_kind| get_index_info(index_id);
         if let Some(op) = self.pending_ops.pop_front() {
             return self.parsed_op_to_streaming(op, &mut get_index_info);
         }
@@ -1943,10 +1983,10 @@ impl StreamingLogicalLogReader {
         Ok(ParseResult::Ops(parsed_ops))
     }
 
-    fn parsed_op_to_streaming(
+    pub(crate) fn parsed_op_to_streaming(
         &self,
         parsed_op: ParsedOp,
-        get_index_info: &mut impl FnMut(MVTableId) -> Result<Arc<IndexInfo>>,
+        get_index_info: &mut impl FnMut(MVTableId, IndexOpKind) -> Result<Arc<IndexInfo>>,
     ) -> Result<StreamingResult> {
         match parsed_op {
             ParsedOp::UpsertTable {
@@ -1959,8 +1999,7 @@ impl StreamingLogicalLogReader {
                 // Compute column_count from the serialized record so recovered rows keep
                 // the same shape metadata as non-recovered rows.
                 let column_count =
-                    crate::types::ImmutableRecord::from_bin_record(record_bytes.clone())
-                        .column_count();
+                    crate::types::ImmutableRecordRef::from_bin_record(&record_bytes).column_count();
                 let row = Row::new_table_row(
                     RowID::new(table_id, rowid.row_id.clone()),
                     record_bytes,
@@ -1990,7 +2029,7 @@ impl StreamingLogicalLogReader {
             } => {
                 let key_record = crate::types::ImmutableRecord::from_bin_record(payload);
                 let column_count = key_record.column_count();
-                let index_info = get_index_info(table_id)?;
+                let index_info = get_index_info(table_id, IndexOpKind::Upsert)?;
                 let key = SortableIndexKey::new_from_record(key_record, index_info);
                 let rowid = RowID::new(table_id, RowKey::Record(key));
                 let row = Row::new_index_row(rowid.clone(), column_count);
@@ -2009,7 +2048,7 @@ impl StreamingLogicalLogReader {
             } => {
                 let key_record = crate::types::ImmutableRecord::from_bin_record(payload);
                 let column_count = key_record.column_count();
-                let index_info = get_index_info(table_id)?;
+                let index_info = get_index_info(table_id, IndexOpKind::Delete)?;
                 let key = SortableIndexKey::new_from_record(key_record, index_info);
                 let rowid = RowID::new(table_id, RowKey::Record(key));
                 let row = Row::new_index_row(rowid.clone(), column_count);
@@ -2276,7 +2315,7 @@ enum ParseResult {
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-enum ParsedOp {
+pub(crate) enum ParsedOp {
     UpsertTable {
         table_id: MVTableId,
         rowid: RowID,
@@ -2307,6 +2346,12 @@ enum ParsedOp {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum IndexOpKind {
+    Upsert,
+    Delete,
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -2330,7 +2375,7 @@ mod tests {
         storage::sqlite3_ondisk::{
             read_varint, read_varint_partial, varint_len, write_varint, DatabaseHeader,
         },
-        types::{ImmutableRecord, IndexInfo, Text},
+        types::{ImmutableRecord, ImmutableRecordRef, IndexInfo, Text},
         Buffer, Completion, LimboError, Value, ValueRef,
     };
 
@@ -2541,7 +2586,7 @@ mod tests {
             .read(tx, &RowID::new((-100).into(), RowKey::Int(1)))
             .unwrap()
             .unwrap();
-        let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
+        let record = ImmutableRecordRef::from_bin_record(row.payload());
         let foo = record.iter().unwrap().next().unwrap().unwrap();
         let ValueRef::Text(foo) = foo else {
             unreachable!()
@@ -2619,7 +2664,7 @@ mod tests {
         for (rowid, value) in &values {
             let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
             let row = mvcc_store.read(tx, rowid).unwrap().unwrap();
-            let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
+            let record = ImmutableRecordRef::from_bin_record(row.payload());
             let foo = record.iter().unwrap().next().unwrap().unwrap();
             let ValueRef::Text(foo) = foo else {
                 unreachable!()
@@ -2738,7 +2783,7 @@ mod tests {
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
         for present_rowid in present_rowids {
             let row = mvcc_store.read(tx, &present_rowid).unwrap().unwrap();
-            let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
+            let record = ImmutableRecordRef::from_bin_record(row.payload());
             let foo = record.iter().unwrap().next().unwrap().unwrap();
             let ValueRef::Text(foo) = foo else {
                 unreachable!()
@@ -2818,7 +2863,7 @@ mod tests {
                 .read(tx, &RowID::new(table_id, RowKey::Int(row_id)))
                 .unwrap()
                 .expect("Table row should exist");
-            let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
+            let record = ImmutableRecordRef::from_bin_record(row.payload());
             let values = record.get_values().unwrap();
             let data_value = values.get(1).expect("Should have data column");
             let ValueRef::Text(data_text) = data_value else {

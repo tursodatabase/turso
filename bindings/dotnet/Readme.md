@@ -1,8 +1,18 @@
-# Turso_dotnet
+# Turso .NET
 
-Dotnet binding for turso database.
+ADO.NET bindings for Turso local databases.
 
-## Getting Started
+The managed `Turso` package exposes `System.Data.Common` types such as `DbConnection`, `DbCommand`, `DbDataReader`, `DbParameter`, `DbTransaction`, and `DbProviderFactory`. The `Turso.Raw` package contains the native SDK-kit interop layer and runtime assets used by the provider.
+
+## Install
+
+```bash
+dotnet add package Turso
+```
+
+`Turso` depends on `Turso.Raw`, so application code usually only needs to reference `Turso`.
+
+## Getting started
 
 ```C#
 using Turso;
@@ -24,3 +34,69 @@ while (reader.Read())
     Console.WriteLine($"Value1: {a}, Value2: {b}");
 }
 ```
+
+## ADO.NET usage
+
+Code written against `DbConnection` can use `TursoConnection` directly:
+
+```C#
+using System.Data.Common;
+using Turso;
+
+await using DbConnection connection = new TursoConnection("Data Source=app.db");
+connection.Open();
+
+await using var command = connection.CreateCommand();
+command.CommandText = "SELECT $value";
+var parameter = command.CreateParameter();
+parameter.ParameterName = "$value";
+parameter.Value = 42;
+command.Parameters.Add(parameter);
+
+var value = command.ExecuteScalar();
+```
+
+Provider factories are available through `TursoFactory.Instance`:
+
+```C#
+DbProviderFactory factory = TursoFactory.Instance;
+using var connection = factory.CreateConnection();
+connection!.ConnectionString = "Data Source=:memory:";
+connection.Open();
+```
+
+## Migrating from Microsoft.Data.Sqlite
+
+For common embedded SQLite usage, `Turso.Data.Sqlite` exposes a SQLite-compatible facade over the Turso engine:
+
+```diff
+- using Microsoft.Data.Sqlite;
++ using Turso.Data.Sqlite;
+
+- using var connection = new SqliteConnection("Data Source=app.db");
++ using var connection = new SqliteConnection("Data Source=app.db");
+```
+
+Supported common connection string keywords include:
+
+| Keyword | Notes |
+| --- | --- |
+| `Data Source` | Database path or `:memory:`. Aliases include `DataSource` and `Filename`. |
+| `Mode` | Parsed and preserved for compatibility. |
+| `Cache` | Parsed and preserved for compatibility. |
+| `Foreign Keys` | Parsed and preserved for compatibility. |
+| `Recursive Triggers` | Parsed and preserved for compatibility. |
+| `Default Timeout` | Used as the default command timeout. Aliases include `Command Timeout`. |
+| `Pooling` | Parsed and preserved for compatibility. |
+| `Vfs` | Parsed and preserved for compatibility. |
+| `Encryption Cipher` | Turso local encryption cipher. |
+| `Encryption Key` | Hex-encoded encryption key used with `Encryption Cipher`. |
+
+## SQLite-compatible facade coverage
+
+- `Turso.Data.Sqlite` is the migration-oriented facade. It includes SQLite-style connection strings, commands, readers, schema metadata, transactions and savepoints, backup, SQL-backed blob streams, scalar and aggregate UDFs, custom collations, and disabled-by-default extension loading.
+- Raw SQLitePCL `sqlite3*` handle interop is intentionally unsupported. `SqliteConnection.Handle` returns `null` rather than exposing a fake SQLite handle.
+- `PRAGMA read_uncommitted` is tracked as connection-local state for API compatibility, but Turso does not currently implement SQLite shared-cache dirty reads.
+- `SqliteBlob` preserves fixed-length blob stream behavior through SQL reads and writes. It is not yet backed by a native incremental-blob storage handle.
+- SQLite virtual-table modules such as FTS3/FTS5 are not built in unless provided by a Turso extension/module.
+- Async methods currently use the base ADO.NET behavior rather than a dedicated async native path.

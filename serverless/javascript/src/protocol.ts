@@ -33,6 +33,14 @@ export interface ExecuteRequest {
   };
 }
 
+export type BatchCondition =
+  | { type: 'ok'; step: number }
+  | { type: 'error'; step: number }
+  | { type: 'not'; cond: BatchCondition }
+  | { type: 'and'; conds: BatchCondition[] }
+  | { type: 'or'; conds: BatchCondition[] }
+  | { type: 'is_autocommit' };
+
 export interface BatchStep {
   stmt: {
     sql: string;
@@ -40,10 +48,7 @@ export interface BatchStep {
     named_args?: NamedArg[];
     want_rows: boolean;
   };
-  condition?: {
-    type: 'ok';
-    step: number;
-  };
+  condition?: BatchCondition;
 }
 
 export interface BatchRequest {

@@ -5,7 +5,7 @@ use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
         self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Table,
-        SQLITE_SEQUENCE_TABLE_NAME,
+        EXPR_INDEX_SENTINEL, SQLITE_SEQUENCE_TABLE_NAME,
     },
     sync::Arc,
     translate::{
@@ -326,7 +326,7 @@ pub fn translate_insert(
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), table.get_name())?;
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
 
     let mut table_references = TableReferences::new(
         vec![JoinedTable {
@@ -653,7 +653,7 @@ pub fn translate_insert(
                 ctx.table,
                 resolver.schema(),
                 None,
-            ),
+            )?,
         });
 
         // Encode values for columns with custom types.
@@ -720,10 +720,15 @@ pub fn translate_insert(
             program.emit_insn(Insn::Goto {
                 target_pc: explicit_done_label,
             });
-            program.preassign_label_to_next_insn(skip_seq_update_label);
 
-            // Missing sqlite_sequence row: materialize it once with max(existing_seq, explicit_key).
-            // For first explicit negative insert this yields seq=0, matching SQLite.
+            // SQLite leaves sqlite_sequence unchanged when the explicit key
+            // does not advance seq.
+            program.preassign_label_to_next_insn(skip_seq_update_label);
+            program.emit_insn(Insn::Goto {
+                target_pc: explicit_done_label,
+            });
+
+            // If sqlite_sequence has no row yet, write max(0, explicit_key).
             program.preassign_label_to_next_insn(missing_row_label);
             let seq_to_write_reg = program.alloc_register();
             program.emit_insn(Insn::Copy {
@@ -1679,6 +1684,11 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
     });
 
     program.emit_column_or_rowid(seq_cursor_id, 1, r_seq);
+    // SQLite emits AddImm r[seq], 0 here. OP_AddImm always leaves an integer.
+    program.emit_insn(Insn::AddImm {
+        register: r_seq,
+        value: 0,
+    });
     program.emit_insn(Insn::RowId {
         cursor_id: seq_cursor_id,
         dest: r_seq_rowid,
@@ -3480,6 +3490,14 @@ fn emit_index_column_value_for_insert(
             table,
             dest_reg,
         )?;
+        // For virtual generated column references, apply the column's
+        // declared affinity to the computed expression result.
+        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
+            let column = &table.columns()[idx_col.pos_in_table];
+            if column.is_virtual_generated() {
+                program.emit_column_affinity(dest_reg, column.affinity());
+            }
+        }
     } else {
         let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
             return Err(LimboError::PlanningError(

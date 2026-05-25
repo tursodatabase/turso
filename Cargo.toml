@@ -7,7 +7,6 @@ members = [
     "bindings/javascript",
     "bindings/javascript/sync",
     "bindings/python",
-    "bindings/dotnet",
     "bindings/rust",
     "cli",
     "core",
@@ -16,7 +15,6 @@ members = [
     "extensions/crypto",
     "extensions/csv",
     "extensions/ipaddr",
-    "extensions/percentile",
     "extensions/regexp",
     "extensions/tests",
     "extensions/fuzzy",
@@ -50,7 +48,6 @@ default-members = [
     "bindings/javascript",
     "bindings/javascript/sync",
     "bindings/python",
-    "bindings/dotnet",
     "bindings/rust",
     "cli",
     "core",
@@ -59,7 +56,6 @@ default-members = [
     "extensions/crypto",
     "extensions/csv",
     "extensions/ipaddr",
-    "extensions/percentile",
     "extensions/regexp",
     "extensions/tests",
     "extensions/fuzzy",
@@ -87,24 +83,24 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.6.0-pre.28"
+version = "0.7.0-pre.3"
 authors = ["the Turso authors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [workspace.dependencies]
-turso = { path = "bindings/rust", version = "0.6.0-pre.28" }
-turso_node = { path = "bindings/javascript", version = "0.6.0-pre.28" }
-turso_sdk_kit = { path = "sdk-kit", version = "0.6.0-pre.28" }
-turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.6.0-pre.28" }
-turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.6.0-pre.28" }
-limbo_completion = { path = "extensions/completion", version = "0.6.0-pre.28" }
-turso_core = { path = "core", version = "0.6.0-pre.28" }
-turso_sync_engine = { path = "sync/engine", version = "0.6.0-pre.28" }
-turso_ext = { path = "extensions/core", version = "0.6.0-pre.28" }
-turso_macros = { path = "macros", version = "0.6.0-pre.28" }
-turso_parser = { path = "parser", version = "0.6.0-pre.28" }
+turso = { path = "bindings/rust", version = "0.7.0-pre.3" }
+turso_node = { path = "bindings/javascript", version = "0.7.0-pre.3" }
+turso_sdk_kit = { path = "sdk-kit", version = "0.7.0-pre.3" }
+turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.7.0-pre.3" }
+turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.7.0-pre.3" }
+limbo_completion = { path = "extensions/completion", version = "0.7.0-pre.3" }
+turso_core = { path = "core", version = "0.7.0-pre.3" }
+turso_sync_engine = { path = "sync/engine", version = "0.7.0-pre.3" }
+turso_ext = { path = "extensions/core", version = "0.7.0-pre.3" }
+turso_macros = { path = "macros", version = "0.7.0-pre.3" }
+turso_parser = { path = "parser", version = "0.7.0-pre.3" }
 sql_generation = { path = "sql_generation" }
 turso-dbhash = { path = "tools/dbhash" }
 strum = { version = "0.26", features = ["derive"] }
@@ -132,6 +128,7 @@ indicatif = "0.17"
 miette = "7.6.0"
 bitflags = "2.9.4"
 fallible-iterator = "0.3.0"
+allocator-api2 = "0.4"
 
 criterion = "0.5.0"
 codspeed-criterion-compat = "4.2.1"
@@ -203,7 +200,7 @@ codegen-units = 16        # Less cross-unit inlining
 inherits = "release-official"
 
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'cfg(antithesis)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'cfg(antithesis)', 'cfg(nightly)'] }
 
 [workspace.lints.clippy]
 or_fun_call = "deny"

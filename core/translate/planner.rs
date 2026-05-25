@@ -525,7 +525,7 @@ fn plan_cte(
             identifier: referenced_table.identifier.clone(),
             internal_id: referenced_table.internal_id,
             table: referenced_table.table.clone(),
-            using_dedup_hidden_cols: referenced_table.using_dedup_hidden_cols(),
+            using_dedup_hidden_cols: referenced_table.using_dedup_hidden_cols()?,
             col_used_mask: ColumnUsedMask::default(),
             cte_select: None,
             cte_explicit_columns: vec![],
@@ -1558,7 +1558,7 @@ pub fn table_mask_from_expr(
                     .iter()
                     .position(|t| t.internal_id == *table)
                 {
-                    mask.set(table_idx);
+                    mask.set(table_idx)?;
                 } else if table_references
                     .find_outer_query_ref_by_internal_id(*table)
                     .is_none()
@@ -1586,7 +1586,7 @@ pub fn table_mask_from_expr(
                                 .iter()
                                 .position(|t| t.internal_id == *outer_ref_id)
                             {
-                                mask.set(table_idx);
+                                mask.set(table_idx)?;
                             }
                         }
                     }
@@ -1604,7 +1604,7 @@ pub fn table_mask_from_expr(
                                 .iter()
                                 .position(|t| t.internal_id == *outer_ref_id)
                             {
-                                mask.set(table_idx);
+                                mask.set(table_idx)?;
                             }
                         }
                     }

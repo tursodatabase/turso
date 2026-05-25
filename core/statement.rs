@@ -13,6 +13,7 @@ use turso_parser::{
     parser::Parser,
 };
 
+use crate::alloc::TursoIteratorExt;
 use crate::{
     busy::BusyHandlerState,
     parameters,
@@ -290,15 +291,21 @@ impl Statement {
                 .fetch_add(1, Ordering::SeqCst);
             self.counted_as_active_root = true;
         }
-        if matches!(self.state.execution_state, ProgramExecutionState::Init)
-            && !self
+        if matches!(self.state.execution_state, ProgramExecutionState::Init) {
+            if self.program.connection.mvcc_enabled() {
+                // MVCC checkpoints can publish internal schema roots without changing
+                // SQLite's schema cookie, so refresh before deciding whether to reprepare.
+                self.program.connection.maybe_update_schema();
+            }
+            if !self
                 .program
                 .prepare_context
                 .matches_connection(&self.program.connection)
-        {
-            if let Err(err) = self.reprepare() {
-                self.release_active_root_if_counted();
-                return Err(err);
+            {
+                if let Err(err) = self.reprepare() {
+                    self.release_active_root_if_counted();
+                    return Err(err);
+                }
             }
         }
 
@@ -541,7 +548,7 @@ impl Statement {
             .iter()
             .chain(self.program.prepared.read_databases.iter())
             .filter(|&id| id != crate::MAIN_DB_ID)
-            .collect();
+            .try_collect()?;
         for db_id in &attached_db_ids {
             // Discard any connection-local schema changes for this non-main DB
             // (temp or attached) so the re-translate reads the committed schema.
@@ -555,14 +562,11 @@ impl Statement {
             }
         }
 
-        // if current connection is within a transaction which changed schema - we must use its schema version instead of DB schema version
-        // see test_prepared_stmt_reprepare_ddl_change_txn (plus test_sync_pull_after_local_ddl_and_remote_writes)
-        {
-            let mut conn_schema = conn.schema.write();
-            if conn_schema.schema_version < conn.db.schema.lock().schema_version {
-                *conn_schema = conn.db.clone_schema();
-            }
-        }
+        // Refresh from shared schema only when shared is newer; this preserves a
+        // connection-local schema that is ahead of shared. An MVCC checkpoint can
+        // publish new btree roots without bumping the schema cookie, so
+        // same-version reprepare still refreshes it.
+        conn.refresh_schema_from_shared_for_reprepare();
         let new_program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;

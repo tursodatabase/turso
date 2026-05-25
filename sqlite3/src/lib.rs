@@ -29,7 +29,10 @@ pub extern "C" fn turso_enable_experimental() {
 fn default_db_opts() -> DatabaseOpts {
     let mut opts = DatabaseOpts::new();
     if EXPERIMENTAL_ENABLED.load(Ordering::Acquire) {
-        opts = opts.with_generated_columns(true).with_vacuum(true);
+        opts = opts
+            .with_generated_columns(true)
+            .with_vacuum(true)
+            .with_without_rowid(true);
     }
     opts
 }
@@ -799,7 +802,7 @@ pub unsafe extern "C" fn sqlite3_context_db_handle(context: *mut ffi::c_void) ->
 pub unsafe extern "C" fn sqlite3_prepare_v2(
     raw_db: *mut sqlite3,
     sql: *const ffi::c_char,
-    _len: ffi::c_int,
+    n_byte: ffi::c_int,
     out_stmt: *mut *mut sqlite3_stmt,
     tail: *mut *const ffi::c_char,
 ) -> ffi::c_int {
@@ -808,8 +811,22 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     }
     let db: &mut sqlite3 = &mut *raw_db;
     let mut db = db.inner.lock().unwrap();
-    let sql_cstr = CStr::from_ptr(sql);
-    let sql_str = match sql_cstr.to_str() {
+    // SQLite C-API contract (https://www.sqlite.org/c3ref/prepare.html):
+    //   If nByte is negative, zSql is read up to the first zero terminator.
+    //   If nByte is positive, it is the number of bytes read from zSql.
+    // Without this branch, the function unconditionally walks until NUL — over-reads
+    // any non-NUL-terminated Rust `&str` passed by rusqlite/libsqlite3-sys, producing
+    // misleading parse errors from neighbouring memory.
+    let sql_bytes: &[u8] = if n_byte < 0 {
+        CStr::from_ptr(sql).to_bytes()
+    } else {
+        let bounded = std::slice::from_raw_parts(sql as *const u8, n_byte as usize);
+        bounded
+            .iter()
+            .position(|&b| b == 0)
+            .map_or(bounded, |i| &bounded[..i])
+    };
+    let sql_str = match std::str::from_utf8(sql_bytes) {
         Ok(s) => s,
         Err(_) => {
             db.err_code = SQLITE_MISUSE;

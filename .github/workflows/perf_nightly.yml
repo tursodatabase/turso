@@ -19,7 +19,7 @@ jobs:
     runs-on: nyrkio_perf_server_4cpu_ubuntu2404
     timeout-minutes: 45 # FIXME: make this run faster
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: useblacksmith/setup-node@v5
         with:
           node-version: 20
@@ -36,7 +36,7 @@ jobs:
       - name: Bench
         run: make bench-exclude-tpc-h  2>&1 | tee output.txt
       - name: Analyze benchmark result with Nyrkiö
-        uses: nyrkio/change-detection@HEAD
+        uses: nyrkio/change-detection@f1e26bea1b51177e5d4fe3f83dbc807410c4bc1d
         with:
           name: nightly/turso
           tool: criterion
@@ -70,7 +70,7 @@ jobs:
     runs-on: nyrkio_perf_server_4cpu_ubuntu2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: useblacksmith/setup-node@v5
         with:
           node-version: 20
@@ -79,7 +79,7 @@ jobs:
         run: make clickbench
 
       - name: Analyze TURSO result with Nyrkiö
-        uses: nyrkio/change-detection@HEAD
+        uses: nyrkio/change-detection@f1e26bea1b51177e5d4fe3f83dbc807410c4bc1d
         with:
           name: nightly/clickbench/turso
           tool: time
@@ -105,7 +105,7 @@ jobs:
           nyrkio-settings-threshold: 0%
 
       - name: Analyze SQLITE3 result with Nyrkiö
-        uses: nyrkio/change-detection@HEAD
+        uses: nyrkio/change-detection@f1e26bea1b51177e5d4fe3f83dbc807410c4bc1d
         with:
           name: nightly/clickbench/sqlite3
           tool: time
@@ -126,7 +126,7 @@ jobs:
     env:
       DB_FILE: "perf/tpc-h/TPC-H.db"
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
@@ -147,7 +147,7 @@ jobs:
       - name: Bench
         run: cargo bench --bench tpc_h_benchmark  2>&1 | tee output.txt
       - name: Analyze benchmark result with Nyrkiö
-        uses: nyrkio/change-detection@HEAD
+        uses: nyrkio/change-detection@f1e26bea1b51177e5d4fe3f83dbc807410c4bc1d
         with:
           name: nightly/tpc-h
           tool: criterion

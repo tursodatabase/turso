@@ -192,7 +192,45 @@ enum CommitState {
     },
 }
 
-#[derive(Debug, Clone)]
+impl CommitState {
+    fn cleanup_mvcc_checkpoint_state(&mut self) {
+        match self {
+            CommitState::CommittingMvcc { state_machine } => {
+                state_machine.inner_mut().cleanup_mvcc_checkpoint_state()
+            }
+            CommitState::CommittingAttachedMvcc { state_machine, .. } => {
+                state_machine.inner_mut().cleanup_mvcc_checkpoint_state()
+            }
+            CommitState::Ready | CommitState::Committing | CommitState::CommittingAttached => {}
+        }
+    }
+
+    fn cleanup_abandoned_mvcc_commit(&mut self, connection: &Connection) {
+        match self {
+            CommitState::CommittingAttachedMvcc {
+                state_machine,
+                db_id: attached_db_id,
+                ..
+            } if !state_machine.is_finalized() => {
+                if connection
+                    .database_schemas()
+                    .write()
+                    .remove(attached_db_id)
+                    .is_some()
+                {
+                    connection.bump_prepare_context_generation();
+                }
+            }
+            CommitState::CommittingMvcc { state_machine } if !state_machine.is_finalized() => {}
+            _ => return, // no-op for already-finalized state machines and non-MVCC commit states
+        };
+
+        connection.rollback_attached_mvcc_txs(true);
+        connection.rollback_attached_wal_txns();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Register {
     Value(Value),
     Aggregate(AggContext),
@@ -318,6 +356,10 @@ pub struct Row {
 pub enum TxnCleanup {
     None,
     RollbackTxn,
+    /// begin_statement was called and statement is participating in an interactive transaction.
+    /// If statement is abandoned and/or dropped without an apparent error, we should rollback statement
+    /// to previous savepoint.
+    RollbackSavepoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -586,6 +628,8 @@ pub struct ProgramState {
     pub(crate) cursors: Vec<Option<Cursor>>,
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
+    /// Trace state: register snapshot for diffing.
+    pre_op_registers: Option<Box<[Register]>>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seeks: Vec<Option<DeferredSeekState>>,
@@ -683,6 +727,7 @@ impl ProgramState {
             cursors,
             cursor_seqs,
             registers,
+            pre_op_registers: None,
             result_row: None,
             last_compare: None,
             deferred_seeks: vec![None; max_cursors],
@@ -810,7 +855,11 @@ impl ProgramState {
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
-        // Reset state machines
+        // A caller can reset or drop a statement after an MVCC auto-checkpoint
+        // has yielded I/O. Waiting for that I/O does not step the nested
+        // CheckpointStateMachine again, so release its checkpoint lock before
+        // replacing commit_state with Ready.
+        self.commit_state.cleanup_mvcc_checkpoint_state();
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
         self.current_collation = None;
@@ -836,6 +885,14 @@ impl ProgramState {
         self.pending_fail_error = None;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
+    }
+
+    /// Whether this statement owns the implicit autocommit transaction it is
+    /// about to finish, including re-entry while its commit is in progress.
+    #[inline]
+    pub(crate) fn owns_auto_txn(&self) -> bool {
+        self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+            || !matches!(self.commit_state, CommitState::Ready)
     }
 
     #[inline]
@@ -1544,6 +1601,46 @@ impl Program {
                 trace_insn(self, state.pc as InsnReference, insn);
                 crate::stack::trace_remaining("program_step:opcode");
             }
+            if self.connection.get_vdbe_trace() {
+                // Diff registers from PREVIOUS opcode
+                // The last opcode (Halt) won't have its diff printed, but Halt
+                // doesn't write to any registers
+                if let Some(ref old) = state.pre_op_registers {
+                    for (i, (old_reg, new_reg)) in
+                        old.iter().zip(state.registers.iter()).enumerate()
+                    {
+                        if old_reg != new_reg {
+                            match new_reg {
+                                Register::Value(v) => eprintln!("R[{i}] = {v}"),
+                                Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
+                                Register::Record(_) => eprintln!("R[{i}] = <record>"),
+                            }
+                        }
+                    }
+                    state.pre_op_registers = None;
+                }
+
+                // Print CURRENT opcode
+                if matches!(insn, Insn::Init { .. }) {
+                    eprintln!("VDBE Trace:");
+                }
+                eprintln!(
+                    "{}",
+                    explain::insn_to_str(
+                        self,
+                        state.pc as InsnReference,
+                        insn,
+                        String::new(),
+                        self.comments
+                            .iter()
+                            .find(|(offset, _)| *offset == state.pc as InsnReference)
+                            .map(|(_, comment)| comment)
+                            .copied()
+                    )
+                );
+                // Snapshot for next iteration
+                state.pre_op_registers = Some(state.registers.clone());
+            }
             // Always increment VM steps for every loop iteration
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
@@ -2168,6 +2265,24 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        // MVCC auto-checkpoint is owned by commit_state, not by normal_step().
+        // If its yielded I/O fails, normal_step sees the error before
+        // CommitStateMachine::Checkpoint gets another step, so the checkpoint
+        // state machine cannot run its own error cleanup. abort() is the first
+        // statement cleanup path that still owns that commit_state.
+        state.commit_state.cleanup_mvcc_checkpoint_state();
+        // If a CommitStateMachine was non-terminal when the program was
+        // aborted — Statement dropped mid-IO yield, or `?` propagated a Busy
+        // out of BeginCommitLogicalLog / SyncLogicalLog — release the locks
+        // it acquired (`pager_commit_lock`, `exclusive_tx`) and roll back the
+        // orphan tx. Without this the tx stays in `Preparing`, the next op on
+        // this connection trips a `turso_assert_eq!(Active)`, and any other
+        // writer parks forever on the leaked `pager_commit_lock`. The
+        // following err-match's no-rollback arms (Busy / TxError / etc.)
+        // would otherwise skip this cleanup.
+        state
+            .commit_state
+            .cleanup_abandoned_mvcc_commit(&self.connection);
 
         // VACUUM (and VACUUM INTO) state can own internal helper statements whose drop path
         // releases nested guards. Clean it before checking whether this program
@@ -2189,6 +2304,7 @@ impl Program {
         }
         // Errors from nested statements are handled by the parent statement.
         if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
+            let owns_auto_txn = state.owns_auto_txn();
             if err.is_some() && !pager.is_checkpointing() {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
@@ -2225,11 +2341,18 @@ impl Program {
                 // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
                 // and the caller is expected to handle transaction cleanup explicitly if needed.
                 Some(LimboError::SchemaUpdated) => {}
+                Some(LimboError::WriteWriteConflict | LimboError::SchemaConflict) => {
+                    // These MVCC errors mean the current transaction cannot
+                    // commit. Roll it back even if this statement opened a
+                    // statement savepoint, as DDL does.
+                    self.rollback_current_txn(pager);
+                    self.connection.set_changes_without_total(0);
+                }
                 // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
                 // FK errors always behave like ABORT: rollback statement,
                 // rollback transaction in autocommit mode.
                 Some(LimboError::ForeignKeyConstraint(_)) => {
-                    if self.connection.get_auto_commit() {
+                    if owns_auto_txn {
                         self.rollback_current_txn(pager);
                     }
                     self.connection.set_changes_without_total(0);
@@ -2265,7 +2388,7 @@ impl Program {
                                     "Failed to release statement savepoint during abort",
                                 );
                             }
-                            if self.connection.get_auto_commit() {
+                            if owns_auto_txn {
                                 // Autocommit FAIL: commit partial changes.
                                 // This matches halt()'s FAIL+autocommit path.
                                 let mv_store = self.connection.mv_store();
@@ -2314,7 +2437,7 @@ impl Program {
                             }
                         }
                         _ => {
-                            if self.connection.get_auto_commit() {
+                            if owns_auto_txn {
                                 self.rollback_current_txn(pager);
                             }
                         }
@@ -2334,11 +2457,33 @@ impl Program {
                         "RaiseIgnore should be caught by op_program, not reach abort"
                     );
                 }
-                _ => {
-                    if state.auto_txn_cleanup != TxnCleanup::None || err.is_some() {
+                _ => match state.auto_txn_cleanup {
+                    TxnCleanup::RollbackTxn => {
                         self.rollback_current_txn(pager);
                     }
-                }
+                    TxnCleanup::RollbackSavepoint => {
+                        if owns_auto_txn {
+                            self.rollback_current_txn(pager);
+                        } else if err.is_none() && !pager.is_checkpointing() {
+                            if let Err(end_stmt_err) = state.end_statement(
+                                &self.connection,
+                                pager,
+                                EndStatement::RollbackSavepoint,
+                            ) {
+                                capture_abort_error(
+                                    &mut abort_error,
+                                    end_stmt_err,
+                                    "Failed to rollback statement savepoint during abort",
+                                );
+                            }
+                        }
+                    }
+                    TxnCleanup::None => {
+                        if owns_auto_txn || (!self.connection.get_auto_commit() && err.is_some()) {
+                            self.rollback_current_txn(pager);
+                        }
+                    }
+                },
             }
         }
         if state.uses_subjournal {

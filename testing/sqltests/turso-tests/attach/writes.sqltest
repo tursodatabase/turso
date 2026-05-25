@@ -1551,3 +1551,47 @@ test attach-temp-trigger-attached-target-not-confused-with-main {
 expect {
     0
 }
+
+# Regression test for #6772
+# DROP TABLE on attached DB must destroy the attached DB's index pages,
+# not main's.
+# The dropped index's root page must be freed. After drop+recreate+reinsert,
+# page_count must stay at 3, not grow to 4.
+@skip-if mvcc "page_count not implemented for mvcc"
+test attach-write-drop-table-with-index-no-page-leak {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE INDEX aux.idx_t_x ON t(x);
+    INSERT INTO aux.t VALUES (1, 1);
+    PRAGMA aux.page_count;
+    DROP TABLE aux.t;
+    CREATE TABLE aux.t(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE INDEX aux.idx_t_x ON t(x);
+    INSERT INTO aux.t VALUES (1, 1);
+    PRAGMA aux.page_count;
+}
+expect {
+    3
+    3
+}
+
+# Regression test for #6772
+# DROP TABLE on attached DB must destroy the attached DB's index pages,
+# not main's.
+test attach-write-drop-table-with-index-no-shortread {
+    CREATE TABLE pad0(q INT);
+    CREATE TABLE pad1(q INT);
+    CREATE TABLE pad2(q INT);
+    CREATE TABLE pad3(q INT);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER);
+    CREATE INDEX idx_main_t_a ON t(a);
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE INDEX aux.idx_t_x ON t(x);
+    INSERT INTO aux.t VALUES (1, 1);
+    DROP TABLE aux.t;
+    SELECT 'ok';
+}
+expect {
+    ok
+}

@@ -160,6 +160,7 @@ pub(crate) fn vacuum_target_opts_from_source(source_db: &Database) -> DatabaseOp
         .with_autovacuum(source_db.experimental_autovacuum_enabled())
         .with_attach(source_db.experimental_attach_enabled())
         .with_generated_columns(source_db.experimental_generated_columns_enabled())
+        .with_without_rowid(source_db.experimental_without_rowid_enabled())
 }
 
 pub(crate) fn reject_unsupported_vacuum_auto_vacuum_mode(mode: AutoVacuumMode) -> Result<()> {
@@ -2397,8 +2398,8 @@ mod tests {
             self.inner.step()
         }
 
-        fn drain(&self) -> Result<()> {
-            self.inner.drain()
+        fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
+            self.inner.drain_completions(completions)
         }
 
         fn cancel(&self, completions: &[Completion]) -> Result<()> {
@@ -2715,7 +2716,6 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    #[ignore = "ignoring for now vaccum is experimental, should be fixed later."]
     fn capture_target_metadata_uses_final_header_cookie_and_preserves_tvfs() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
         let source_dir = tempfile::tempdir().unwrap();
@@ -2729,7 +2729,15 @@ mod tests {
             None,
         )?;
         let source_conn = source_db.connect()?;
-        let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, 0)?;
+        // Source is uninitialized so its header reserved_space isn't usable.
+        // Derive from the IOContext to keep reserved_space and the auto-
+        // installed checksum context consistent under `feature = "checksum"`.
+        let reserved_space = source_conn
+            .get_pager()
+            .io_ctx
+            .read()
+            .get_reserved_space_bytes();
+        let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, reserved_space)?;
 
         temp.conn.execute("BEGIN IMMEDIATE")?;
         temp.conn

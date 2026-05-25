@@ -2007,7 +2007,7 @@ impl Pager {
             // rolled-back savepoint/statement.
             page.set_dirty();
             dirty_pages.insert(page_id);
-            self.upsert_page_in_cache(page_id as usize, page, true)?;
+            self.force_upsert_page_in_cache(page_id as usize, page)?;
         }
 
         let truncate_completion = subjournal.truncate(journal_start_offset)?;
@@ -2765,7 +2765,7 @@ impl Pager {
                         Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                         Ok(IOResult::Done(_)) => complete_commit(),
                         Err(err) => {
-                            tracing::info!("auto-checkpoint failed: {err}");
+                            tracing::debug!("auto-checkpoint failed: {err}");
                             complete_commit();
                             self.cleanup_after_auto_checkpoint_failure();
                         }
@@ -3370,7 +3370,7 @@ impl Pager {
             }
             Err(e) => {
                 self.io.cancel(&state.completions)?;
-                self.io.drain()?;
+                self.io.drain_completions(&state.completions)?;
                 Err(e)
             }
         }
@@ -3569,7 +3569,7 @@ impl Pager {
                 Ok(c) => completions.push(c),
                 Err(e) => {
                     self.io.cancel(&completions)?;
-                    self.io.drain()?;
+                    self.io.drain_completions(&completions)?;
                     return Err(e);
                 }
             }
@@ -3592,7 +3592,7 @@ impl Pager {
                     if spilled {
                         // After spilling, try to evict clean pages to make room in the cache
                         let mut cache = self.page_cache.write();
-                        if let Err(e) = cache.make_room_for(1) {
+                        if let Err(e) = cache.make_room_for(1, false) {
                             // Cache is completely full with unevictable pages
                             tracing::error!(
                                 "ensure_cache_space: {e} cache full, could not make room"
@@ -5029,6 +5029,27 @@ impl Pager {
         Ok(())
     }
 
+    fn force_upsert_page_in_cache(&self, id: usize, page: PageRef) -> Result<(), LimboError> {
+        let mut cache = self.page_cache.write();
+        let page_key = PageCacheKey::new(id);
+
+        turso_assert!(
+            page.is_dirty(),
+            "restored savepoint page must be dirty",
+            { "page_id": id }
+        );
+        cache
+            .force_upsert_page(page_key, page.clone())
+            .map_err(|e| {
+                LimboError::InternalError(format!(
+                    "Failed to restore savepoint page {id} into cache: {e:?}"
+                ))
+            })?;
+        page.set_loaded();
+        page.clear_wal_tag();
+        Ok(())
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn rollback(&self, schema_did_change: bool, connection: &Connection, is_write: bool) {
         tracing::debug!(schema_did_change);
@@ -5708,6 +5729,21 @@ mod checkpoint_phase_tests {
     use crate::types::IOResult;
     use crate::Database;
 
+    /// Returns an IO backend that supports shared WAL coordination on the host.
+    /// On Windows the default `PlatformIO` (`WindowsIO`) lacks the byte-locking
+    /// and mapping primitives, so the experimental IOCP backend is used when
+    /// the `experimental_win_iocp` feature is enabled.
+    fn shared_wal_test_io() -> Arc<dyn IO> {
+        #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+        {
+            Arc::new(crate::WindowsIOCP::new().unwrap())
+        }
+        #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+        {
+            Arc::new(PlatformIO::new().unwrap())
+        }
+    }
+
     fn open_checkpoint_test_database() -> (Arc<Database>, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap().keep();
         let db_path = dir.join("test.db");
@@ -5717,7 +5753,7 @@ mod checkpoint_phase_tests {
                 .pragma_update(None, "journal_mode", "wal")
                 .unwrap();
         }
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let db = Database::open_file_with_flags(
             io,
             db_path.to_str().unwrap(),

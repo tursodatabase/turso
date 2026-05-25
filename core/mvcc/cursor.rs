@@ -1,11 +1,10 @@
-use crate::sync::RwLock;
 use crate::turso_assert;
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
+    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersions, SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -282,7 +281,7 @@ pub enum MvccCursorType {
 }
 
 pub(crate) type MvccIterator<'l, T> =
-    Box<dyn Iterator<Item = Entry<'l, T, RwLock<Vec<RowVersion>>>> + Send + Sync>;
+    Box<dyn Iterator<Item = Entry<'l, T, RowVersions>> + Send + Sync>;
 
 /// Extends the lifetime of a SkipMap iterator to `'static`.
 ///
@@ -309,16 +308,8 @@ macro_rules! static_iterator_hack {
         // SAFETY: See macro documentation above.
         unsafe {
             std::mem::transmute::<
-                Box<
-                    dyn Iterator<Item = Entry<'_, $key_type, RwLock<Vec<RowVersion>>>>
-                        + Send
-                        + Sync,
-                >,
-                Box<
-                    dyn Iterator<Item = Entry<'static, $key_type, RwLock<Vec<RowVersion>>>>
-                        + Send
-                        + Sync,
-                >,
+                Box<dyn Iterator<Item = Entry<'_, $key_type, RowVersions>> + Send + Sync>,
+                Box<dyn Iterator<Item = Entry<'static, $key_type, RowVersions>> + Send + Sync>,
             >($iter)
         }
     };
@@ -884,6 +875,15 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 }
 
+impl<Clock: LogicalClock + 'static> Drop for MvccLazyCursor<Clock> {
+    fn drop(&mut self) {
+        // Release the per-table RowidAllocator lock if a Statement was dropped
+        // while paused at an op_new_rowid IO yield. end_new_rowid is a no-op
+        // when creating_new_rowid is false, so this is safe in every case.
+        self.end_new_rowid();
+    }
+}
+
 impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     fn last(&mut self) -> Result<IOResult<()>> {
         // A cursor may be NullRow'd during outer-join unmatched emission.
@@ -1416,17 +1416,17 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         // Check if the cursor is currently positioned at a B-tree row that matches
         // the row we're inserting. This indicates we're updating a B-tree-resident row
         // that doesn't yet have an MVCC version.
-        let (in_btree, was_btree_resident) = match &self.current_pos {
+        let was_btree_resident = match &self.current_pos {
             CursorPosition::Loaded {
                 row_id: current_row_id,
                 in_btree,
-            } => (*in_btree, *in_btree && *current_row_id == row.id),
-            _ => (false, false),
+            } => *in_btree && *current_row_id == row.id,
+            _ => false,
         };
 
         self.current_pos = CursorPosition::Loaded {
             row_id: row.id.clone(),
-            in_btree,
+            in_btree: was_btree_resident,
         };
         let maybe_index_id = match &self.mv_cursor_type {
             MvccCursorType::Index(_) => Some(self.table_id),
@@ -1467,6 +1467,13 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             CursorPosition::Loaded { row_id, in_btree } => (row_id, in_btree),
             _ => panic!("Cannot delete: no current row"),
         };
+        if in_btree {
+            turso_assert!(
+                self.is_btree_allocated(),
+                "MVCC cursor marked current row as B-tree resident without an allocated B-tree",
+                { "row_id": &rowid }
+            );
+        }
         let maybe_index_id = match &self.mv_cursor_type {
             MvccCursorType::Index(_) => Some(self.table_id),
             MvccCursorType::Table => None,
@@ -1487,6 +1494,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         // in the btree but not the mv store. In this case, we create a tombstone for the row
         // based on the btree row.
         if !was_deleted {
+            // The cursor can also be positioned on a row that was rolled back
+            // after seek. That row does not exist in either MVCC or the B-tree.
+            if !in_btree {
+                self.invalidate_record();
+                return Ok(IOResult::Done(()));
+            }
             // The btree cursor must be correctly positioned and cannot cause IO to happen
             // because we pre-fetched the record above when `in_btree` was true.
             let IOResult::Done(Some(record)) = self.record()? else {

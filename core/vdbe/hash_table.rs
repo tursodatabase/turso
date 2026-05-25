@@ -92,6 +92,9 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
                     CollationSeq::Binary | CollationSeq::Unset => {
                         hasher.write(text.as_bytes());
                     }
+                    CollationSeq::Locale(_) => {
+                        hasher.write(&collation.hash_key(text.as_str()));
+                    }
                 }
             }
             ValueRef::Blob(blob) => {
@@ -1149,7 +1152,10 @@ impl HashTable {
         metrics: Option<&mut HashJoinMetrics>,
     ) -> Result<HashInsertResult> {
         turso_assert!(
-            matches!(self.state,  HashTableState::Building | HashTableState::Spilled),
+            matches!(
+                self.state,
+                HashTableState::Building | HashTableState::Spilled
+            ),
             "Cannot insert into hash table in unexpected state",
             { "state": format!("{:?}", self.state) }
         );

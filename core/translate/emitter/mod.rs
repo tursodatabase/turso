@@ -22,9 +22,11 @@ use super::{
     trigger_exec::{get_triggers_including_temp, has_triggers_including_temp},
     window::WindowMetadata,
 };
+use crate::alloc::TursoIteratorExt;
 use crate::instrument;
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
+    EXPR_INDEX_SENTINEL,
 };
 use crate::translate::plan::ColumnMask;
 use crate::vdbe::{
@@ -522,20 +524,21 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    pub(crate) fn attached_database_ids_in_search_order(&self) -> BitSet {
-        self.attached_databases
+    pub(crate) fn attached_database_ids_in_search_order(&self) -> Result<BitSet> {
+        Ok(self
+            .attached_databases
             .read()
             .index_to_data
             .keys()
             .copied()
-            .collect()
+            .try_collect()?)
     }
 
     fn resolve_unqualified_existing_database_id<F>(
         &self,
         object_name: &str,
         schema_contains_object: F,
-    ) -> usize
+    ) -> Result<usize>
     where
         F: Fn(&Schema, &str) -> bool,
     {
@@ -547,24 +550,24 @@ impl<'a> Resolver<'a> {
                 schema_contains_object(schema, object_name)
             })
         {
-            return crate::TEMP_DB_ID;
+            return Ok(crate::TEMP_DB_ID);
         }
 
         if self.with_schema(crate::MAIN_DB_ID, |schema| {
             schema_contains_object(schema, object_name)
         }) {
-            return crate::MAIN_DB_ID;
+            return Ok(crate::MAIN_DB_ID);
         }
 
-        for database_id in self.attached_database_ids_in_search_order() {
+        for database_id in self.attached_database_ids_in_search_order()? {
             if self.with_schema(database_id, |schema| {
                 schema_contains_object(schema, object_name)
             }) {
-                return database_id;
+                return Ok(database_id);
             }
         }
 
-        crate::MAIN_DB_ID
+        Ok(crate::MAIN_DB_ID)
     }
 
     fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
@@ -617,20 +620,20 @@ impl<'a> Resolver<'a> {
                 return Ok(ctx.database_id);
             }
 
-            return Ok(self.resolve_unqualified_existing_database_id(
+            return self.resolve_unqualified_existing_database_id(
                 table_name,
                 Self::schema_has_table_like_object,
-            ));
+            );
         }
 
         if let Some(database_id) = Self::resolve_schema_table_database_id(table_name) {
             return Ok(database_id);
         }
 
-        Ok(self.resolve_unqualified_existing_database_id(
+        self.resolve_unqualified_existing_database_id(
             table_name,
             Self::schema_has_table_like_object,
-        ))
+        )
     }
 
     pub(crate) fn resolve_existing_index_database_id(
@@ -642,7 +645,7 @@ impl<'a> Resolver<'a> {
         }
 
         let index_name = normalize_ident(qualified_name.name.as_str());
-        Ok(self.resolve_unqualified_existing_database_id(&index_name, Self::schema_has_index))
+        self.resolve_unqualified_existing_database_id(&index_name, Self::schema_has_index)
     }
 
     pub(crate) fn resolve_existing_trigger_database_id(
@@ -654,7 +657,7 @@ impl<'a> Resolver<'a> {
         }
 
         let trigger_name = qualified_name.name.as_str();
-        Ok(self.resolve_unqualified_existing_database_id(trigger_name, Self::schema_has_trigger))
+        self.resolve_unqualified_existing_database_id(trigger_name, Self::schema_has_trigger)
     }
 
     /// Resolve database ID from a qualified name
@@ -1718,8 +1721,8 @@ pub(crate) fn emit_columns_and_dependencies(
     let target_base = program.alloc_registers(targets.len());
     let extra_base = {
         let mut dependencies_not_in_targets: ColumnMask = dependencies.clone();
-        let target_mask = targets.iter().copied().collect();
-        dependencies_not_in_targets -= &target_mask;
+        let target_mask = targets.iter().copied().try_collect()?;
+        dependencies_not_in_targets.union_with(&target_mask)?;
 
         let extra_count = dependencies_not_in_targets.count();
 
@@ -1803,6 +1806,16 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
+        // For virtual generated column references, apply the column's
+        // declared affinity to the computed expression result.
+        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
+            if let Some(table) = program.btree_table_from_cursor(table_cursor_id) {
+                let column = &table.columns()[idx_col.pos_in_table];
+                if column.is_virtual_generated() {
+                    program.emit_column_affinity(dest_reg, column.affinity());
+                }
+            }
+        }
     } else if let Some(generated_column) = generated_column(program, table_cursor_id, idx_col) {
         emit_table_column(
             program,

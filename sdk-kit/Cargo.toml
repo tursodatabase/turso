@@ -1,6 +1,6 @@
 [package]
 name = "turso_sdk_kit"
-description = "Turso SDK kit"
+description = "Low-level C ABI for building Turso language bindings. For Rust applications, use the `turso` crate instead."
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

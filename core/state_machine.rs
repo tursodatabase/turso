@@ -89,6 +89,10 @@ impl<State: StateTransition> StateMachine<State> {
         Ok(())
     }
 
+    pub(crate) fn inner_mut(&mut self) -> &mut State {
+        &mut self.state
+    }
+
     pub fn is_finalized(&self) -> bool {
         self.is_finalized
     }

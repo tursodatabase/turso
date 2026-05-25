@@ -1,4 +1,5 @@
 use crate::{
+    alloc::{TursoFromIterator, TursoIteratorExt},
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
@@ -319,7 +320,7 @@ struct MaterializationSpec {
 /// For probe->build chaining we store join keys and payload columns directly
 /// in the ephemeral table; otherwise we only store rowids and `SeekRowid`
 /// during probing when needed.
-fn emit_materialized_build_inputs(
+pub(crate) fn emit_materialized_build_inputs(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     plan: &mut SelectPlan,
@@ -334,7 +335,7 @@ fn emit_materialized_build_inputs(
     for table in plan.table_references.joined_tables().iter() {
         if let Operation::HashJoin(hash_join_op) = &table.op {
             let build_table = &plan.table_references.joined_tables()[hash_join_op.build_table_idx];
-            hash_tables_to_keep_open.set(build_table.internal_id.into());
+            hash_tables_to_keep_open.set(build_table.internal_id.into())?;
         }
     }
 
@@ -349,7 +350,7 @@ fn emit_materialized_build_inputs(
             {
                 continue;
             }
-            seen_build_tables.set(hash_join_op.build_table_idx);
+            seen_build_tables.set(hash_join_op.build_table_idx)?;
 
             let probe_table_idx = hash_join_op.probe_table_idx;
             let probe_pos = plan
@@ -496,12 +497,21 @@ fn emit_materialized_build_inputs(
         });
         program.nested(|program| -> Result<()> {
             program.set_hash_tables_to_keep_open(&hash_tables_to_keep_open);
+            // emit_program_for_select_with_inputs unconditionally overwrites
+            // program.result_columns and extends program.table_references with
+            // the materialize subplan's columns/refs. In a nested context (e.g.
+            // a compound branch or CTE) those belong to the *outer* SELECT, so
+            // save and restore them around the nested emission.
+            let saved_result_columns = std::mem::take(&mut program.result_columns);
+            let saved_table_references = std::mem::take(&mut program.table_references);
             emit_program_for_select_with_inputs(
                 program,
                 resolver,
                 materialize_plan,
                 build_inputs.clone(),
             )?;
+            program.result_columns = saved_result_columns;
+            program.table_references = saved_table_references;
             program.clear_hash_tables_to_keep_open();
             Ok(())
         })?;
@@ -575,7 +585,7 @@ fn prune_join_order_for_materialized_inputs(
     for member in plan.join_order.iter() {
         let table = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table.op {
-            build_tables_in_plan.set(hash_join_op.build_table_idx);
+            build_tables_in_plan.set(hash_join_op.build_table_idx)?;
         }
     }
 
@@ -585,7 +595,7 @@ fn prune_join_order_for_materialized_inputs(
             continue;
         }
         if matches!(input.mode, MaterializedBuildInputMode::KeyPayload { .. }) {
-            tables_to_remove.extend(input.prefix_tables.iter());
+            tables_to_remove.try_extend(input.prefix_tables.iter())?;
         }
     }
 
@@ -668,11 +678,14 @@ fn materialization_prefix(
         });
     }
 
-    let mut included_tables: TableMask = prefix_join_order.iter().map(|m| m.original_idx).collect();
+    let mut included_tables: TableMask = prefix_join_order
+        .iter()
+        .map(|m| m.original_idx)
+        .try_collect()?;
     for member in prefix_join_order.iter() {
         let table_ref = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table_ref.op {
-            included_tables.set(hash_join_op.build_table_idx);
+            included_tables.set(hash_join_op.build_table_idx)?;
         }
     }
     Ok((prefix_join_order, included_tables))
@@ -776,7 +789,7 @@ fn build_materialized_build_input_plan(
     // Bitmask of tables that are actually in the prefix join order for
     // this materialization subplan. Anything that depends on other tables
     // cannot be evaluated during those table scans.
-    let join_prefix_mask: TableMask = join_order.iter().map(|m| m.original_idx).collect();
+    let join_prefix_mask: TableMask = join_order.iter().map(|m| m.original_idx).try_collect()?;
 
     // Clone WHERE terms for the materialization subplan. We cannot reuse the
     // parent plan's consumed flags because the optimizer may have consumed

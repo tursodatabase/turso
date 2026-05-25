@@ -1,3 +1,9 @@
+#![cfg_attr(
+    nightly,
+    feature(allocator_api, btreemap_alloc, clone_from_ref, try_with_capacity)
+)]
+
+pub mod alloc;
 pub mod busy;
 #[cfg(feature = "cli_only")]
 pub mod dbpage;
@@ -45,6 +51,8 @@ mod json;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod numeric;
 mod parameters;
+#[cfg(feature = "percentile")]
+mod percentile;
 mod pragma;
 mod progress;
 mod pseudo;
@@ -206,6 +214,7 @@ pub struct DatabaseOpts {
     pub enable_attach: bool,
     pub enable_generated_columns: bool,
     pub enable_multiprocess_wal: bool,
+    pub enable_without_rowid: bool,
     pub unsafe_testing: bool,
     enable_load_extension: bool,
 }
@@ -263,6 +272,11 @@ impl DatabaseOpts {
 
     pub fn with_multiprocess_wal(mut self, enable: bool) -> Self {
         self.enable_multiprocess_wal = enable;
+        self
+    }
+
+    pub fn with_without_rowid(mut self, enable: bool) -> Self {
+        self.enable_without_rowid = enable;
         self
     }
 
@@ -1612,10 +1626,11 @@ impl Database {
         pager.set_schema_cookie(None);
 
         if open_mv_store {
+            let canonical_path = self.get_database_canonical_path();
             let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
-                &self.path,
+                &canonical_path,
                 self.open_flags,
                 self.durable_storage.clone(),
                 enc_ctx,
@@ -1624,6 +1639,19 @@ impl Database {
         }
 
         Ok(Arc::new(pager))
+    }
+
+    pub fn get_database_canonical_path(&self) -> String {
+        if self.is_in_memory_db() {
+            // For in-memory databases, SQLite shows empty string
+            String::new()
+        } else {
+            // For file databases, try show the full absolute path if that doesn't fail
+            match std::fs::canonicalize(&self.path) {
+                Ok(abs_path) => abs_path.to_string_lossy().to_string(),
+                Err(_) => self.path.to_string(),
+            }
+        }
     }
 
     #[instrument(skip_all, level = Level::INFO)]
@@ -1685,6 +1713,7 @@ impl Database {
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
+            vdbe_trace: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
             dqs_dml: AtomicBool::new(true),
             mv_tx: RwLock::new(None),
@@ -1712,6 +1741,7 @@ impl Database {
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             full_column_names: AtomicBool::new(false),
             short_column_names: AtomicBool::new(true),
+            enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             n_active_writes: AtomicI32::new(0),
@@ -2406,6 +2436,10 @@ impl Database {
 
     pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
         self.opts.enable_multiprocess_wal
+    }
+
+    pub fn experimental_without_rowid_enabled(&self) -> bool {
+        self.opts.enable_without_rowid
     }
 
     /// check if database is currently in MVCC mode

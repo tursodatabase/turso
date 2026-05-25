@@ -1080,3 +1080,52 @@ fn test_multiple_create_drop_cycles_recover(db: TempDatabase) -> anyhow::Result<
 
     Ok(())
 }
+
+/// Regression test for tursodatabase/turso#5790:
+/// "Btree cursor should have a record when deleting a row that only exists in the btree".
+///
+/// Under MVCC, an UPDATE compiles to a delete-then-insert sequence using a
+/// DeferredSeek. When the row to be updated only lives in the btree (no MVCC
+/// version cached in memory), the VDBE never calls Column on the table cursor,
+/// so the cursor's record is not materialized before MvccLazyCursor::delete()
+/// runs. The synchronous record fetch inside delete() was not IO-reentrant
+/// w.r.t. delete_from_table_or_index's side effects and would return None,
+/// tripping a corruption assertion. PR #6306 pre-fetches the record when the
+/// cursor sits on a btree-only row to keep the synchronous path safe.
+///
+/// Recipe: insert a wide-enough row (a 4 KiB blob) under MVCC, run
+/// wal_checkpoint(TRUNCATE) so the row is flushed to the btree and the WAL is
+/// reset, close the database, reopen it, and UPDATE the row by primary key.
+/// Without the fix, the UPDATE returns
+/// `Corrupt database: Btree cursor should have a record when deleting a row
+/// that only exists in the btree`.
+#[turso_macros::test]
+fn test_mvcc_update_btree_only_row_after_truncate_checkpoint(
+    db: TempDatabase,
+) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    // Phase 1: enable MVCC, insert a row, then truncate-checkpoint so the row
+    // ends up exclusively in the btree on the next open.
+    {
+        let conn = db.connect_limbo();
+        conn.pragma_update("journal_mode", "'mvcc'")?;
+        conn.execute("CREATE TABLE quint_corrupt (key TEXT PRIMARY KEY, value BLOB)")?;
+        conn.execute("INSERT INTO quint_corrupt (key, value) VALUES ('k0', zeroblob(4096))")?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    }
+    drop(db);
+
+    // Phase 2: reopen and UPDATE the btree-only row. Pre-fix this raised
+    // a corruption error from MvccLazyCursor::delete().
+    let db = Database::open_file(io, path.to_str().unwrap())?;
+    let conn = db.connect()?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("UPDATE quint_corrupt SET value = zeroblob(32) WHERE key = 'k0'")?;
+
+    let rows: Vec<(String, i64)> = conn.exec_rows("SELECT key, length(value) FROM quint_corrupt");
+    assert_eq!(rows, vec![("k0".to_string(), 32)]);
+
+    Ok(())
+}

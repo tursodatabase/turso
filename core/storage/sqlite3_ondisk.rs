@@ -737,7 +737,7 @@ pub fn write_pages_vectored(
                 let _ = err.set(CompletionError::Aborted);
                 done_flag.store(true, Ordering::Release);
                 pager.io.cancel(&completions)?;
-                pager.io.drain()?;
+                pager.io.drain_completions(&completions)?;
                 return Err(e);
             }
         }
