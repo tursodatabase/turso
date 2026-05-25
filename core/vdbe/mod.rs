@@ -286,10 +286,10 @@ impl Register {
     /// Set the value of the register to a Text,
     /// reusing Register::Value(Value::Text(_)) buffer if possible.
     #[inline]
-    pub fn set_text(&mut self, val: Text) {
+    pub fn set_text(&mut self, val: Text) -> Result<()> {
         match self {
             Register::Value(Value::Text(existing)) => {
-                existing.do_extend(&val);
+                existing.do_extend(&val)?;
             }
             Register::Value(other_value_kind) => {
                 *other_value_kind = Value::Text(val);
@@ -298,15 +298,16 @@ impl Register {
                 *self = Register::Value(Value::Text(val));
             }
         }
+        Ok(())
     }
 
     /// Set the value of the register to a blob,
     /// reusing Register::Value(Value::Blob(_)) buffer if possible.
     #[inline]
-    pub fn set_blob(&mut self, val: Vec<u8>) {
+    pub fn set_blob(&mut self, val: Vec<u8>) -> Result<()> {
         match self {
             Register::Value(Value::Blob(existing)) => {
-                existing.do_extend(&val);
+                existing.do_extend(&val)?;
             }
             Register::Value(other_value_kind) => {
                 *other_value_kind = Value::Blob(val);
@@ -315,6 +316,7 @@ impl Register {
                 *self = Register::Value(Value::Blob(val));
             }
         }
+        Ok(())
     }
 
     // Set the value of the register to NULL,
@@ -789,7 +791,7 @@ impl ProgramState {
         matches!(self.execution_state, ProgramExecutionState::Interrupting)
     }
 
-    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
+    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) -> Result<()> {
         let i = index.get() - 1;
         if i >= self.parameters.len() {
             self.parameters.resize(i + 1, Value::Null);
@@ -803,10 +805,11 @@ impl ProgramState {
             (Value::Numeric(Numeric::Float(existing)), Value::Numeric(Numeric::Float(new))) => {
                 *existing = new
             }
-            (Value::Text(existing), Value::Text(new)) => existing.do_extend(&new),
-            (Value::Blob(existing), Value::Blob(new)) => existing.do_extend(&new),
+            (Value::Text(existing), Value::Text(new)) => existing.do_extend(&new)?,
+            (Value::Blob(existing), Value::Blob(new)) => existing.do_extend(&new)?,
             (slot, value) => *slot = value,
         }
+        Ok(())
     }
 
     pub fn clear_bindings(&mut self) {
@@ -2825,10 +2828,14 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 let blob_data = &data[..content_size];
                 match dest {
                     Register::Value(Value::Blob(existing_blob)) => {
-                        existing_blob.do_extend(&blob_data);
+                        if let Err(err) = existing_blob.do_extend(&blob_data) {
+                            return Some(Err(err));
+                        }
                     }
                     _ => {
-                        dest.set_blob(blob_data.to_vec());
+                        if let Err(err) = dest.set_blob(blob_data.to_vec()) {
+                            return Some(Err(err));
+                        }
                     }
                 }
             }
@@ -2855,7 +2862,9 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 };
                 match dest {
                     Register::Value(Value::Text(existing_text)) => {
-                        existing_text.do_extend(&text_str);
+                        if let Err(err) = existing_text.do_extend(&text_str) {
+                            return Some(Err(err));
+                        }
                     }
                     _ => {
                         dest.set_text(Text::new(text_str.to_string()));

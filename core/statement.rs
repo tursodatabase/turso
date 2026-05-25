@@ -822,8 +822,9 @@ impl Statement {
         self.program.parameters.index(name)
     }
 
-    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
-        self.state.bind_at(index, value);
+    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) -> Result<()> {
+        self.state.bind_at(index, value)?;
+        Ok(())
     }
 
     pub fn clear_bindings(&mut self) {

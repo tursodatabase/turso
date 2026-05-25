@@ -1836,13 +1836,13 @@ pub fn op_column(
                                 Value::Text(new_text),
                                 Register::Value(Value::Text(existing_text)),
                             ) => {
-                                existing_text.do_extend(new_text);
+                                existing_text.do_extend(new_text)?;
                             }
                             (
                                 Value::Blob(new_blob),
                                 Register::Value(Value::Blob(existing_blob)),
                             ) => {
-                                existing_blob.do_extend(new_blob);
+                                existing_blob.do_extend(new_blob)?;
                             }
                             _ => {
                                 state.registers[*dest].set_value(default.clone());
@@ -2135,7 +2135,7 @@ pub fn op_array_encode(
 
     // Serialize coerced elements as a native record-format BLOB
     let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len());
-    state.registers[*reg].set_blob(record.into_payload());
+    state.registers[*reg].set_blob(record.into_payload())?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2631,7 +2631,7 @@ pub fn op_array_set_element(
     let mut elements = array_values_from_blob(blob)?;
     if idx >= elements.len() {
         // Out-of-bounds: preserve original array unchanged
-        state.registers[*dest].set_blob(blob.clone());
+        state.registers[*dest].set_blob(blob.clone())?;
     } else {
         elements[idx] = new_val;
         state.registers[*dest].set_value(values_to_record_blob(&elements));
@@ -7637,7 +7637,7 @@ pub fn op_function(
                     _ => 0,
                 };
                 let accum = StatAccum::new(n_col);
-                state.registers[*dest].set_blob(accum.to_bytes());
+                state.registers[*dest].set_blob(accum.to_bytes())?;
             }
             ScalarFunc::StatPush => {
                 // stat_push(accum_blob, i_chng): Push a row into the accumulator
@@ -12504,7 +12504,7 @@ pub fn op_integrity_check(
                 errors.truncate(*max_errors);
                 let message = format_integrity_check_result(errors);
                 match message {
-                    Some(msg) => state.registers[*message_register].set_text(Text::new(msg)),
+                    Some(msg) => state.registers[*message_register].set_text(Text::new(msg))?,
                     None => state.registers[*message_register].set_null(),
                 };
                 state.active_op_state.clear();
@@ -12562,7 +12562,7 @@ pub fn op_integrity_check(
             errors.truncate(*max_errors);
             let message = format_integrity_check_result(errors);
             match message {
-                Some(msg) => state.registers[*message_register].set_text(Text::new(msg)),
+                Some(msg) => state.registers[*message_register].set_text(Text::new(msg))?,
                 None => state.registers[*message_register].set_null(),
             };
             state.active_op_state.clear();

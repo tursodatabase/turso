@@ -4,6 +4,8 @@ use either::Either;
 use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
 use turso_parser::ast::SortOrder;
 
+use crate::alloc::vec;
+use crate::alloc::*;
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
 use crate::index_method::IndexMethodCursor;
@@ -132,12 +134,12 @@ impl<'a> Deref for TextRef<'a> {
 }
 
 pub trait Extendable<T> {
-    fn do_extend(&mut self, other: &T);
+    fn do_extend(&mut self, other: &T) -> Result<()>;
 }
 
 impl<T: AnyText> Extendable<T> for Text {
     #[inline(always)]
-    fn do_extend(&mut self, other: &T) {
+    fn do_extend(&mut self, other: &T) -> Result<()> {
         let other_str = other.as_ref();
         match &mut self.value {
             Cow::Owned(s) => {
@@ -162,12 +164,13 @@ impl<T: AnyText> Extendable<T> for Text {
             }
         }
         self.subtype = other.subtype();
+        Ok(())
     }
 }
 
 impl<T: AnyBlob> Extendable<T> for Vec<u8> {
     #[inline(always)]
-    fn do_extend(&mut self, other: &T) {
+    fn do_extend(&mut self, other: &T) -> Result<()> {
         let other_slice = other.as_slice();
         let needed = other_slice.len();
         if self.capacity() >= needed {
@@ -183,8 +186,11 @@ impl<T: AnyBlob> Extendable<T> for Vec<u8> {
             }
         } else {
             self.clear();
+            // Reserve mores space to extend the slice
+            self.try_reserve(self.len().abs_diff(needed))?;
             self.extend_from_slice(other_slice);
         }
+        Ok(())
     }
 }
 
@@ -3196,6 +3202,7 @@ impl WalFrameInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
 
     #[test]
