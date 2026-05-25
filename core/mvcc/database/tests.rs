@@ -7,7 +7,9 @@ use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
 use crate::mvcc::database::CommitYieldPoint;
 #[cfg(feature = "conn_raw_api")]
-use crate::mvcc::persistent_storage::logical_log::{ParsedOp, StreamingLogicalLogReader};
+use crate::mvcc::persistent_storage::logical_log::reader::StreamingLogicalLogReader;
+#[cfg(feature = "conn_raw_api")]
+use crate::mvcc::persistent_storage::logical_log::ParsedOp;
 use crate::mvcc::persistent_storage::logical_log::{
     ENCRYPTED_PAYLOAD_CHUNK_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,
 };
@@ -1126,7 +1128,11 @@ fn test_recover_logical_log_short_file_ignored() {
     conn.db.io.wait_for_completion(c).unwrap();
     assert_eq!(file.size().unwrap(), 1);
 
-    let recovered = mvcc_store.maybe_recover_logical_log(conn).unwrap();
+    let recovered = run_until_done(
+        || mvcc_store.maybe_recover_logical_log(conn.clone()),
+        &conn.db.io,
+    )
+    .unwrap();
     assert!(!recovered);
 }
 
@@ -11289,8 +11295,28 @@ fn collect_mvcc_recovery_ops(conn: &Arc<Connection>) -> Vec<ParsedOp> {
     reader.read_header(&io).unwrap();
 
     let mut ops = Vec::new();
-    while let Some(frame_ops) = reader.next_frame(&io).unwrap() {
-        ops.extend(frame_ops);
+    loop {
+        let next_iter = loop {
+            match reader.next_frame(&io).unwrap() {
+                IOResult::Done(value) => break value,
+                IOResult::IO(completions) => completions.wait(io.as_ref()).unwrap(),
+            }
+        };
+        let Some(mut frame_iter) = next_iter else {
+            break;
+        };
+        loop {
+            let record = loop {
+                match frame_iter.next_record(&io).unwrap() {
+                    IOResult::Done(record) => break record,
+                    IOResult::IO(completions) => completions.wait(io.as_ref()).unwrap(),
+                }
+            };
+            match record {
+                Some(op) => ops.push(op),
+                None => break,
+            }
+        }
     }
     ops
 }
@@ -11959,6 +11985,40 @@ fn test_encrypted_recovery_checkpoint_then_more_writes() {
     assert_eq!(rows[1][1].to_string(), "b");
     assert_eq!(rows[2][0].as_int().unwrap(), 3);
     assert_eq!(rows[2][1].to_string(), "c");
+}
+
+/// Recovery must replay encrypted LML3 frames whose encrypted body is the transaction extension
+/// block followed by the recovery payload. The extension block is skipped while decrypting chunks,
+/// including when the recovery payload spans multiple encrypted chunks after that skip.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_encrypted_portable_changes_recovery_skips_extension_blocks() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let big = "x".repeat(80 * 1024);
+    {
+        let conn = db.connect();
+        conn.set_portable_logical_changes_enabled(true);
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        // A row larger than the encrypted chunk size forces the recovery payload to span multiple
+        // encrypted chunks after the leading extension block is skipped.
+        conn.execute(format!("INSERT INTO t VALUES (3, '{big}')"))
+            .unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "a");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "b");
+    assert_eq!(rows[2][0].as_int().unwrap(), 3);
+    assert_eq!(rows[2][1].to_string(), big);
 }
 
 /// Write, restart, write more, restart again, verify all data accumulates correctly.
@@ -14292,4 +14352,16 @@ fn test_global_header_regression_would_lose_committed_user_version() {
         42,
         "older out-of-order FinalizeCommit regressed committed PRAGMA user_version"
     );
+}
+
+fn run_until_done<T>(
+    mut action: impl FnMut() -> Result<IOResult<T>>,
+    io: &Arc<dyn crate::IO>,
+) -> Result<T> {
+    loop {
+        match action()? {
+            IOResult::Done(value) => return Ok(value),
+            IOResult::IO(completions) => completions.wait(io.as_ref())?,
+        }
+    }
 }
