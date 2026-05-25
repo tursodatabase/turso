@@ -45,9 +45,25 @@ impl RecordingDurableStorage {
 }
 
 impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableStorage {
+    fn serialize_row_version(
+        &self,
+        log_record: &mut turso_core::mvcc::database::LogRecord,
+        row_version: &turso_core::mvcc::database::RowVersion,
+    ) -> turso_core::Result<()> {
+        self.inner.serialize_row_version(log_record, row_version)
+    }
+
+    fn serialize_database_header(
+        &self,
+        log_record: &mut turso_core::mvcc::database::LogRecord,
+        header: &turso_core::storage::sqlite3_ondisk::DatabaseHeader,
+    ) -> turso_core::Result<()> {
+        self.inner.serialize_database_header(log_record, header)
+    }
+
     fn log_tx(
         &self,
-        m: &turso_core::mvcc::database::LogRecord,
+        m: turso_core::mvcc::database::LogRecord,
         on_serialization_complete: Option<&dyn Fn(&[u8], u32) -> turso_core::Result<()>>,
     ) -> turso_core::Result<(turso_core::Completion, u64)> {
         self.used_log_tx

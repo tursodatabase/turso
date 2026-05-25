@@ -12650,10 +12650,11 @@ fn dropped_attached_commit_rolls_back_remaining_attached_mvcc_txs() {
 fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
     use crate::io::FileSyncType;
     use crate::mvcc;
-    use crate::mvcc::database::LogRecord;
+    use crate::mvcc::database::{LogRecord, RowVersion};
     use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
     use crate::mvcc::persistent_storage::DurableStorage;
     use crate::storage::encryption::EncryptionContext;
+    use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::{CheckpointResult, File, Result, IO};
     use std::time::Duration;
 
@@ -12675,9 +12676,23 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
         }
     }
     impl DurableStorage for BusyOnLogTxStorage {
+        fn serialize_row_version(
+            &self,
+            log_record: &mut LogRecord,
+            row_version: &RowVersion,
+        ) -> Result<()> {
+            self.inner.serialize_row_version(log_record, row_version)
+        }
+        fn serialize_database_header(
+            &self,
+            log_record: &mut LogRecord,
+            header: &DatabaseHeader,
+        ) -> Result<()> {
+            self.inner.serialize_database_header(log_record, header)
+        }
         fn log_tx(
             &self,
-            m: &LogRecord,
+            m: LogRecord,
             c: OnSerializationComplete<'_>,
         ) -> Result<(Completion, u64)> {
             if self.arm_log_tx_busy.swap(false, Ordering::AcqRel) {
