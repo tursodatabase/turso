@@ -1044,7 +1044,10 @@ pub(crate) enum CommitYieldPoint {
     /// `LogRecordPrepared` to bracket the BuildLogRecord chunked yields.
     BuildLogRecordStart,
     LogRecordPrepared,
-    BeforeCommittedTimestampWatermarkUpdate,
+    /// Fires after commit dependencies are released and the commit lock is
+    /// dropped, but before publishing the cached global header / committed
+    /// timestamp watermark.
+    BeforeGlobalHeaderUpdate,
     BeforeFinishCommittedTx,
     /// Boundary right after `remove_tx` runs but before the connection cache
     /// is cleared by the caller at vdbe/mod.rs. Used for failure injection
@@ -2438,24 +2441,25 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 mvcc_store.unlock_commit_lock_if_held(tx_unlocked);
 
-                mvcc_store
-                    .global_header
-                    .write()
-                    .replace(*tx_unlocked.header.read());
+                inject_transition_yield!(self, CommitYieldPoint::BeforeGlobalHeaderUpdate);
 
-                inject_transition_yield!(
-                    self,
-                    CommitYieldPoint::BeforeCommittedTimestampWatermarkUpdate
-                );
-
-                // Since we assign a commit timestamp and then we drive the commit to completion,
-                // it is totally possible for so an older transaction can finish after a newer one.
-                // In such case, we should not let older commit to set lower value than previous.
-                // This value is used in checkpointing as a watermark boundary, and an incorrect
-                // lower value can cause data loss / corruption.
-                mvcc_store
-                    .last_committed_tx_ts
-                    .fetch_max(*end_ts, Ordering::AcqRel);
+                let tx_header = *tx_unlocked.header.read();
+                {
+                    // Hold the header lock across the watermark update and header
+                    // publish so the guard decision and replacement are serialized.
+                    let mut global_header = mvcc_store.global_header.write();
+                    // Since we assign a commit timestamp and then we drive the commit to completion,
+                    // it is totally possible for so an older transaction can finish after a newer one.
+                    // In such case, we should not let older commit to set lower value than previous.
+                    // This value is used in checkpointing as a watermark boundary, and an incorrect
+                    // lower value can cause data loss / corruption.
+                    let last_committed_ts = mvcc_store
+                        .last_committed_tx_ts
+                        .fetch_max(*end_ts, Ordering::AcqRel);
+                    if last_committed_ts <= *end_ts {
+                        global_header.replace(tx_header);
+                    }
+                }
                 if self.did_commit_schema_change {
                     mvcc_store
                         .last_committed_schema_change_ts
