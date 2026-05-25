@@ -5,7 +5,7 @@ pub trait TursoAllocExt {
 }
 
 pub trait TursoTryWithCapacityExt: Sized {
-    fn try_with_capacity(capacity: usize) -> Result<Self, TryReserveError>;
+    fn try_with_capacity_ext(capacity: usize) -> Result<Self, TryReserveError>;
 }
 
 pub trait TursoNewExt<T> {

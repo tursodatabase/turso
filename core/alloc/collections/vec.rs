@@ -45,7 +45,7 @@ impl<T> TursoVecExt<T> for Vec<T> {
 
 impl<T> TursoTryWithCapacityExt for Vec<T> {
     #[inline(always)]
-    fn try_with_capacity(capacity: usize) -> Result<Self, TryReserveError> {
+    fn try_with_capacity_ext(capacity: usize) -> Result<Self, TryReserveError> {
         Ok(vec_with_capacity(capacity))
     }
 }
@@ -84,7 +84,7 @@ impl<T: Clone> TryClone for Vec<T> {
     #[inline(always)]
     fn try_clone(&self) -> Result<Self, Self::Error> {
         #[cfg(not(nightly))]
-        let mut cloned = <Self as TursoTryWithCapacityExt>::try_with_capacity(self.len())?;
+        let mut cloned = <Self as TursoTryWithCapacityExt>::try_with_capacity_ext(self.len())?;
         #[cfg(nightly)]
         let mut cloned = {
             let alloc = self.allocator().clone();
