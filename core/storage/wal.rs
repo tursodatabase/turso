@@ -4069,6 +4069,15 @@ impl Wal for WalFile {
                             local_state.snapshot.max_frame + 1,
                         )
                     } else {
+                        let read_snapshot_is_protected =
+                            !matches!(local_state.read_guard, ReadGuardKind::None);
+                        let wal_content_changed = snapshot.max_frame
+                            != local_state.snapshot.max_frame
+                            || snapshot.last_checksum != local_state.snapshot.last_checksum
+                            || snapshot.transaction_count != local_state.snapshot.transaction_count;
+                        if read_snapshot_is_protected && wal_content_changed {
+                            return Err(LimboError::BusySnapshot);
+                        }
                         // The current generation was restarted/truncated back to
                         // frame 0 or another process changed the durable WAL
                         // state. Re-seed this connection from the authoritative
@@ -4278,6 +4287,7 @@ impl Wal for WalFile {
         for (page, fid, csum) in &page_frame_and_checksum {
             self.complete_append_frame(page.get().id as u64, *fid, *csum);
         }
+        self.has_unpublished_frames.store(true, Ordering::Release);
 
         Ok(c)
     }
@@ -6390,6 +6400,51 @@ pub mod test {
                 ReadGuardKind::ReadMark(NonZeroUsize::new(2).unwrap())
             )
         );
+    }
+
+    #[test]
+    fn test_prepare_frames_rejects_stale_protected_read_snapshot() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool.finalize_with_page_size(4096).unwrap();
+        let file = io
+            .open_file("stale-protected-read.db-wal", OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let wal = WalFile::new(io.clone(), shared.clone(), ((0, 0), 0), buffer_pool);
+        let page_size = PageSize::new(4096).unwrap();
+        if let Some(c) = wal.prepare_wal_start(page_size).unwrap() {
+            wal.io.wait_for_completion(c).unwrap();
+        }
+        let c = wal.prepare_wal_finish(FileSyncType::Fsync).unwrap();
+        wal.io.wait_for_completion(c).unwrap();
+
+        let stale = WalSnapshot {
+            max_frame: 5,
+            nbackfills: 0,
+            last_checksum: (10, 11),
+            checkpoint_seq: 1,
+            transaction_count: 7,
+        };
+        let current = WalSnapshot {
+            max_frame: 8,
+            nbackfills: 0,
+            last_checksum: (20, 21),
+            checkpoint_seq: 1,
+            transaction_count: 8,
+        };
+        set_shared_snapshot(&shared, current);
+        wal.install_connection_state(WalConnectionState::new(
+            stale,
+            ReadGuardKind::ReadMark(NonZeroUsize::new(1).unwrap()),
+        ));
+
+        let page = page_with_pattern(3, 17, &wal.buffer_pool);
+        let err = match wal.prepare_frames(&[page], page_size, Some(10), None) {
+            Ok(_) => panic!("stale read snapshot must not be silently reseeded while writing"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, LimboError::BusySnapshot));
     }
 
     #[test]

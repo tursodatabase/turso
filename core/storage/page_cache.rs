@@ -695,27 +695,52 @@ impl PageCache {
     }
 
     pub fn clear(&mut self, clear_dirty: bool) -> Result<(), CacheError> {
-        // Check all pages are clean
-        for &entry_ptr in self.map.values() {
+        let keys = self
+            .map
+            .iter()
+            .filter_map(|(key, &entry_ptr)| {
+                let entry = unsafe { &*entry_ptr };
+                if !clear_dirty && entry.page.is_dirty() {
+                    None
+                } else {
+                    Some(*key)
+                }
+            })
+            .collect::<Vec<_>>();
+        for key in keys {
+            let Some(&entry_ptr) = self.map.get(&key) else {
+                continue;
+            };
             let entry = unsafe { &*entry_ptr };
-            if entry.page.is_dirty() && !clear_dirty {
-                return Err(CacheError::Dirty {
-                    pgno: entry.page.get().id,
-                });
+            let was_evictable = Self::counted_as_evictable(&entry.page);
+            if clear_dirty {
+                entry.page.clear_dirty();
             }
-        }
-
-        // Clean all pages
-        for &entry_ptr in self.map.values() {
-            let entry = unsafe { &*entry_ptr };
             entry.page.clear_loaded();
             let _ = entry.page.get().buffer.take();
-        }
 
-        self.map.clear();
-        self.queue.clear();
-        self.clock_hand = std::ptr::null_mut();
-        self.evictable_count = 0;
+            self.map.remove(&key);
+
+            if self.clock_hand == entry_ptr {
+                self.advance_clock_hand();
+                if self.clock_hand == entry_ptr {
+                    self.clock_hand = std::ptr::null_mut();
+                }
+            }
+
+            unsafe {
+                let mut cursor = self.queue.cursor_mut_from_ptr(entry_ptr);
+                cursor.remove();
+            }
+
+            if was_evictable {
+                self.evictable_count = self.evictable_count.saturating_sub(1);
+            }
+        }
+        if self.map.is_empty() {
+            self.clock_hand = std::ptr::null_mut();
+            self.evictable_count = 0;
+        }
         Ok(())
     }
 
@@ -1183,6 +1208,24 @@ mod tests {
         assert!(cache.get(&key1).unwrap().is_none());
         assert!(cache.get(&key2).unwrap().is_none());
         assert_eq!(cache.len(), 0);
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_page_cache_clear_without_dirty_preserves_dirty_pages() {
+        let mut cache = PageCache::default();
+        let clean_key = insert_page(&mut cache, 1);
+        let dirty_key = insert_page(&mut cache, 2);
+        let dirty_page = cache.get(&dirty_key).unwrap().unwrap();
+        cache.notify_page_dirty(dirty_key);
+        dirty_page.set_dirty();
+
+        assert!(cache.clear(false).is_ok());
+        assert!(cache.get(&clean_key).unwrap().is_none());
+        let cached_dirty = cache.get(&dirty_key).unwrap().unwrap();
+        assert!(cached_dirty.is_dirty());
+        assert!(cached_dirty.is_loaded());
+        assert_eq!(cache.len(), 1);
         cache.verify_cache_integrity();
     }
 

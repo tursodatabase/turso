@@ -4472,16 +4472,18 @@ impl Pager {
         }
     }
 
-    /// Invalidates entire page cache by removing all dirty and clean pages. Usually used in case
-    /// of a rollback or in case we want to invalidate page cache after starting a read transaction
-    /// right after new writes happened which would invalidate current page cache.
+    /// Invalidates cached pages. Rollback paths pass `clear_dirty=true` to
+    /// discard uncommitted writes; snapshot refresh paths pass `false` and must
+    /// preserve dirty pages owned by an active writer on the shared pager.
     pub fn clear_page_cache(&self, clear_dirty: bool) {
         let dirty_pages = self.dirty_pages.write();
         let mut cache = self.page_cache.write();
-        for page_id in dirty_pages.iter() {
-            let page_key = PageCacheKey::new(page_id as usize);
-            if let Some(page) = cache.get(&page_key).unwrap_or(None) {
-                page.clear_dirty();
+        if clear_dirty {
+            for page_id in dirty_pages.iter() {
+                let page_key = PageCacheKey::new(page_id as usize);
+                if let Some(page) = cache.get(&page_key).unwrap_or(None) {
+                    page.clear_dirty();
+                }
             }
         }
         cache
@@ -5431,13 +5433,17 @@ pub(crate) mod ptrmap {
 
 #[cfg(test)]
 mod tests {
-    use crate::sync::Arc;
+    use crate::sync::{Arc, Mutex};
 
     use crate::sync::RwLock;
+    use arc_swap::ArcSwapOption;
 
+    use crate::io::{MemoryIO, OpenFlags, IO};
+    use crate::storage::buffer_pool::BufferPool;
+    use crate::storage::database::{DatabaseFile, DatabaseStorage};
     use crate::storage::page_cache::{PageCache, PageCacheKey};
 
-    use super::Page;
+    use super::{default_page1, Page, Pager};
 
     #[test]
     fn test_shared_cache() {
@@ -5460,6 +5466,50 @@ mod tests {
         let page_key = PageCacheKey::new(1);
         let page = cache.get(&page_key).unwrap();
         assert_eq!(page.unwrap().get().id, 1);
+    }
+
+    #[test]
+    fn clear_page_cache_without_dirty_clear_preserves_dirty_pages() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(
+            io.open_file("cache-preserve-dirty.db", OpenFlags::Create, true)
+                .unwrap(),
+        ));
+        let pager = Pager::new(
+            db_file,
+            None,
+            io.clone(),
+            PageCache::new(10),
+            BufferPool::begin_init(&io, 65536),
+            Arc::new(Mutex::new(())),
+            Arc::new(ArcSwapOption::new(Some(default_page1(None)))),
+        )
+        .unwrap();
+
+        let clean_page = Arc::new(Page::new(2));
+        clean_page.set_loaded();
+        let dirty_page = Arc::new(Page::new(3));
+        dirty_page.set_loaded();
+        dirty_page.set_dirty();
+        {
+            let mut cache = pager.page_cache.write();
+            cache.insert(PageCacheKey::new(2), clean_page).unwrap();
+            cache
+                .insert(PageCacheKey::new(3), dirty_page.clone())
+                .unwrap();
+            cache.notify_page_dirty(PageCacheKey::new(3));
+        }
+        pager.dirty_pages.write().insert(3);
+
+        pager.clear_page_cache(false);
+
+        let mut cache = pager.page_cache.write();
+        assert!(cache.get(&PageCacheKey::new(2)).unwrap().is_none());
+        let cached_dirty = cache.get(&PageCacheKey::new(3)).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&cached_dirty, &dirty_page));
+        assert!(cached_dirty.is_dirty());
+        assert!(cached_dirty.is_loaded());
+        assert!(pager.dirty_pages.read().contains(3));
     }
 }
 
