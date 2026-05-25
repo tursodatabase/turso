@@ -110,6 +110,41 @@ fn test_savepoint_rollback_after_cache_spill_preserves_wal_pages(
     Ok(())
 }
 
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_non_root_balance_reused_freelist_page_persists_in_wal(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA page_size=512;")?;
+    conn.execute("PRAGMA journal_mode=WAL;")?;
+    conn.execute("PRAGMA cache_size=50;")?;
+    conn.execute("CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB NOT NULL);")?;
+
+    for k in 1..=360 {
+        conn.execute(&format!("INSERT INTO t(k, v) VALUES ({k}, zeroblob(80));"))?;
+    }
+
+    execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
+    conn.execute("DELETE FROM t WHERE k BETWEEN 80 AND 170;")?;
+    execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
+
+    conn.execute("BEGIN;")?;
+    for k in 80..=170 {
+        conn.execute(&format!("INSERT INTO t(k, v) VALUES ({k}, zeroblob(300));"))?;
+    }
+    conn.execute("COMMIT;")?;
+
+    // Use a separate database handle so the check reads the committed WAL
+    // instead of the writer connection's page cache.
+    let verify_db = TempDatabase::new_with_existent(&tmp_db.path);
+    let verify_conn = verify_db.connect_limbo();
+    let res = execute_and_get_strings(&verify_conn, "PRAGMA integrity_check;")?;
+    assert_eq!(res, vec!["ok"]);
+
+    Ok(())
+}
+
 #[test]
 #[ignore = "ignored for now because it's flaky"]
 fn test_wal_1_writer_1_reader() -> Result<()> {

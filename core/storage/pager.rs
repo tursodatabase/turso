@@ -3037,7 +3037,16 @@ impl Pager {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
         let page_key = PageCacheKey::new(page_idx);
-        page_cache.get(&page_key)
+        let page = page_cache.get(&page_key)?;
+        if let Some(page) = &page {
+            turso_assert_eq!(
+                page.get().id,
+                page_idx,
+                "cached page id must match its cache key",
+                { "page_id": page_idx }
+            );
+        }
+        Ok(page)
     }
 
     /// Get a page from cache only if it matches the target frame
@@ -3264,6 +3273,12 @@ impl Pager {
 
             match cache_result {
                 Some(page) => {
+                    turso_assert_eq!(
+                        page.get().id,
+                        page_id,
+                        "cached dirty page id must match its cache key",
+                        { "page_id": page_id }
+                    );
                     trace!(
                         "cacheflush(page={}, page_type={:?})",
                         page_id,
@@ -3783,9 +3798,16 @@ impl Pager {
                         let page = match &commit_info.page_sources[cursor] {
                             PageSource::Cached(page_id) => {
                                 let page_key = PageCacheKey::new(*page_id);
-                                cache
+                                let page = cache
                                     .get(&page_key)?
-                                    .expect("page evicted between scan and prepare")
+                                    .expect("page evicted between scan and prepare");
+                                turso_assert_eq!(
+                                    page.get().id,
+                                    *page_id,
+                                    "cached dirty page id must match its cache key",
+                                    { "page_id": *page_id }
+                                );
+                                page
                             }
                             PageSource::Evicted(page) => page.clone(),
                         };
