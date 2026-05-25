@@ -1041,12 +1041,17 @@ pub fn try_hash_join_access_method(
     {
         return None;
     }
-    // Avoid hash join on self-joins over the same underlying table. The current
-    // implementation assumes distinct build/probe sources; sharing storage can
-    // lead to incorrect matches.
+    // Avoid hash join on self-joins over the same underlying table for INNER /
+    // LEFT joins: a nested-loop with index seek is usually preferred and avoids
+    // double-buffering the table in the hash table. FULL OUTER has no
+    // nested-loop form yet, so it must use hash join even for self-joins.
     let probe_root_page = probe_table.table.btree().expect("table is BTree").root_page;
     let build_root_page = build_table.table.btree().expect("table is BTree").root_page;
-    if build_root_page == probe_root_page {
+    let is_full_outer = probe_table
+        .join_info
+        .as_ref()
+        .is_some_and(|ji| ji.is_full_outer());
+    if build_root_page == probe_root_page && !is_full_outer {
         return None;
     }
     // Explicit INDEXED BY / NOT INDEXED directives must be honored. A hash join
