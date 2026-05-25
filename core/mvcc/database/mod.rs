@@ -376,7 +376,12 @@ impl LogRecord {
 
     /// True iff no ops (row versions or header) have been appended.
     pub fn is_empty(&self) -> bool {
-        self.op_count == 0
+        let empty = self.op_count == 0;
+        turso_assert!(
+            !empty || !self.has_header,
+            "header shouldn't have been written"
+        );
+        empty
     }
 
     /// Test-only constructor that eagerly serializes a list of row versions
