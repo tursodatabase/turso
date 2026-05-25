@@ -6427,7 +6427,7 @@ pub fn op_sorter_open(
         page_size,
         pager.io.clone(),
         temp_store,
-    );
+    )?;
     let cursors = &mut state.cursors;
     cursors
         .get_mut(*cursor_id)
