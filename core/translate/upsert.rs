@@ -258,17 +258,96 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
     });
 }
 
+fn bind_partial_index_where_expr(expr: &mut ast::Expr, table: &Table) {
+    let table_name = normalize_ident(table.get_name());
+
+    let _ = walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            match e {
+                ast::Expr::Id(name) => {
+                    if let Some((column, col)) =
+                        table.get_column_by_name(&normalize_ident(name.as_str()))
+                    {
+                        *e = ast::Expr::Column {
+                            database: None,
+                            table: ast::TableInternalId::SELF_TABLE,
+                            column,
+                            is_rowid_alias: col.is_rowid_alias(),
+                        };
+                    } else if ROWID_STRS
+                        .iter()
+                        .any(|rowid| rowid.eq_ignore_ascii_case(name.as_str()))
+                    {
+                        *e = ast::Expr::RowId {
+                            database: None,
+                            table: ast::TableInternalId::SELF_TABLE,
+                        };
+                    }
+                }
+                ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col)
+                    if normalize_ident(ns.as_str()).eq_ignore_ascii_case(&table_name) =>
+                {
+                    if let Some((column, table_col)) =
+                        table.get_column_by_name(&normalize_ident(col.as_str()))
+                    {
+                        *e = ast::Expr::Column {
+                            database: None,
+                            table: ast::TableInternalId::SELF_TABLE,
+                            column,
+                            is_rowid_alias: table_col.is_rowid_alias(),
+                        };
+                    } else if ROWID_STRS
+                        .iter()
+                        .any(|rowid| rowid.eq_ignore_ascii_case(col.as_str()))
+                    {
+                        *e = ast::Expr::RowId {
+                            database: None,
+                            table: ast::TableInternalId::SELF_TABLE,
+                        };
+                    }
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        },
+    );
+}
+
+fn partial_index_where_clauses_match(
+    target_where: &ast::Expr,
+    index_where: &ast::Expr,
+    table: &Table,
+) -> bool {
+    let mut target_where = target_where.clone();
+    let mut index_where = index_where.clone();
+    // TODO: ideally we would have a binding step where we wouldn't need to do these ad-hoc bindings just to compare exprs
+    bind_partial_index_where_expr(&mut target_where, table);
+    bind_partial_index_where_expr(&mut index_where, table);
+    exprs_are_equivalent(&target_where, &index_where)
+}
+
 /// Match ON CONFLICT target to a UNIQUE index, *ignoring order* but requiring
 /// exact coverage (same column multiset). If the target specifies a COLLATED
 /// column, the collation must match the index column's effective collation.
 /// If the target omits collation, any index collation is accepted.
-/// Partial (WHERE) indexes never match.
+/// Partial indexes require a matching conflict-target WHERE clause.
 pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bool {
     let Some(target) = upsert.index.as_ref() else {
         return true;
     };
-    // must be a non-partial UNIQUE index with identical arity
-    if !index.unique || index.where_clause.is_some() || target.targets.len() != index.columns.len()
+
+    let partial_index_predicate_matches = match (&index.where_clause, &target.where_clause) {
+        (Some(index_where), Some(target_where)) => {
+            partial_index_where_clauses_match(target_where.as_ref(), index_where.as_ref(), table)
+        }
+        (Some(_), None) => false,
+        (None, _) => true,
+    };
+
+    if !index.unique
+        || !partial_index_predicate_matches
+        || target.targets.len() != index.columns.len()
     {
         return false;
     }
