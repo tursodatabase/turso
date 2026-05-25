@@ -6653,7 +6653,7 @@ pub fn op_rowset_add(
 
     let rowset = state.rowsets.entry(*rowset_reg).or_default();
 
-    rowset.insert(rowid);
+    rowset.insert(rowid)?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -6755,7 +6755,7 @@ pub fn op_rowset_test(
         state.pc = pc_if_found.as_offset_int();
     } else {
         if *batch != -1 {
-            rowset.insert(rowid);
+            rowset.insert(rowid)?;
         }
         state.pc += 1;
     }
