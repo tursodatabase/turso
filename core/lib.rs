@@ -2,6 +2,7 @@
     nightly,
     feature(allocator_api, btreemap_alloc, clone_from_ref, try_with_capacity)
 )]
+#![recursion_limit = "256"]
 
 pub mod alloc;
 pub mod busy;
