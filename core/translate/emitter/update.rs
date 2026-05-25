@@ -31,8 +31,7 @@ use crate::{
         },
         fkeys::{
             emit_fk_child_update_counters, emit_fk_parent_deferred_new_key_probes,
-            emit_fk_update_parent_actions, fire_fk_update_actions, stabilize_new_row_for_fk,
-            ForeignKeyActions, ParentKeyNewProbeMode,
+            stabilize_new_row_for_fk, ForeignKeyActions, ParentFkUpdateWork, ParentKeyNewProbeMode,
         },
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
@@ -90,6 +89,80 @@ fn rowid_update_info(
         rowid_alias_index,
         updates_rowid,
     }
+}
+
+fn updated_indexes_reference_virtual_column(
+    indexes_to_update: &[Arc<Index>],
+    columns: &[Column],
+) -> bool {
+    if indexes_to_update.is_empty() {
+        return false;
+    }
+
+    if indexes_to_update.iter().any(|idx| {
+        idx.columns.iter().any(|col| {
+            col.pos_in_table != EXPR_INDEX_SENTINEL
+                && columns[col.pos_in_table].is_virtual_generated()
+        })
+    }) {
+        return true;
+    }
+
+    let has_expression_or_partial_index = indexes_to_update.iter().any(|idx| {
+        idx.where_clause.is_some()
+            || idx
+                .columns
+                .iter()
+                .any(|col| col.pos_in_table == EXPR_INDEX_SENTINEL && col.expr.is_some())
+    });
+    if !has_expression_or_partial_index {
+        return false;
+    }
+
+    let virtual_col_names: HashSet<String> = columns
+        .iter()
+        .filter(|c| c.is_virtual_generated())
+        .filter_map(|c| c.name.as_ref().map(|n| normalize_ident(n)))
+        .collect();
+    let expr_references_virtual = |expr: &ast::Expr| {
+        !collect_column_dependencies_of_expr(expr, columns).is_disjoint(&virtual_col_names)
+    };
+
+    indexes_to_update.iter().any(|idx| {
+        idx.columns.iter().any(|col| {
+            col.pos_in_table == EXPR_INDEX_SENTINEL
+                && col.expr.as_deref().is_some_and(expr_references_virtual)
+        }) || idx
+            .where_clause
+            .as_deref()
+            .is_some_and(expr_references_virtual)
+    })
+}
+
+struct UpdateVirtualColumnNeeds {
+    update_affects_virtual_columns: bool,
+    has_before_triggers: bool,
+    has_after_triggers: bool,
+    has_parent_fk_work: bool,
+    has_returning: bool,
+    indexes_reference_virtual_columns: bool,
+    has_check_constraints: bool,
+}
+
+impl UpdateVirtualColumnNeeds {
+    fn requires_virtual_values(self) -> bool {
+        self.update_affects_virtual_columns
+            || self.has_before_triggers
+            || self.has_after_triggers
+            || self.has_parent_fk_work
+            || self.has_returning
+            || self.has_check_constraints
+            || self.indexes_reference_virtual_columns
+    }
+}
+
+fn update_needs_virtual_column_values(btree: &BTreeTable, needs: UpdateVirtualColumnNeeds) -> bool {
+    btree.has_virtual_columns() && needs.requires_virtual_values()
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -428,9 +501,10 @@ pub fn emit_program_for_update(
     // Emit update instructions
     turso_assert!(
         plan.set_clauses.iter().all(|set_clause| {
-            set_clause.update_from_result.as_ref().is_none_or(|result| {
-                matches!(result.as_ref(), ast::Expr::Column { .. })
-            })
+            set_clause
+                .update_from_result
+                .as_ref()
+                .is_none_or(|result| matches!(result.as_ref(), ast::Expr::Column { .. }))
         }),
         "materialized UPDATE set clauses must stay attached to their original clause and read from scratch-table columns"
     );
@@ -1240,10 +1314,31 @@ fn emit_update_insns<'a>(
     let table_name = target_table.table.get_name();
     let start = if is_virtual_table { beg + 2 } else { beg + 1 };
     let layout = ColumnLayout::from_table(&target_table.as_ref().table);
+    let new_row_ctx = DmlColumnContext::layout(
+        target_table.table.columns(),
+        start,
+        effective_rowid_reg,
+        layout.clone(),
+    );
     let affected_columns = match target_table.table.btree() {
         Some(btree) => btree.columns_affected_by_update(&updated_column_indices)?,
         None => updated_column_indices.clone(),
     };
+    let parent_fk_work = if connection.foreign_keys_enabled()
+        && target_table.table.btree().is_some()
+        && t_ctx.resolver.with_schema(update_database_id, |s| {
+            s.any_resolved_fks_referencing(table_name)
+        }) {
+        ParentFkUpdateWork::prepare(
+            &t_ctx.resolver,
+            table_name,
+            &updated_column_indices,
+            update_database_id,
+        )?
+    } else {
+        ParentFkUpdateWork::default()
+    };
+    let has_parent_fk_work = parent_fk_work.has_any_work();
     let column_ctx = UpdateColumnCtx {
         cdc_update_alter_statement,
         target_table: &target_table,
@@ -1298,10 +1393,6 @@ fn emit_update_insns<'a>(
     // Fire BEFORE UPDATE triggers and preserve OLD row registers for later trigger/FK work.
     let mut has_before_triggers = false;
     let mut has_after_triggers = false;
-    let has_parent_fk_actions = connection.foreign_keys_enabled()
-        && t_ctx.resolver.with_schema(update_database_id, |s| {
-            s.any_resolved_fks_referencing(table_name)
-        });
     let preserved_old_registers: Option<Vec<usize>> =
         if let Some(btree_table) = target_table.table.btree() {
             let relevant_before_update_triggers = get_triggers_including_temp(
@@ -1321,27 +1412,39 @@ fn emit_update_insns<'a>(
             );
 
             has_before_triggers = !relevant_before_update_triggers.is_empty();
-            let needs_old_registers =
-                has_before_triggers || has_after_triggers || has_parent_fk_actions;
+            // Only parent-side action firing (CASCADE/SET NULL/SET DEFAULT) consumes
+            // the materialized OLD row image; the NO ACTION/RESTRICT counter check
+            // reads OLD values directly from the cursor.
+            let needs_old_registers = has_before_triggers
+                || has_after_triggers
+                || parent_fk_work.has_cascade_or_set_actions();
 
             // Only read OLD row values when triggers or parent-side FK work needs them.
             let columns = target_table.table.columns();
             let old_registers: Option<Vec<usize>> = if needs_old_registers {
                 let mut regs = Vec::with_capacity(col_len + 1);
                 for (i, column) in columns.iter().enumerate() {
-                    let reg = program.alloc_register();
-                    emit_table_column(
-                        program,
-                        target_table_cursor_id,
-                        internal_id,
-                        table_references,
-                        column,
-                        i,
-                        reg,
-                        &t_ctx.resolver,
-                    )?;
+                    let reg = if column.is_rowid_alias() {
+                        // Keep INTEGER PRIMARY KEY aliases canonicalized to the
+                        // tracked rowid register for OLD.* consumers.
+                        beg
+                    } else {
+                        let reg = program.alloc_register();
+                        emit_table_column(
+                            program,
+                            target_table_cursor_id,
+                            internal_id,
+                            table_references,
+                            column,
+                            i,
+                            reg,
+                            &t_ctx.resolver,
+                        )?;
+                        reg
+                    };
                     regs.push(reg);
                 }
+                // Trigger/FK OLD.rowid consumers read the last slot.
                 regs.push(beg);
                 Some(regs)
             } else {
@@ -1354,17 +1457,13 @@ fn emit_update_insns<'a>(
                 // NEW row values are already in 'start' registers.
                 // If the rowid is being updated (INTEGER PRIMARY KEY in SET clause),
                 // use the new rowid register; otherwise use the current rowid (beg).
-                let new_rowid_reg = effective_rowid_reg;
-
                 // Compute virtual columns for NEW values
                 //TODO only emit required virtual columns
                 if let Table::BTree(ref btree) = target_table.table {
-                    let new_ctx =
-                        DmlColumnContext::layout(columns, start, new_rowid_reg, layout.clone());
                     compute_virtual_columns(
                         program,
                         &btree.columns_topo_sort()?,
-                        &new_ctx,
+                        &new_row_ctx,
                         &t_ctx.resolver,
                         btree,
                     )?;
@@ -1372,7 +1471,7 @@ fn emit_update_insns<'a>(
 
                 let new_registers = (0..col_len)
                     .map(|i| layout.to_register(start, i))
-                    .chain(std::iter::once(new_rowid_reg))
+                    .chain(std::iter::once(effective_rowid_reg))
                     .collect();
 
                 // Propagate conflict resolution to trigger context:
@@ -1414,14 +1513,22 @@ fn emit_update_insns<'a>(
                     // (since registers might be overwritten during trigger execution)
                     let preserved: Vec<usize> = old_registers
                         .iter()
-                        .map(|old_reg| {
-                            let preserved_reg = program.alloc_register();
-                            program.emit_insn(Insn::Copy {
-                                src_reg: *old_reg,
-                                dst_reg: preserved_reg,
-                                extra_amount: 0,
-                            });
-                            preserved_reg
+                        .enumerate()
+                        .map(|(idx, old_reg)| {
+                            if rowid_alias_index == Some(idx) {
+                                // Keep the alias slot canonicalized to `beg` so
+                                // downstream DmlColumnContext construction stays
+                                // consistent with rowid/alias identity.
+                                *old_reg
+                            } else {
+                                let preserved_reg = program.alloc_register();
+                                program.emit_insn(Insn::Copy {
+                                    src_reg: *old_reg,
+                                    dst_reg: preserved_reg,
+                                    extra_amount: 0,
+                                });
+                                preserved_reg
+                            }
                         })
                         .collect();
                     Some(preserved)
@@ -1480,47 +1587,26 @@ fn emit_update_insns<'a>(
     let update_affects_virtual_columns = affected_columns.count() > updated_column_indices.count();
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
     if let Table::BTree(ref btree) = target_table.table {
-        let has_check_constraints = !btree.check_constraints.is_empty();
-        let cols = btree.columns();
-        let virtual_col_names: HashSet<String> = cols
-            .iter()
-            .filter(|c| c.is_virtual_generated())
-            .filter_map(|c| c.name.as_ref().map(|n| normalize_ident(n)))
-            .collect();
-        let expr_references_virtual = |expr: &ast::Expr| {
-            !virtual_col_names.is_empty()
-                && !collect_column_dependencies_of_expr(expr, cols).is_disjoint(&virtual_col_names)
-        };
-        let index_references_virtual_column = indexes_to_update.iter().any(|idx| {
-            idx.columns.iter().any(|col| {
-                if col.pos_in_table != EXPR_INDEX_SENTINEL {
-                    cols[col.pos_in_table].is_virtual_generated()
-                } else {
-                    col.expr.as_deref().is_some_and(expr_references_virtual)
-                }
-            }) || idx
-                .where_clause
-                .as_deref()
-                .is_some_and(expr_references_virtual)
-        });
-
-        if update_affects_virtual_columns
-            || has_before_triggers
-            || has_after_triggers
-            || has_parent_fk_actions
-            || has_returning
-            || has_check_constraints
-            || index_references_virtual_column
-        {
-            let columns = target_table.table.columns();
-
+        if update_needs_virtual_column_values(
+            btree,
+            UpdateVirtualColumnNeeds {
+                update_affects_virtual_columns,
+                has_before_triggers,
+                has_after_triggers,
+                has_parent_fk_work,
+                has_returning,
+                indexes_reference_virtual_columns: updated_indexes_reference_virtual_column(
+                    indexes_to_update,
+                    btree.columns(),
+                ),
+                has_check_constraints: !btree.check_constraints.is_empty(),
+            },
+        ) {
             //TODO don't emit all virtual columns
-            let dml_ctx =
-                DmlColumnContext::layout(columns, start, effective_rowid_reg, layout.clone());
             compute_virtual_columns(
                 program,
                 &btree.columns_topo_sort()?,
-                &dml_ctx,
+                &new_row_ctx,
                 &t_ctx.resolver,
                 btree,
             )?;
@@ -1552,34 +1638,29 @@ fn emit_update_insns<'a>(
             // Parent-side NO ACTION/RESTRICT checks must happen BEFORE the update.
             // This checks that no child rows reference the old parent key values.
             // CASCADE/SET NULL actions are fired AFTER the update (see below after Insert).
-            if t_ctx.resolver.with_schema(update_database_id, |s| {
-                s.any_resolved_fks_referencing(table_name)
-            }) {
-                let new_key_probe_mode = if any_effective_replace(
-                    program.flags.has_statement_conflict(),
-                    or_conflict,
-                    table_btree.rowid_alias_conflict_clause,
-                    indexes_to_update.iter().map(|idx| idx.on_conflict),
-                ) {
-                    ParentKeyNewProbeMode::AfterReplace
-                } else {
-                    ParentKeyNewProbeMode::BeforeWrite
-                };
-                deferred_new_key_plans = emit_fk_update_parent_actions(
-                    program,
-                    &table_btree,
-                    indexes_to_update.iter(),
-                    target_table_cursor_id,
-                    beg,
-                    start,
-                    rowid_new_reg,
-                    rowid_set_clause_reg,
-                    &updated_set_columns,
-                    new_key_probe_mode,
-                    update_database_id,
-                    &t_ctx.resolver,
-                )?;
-            }
+            let new_key_probe_mode = if any_effective_replace(
+                program.flags.has_statement_conflict(),
+                or_conflict,
+                table_btree.rowid_alias_conflict_clause,
+                indexes_to_update.iter().map(|idx| idx.on_conflict),
+            ) {
+                ParentKeyNewProbeMode::AfterReplace
+            } else {
+                ParentKeyNewProbeMode::BeforeWrite
+            };
+            deferred_new_key_plans = parent_fk_work.emit_counter_checks(
+                program,
+                &table_btree,
+                indexes_to_update.iter(),
+                target_table_cursor_id,
+                beg,
+                start,
+                rowid_new_reg,
+                rowid_set_clause_reg,
+                new_key_probe_mode,
+                update_database_id,
+                &t_ctx.resolver,
+            )?;
         }
     }
 
@@ -1853,7 +1934,7 @@ fn emit_update_insns<'a>(
             )?;
 
             // Evaluate the partial index predicate against the NEW row image.
-            // We use emit_dml_expr_index_value which properly sets up SelfTableContext::ForDML,
+            // We use emit_dml_expr_index_value which sets up a DML self-table context,
             // allowing resolve_union_from_column to find type definitions for custom type
             // functions like union_tag() in the WHERE clause.
             let new_where_expr = index
@@ -1882,6 +1963,7 @@ fn emit_update_insns<'a>(
                 new_where_expr,
                 columns,
                 &mut column_regs,
+                effective_rowid_reg,
                 &bt,
                 new_satisfied_reg,
             )?;
@@ -2313,22 +2395,17 @@ fn emit_update_insns<'a>(
 
             // Fire FK CASCADE/SET NULL/SET DEFAULT actions after the parent row is updated.
             // This ensures the new parent key exists when cascade actions update child rows.
-            if connection.foreign_keys_enabled()
-                && t_ctx.resolver.with_schema(update_database_id, |s| {
-                    s.any_resolved_fks_referencing(table_name)
-                })
-            {
+            // NO ACTION/RESTRICT are handled by the pre-UPDATE counter check above.
+            if parent_fk_work.has_cascade_or_set_actions() {
                 let old_regs = preserved_old_registers
                     .as_ref()
                     .expect("FK check requires OLD values");
                 let columns = target_table.table.columns();
                 let old_row_ctx = DmlColumnContext::from_column_reg_mapping(
                     columns.iter().zip(old_regs.iter().copied()),
-                    Some(beg),
+                    beg,
                 );
-                let new_row_ctx =
-                    DmlColumnContext::layout(columns, start, effective_rowid_reg, layout.clone());
-                fire_fk_update_actions(
+                parent_fk_work.fire(
                     program,
                     &mut t_ctx.resolver,
                     table_name,
@@ -2352,32 +2429,17 @@ fn emit_update_insns<'a>(
                 if !relevant_triggers.is_empty() {
                     let columns = target_table.table.columns();
 
-                    // Compute VIRTUAL columns for NEW values
-                    //TODO only emit required virtual columns
                     let bt = target_table.table.btree().ok_or_else(|| {
                         crate::LimboError::InternalError(
                             "UPDATE on virtual table has no btree".into(),
                         )
                     })?;
-                    let new_ctx = DmlColumnContext::layout(
-                        columns,
-                        start,
-                        effective_rowid_reg,
-                        layout.clone(),
-                    );
-                    compute_virtual_columns(
-                        program,
-                        &btree_table.columns_topo_sort()?,
-                        &new_ctx,
-                        &t_ctx.resolver,
-                        &bt,
-                    )?;
 
                     // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
                     if let Some(ref old_regs) = preserved_old_registers {
                         let pairs = columns.iter().zip(old_regs.iter().copied());
                         //TODO only emit required virtual columns
-                        let old_ctx = DmlColumnContext::from_column_reg_mapping(pairs, Some(beg));
+                        let old_ctx = DmlColumnContext::from_column_reg_mapping(pairs, beg);
                         compute_virtual_columns(
                             program,
                             &btree_table.columns_topo_sort()?,

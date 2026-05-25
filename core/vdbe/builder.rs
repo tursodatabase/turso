@@ -135,7 +135,7 @@ enum DmlColumnRegisters {
 pub struct DmlColumnContext {
     registers: DmlColumnRegisters,
     rowid_alias_col: Option<usize>,
-    rowid_reg: Option<usize>,
+    rowid_reg: usize,
 }
 
 impl DmlColumnContext {
@@ -150,13 +150,18 @@ impl DmlColumnContext {
         Self {
             registers: DmlColumnRegisters::Layout { base_reg, layout },
             rowid_alias_col,
-            rowid_reg: Some(rowid_reg),
+            rowid_reg,
         }
     }
 
+    /// Build a DML column context from an explicit per-column register mapping.
+    ///
+    /// If the table has an INTEGER PRIMARY KEY alias column, that slot is
+    /// canonicalized to `rowid_reg` regardless of the register provided in
+    /// `pairs`, so alias and rowid access agree.
     pub fn from_column_reg_mapping<'a>(
         pairs: impl Iterator<Item = (&'a Column, usize)>,
-        rowid_reg: Option<usize>,
+        rowid_reg: usize,
     ) -> Self {
         let mut rowid_alias_col = None;
         let mut column_regs = Vec::new();
@@ -166,7 +171,10 @@ impl DmlColumnContext {
                 rowid_alias_col = Some(idx);
             }
         }
-        if let (Some(alias_idx), Some(rowid_reg)) = (rowid_alias_col, rowid_reg) {
+        // Canonicalize rowid aliases to the explicit rowid register so both
+        // `to_column_reg(alias_idx)` and `rowid_reg()` observe the same source.
+        // This matches the Layout variant and SQLite's rowid-alias semantics.
+        if let Some(alias_idx) = rowid_alias_col {
             column_regs[alias_idx] = rowid_reg;
         }
         Self {
@@ -181,7 +189,6 @@ impl DmlColumnContext {
             DmlColumnRegisters::Layout { base_reg, layout } => {
                 if self.rowid_alias_col == Some(col_idx) {
                     self.rowid_reg
-                        .expect("layout row images must carry an explicit rowid register")
                 } else {
                     layout.to_register(*base_reg, col_idx)
                 }
@@ -190,14 +197,8 @@ impl DmlColumnContext {
         }
     }
 
-    pub fn rowid_reg(&self) -> Option<usize> {
-        if let Some(rowid_reg) = self.rowid_reg {
-            return Some(rowid_reg);
-        }
-        let DmlColumnRegisters::Indexed { column_regs } = &self.registers else {
-            return None;
-        };
-        self.rowid_alias_col.map(|idx| column_regs[idx])
+    pub fn rowid_reg(&self) -> usize {
+        self.rowid_reg
     }
 }
 

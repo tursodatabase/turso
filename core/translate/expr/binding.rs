@@ -701,13 +701,9 @@ pub(super) fn extract_string_literal(expr: &ast::Expr) -> crate::Result<String> 
     }
 }
 
-/// Resolve the UnionDef for a column expression. Returns the variant names list
-/// and optionally resolves a tag name to its numeric index.
-/// Used by union_value, union_tag, union_extract function translation.
-///
 /// In the DML index-maintenance path (INSERT with expression indexes),
 /// `referenced_tables` is `None` and columns use `SELF_TABLE`. We fall back
-/// to the Resolver's `SelfTableContext::ForDML` to obtain column metadata.
+/// to the Resolver's self-table context to obtain column metadata.
 /// Resolve the TypeDef for a column expression (Column or DML self-table column).
 pub(super) fn resolve_typedef_from_column(
     expr: &ast::Expr,

@@ -322,8 +322,8 @@ pub(super) fn find_custom_type_operator(
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
 ///
 /// Shared logic: decode custom-type column registers into temps (so the
-/// expression sees user-facing values), build a `SelfTableContext::ForDML`,
-/// and translate the expression.
+/// expression sees user-facing values), build a DML self-table context, and
+/// translate the expression.
 ///
 /// The caller must:
 /// 1. Clone the expression from `idx_col.expr`
@@ -337,6 +337,7 @@ pub(crate) fn emit_dml_expr_index_value(
     mut expr: ast::Expr,
     columns: &[Column],
     column_regs: &mut [usize],
+    rowid_reg: usize,
     table: &Arc<BTreeTable>,
     dest_reg: usize,
 ) -> Result<()> {
@@ -359,7 +360,7 @@ pub(crate) fn emit_dml_expr_index_value(
 
     let pairs = columns.iter().zip(column_regs.iter().copied());
     let ctx = SelfTableContext::ForDML {
-        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs, None),
+        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs, rowid_reg),
         table: Arc::clone(table),
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {

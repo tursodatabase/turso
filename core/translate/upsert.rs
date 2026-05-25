@@ -11,8 +11,7 @@ use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
-    emit_fk_child_update_counters, emit_fk_update_parent_actions, fire_fk_update_actions,
-    ParentKeyNewProbeMode,
+    emit_fk_child_update_counters, ParentFkUpdateWork, ParentKeyNewProbeMode,
 };
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
 use crate::translate::plan::ColumnMask;
@@ -162,7 +161,7 @@ pub fn upsert_matches_rowid_alias(upsert: &Upsert, table: &Table) -> bool {
     }
 }
 
-/// Returns array of chaned column indicies and whether rowid was changed.
+/// Returns array of changed column indices and whether rowid was changed.
 fn collect_changed_cols(
     table: &Table,
     set_pairs: &[(usize, Box<ast::Expr>)],
@@ -686,11 +685,25 @@ pub fn emit_upsert(
 
     // Fire BEFORE UPDATE triggers
     let upsert_database_id = ctx.database_id;
+    let updated_column_indices: ColumnMask = set_pairs
+        .iter()
+        .map(|(col_idx, _)| *col_idx)
+        .try_collect()?;
+    let parent_fk_work = if connection.foreign_keys_enabled()
+        && table.btree().is_some()
+        && resolver.with_schema(upsert_database_id, |s| {
+            s.any_resolved_fks_referencing(table.get_name())
+        }) {
+        ParentFkUpdateWork::prepare(
+            resolver,
+            table.get_name(),
+            &updated_column_indices,
+            upsert_database_id,
+        )?
+    } else {
+        ParentFkUpdateWork::default()
+    };
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table.btree() {
-        let updated_column_indices: ColumnMask = set_pairs
-            .iter()
-            .map(|(col_idx, _)| *col_idx)
-            .try_collect()?;
         let relevant_before_update_triggers = get_triggers_including_temp(
             resolver,
             upsert_database_id,
@@ -801,10 +814,6 @@ pub fn emit_upsert(
     } else {
         None
     };
-    let updated_positions: ColumnMask = set_pairs
-        .iter()
-        .map(|(col_idx, _)| *col_idx)
-        .try_collect()?;
     if let Some(bt) = table.btree() {
         if connection.foreign_keys_enabled() {
             let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
@@ -835,7 +844,7 @@ pub fn emit_upsert(
                         .transpose()
                 })
                 .collect::<crate::Result<_>>()?;
-            let _ = emit_fk_update_parent_actions(
+            let deferred_new_key_plans = parent_fk_work.emit_counter_checks(
                 program,
                 &bt,
                 affected_upsert_indices.into_iter(),
@@ -844,11 +853,14 @@ pub fn emit_upsert(
                 new_start,
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
                 rowid_set_clause_reg,
-                &updated_positions,
                 ParentKeyNewProbeMode::BeforeWrite,
                 upsert_database_id,
                 resolver,
             )?;
+            debug_assert!(
+                deferred_new_key_plans.is_empty(),
+                "BeforeWrite mode must not produce deferred parent FK NEW-key probes"
+            );
         }
     }
 
@@ -1128,33 +1140,28 @@ pub fn emit_upsert(
         });
     }
 
-    // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) for parent-side updates.
-    // This must be done after the update is complete but before AFTER triggers.
-    if let Some(bt) = table.btree() {
-        if connection.foreign_keys_enabled()
-            && resolver.with_schema(upsert_database_id, |s| {
-                s.any_resolved_fks_referencing(bt.name.as_str())
-            })
-        {
-            let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
-            let old_row_ctx = DmlColumnContext::layout(
-                table.columns(),
-                current_start,
-                ctx.conflict_rowid_reg,
-                layout.clone(),
-            );
-            let new_row_ctx =
-                DmlColumnContext::layout(table.columns(), new_start, new_rowid, layout.clone());
-            fire_fk_update_actions(
-                program,
-                resolver,
-                bt.name.as_str(),
-                &old_row_ctx,
-                &new_row_ctx,
-                connection,
-                upsert_database_id,
-            )?;
-        }
+    // Fire FK CASCADE/SET NULL/SET DEFAULT actions after the parent row is
+    // updated and before AFTER triggers. NO ACTION/RESTRICT are handled by the
+    // pre-UPDATE counter check.
+    if parent_fk_work.has_cascade_or_set_actions() {
+        let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+        let old_row_ctx = DmlColumnContext::layout(
+            table.columns(),
+            current_start,
+            ctx.conflict_rowid_reg,
+            layout.clone(),
+        );
+        let new_row_ctx =
+            DmlColumnContext::layout(table.columns(), new_start, new_rowid, layout.clone());
+        parent_fk_work.fire(
+            program,
+            resolver,
+            table.get_name(),
+            &old_row_ctx,
+            &new_row_ctx,
+            connection,
+            upsert_database_id,
+        )?;
     }
 
     // emit CDC instructions
@@ -1406,6 +1413,7 @@ fn eval_partial_pred_for_row_image(
         expr,
         columns,
         &mut column_regs,
+        rowid_reg,
         &bt,
         r,
     )
@@ -1446,6 +1454,7 @@ fn emit_upsert_expr_index_value(
         expr,
         columns,
         &mut column_regs,
+        rowid_reg,
         &bt,
         dest_reg,
     )?;

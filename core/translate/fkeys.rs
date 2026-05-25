@@ -115,7 +115,7 @@ fn emit_parent_key_change_probes(
             lhs: old_key_start + i,
             rhs: new_key_start + i,
             target_pc: next,
-            flags: CmpInsFlags::default(),
+            flags: CmpInsFlags::default().null_eq(),
             collation: None,
         });
         program.emit_insn(Insn::Goto { target_pc: changed });
@@ -169,53 +169,27 @@ pub fn open_read_table(program: &mut ProgramBuilder, tbl: &Arc<BTreeTable>, db: 
     tcur
 }
 
-/// Copy `len` registers starting at `src_start` to a fresh block and apply index affinities.
-/// Returns the destination start register.
+/// Copy `len` registers into a fresh contiguous block and apply index affinities.
+/// `src_for(i)` resolves the source register for slot `i` — use this when the
+/// source registers are not adjacent (e.g., a rowid alias lives outside the
+/// row-image block).
 #[inline]
 fn copy_with_affinity(
     program: &mut ProgramBuilder,
-    src_start: usize,
     len: usize,
+    src_for: impl Fn(usize) -> usize,
     idx: &Index,
     aff_from_tbl: &BTreeTable,
 ) -> usize {
     let dst = program.alloc_registers(len);
     for i in 0..len {
         program.emit_insn(Insn::Copy {
-            src_reg: src_start + i,
+            src_reg: src_for(i),
             dst_reg: dst + i,
             extra_amount: 0,
         });
     }
     if let Some(count) = NonZeroUsize::new(len) {
-        program.emit_insn(Insn::Affinity {
-            start_reg: dst,
-            count,
-            affinities: build_index_affinity_string(idx, aff_from_tbl),
-        });
-    }
-    dst
-}
-
-/// Build an unpacked key for opcodes that require adjacent registers; rowid aliases
-/// may resolve outside the compact column block.
-#[inline]
-fn copy_context_columns_with_affinity(
-    program: &mut ProgramBuilder,
-    dml_ctx: &DmlColumnContext,
-    column_positions: &[usize],
-    idx: &Index,
-    aff_from_tbl: &BTreeTable,
-) -> usize {
-    let dst = program.alloc_registers(column_positions.len());
-    for (i, pos) in column_positions.iter().enumerate() {
-        program.emit_insn(Insn::Copy {
-            src_reg: dml_ctx.to_column_reg(*pos),
-            dst_reg: dst + i,
-            extra_amount: 0,
-        });
-    }
-    if let Some(count) = NonZeroUsize::new(column_positions.len()) {
         program.emit_insn(Insn::Affinity {
             start_reg: dst,
             count,
@@ -280,6 +254,14 @@ where
 {
     let ccur = open_read_table(program, child_tbl, database_id);
     let done = program.allocate_label();
+    // SQLite's parent-key probes use `=` semantics. If any parent-key
+    // component is NULL, the predicate is UNKNOWN for all child rows.
+    for i in 0..child_cols.len() {
+        program.emit_insn(Insn::IsNull {
+            reg: parent_key_start + i,
+            target_pc: done,
+        });
+    }
     program.emit_insn(Insn::Rewind {
         cursor_id: ccur,
         pc_if_empty: done,
@@ -311,7 +293,7 @@ where
             lhs: tmp,
             rhs: parent_key_start + i,
             target_pc: cont,
-            flags: CmpInsFlags::default().jump_if_null(),
+            flags: CmpInsFlags::default(),
             collation: Some(CollationSeq::Binary),
         });
         program.emit_insn(Insn::Goto {
@@ -677,6 +659,16 @@ fn emit_fk_parent_key_probe(
         Ok(())
     };
 
+    // Match SQLite fkScanChildren `=` semantics: if any parent-key component
+    // is NULL, no child row can match this parent key.
+    let skip_probe = program.allocate_label();
+    for i in 0..n_cols {
+        program.emit_insn(Insn::IsNull {
+            reg: parent_key_start + i,
+            target_pc: skip_probe,
+        });
+    }
+
     // Prefer exact child index on (child_cols...)
     let indices: Vec<_> = resolver.with_schema(database_id, |s| {
         s.get_indices(&child_tbl.name).cloned().collect()
@@ -692,7 +684,7 @@ fn emit_fk_parent_key_probe(
 
     if let Some(ix) = idx {
         let icur = open_read_index(program, ix, database_id);
-        let probe = copy_with_affinity(program, parent_key_start, n_cols, ix, child_tbl);
+        let probe = copy_with_affinity(program, n_cols, |i| parent_key_start + i, ix, child_tbl);
 
         // FOUND => on_match; NOT FOUND => no-op
         index_probe(program, icur, probe, n_cols, on_match, |_p| Ok(()))?;
@@ -708,6 +700,8 @@ fn emit_fk_parent_key_probe(
             on_match,
         )?;
     }
+
+    program.preassign_label_to_next_insn(skip_probe);
 
     Ok(())
 }
@@ -897,10 +891,10 @@ pub fn emit_fk_child_update_counters(
                         .expect("parent unique index required");
                     let icur = open_read_index(program, idx, database_id);
 
-                    let probe = copy_context_columns_with_affinity(
+                    let probe = copy_with_affinity(
                         program,
-                        &dml_ctx,
-                        &fk_col_positions,
+                        fk_col_positions.len(),
+                        |i| dml_ctx.to_column_reg(fk_col_positions[i]),
                         idx,
                         &parent_tbl,
                     );
@@ -1071,6 +1065,16 @@ fn emit_fk_delete_parent_existence_check_single(
         resolver,
     )?;
 
+    // Match SQLite fkScanChildren `=` semantics: parent keys containing NULL
+    // never match child rows.
+    let skip_check = program.allocate_label();
+    for i in 0..ncols {
+        program.emit_insn(Insn::IsNull {
+            reg: parent_key_start + i,
+            target_pc: skip_check,
+        });
+    }
+
     let child_cols = &fk_ref.fk.child_columns;
     let child_idx = if !is_self_ref {
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -1100,7 +1104,13 @@ fn emit_fk_delete_parent_existence_check_single(
 
     if let Some(ref idx) = child_idx {
         let icur = open_read_index(program, idx, database_id);
-        let probe = copy_with_affinity(program, parent_key_start, ncols, idx, &fk_ref.child_table);
+        let probe = copy_with_affinity(
+            program,
+            ncols,
+            |i| parent_key_start + i,
+            idx,
+            &fk_ref.child_table,
+        );
         index_probe(
             program,
             icur,
@@ -1130,92 +1140,8 @@ fn emit_fk_delete_parent_existence_check_single(
             },
         )?;
     }
+    program.preassign_label_to_next_insn(skip_check);
     Ok(())
-}
-
-/// Parent-side FK counter checks for UPDATE.
-///
-/// CASCADE/SET NULL/SET DEFAULT actions are handled later by
-/// `fire_fk_update_actions`; this function only emits counter-based checks
-/// for NO ACTION / RESTRICT foreign keys.
-///
-/// Returns deferred NEW-key probes when `new_key_probe_mode` is `AfterReplace`,
-/// so the caller can run them only after the REPLACE write has established the
-/// final parent row at the NEW key.
-#[allow(clippy::too_many_arguments)]
-pub fn emit_fk_update_parent_actions(
-    program: &mut ProgramBuilder,
-    table_btree: &BTreeTable,
-    indexes_to_update: impl Iterator<Item = impl AsRef<Index>>,
-    cursor_id: usize,
-    old_rowid_reg: usize,
-    start: usize,
-    rowid_new_reg: usize,
-    rowid_set_clause_reg: Option<usize>,
-    updated_positions: &ColumnMask,
-    new_key_probe_mode: ParentKeyNewProbeMode,
-    database_id: usize,
-    resolver: &Resolver,
-) -> Result<Vec<DeferredNewKeyProbePlan>> {
-    let mut deferred_new_key_plans = Vec::new();
-    let mut check_fks: Vec<_> = Vec::new();
-    let referencing = resolver.with_schema(database_id, |s| {
-        s.resolved_fks_referencing(&table_btree.name)
-    })?;
-    for fk in referencing {
-        if !fk.parent_key_may_change(updated_positions, table_btree)? {
-            continue;
-        }
-        if !matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict) {
-            continue;
-        }
-        check_fks.push(fk);
-    }
-    if check_fks.is_empty() {
-        return Ok(deferred_new_key_plans);
-    }
-
-    let primary_key_is_rowid_alias = table_btree.get_rowid_alias_column().is_some();
-    if primary_key_is_rowid_alias || table_btree.primary_key_columns.is_empty() {
-        let rowid_fks: Vec<_> = check_fks
-            .iter()
-            .filter(|fk| fk.parent_uses_rowid)
-            .cloned()
-            .collect();
-        if !rowid_fks.is_empty() {
-            if let Some(plan) = emit_rowid_pk_change_check(
-                program,
-                &rowid_fks,
-                old_rowid_reg,
-                rowid_set_clause_reg.unwrap_or(old_rowid_reg),
-                new_key_probe_mode,
-                database_id,
-                resolver,
-            )? {
-                deferred_new_key_plans.push(plan);
-            }
-        }
-    }
-
-    for index in indexes_to_update {
-        if let Some(plan) = emit_parent_index_key_change_checks(
-            program,
-            cursor_id,
-            start,
-            old_rowid_reg,
-            rowid_new_reg,
-            &check_fks,
-            table_btree,
-            index.as_ref(),
-            new_key_probe_mode,
-            database_id,
-            resolver,
-        )? {
-            deferred_new_key_plans.push(plan);
-        }
-    }
-
-    Ok(deferred_new_key_plans)
 }
 
 /// Context for FK action execution: holds register info for OLD/NEW parent key values
@@ -1305,9 +1231,7 @@ fn copy_key_from_context(
 ) -> Result<()> {
     for (i, pcol) in parent_cols.iter().enumerate() {
         let src = if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) {
-            dml_ctx
-                .rowid_reg()
-                .ok_or_else(|| LimboError::InternalError("FK row image missing rowid".into()))?
+            dml_ctx.rowid_reg()
         } else {
             let (pos, _) = parent_bt
                 .get_column(pcol)
@@ -1343,7 +1267,7 @@ fn emit_key_change_check(
             lhs: old_key_start + i,
             rhs: new_key_start + i,
             target_pc: next.unwrap_or(skip_label),
-            flags: CmpInsFlags::default(),
+            flags: CmpInsFlags::default().null_eq(),
             collation: None,
         });
         program.emit_insn(Insn::Goto {
@@ -1702,6 +1626,197 @@ pub struct PreparedFkDeleteAction {
     ctx: FkActionContext,
 }
 
+#[derive(Default)]
+pub struct ParentFkUpdateWork {
+    action_fks: Vec<ResolvedFkRef>,
+    counter_check_fks: Vec<ResolvedFkRef>,
+}
+
+impl ParentFkUpdateWork {
+    pub fn prepare(
+        resolver: &Resolver,
+        parent_table_name: &str,
+        updated_parent_positions: &ColumnMask,
+        database_id: usize,
+    ) -> Result<Self> {
+        let parent_bt = resolver
+            .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
+            .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
+
+        let mut actions = Vec::new();
+        let mut counter_check_fks = Vec::new();
+        for fk_ref in resolver.with_schema(database_id, |s| {
+            s.resolved_fks_referencing(parent_table_name)
+        })? {
+            if !fk_ref.parent_key_may_change(updated_parent_positions, &parent_bt)? {
+                continue;
+            }
+            match fk_ref.fk.on_update {
+                RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault => {
+                    actions.push(fk_ref);
+                }
+                RefAct::NoAction | RefAct::Restrict => {
+                    counter_check_fks.push(fk_ref);
+                }
+            }
+        }
+        Ok(Self {
+            action_fks: actions,
+            counter_check_fks,
+        })
+    }
+
+    pub fn has_any_work(&self) -> bool {
+        !self.action_fks.is_empty() || !self.counter_check_fks.is_empty()
+    }
+
+    pub fn has_cascade_or_set_actions(&self) -> bool {
+        !self.action_fks.is_empty()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_counter_checks(
+        &self,
+        program: &mut ProgramBuilder,
+        table_btree: &BTreeTable,
+        indexes_to_update: impl Iterator<Item = impl AsRef<Index>>,
+        cursor_id: usize,
+        old_rowid_reg: usize,
+        start: usize,
+        rowid_new_reg: usize,
+        rowid_set_clause_reg: Option<usize>,
+        new_key_probe_mode: ParentKeyNewProbeMode,
+        database_id: usize,
+        resolver: &Resolver,
+    ) -> Result<Vec<DeferredNewKeyProbePlan>> {
+        let mut deferred_new_key_plans = Vec::new();
+        if self.counter_check_fks.is_empty() {
+            return Ok(deferred_new_key_plans);
+        }
+
+        let primary_key_is_rowid_alias = table_btree.get_rowid_alias_column().is_some();
+        if primary_key_is_rowid_alias || table_btree.primary_key_columns.is_empty() {
+            let rowid_fks: Vec<_> = self
+                .counter_check_fks
+                .iter()
+                .filter(|fk| fk.parent_uses_rowid)
+                .cloned()
+                .collect();
+            if !rowid_fks.is_empty() {
+                if let Some(plan) = emit_rowid_pk_change_check(
+                    program,
+                    &rowid_fks,
+                    old_rowid_reg,
+                    rowid_set_clause_reg.unwrap_or(old_rowid_reg),
+                    new_key_probe_mode,
+                    database_id,
+                    resolver,
+                )? {
+                    deferred_new_key_plans.push(plan);
+                }
+            }
+        }
+
+        for index in indexes_to_update {
+            if let Some(plan) = emit_parent_index_key_change_checks(
+                program,
+                cursor_id,
+                start,
+                old_rowid_reg,
+                rowid_new_reg,
+                &self.counter_check_fks,
+                table_btree,
+                index.as_ref(),
+                new_key_probe_mode,
+                database_id,
+                resolver,
+            )? {
+                deferred_new_key_plans.push(plan);
+            }
+        }
+
+        Ok(deferred_new_key_plans)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fire(
+        &self,
+        program: &mut ProgramBuilder,
+        resolver: &mut Resolver,
+        parent_table_name: &str,
+        old_row_ctx: &DmlColumnContext,
+        new_row_ctx: &DmlColumnContext,
+        connection: &Arc<Connection>,
+        database_id: usize,
+    ) -> Result<()> {
+        if self.action_fks.is_empty() {
+            return Ok(());
+        }
+
+        let parent_bt = resolver
+            .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
+            .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
+
+        for fk_ref in &self.action_fks {
+            let parent_cols: &[String] = &fk_ref.parent_cols;
+            let ncols = parent_cols.len();
+
+            let old_key_start = program.alloc_registers(ncols);
+            copy_key_from_context(program, &parent_bt, parent_cols, old_row_ctx, old_key_start)?;
+
+            let new_key_start = program.alloc_registers(ncols);
+            copy_key_from_context(program, &parent_bt, parent_cols, new_row_ctx, new_key_start)?;
+
+            decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, old_key_start)?;
+            decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, new_key_start)?;
+
+            let old_key_registers: Vec<usize> = (old_key_start..old_key_start + ncols).collect();
+            let new_key_registers: Vec<usize> = (new_key_start..new_key_start + ncols).collect();
+
+            let skip_action = program.allocate_label();
+            let key_changed = program.allocate_label();
+            emit_key_change_check(
+                program,
+                old_key_start,
+                new_key_start,
+                ncols,
+                skip_action,
+                key_changed,
+            );
+
+            program.preassign_label_to_next_insn(key_changed);
+
+            let ctx = FkActionContext::new_for_update(old_key_registers, new_key_registers);
+
+            match fk_ref.fk.on_update {
+                RefAct::Cascade => {
+                    fire_fk_cascade_update(
+                        program,
+                        resolver,
+                        fk_ref,
+                        connection,
+                        &ctx,
+                        database_id,
+                    )?;
+                }
+                RefAct::SetNull => {
+                    fire_fk_set_null(program, resolver, fk_ref, connection, &ctx, database_id)?;
+                }
+                RefAct::SetDefault => {
+                    fire_fk_set_default(program, resolver, fk_ref, connection, &ctx, database_id)?;
+                }
+                RefAct::NoAction | RefAct::Restrict => unreachable!(
+                    "ParentFkUpdateWork::prepare partitions NO ACTION/RESTRICT into counter_check_fks"
+                ),
+            }
+
+            program.preassign_label_to_next_insn(skip_action);
+        }
+
+        Ok(())
+    }
+}
+
 pub struct ForeignKeyActions<T>(Vec<T>);
 
 impl<T> Default for ForeignKeyActions<T> {
@@ -1752,6 +1867,19 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                 resolver,
             )?;
 
+            let emit_parent_check = |program: &mut ProgramBuilder| {
+                emit_fk_delete_parent_existence_check_single(
+                    program,
+                    &fk_ref,
+                    &parent_bt,
+                    parent_table_name,
+                    parent_cursor_id,
+                    parent_rowid_reg,
+                    database_id,
+                    resolver,
+                )
+            };
+
             match fk_ref.fk.on_delete {
                 RefAct::NoAction => {
                     // For REPLACE-style updates with immediate NO ACTION: skip the
@@ -1786,42 +1914,15 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                                 changed,
                             );
                             program.preassign_label_to_next_insn(changed);
-                            emit_fk_delete_parent_existence_check_single(
-                                program,
-                                &fk_ref,
-                                &parent_bt,
-                                parent_table_name,
-                                parent_cursor_id,
-                                parent_rowid_reg,
-                                database_id,
-                                resolver,
-                            )?;
+                            emit_parent_check(program)?;
                             program.preassign_label_to_next_insn(skip);
                             continue;
                         }
                     }
-                    emit_fk_delete_parent_existence_check_single(
-                        program,
-                        &fk_ref,
-                        &parent_bt,
-                        parent_table_name,
-                        parent_cursor_id,
-                        parent_rowid_reg,
-                        database_id,
-                        resolver,
-                    )?;
+                    emit_parent_check(program)?;
                 }
                 RefAct::Restrict => {
-                    emit_fk_delete_parent_existence_check_single(
-                        program,
-                        &fk_ref,
-                        &parent_bt,
-                        parent_table_name,
-                        parent_cursor_id,
-                        parent_rowid_reg,
-                        database_id,
-                        resolver,
-                    )?;
+                    emit_parent_check(program)?;
                 }
                 RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault => {
                     // Decode encoded values so they match the subprogram's decoded column reads
@@ -1894,79 +1995,6 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
 
         Ok(())
     }
-}
-
-/// Fire FK actions for UPDATE on parent table using Program opcode.
-/// This is called after the UPDATE is performed but before AFTER triggers.
-pub fn fire_fk_update_actions(
-    program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
-    parent_table_name: &str,
-    old_row_ctx: &DmlColumnContext,
-    new_row_ctx: &DmlColumnContext,
-    connection: &Arc<Connection>,
-    database_id: usize,
-) -> Result<()> {
-    let parent_bt = resolver
-        .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
-        .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
-
-    for fk_ref in resolver.with_schema(database_id, |s| {
-        s.resolved_fks_referencing(parent_table_name)
-    })? {
-        let parent_cols: &[String] = &fk_ref.parent_cols;
-        let ncols = parent_cols.len();
-
-        // Copy OLD and NEW parent key values using the helper
-        let old_key_start = program.alloc_registers(ncols);
-        copy_key_from_context(program, &parent_bt, parent_cols, old_row_ctx, old_key_start)?;
-
-        let new_key_start = program.alloc_registers(ncols);
-        copy_key_from_context(program, &parent_bt, parent_cols, new_row_ctx, new_key_start)?;
-
-        // Decode encoded values so they match the subprogram's decoded column reads
-        decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, old_key_start)?;
-        decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, new_key_start)?;
-
-        let old_key_registers: Vec<usize> = (old_key_start..old_key_start + ncols).collect();
-        let new_key_registers: Vec<usize> = (new_key_start..new_key_start + ncols).collect();
-
-        // Check if parent key changed - skip action if all values are equal
-        let skip_action = program.allocate_label();
-        let key_changed = program.allocate_label();
-        emit_key_change_check(
-            program,
-            old_key_start,
-            new_key_start,
-            ncols,
-            skip_action,
-            key_changed,
-        );
-
-        program.preassign_label_to_next_insn(key_changed);
-
-        let ctx = FkActionContext::new_for_update(old_key_registers, new_key_registers);
-
-        match fk_ref.fk.on_update {
-            RefAct::NoAction | RefAct::Restrict => {
-                // NO ACTION/RESTRICT checks are handled by emit_fk_update_parent_actions
-                // which is called BEFORE the update using the counter-based approach.
-            }
-            RefAct::Cascade => {
-                fire_fk_cascade_update(program, resolver, &fk_ref, connection, &ctx, database_id)?;
-            }
-            RefAct::SetNull => {
-                fire_fk_set_null(program, resolver, &fk_ref, connection, &ctx, database_id)?;
-            }
-            RefAct::SetDefault => {
-                fire_fk_set_default(program, resolver, &fk_ref, connection, &ctx, database_id)?;
-            }
-        }
-
-        program.preassign_label_to_next_insn(skip_action);
-    }
-
-    Ok(())
 }
 
 /// Emit pre-DROP FK checks and actions for a table.
@@ -2232,4 +2260,27 @@ pub fn emit_fk_drop_table_check(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_change_check_treats_nulls_as_equal() {
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 4, 2));
+        let skip = program.allocate_label();
+        let changed = program.allocate_label();
+
+        emit_key_change_check(&mut program, 1, 2, 1, skip, changed);
+
+        assert!(
+            matches!(
+                &program.insns[0].0,
+                Insn::Eq { flags, .. } if flags.has_nulleq()
+            ),
+            "FK UPDATE action guard must use IS semantics for OLD/NEW key comparison"
+        );
+    }
 }
