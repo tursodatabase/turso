@@ -1194,6 +1194,89 @@ test fk-deferred-child-update-rowid-alias-composite-old-probe-second-component {
 expect error {
 }
 
+# Parent UPDATE CASCADE when the FK target includes the parent's rowid alias.
+# Exercises OLD parent key materialization through the rowid-alias path in
+# `ParentFkUpdateWork::fire` -> `copy_key_from_context`.
+@cross-check-integrity
+test fk-update-parent-cascade-rowid-alias-composite {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, b INT, UNIQUE(id, b));
+    CREATE TABLE child(
+        x INT,
+        y INT,
+        FOREIGN KEY(x, y) REFERENCES parent(id, b) ON UPDATE CASCADE
+    );
+    INSERT INTO parent VALUES(1, 10), (2, 20);
+    INSERT INTO child VALUES(1, 10), (2, 20);
+    UPDATE parent SET b = 99 WHERE id = 1;
+    SELECT * FROM child ORDER BY x;
+}
+expect {
+    1|99
+    2|20
+}
+
+# Parent UPDATE CASCADE where the rowid alias sits at the second position of the
+# parent unique index referenced by the FK.
+@cross-check-integrity
+test fk-update-parent-cascade-rowid-alias-composite-second-pos {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(b INT, id INTEGER PRIMARY KEY, UNIQUE(b, id));
+    CREATE TABLE child(
+        x INT,
+        y INT,
+        FOREIGN KEY(x, y) REFERENCES parent(b, id) ON UPDATE CASCADE
+    );
+    INSERT INTO parent(b, id) VALUES(10, 1), (20, 2);
+    INSERT INTO child VALUES(10, 1), (20, 2);
+    UPDATE parent SET b = 99 WHERE id = 1;
+    SELECT * FROM child ORDER BY y;
+}
+expect {
+    99|1
+    20|2
+}
+
+# SET NULL on parent UPDATE where the FK target includes the rowid alias.
+@cross-check-integrity
+test fk-update-parent-setnull-rowid-alias-composite {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, b INT, UNIQUE(id, b));
+    CREATE TABLE child(
+        x INT,
+        y INT,
+        FOREIGN KEY(x, y) REFERENCES parent(id, b) ON UPDATE SET NULL
+    );
+    INSERT INTO parent VALUES(1, 10), (2, 20);
+    INSERT INTO child VALUES(1, 10), (2, 20);
+    UPDATE parent SET b = 99 WHERE id = 1;
+    SELECT ifnull(x, 'NULL'), ifnull(y, 'NULL') FROM child ORDER BY rowid;
+}
+expect {
+    NULL|NULL
+    2|20
+}
+
+# SET DEFAULT on parent UPDATE where the FK target includes the rowid alias.
+@cross-check-integrity
+test fk-update-parent-setdefault-rowid-alias-composite {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, b INT, UNIQUE(id, b));
+    CREATE TABLE child(
+        x INT DEFAULT 0,
+        y INT DEFAULT 0,
+        FOREIGN KEY(x, y) REFERENCES parent(id, b) ON UPDATE SET DEFAULT
+    );
+    INSERT INTO parent VALUES(0, 0), (1, 10), (2, 20);
+    INSERT INTO child VALUES(1, 10), (2, 20);
+    UPDATE parent SET b = 99 WHERE id = 1;
+    SELECT x, y FROM child ORDER BY rowid;
+}
+expect {
+    0|0
+    2|20
+}
+
 # TX: NULL in child FK -> never a violation
 @cross-check-integrity
 test fk-deferred-null-fk-never-violates {
@@ -1852,6 +1935,52 @@ expect {
     10|100
 }
 
+# ON UPDATE CASCADE with both BEFORE and AFTER triggers on the parent.
+# Exercises OLD-row preservation when parent FK actions also fire.
+@cross-check-integrity
+test fk-cascade-update-basic-with-before-after-triggers {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON UPDATE CASCADE);
+    CREATE TRIGGER parent_bu BEFORE UPDATE ON parent BEGIN
+        SELECT old.id, new.id;
+    END;
+    CREATE TRIGGER parent_au AFTER UPDATE ON parent BEGIN
+        SELECT old.id, new.id;
+    END;
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10,1);
+    UPDATE parent SET id=100 WHERE id=1;
+    SELECT id, pid FROM child ORDER BY id;
+}
+expect {
+    10|100
+}
+
+# UPSERT DO UPDATE that changes an INTEGER PRIMARY KEY with both BEFORE and
+# AFTER UPDATE triggers on the parent. Ensures FK cascade action and trigger
+# OLD-row handling are stable in the UPSERT path too.
+@cross-check-integrity
+test fk-upsert-cascade-update-with-before-after-triggers {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, payload INT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON UPDATE CASCADE);
+    CREATE TRIGGER parent_bu BEFORE UPDATE ON parent BEGIN
+        SELECT old.id, new.id;
+    END;
+    CREATE TRIGGER parent_au AFTER UPDATE ON parent BEGIN
+        SELECT old.id, new.id;
+    END;
+    INSERT INTO parent VALUES(1,1);
+    INSERT INTO child VALUES(10,1);
+    INSERT INTO parent(id,payload) VALUES(1,2)
+        ON CONFLICT(id) DO UPDATE SET id=100;
+    SELECT id, pid FROM child ORDER BY id;
+}
+expect {
+    10|100
+}
+
 # ON UPDATE CASCADE - multiple children
 @cross-check-integrity
 test fk-cascade-update-multi-children {
@@ -2363,6 +2492,43 @@ expect {
     orphans|0
 }
 
+# UPSERT-DO-UPDATE that changes the parent's rowid alias (INTEGER PRIMARY KEY)
+# which is also the FK parent key should cascade to children.
+@cross-check-integrity
+test fk-upsert-update-cascade-rowid-alias {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE c(cid INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON UPDATE CASCADE);
+    INSERT INTO p VALUES(1, 100);
+    INSERT INTO c VALUES(10, 1);
+    INSERT INTO p VALUES(1, 999) ON CONFLICT(id) DO UPDATE SET id = 5;
+    SELECT id, val FROM p;
+    SELECT cid, pid FROM c;
+}
+expect {
+    5|100
+    10|5
+}
+
+# Composite parent key including rowid alias (id) and a regular column,
+# triggered via UPSERT-DO-UPDATE.
+@cross-check-integrity
+test fk-upsert-update-cascade-composite-rowid-alias {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, a INT, UNIQUE(id, a));
+    CREATE TABLE c(cid INTEGER PRIMARY KEY, p_id INT, p_a INT,
+        FOREIGN KEY(p_id, p_a) REFERENCES p(id, a) ON UPDATE CASCADE);
+    INSERT INTO p VALUES(1, 100);
+    INSERT INTO c VALUES(10, 1, 100);
+    INSERT INTO p VALUES(1, 100) ON CONFLICT(id) DO UPDATE SET id = 7, a = 200;
+    SELECT id, a FROM p;
+    SELECT cid, p_id, p_a FROM c;
+}
+expect {
+    7|200
+    10|7|200
+}
+
 # ON DELETE RESTRICT should fail when child references the parent row
 @cross-check-integrity
 test fk-delete-restrict-fails {
@@ -2487,6 +2653,46 @@ test fk-restrict-null-child-ok {
 }
 expect {
     0
+}
+
+# ON UPDATE RESTRICT should ignore parent keys containing NULL (SQLite `=` semantics).
+@cross-check-integrity
+test fk-update-restrict-null-parent-key-noop {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(k INT UNIQUE);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        pkey INT REFERENCES parent(k) ON UPDATE RESTRICT
+    );
+    CREATE INDEX child_pkey_idx ON child(pkey);
+    INSERT INTO parent VALUES(NULL), (1);
+    INSERT INTO child VALUES(10, NULL), (20, 1);
+    UPDATE parent SET k = k WHERE k IS NULL;
+    SELECT ifnull(pkey, 'NULL') FROM child ORDER BY id;
+}
+expect {
+    NULL
+    1
+}
+
+# ON UPDATE NO ACTION should also ignore parent keys containing NULL.
+@cross-check-integrity
+test fk-update-noaction-null-parent-key-noop {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(k INT UNIQUE);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        pkey INT REFERENCES parent(k) ON UPDATE NO ACTION
+    );
+    CREATE INDEX child_pkey_idx ON child(pkey);
+    INSERT INTO parent VALUES(NULL), (1);
+    INSERT INTO child VALUES(10, NULL), (20, 1);
+    UPDATE parent SET k = 2 WHERE k IS NULL;
+    SELECT ifnull(pkey, 'NULL') FROM child ORDER BY id;
+}
+expect {
+    NULL
+    1
 }
 
 # DROP parent table should fail when child rows reference it
