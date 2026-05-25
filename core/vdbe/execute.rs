@@ -13512,21 +13512,20 @@ pub fn op_hash_build(
     } else {
         data.mem_budget
     };
-    state
-        .hash_tables
-        .entry(data.hash_table_id)
-        .or_insert_with(|| {
-            let config = HashTableConfig {
-                initial_buckets: 1024,
-                mem_budget,
-                num_keys: data.num_keys,
-                collations: data.collations.clone(),
-                temp_store,
-                track_matched: data.track_matched,
-                partition_count: None,
-            };
-            HashTable::new(config, pager.io.clone())
-        });
+    if let std::collections::hash_map::Entry::Vacant(e) =
+        state.hash_tables.entry(data.hash_table_id)
+    {
+        let config = HashTableConfig {
+            initial_buckets: 1024,
+            mem_budget,
+            num_keys: data.num_keys,
+            collations: data.collations.clone(),
+            temp_store,
+            track_matched: data.track_matched,
+            partition_count: None,
+        };
+        e.insert(HashTable::new(config, pager.io.clone())?);
+    }
 
     // Read pre-computed key values directly from registers
     while op_state.key_idx < data.num_keys {
@@ -13617,21 +13616,24 @@ pub fn op_hash_distinct(
     } else {
         DEFAULT_MEM_BUDGET
     };
+    if let std::collections::hash_map::Entry::Vacant(e) =
+        state.hash_tables.entry(data.hash_table_id)
+    {
+        let config = HashTableConfig {
+            initial_buckets: 1024,
+            mem_budget,
+            num_keys: data.num_keys,
+            collations: data.collations.clone(),
+            temp_store,
+            track_matched: false,
+            partition_count: None,
+        };
+        e.insert(HashTable::new(config, pager.io.clone())?);
+    }
     let hash_table = state
         .hash_tables
-        .entry(data.hash_table_id)
-        .or_insert_with(|| {
-            let config = HashTableConfig {
-                initial_buckets: 1024,
-                mem_budget,
-                num_keys: data.num_keys,
-                collations: data.collations.clone(),
-                temp_store,
-                track_matched: false,
-                partition_count: None,
-            };
-            HashTable::new(config, pager.io.clone())
-        });
+        .get_mut(&data.hash_table_id)
+        .expect("hash table exists");
 
     let key_values = &mut state.distinct_key_values;
     key_values.clear();
@@ -13753,8 +13755,10 @@ pub fn op_hash_probe(
     // For spilled hash tables, either buffer main-loop probe rows for grace
     // processing or probe a partition that grace logic already loaded.
     if hash_table.has_spilled() {
-        let partition_idx =
-            partition_idx.unwrap_or_else(|| hash_table.partition_for_keys(&probe_keys));
+        let partition_idx = match partition_idx {
+            Some(partition_idx) => partition_idx,
+            None => hash_table.partition_for_keys(&probe_keys)?,
+        };
 
         // Main probe loop: buffer probe rows targeting spilled build partitions.
         if let Some(rowid_reg) = probe_rowid_reg {
@@ -13807,7 +13811,7 @@ pub fn op_hash_probe(
             partition_idx,
             &probe_keys,
             Some(&mut state.metrics.hash_join),
-        ) {
+        )? {
             Some(entry) => {
                 state.registers[dest_reg].set_int(entry.rowid);
                 write_hash_payload_to_registers(
@@ -13828,7 +13832,7 @@ pub fn op_hash_probe(
         }
     } else {
         // Non-spilled hash table, use normal probe
-        match hash_table.probe(probe_keys, Some(&mut state.metrics.hash_join)) {
+        match hash_table.probe(probe_keys, Some(&mut state.metrics.hash_join))? {
             Some(entry) => {
                 state.registers[dest_reg].set_int(entry.rowid);
                 write_hash_payload_to_registers(
@@ -13871,7 +13875,7 @@ pub fn op_hash_next(
         mark_unlikely();
         LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
     })?;
-    match hash_table.next_match() {
+    match hash_table.next_match()? {
         Some(entry) => {
             state.registers[*dest_reg].set_int(entry.rowid);
             write_hash_payload_to_registers(
@@ -13912,7 +13916,7 @@ pub fn op_hash_clear(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(HashClear { hash_table_id }, insn);
     if let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) {
-        hash_table.clear();
+        hash_table.clear()?;
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -14103,7 +14107,7 @@ pub fn op_hash_grace_init(
     }
 
     // Initialize grace processing
-    if !hash_table.grace_begin() {
+    if !hash_table.grace_begin()? {
         state.pc = target_pc.as_offset_int();
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -15258,7 +15262,7 @@ mod tests {
             track_matched: false,
             ..Default::default()
         };
-        let mut ht = HashTable::new(config, io);
+        let mut ht = HashTable::new(config, io).unwrap();
 
         for i in 0..1024 {
             match ht
@@ -15279,11 +15283,11 @@ mod tests {
         let probe_key = (0..1024)
             .map(|i| vec![Value::from_i64(i)])
             .find(|key| {
-                let partition_idx = ht.partition_for_keys(key);
+                let partition_idx = ht.partition_for_keys(key).unwrap();
                 !ht.is_partition_loaded(partition_idx)
             })
             .expect("expected an unloaded spilled partition");
-        let partition_idx = ht.partition_for_keys(&probe_key);
+        let partition_idx = ht.partition_for_keys(&probe_key).unwrap();
 
         (ht, probe_key, partition_idx)
     }
