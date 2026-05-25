@@ -80,6 +80,8 @@ Use if-statements only when both branches are expected paths.
 - Comments that repeat code
 - References to AI conversations ("This test should trigger the bug")
 - Temporal markers ("added", "existing code", "Phase 1")
+- References to the previous implementation
+- Comments of 3 or more lines, unless necessary to explain something otherwise surprising or unconventional
 
 ## Avoid Over-Engineering
 

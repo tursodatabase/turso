@@ -1114,7 +1114,11 @@ fn test_recover_logical_log_short_file_ignored() {
     conn.db.io.wait_for_completion(c).unwrap();
     assert_eq!(file.size().unwrap(), 1);
 
-    let recovered = mvcc_store.maybe_recover_logical_log(conn).unwrap();
+    let recovered = run_until_done(
+        || mvcc_store.maybe_recover_logical_log(conn.clone()),
+        &conn.db.io,
+    )
+    .unwrap();
     assert!(!recovered);
 }
 
@@ -13232,4 +13236,16 @@ fn test_global_header_regression_would_lose_committed_user_version() {
         42,
         "older out-of-order FinalizeCommit regressed committed PRAGMA user_version"
     );
+}
+
+fn run_until_done<T>(
+    mut action: impl FnMut() -> Result<IOResult<T>>,
+    io: &Arc<dyn crate::IO>,
+) -> Result<T> {
+    loop {
+        match action()? {
+            IOResult::Done(value) => return Ok(value),
+            IOResult::IO(completions) => completions.wait(io.as_ref())?,
+        }
+    }
 }
