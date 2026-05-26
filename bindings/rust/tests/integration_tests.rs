@@ -1620,6 +1620,32 @@ async fn test_wal_reuses_freed_table_leaf_page_as_overflow() {
     .await;
     assert_eq!(reader_count_after_delete, 101);
 
+    // Match the Antithesis window before the failing row:
+    // BEGIN -> SAVEPOINT -> DML -> RELEASE -> ROLLBACK, then a duplicate
+    // insert transaction, then the large zeroblob(8451) row with id 478.
+    writer.execute("BEGIN", ()).await.unwrap();
+    writer.execute("SAVEPOINT sp_19", ()).await.unwrap();
+    writer
+        .execute("UPDATE t SET payload = x'6461726b' WHERE id = 562", ())
+        .await
+        .unwrap();
+    writer.execute("RELEASE sp_19", ()).await.unwrap();
+    writer.execute("ROLLBACK", ()).await.unwrap();
+
+    writer.execute("BEGIN", ()).await.unwrap();
+    let duplicate = writer
+        .execute(
+            "INSERT INTO t(payload, r, id, a, b) \
+             VALUES(x'6c69676874', 2.73, 566, 952, 597)",
+            (),
+        )
+        .await;
+    assert!(
+        duplicate.is_err(),
+        "duplicate primary-key insert should fail like the Antithesis flow"
+    );
+    writer.execute("COMMIT", ()).await.unwrap();
+
     writer
         .execute(
             "INSERT INTO t(payload, r, id, a, b) \
@@ -1656,6 +1682,44 @@ async fn test_wal_reuses_freed_table_leaf_page_as_overflow() {
     let conn = reopened.connect().unwrap();
     assert_large_blob_row_ok(&conn).await;
     assert_integrity_ok(&conn).await;
+}
+
+#[tokio::test]
+async fn test_integrity_check_reports_antithesis_invalid_overflow_page_without_short_read() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("antithesis-invalid-overflow-page.db");
+    // Captured from the page-218103808 Antithesis turso_stress run, without
+    // modifying pages in the test. The SQL flow inserts row id 478 with
+    // zeroblob(8451), then PRAGMA integrity_check follows the overflow chain
+    // 53 -> 8. Page 8 contains a stale table-leaf header, so its first four
+    // bytes (0x0d000000) look like overflow page 218103808.
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/antithesis-invalid-overflow-page.sqlite-fixture");
+    std::fs::copy(fixture_path, &db_path).unwrap();
+
+    let db = Builder::new_local(db_path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    assert_eq!(query_i64(&conn, "PRAGMA page_count").await, 178);
+
+    let mut rows = conn.query("PRAGMA integrity_check", ()).await.unwrap();
+    let row = rows
+        .next()
+        .await
+        .expect("integrity_check should not fail with short read")
+        .unwrap();
+    let result = row.get::<String>(0).unwrap();
+
+    assert!(
+        result.contains("invalid page number 218103808"),
+        "expected invalid overflow page report, got {result}"
+    );
+    assert!(
+        !result.contains("short read"),
+        "integrity_check should report corruption without reading past the database: {result}"
+    );
 }
 
 async fn drain_query(conn: &turso::Connection, sql: &str) {

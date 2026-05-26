@@ -5926,6 +5926,8 @@ pub enum IntegrityCheckError {
     },
     #[error("Freelist: invalid page number {pointer}")]
     FreelistPointerOutOfRange { page_id: i64, pointer: i64 },
+    #[error("Page {page_id}: invalid page number {pointer}")]
+    PagePointerOutOfRange { page_id: i64, pointer: i64 },
     #[error("overflow list length is {got} but should be {expected}")]
     OverflowListLengthMismatch { got: usize, expected: usize },
 }
@@ -6015,6 +6017,16 @@ impl IntegrityCheckState {
         errors: &mut Vec<IntegrityCheckError>,
     ) {
         let page_id = entry.page_idx;
+        if self.db_size != 0
+            && (page_id == 0
+                || usize::try_from(page_id).is_ok_and(|page_id| page_id > self.db_size))
+        {
+            errors.push(IntegrityCheckError::PagePointerOutOfRange {
+                page_id: referenced_by,
+                pointer: page_id,
+            });
+            return;
+        }
         let Some(previous) = self.page_reference.insert(page_id, referenced_by) else {
             self.page_stack.push(entry);
             return;
