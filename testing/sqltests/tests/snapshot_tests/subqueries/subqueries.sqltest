@@ -86,6 +86,37 @@ snapshot scalar-subquery-simple-count {
     SELECT (SELECT count(*) FROM orders) AS order_count;
 }
 
+# Ensures BETWEEN expr is emitted once. Issue #5152.
+@setup schema
+snapshot between-subquery-lhs {
+    SELECT id
+    FROM products
+    WHERE (SELECT max(id) FROM products) BETWEEN 1 AND 100;
+}
+
+# Ensures BETWEEN expr is emitted once in UPDATE. Issue #5152.
+@setup schema
+snapshot between-subquery-lhs-update {
+    UPDATE products
+    SET stock = stock + 1
+    WHERE (SELECT max(id) FROM products) BETWEEN 1 AND 100;
+}
+
+# Ensures BETWEEN expr is emitted once in DELETE. Issue #5152.
+@setup schema
+snapshot between-subquery-lhs-delete {
+    DELETE FROM products
+    WHERE (SELECT max(id) FROM products) BETWEEN 1 AND 100;
+}
+
+# Ensures NOT BETWEEN expr is emitted once. Issue #5152.
+@setup schema
+snapshot between-subquery-lhs-not {
+    SELECT id
+    FROM products
+    WHERE (SELECT max(id) FROM products) NOT BETWEEN 10 AND 20;
+}
+
 # =============================================================================
 # EXISTS SUBQUERIES
 # =============================================================================

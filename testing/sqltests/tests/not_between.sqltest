@@ -82,3 +82,15 @@ test not-between-subquery-bound-orderby-offset {
 expect {
     0
 }
+
+@cross-check-integrity
+test between-scalar-subquery-lhs-issue-5152 {
+    CREATE TABLE t(id INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES(1), (2), (3);
+    SELECT id FROM t WHERE (SELECT max(id) FROM t) BETWEEN 1 AND 3;
+}
+expect {
+    1
+    2
+    3
+}
