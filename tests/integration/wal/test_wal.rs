@@ -145,6 +145,74 @@ fn test_non_root_balance_reused_freelist_page_persists_in_wal(tmp_db: TempDataba
     Ok(())
 }
 
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_antithesis_like_savepoint_rebalance_does_not_persist_invalid_page_type(
+    tmp_db: TempDatabase,
+) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA page_size=512;")?;
+    conn.execute("PRAGMA journal_mode=WAL;")?;
+    conn.execute("PRAGMA cache_size=50;")?;
+    conn.execute(
+        "CREATE TABLE calm_roof_888 (
+            cold_door_963 BLOB,
+            big_bird_239 REAL,
+            wet_stone_286 INTEGER NOT NULL PRIMARY KEY,
+            hot_door_96 INTEGER,
+            brave_lake_630 INTEGER
+        );",
+    )?;
+
+    for k in 1..=360 {
+        conn.execute(&format!(
+            "INSERT INTO calm_roof_888
+             (cold_door_963, big_bird_239, wet_stone_286, hot_door_96, brave_lake_630)
+             VALUES (zeroblob(80), 1.25, {k}, {k}, {k});"
+        ))?;
+    }
+
+    execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
+    conn.execute("DELETE FROM calm_roof_888 WHERE wet_stone_286 BETWEEN 80 AND 170;")?;
+    execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
+
+    conn.execute("BEGIN;")?;
+    for k in 80..94 {
+        conn.execute(&format!(
+            "INSERT INTO calm_roof_888
+             (cold_door_963, big_bird_239, wet_stone_286, hot_door_96, brave_lake_630)
+             VALUES (zeroblob(300), 2.50, {k}, {k}, {k});"
+        ))?;
+    }
+    conn.execute("SAVEPOINT sp_59;")?;
+    for k in 94..=97 {
+        conn.execute(&format!(
+            "INSERT INTO calm_roof_888
+             (cold_door_963, big_bird_239, wet_stone_286, hot_door_96, brave_lake_630)
+             VALUES (zeroblob(300), 2.50, {k}, {k}, {k});"
+        ))?;
+    }
+    conn.execute("ROLLBACK TO sp_59;")?;
+    conn.execute("RELEASE sp_59;")?;
+    for k in 94..=97 {
+        conn.execute(&format!(
+            "INSERT INTO calm_roof_888
+             (cold_door_963, big_bird_239, wet_stone_286, hot_door_96, brave_lake_630)
+             VALUES (zeroblob(300), 2.50, {k}, {k}, {k});"
+        ))?;
+    }
+    conn.execute("COMMIT;")?;
+
+    let verify_db = TempDatabase::new_with_existent(&tmp_db.path);
+    let verify_conn = verify_db.connect_limbo();
+    let res = execute_and_get_strings(&verify_conn, "PRAGMA integrity_check;")?;
+    assert_eq!(res, vec!["ok"]);
+
+    Ok(())
+}
+
 #[test]
 #[ignore = "ignored for now because it's flaky"]
 fn test_wal_1_writer_1_reader() -> Result<()> {
