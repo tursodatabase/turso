@@ -1221,8 +1221,8 @@ pub fn op_open_read(
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 index.as_ref(),
                 num_columns,
-            ));
-            let index_info = Arc::new(IndexInfo::new_from_index(index));
+            )?);
+            let index_info = Arc::new(IndexInfo::new_from_index(index)?);
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
@@ -10482,8 +10482,8 @@ pub fn op_open_write(
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 index.as_ref(),
                 num_columns,
-            ));
-            let index_info = Arc::new(IndexInfo::new_from_index(index));
+            )?);
+            let index_info = Arc::new(IndexInfo::new_from_index(index)?);
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
@@ -12077,8 +12077,12 @@ pub fn op_open_ephemeral(
             let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
                 BTreeCursor::new_index(pager.clone(), root_page, index, num_columns)
             } else {
-                BTreeCursor::new_table(pager.clone(), root_page, num_columns)
-            };
+                Ok(BTreeCursor::new_table(
+                    pager.clone(),
+                    root_page,
+                    num_columns,
+                ))
+            }?;
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::Rewind {
                 cursor: Box::new(cursor),
                 temp_file: temp_file.take(),

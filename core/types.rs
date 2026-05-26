@@ -2001,31 +2001,30 @@ impl Default for IndexInfo {
 }
 
 impl IndexInfo {
-    pub fn new_from_index(index: &Index) -> Self {
-        Self {
-            key_info: {
-                let mut key_info: Vec<KeyInfo> = index
-                    .columns
-                    .iter()
-                    .map(|c| KeyInfo {
-                        sort_order: c.order,
-                        collation: c.collation.unwrap_or_default(),
-                        nulls_order: None,
-                    })
-                    .collect();
-                if index.has_rowid {
-                    key_info.push(KeyInfo {
-                        sort_order: SortOrder::Asc,
-                        collation: CollationSeq::Binary,
-                        nulls_order: None,
-                    });
-                }
-                key_info
-            },
+    pub fn new_from_index(index: &Index) -> Result<Self> {
+        let mut key_info: Vec<KeyInfo> = index
+            .columns
+            .iter()
+            .map(|c| KeyInfo {
+                sort_order: c.order,
+                collation: c.collation.unwrap_or_default(),
+                nulls_order: None,
+            })
+            .try_collect()?;
+        if index.has_rowid {
+            key_info.try_push(KeyInfo {
+                sort_order: SortOrder::Asc,
+                collation: CollationSeq::Binary,
+                nulls_order: None,
+            })?;
+        }
+        let this = Self {
+            key_info,
             has_rowid: index.has_rowid,
             num_cols: index.columns.len() + (index.has_rowid as usize),
             is_unique: index.unique,
-        }
+        };
+        Ok(this)
     }
 }
 

@@ -799,10 +799,15 @@ impl BTreeCursor {
         cursor
     }
 
-    pub fn new_index(pager: Arc<Pager>, root_page: i64, index: &Index, num_columns: usize) -> Self {
+    pub fn new_index(
+        pager: Arc<Pager>,
+        root_page: i64,
+        index: &Index,
+        num_columns: usize,
+    ) -> Result<Self> {
         let mut cursor = Self::new(pager, root_page, num_columns);
-        cursor.index_info = Some(Arc::new(IndexInfo::new_from_index(index)));
-        cursor
+        cursor.index_info = Some(Arc::new(IndexInfo::new_from_index(index)?));
+        Ok(cursor)
     }
 
     /// Resets the cached count state so the next `count()` call re-traverses the
@@ -9108,7 +9113,8 @@ mod tests {
             };
             let num_columns = index_def.columns.len();
             let mut cursor =
-                BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, num_columns);
+                BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, num_columns)
+                    .unwrap();
             let mut keys = SortedVec::new();
             tracing::info!("seed: {seed}");
             for i in 0..inserts {
@@ -9283,7 +9289,8 @@ mod tests {
                 index_method: None,
                 on_conflict: None,
             };
-            let mut cursor = BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, 1);
+            let mut cursor =
+                BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, 1).unwrap();
 
             // Track expected keys that should be present in the tree
             let mut expected_keys = Vec::new();

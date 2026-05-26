@@ -504,7 +504,7 @@ impl DbspCircuit {
                 self.internal_state_index_root,
                 &index_def,
                 3,
-            );
+            )?;
             let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
             self.execute_node(root_id, pager, execute_state, false, &mut cursors)
         } else {
@@ -558,7 +558,7 @@ impl DbspCircuit {
                         self.internal_state_index_root,
                         &index_def,
                         3, // Index on first 3 columns
-                    );
+                    )?;
 
                     let state_cursors = Box::new(DbspStateCursors::new(
                         state_table_cursor,
@@ -745,7 +745,7 @@ impl DbspCircuit {
                             self.internal_state_index_root,
                             &index_def,
                             3,
-                        );
+                        )?;
                         let mut temp_cursors =
                             DbspStateCursors::new(temp_table_cursor, temp_index_cursor);
 
