@@ -36,6 +36,7 @@ use crate::{
 use arc_swap::ArcSwapOption;
 use roaring::RoaringBitmap;
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use tracing::{instrument, trace, Level};
 
 use super::btree::offset::{
@@ -1331,6 +1332,12 @@ pub struct Pager {
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
+    /// Reads that have begun (disk IO issued, page allocated) but whose
+    /// `cache_insert` has not yet succeeded because the cache was full and we
+    /// yielded waiting for a spill to complete. The next call to
+    /// `read_page_nonblock(idx)` reuses the stored `(page, disk_read)` pair
+    /// instead of issuing a duplicate disk read.
+    pending_reads: RwLock<HashMap<i64, PendingRead>>,
     /// Dirty pages as a bitmap, naturally sorted by page number.
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
     subjournal: RwLock<Option<Subjournal>>,
@@ -1377,6 +1384,18 @@ pub struct Pager {
 }
 
 assert_send_sync!(Pager);
+
+/// State for a `read_page_nonblock` call that has issued its disk read but has
+/// not yet been able to insert the page into the cache (cache full, spill in
+/// flight). Stored in `Pager::pending_reads` so the next re-entry can resume
+/// without issuing a duplicate disk read.
+#[derive(Clone)]
+struct PendingRead {
+    page: PageRef,
+    /// `None` if the page was satisfied from WAL/cache shortcut and no
+    /// disk read completion needs to be surfaced to the caller.
+    disk_read: Option<Completion>,
+}
 
 #[cfg(not(feature = "omit_autovacuum"))]
 pub struct VacuumState {
@@ -1504,6 +1523,7 @@ impl Pager {
             wal,
             page_cache: Arc::new(RwLock::new(page_cache)),
             io,
+            pending_reads: RwLock::new(HashMap::new()),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
@@ -1590,13 +1610,22 @@ impl Pager {
                         return Ok(IOResult::Done(page1));
                     }
 
-                    let (page, c) = self.read_page(DatabaseHeader::PAGE_ID as i64)?;
-                    *self.header_ref_state.write() = HeaderRefState::CreateHeader {
-                        page,
-                        completion: c.clone(),
-                    };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
+                    // On `IO(spill_c)` we keep the state at `Start` so
+                    // re-entry resumes here via the pager's `pending_reads`
+                    // memoization (no duplicate disk read).
+                    match self.read_page(DatabaseHeader::PAGE_ID as i64)? {
+                        IOResult::Done((page, c)) => {
+                            *self.header_ref_state.write() = HeaderRefState::CreateHeader {
+                                page,
+                                completion: c.clone(),
+                            };
+                            if let Some(c) = c {
+                                io_yield_one!(c);
+                            }
+                        }
+                        IOResult::IO(IOCompletions::Single(spill_c)) => {
+                            io_yield_one!(spill_c);
+                        }
                     }
                 }
                 HeaderRefState::CreateHeader { page, completion } => {
@@ -2170,13 +2199,22 @@ impl Pager {
                         ptrmap_pg_no
                     );
 
-                    let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as i64)?;
-                    self.vacuum_state.write().ptrmap_get_state = PtrMapGetState::Deserialize {
-                        ptrmap_page,
-                        offset_in_ptrmap_page,
-                    };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
+                    // On `IO(spill_c)` keep `ptrmap_get_state` at `Start` so
+                    // re-entry resumes via the pager's pending-read tracking.
+                    match self.read_page(ptrmap_pg_no as i64)? {
+                        IOResult::Done((ptrmap_page, c)) => {
+                            self.vacuum_state.write().ptrmap_get_state =
+                                PtrMapGetState::Deserialize {
+                                    ptrmap_page,
+                                    offset_in_ptrmap_page,
+                                };
+                            if let Some(c) = c {
+                                io_yield_one!(c);
+                            }
+                        }
+                        IOResult::IO(IOCompletions::Single(spill_c)) => {
+                            io_yield_one!(spill_c);
+                        }
                     }
                 }
                 PtrMapGetState::Deserialize {
@@ -2270,13 +2308,22 @@ impl Pager {
                         offset_in_ptrmap_page
                     );
 
-                    let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as i64)?;
-                    self.vacuum_state.write().ptrmap_put_state = PtrMapPutState::Deserialize {
-                        ptrmap_page,
-                        offset_in_ptrmap_page,
-                    };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
+                    // On `IO(spill_c)` keep `ptrmap_put_state` at `Start` so
+                    // re-entry resumes via the pager's pending-read tracking.
+                    match self.read_page(ptrmap_pg_no as i64)? {
+                        IOResult::Done((ptrmap_page, c)) => {
+                            self.vacuum_state.write().ptrmap_put_state =
+                                PtrMapPutState::Deserialize {
+                                    ptrmap_page,
+                                    offset_in_ptrmap_page,
+                                };
+                            if let Some(c) = c {
+                                io_yield_one!(c);
+                            }
+                        }
+                        IOResult::IO(IOCompletions::Single(spill_c)) => {
+                            io_yield_one!(spill_c);
+                        }
                     }
                 }
                 PtrMapPutState::Deserialize {
@@ -2941,43 +2988,68 @@ impl Pager {
         Ok((page, c))
     }
 
-    /// Reads a page from the database.
+    /// Issue a non-blocking page read, inserting into the page cache, may spill to disk.
+    ///
+    /// * `Done((page, None))`: page was already in cache, no IO needed.
+    /// * `Done((page, Some(c_disk)))`: page was not in cache; it has been
+    ///   inserted into the cache and a disk-read is in flight against it.
+    ///   The caller must yield on `c_disk` before reading `page` contents.
+    /// * `IO(c_spill)`: the page cache was full and a spill is in flight.
+    ///   Caller must yield on `c_spill` and then call `read_page_nonblock(idx)`
+    ///   again. The disk read for this page has already been issued and will
+    ///   be reused on re-entry via `pending_reads` (no duplicate IO).
+    ///
+    /// Re-entrancy contract: the caller may invoke this with the same
+    /// `page_idx` arbitrarily many times. Each `Some(page_idx)` mapping in
+    /// `pending_reads` corresponds to a single outstanding disk read; the
+    /// entry is removed exactly when this method returns `Done`.
     #[tracing::instrument(skip_all, level = Level::TRACE)]
-    pub fn read_page(&self, page_idx: i64) -> Result<(PageRef, Option<Completion>)> {
+    pub fn read_page(&self, page_idx: i64) -> Result<IOResult<(PageRef, Option<Completion>)>> {
         turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
-        tracing::debug!("read_page(page_idx = {})", page_idx);
-
-        // First check if page is in cache
-        {
-            let mut page_cache = self.page_cache.write();
-            let page_key = PageCacheKey::new(page_idx as usize);
-            if let Some(page) = page_cache.get(&page_key)? {
-                turso_assert!(
-                    page_idx as usize == page.get().id,
-                    "attempted to read page but got different page",
-                    { "expected_page": page_idx, "actual_page": page.get().id }
-                );
-                return Ok((page, None));
+        tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
+        let pending = self.pending_reads.read().get(&page_idx).cloned();
+        let (page, c_disk) = if let Some(pending) = pending {
+            // Re-entry: previous call yielded on spill before completing
+            // `cache_insert`. Reuse the same PageRef and in-flight disk read
+            // rather than issuing duplicate IO.
+            (pending.page, pending.disk_read)
+        } else {
+            // Fast path: cache hit.
+            {
+                let mut page_cache = self.page_cache.write();
+                let page_key = PageCacheKey::new(page_idx as usize);
+                if let Some(page) = page_cache.get(&page_key)? {
+                    turso_assert!(
+                        page_idx as usize == page.get().id,
+                        "attempted to read page but got different page",
+                        { "expected_page": page_idx, "actual_page": page.get().id }
+                    );
+                    return Ok(IOResult::Done((page, None)));
+                }
             }
-        }
 
-        tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
-        // Page not in cache, read from disk
-        let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
-        loop {
-            match self.cache_insert(page_idx as usize, page.clone())? {
-                IOResult::Done(()) => {
-                    return Ok((page, Some(c)));
-                }
-                IOResult::IO(IOCompletions::Single(spill_c)) => {
-                    // NOTE: Because `cache_insert` can return completions as *multiple* different states, we cannot
-                    // simply create a new CompletionGroup and return it here without inserting the
-                    // page into the cache. In order to do this, we would need to make read_page
-                    // re-entrant so it continues to call cache_insert and have every caller
-                    // propogate the IOResult. For now, we will wait syncronously for spilling IO
-                    // on cache insertion on read_page.
-                    self.io.wait_for_completion(spill_c)?;
-                }
+            tracing::debug!("read_page_nonblock(page_idx = {page_idx}) = reading page from disk");
+            let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
+            self.pending_reads.write().insert(
+                page_idx,
+                PendingRead {
+                    page: page.clone(),
+                    disk_read: Some(c.clone()),
+                },
+            );
+            (page, Some(c))
+        };
+
+        match self.cache_insert(page_idx as usize, page.clone())? {
+            IOResult::Done(()) => {
+                self.pending_reads.write().remove(&page_idx);
+                Ok(IOResult::Done((page, c_disk)))
+            }
+            IOResult::IO(IOCompletions::Single(spill_c)) => {
+                // Leave the pending entry in place; the next call to
+                // `read_page_nonblock(page_idx)` will recover it and retry
+                // `cache_insert` without re-issuing the disk read.
+                io_yield_one!(spill_c);
             }
         }
     }
@@ -4582,6 +4654,16 @@ impl Pager {
                         )));
                     }
 
+                    // The non-blocking read fork here is safe: if the caller
+                    // passes `Some(page)`, no IO occurs and the mutations
+                    // below run synchronously. If the caller passes `None`
+                    // and `read_page_nonblock` yields for spill, we leave
+                    // `state` at `Start` so re-entry re-takes either branch
+                    // (the pager's `pending_reads` memoization returns the
+                    // same `PageRef` the next time). Crucially, the
+                    // non-idempotent mutations (`freelist_pages` increment,
+                    // `page.pin()`, state advance) all happen AFTER both
+                    // branches converge.
                     let (page, c) = match page.take() {
                         Some(page) => {
                             turso_assert_eq!(
@@ -4596,7 +4678,12 @@ impl Pager {
                             }
                             (page, None)
                         }
-                        None => self.read_page(page_id as i64)?,
+                        None => match self.read_page(page_id as i64)? {
+                            IOResult::Done(v) => v,
+                            IOResult::IO(IOCompletions::Single(spill_c)) => {
+                                io_yield_one!(spill_c);
+                            }
+                        },
                     };
                     header.freelist_pages = (header.freelist_pages.get() + 1).into();
 
@@ -4618,7 +4705,18 @@ impl Pager {
                 }
                 FreePageState::AddToTrunk { page } => {
                     let trunk_page_id = header.freelist_trunk_page.get();
-                    let (trunk_page, c) = self.read_page(trunk_page_id as i64)?;
+                    // Spill yield here keeps `state` at `AddToTrunk`. The
+                    // subsequent writes / `unpin()` only run after we have
+                    // a loaded `trunk_page`; on re-entry the pager's
+                    // `pending_reads` returns the same `trunk_page`, and the
+                    // writes are byte-identical (we haven't written yet so
+                    // `number_of_leaf_pages` is unchanged).
+                    let (trunk_page, c) = match self.read_page(trunk_page_id as i64)? {
+                        IOResult::Done(v) => v,
+                        IOResult::IO(IOCompletions::Single(spill_c)) => {
+                            io_yield_one!(spill_c);
+                        }
+                    };
                     if let Some(c) = c {
                         if !c.succeeded() {
                             io_yield_one!(c);
@@ -4808,11 +4906,24 @@ impl Pager {
                         {
                             // we will allocate a ptrmap page, so increment size
                             new_db_size += 1;
-                            let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
-                            self.add_dirty(&page)?;
-                            let page_key = PageCacheKey::new(page.get().id as usize);
-                            let mut cache = self.page_cache.write();
-                            cache.insert(page_key, page)?;
+                            // Make the ptrmap allocation idempotent across
+                            // spill-yield re-entries: only allocate + insert
+                            // if the cache doesn't already contain it. The
+                            // read-then-write pattern is safe because
+                            // `allocate_page` holds the only writer for
+                            // `database_size`/`freelist_trunk_page`; no
+                            // concurrent caller can race in between.
+                            let page_key = PageCacheKey::new(new_db_size as usize);
+                            let already_present = {
+                                let cache = self.page_cache.read();
+                                cache.contains_key(&page_key)
+                            };
+                            if !already_present {
+                                let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                                self.add_dirty(&page)?;
+                                let mut cache = self.page_cache.write();
+                                cache.insert(page_key, page)?;
+                            }
                         }
                     }
 
@@ -4823,12 +4934,20 @@ impl Pager {
                         };
                         continue;
                     }
-                    let (trunk_page, c) = self.read_page(first_freelist_trunk_page_id as i64)?;
-                    // Pin trunk_page to prevent eviction while stored in state machine
-                    trunk_page.pin();
-                    *state = AllocatePageState::SearchAvailableFreeListLeaf { trunk_page };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
+                    // Spill yield routes back through `Start`; the ptrmap
+                    // allocation above is idempotent and `trunk_page.pin()`
+                    // happens only after `Done`, so no double-pin.
+                    match self.read_page(first_freelist_trunk_page_id as i64)? {
+                        IOResult::Done((trunk_page, c)) => {
+                            trunk_page.pin();
+                            *state = AllocatePageState::SearchAvailableFreeListLeaf { trunk_page };
+                            if let Some(c) = c {
+                                io_yield_one!(c);
+                            }
+                        }
+                        IOResult::IO(IOCompletions::Single(spill_c)) => {
+                            io_yield_one!(spill_c);
+                        }
                     }
                 }
                 AllocatePageState::SearchAvailableFreeListLeaf { trunk_page } => {
@@ -4849,27 +4968,34 @@ impl Pager {
                         let page_contents = trunk_page.get_contents();
                         let next_leaf_page_id =
                             page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR);
-                        let (leaf_page, c) = self.read_page(next_leaf_page_id as i64)?;
+                        // Pin + state-advance happen only on `Done` so a
+                        // spill yield doesn't double-pin the leaf page.
+                        match self.read_page(next_leaf_page_id as i64)? {
+                            IOResult::Done((leaf_page, c)) => {
+                                turso_assert!(
+                                    number_of_freelist_leaves > 0,
+                                    "Freelist trunk page has no leaves",
+                                    { "page_id": trunk_page.get().id }
+                                );
 
-                        turso_assert!(
-                            number_of_freelist_leaves > 0,
-                            "Freelist trunk page has no leaves",
-                            { "page_id": trunk_page.get().id }
-                        );
+                                // Pin leaf_page to prevent eviction while stored in state machine
+                                // trunk_page is already pinned from previous state
+                                leaf_page.pin();
 
-                        // Pin leaf_page to prevent eviction while stored in state machine
-                        // trunk_page is already pinned from previous state
-                        leaf_page.pin();
-
-                        *state = AllocatePageState::ReuseFreelistLeaf {
-                            trunk_page: trunk_page.clone(),
-                            leaf_page,
-                            number_of_freelist_leaves,
-                        };
-                        if let Some(c) = c {
-                            io_yield_one!(c);
+                                *state = AllocatePageState::ReuseFreelistLeaf {
+                                    trunk_page: trunk_page.clone(),
+                                    leaf_page,
+                                    number_of_freelist_leaves,
+                                };
+                                if let Some(c) = c {
+                                    io_yield_one!(c);
+                                }
+                                continue;
+                            }
+                            IOResult::IO(IOCompletions::Single(spill_c)) => {
+                                io_yield_one!(spill_c);
+                            }
                         }
-                        continue;
                     }
 
                     // No freelist leaves on this trunk page.
@@ -5628,7 +5754,9 @@ mod ptrmap_tests {
         assert_eq!(expected_ptrmap_pg_no, FIRST_PTRMAP_PAGE_NO);
 
         //  Ensure the pointer map page ref is created and loadable via the pager
-        let ptrmap_page_ref = pager.read_page(expected_ptrmap_pg_no as i64);
+        let ptrmap_page_ref = pager
+            .io
+            .block(|| pager.read_page(expected_ptrmap_pg_no as i64))?;
         assert!(ptrmap_page_ref.is_ok());
 
         //  Ensure that the database header size is correctly reflected
@@ -5715,6 +5843,94 @@ mod ptrmap_tests {
         assert_eq!(
             get_ptrmap_offset_in_page(108, 105, page_size).unwrap(),
             2 * PTRMAP_ENTRY_SIZE
+        );
+    }
+
+    /// Cache-hit fast path: `read_page_nonblock` must return `Done` with no
+    /// disk-read completion and must not touch `pending_reads`.
+    #[test]
+    fn read_page_nonblock_cache_hit_returns_done() {
+        let pager = test_pager_setup(4096, 10);
+
+        // Page 1 is unconditionally loaded into cache by `allocate_page1`.
+        let res = pager.read_page(1).unwrap();
+        match res {
+            IOResult::Done((page, c)) => {
+                assert_eq!(page.get().id, 1);
+                assert!(
+                    c.is_none(),
+                    "cache hit must not return a disk-read completion"
+                );
+            }
+            IOResult::IO(_) => panic!("cache hit should not yield"),
+        }
+        assert!(
+            pager.pending_reads.read().is_empty(),
+            "pending_reads must stay empty on cache-hit path"
+        );
+    }
+
+    /// Re-entry contract: if `pending_reads` already has a `PendingRead` for
+    /// this page (as happens after a previous call yielded for spill), the
+    /// next call must reuse that `(page, disk_read)` instead of allocating a
+    /// new page and issuing a duplicate disk read.
+    ///
+    /// This test does NOT force a real spill yield — that requires an IO
+    /// backend that returns non-finished completions, which we don't have at
+    /// the core unit-test layer. We instead synthesize the post-yield state
+    /// directly and assert the function honors it.
+    #[test]
+    fn read_page_nonblock_reentry_reuses_pending_entry() {
+        let pager = test_pager_setup(4096, 10);
+
+        // Pick a page id well beyond the initialized DB so it is *not* in
+        // the cache. We never actually issue IO against it (we short-circuit
+        // via the pre-populated `pending_reads` entry), so the page id only
+        // needs to be unique within the cache.
+        let target_idx: i64 = 9999;
+        assert!(
+            pager.cache_get(target_idx as usize).unwrap().is_none(),
+            "test precondition: target page must not be in cache"
+        );
+
+        // Synthesize the state that would exist after a previous call had to
+        // yield on spill: a `PendingRead` entry whose `page` is the
+        // PageRef we already handed back to the caller, and whose
+        // `disk_read` is the in-flight disk-read completion.
+        let synthetic_page: PageRef = Arc::new(Page::new(target_idx));
+        // Mark loaded so cache eviction logic treats it as a normal page; the
+        // contents don't matter for this test.
+        synthetic_page.set_loaded();
+        let stub_disk_read = Completion::new_yield();
+        pager.pending_reads.write().insert(
+            target_idx,
+            PendingRead {
+                page: synthetic_page.clone(),
+                disk_read: Some(stub_disk_read.clone()),
+            },
+        );
+
+        let res = pager.read_page(target_idx).unwrap();
+        let (page, c) = match res {
+            IOResult::Done(v) => v,
+            IOResult::IO(_) => panic!(
+                "with pending entry present and cache space available, \
+                 read_page_nonblock should complete without yielding"
+            ),
+        };
+
+        assert!(
+            Arc::ptr_eq(&page, &synthetic_page),
+            "read_page_nonblock must reuse the PageRef from pending_reads, \
+             not allocate a new page (this is the no-duplicate-IO invariant)"
+        );
+        assert!(
+            c.is_some(),
+            "the disk-read completion from pending_reads should be returned"
+        );
+        assert!(
+            pager.pending_reads.read().get(&target_idx).is_none(),
+            "pending_reads entry must be cleared once read_page_nonblock returns Done"
         );
     }
 }
