@@ -1,6 +1,6 @@
 ---
 name: allocator-migration
-description: Use when migrating Turso core code to crate::alloc, allocator-api2, cfg(nightly) allocator aliases, fallible collection APIs, try_vec!, try_collect, or LimboError::OutOfMemory handling. Covers import style, allocator-aware aliases, stable/nightly boundaries, shuttle Arc compatibility, and how to keep allocator foundation commits separate from module migrations.
+description: Use when migrating Turso core code to crate::alloc, allocator-api2, cfg(nightly) allocator aliases, fallible collection APIs, try_vec!, try_collect, or LimboError::OutOfMemory handling. Covers import style, allocator-aware aliases, stable/nightly boundaries, shuttle Arc compatibility, and how to keep allocator foundation commits separate from module migrations. Read this when changing code that does allocations.
 ---
 
 # Turso Allocator Migration

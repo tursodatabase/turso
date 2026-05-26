@@ -201,6 +201,8 @@ inherits = "release-official"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'cfg(antithesis)', 'cfg(nightly)'] }
+# For now allow this for the allocator api migration
+unstable_name_collisions = "allow"
 
 [workspace.lints.clippy]
 or_fun_call = "deny"
