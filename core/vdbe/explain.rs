@@ -956,19 +956,27 @@ pub fn insn_to_row(
             Insn::Program {
                 param_registers,
                 ignore_jump_target,
-                ..
-            } => (
-                "Program",
-                // P1: first parent register that contains a param
-                param_registers.first().copied().unwrap_or(0) as i64,
-                // P2: ignore jump target (for RAISE(IGNORE))
-                ignore_jump_target.as_debug_int() as i64,
-                // P3: number of registers that contain params
-                param_registers.len() as i64,
-                Value::build_text(program.sql.clone()),
-                0,
-                format!("subprogram={}", program.sql),
-            ),
+                program: subprogram,
+            } => {
+                let sql = subprogram
+                    .prepared_program()
+                    .expect("Program subprogram should be resolved before EXPLAIN")
+                    .sql
+                    .clone();
+                let comment = format!("subprogram={sql}");
+                (
+                    "Program",
+                    // P1: first parent register that contains a param
+                    param_registers.first().copied().unwrap_or(0) as i64,
+                    // P2: ignore jump target (for RAISE(IGNORE))
+                    ignore_jump_target.as_debug_int() as i64,
+                    // P3: number of registers that contain params
+                    param_registers.len() as i64,
+                    Value::build_text(sql),
+                    0,
+                    comment,
+                )
+            }
             Insn::ResetCount => (
                 "ResetCount",
                 0,

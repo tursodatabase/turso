@@ -2230,10 +2230,10 @@ mod fuzz_tests {
         println!("fk_cascade_actions_fuzz complete (seed {seed})");
     }
 
-    // Fuzz test for recursive CASCADE (A->B->C chains)
+    // Fuzz test for recursive CASCADE chains, self-references, and FK cycles.
     #[turso_macros::test(mvcc)]
-    pub fn fk_recursive_cascade_fuzz(db: TempDatabase) {
-        let (mut rng, seed) = helpers::init_fuzz_test("fk_recursive_cascade_fuzz");
+    pub fn fk_recursive_fk_action_fuzz(db: TempDatabase) {
+        let (mut rng, seed) = helpers::init_fuzz_test("fk_recursive_fk_action_fuzz");
 
         let builder = helpers::builder_from_db(&db);
 
@@ -2241,7 +2241,7 @@ mod fuzz_tests {
         const INNER_ITERS: usize = 200;
 
         for outer in 0..OUTER_ITERS {
-            println!("fk_recursive_cascade_fuzz {}/{}", outer + 1, OUTER_ITERS);
+            println!("fk_recursive_fk_action_fuzz {}/{}", outer + 1, OUTER_ITERS);
 
             let limbo_db = builder.clone().build();
             let sqlite_db = builder.clone().build();
@@ -2278,6 +2278,31 @@ mod fuzz_tests {
             );
             limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
+
+            for stmt in [
+                "CREATE TABLE self_fk(id INTEGER PRIMARY KEY, pid INT, \
+                 FOREIGN KEY(pid) REFERENCES self_fk(id) ON DELETE CASCADE ON UPDATE CASCADE)",
+                "CREATE TABLE cycle_a(id INTEGER PRIMARY KEY, bid INT, \
+                 FOREIGN KEY(bid) REFERENCES cycle_b(id) ON DELETE CASCADE ON UPDATE CASCADE)",
+                "CREATE TABLE cycle_b(id INTEGER PRIMARY KEY, aid INT, \
+                 FOREIGN KEY(aid) REFERENCES cycle_a(id) ON DELETE CASCADE ON UPDATE CASCADE)",
+                "CREATE TABLE null_a(id INTEGER PRIMARY KEY, bid INT, \
+                 FOREIGN KEY(bid) REFERENCES null_b(id) ON DELETE SET NULL ON UPDATE SET NULL)",
+                "CREATE TABLE null_b(id INTEGER PRIMARY KEY, aid INT, \
+                 FOREIGN KEY(aid) REFERENCES null_a(id) ON DELETE SET NULL ON UPDATE SET NULL)",
+                "CREATE TABLE default_a(id INTEGER PRIMARY KEY, bid INT DEFAULT NULL, \
+                 FOREIGN KEY(bid) REFERENCES default_b(id) ON DELETE SET DEFAULT ON UPDATE SET DEFAULT)",
+                "CREATE TABLE default_b(id INTEGER PRIMARY KEY, aid INT DEFAULT NULL, \
+                 FOREIGN KEY(aid) REFERENCES default_a(id) ON DELETE SET DEFAULT ON UPDATE SET DEFAULT)",
+                "CREATE TABLE bad_default_a(id INTEGER PRIMARY KEY, bid INT DEFAULT 999, \
+                 FOREIGN KEY(bid) REFERENCES bad_default_b(id) ON DELETE SET DEFAULT ON UPDATE SET DEFAULT)",
+                "CREATE TABLE bad_default_b(id INTEGER PRIMARY KEY, aid INT DEFAULT 999, \
+                 FOREIGN KEY(aid) REFERENCES bad_default_a(id) ON DELETE SET DEFAULT ON UPDATE SET DEFAULT)",
+            ] {
+                let stmt = log_and_exec(stmt);
+                limbo_exec_rows(&limbo, &stmt);
+                sqlite.execute(&stmt, params![]).unwrap();
+            }
 
             // Seed grandparents
             let mut gp_ids = std::collections::HashSet::new();
@@ -2319,9 +2344,29 @@ mod fuzz_tests {
                 }
             }
 
-            // Fuzz mutations on the hierarchy
+            for stmt in [
+                "INSERT INTO self_fk VALUES (1,NULL),(2,1),(3,2),(4,3),(10,NULL),(11,10)",
+                "INSERT INTO cycle_a VALUES (1,NULL)",
+                "INSERT INTO cycle_b VALUES (2,1)",
+                "UPDATE cycle_a SET bid=2 WHERE id=1",
+                "INSERT INTO null_a VALUES (1,NULL)",
+                "INSERT INTO null_b VALUES (2,1)",
+                "UPDATE null_a SET bid=2 WHERE id=1",
+                "INSERT INTO default_a VALUES (1,NULL)",
+                "INSERT INTO default_b VALUES (2,1)",
+                "UPDATE default_a SET bid=2 WHERE id=1",
+                "INSERT INTO bad_default_a(id,bid) VALUES (1,NULL)",
+                "INSERT INTO bad_default_b(id,aid) VALUES (2,1)",
+                "UPDATE bad_default_a SET bid=2 WHERE id=1",
+            ] {
+                let stmt = log_and_exec(stmt);
+                limbo_exec_rows(&limbo, &stmt);
+                sqlite.execute(&stmt, params![]).unwrap();
+            }
+
+            // Fuzz mutations on the hierarchy, self-reference, and cycles.
             for _ in 0..INNER_ITERS {
-                let op = rng.random_range(0..12);
+                let op = rng.random_range(0..30);
                 let stmt = match op {
                     // DELETE grandparent (should cascade to parent and child)
                     0 | 1 => {
@@ -2431,7 +2476,7 @@ mod fuzz_tests {
                         }
                     }
                     // UPSERT on parent that updates value (doesn't change FK key)
-                    _ => {
+                    11 => {
                         if let Some(id) = p_ids.iter().choose(&mut rng).cloned() {
                             if let Some(gp_id) = gp_ids.iter().choose(&mut rng) {
                                 let new_v = rng.random_range(0..=100);
@@ -2445,59 +2490,94 @@ mod fuzz_tests {
                             continue;
                         }
                     }
+                    // DELETE a self-referential cascade root.
+                    12 => "DELETE FROM self_fk WHERE id=1".to_string(),
+                    // DELETE more than one self-referential cascade root.
+                    13 => "DELETE FROM self_fk WHERE id IN (1,10)".to_string(),
+                    // UPDATE a self-referential cascade root.
+                    14 => "UPDATE self_fk SET id=id+100 WHERE id=1".to_string(),
+                    // Try to rebuild the root of the self-referential graph.
+                    15 => "INSERT OR IGNORE INTO self_fk VALUES(1,NULL)".to_string(),
+                    // Try to rebuild one child in the self-referential graph.
+                    16 => "INSERT OR IGNORE INTO self_fk VALUES(2,1)".to_string(),
+                    // DELETE one side of a two-table cascade cycle.
+                    17 => "DELETE FROM cycle_a WHERE id=1".to_string(),
+                    // UPDATE one side of a two-table cascade cycle.
+                    18 => "UPDATE cycle_a SET id=10 WHERE id=1".to_string(),
+                    // Try to rebuild the first row in the two-table cascade cycle.
+                    19 => "INSERT OR IGNORE INTO cycle_a VALUES(1,NULL)".to_string(),
+                    // Try to rebuild the second row in the two-table cascade cycle.
+                    20 => "INSERT OR IGNORE INTO cycle_b VALUES(2,1)".to_string(),
+                    // Try to link the rebuilt two-table cascade cycle.
+                    21 => "UPDATE cycle_a SET bid=2 WHERE id=1".to_string(),
+                    // DELETE through a SET NULL cycle.
+                    22 => "DELETE FROM null_a WHERE id=1".to_string(),
+                    // UPDATE through a SET NULL cycle.
+                    23 => "UPDATE null_a SET id=10 WHERE id=1".to_string(),
+                    // DELETE through a SET DEFAULT cycle whose default is NULL.
+                    24 => "DELETE FROM default_a WHERE id=1".to_string(),
+                    // UPDATE through a SET DEFAULT cycle whose default is NULL.
+                    25 => "UPDATE default_a SET id=10 WHERE id=1".to_string(),
+                    // DELETE through a SET DEFAULT cycle whose default breaks the FK.
+                    26 => "DELETE FROM bad_default_a WHERE id=1".to_string(),
+                    // UPDATE through a SET DEFAULT cycle whose default breaks the FK.
+                    27 => "UPDATE bad_default_a SET id=10 WHERE id=1".to_string(),
+                    // INSERT a missing self-reference. Both engines must reject it.
+                    28 => "INSERT INTO self_fk(id,pid) VALUES(30,999)".to_string(),
+                    // INSERT a missing cycle reference. Both engines must reject it.
+                    _ => "INSERT INTO cycle_a VALUES(30,999)".to_string(),
                 };
 
                 let stmt = log_and_exec(&stmt);
                 let sres = sqlite.execute(&stmt, params![]);
                 let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                let context = format!(
+                    "recursive FK action fuzz\nseed: {seed}\nouter: {}\nlast stmt: {stmt}",
+                    outer + 1
+                );
+                helpers::assert_outcome_parity(&sres, &lres, &stmt, &context);
 
-                match (sres, lres) {
-                    (Ok(_), Ok(_)) => {
-                        // Verify state parity
-                        let s_gp = sqlite_exec_rows(&sqlite, "SELECT id,v FROM gp ORDER BY id");
-                        let l_gp = limbo_exec_rows(&limbo, "SELECT id,v FROM gp ORDER BY id");
-                        let s_p = sqlite_exec_rows(&sqlite, "SELECT id,gp_id,v FROM p ORDER BY id");
-                        let l_p = limbo_exec_rows(&limbo, "SELECT id,gp_id,v FROM p ORDER BY id");
-                        let s_c = sqlite_exec_rows(&sqlite, "SELECT id,p_id,v FROM c ORDER BY id");
-                        let l_c = limbo_exec_rows(&limbo, "SELECT id,p_id,v FROM c ORDER BY id");
-
-                        if s_gp != l_gp || s_p != l_p || s_c != l_c {
-                            eprintln!("\n=== Recursive CASCADE fuzz failure ===");
-                            eprintln!("seed: {seed}, outer: {}", outer + 1);
-                            eprintln!("last stmt: {stmt}");
-                            eprintln!("sqlite gp: {s_gp:?}");
-                            eprintln!("limbo  gp: {l_gp:?}");
-                            eprintln!("sqlite p: {s_p:?}");
-                            eprintln!("limbo  p: {l_p:?}");
-                            eprintln!("sqlite c: {s_c:?}");
-                            eprintln!("limbo  c: {l_c:?}");
-                            let mut file =
-                                std::fs::File::create("fk_recursive_cascade_fuzz.sql").unwrap();
-                            for s in stmts.iter() {
-                                let _ = file.write_fmt(format_args!("{s};\n"));
-                            }
-                            file.flush().unwrap();
-                            panic!("Recursive CASCADE mismatch");
-                        }
-                    }
-                    (Err(_), Err(_)) => {}
-                    (ok_sqlite, ok_limbo) => {
-                        eprintln!("\n=== Recursive CASCADE outcome mismatch ===");
-                        eprintln!("seed: {seed}");
-                        eprintln!("sqlite: {ok_sqlite:?}, limbo: {ok_limbo:?}");
-                        eprintln!("stmt: {stmt}");
+                for (table, query) in [
+                    ("gp", "SELECT id,v FROM gp ORDER BY id"),
+                    ("p", "SELECT id,gp_id,v FROM p ORDER BY id"),
+                    ("c", "SELECT id,p_id,v FROM c ORDER BY id"),
+                    ("self_fk", "SELECT id,pid FROM self_fk ORDER BY id"),
+                    ("cycle_a", "SELECT id,bid FROM cycle_a ORDER BY id"),
+                    ("cycle_b", "SELECT id,aid FROM cycle_b ORDER BY id"),
+                    ("null_a", "SELECT id,bid FROM null_a ORDER BY id"),
+                    ("null_b", "SELECT id,aid FROM null_b ORDER BY id"),
+                    ("default_a", "SELECT id,bid FROM default_a ORDER BY id"),
+                    ("default_b", "SELECT id,aid FROM default_b ORDER BY id"),
+                    (
+                        "bad_default_a",
+                        "SELECT id,bid FROM bad_default_a ORDER BY id",
+                    ),
+                    (
+                        "bad_default_b",
+                        "SELECT id,aid FROM bad_default_b ORDER BY id",
+                    ),
+                ] {
+                    let sqlite_rows = sqlite_exec_rows(&sqlite, query);
+                    let limbo_rows = limbo_exec_rows(&limbo, query);
+                    if sqlite_rows != limbo_rows {
+                        eprintln!("\n=== Recursive FK fuzz failure ===");
+                        eprintln!("seed: {seed}, outer: {}", outer + 1);
+                        eprintln!("last stmt: {stmt}");
+                        eprintln!("table: {table}");
+                        eprintln!("sqlite rows: {sqlite_rows:?}");
+                        eprintln!("limbo  rows: {limbo_rows:?}");
                         let mut file =
-                            std::fs::File::create("fk_recursive_cascade_fuzz.sql").unwrap();
+                            std::fs::File::create("fk_recursive_fk_action_fuzz.sql").unwrap();
                         for s in stmts.iter() {
                             let _ = file.write_fmt(format_args!("{s};\n"));
                         }
                         file.flush().unwrap();
-                        panic!("Recursive CASCADE outcome mismatch");
+                        panic!("Recursive FK state mismatch");
                     }
                 }
             }
         }
-        println!("fk_recursive_cascade_fuzz complete (seed {seed})");
+        println!("fk_recursive_fk_action_fuzz complete (seed {seed})");
     }
 
     #[turso_macros::test(mvcc)]

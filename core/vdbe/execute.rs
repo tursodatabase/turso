@@ -4452,6 +4452,7 @@ pub fn op_program(
         },
         insn
     );
+    let subprogram = subprogram.prepared_program()?;
     loop {
         match std::mem::take(state.active_op_state.program()) {
             OpProgramState::Start => {
