@@ -1114,9 +1114,6 @@ pub struct StreamingLogicalLogReader {
     buffer_offset: usize,
     file_size: usize,
     state: StreamingState,
-    /// Buffer of parsed ops from the current transaction frame. `parse_next_transaction`
-    /// fills this; `next_record` drains one op at a time. Empty between transactions.
-    pending_ops: std::collections::VecDeque<ParsedOp>,
     /// Byte offset of the end of the last fully validated transaction frame. Used during
     /// recovery to set the writer offset so that torn-tail bytes are overwritten on next append.
     last_valid_offset: usize,
@@ -1151,7 +1148,6 @@ impl StreamingLogicalLogReader {
             buffer_offset: 0,
             file_size,
             state: StreamingState::NeedTransactionStart,
-            pending_ops: std::collections::VecDeque::new(),
             last_valid_offset: 0,
             running_crc: 0,
             encryption_ctx,
@@ -1247,12 +1243,6 @@ impl StreamingLogicalLogReader {
     /// index op. Empty parsed frames are skipped, so callers that receive Some(frame) can
     /// rely on `frame` being non-empty.
     pub(crate) fn next_frame(&mut self, io: &Arc<dyn crate::IO>) -> Result<Option<Vec<ParsedOp>>> {
-        if !self.pending_ops.is_empty() {
-            return Err(LimboError::InternalError(
-                "next_frame cannot be mixed with next_record on the same reader".to_string(),
-            ));
-        }
-
         loop {
             match self.state {
                 StreamingState::NeedTransactionStart => {
@@ -1269,49 +1259,6 @@ impl StreamingLogicalLogReader {
                         continue;
                     }
                     return Ok(Some(ops));
-                }
-            }
-        }
-    }
-
-    /// Reads next record in log.
-    ///
-    /// This is a test-only version of [Self::next_frame], and it could eventually be replaced
-    /// in tests by [Self::next_frame], which didn't exist when [Self::next_record] was written.
-    #[cfg(test)]
-    pub fn next_record(
-        &mut self,
-        io: &Arc<dyn crate::IO>,
-        mut get_index_info: impl FnMut(MVTableId) -> Result<Arc<IndexInfo>>,
-    ) -> Result<StreamingResult> {
-        let mut get_index_info = |index_id, _op_kind| get_index_info(index_id);
-        if let Some(op) = self.pending_ops.pop_front() {
-            return self.parsed_op_to_streaming(op, &mut get_index_info);
-        }
-
-        loop {
-            match self.state {
-                StreamingState::NeedTransactionStart => {
-                    if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
-                        return Ok(StreamingResult::Eof);
-                    }
-
-                    let ops = match self.parse_next_transaction(io)? {
-                        ParseResult::Ops(ops) => ops,
-                        ParseResult::Eof | ParseResult::InvalidFrame => {
-                            return Ok(StreamingResult::Eof);
-                        }
-                    };
-
-                    if ops.is_empty() {
-                        continue;
-                    }
-                    self.pending_ops = ops.into();
-                    let op = self
-                        .pending_ops
-                        .pop_front()
-                        .expect("ops queue should not be empty");
-                    return self.parsed_op_to_streaming(op, &mut get_index_info);
                 }
             }
         }
@@ -2354,16 +2301,16 @@ mod tests {
             read_varint, read_varint_partial, varint_len, write_varint, DatabaseHeader,
         },
         types::{ImmutableRecord, ImmutableRecordRef, IndexInfo, Text},
-        Buffer, Completion, LimboError, Value, ValueRef,
+        Buffer, Completion, Value, ValueRef,
     };
 
     use super::{
         build_encrypted_chunk_aad, encrypted_chunk_blob_size, encrypted_chunk_plaintext_len,
         encrypted_payload_blob_size, encrypted_payload_chunk_count, serialize_header_entry,
         serialize_op_entry, HeaderReadResult, LogHeader, LogicalLog, ParseResult, ParsedOp,
-        StreamingLogicalLogReader, StreamingResult, ENCRYPTED_CHUNK_AAD_SIZE,
-        ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC, FRAME_MAGIC, LOG_HDR_CRC_START,
-        LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION, TX_HEADER_SIZE, TX_TRAILER_SIZE,
+        StreamingLogicalLogReader, ENCRYPTED_CHUNK_AAD_SIZE, ENCRYPTED_PAYLOAD_CHUNK_SIZE,
+        END_MAGIC, FRAME_MAGIC, LOG_HDR_CRC_START, LOG_HDR_RESERVED_START, LOG_HDR_SIZE,
+        LOG_VERSION, TX_HEADER_SIZE, TX_TRAILER_SIZE,
     };
     use crate::OpenFlags;
     use crate::{turso_assert, turso_assert_less_than};
@@ -2425,39 +2372,36 @@ mod tests {
         let mut reader = StreamingLogicalLogReader::new(file, None);
         reader.read_header(io).unwrap();
         let mut ops = Vec::new();
-        loop {
-            match reader
-                .next_record(io, |_id| {
-                    Err(LimboError::InternalError("no index".to_string()))
-                })
-                .unwrap()
-            {
-                StreamingResult::UpsertTableRow {
-                    row,
-                    rowid,
-                    commit_ts,
-                    btree_resident,
-                } => {
-                    ops.push(ExpectedTableOp::Upsert {
-                        rowid: rowid.row_id.to_int_or_panic(),
-                        payload: row.payload().to_vec(),
+        while let Some(frame) = reader.next_frame(io).unwrap() {
+            for op in frame {
+                match op {
+                    ParsedOp::UpsertTable {
+                        rowid,
+                        record_bytes,
                         commit_ts,
                         btree_resident,
-                    });
-                }
-                StreamingResult::DeleteTableRow {
-                    rowid,
-                    commit_ts,
-                    btree_resident,
-                } => {
-                    ops.push(ExpectedTableOp::Delete {
-                        rowid: rowid.row_id.to_int_or_panic(),
+                        ..
+                    } => {
+                        ops.push(ExpectedTableOp::Upsert {
+                            rowid: rowid.row_id.to_int_or_panic(),
+                            payload: record_bytes,
+                            commit_ts,
+                            btree_resident,
+                        });
+                    }
+                    ParsedOp::DeleteTable {
+                        rowid,
                         commit_ts,
                         btree_resident,
-                    });
+                    } => {
+                        ops.push(ExpectedTableOp::Delete {
+                            rowid: rowid.row_id.to_int_or_panic(),
+                            commit_ts,
+                            btree_resident,
+                        });
+                    }
+                    other => panic!("unexpected op: {other:?}"),
                 }
-                StreamingResult::Eof => break,
-                other => panic!("unexpected record: {other:?}"),
             }
         }
         ops
@@ -2947,12 +2891,16 @@ mod tests {
             reader.read_header(&io).unwrap();
             let mut seen = 0;
             loop {
-                match reader.next_record(&io, |_id| {
-                    Err(LimboError::InternalError("no index".to_string()))
-                }) {
-                    Ok(StreamingResult::UpsertTableRow { .. }) => seen += 1,
-                    Ok(StreamingResult::Eof) => break,
-                    Ok(other) => panic!("unexpected record: {other:?}"),
+                match reader.next_frame(&io) {
+                    Ok(Some(frame)) => {
+                        for op in frame {
+                            match op {
+                                ParsedOp::UpsertTable { .. } => seen += 1,
+                                other => panic!("unexpected op: {other:?}"),
+                            }
+                        }
+                    }
+                    Ok(None) => break,
                     Err(err) => panic!("unexpected error: {err:?}"),
                 }
             }
@@ -3030,17 +2978,14 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file, None);
         reader.read_header(&io).unwrap();
-        match reader
-            .next_record(&io, |_id| {
-                Err(LimboError::InternalError("no index".to_string()))
-            })
-            .unwrap()
-        {
-            StreamingResult::UpsertTableRow { rowid, .. } => {
+        let frame = reader.next_frame(&io).unwrap().expect("expected one frame");
+        assert_eq!(frame.len(), 1);
+        match &frame[0] {
+            ParsedOp::UpsertTable { rowid, .. } => {
                 assert_eq!(rowid.table_id, table_id);
                 assert_eq!(rowid.row_id.to_int_or_panic(), 7);
             }
-            other => panic!("unexpected record: {other:?}"),
+            other => panic!("unexpected op: {other:?}"),
         }
     }
 
@@ -3149,10 +3094,8 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
-        let res = reader.next_record(&io, |_id| {
-            Err(LimboError::InternalError("no index".to_string()))
-        });
-        assert!(matches!(res.unwrap(), StreamingResult::Eof));
+        let res = reader.next_frame(&io);
+        assert!(res.unwrap().is_none());
     }
 
     /// What this test checks: Malformed payload-length varint in newest frame is treated as invalid tail.
@@ -3223,10 +3166,8 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
-        let res = reader.next_record(&io, |_id| {
-            Err(LimboError::InternalError("no index".to_string()))
-        });
-        assert!(matches!(res.unwrap(), StreamingResult::Eof));
+        let res = reader.next_frame(&io);
+        assert!(res.unwrap().is_none());
     }
 
     /// What this test checks: Header payload-size mismatch in the newest frame is treated as invalid tail.
@@ -3251,10 +3192,8 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
-        let res = reader.next_record(&io, |_id| {
-            Err(LimboError::InternalError("no index".to_string()))
-        });
-        assert!(matches!(res.unwrap(), StreamingResult::Eof));
+        let res = reader.next_frame(&io);
+        assert!(res.unwrap().is_none());
     }
 
     /// What this test checks: Invalid frame-magic at newest frame boundary is treated as invalid tail.
@@ -3275,10 +3214,8 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
-        let res = reader.next_record(&io, |_id| {
-            Err(LimboError::InternalError("no index".to_string()))
-        });
-        assert!(matches!(res.unwrap(), StreamingResult::Eof));
+        let res = reader.next_frame(&io);
+        assert!(res.unwrap().is_none());
     }
 
     /// What this test checks: Corrupting only the stored CRC field turns newest frame into invalid tail.
@@ -3298,10 +3235,8 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
-        let res = reader.next_record(&io, |_id| {
-            Err(LimboError::InternalError("no index".to_string()))
-        });
-        assert!(matches!(res.unwrap(), StreamingResult::Eof));
+        let res = reader.next_frame(&io);
+        assert!(res.unwrap().is_none());
     }
 
     /// What this test checks: A corrupted newest frame is dropped while older valid frames still replay.
@@ -3516,10 +3451,8 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
-        let res = reader.next_record(&io, |_id| {
-            Err(LimboError::InternalError("no index".to_string()))
-        });
-        assert!(matches!(res.unwrap(), StreamingResult::Eof));
+        let res = reader.next_frame(&io);
+        assert!(res.unwrap().is_none());
     }
 
     /// What this test checks: Non-negative table_id in newest frame is treated as invalid tail.
@@ -3542,10 +3475,8 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
-        let res = reader.next_record(&io, |_id| {
-            Err(LimboError::InternalError("no index".to_string()))
-        });
-        assert!(matches!(res.unwrap(), StreamingResult::Eof));
+        let res = reader.next_frame(&io);
+        assert!(res.unwrap().is_none());
     }
 
     /// What this test checks: Zero-operation frames are silently skipped by the reader, and a
@@ -3579,29 +3510,24 @@ mod tests {
         reader.read_header(&io).unwrap();
 
         // The reader skips the empty frame and returns the UpdateHeader from frame 2.
-        let rec = reader
-            .next_record(&io, |_id| {
-                Err(LimboError::InternalError("no index".to_string()))
-            })
-            .unwrap();
-        match rec {
-            StreamingResult::UpdateHeader {
+        let frame = reader
+            .next_frame(&io)
+            .unwrap()
+            .expect("expected UpdateHeader frame after empty tx");
+        assert_eq!(frame.len(), 1);
+        match &frame[0] {
+            ParsedOp::UpdateHeader {
                 header: recovered,
                 commit_ts: recovered_ts,
             } => {
-                assert_eq!(recovered_ts, commit_ts);
+                assert_eq!(*recovered_ts, commit_ts);
                 assert_eq!(recovered.magic, db_header.magic);
             }
             other => panic!("expected UpdateHeader, got {other:?}"),
         }
 
         // Nothing left after frame 2.
-        let eof = reader
-            .next_record(&io, |_id| {
-                Err(LimboError::InternalError("no index".to_string()))
-            })
-            .unwrap();
-        assert!(matches!(eof, StreamingResult::Eof));
+        assert!(reader.next_frame(&io).unwrap().is_none());
     }
 
     /// What this test checks: Every single-bit flip in a full frame is either detected or safely rejected.
@@ -3648,13 +3574,11 @@ mod tests {
 
                 let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
                 reader.read_header(&io).unwrap();
-                let res = reader.next_record(&io, |_id| {
-                    Err(LimboError::InternalError("no index".to_string()))
-                });
+                let res = reader.next_frame(&io);
                 match res {
-                    Err(_) | Ok(StreamingResult::Eof) => {}
-                    Ok(other) => {
-                        panic!("bit flip at offset={i}, bit={bit} produced valid record: {other:?}")
+                    Err(_) | Ok(None) => {}
+                    Ok(Some(frame)) => {
+                        panic!("bit flip at offset={i}, bit={bit} produced valid frame: {frame:?}")
                     }
                 }
 
@@ -3925,16 +3849,13 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
-        let rec = reader
-            .next_record(&io, |_id| {
-                Err(LimboError::InternalError("no index".to_string()))
-            })
-            .unwrap();
-        match rec {
-            StreamingResult::UpsertTableRow { btree_resident, .. } => {
-                assert!(btree_resident);
+        let frame = reader.next_frame(&io).unwrap().expect("expected one frame");
+        assert_eq!(frame.len(), 1);
+        match &frame[0] {
+            ParsedOp::UpsertTable { btree_resident, .. } => {
+                assert!(*btree_resident);
             }
-            _ => panic!("unexpected record"),
+            other => panic!("unexpected op: {other:?}"),
         }
     }
 
