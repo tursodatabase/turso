@@ -430,6 +430,12 @@ def _test_kv(exec_name, ext_path):
     turso.execute_dot(
         "create virtual table t using kv_store;",
     )
+    if exec_name is None:
+        turso.run_test_fn(
+            "SELECT test_scalar_context(40, 2);",
+            lambda res: "42" == res,
+            "can call scalar_context macro extension function",
+        )
     turso.run_test_fn(".schema", lambda res: "CREATE VIRTUAL TABLE t" in res)
     turso.run_test_fn(
         "insert into t values ('hello', 'world');",
