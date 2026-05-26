@@ -1099,7 +1099,10 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     .is_some_and(|j| j.is_ordering_constrained())
             })
             .count();
-        if ordering_constrained_count == 0 {
+        let has_full_outer = joined_tables
+            .iter()
+            .any(|t| t.join_info.as_ref().is_some_and(|j| j.is_full_outer()));
+        if ordering_constrained_count == 0 && !has_full_outer {
             None
         } else {
             // map from rhs table index to lhs table index
@@ -1122,6 +1125,25 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                             mask.set(j)?;
                             left_join_illegal_map.insert(i, mask);
                         }
+                    }
+                }
+            }
+            // FULL OUTER acts as a reordering barrier in both directions: tables
+            // originally after a FULL OUTER table cannot be moved before it, or
+            // the planner produces e.g. `(t1 INNER t3) FULL OUTER t2` instead of
+            // the requested `(t1 FULL OUTER t2) INNER t3`, which can leak
+            // NULL-filled probe rows past the inner join.
+            for (k, t) in joined_tables.iter().enumerate() {
+                if !t.join_info.as_ref().is_some_and(|j| j.is_full_outer()) {
+                    continue;
+                }
+                for j in (k + 1)..joined_tables.len() {
+                    if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&k) {
+                        illegal_lhs.set(j)?;
+                    } else {
+                        let mut mask = TableMask::default();
+                        mask.set(j)?;
+                        left_join_illegal_map.insert(k, mask);
                     }
                 }
             }
