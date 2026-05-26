@@ -21,7 +21,7 @@ where
     K: Eq + Hash,
 {
     #[inline(always)]
-    fn try_with_capacity(capacity: usize) -> Result<Self, TryReserveError> {
+    fn try_with_capacity_ext(capacity: usize) -> Result<Self, TryReserveError> {
         Ok(HashMap::with_capacity_and_hasher(capacity, FxBuildHasher))
     }
 }

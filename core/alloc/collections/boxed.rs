@@ -1,10 +1,24 @@
 use super::{TryClone, TursoBoxExt, TursoNewExt, TursoTryNewExt};
-use crate::alloc::{AllocError, Box, TursoAllocator};
+#[cfg(nightly)]
+use crate::alloc::TursoAllocator;
+use crate::alloc::{AllocError, Box};
 
+#[cfg(not(nightly))]
+fn boxed<T>(value: T) -> Box<T> {
+    Box::new(value)
+}
+
+#[cfg(nightly)]
 fn boxed<T>(value: T) -> Box<T> {
     Box::new_in(value, TursoAllocator)
 }
 
+#[cfg(not(nightly))]
+fn try_boxed<T>(value: T) -> Result<Box<T>, AllocError> {
+    Ok(Box::new(value))
+}
+
+#[cfg(nightly)]
 fn try_boxed<T>(value: T) -> Result<Box<T>, AllocError> {
     Box::try_new_in(value, TursoAllocator)
 }
@@ -25,7 +39,7 @@ impl<T> TursoBoxExt<T> for Box<T> {
     fn into_inner(self) -> T {
         #[cfg(not(nightly))]
         {
-            Box::into_inner(self)
+            *self
         }
         #[cfg(nightly)]
         {

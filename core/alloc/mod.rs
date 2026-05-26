@@ -47,8 +47,9 @@ pub struct TursoAllocator;
 
 pub type Allocator = TursoAllocator;
 
+// TODO: change this to use allocator_api2 Box when we finish migrating callsites
 #[cfg(not(nightly))]
-pub type Box<T> = allocator_api2::boxed::Box<T, TursoAllocator>;
+pub type Box<T> = std::boxed::Box<T>;
 #[cfg(nightly)]
 pub type Box<T> = std::boxed::Box<T, TursoAllocator>;
 
@@ -105,7 +106,7 @@ macro_rules! __turso_alloc_try_vec {
         (|| {
             let count = $count;
             let mut values =
-                <$crate::alloc::Vec<_> as $crate::alloc::TursoTryWithCapacityExt>::try_with_capacity(
+                <$crate::alloc::Vec<_> as $crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
                     count,
                 )?;
             values.resize(count, $element);
@@ -115,7 +116,7 @@ macro_rules! __turso_alloc_try_vec {
     ($($element:expr),+ $(,)?) => {{
         (|| {
             let mut values =
-                <$crate::alloc::Vec<_> as $crate::alloc::TursoTryWithCapacityExt>::try_with_capacity(
+                <$crate::alloc::Vec<_> as $crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
                     $crate::__turso_alloc_vec_count!($($element),+),
                 )?;
             $(values.try_push($element)?;)+

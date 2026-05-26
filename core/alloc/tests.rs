@@ -255,11 +255,11 @@ fn iterator_try_unzip_builds_turso_collections() {
 
 #[test]
 fn try_with_capacity_builds_turso_collections() {
-    let values: Vec<usize> = TursoTryWithCapacityExt::try_with_capacity(3).unwrap();
-    let map: HashMap<usize, usize> = TursoTryWithCapacityExt::try_with_capacity(3).unwrap();
-    let set: HashSet<usize> = TursoTryWithCapacityExt::try_with_capacity(3).unwrap();
-    let queue: VecDeque<usize> = TursoTryWithCapacityExt::try_with_capacity(3).unwrap();
-    let heap: BinaryHeap<usize> = TursoTryWithCapacityExt::try_with_capacity(3).unwrap();
+    let values: Vec<usize> = TursoTryWithCapacityExt::try_with_capacity_ext(3).unwrap();
+    let map: HashMap<usize, usize> = TursoTryWithCapacityExt::try_with_capacity_ext(3).unwrap();
+    let set: HashSet<usize> = TursoTryWithCapacityExt::try_with_capacity_ext(3).unwrap();
+    let queue: VecDeque<usize> = TursoTryWithCapacityExt::try_with_capacity_ext(3).unwrap();
+    let heap: BinaryHeap<usize> = TursoTryWithCapacityExt::try_with_capacity_ext(3).unwrap();
 
     assert!(values.capacity() >= 3);
     assert!(map.capacity() >= 3);
@@ -275,7 +275,7 @@ fn try_clone_builds_independent_alloc_collections() {
     assert_eq!(cloned.as_slice(), values.as_slice());
     assert_ne!(cloned.as_ptr(), values.as_ptr());
 
-    let boxed = Box::try_new(String::from("turso")).unwrap();
+    let boxed: Box<_> = TursoTryNewExt::try_new(String::from("turso")).unwrap();
     let cloned = boxed.try_clone().unwrap();
     assert_eq!(&*cloned, &*boxed);
 
