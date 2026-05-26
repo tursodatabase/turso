@@ -94,4 +94,3 @@ pub fn scalar(attr: TokenStream, input: TokenStream) -> TokenStream {
 
     TokenStream::from(expanded)
 }
-
