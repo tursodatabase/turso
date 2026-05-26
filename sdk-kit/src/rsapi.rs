@@ -1095,7 +1095,7 @@ impl TursoStatement {
                 "bind index {index} is out of bounds"
             )));
         }
-        stmt.bind_at(index, value);
+        stmt.bind_at(index, value)?;
         Ok(())
     }
     /// named parameter position.

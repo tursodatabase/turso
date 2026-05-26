@@ -489,7 +489,7 @@ impl DatabaseChangesIterator {
         query_stmt.bind_at(
             1.try_into().unwrap(),
             turso_core::Value::from_i64(change_id_filter),
-        );
+        )?;
 
         let mut last_change_id = None;
         while let Some(row) = run_stmt_once(coro, query_stmt).await? {
@@ -547,7 +547,7 @@ async fn replay_stmt<Ctx>(
 ) -> Result<()> {
     stmt.reset()?;
     for (i, value) in values.into_iter().enumerate() {
-        stmt.bind_at((i + 1).try_into().unwrap(), value);
+        stmt.bind_at((i + 1).try_into().unwrap(), value)?;
     }
     exec_stmt(coro, stmt).await?;
     Ok(())

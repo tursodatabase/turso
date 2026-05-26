@@ -793,7 +793,8 @@ impl Statement {
             .borrow_mut()
             .as_mut()
             .ok_or_else(|| create_generic_error("statement has been finalized"))?
-            .bind_at(non_zero_idx, turso_value);
+            .bind_at(non_zero_idx, turso_value)
+            .map_err(|err| create_generic_error(&err.to_string()))?;
         Ok(())
     }
 

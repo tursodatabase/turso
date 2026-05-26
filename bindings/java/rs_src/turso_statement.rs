@@ -158,9 +158,16 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_bindNull<'local>(
         }
     };
 
-    stmt.stmt
-        .bind_at(NonZero::new(position as usize).unwrap(), Value::Null);
-    SQLITE_OK
+    match stmt
+        .stmt
+        .bind_at(NonZero::new(position as usize).unwrap(), Value::Null)
+    {
+        Ok(()) => SQLITE_OK,
+        Err(e) => {
+            set_err_msg_and_throw_exception(&mut env, obj, SQLITE_ERROR, e.to_string());
+            SQLITE_ERROR
+        }
+    }
 }
 
 #[no_mangle]
@@ -179,11 +186,16 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_bindLong<'local>(
         }
     };
 
-    stmt.stmt.bind_at(
+    match stmt.stmt.bind_at(
         NonZero::new(position as usize).unwrap(),
         Value::from_i64(value),
-    );
-    SQLITE_OK
+    ) {
+        Ok(()) => SQLITE_OK,
+        Err(e) => {
+            set_err_msg_and_throw_exception(&mut env, obj, SQLITE_ERROR, e.to_string());
+            SQLITE_ERROR
+        }
+    }
 }
 
 #[no_mangle]
@@ -202,11 +214,16 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_bindDouble<'local>(
         }
     };
 
-    stmt.stmt.bind_at(
+    match stmt.stmt.bind_at(
         NonZero::new(position as usize).unwrap(),
         Value::from_f64(value),
-    );
-    SQLITE_OK
+    ) {
+        Ok(()) => SQLITE_OK,
+        Err(e) => {
+            set_err_msg_and_throw_exception(&mut env, obj, SQLITE_ERROR, e.to_string());
+            SQLITE_ERROR
+        }
+    }
 }
 
 #[no_mangle]
@@ -230,11 +247,16 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_bindText<'local>(
         Err(_) => return SQLITE_ERROR,
     };
 
-    stmt.stmt.bind_at(
+    match stmt.stmt.bind_at(
         NonZero::new(position as usize).unwrap(),
         Value::build_text(text),
-    );
-    SQLITE_OK
+    ) {
+        Ok(()) => SQLITE_OK,
+        Err(e) => {
+            set_err_msg_and_throw_exception(&mut env, obj, SQLITE_ERROR, e.to_string());
+            SQLITE_ERROR
+        }
+    }
 }
 
 #[no_mangle]
@@ -258,9 +280,16 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_bindBlob<'local>(
         Err(_) => return SQLITE_ERROR,
     };
 
-    stmt.stmt
-        .bind_at(NonZero::new(position as usize).unwrap(), Value::Blob(blob));
-    SQLITE_OK
+    match stmt
+        .stmt
+        .bind_at(NonZero::new(position as usize).unwrap(), Value::Blob(blob))
+    {
+        Ok(()) => SQLITE_OK,
+        Err(e) => {
+            set_err_msg_and_throw_exception(&mut env, obj, SQLITE_ERROR, e.to_string());
+            SQLITE_ERROR
+        }
+    }
 }
 
 #[no_mangle]

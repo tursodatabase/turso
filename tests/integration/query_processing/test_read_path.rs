@@ -9,7 +9,7 @@ fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     let mut stmt = conn.prepare("select ?")?;
 
-    stmt.bind_at(1.try_into()?, Value::from_i64(1));
+    stmt.bind_at(1.try_into()?, Value::from_i64(1))?;
     stmt.run_with_row_callback(|row| {
         assert_eq!(
             *row.get::<&Value>(0).unwrap(),
@@ -21,7 +21,7 @@ fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     stmt.reset()?;
 
-    stmt.bind_at(1.try_into()?, Value::from_i64(2));
+    stmt.bind_at(1.try_into()?, Value::from_i64(2))?;
 
     stmt.run_with_row_callback(|row| {
         assert_eq!(
@@ -41,14 +41,14 @@ fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     let mut stmt = conn.prepare("select ?, ?1, :named, ?3, ?4")?;
 
-    stmt.bind_at(1.try_into()?, Value::build_text("hello"));
+    stmt.bind_at(1.try_into()?, Value::build_text("hello"))?;
 
     let i = stmt.parameters().index(":named").unwrap();
-    stmt.bind_at(i, Value::from_i64(42));
+    stmt.bind_at(i, Value::from_i64(42))?;
 
-    stmt.bind_at(3.try_into()?, Value::from_blob(vec![0x1, 0x2, 0x3]));
+    stmt.bind_at(3.try_into()?, Value::from_blob(vec![0x1, 0x2, 0x3]))?;
 
-    stmt.bind_at(4.try_into()?, Value::from_f64(0.5));
+    stmt.bind_at(4.try_into()?, Value::from_f64(0.5))?;
 
     assert_eq!(stmt.parameters().count(), 4);
 
@@ -142,7 +142,7 @@ fn test_insert_parameter_remap(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let args = [Value::from_i64(111), Value::from_i64(222)];
     for (i, arg) in args.iter().enumerate() {
         let idx = i + 1;
-        ins.bind_at(idx.try_into()?, arg.clone());
+        ins.bind_at(idx.try_into()?, arg.clone())?;
     }
     ins.run_with_row_callback(|_| panic!("Unexpected row"))?;
 
@@ -196,7 +196,7 @@ fn test_insert_parameter_remap_all_params(tmp_db: TempDatabase) -> anyhow::Resul
     ];
     for (i, value) in values.iter().enumerate() {
         let idx = i + 1;
-        ins.bind_at(idx.try_into()?, value.clone());
+        ins.bind_at(idx.try_into()?, value.clone())?;
     }
 
     // execute the insert (no rows returned)
@@ -249,7 +249,7 @@ fn test_insert_parameter_multiple_remap_backwards(tmp_db: TempDatabase) -> anyho
     ];
     for (i, value) in values.iter().enumerate() {
         let idx = i + 1;
-        ins.bind_at(idx.try_into()?, value.clone());
+        ins.bind_at(idx.try_into()?, value.clone())?;
     }
 
     // execute the insert (no rows returned)
@@ -302,7 +302,7 @@ fn test_insert_parameter_multiple_no_remap(tmp_db: TempDatabase) -> anyhow::Resu
     ];
     for (i, value) in values.iter().enumerate() {
         let idx = i + 1;
-        ins.bind_at(idx.try_into()?, value.clone());
+        ins.bind_at(idx.try_into()?, value.clone())?;
     }
 
     // execute the insert (no rows returned)
@@ -357,7 +357,7 @@ fn test_insert_parameter_multiple_row(tmp_db: TempDatabase) -> anyhow::Result<()
     ];
     for (i, value) in values.iter().enumerate() {
         let idx = i + 1;
-        ins.bind_at(idx.try_into()?, value.clone());
+        ins.bind_at(idx.try_into()?, value.clone())?;
     }
 
     // execute the insert (no rows returned)
@@ -396,8 +396,8 @@ fn test_bind_parameters_update_query(tmp_db: TempDatabase) -> anyhow::Result<()>
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut ins = conn.prepare("update test set a = ? where b = ?;")?;
-    ins.bind_at(1.try_into()?, Value::from_i64(222));
-    ins.bind_at(2.try_into()?, Value::build_text("test1"));
+    ins.bind_at(1.try_into()?, Value::from_i64(222))?;
+    ins.bind_at(2.try_into()?, Value::build_text("test1"))?;
 
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
@@ -421,9 +421,9 @@ fn test_bind_parameters_update_query_multiple_where(tmp_db: TempDatabase) -> any
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut ins = conn.prepare("update test set a = ? where b = ? and c = 4 and d = ?;")?;
-    ins.bind_at(1.try_into()?, Value::from_i64(222));
-    ins.bind_at(2.try_into()?, Value::build_text("test1"));
-    ins.bind_at(3.try_into()?, Value::from_i64(5));
+    ins.bind_at(1.try_into()?, Value::from_i64(222))?;
+    ins.bind_at(2.try_into()?, Value::build_text("test1"))?;
+    ins.bind_at(3.try_into()?, Value::from_i64(5))?;
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select a, b, c, d from test;")?;
@@ -455,8 +455,8 @@ fn test_bind_parameters_update_rowid_alias(tmp_db: TempDatabase) -> anyhow::Resu
     })?;
 
     let mut ins = conn.prepare("update test set name = ? where id = ?;")?;
-    ins.bind_at(1.try_into()?, Value::build_text("updated"));
-    ins.bind_at(2.try_into()?, Value::from_i64(1));
+    ins.bind_at(1.try_into()?, Value::build_text("updated"))?;
+    ins.bind_at(2.try_into()?, Value::from_i64(1))?;
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select id, name from test;")?;
@@ -495,10 +495,10 @@ fn test_bind_parameters_update_rowid_alias_seek_rowid(tmp_db: TempDatabase) -> a
     })?;
 
     let mut ins = conn.prepare("update test set name = ? where id < ? AND age between ? and ?;")?;
-    ins.bind_at(1.try_into()?, Value::build_text("updated"));
-    ins.bind_at(2.try_into()?, Value::from_i64(2));
-    ins.bind_at(3.try_into()?, Value::from_i64(3));
-    ins.bind_at(4.try_into()?, Value::from_i64(5));
+    ins.bind_at(1.try_into()?, Value::build_text("updated"))?;
+    ins.bind_at(2.try_into()?, Value::from_i64(2))?;
+    ins.bind_at(3.try_into()?, Value::from_i64(3))?;
+    ins.bind_at(4.try_into()?, Value::from_i64(5))?;
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select name from test;")?;
@@ -529,10 +529,10 @@ fn test_bind_parameters_delete_rowid_alias_seek_out_of_order(
 
     let mut ins =
         conn.prepare("delete from test where age between ? and ? AND id > ? AND name = ?;")?;
-    ins.bind_at(1.try_into()?, Value::from_i64(10));
-    ins.bind_at(2.try_into()?, Value::from_i64(12));
-    ins.bind_at(3.try_into()?, Value::from_i64(4));
-    ins.bind_at(4.try_into()?, Value::build_text("test"));
+    ins.bind_at(1.try_into()?, Value::from_i64(10))?;
+    ins.bind_at(2.try_into()?, Value::from_i64(12))?;
+    ins.bind_at(3.try_into()?, Value::from_i64(4))?;
+    ins.bind_at(4.try_into()?, Value::build_text("test"))?;
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select name from test;")?;
@@ -672,8 +672,8 @@ fn test_offset_limit_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
         (1, 1, vec![vec![turso_core::Value::from_i64(4)]]),
     ] {
         let mut stmt = conn.prepare("SELECT * FROM test LIMIT ? OFFSET ?")?;
-        stmt.bind_at(1.try_into()?, Value::from_i64(limit));
-        stmt.bind_at(2.try_into()?, Value::from_i64(offset));
+        stmt.bind_at(1.try_into()?, Value::from_i64(limit))?;
+        stmt.bind_at(2.try_into()?, Value::from_i64(offset))?;
 
         let mut rows = Vec::new();
         stmt.run_with_row_callback(|row| {
@@ -697,11 +697,11 @@ fn test_upsert_parameters_order(tmp_db: TempDatabase) -> anyhow::Result<()> {
     conn.execute("INSERT INTO test VALUES (1, 2), (3, 4)")?;
     let mut stmt =
         conn.prepare("INSERT INTO test VALUES (?, ?), (?, ?) ON CONFLICT DO UPDATE SET v = ?")?;
-    stmt.bind_at(1.try_into()?, Value::from_i64(1));
-    stmt.bind_at(2.try_into()?, Value::from_i64(20));
-    stmt.bind_at(3.try_into()?, Value::from_i64(3));
-    stmt.bind_at(4.try_into()?, Value::from_i64(40));
-    stmt.bind_at(5.try_into()?, Value::from_i64(66));
+    stmt.bind_at(1.try_into()?, Value::from_i64(1))?;
+    stmt.bind_at(2.try_into()?, Value::from_i64(20))?;
+    stmt.bind_at(3.try_into()?, Value::from_i64(3))?;
+    stmt.bind_at(4.try_into()?, Value::from_i64(40))?;
+    stmt.bind_at(5.try_into()?, Value::from_i64(66))?;
     stmt.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut rows = Vec::new();
@@ -755,7 +755,7 @@ fn test_stmt_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let mut stmt1 = conn1.prepare("INSERT INTO test VALUES (?)").unwrap();
     for _ in 0..3 {
         stmt1.reset()?;
-        stmt1.bind_at(1.try_into().unwrap(), Value::Blob(vec![0u8; 1024]));
+        stmt1.bind_at(1.try_into().unwrap(), Value::Blob(vec![0u8; 1024]))?;
         loop {
             match stmt1.step().unwrap() {
                 StepResult::Done => break,
@@ -770,7 +770,7 @@ fn test_stmt_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
         .unwrap();
 
     stmt1.reset()?;
-    stmt1.bind_at(1.try_into().unwrap(), Value::Blob(vec![0u8; 1024]));
+    stmt1.bind_at(1.try_into().unwrap(), Value::Blob(vec![0u8; 1024]))?;
     loop {
         match stmt1.step().unwrap() {
             StepResult::Done => break,
@@ -922,11 +922,13 @@ fn test_eval_param_only_once(tmp_db: TempDatabase) {
     stmt.bind_at(
         1.try_into().unwrap(),
         turso_core::Value::from_i64(100_000_000),
-    );
+    )
+    .unwrap();
     stmt.bind_at(
         2.try_into().unwrap(),
         turso_core::Value::from_i64(100_000_000),
-    );
+    )
+    .unwrap();
     let start_time = std::time::Instant::now();
     stmt.run_with_row_callback(|row| {
         let values = row.get_values().cloned().collect::<Vec<_>>();
@@ -1020,8 +1022,8 @@ fn test_bind_in_exists_subquery(tmp_db: TempDatabase) -> anyhow::Result<()> {
         stmt.parameters().has_slot(2.try_into().unwrap()),
         "parameter ?2 should be registered"
     );
-    stmt.bind_at(1.try_into()?, Value::from_i64(42));
-    stmt.bind_at(2.try_into()?, Value::from_i64(1));
+    stmt.bind_at(1.try_into()?, Value::from_i64(42))?;
+    stmt.bind_at(2.try_into()?, Value::from_i64(1))?;
     let mut turso_rows = Vec::new();
     stmt.run_with_row_callback(|row| {
         turso_rows.push(row.get::<&Value>(2).unwrap().clone());
