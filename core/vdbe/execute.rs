@@ -14664,12 +14664,22 @@ fn op_journal_mode_inner(
                         enc_ctx,
                     )?;
                     program.connection.db.mv_store.store(Some(mv_store.clone()));
+                    program
+                        .connection
+                        .db
+                        .mv_store_active
+                        .store(true, Ordering::Release);
                     program.connection.demote_to_mvcc_connection();
                     mv_store.bootstrap(program.connection.clone())?;
                 }
 
                 if matches!(new_mode, journal_mode::JournalMode::Wal) {
                     program.connection.db.mv_store.store(None);
+                    program
+                        .connection
+                        .db
+                        .mv_store_active
+                        .store(false, Ordering::Release);
                 }
 
                 // Return result

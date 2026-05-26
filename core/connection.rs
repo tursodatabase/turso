@@ -2072,10 +2072,12 @@ impl Connection {
         }
 
         // Never use MV store for bootstrapping - we read state directly from sqlite_schema in the DB file.
-        if !self.is_mvcc_bootstrap_connection() {
-            either::Left(self.db.get_mv_store())
-        } else {
+        // The `has_mv_store` check is a relaxed atomic-bool load that lets non-MVCC
+        // databases skip the ArcSwap load entirely on the per-step hot path.
+        if self.is_mvcc_bootstrap_connection() || !self.db.has_mv_store() {
             either::Right(TransparentWrapper(None))
+        } else {
+            either::Left(self.db.get_mv_store())
         }
     }
 
@@ -2564,6 +2566,7 @@ impl Connection {
                 enc_ctx,
             )?;
             db.mv_store.store(Some(mv_store.clone()));
+            db.mv_store_active.store(true, Ordering::Release);
             let bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;
             mv_store.bootstrap(bootstrap_conn)?;
         }
@@ -3353,14 +3356,21 @@ impl Connection {
             return None;
         }
         match db {
-            crate::MAIN_DB_ID => self.db.get_mv_store().as_ref().cloned(),
+            crate::MAIN_DB_ID => {
+                if !self.db.has_mv_store() {
+                    return None;
+                }
+                self.db.get_mv_store().as_ref().cloned()
+            }
             crate::TEMP_DB_ID => None,
             _ => {
                 let catalog = self.attached_databases.read();
-                catalog
-                    .index_to_data
-                    .get(&db)
-                    .and_then(|(db, _)| db.get_mv_store().as_ref().cloned())
+                catalog.index_to_data.get(&db).and_then(|(db, _)| {
+                    if !db.has_mv_store() {
+                        return None;
+                    }
+                    db.get_mv_store().as_ref().cloned()
+                })
             }
         }
     }

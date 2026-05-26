@@ -480,6 +480,10 @@ static DATABASE_MANAGER: LazyLock<Arc<parking_lot::Mutex<HashMap<DatabaseKey, Re
 /// encryption key here.
 pub struct Database {
     mv_store: ArcSwapOption<MvStore>,
+    /// Set when `mv_store` is populated. Lets callers skip the ArcSwap load on
+    /// non-MVCC databases: an Acquire `bool` is ~1ns vs ~30ns for
+    /// `HybridStrategy::load`, and this fires on every `Statement::step()`.
+    mv_store_active: AtomicBool,
     schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
     pub path: String,
@@ -589,6 +593,7 @@ impl Database {
         let wal_path = wal_path.into();
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
+        let mv_store_active = AtomicBool::new(false);
 
         let db_size = db_file.size()?;
 
@@ -616,6 +621,7 @@ impl Database {
 
         let db = Database {
             mv_store,
+            mv_store_active,
             path,
             wal_path,
             schema: Arc::new(Mutex::new(Arc::new({
@@ -1637,6 +1643,7 @@ impl Database {
                 enc_ctx,
             )?;
             self.mv_store.store(Some(mv_store));
+            self.mv_store_active.store(true, Ordering::Release);
         }
 
         Ok(Arc::new(pager))
@@ -2403,6 +2410,13 @@ impl Database {
         self.mv_store.load()
     }
 
+    /// Cheap fast-path check: true once `mv_store` has been populated. Avoids
+    /// the ArcSwap load on the hot per-step path for non-MVCC databases.
+    #[inline]
+    pub fn has_mv_store(&self) -> bool {
+        self.mv_store_active.load(Ordering::Acquire)
+    }
+
     pub fn experimental_views_enabled(&self) -> bool {
         self.opts.enable_views
     }
@@ -2445,7 +2459,7 @@ impl Database {
 
     /// check if database is currently in MVCC mode
     pub fn mvcc_enabled(&self) -> bool {
-        self.mv_store.load().is_some()
+        self.has_mv_store()
     }
 
     #[cfg(feature = "test_helper")]
