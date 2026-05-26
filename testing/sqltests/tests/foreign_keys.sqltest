@@ -767,6 +767,192 @@ expect {
 }
 
 @cross-check-integrity
+test fk-deferred-parent-update-ignore-noop-keeps-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id UNIQUE ON CONFLICT IGNORE);
+    CREATE TABLE child(
+        id PRIMARY KEY,
+        pid,
+        FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (20);
+    INSERT INTO parent VALUES (24);
+    INSERT INTO child VALUES (1, 20);
+    BEGIN;
+    INSERT INTO child VALUES (2, 276);
+    UPDATE parent SET id=20 WHERE id=24;
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-parent-update-or-ignore-noop-keeps-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id UNIQUE);
+    CREATE TABLE child(
+        id PRIMARY KEY,
+        pid,
+        FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (20);
+    INSERT INTO parent VALUES (24);
+    INSERT INTO child VALUES (1, 20);
+    BEGIN;
+    INSERT INTO child VALUES (2, 276);
+    UPDATE OR IGNORE parent SET id=20 WHERE id=24;
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-parent-update-ignore-noop-keeps-old-key-valid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id UNIQUE ON CONFLICT IGNORE);
+    CREATE TABLE child(
+        id PRIMARY KEY,
+        pid,
+        FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (20);
+    INSERT INTO parent VALUES (24);
+    INSERT INTO child VALUES (1, 24);
+    BEGIN;
+    UPDATE parent SET id=20 WHERE id=24;
+    COMMIT;
+    SELECT id, pid FROM child;
+}
+expect {
+    1|24
+}
+
+@cross-check-integrity
+test fk-deferred-parent-ipk-update-ignore-noop-keeps-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY ON CONFLICT IGNORE);
+    CREATE TABLE child(
+        id PRIMARY KEY,
+        pid REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (20);
+    INSERT INTO parent VALUES (24);
+    INSERT INTO child VALUES (1, 20);
+    BEGIN;
+    INSERT INTO child VALUES (2, 276);
+    UPDATE parent SET id=20 WHERE id=24;
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-parent-update-ignore-notnull-noop-keeps-old-key-valid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id UNIQUE, nn NOT NULL);
+    CREATE TABLE child(
+        id PRIMARY KEY,
+        pid REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (24, 'ok');
+    INSERT INTO child VALUES (1, 24);
+    BEGIN;
+    UPDATE OR IGNORE parent SET id=99, nn=NULL WHERE id=24;
+    COMMIT;
+    SELECT id, nn FROM parent;
+}
+expect {
+    24|ok
+}
+
+@cross-check-integrity
+test fk-deferred-child-update-ignore-noop-keeps-old-key-valid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id UNIQUE);
+    CREATE TABLE child(
+        id PRIMARY KEY,
+        pid,
+        u UNIQUE ON CONFLICT IGNORE,
+        FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1, 10);
+    INSERT INTO child VALUES (2, 1, 20);
+    BEGIN;
+    UPDATE child SET pid=999, u=10 WHERE id=2;
+    COMMIT;
+    SELECT id, pid, u FROM child ORDER BY id;
+}
+expect {
+    1|1|10
+    2|1|20
+}
+
+@cross-check-integrity
+test fk-deferred-child-update-ignore-noop-keeps-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id UNIQUE);
+    CREATE TABLE child(
+        id PRIMARY KEY,
+        pid,
+        u UNIQUE ON CONFLICT IGNORE,
+        FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1, 10);
+    BEGIN;
+    INSERT INTO child VALUES (2, 999, 20);
+    UPDATE child SET pid=1, u=10 WHERE id=2;
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-child-update-or-ignore-noop-keeps-old-key-valid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id UNIQUE);
+    CREATE TABLE child(
+        id PRIMARY KEY,
+        pid,
+        u UNIQUE,
+        FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1, 10);
+    INSERT INTO child VALUES (2, 1, 20);
+    BEGIN;
+    UPDATE OR IGNORE child SET pid=999, u=10 WHERE id=2;
+    COMMIT;
+    SELECT id, pid, u FROM child ORDER BY id;
+}
+expect {
+    1|1|10
+    2|1|20
+}
+
+@cross-check-integrity
+test fk-deferred-child-ipk-update-ignore-noop-keeps-old-key-valid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id UNIQUE);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY ON CONFLICT IGNORE,
+        pid REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+    INSERT INTO child VALUES (2, 1);
+    BEGIN;
+    UPDATE child SET id=1, pid=999 WHERE id=2;
+    COMMIT;
+    SELECT id, pid FROM child ORDER BY id;
+}
+expect {
+    1|1
+    2|1
+}
+
+@cross-check-integrity
 test fk-deferred-insert-commit-fails {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -959,6 +1145,111 @@ test fk-deferred-update-self-ref-id-change-and-fix {
 }
 expect {
     2|2
+}
+
+@cross-check-integrity
+test fk-deferred-update-self-ref-id-and-pid-one-stmt {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id  INTEGER PRIMARY KEY,
+        pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO t VALUES(1, 1);
+    BEGIN;
+    UPDATE t SET id=2, pid=2 WHERE id=1;
+    COMMIT;
+    SELECT id, pid FROM t;
+}
+expect {
+    2|2
+}
+
+@cross-check-integrity
+test fk-deferred-update-self-ref-rowid-affinity-one-stmt {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id  INTEGER PRIMARY KEY,
+        pid TEXT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO t VALUES(1, 1);
+    BEGIN;
+    UPDATE t SET id=2, pid='2' WHERE id=1;
+    COMMIT;
+    SELECT id, typeof(pid), pid FROM t;
+}
+expect {
+    2|text|2
+}
+
+@cross-check-integrity
+test fk-deferred-update-self-ref-indexed-child-key-one-stmt {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id  INTEGER PRIMARY KEY,
+        pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    CREATE INDEX t_pid ON t(pid);
+    INSERT INTO t VALUES(1, 1);
+    BEGIN;
+    UPDATE t SET id=2, pid=2 WHERE id=1;
+    COMMIT;
+    SELECT id, pid FROM t;
+}
+expect {
+    2|2
+}
+
+@cross-check-integrity
+test fk-deferred-update-self-ref-unique-key-one-stmt {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        u  TEXT UNIQUE,
+        pu TEXT REFERENCES t(u) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO t VALUES(1, 'a', 'a');
+    BEGIN;
+    UPDATE t SET u='b', pu='b' WHERE id=1;
+    COMMIT;
+    SELECT u, pu FROM t;
+}
+expect {
+    b|b
+}
+
+@cross-check-integrity
+test fk-deferred-update-self-ref-composite-key-one-stmt {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        a, b,
+        x, y,
+        UNIQUE(a, b),
+        FOREIGN KEY(x, y) REFERENCES t(a, b) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO t VALUES(1, 1, 2, 1, 2);
+    BEGIN;
+    UPDATE t SET a=3, b=4, x=3, y=4 WHERE id=1;
+    COMMIT;
+    SELECT a, b, x, y FROM t;
+}
+expect {
+    3|4|3|4
+}
+
+@cross-check-integrity
+test fk-deferred-update-self-ref-one-stmt-still-fails-if-missing {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id  INTEGER PRIMARY KEY,
+        pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO t VALUES(1, 1);
+    BEGIN;
+    UPDATE t SET id=2, pid=3 WHERE id=1;
+    COMMIT;
+}
+expect error {
 }
 
 @cross-check-integrity
