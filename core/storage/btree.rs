@@ -466,6 +466,7 @@ impl Debug for CursorState {
 enum OverflowState {
     Start,
     ProcessPage { next_page: PageRef },
+    FreePage { page: PageRef, next: u32 },
     Done,
 }
 
@@ -4565,6 +4566,9 @@ impl BTreeCursor {
 
                     let contents = page.get_contents();
                     let next = contents.read_u32_no_offset(0);
+                    self.overflow_state = OverflowState::FreePage { page, next };
+                }
+                OverflowState::FreePage { page, next } => {
                     let next_page_id = page.get().id;
 
                     return_if_io!(self.pager.free_page(Some(page), next_page_id));
@@ -9789,6 +9793,79 @@ mod tests {
                 );
             }
         }
+
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_clear_overflow_pages_resume_uses_captured_next_page() -> Result<()> {
+        let pager = setup_test_env(3);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), 1, 5);
+        let mut overflow_pages = Vec::new();
+
+        for current_page in 2..=3 {
+            #[allow(clippy::arc_with_non_send_sync)]
+            let buf = Arc::new(Buffer::new_temporary(
+                pager
+                    .io
+                    .block(|| pager.with_header(|header| header.page_size))?
+                    .get() as usize,
+            ));
+            let _buf = buf.clone();
+            let c = Completion::new_write(move |_| {
+                let _ = _buf.clone();
+            });
+            let _c =
+                pager
+                    .db_file
+                    .write_page(current_page, buf.clone(), &IOContext::default(), c)?;
+            pager.io.step()?;
+
+            let (page, c) = cursor.read_page(current_page as i64)?;
+            if let Some(c) = c {
+                pager.io.wait_for_completion(c)?;
+            }
+            while page.is_locked() {
+                cursor.pager.io.step()?;
+            }
+
+            let contents = page.get_contents();
+            let next_page = if current_page == 2 { 3 } else { 0 };
+            contents.write_u32_no_offset(0, next_page);
+            contents.as_ptr()[4..].fill(b'A');
+            overflow_pages.push(page);
+        }
+
+        let first_overflow_page = overflow_pages.remove(0);
+        let captured_next = first_overflow_page.get_contents().read_u32_no_offset(0);
+        first_overflow_page.get_contents().write_u32_no_offset(0, 0);
+        cursor.overflow_state = OverflowState::FreePage {
+            page: first_overflow_page,
+            next: captured_next,
+        };
+
+        let leaf_cell = BTreeCell::TableLeafCell(TableLeafCell {
+            rowid: 1,
+            payload: &[],
+            first_overflow_page: Some(2),
+            payload_size: 0,
+        });
+        let initial_freelist_pages = pager
+            .io
+            .block(|| pager.with_header(|header| header.freelist_pages))?
+            .get();
+
+        pager.io.block(|| cursor.clear_overflow_pages(&leaf_cell))?;
+
+        let freelist_pages = pager
+            .io
+            .block(|| pager.with_header(|header| header.freelist_pages))?
+            .get();
+        assert_eq!(
+            freelist_pages,
+            initial_freelist_pages + 2,
+            "clear_overflow_pages must continue from the captured overflow next page"
+        );
 
         Ok(())
     }
