@@ -8,16 +8,16 @@ use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use turso_ext::{
-    register_extension, scalar, scalar_context, Connection, ConstraintInfo, ConstraintOp,
-    ConstraintUsage, ExtResult, IndexInfo, OrderByInfo, ResultCode, StepResult, VTabCursor,
-    VTabKind, VTabModule, VTabModuleDerive, VTable, Value,
+    register_extension, scalar, Connection, ConstraintInfo, ConstraintOp, ConstraintUsage,
+    ExtResult, IndexInfo, OrderByInfo, ResultCode, StepResult, VTabCursor, VTabKind, VTabModule,
+    VTabModuleDerive, VTable, Value,
 };
 #[cfg(not(target_family = "wasm"))]
 use turso_ext::{BufferRef, Callback, VfsDerive, VfsExtension, VfsFile};
 
 register_extension! {
     vtabs: { KVStoreVTabModule, TableStatsVtabModule },
-    scalars: { test_scalar, test_scalar_context },
+    scalars: { test_scalar },
     vfs: { TestFS },
 }
 
@@ -340,20 +340,6 @@ pub struct TestFS {
 #[scalar(name = "test_scalar")]
 fn test_scalar(_args: turso_ext::Value) -> turso_ext::Value {
     turso_ext::Value::from_integer(42)
-}
-
-#[scalar_context(name = "test_scalar_context")]
-fn test_scalar_context(
-    context: usize,
-    args: &[Value],
-    context_destructor: Option<turso_ext::ContextDestructor>,
-    value_destructor: Option<turso_ext::ValueDestructor>,
-) -> Value {
-    let metadata_score = context as i64
-        + if context_destructor.is_some() { 100 } else { 0 }
-        + if value_destructor.is_some() { 10 } else { 0 };
-    let arg_score = args.iter().filter_map(Value::to_integer).sum::<i64>();
-    Value::from_integer(metadata_score + arg_score)
 }
 
 #[cfg(not(target_family = "wasm"))]
