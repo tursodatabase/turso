@@ -1,4 +1,6 @@
+use crate::alloc::vec;
 use crate::alloc::TursoFromIterator;
+use crate::alloc::*;
 use crate::function::{Deterministic, Func};
 use crate::incremental::view::IncrementalView;
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, operator::create_dbsp_state_index};
@@ -427,7 +429,7 @@ impl TypeDef {
                         base_affinity: Affinity::affinity(&f.field_type.name),
                         type_name: f.field_type.name.clone(),
                     })
-                    .collect();
+                    .try_collect()?;
                 Self {
                     name: type_name.to_string(),
                     is_builtin,
@@ -456,7 +458,7 @@ impl TypeDef {
                         base_affinity: Affinity::affinity(&f.field_type.name),
                         type_name: f.field_type.name.clone(),
                     })
-                    .collect();
+                    .try_collect()?;
                 Self {
                     name: type_name.to_string(),
                     is_builtin,
@@ -468,7 +470,7 @@ impl TypeDef {
                         tag_names: variants
                             .iter()
                             .map(|v| v.tag_name.clone())
-                            .collect::<Vec<_>>()
+                            .try_collect::<Vec<_>>()?
                             .into(),
                         variants,
                     }),
@@ -2071,7 +2073,7 @@ impl Schema {
                 .primary_key_columns
                 .iter()
                 .map(|(col, _)| col.clone())
-                .collect()
+                .try_collect()?
         } else {
             fk.parent_columns.clone()
         };
@@ -2229,7 +2231,8 @@ impl Clone for Schema {
                     ))),
                 ),
             })
-            .collect();
+            .try_collect()
+            .expect("TODO: Clone is supposed to be fallible");
         let indexes = self
             .indexes
             .iter()
@@ -2237,32 +2240,41 @@ impl Clone for Schema {
                 let indexes = indexes
                     .iter()
                     .map(|index| Arc::new((**index).clone()))
-                    .collect();
-                (name.clone(), indexes)
+                    .try_collect()?;
+                Ok::<_, LimboError>((name.clone(), indexes))
             })
-            .collect();
+            .try_collect::<Result<_>>()
+            .expect("TODO: Clone is supposed to be fallible")
+            .unwrap();
         let materialized_view_names = self.materialized_view_names.clone();
         let materialized_view_sql = self.materialized_view_sql.clone();
         let incremental_views = self
             .incremental_views
             .iter()
             .map(|(name, view)| (name.clone(), view.clone()))
-            .collect();
+            .try_collect()
+            .expect("TODO: Clone is supposed to be fallible");
         let views = self
             .views
             .iter()
             .map(|(name, view)| (name.clone(), Arc::new((**view).clone())))
-            .collect();
+            .try_collect()
+            .expect("TODO: Clone is supposed to be fallible");
         let triggers = self
             .triggers
             .iter()
             .map(|(table_name, triggers)| {
-                (
+                Ok::<_, LimboError>((
                     table_name.clone(),
-                    triggers.iter().map(|t| Arc::new((**t).clone())).collect(),
-                )
+                    triggers
+                        .iter()
+                        .map(|t| Arc::new((**t).clone()))
+                        .try_collect()?,
+                ))
             })
-            .collect();
+            .try_collect::<Result<_>>()
+            .expect("TODO: Clone is supposed to be fallible")
+            .unwrap();
         let incompatible_views = self.incompatible_views.clone();
         Self {
             tables,
@@ -2627,7 +2639,7 @@ impl GeneratedColGraph {
 
         // Kahn's algorithm (topological sort) over direct_deps.
         let mut topological_sort: Vec<usize> = Vec::with_capacity(n);
-        let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+        let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).try_collect()?;
         while let Some(i) = ready.pop() {
             topological_sort.push(i);
             for j in direct_dependents[i].iter() {
@@ -2643,7 +2655,7 @@ impl GeneratedColGraph {
             let cycle_names: Vec<&str> = (0..n)
                 .filter(|i| in_degree[*i] > 0)
                 .filter_map(|i| columns[i].name.as_deref())
-                .collect();
+                .try_collect()?;
             bail_parse_error!(
                 "circular dependency in generated columns: {}",
                 cycle_names.join(", ")
@@ -3152,11 +3164,12 @@ impl BTreeTable {
         !self.has_rowid && self.primary_key_columns.len() == 1 && column.primary_key()
     }
 
-    pub fn column_collations(&self) -> Vec<CollationSeq> {
-        self.columns
+    pub fn column_collations(&self) -> Result<Vec<CollationSeq>> {
+        Ok(self
+            .columns
             .iter()
             .map(|column| column.collation())
-            .collect()
+            .try_collect()?)
     }
 
     #[inline]
@@ -3783,14 +3796,14 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     let child_columns: Box<[String]> = columns
                         .iter()
                         .map(|ic| normalize_ident(ic.col_name.as_str()))
-                        .collect();
+                        .try_collect()?;
                     // derive parent columns: explicit or default to parent PK
                     let parent_table = normalize_ident(clause.tbl_name.as_str());
                     let parent_columns: Box<[String]> = clause
                         .columns
                         .iter()
                         .map(|ic| normalize_ident(ic.col_name.as_str()))
-                        .collect();
+                        .try_collect()?;
 
                     // Only check arity if parent columns were explicitly listed
                     if !parent_columns.is_empty() && child_columns.len() != parent_columns.len() {
@@ -3999,8 +4012,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     .columns
                                     .iter()
                                     .map(|c| normalize_ident(c.col_name.as_str()))
-                                    .collect::<Vec<_>>()
-                                    .into_boxed_slice(),
+                                    .try_collect()?,
                                 on_delete: clause
                                     .args
                                     .iter()
@@ -4147,7 +4159,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut unique_sets = unique_sets_columns
         .into_iter()
         .chain(unique_sets_constraints)
-        .collect::<Vec<_>>();
+        .try_collect::<Vec<_>>()?;
     // Capture PK conflict clause before the rowid-alias UniqueSet is removed.
     let rowid_alias_conflict_clause = unique_sets
         .iter()
@@ -5248,6 +5260,7 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
 
     #[test]
     pub fn test_has_rowid_true() -> Result<()> {
