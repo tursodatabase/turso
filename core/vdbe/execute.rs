@@ -200,12 +200,14 @@ fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
 }
 
 /// Create a sort comparator closure from a SortComparatorType enum.
-fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::SortComparator {
+fn make_sort_comparator(
+    cmp_type: &SortComparatorType,
+) -> Result<crate::vdbe::sorter::SortComparator> {
     use std::cmp::Ordering;
-    match cmp_type {
+    let cmp: crate::vdbe::sorter::SortComparator = match cmp_type {
         SortComparatorType::NumericLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
-                match (a, b) {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
+                let res = match (a, b) {
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
                     (_, ValueRef::Null) => Ordering::Greater,
@@ -218,27 +220,29 @@ fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::S
                             _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
                         }
                     }
-                }
+                };
+                Ok(res)
             })
         }
         SortComparatorType::StringReverse => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
                 fn reverse_str(v: &ValueRef) -> String {
                     match v {
                         ValueRef::Text(t) => t.to_string().chars().rev().collect(),
                         _ => String::new(),
                     }
                 }
-                match (a, b) {
+                let res = match (a, b) {
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
                     (_, ValueRef::Null) => Ordering::Greater,
                     _ => reverse_str(a).cmp(&reverse_str(b)),
-                }
+                };
+                Ok(res)
             })
         }
         SortComparatorType::TestUintLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
                 fn to_u64(v: &ValueRef) -> Option<u64> {
                     match v {
                         ValueRef::Null => None,
@@ -253,7 +257,7 @@ fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::S
                         _ => None,
                     }
                 }
-                match (a, b) {
+                let res = match (a, b) {
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
                     (_, ValueRef::Null) => Ordering::Greater,
@@ -261,12 +265,13 @@ fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::S
                         (Some(a), Some(b)) => a.cmp(&b),
                         _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
                     },
-                }
+                };
+                Ok(res)
             })
         }
         SortComparatorType::ArrayLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
-                match (a, b) {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
+                let res = match (a, b) {
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
                     (_, ValueRef::Null) => Ordering::Greater,
@@ -279,8 +284,8 @@ fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::S
                         let b_vals = crate::vdbe::array::parse_text_array(b_text);
                         match (a_vals, b_vals) {
                             (Some(av), Some(bv)) => {
-                                let a_blob = crate::vdbe::array::values_to_record_blob(&av);
-                                let b_blob = crate::vdbe::array::values_to_record_blob(&bv);
+                                let a_blob = crate::vdbe::array::values_to_record_blob(&av)?;
+                                let b_blob = crate::vdbe::array::values_to_record_blob(&bv)?;
                                 if let (Value::Blob(ab), Value::Blob(bb)) = (&a_blob, &b_blob) {
                                     crate::vdbe::array::compare_arrays(ab, bb)
                                         .unwrap_or(Ordering::Equal)
@@ -292,10 +297,12 @@ fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::S
                         }
                     }
                     _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                }
+                };
+                Ok(res)
             })
         }
-    }
+    };
+    Ok(cmp)
 }
 
 /// Compare two values using the specified collation for text values.
@@ -2134,7 +2141,7 @@ pub fn op_array_encode(
     }
 
     // Serialize coerced elements as a native record-format BLOB
-    let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len());
+    let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len())?;
     state.registers[*reg].set_blob(record.into_payload())?;
 
     state.pc += 1;
@@ -2282,7 +2289,7 @@ pub fn op_make_array(
         &state.registers,
         *start_reg,
         *count,
-    ));
+    )?);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2325,7 +2332,7 @@ pub fn op_make_array_dynamic(
         &state.registers,
         *start_reg,
         count,
-    ));
+    )?);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2386,7 +2393,7 @@ pub fn op_union_pack(
     );
 
     let record =
-        ImmutableRecord::from_registers(std::slice::from_ref(&state.registers[*value_reg]), 1);
+        ImmutableRecord::from_registers(std::slice::from_ref(&state.registers[*value_reg]), 1)?;
     let record_bytes = record.into_payload();
 
     // Format: [tag_index: 1 byte][record bytes]
@@ -2564,17 +2571,17 @@ pub fn op_array_concat(
             let mut elems_a = array_values_from_blob(lb)?;
             let elems_b = array_values_from_blob(rb)?;
             elems_a.extend(elems_b);
-            values_to_record_blob(&elems_a)
+            values_to_record_blob(&elems_a)?
         }
         (Value::Blob(lb), _) => {
             let mut elems = array_values_from_blob(lb)?;
             elems.push(rhs_ref.clone());
-            values_to_record_blob(&elems)
+            values_to_record_blob(&elems)?
         }
         (_, Value::Blob(rb)) => {
             let mut elems = array_values_from_blob(rb)?;
             elems.insert(0, lhs_ref.clone());
-            values_to_record_blob(&elems)
+            values_to_record_blob(&elems)?
         }
         _ => {
             // Neither is an array blob — fall back to string concat
@@ -2634,7 +2641,7 @@ pub fn op_array_set_element(
         state.registers[*dest].set_blob(blob.clone())?;
     } else {
         elements[idx] = new_val;
-        state.registers[*dest].set_value(values_to_record_blob(&elements));
+        state.registers[*dest].set_value(values_to_record_blob(&elements)?);
     }
 
     state.pc += 1;
@@ -2662,7 +2669,7 @@ pub fn op_array_slice(
     let start_val = state.registers[*start_reg].get_value().clone();
     let end_val = state.registers[*end_reg].get_value().clone();
 
-    let result = exec_array_slice(&arr_val, &start_val, &end_val);
+    let result = exec_array_slice(&arr_val, &start_val, &end_val)?;
     state.registers[*dest].set_value(result);
 
     state.pc += 1;
@@ -2705,7 +2712,7 @@ pub fn op_make_record(
         }
     }
 
-    let record = make_record(&state.registers, &start_reg, &count);
+    let record = make_record(&state.registers, &start_reg, &count)?;
     state.registers[dest_reg] = Register::Record(record);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -5990,7 +5997,7 @@ fn update_agg_payload(
             let cmp = if let Some(ref cmp_fn) = comparator {
                 let arg_ref = arg.as_ref();
                 let payload_ref = payload[0].as_ref();
-                cmp_fn(&arg_ref, &payload_ref)
+                cmp_fn(&arg_ref, &payload_ref)?
             } else {
                 compare_with_collation(&arg, &payload[0], Some(collation))
             };
@@ -6146,7 +6153,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                 )));
             } else {
                 let elements = &payload[1..1 + count];
-                Value::Blob(ImmutableRecord::from_values(elements, count).into_payload())
+                Value::Blob(ImmutableRecord::from_values(elements, count)?.into_payload())
             }
         }
         AggFunc::External(_) => {
@@ -6225,7 +6232,7 @@ pub fn op_agg_step(
     }
 
     // Resolve custom type comparator for MIN/MAX if provided
-    let comparator = comparator.as_ref().map(make_sort_comparator);
+    let comparator = comparator.as_ref().map(make_sort_comparator).transpose()?;
 
     // Step the aggregate
     match func {
@@ -6415,8 +6422,8 @@ pub fn op_sorter_open(
     }
     let comparators = comparators
         .iter()
-        .map(|c| c.as_ref().map(make_sort_comparator))
-        .collect();
+        .map(|c| c.as_ref().map(make_sort_comparator).transpose())
+        .collect::<Result<_>>()?;
     let temp_store = program.connection.get_temp_store();
     let cursor = Sorter::new(
         &order,
@@ -8008,25 +8015,25 @@ pub fn op_function(
                 check_arg_count!(arg_count, 2);
                 let arr_val = state.registers[*start_reg].get_value().clone();
                 let elem_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_append(&arr_val, &elem_val));
+                state.registers[*dest].set_value(exec_array_append(&arr_val, &elem_val)?);
             }
             ScalarFunc::ArrayPrepend => {
                 check_arg_count!(arg_count, 2);
                 let elem_val = state.registers[*start_reg].get_value().clone();
                 let arr_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_prepend(&arr_val, &elem_val));
+                state.registers[*dest].set_value(exec_array_prepend(&arr_val, &elem_val)?);
             }
             ScalarFunc::ArrayCat => {
                 check_arg_count!(arg_count, 2);
                 let a_val = state.registers[*start_reg].get_value().clone();
                 let b_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_cat(&a_val, &b_val));
+                state.registers[*dest].set_value(exec_array_cat(&a_val, &b_val)?);
             }
             ScalarFunc::ArrayRemove => {
                 check_arg_count!(arg_count, 2);
                 let arr_val = state.registers[*start_reg].get_value().clone();
                 let target = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_remove(&arr_val, &target));
+                state.registers[*dest].set_value(exec_array_remove(&arr_val, &target)?);
             }
             ScalarFunc::ArrayContains => {
                 check_arg_count!(arg_count, 2);
@@ -8053,7 +8060,7 @@ pub fn op_function(
                 let arr_val = state.registers[*start_reg].get_value().clone();
                 let start_idx = state.registers[*start_reg + 1].get_value().clone();
                 let end_idx = state.registers[*start_reg + 2].get_value().clone();
-                let result = exec_array_slice(&arr_val, &start_idx, &end_idx);
+                let result = exec_array_slice(&arr_val, &start_idx, &end_idx)?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::StringToArray => {
@@ -8068,7 +8075,7 @@ pub fn op_function(
                     &text,
                     &delimiter,
                     null_str.as_ref(),
-                ));
+                )?);
             }
             ScalarFunc::ArrayToString => {
                 let arr_val = state.registers[*start_reg].get_value().clone();
@@ -9301,7 +9308,7 @@ pub fn op_insert(
                             Register::Record(r) => std::borrow::Cow::Borrowed(r),
                             Register::Value(value) => {
                                 let values = [value];
-                                let record = ImmutableRecord::from_values(values, values.len());
+                                let record = ImmutableRecord::from_values(values, values.len())?;
                                 std::borrow::Cow::Owned(record)
                             }
                             Register::Aggregate(..) => {
@@ -9323,7 +9330,7 @@ pub fn op_insert(
                         Register::Record(r) => std::borrow::Cow::Borrowed(r),
                         Register::Value(value) => {
                             let values = [value];
-                            let record = ImmutableRecord::from_values(values, values.len());
+                            let record = ImmutableRecord::from_values(values, values.len())?;
                             std::borrow::Cow::Owned(record)
                         }
                         Register::Aggregate(..) => {
@@ -9419,7 +9426,7 @@ pub fn op_insert(
                         Register::Record(r) => std::borrow::Cow::Borrowed(r),
                         Register::Value(value) => {
                             let values = [value];
-                            let record = ImmutableRecord::from_values(values, values.len());
+                            let record = ImmutableRecord::from_values(values, values.len())?;
                             std::borrow::Cow::Owned(record)
                         }
                         Register::Aggregate(..) => {

@@ -556,8 +556,10 @@ impl AggregateEvalState {
                         ];
 
                         // Create an immutable record for the index key
-                        let index_record =
-                            ImmutableRecord::from_values(&index_key_values, index_key_values.len());
+                        let index_record = ImmutableRecord::from_values(
+                            &index_key_values,
+                            index_key_values.len(),
+                        )?;
 
                         // Seek in the index to find if this row exists
                         let seek_result = return_if_io!(cursors.index_cursor.seek(
@@ -999,15 +1001,15 @@ impl AggregateState {
         Ok(state)
     }
 
-    fn to_blob(&self, aggregates: &[AggregateFunction], group_key: &[Value]) -> Vec<u8> {
+    fn to_blob(&self, aggregates: &[AggregateFunction], group_key: &[Value]) -> Result<Vec<u8>> {
         let mut all_values = Vec::new();
         // Store the group key size first
         all_values.push(Value::from_i64(group_key.len() as i64));
         all_values.extend_from_slice(group_key);
         all_values.extend(self.to_value_vector(aggregates));
 
-        let record = ImmutableRecord::from_values(&all_values, all_values.len());
-        record.as_blob().clone()
+        let record = ImmutableRecord::from_values(&all_values, all_values.len())?;
+        Ok(record.as_blob().clone())
     }
 
     pub fn from_blob(blob: &[u8]) -> Result<(Self, Vec<Value>)> {
@@ -1897,7 +1899,7 @@ impl IncrementalOperator for AggregateOperator {
                         let weight = if agg_state.count == 0 { -1 } else { 1 };
 
                         // Serialize the aggregate state (only for regular aggregates, not plain DISTINCT)
-                        let state_blob = agg_state.to_blob(&self.aggregates, group_key);
+                        let state_blob = agg_state.to_blob(&self.aggregates, group_key)?;
                         let blob_value = Value::Blob(state_blob);
 
                         // Build the aggregate storage format: [operator_id, zset_hash, element_id, value, weight]
@@ -2468,7 +2470,7 @@ impl ScanState {
                         zset_hash.to_value(),
                         current_candidate.clone(),
                     ];
-                    let index_record = ImmutableRecord::from_values(&index_key, index_key.len());
+                    let index_record = ImmutableRecord::from_values(&index_key, index_key.len())?;
 
                     let seek_op = if *is_min {
                         SeekOp::GT // For MIN, seek greater than current
@@ -2722,7 +2724,7 @@ impl FetchDistinctState {
                         zset_hash.to_value(),
                         element_id.to_value(),
                     ];
-                    let index_record = ImmutableRecord::from_values(&index_key, index_key.len());
+                    let index_record = ImmutableRecord::from_values(&index_key, index_key.len())?;
 
                     let seek_result = return_if_io!(cursors.index_cursor.seek(
                         SeekKey::IndexKey(&index_record),
@@ -2985,7 +2987,7 @@ impl DistinctPersistState {
                         count: *weight as i64,
                         ..Default::default()
                     };
-                    let weight_blob = weight_state.to_blob(&[], &[]);
+                    let weight_blob = weight_state.to_blob(&[], &[])?;
 
                     let record_values = vec![
                         Value::from_i64(storage_id),

@@ -414,9 +414,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                         return Ok(IOResult::Done(None));
                     };
                     {
-                        let record = self.get_immutable_record_or_create();
+                        let record = self.get_immutable_record_or_create()?;
                         record.invalidate();
-                        record.start_serialization(row.payload());
+                        record.start_serialization(row.payload())?;
                     }
 
                     let record_ref = self.reusable_immutable_record.as_ref().ok_or_else(|| {
@@ -506,9 +506,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         }
     }
 
-    fn get_immutable_record_or_create(&mut self) -> &mut ImmutableRecord {
-        self.reusable_immutable_record
-            .get_or_insert_with(|| ImmutableRecord::new(1024))
+    fn get_immutable_record_or_create(&mut self) -> Result<&mut ImmutableRecord> {
+        if self.reusable_immutable_record.is_none() {
+            self.reusable_immutable_record = Some(ImmutableRecord::new(1024)?);
+        }
+        Ok(self.reusable_immutable_record.as_mut().unwrap())
     }
 
     fn get_current_pos(&self) -> CursorPosition {
@@ -1163,7 +1165,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         registers: &[Register],
         op: SeekOp,
     ) -> Result<IOResult<SeekResult>> {
-        let record = make_record(registers, &0, &registers.len());
+        let record = make_record(registers, &0, &registers.len())?;
         self.seek(SeekKey::IndexKey(&record), op)
     }
 
@@ -1811,7 +1813,9 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn invalidate_record(&mut self) {
-        self.get_immutable_record_or_create().invalidate();
+        if let Some(record) = self.reusable_immutable_record.as_mut() {
+            record.invalidate();
+        }
     }
 
     fn has_rowid(&self) -> bool {

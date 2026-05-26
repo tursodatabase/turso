@@ -127,7 +127,7 @@ impl WriteRowView {
 
                     // Create an ImmutableRecord from the values
                     let immutable_record =
-                        ImmutableRecord::from_values(&record_values, record_values.len());
+                        ImmutableRecord::from_values(&record_values, record_values.len())?;
                     let btree_key = BTreeKey::new_table_rowid(key_i64, Some(&immutable_record));
 
                     // Mark as Done before insert to avoid retry on I/O

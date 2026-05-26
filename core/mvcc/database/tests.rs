@@ -530,7 +530,8 @@ impl MvccTestDbNoConn {
 }
 
 pub(crate) fn generate_simple_string_row(table_id: MVTableId, id: i64, data: &str) -> Row {
-    let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1);
+    let record =
+        ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1).unwrap();
     Row::new_table_row(
         RowID::new(table_id, RowKey::Int(id)),
         record.as_blob().to_vec(),
@@ -539,7 +540,7 @@ pub(crate) fn generate_simple_string_row(table_id: MVTableId, id: i64, data: &st
 }
 
 pub(crate) fn generate_simple_string_record(data: &str) -> ImmutableRecord {
-    ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1)
+    ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1).unwrap()
 }
 
 fn advance_checkpoint_until_wal_has_commit_frame(
@@ -789,7 +790,8 @@ fn tamper_db_metadata_row_value(db_path: &str, metadata_root_page: u32, new_valu
             Value::from_i64(new_value),
         ],
         2,
-    );
+    )
+    .unwrap();
     rewrite_table_leaf_cell_payload(&mut page, loc, new_record.as_blob());
     write_db_page(db_path, metadata_root_page, page_size, &page);
 }
@@ -821,7 +823,8 @@ fn tamper_db_metadata_row_value_by_key(
                 Value::from_i64(new_value),
             ],
             2,
-        );
+        )
+        .unwrap();
         rewrite_table_leaf_cell_payload(&mut page, loc, new_record.as_blob());
         updated = true;
     }
@@ -861,7 +864,8 @@ fn tamper_db_metadata_row_key(db_path: &str, metadata_root_page: u32, new_key: &
             Value::from_i64(value),
         ],
         2,
-    );
+    )
+    .unwrap();
     rewrite_table_leaf_cell_payload(&mut page, loc, new_record.as_blob());
     write_db_page(db_path, metadata_root_page, page_size, &page);
 }
@@ -3817,7 +3821,8 @@ fn setup_test_db() -> (MvccTestDb, u64, MVTableId, i64) {
 
     for (row_id, data) in test_rows.iter() {
         let id = RowID::new(table_id, RowKey::Int(*row_id));
-        let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1);
+        let record =
+            ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1).unwrap();
         let row = Row::new_table_row(id, record.as_blob().to_vec(), 1);
         db.mvcc_store.insert(tx_id, row).unwrap();
     }
@@ -3853,7 +3858,7 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
     for i in initial_keys {
         let id = RowID::new(table_id, RowKey::Int(*i));
         let data = format!("row{i}");
-        let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data))], 1);
+        let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data))], 1).unwrap();
         let row = Row::new_table_row(id, record.as_blob().to_vec(), 1);
         db.mvcc_store.insert(tx_id, row).unwrap();
     }
@@ -5480,7 +5485,8 @@ fn write_synthetic_row(db: &MvccTestDbNoConn, value: &str) {
             )),
         ],
         5,
-    );
+    )
+    .unwrap();
     mvcc_store
         .insert(
             tx_id,
@@ -5593,8 +5599,8 @@ fn test_delete_with_conn() {
 }
 
 fn get_record_value(row: &Row) -> ImmutableRecord {
-    let mut record = ImmutableRecord::new(1024);
-    record.start_serialization(row.payload());
+    let mut record = ImmutableRecord::new(1024).unwrap();
+    record.start_serialization(row.payload()).unwrap();
     record
 }
 
@@ -6501,7 +6507,8 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
     )));
 
     for key in 1..=600 {
-        let record = ImmutableRecord::from_values(&[Value::from_i64(key), Value::from_i64(key)], 2);
+        let record =
+            ImmutableRecord::from_values(&[Value::from_i64(key), Value::from_i64(key)], 2).unwrap();
         let seek_result = run_pager_until_done(
             || {
                 cursor.write().seek(
@@ -6526,7 +6533,8 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
     pager.begin_read_tx().unwrap();
     let mut interior_key = None;
     for key in 1..=600 {
-        let record = ImmutableRecord::from_values(&[Value::from_i64(key), Value::from_i64(key)], 2);
+        let record =
+            ImmutableRecord::from_values(&[Value::from_i64(key), Value::from_i64(key)], 2).unwrap();
         let seek_result = run_pager_until_done(
             || {
                 cursor.write().seek(
@@ -6554,7 +6562,8 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
     let record = ImmutableRecord::from_values(
         &[Value::from_i64(interior_key), Value::from_i64(interior_key)],
         2,
-    );
+    )
+    .unwrap();
     let row_key = SortableIndexKey::new_from_record(record, index_info);
     let row = Row::new_index_row(
         RowID::new(MVTableId::new(-42), RowKey::Record(row_key)),
