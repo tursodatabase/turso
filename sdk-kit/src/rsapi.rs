@@ -606,11 +606,9 @@ impl TursoDatabase {
                         "win_iocp is only available on Windows targets".to_string(),
                     ));
                 }
-                Some(vfs) => {
-                    return Err(TursoError::Error(format!(
-                        "unsupported VFS backend: '{vfs}'"
-                    )))
-                }
+                Some(vfs) => Database::io_for_vfs(vfs).map_err(|e| {
+                    TursoError::Error(format!("{e}"))
+                })?,
                 None => match self.config.path.as_str() {
                     ":memory:" => Arc::new(turso_core::MemoryIO::new()),
                     _ => Arc::new(turso_core::PlatformIO::new()?),
