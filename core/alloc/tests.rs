@@ -110,6 +110,13 @@ fn iterator_try_collect_builds_turso_vec() {
 }
 
 #[test]
+fn iterator_try_collect_builds_boxed_slice() {
+    let values: Box<[_]> = [1, 2, 3].into_iter().try_collect().unwrap();
+
+    assert_eq!(&*values, &[1, 2, 3]);
+}
+
+#[test]
 fn try_extend_extends_existing_collection() {
     let mut values = try_vec![1].unwrap();
 
