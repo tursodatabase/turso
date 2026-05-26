@@ -40,7 +40,7 @@ use super::{
     emitter::{Resolver, TranslateCtx},
     main_loop::LoopLabels,
     plan::{Aggregate, Operation, QueryDestination, Scan, Search, SelectPlan},
-    planner::{resolve_window_and_aggregate_functions, TableMask},
+    planner::{resolve_window_and_aggregate_functions, rewrite_between_in_where_clause, TableMask},
 };
 
 struct DirectMaterializedSubquery {
@@ -242,6 +242,7 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryOrigin::SelectWhere,
             SubqueryPosition::Where.allow_correlated(),
         )?;
+        rewrite_between_in_where_clause(&mut plan.where_clause);
     }
 
     // GROUP BY
@@ -368,7 +369,7 @@ pub fn plan_subqueries_from_where_clause(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
     table_references: &mut TableReferences,
-    where_clause: &mut [WhereTerm],
+    where_clause: &mut Vec<WhereTerm>,
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
@@ -384,6 +385,7 @@ pub fn plan_subqueries_from_where_clause(
         SubqueryPosition::Where.allow_correlated(),
     )?;
 
+    rewrite_between_in_where_clause(where_clause);
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
     Ok(())
 }
