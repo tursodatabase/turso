@@ -1,5 +1,8 @@
 use crate::{
-    ext::{register_aggregate_function, register_scalar_function, register_vtab_module},
+    ext::{
+        register_aggregate_function, register_scalar_function_with_options, register_vtab_module,
+        unregister_function,
+    },
     Connection, LimboError,
 };
 #[cfg(not(target_family = "wasm"))]
@@ -105,8 +108,9 @@ pub fn add_builtin_vfs_extensions(
     let mut api = match api {
         None => ExtensionApi {
             ctx: std::ptr::null_mut(),
-            register_scalar_function,
+            register_scalar_function: register_scalar_function_with_options,
             register_aggregate_function,
+            unregister_function,
             register_vtab_module,
             vfs_interface: VfsInterface {
                 register_vfs,

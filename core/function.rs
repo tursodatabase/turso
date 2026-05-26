@@ -2,7 +2,10 @@ use crate::sync::Arc;
 use std::fmt;
 use std::fmt::{Debug, Display};
 use strum::IntoEnumIterator;
-use turso_ext::{FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction};
+use turso_ext::{
+    ContextDestructor, FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction,
+    ValueDestructor,
+};
 
 use crate::LimboError;
 
@@ -17,14 +20,23 @@ pub struct ExternalFunc {
 
 impl Deterministic for ExternalFunc {
     fn is_deterministic(&self) -> bool {
-        // external functions can be whatever so let's just default to false
-        false
+        match self.func {
+            ExtFunc::Scalar { deterministic, .. } => deterministic,
+            _ => false,
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum ExtFunc {
-    Scalar(ScalarFunction),
+    Scalar {
+        context: usize,
+        argc: i32,
+        deterministic: bool,
+        callback: ScalarFunction,
+        context_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    },
     Aggregate {
         argc: usize,
         init: InitAggFunction,
@@ -40,13 +52,39 @@ impl ExtFunc {
         }
         Err(())
     }
+
+    pub fn matches_arg_count(&self, arg_count: usize) -> bool {
+        match self {
+            Self::Scalar { argc, .. } => *argc < 0 || *argc as usize == arg_count,
+            Self::Aggregate { .. } => true,
+        }
+    }
+
+    pub fn is_aggregate(&self) -> bool {
+        matches!(self, Self::Aggregate { .. })
+    }
 }
 
 impl ExternalFunc {
-    pub fn new_scalar(name: String, func: ScalarFunction) -> Self {
+    pub fn new_scalar(
+        name: String,
+        argc: i32,
+        deterministic: bool,
+        context: usize,
+        callback: ScalarFunction,
+        context_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> Self {
         Self {
             name,
-            func: ExtFunc::Scalar(func),
+            func: ExtFunc::Scalar {
+                context,
+                argc,
+                deterministic,
+                callback,
+                context_destructor,
+                value_destructor,
+            },
         }
     }
 
@@ -63,6 +101,19 @@ impl ExternalFunc {
                 step: func.1,
                 finalize: func.2,
             },
+        }
+    }
+}
+
+impl Drop for ExternalFunc {
+    fn drop(&mut self) {
+        if let ExtFunc::Scalar {
+            context,
+            context_destructor: Some(context_destructor),
+            ..
+        } = self.func
+        {
+            unsafe { context_destructor(context) };
         }
     }
 }

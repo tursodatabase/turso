@@ -8164,35 +8164,44 @@ pub fn op_function(
             }
         }
         crate::function::Func::External(f) => match f.func {
-            ExtFunc::Scalar(f) => {
-                if arg_count == 0 {
-                    let result_c_value: ExtValue = unsafe { (f)(0, std::ptr::null()) };
-                    match Value::from_ffi(result_c_value) {
-                        Ok(result_ov) => {
-                            state.registers[*dest].set_value(result_ov);
-                        }
-                        Err(e) => {
-                            return Err(e);
-                        }
-                    }
-                } else {
+            ExtFunc::Scalar {
+                context,
+                callback,
+                context_destructor,
+                value_destructor,
+                ..
+            } => {
+                let mut ext_values = Vec::with_capacity(arg_count);
+                if arg_count != 0 {
                     let register_slice = &state.registers[*start_reg..*start_reg + arg_count];
-                    let mut ext_values: Vec<ExtValue> = Vec::with_capacity(arg_count);
                     for ov in register_slice.iter() {
-                        let val = ov.get_value().to_ffi();
-                        ext_values.push(val);
-                    }
-                    let argv_ptr = ext_values.as_ptr();
-                    let result_c_value: ExtValue = unsafe { (f)(arg_count as i32, argv_ptr) };
-                    match Value::from_ffi(result_c_value) {
-                        Ok(result_ov) => {
-                            state.registers[*dest].set_value(result_ov);
-                        }
-                        Err(e) => {
-                            return Err(e);
-                        }
+                        ext_values.push(ov.get_value().to_ffi());
                     }
                 }
+                let argv_ptr = if ext_values.is_empty() {
+                    std::ptr::null()
+                } else {
+                    ext_values.as_ptr()
+                };
+                let mut result = unsafe {
+                    callback(
+                        context,
+                        arg_count as i32,
+                        argv_ptr,
+                        context_destructor,
+                        value_destructor,
+                    )
+                };
+                let value = Value::from_ffi_ref(&result);
+                if let Some(value_destructor) = value_destructor {
+                    unsafe { value_destructor(&mut result) };
+                } else {
+                    unsafe { result.__free_internal_type() };
+                }
+                for ext_value in ext_values {
+                    unsafe { ext_value.__free_internal_type() };
+                }
+                state.registers[*dest].set_value(value?);
             }
             _ => unreachable!("aggregate called in scalar context"),
         },

@@ -4,9 +4,10 @@ mod types;
 mod vfs_modules;
 mod vtabs;
 pub use functions::{
-    AggCtx, AggFunc, FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction,
+    AggCtx, AggFunc, ContextDestructor, FinalizeFunction, InitAggFunction, ScalarFunction,
+    StepFunction, ValueDestructor,
 };
-use functions::{RegisterAggFn, RegisterScalarFn};
+use functions::{RegisterAggFn, RegisterScalarFn, UnregisterFunctionFn};
 use std::os::raw::c_void;
 #[cfg(feature = "vfs")]
 pub use turso_macros::VfsDerive;
@@ -33,6 +34,7 @@ pub struct ExtensionApi {
     pub ctx: *mut c_void,
     pub register_scalar_function: RegisterScalarFn,
     pub register_aggregate_function: RegisterAggFn,
+    pub unregister_function: UnregisterFunctionFn,
     pub register_vtab_module: RegisterModuleFn,
     #[cfg(feature = "vfs")]
     pub vfs_interface: VfsInterface,

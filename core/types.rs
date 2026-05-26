@@ -533,8 +533,8 @@ impl Value {
         }
     }
 
-    pub fn from_ffi(v: ExtValue) -> Result<Self> {
-        let res = match v.value_type() {
+    pub(crate) fn from_ffi_ref(v: &ExtValue) -> Result<Self> {
+        match v.value_type() {
             ExtValueType::Null => Ok(Value::Null),
             ExtValueType::Integer => {
                 let Some(int) = v.to_integer() else {
@@ -573,7 +573,11 @@ impl Value {
                     (code, None) => Err(LimboError::ExtensionError(code.to_string())),
                 }
             }
-        };
+        }
+    }
+
+    pub fn from_ffi(v: ExtValue) -> Result<Self> {
+        let res = Self::from_ffi_ref(&v);
         unsafe { v.__free_internal_type() };
         res
     }
