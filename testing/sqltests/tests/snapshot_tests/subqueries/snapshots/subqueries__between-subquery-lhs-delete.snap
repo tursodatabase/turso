@@ -1,0 +1,66 @@
+---
+source: subqueries.sqltest
+expression: |-
+  DELETE FROM products
+      WHERE (SELECT max(id) FROM products) BETWEEN 1 AND 100;
+info:
+  statement_type: DELETE
+  tables:
+  - products
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCALAR SUBQUERY 1
+|  `--SCAN products
+`--SCAN products
+
+BYTECODE
+addr  opcode          p1  p2  p3  p4              p5  comment
+   0    Init           0  42   0                   0  Start at 42
+   1    OpenWrite      0   2   0                   0  root=2; iDb=0
+   2    OpenWrite      1   8   0                   0  root=8; iDb=0
+   3    Null           0   1   0                   0  r[1]=NULL
+   4    Once          21   0   0                   0  goto 21
+   5    BeginSubrtn    3   0   0                   0  r[3]=NULL
+   6    Null           0   2   0                   0  r[2]=NULL
+   7    Null           0   5   0                   0  r[5]=NULL
+   8    Integer        1   6   0                   0  r[6]=1; LIMIT counter
+   9    IfNot          6  17   0                   0  if !r[6] goto 17
+  10    OpenRead       2   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  11    Last           2  17   0                   0
+  12      RowId        2   7   0                   0  r[7]=products.rowid
+  13      CollSeq      0   0   0  Binary           0  collation=Binary
+  14      AggStep      0   7   5  max              0  accum=r[5] step(r[7])
+  15      Goto         0  17   0                   0
+  16    Prev           2  12   0                   0
+  17    AggFinal       0   5   0  max              0  accum=r[5]
+  18    Copy           5   4   0                   0  r[4]=r[5]
+  19    Copy           4   2   0                   0  r[2]=r[4]
+  20  Return           3   0   1                   0
+  21  OpenRead         0   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  22  Copy             2  11   0                   0  r[11]=r[2]
+  23  Gt              10  11  30                   0  if r[10]>r[11] goto 30
+  24  Copy             2  13   0                   0  r[13]=r[2]
+  25  Gt              13  14  30                   0  if r[13]>r[14] goto 30
+  26  Rewind           0  30   0                   0  Rewind table products
+  27    RowId          0   8   0                   0  r[8]=products.rowid
+  28    RowSetAdd      1   8   0                   0
+  29  Next             0  27   0                   0
+  30  Close            0   0   0                   0
+  31  OpenWrite        0   2   0                   0  root=2; iDb=0
+  32  OpenWrite        3   8   0                   0  root=8; iDb=0
+  33    RowSetRead     1  41  15                   0
+  34    NotExists      0  40  15                   0
+  35    NotExists      0  40  15                   0
+  36    Column         0   2  16                   0  r[16]=products.category_id
+  37    RowId          0  17   0                   0  r[17]=products.rowid
+  38    IdxDelete      1  16   2                   1
+  39    Delete         0   0   0  products         0
+  40  Goto             0  33   0                   0
+  41  Halt             0   0   0                   0
+  42  Transaction      0   2  11                   0  iDb=0 tx_mode=Write
+  43  Integer          1  10   0                   0  r[10]=1
+  44  Integer        100  14   0                   0  r[14]=100
+  45  Goto             0   1   0                   0
