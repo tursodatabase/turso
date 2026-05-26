@@ -186,6 +186,12 @@ fn test_antithesis_like_savepoint_rebalance_does_not_persist_invalid_page_type(
              VALUES (zeroblob(300), 2.50, {k}, {k}, {k});"
         ))?;
     }
+    let duplicate = conn.execute(
+        "INSERT INTO calm_roof_888
+         (cold_door_963, big_bird_239, wet_stone_286, hot_door_96, brave_lake_630)
+         VALUES (zeroblob(2296), 8.15, 60, 255, 261);",
+    );
+    assert!(matches!(duplicate, Err(LimboError::Constraint(_))));
     conn.execute("SAVEPOINT sp_59;")?;
     for k in 94..=97 {
         conn.execute(&format!(
@@ -196,13 +202,25 @@ fn test_antithesis_like_savepoint_rebalance_does_not_persist_invalid_page_type(
     }
     conn.execute("ROLLBACK TO sp_59;")?;
     conn.execute("RELEASE sp_59;")?;
-    for k in 94..=97 {
-        conn.execute(&format!(
-            "INSERT INTO calm_roof_888
-             (cold_door_963, big_bird_239, wet_stone_286, hot_door_96, brave_lake_630)
-             VALUES (zeroblob(300), 2.50, {k}, {k}, {k});"
-        ))?;
-    }
+    conn.execute("ROLLBACK;")?;
+
+    conn.execute(
+        "UPDATE calm_roof_888
+         SET cold_door_963 = x'6269675f646f6f725f333239',
+             big_bird_239 = 2.24,
+             hot_door_96 = 449,
+             brave_lake_630 = 512
+         WHERE wet_stone_286 = 777;",
+    )?;
+    conn.execute("BEGIN;")?;
+    conn.execute(
+        "UPDATE calm_roof_888
+         SET cold_door_963 = x'626c75655f626972645f3230',
+             big_bird_239 = 6.64,
+             hot_door_96 = 980,
+             brave_lake_630 = 642
+         WHERE wet_stone_286 = 848;",
+    )?;
     conn.execute("COMMIT;")?;
 
     let verify_db = TempDatabase::new_with_existent(&tmp_db.path);
@@ -212,7 +230,6 @@ fn test_antithesis_like_savepoint_rebalance_does_not_persist_invalid_page_type(
 
     Ok(())
 }
-
 #[test]
 #[ignore = "ignored for now because it's flaky"]
 fn test_wal_1_writer_1_reader() -> Result<()> {
