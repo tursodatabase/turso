@@ -141,8 +141,9 @@ pub use io::UringIO;
 pub use io::WindowsIOCP;
 pub use io::{
     clock::{Clock, MonotonicInstant, WallClockInstant},
-    Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
-    SyscallIO, WriteCompletion, IO,
+    get_registered_io, list_registered_io, register_io, unregister_io, Buffer, Completion,
+    CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO, SyscallIO,
+    WriteCompletion, IO,
 };
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{Statement, StatementStatusCounter};
@@ -2316,6 +2317,9 @@ impl Database {
 
     #[cfg(feature = "fs")]
     pub fn io_for_vfs<S: AsRef<str> + std::fmt::Display>(vfs: S) -> Result<Arc<dyn IO>> {
+        if let Some(io) = crate::io::get_registered_io(vfs.as_ref()) {
+            return Ok(io);
+        }
         let vfsmods = ext::add_builtin_vfs_extensions(None)?;
         let io: Arc<dyn IO> = match vfsmods
             .iter()

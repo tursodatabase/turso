@@ -7,8 +7,10 @@ use bitflags::bitflags;
 use cfg_block::cfg_block;
 use rand::{Rng, RngCore};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::ptr::NonNull;
+use std::sync::LazyLock;
 use std::{fmt::Debug, pin::Pin};
 use turso_macros::AtomicEnum;
 
@@ -729,6 +731,111 @@ impl TempBufferCache {
         if self.max_cached > cache.len() {
             cache.push(buff);
         }
+    }
+}
+
+// Runtime-registrable Rust IO backends, resolved by `Database::io_for_vfs`.
+#[allow(clippy::type_complexity)]
+static IO_REGISTRY: LazyLock<parking_lot::Mutex<HashMap<String, Arc<dyn IO>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+const BUILTIN_VFS_NAMES: &[&str] = &["memory", "syscall", "io_uring", "experimental_win_iocp"];
+
+/// Register a named Rust IO backend.
+///
+/// Once registered, it can be used via [`Database::io_for_vfs`] or through
+/// any language binding's `vfs=` parameter (Go DSN, Python kwarg, etc.).
+///
+/// Re-registering the same name replaces the previous backend. Registered
+/// names take precedence over C VFS extensions and built-in backends
+/// (`"memory"`, `"syscall"`, `"io_uring"`), so registering a built-in name
+/// will shadow the default implementation.
+///
+/// # Errors
+///
+/// Returns [`LimboError::InvalidArgument`] if `name` is empty.
+pub fn register_io(name: &str, io: Arc<dyn IO>) -> crate::Result<()> {
+    if name.is_empty() {
+        return Err(crate::LimboError::InvalidArgument(
+            "IO backend name must not be empty".into(),
+        ));
+    }
+    if BUILTIN_VFS_NAMES.contains(&name) {
+        tracing::warn!("registered IO backend \"{name}\" shadows a built-in VFS");
+    }
+    IO_REGISTRY.lock().insert(name.to_string(), io);
+    Ok(())
+}
+
+/// Remove a registered Rust IO backend by name.
+///
+/// Returns `true` if an entry was removed, `false` if the name was not found.
+pub fn unregister_io(name: &str) -> bool {
+    IO_REGISTRY.lock().remove(name).is_some()
+}
+
+/// Look up a registered Rust IO backend by name.
+pub fn get_registered_io(name: &str) -> Option<Arc<dyn IO>> {
+    IO_REGISTRY.lock().get(name).cloned()
+}
+
+/// List all registered Rust IO backend names.
+pub fn list_registered_io() -> Vec<String> {
+    IO_REGISTRY.lock().keys().cloned().collect()
+}
+
+#[cfg(test)]
+mod io_registry_tests {
+    use super::*;
+
+    #[test]
+    fn register_and_retrieve() {
+        let io = Arc::new(MemoryIO::new());
+        register_io("ioreg::retrieve", io).unwrap();
+        assert!(get_registered_io("ioreg::retrieve").is_some());
+        assert!(get_registered_io("nonexistent").is_none());
+        unregister_io("ioreg::retrieve");
+    }
+
+    #[test]
+    fn re_register_replaces() {
+        let io1 = Arc::new(MemoryIO::new());
+        let io2 = Arc::new(MemoryIO::new());
+        register_io("ioreg::replace", io1).unwrap();
+        register_io("ioreg::replace", io2).unwrap();
+        let count = list_registered_io()
+            .into_iter()
+            .filter(|n| n == "ioreg::replace")
+            .count();
+        assert_eq!(count, 1, "should not duplicate entries");
+        unregister_io("ioreg::replace");
+    }
+
+    #[test]
+    fn unregister_returns_false_for_missing() {
+        assert!(!unregister_io("ioreg::never_registered"));
+    }
+
+    #[test]
+    fn unregister_removes() {
+        let io = Arc::new(MemoryIO::new());
+        register_io("ioreg::removable", io).unwrap();
+        assert!(unregister_io("ioreg::removable"));
+        assert!(get_registered_io("ioreg::removable").is_none());
+    }
+
+    #[test]
+    fn list_includes_registered() {
+        let io = Arc::new(MemoryIO::new());
+        register_io("ioreg::listed", io).unwrap();
+        assert!(list_registered_io().contains(&"ioreg::listed".to_string()));
+        unregister_io("ioreg::listed");
+    }
+
+    #[test]
+    fn empty_name_returns_error() {
+        let result = register_io("", Arc::new(MemoryIO::new()));
+        assert!(result.is_err());
     }
 }
 
