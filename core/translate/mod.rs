@@ -160,6 +160,7 @@ pub fn translate_inner(
             | ast::Stmt::Update { .. }
             | ast::Stmt::Insert { .. }
     );
+    crate::stack::trace_remaining("translate_inner:after_is_write");
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
     if is_vacuum && connection.get_query_only() {
@@ -171,6 +172,7 @@ pub fn translate_inner(
     }
 
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
+    crate::stack::trace_remaining("translate_inner:before_match");
 
     match stmt {
         ast::Stmt::AlterTable(alter) => {
@@ -192,15 +194,18 @@ pub fn translate_inner(
             if_not_exists,
             tbl_name,
             body,
-        } => translate_create_table(
-            tbl_name,
-            resolver,
-            temporary,
-            if_not_exists,
-            body,
-            program,
-            connection,
-        )?,
+        } => {
+            crate::stack::trace_remaining("translate_inner:create_table_arm");
+            translate_create_table(
+                tbl_name,
+                resolver,
+                temporary,
+                if_not_exists,
+                body,
+                program,
+                connection,
+            )?
+        }
         ast::Stmt::CreateTrigger {
             temporary,
             if_not_exists,

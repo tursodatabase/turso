@@ -3378,6 +3378,7 @@ impl FromClauseSubquery {
 }
 
 fn collect_column_refs(expr: &Expr) -> HashSet<String> {
+    crate::stack::trace_remaining("collect_column_refs:entry");
     collect_column_dependencies_of_expr(expr, &[])
 }
 
@@ -3502,6 +3503,7 @@ pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) ->
 }
 
 pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
+    crate::stack::trace_remaining("validate_generated_expr:entry");
     use ast::Expr;
     match expr {
         Expr::Qualified(_, _) => {
@@ -3631,6 +3633,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
 }
 
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
+    crate::stack::trace_remaining("schema_create_table:entry");
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
     let has_rowid;
@@ -3642,12 +3645,14 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let is_strict: bool;
     let mut unique_sets_columns: Vec<UniqueSet> = vec![];
     let mut unique_sets_constraints: Vec<UniqueSet> = vec![];
+    crate::stack::trace_remaining("schema_create_table:after_locals");
     match body {
         CreateTableBody::ColumnsAndConstraints {
             columns,
             constraints,
             options,
         } => {
+            crate::stack::trace_remaining("schema_create_table:columns_body");
             has_rowid = !options.contains_without_rowid();
             is_strict = options.contains_strict();
             let column_fk_count = columns
@@ -3666,6 +3671,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             // that's why we maintain 2 unique_set sequences and merge them together in the end
 
             let mut table_fk_order = column_fk_count;
+            crate::stack::trace_remaining("schema_create_table:before_table_constraints");
             for c in constraints {
                 if let ast::TableConstraint::PrimaryKey {
                     columns,
@@ -3801,6 +3807,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     check_constraints.push(CheckConstraint::new(c.name.as_ref(), expr, None));
                 }
             }
+            crate::stack::trace_remaining("schema_create_table:after_table_constraints");
 
             // Due to a bug in SQLite, this check is needed to maintain backwards compatibility with rowid alias
             // SQLite docs: https://sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
@@ -3808,6 +3815,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             let mut primary_key_desc_columns_constraint = false;
 
             let mut column_fk_order = 0;
+            crate::stack::trace_remaining("schema_create_table:before_column_loop");
             for ast::ColumnDefinition {
                 col_name,
                 col_type,
@@ -3876,8 +3884,17 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             {
                                 bail_parse_error!("Stored generated columns are not supported");
                             }
+                            crate::stack::trace_remaining(
+                                "schema_create_table:before_validate_generated_expr",
+                            );
                             validate_generated_expr(expr)?;
+                            crate::stack::trace_remaining(
+                                "schema_create_table:after_validate_generated_expr",
+                            );
                             generated = Some(expr.clone());
+                            crate::stack::trace_remaining(
+                                "schema_create_table:after_generated_clone",
+                            );
                         }
                         ast::ColumnConstraint::PrimaryKey {
                             order: o,
@@ -4004,7 +4021,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         );
                     }
 
+                    crate::stack::trace_remaining("schema_create_table:before_collect_column_refs");
                     let referenced_cols = collect_column_refs(gen_expr);
+                    crate::stack::trace_remaining("schema_create_table:after_collect_column_refs");
                     let current_col_name = normalize_ident(&name);
 
                     if referenced_cols.iter().any(|c| c == &current_col_name) {
@@ -4030,6 +4049,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     primary_key = true;
                 }
 
+                crate::stack::trace_remaining("schema_create_table:before_column_new");
                 let mut col = Column::new(
                     Some(name),
                     ty_str,
@@ -4056,12 +4076,15 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     }
                 }
                 cols.push(col);
+                crate::stack::trace_remaining("schema_create_table:after_column_push");
             }
+            crate::stack::trace_remaining("schema_create_table:after_column_loop");
         }
         CreateTableBody::AsSelect(_) => {
             crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
         }
     };
+    crate::stack::trace_remaining("schema_create_table:after_body_match");
 
     // flip is_rowid_alias back to false if the table has multiple primary key columns
     // or if the table has no rowid
@@ -4092,6 +4115,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     }
 
     // concat unqiue_sets collected from column definitions and constraints in correct order
+    crate::stack::trace_remaining("schema_create_table:before_unique_sets");
     let mut unique_sets = unique_sets_columns
         .into_iter()
         .chain(unique_sets_constraints)
@@ -4121,6 +4145,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         }
     }
 
+    crate::stack::trace_remaining("schema_create_table:before_table_struct");
     let mut table = BTreeTable {
         root_page,
         name: table_name,
@@ -4177,7 +4202,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         logical_to_physical_map: Vec::new(),
         column_dependencies: Default::default(),
     };
+    crate::stack::trace_remaining("schema_create_table:after_table_struct");
     table.prepare_generated_columns()?;
+    crate::stack::trace_remaining("schema_create_table:after_prepare_generated_columns");
     if !table.has_rowid {
         if table.primary_key_columns.is_empty() {
             crate::bail_parse_error!("PRIMARY KEY missing on table {}", table.name);
@@ -4202,6 +4229,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         &table.primary_key_columns,
         table.has_rowid,
     );
+    crate::stack::trace_remaining("schema_create_table:after_logical_map");
     Ok(table)
 }
 

@@ -289,7 +289,7 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    pub fn schema(&self) -> &Schema {
+    pub fn schema(&self) -> &'a Schema {
         self.schema
     }
 
@@ -372,6 +372,16 @@ impl<'a> Resolver<'a> {
             .as_ref()
             .map(|scope| scope.context.clone());
         f(ctx.as_ref())
+    }
+
+    pub(crate) fn replace_self_table_context(
+        &self,
+        ctx: Option<SelfTableContext>,
+    ) -> Option<SelfTableContext> {
+        let mut scope = self.self_table_scope.borrow_mut();
+        let prev = scope.take().map(|scope| scope.context);
+        *scope = ctx.map(SelfTableScope::new);
+        prev
     }
 
     pub(crate) fn self_table_affinity(&self, column: usize) -> Option<Affinity> {

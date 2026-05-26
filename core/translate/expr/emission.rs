@@ -132,6 +132,7 @@ pub fn emit_function_call(
 
 /// Process a RETURNING clause, converting ResultColumn expressions into ResultSetColumn structures
 /// with proper column binding and alias handling.
+#[turso_macros::trace_stack]
 pub fn process_returning_clause(
     returning: &mut [ast::ResultColumn],
     table_references: &mut TableReferences,
@@ -253,6 +254,7 @@ pub(crate) fn emit_returning_scan_back(program: &mut ProgramBuilder, buf: &Retur
 /// instead of being yielded immediately. A subsequent call to `emit_returning_scan_back`
 /// will drain the buffer and yield the rows to the caller.
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub(crate) fn emit_returning_results<'a>(
     program: &mut ProgramBuilder,
     table_references: &TableReferences,
@@ -343,6 +345,7 @@ pub(crate) struct ReturningRowImageCacheState {
     cache_enabled: bool,
 }
 
+#[turso_macros::trace_stack]
 pub(crate) fn seed_returning_row_image_in_cache<'a>(
     program: &mut ProgramBuilder,
     table_references: &TableReferences,
