@@ -25,6 +25,9 @@ macro_rules! assert_sync {
     };
 }
 
+assert_send!(ConcurrentGuard);
+assert_sync!(ConcurrentGuard);
+
 /// simple helper which return MISUSE error in case of concurrent access to some operation
 struct ConcurrentGuard {
     in_use: AtomicU32,
@@ -59,5 +62,33 @@ impl<'a> Drop for ConcurrentGuardToken<'a> {
             before == 1,
             "invalid db state: guard wasn't in use while token is active"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_guard_allows_single_use() {
+        let guard = ConcurrentGuard::new();
+        assert!(guard.try_use().is_ok());
+    }
+
+    #[test]
+    fn concurrent_guard_rejects_double_use() {
+        let guard = ConcurrentGuard::new();
+        let _token = guard.try_use().unwrap();
+        assert!(guard.try_use().is_err());
+    }
+
+    #[test]
+    fn concurrent_guard_allows_reuse_after_drop() {
+        let guard = ConcurrentGuard::new();
+        {
+            let token = guard.try_use().unwrap();
+            drop(token);
+        }
+        assert!(guard.try_use().is_ok());
     }
 }

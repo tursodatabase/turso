@@ -3,8 +3,8 @@ use std::{
     fmt::Display,
     ops::Deref,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex, Once, RwLock, Weak,
+        atomic::{AtomicUsize, Ordering},
     },
     task::Waker,
     time::Duration,
@@ -12,21 +12,20 @@ use std::{
 
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
+    EnvFilter, Layer,
     fmt::{self, format::Writer},
     layer::{Context, SubscriberExt},
     util::SubscriberInitExt,
-    EnvFilter, Layer,
 };
 use turso_core::{
-    storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, QueryMode,
-    Statement, StepResult, IO,
+    Connection, Database, DatabaseOpts, DatabaseStorage, EncryptionKey, IO, IOResult, LimboError,
+    OpenDbAsyncState, OpenFlags, QueryMode, Statement, StepResult, storage::database::DatabaseFile,
+    types::AsValueRef,
 };
 
 use crate::{
-    assert_send, assert_sync,
+    ConcurrentGuard, assert_send, assert_sync,
     capi::{self, c},
-    ConcurrentGuard,
 };
 
 assert_send!(TursoDatabase, TursoConnection, TursoStatement);
@@ -609,7 +608,7 @@ impl TursoDatabase {
                 Some(vfs) => {
                     return Err(TursoError::Error(format!(
                         "unsupported VFS backend: '{vfs}'"
-                    )))
+                    )));
                 }
                 None => match self.config.path.as_str() {
                     ":memory:" => Arc::new(turso_core::MemoryIO::new()),
@@ -1290,7 +1289,7 @@ impl TursoStatement {
 #[cfg(test)]
 mod tests {
     use crate::rsapi::{
-        TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR,
+        FINALIZED_ERR, TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode,
     };
     use turso_core::Value;
 

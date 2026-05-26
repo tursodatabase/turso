@@ -2,12 +2,12 @@
 
 use std::time::Duration;
 
-use turso_core::{types::AsValueRef, types::Text, IOResult};
+use turso_core::{IOResult, types::AsValueRef, types::Text};
 use turso_sdk_kit_macros::signature;
 
 use crate::rsapi::{
-    self, bytes_from_slice, c_string_to_str, str_from_c_str, str_from_slice, str_to_c_string,
-    TursoConnection, TursoDatabase, TursoStatement,
+    self, TursoConnection, TursoDatabase, TursoStatement, bytes_from_slice, c_string_to_str,
+    str_from_c_str, str_from_slice, str_to_c_string,
 };
 
 pub mod c {
