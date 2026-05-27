@@ -4274,7 +4274,7 @@ fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
         tx_id,
         begin_ts,
         write_set: Mutex::new(WriteSet::new()),
-        read_set: SkipSet::new(),
+        read_set: Mutex::new(Vec::new()),
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
@@ -5849,9 +5849,13 @@ fn transaction_display() {
         write_set
     });
 
-    let read_set = SkipSet::new();
-    read_set.insert(RowID::new((-2).into(), RowKey::Int(17)));
-    read_set.insert(RowID::new((-2).into(), RowKey::Int(19)));
+    let read_set = Mutex::new(Vec::new());
+    read_set
+        .lock()
+        .push(RowID::new((-2).into(), RowKey::Int(17)));
+    read_set
+        .lock()
+        .push(RowID::new((-2).into(), RowKey::Int(19)));
 
     let tx = Transaction {
         state,
