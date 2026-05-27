@@ -2057,4 +2057,87 @@ mod tests {
             "a retry checkpoint must not replay a delete whose btree_resident tombstone was already made durable"
         );
     }
+
+    fn committed_table_row_version(table_id: MVTableId, rowid: i64) -> RowVersion {
+        let record = ImmutableRecord::from_values(&[Value::from_i64(rowid)], 1).unwrap();
+        RowVersion {
+            id: 1,
+            begin: Some(TxTimestampOrID::Timestamp(5)),
+            end: None,
+            row: Row::new_table_row(
+                RowID::new(table_id, RowKey::Int(rowid)),
+                record.as_blob().to_vec(),
+                1,
+            ),
+            btree_resident: false,
+        }
+    }
+
+    #[test]
+    fn collect_table_rows_preempts_on_large_scan() {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        let mvstore = db.get_mvcc_store();
+        let pager = conn.pager.load().clone();
+        let mut checkpoint = CheckpointStateMachine::new(
+            pager,
+            mvstore.clone(),
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+        );
+
+        // More than one chunk worth of committed rows so collection must preempt.
+        let table_id = MVTableId::from(-2);
+        let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
+        for i in 0..row_count as i64 {
+            let version = committed_table_row_version(table_id, i);
+            mvstore
+                .rows
+                .insert(RowID::new(table_id, RowKey::Int(i)), Arc::new(RwLock::new(vec![version])));
+        }
+
+        // The first chunk fills up before the scan finishes, so it must yield.
+        let first = checkpoint.collect_table_rows();
+        assert!(
+            first.is_some_and(|io| io.is_explicit_yield()),
+            "scanning more than COLLECT_PREEMPTION_THRESHOLD rows must preempt with an explicit yield"
+        );
+
+        // Resume from the cursor until the scan finishes; every row must still
+        // be collected exactly once across the chunks.
+        while checkpoint.collect_table_rows().is_some() {}
+        assert_eq!(checkpoint.write_set.len(), row_count);
+    }
+
+    #[test]
+    fn collect_index_rows_preempts_on_large_scan() {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        let mvstore = db.get_mvcc_store();
+        let pager = conn.pager.load().clone();
+        let mut checkpoint = CheckpointStateMachine::new(
+            pager,
+            mvstore.clone(),
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+        );
+
+        let index_id = MVTableId::from(-7);
+        let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
+        for i in 0..row_count as i64 {
+            let (key, version) = index_row_version(index_id, "k", i, 1, Some(5), None, false);
+            mvstore.insert_index_version(index_id, key, version);
+        }
+
+        let first = checkpoint.collect_index_rows();
+        assert!(
+            first.is_some_and(|io| io.is_explicit_yield()),
+            "scanning more than COLLECT_PREEMPTION_THRESHOLD index rows must preempt with an explicit yield"
+        );
+
+        while checkpoint.collect_index_rows().is_some() {}
+        assert_eq!(checkpoint.index_write_set.len(), row_count);
+    }
 }
