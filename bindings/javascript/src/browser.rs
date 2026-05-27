@@ -18,7 +18,7 @@ impl Task for NoopTask {
 }
 
 #[napi]
-/// turso-db in the the browser requires explicit thread pool initialization
+/// turso-db in the browser requires explicit thread pool initialization
 /// so, we just put no-op task on the thread pool and force emnapi to allocate web worker
 pub fn init_thread_pool() -> napi::Result<AsyncTask<NoopTask>> {
     Ok(AsyncTask::new(NoopTask))

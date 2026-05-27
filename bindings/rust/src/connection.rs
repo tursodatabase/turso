@@ -228,7 +228,7 @@ impl Connection {
     /// This api defers slighty from: https://www.sqlite.org/c3ref/busy_timeout.html
     ///
     /// Instead of sleeping for linear amount of time specified by the user,
-    /// we will sleep in phases, until the the total amount of time is reached.
+    /// we will sleep in phases, until the total amount of time is reached.
     /// This means we first sleep of 1ms, then if we still return busy, we sleep for 2 ms, and repeat until a maximum of 100 ms per phase.
     ///
     /// Example:
