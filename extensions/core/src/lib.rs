@@ -4,14 +4,16 @@ mod types;
 mod vfs_modules;
 mod vtabs;
 pub use functions::{
-    AggCtx, AggFunc, ContextDestructor, FinalizeFunction, InitAggFunction, ScalarFunction,
-    StepFunction, ValueDestructor,
+    AggCtx, AggFunc, ContextDestructor, FinalizeFunction, InitAggFunction, ScalarFunc,
+    ScalarFunction, StepFunction, ValueDestructor,
 };
 use functions::{RegisterAggFn, RegisterScalarFn, UnregisterFunctionFn};
 use std::os::raw::c_void;
 #[cfg(feature = "vfs")]
 pub use turso_macros::VfsDerive;
-pub use turso_macros::{register_extension, scalar, AggregateDerive, VTabModuleDerive};
+pub use turso_macros::{
+    register_extension, scalar, AggregateDerive, ScalarDerive, VTabModuleDerive,
+};
 pub use types::{ResultCode, StepResult, Value, ValueType};
 #[cfg(feature = "vfs")]
 pub use vfs_modules::{

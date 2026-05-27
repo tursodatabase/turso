@@ -60,3 +60,21 @@ pub trait AggFunc {
     fn step(state: &mut Self::State, args: &[Value]);
     fn finalize(state: Self::State) -> Result<Value, Self::Error>;
 }
+
+/// A scalar function that carries opaque, per-registration state.
+///
+/// `State` is constructed once per registration via [`ScalarFunc::init`], shared
+/// by reference across every invocation, and dropped when the function is
+/// unregistered or the owning connection is dropped. Because a single registration
+/// is shared across connections and may be invoked concurrently, `State` must be
+/// `Send + Sync`.
+///
+/// Stateless functions should use the `#[scalar]` attribute macro instead.
+pub trait ScalarFunc {
+    type State: Send + Sync;
+    const NAME: &'static str;
+    const ALIAS: Option<&'static str> = None;
+
+    fn init() -> Self::State;
+    fn call(state: &Self::State, args: &[Value]) -> Value;
+}
