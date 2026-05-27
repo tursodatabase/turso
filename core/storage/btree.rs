@@ -1039,13 +1039,13 @@ impl BTreeCursor {
             }
             let payload_swap = std::mem::take(payload);
 
-            let mut reuse_immutable = self.get_immutable_record_or_create();
+            let mut reuse_immutable = self.get_immutable_record_or_create()?;
             reuse_immutable.as_mut().unwrap().invalidate();
 
             reuse_immutable
                 .as_mut()
                 .unwrap()
-                .start_serialization(&payload_swap);
+                .start_serialization(&payload_swap)?;
 
             self.read_overflow_state.take();
             break Ok(IOResult::Done(()));
@@ -1682,14 +1682,14 @@ impl BTreeCursor {
                 return Ok(ControlFlow::Break(res));
             }
         } else {
-            self.get_immutable_record_or_create()
+            self.get_immutable_record_or_create()?
                 .as_mut()
                 .unwrap()
                 .invalidate();
-            self.get_immutable_record_or_create()
+            self.get_immutable_record_or_create()?
                 .as_mut()
                 .unwrap()
-                .start_serialization(payload);
+                .start_serialization(payload)?;
         };
 
         let (target_leaf_page_is_in_left_subtree, is_eq) = {
@@ -2118,14 +2118,14 @@ impl BTreeCursor {
                 return Ok(ControlFlow::Break(IOResult::IO(io)));
             }
         } else {
-            self.get_immutable_record_or_create()
+            self.get_immutable_record_or_create()?
                 .as_mut()
                 .unwrap()
                 .invalidate();
-            self.get_immutable_record_or_create()
+            self.get_immutable_record_or_create()?
                 .as_mut()
                 .unwrap()
-                .start_serialization(payload);
+                .start_serialization(payload)?;
         };
 
         let (cmp, found) = self.compare_with_current_record(
@@ -4909,14 +4909,14 @@ impl BTreeCursor {
         Ok(())
     }
 
-    fn get_immutable_record_or_create(&mut self) -> Option<&mut ImmutableRecord> {
+    fn get_immutable_record_or_create(&mut self) -> Result<Option<&mut ImmutableRecord>> {
         let reusable_immutable_record = &mut self.reusable_immutable_record;
         if reusable_immutable_record.is_none() {
             let page_size = self.pager.get_page_size_unchecked().get();
-            let record = ImmutableRecord::new(page_size as usize);
+            let record = ImmutableRecord::new(page_size as usize)?;
             reusable_immutable_record.replace(record);
         }
-        reusable_immutable_record.as_mut()
+        Ok(reusable_immutable_record.as_mut())
     }
 
     fn get_immutable_record(&self) -> Option<&ImmutableRecord> {
@@ -5154,14 +5154,14 @@ impl CursorTrait for BTreeCursor {
         if let Some(next_page) = first_overflow_page {
             return_if_io!(self.process_overflow_read(payload, next_page, payload_size))
         } else {
-            self.get_immutable_record_or_create()
+            self.get_immutable_record_or_create()?
                 .as_mut()
                 .unwrap()
                 .invalidate();
-            self.get_immutable_record_or_create()
+            self.get_immutable_record_or_create()?
                 .as_mut()
                 .unwrap()
-                .start_serialization(payload);
+                .start_serialization(payload)?;
         };
 
         Ok(IOResult::Done(self.reusable_immutable_record.as_ref()))
@@ -5750,10 +5750,9 @@ impl CursorTrait for BTreeCursor {
 
     #[inline]
     fn invalidate_record(&mut self) {
-        self.get_immutable_record_or_create()
-            .as_mut()
-            .unwrap()
-            .invalidate();
+        if let Some(record) = self.reusable_immutable_record.as_mut() {
+            record.invalidate();
+        }
     }
 
     #[inline]
@@ -8422,7 +8421,7 @@ mod tests {
         val: Value,
     ) -> Result<(), LimboError> {
         let regs = &[Register::Value(val)];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
 
         run_until_done(
             || {
@@ -8454,7 +8453,7 @@ mod tests {
 
         let header_size = 8;
         let regs = &[Register::Value(Value::from_i64(1))];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let payload = add_record(1, 0, page.clone(), record, &conn);
         let page_contents = page.get_contents();
         assert_eq!(page_contents.cell_count(), 1);
@@ -8485,7 +8484,7 @@ mod tests {
         let usable_space = 4096;
         for i in 0..3 {
             let regs = &[Register::Value(Value::from_i64(i as i64))];
-            let record = ImmutableRecord::from_registers(regs, regs.len());
+            let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
             let payload = add_record(i, i, page.clone(), record, &conn);
             assert_eq!(page_contents.cell_count(), i + 1);
             let free = compute_free_space(page_contents, usable_space).unwrap();
@@ -8732,7 +8731,7 @@ mod tests {
 
         // Create a record with the large payload
         let regs = &[Register::Value(Value::Blob(large_payload))];
-        let large_record = ImmutableRecord::from_registers(regs, regs.len());
+        let large_record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
 
         // Create cursor for the table
         let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
@@ -8785,7 +8784,7 @@ mod tests {
         // Create a smaller record to overwrite with
         let small_payload = vec![b'Y'; 100]; // Much smaller payload
         let regs = &[Register::Value(Value::Blob(small_payload.clone()))];
-        let small_record = ImmutableRecord::from_registers(regs, regs.len());
+        let small_record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
 
         // Seek to the existing record
         run_until_done(
@@ -8904,7 +8903,7 @@ mod tests {
                 )
                 .unwrap();
                 let regs = &[Register::Value(Value::Blob(vec![0; *size]))];
-                let value = ImmutableRecord::from_registers(regs, regs.len());
+                let value = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
                 tracing::info!("insert key:{}", key);
                 run_until_done(
                     || cursor.insert(&BTreeKey::new_table_rowid(*key, Some(&value))),
@@ -9001,7 +9000,7 @@ mod tests {
                 )
                 .unwrap();
                 let regs = &[Register::Value(Value::Blob(vec![0; size]))];
-                let value = ImmutableRecord::from_registers(regs, regs.len());
+                let value = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
                 let btree_before = if do_validate {
                     format_btree(pager.clone(), root_page, 0)
                 } else {
@@ -9140,10 +9139,10 @@ mod tests {
                     .iter()
                     .map(|col| Register::Value(Value::from_i64(*col)))
                     .collect::<Vec<_>>();
-                let value = ImmutableRecord::from_registers(&regs, regs.len());
+                let value = ImmutableRecord::from_registers(&regs, regs.len()).unwrap();
                 run_until_done(
                     || {
-                        let record = ImmutableRecord::from_registers(&regs, regs.len());
+                        let record = ImmutableRecord::from_registers(&regs, regs.len()).unwrap();
                         let key = SeekKey::IndexKey(&record);
                         cursor.seek(key, SeekOp::GE { eq_only: true })
                     },
@@ -9174,7 +9173,9 @@ mod tests {
                             .map(|col| Register::Value(Value::from_i64(*col)))
                             .collect::<Vec<_>>();
                         cursor.seek(
-                            SeekKey::IndexKey(&ImmutableRecord::from_registers(&regs, regs.len())),
+                            SeekKey::IndexKey(
+                                &ImmutableRecord::from_registers(&regs, regs.len()).unwrap(),
+                            ),
                             SeekOp::GE { eq_only: true },
                         )
                     },
@@ -9326,11 +9327,12 @@ mod tests {
                     expected_keys.push(key.clone());
 
                     let regs = vec![Register::Value(Value::Blob(key))];
-                    let value = ImmutableRecord::from_registers(&regs, regs.len());
+                    let value = ImmutableRecord::from_registers(&regs, regs.len()).unwrap();
 
                     let seek_result = run_until_done(
                         || {
-                            let record = ImmutableRecord::from_registers(&regs, regs.len());
+                            let record =
+                                ImmutableRecord::from_registers(&regs, regs.len()).unwrap();
                             let key = SeekKey::IndexKey(&record);
                             cursor.seek(key, SeekOp::GE { eq_only: true })
                         },
@@ -9356,7 +9358,7 @@ mod tests {
                         }
 
                         let regs = vec![Register::Value(Value::Blob(key_to_delete.clone()))];
-                        let record = ImmutableRecord::from_registers(&regs, regs.len());
+                        let record = ImmutableRecord::from_registers(&regs, regs.len()).unwrap();
 
                         // Seek to the key to delete
                         let seek_result = run_until_done(
@@ -9417,7 +9419,9 @@ mod tests {
                 || {
                     let regs = vec![Register::Value(Value::Blob(key.clone()))];
                     cursor.seek(
-                        SeekKey::IndexKey(&ImmutableRecord::from_registers(&regs, regs.len())),
+                        SeekKey::IndexKey(
+                            &ImmutableRecord::from_registers(&regs, regs.len()).unwrap(),
+                        ),
                         SeekOp::GE { eq_only: true },
                     )
                 },
@@ -9497,7 +9501,7 @@ mod tests {
         let total_cells = 10;
         for i in 0..total_cells {
             let regs = &[Register::Value(Value::from_i64(i as i64))];
-            let record = ImmutableRecord::from_registers(regs, regs.len());
+            let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
             let payload = add_record(i, i, page.clone(), record, &conn);
             assert_eq!(page_contents.cell_count(), i + 1);
             let free = compute_free_space(page_contents, usable_space).unwrap();
@@ -10250,7 +10254,7 @@ mod tests {
         let usable_space = 4096;
         for i in 0..3 {
             let regs = &[Register::Value(Value::from_i64(i as i64))];
-            let record = ImmutableRecord::from_registers(regs, regs.len());
+            let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
             let payload = add_record(i, i, page.clone(), record, &conn);
             assert_eq!(page_contents.cell_count(), i + 1);
             let free = compute_free_space(page_contents, usable_space).unwrap();
@@ -10292,7 +10296,7 @@ mod tests {
         let total_cells = 10;
         for i in 0..total_cells {
             let regs = &[Register::Value(Value::from_i64(i as i64))];
-            let record = ImmutableRecord::from_registers(regs, regs.len());
+            let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
             let payload = add_record(i, i, page.clone(), record, &conn);
             assert_eq!(page_contents.cell_count(), i + 1);
             let free = compute_free_space(page_contents, usable_space).unwrap();
@@ -10348,7 +10352,7 @@ mod tests {
                     let cell_idx = rng.next_u64() as usize % (page_contents.cell_count() + 1);
                     let free = compute_free_space(page_contents, usable_space).unwrap();
                     let regs = &[Register::Value(Value::from_i64(i as i64))];
-                    let record = ImmutableRecord::from_registers(regs, regs.len());
+                    let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
                     let mut payload: Vec<u8> = Vec::new();
                     let mut fill_cell_payload_state = FillCellPayloadState::Start;
                     run_until_done(
@@ -10431,7 +10435,7 @@ mod tests {
                         let cell_idx = rng.next_u64() as usize % (page_contents.cell_count() + 1);
                         let free = compute_free_space(page_contents, usable_space).unwrap();
                         let regs = &[Register::Value(Value::from_i64(i))];
-                        let record = ImmutableRecord::from_registers(regs, regs.len());
+                        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
                         let mut payload: Vec<u8> = Vec::new();
                         let mut fill_cell_payload_state = FillCellPayloadState::Start;
                         run_until_done(
@@ -10591,7 +10595,7 @@ mod tests {
         let usable_space = 4096;
 
         let regs = &[Register::Value(Value::from_i64(0))];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let payload = add_record(0, 0, page.clone(), record, &conn);
         let free = compute_free_space(page_contents, usable_space).unwrap();
         assert_eq!(free, 4096 - payload.len() - 2 - header_size);
@@ -10608,7 +10612,7 @@ mod tests {
         let usable_space = 4096;
 
         let regs = &[Register::Value(Value::from_i64(0))];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let payload = add_record(0, 0, page.clone(), record, &conn);
 
         assert_eq!(page_contents.cell_count(), 1);
@@ -10633,7 +10637,7 @@ mod tests {
             Register::Value(Value::from_i64(0)),
             Register::Value(Value::Text(Text::new("aaaaaaaa"))),
         ];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let _ = add_record(0, 0, page.clone(), record, &conn);
 
         assert_eq!(page_contents.cell_count(), 1);
@@ -10641,7 +10645,7 @@ mod tests {
         assert_eq!(page_contents.cell_count(), 0);
 
         let regs = &[Register::Value(Value::from_i64(0))];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let payload = add_record(0, 0, page.clone(), record, &conn);
         assert_eq!(page_contents.cell_count(), 1);
 
@@ -10664,7 +10668,7 @@ mod tests {
             Register::Value(Value::from_i64(0)),
             Register::Value(Value::Text(Text::new("aaaaaaaa"))),
         ];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let _ = add_record(0, 0, page.clone(), record, &conn);
 
         for _ in 0..100 {
@@ -10673,7 +10677,7 @@ mod tests {
             assert_eq!(page_contents.cell_count(), 0);
 
             let regs = &[Register::Value(Value::from_i64(0))];
-            let record = ImmutableRecord::from_registers(regs, regs.len());
+            let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
             let payload = add_record(0, 0, page.clone(), record, &conn);
             assert_eq!(page_contents.cell_count(), 1);
 
@@ -10694,13 +10698,13 @@ mod tests {
         let usable_space = 4096;
 
         let regs = &[Register::Value(Value::from_i64(0))];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let payload = add_record(0, 0, page.clone(), record, &conn);
         let regs = &[Register::Value(Value::from_i64(1))];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let _ = add_record(1, 1, page.clone(), record, &conn);
         let regs = &[Register::Value(Value::from_i64(2))];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let _ = add_record(2, 2, page.clone(), record, &conn);
 
         drop_cell(page_contents, 1, usable_space).unwrap();
@@ -10720,24 +10724,24 @@ mod tests {
         let usable_space = 4096;
 
         let regs = &[Register::Value(Value::from_i64(0))];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let _ = add_record(0, 0, page.clone(), record, &conn);
 
         let regs = &[Register::Value(Value::from_i64(0))];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let _ = add_record(0, 0, page.clone(), record, &conn);
         drop_cell(page_contents, 0, usable_space).unwrap();
 
         defragment_page(page_contents, usable_space, 4).unwrap();
 
         let regs = &[Register::Value(Value::from_i64(0))];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let _ = add_record(0, 1, page.clone(), record, &conn);
 
         drop_cell(page_contents, 0, usable_space).unwrap();
 
         let regs = &[Register::Value(Value::from_i64(0))];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let _ = add_record(0, 1, page.clone(), record, &conn);
     }
 
@@ -10750,7 +10754,7 @@ mod tests {
         let usable_space = 4096;
         let insert = |pos, page| {
             let regs = &[Register::Value(Value::from_i64(0))];
-            let record = ImmutableRecord::from_registers(regs, regs.len());
+            let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
             let _ = add_record(0, pos, page, record, &conn);
         };
         let drop = |pos, page| {
@@ -10791,7 +10795,7 @@ mod tests {
         let usable_space = 4096;
         let insert = |pos, page| {
             let regs = &[Register::Value(Value::from_i64(0))];
-            let record = ImmutableRecord::from_registers(regs, regs.len());
+            let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
             let _ = add_record(0, pos, page, record, &conn);
         };
         let drop = |pos, page| {
@@ -10801,7 +10805,7 @@ mod tests {
             defragment_page(page, usable_space, 4).unwrap();
         };
         let regs = &[Register::Value(Value::from_i64(0))];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let mut payload: Vec<u8> = Vec::new();
         let mut fill_cell_payload_state = FillCellPayloadState::Start;
         run_until_done(
@@ -10847,7 +10851,7 @@ mod tests {
             let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             tracing::info!("INSERT INTO t VALUES ({});", i,);
             let regs = &[Register::Value(Value::from_i64(i))];
-            let value = ImmutableRecord::from_registers(regs, regs.len());
+            let value = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
             tracing::trace!("before insert {}", i);
             run_until_done(
                 || {
@@ -10887,7 +10891,7 @@ mod tests {
         let page = get_page(2);
         let usable_space = 4096;
         let regs = &[Register::Value(Value::Blob(vec![0; 3600]))];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let mut payload: Vec<u8> = Vec::new();
         let mut fill_cell_payload_state = FillCellPayloadState::Start;
         run_until_done(
@@ -10933,7 +10937,7 @@ mod tests {
         for i in 1..=10000 {
             let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             let regs = &[Register::Value(Value::Text(Text::new("hello world")))];
-            let value = ImmutableRecord::from_registers(regs, regs.len());
+            let value = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
 
             run_until_done(
                 || {
@@ -11012,7 +11016,7 @@ mod tests {
             let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             tracing::info!("INSERT INTO t VALUES ({});", i,);
             let regs = &[Register::Value(Value::Text(Text::new(huge_text.clone())))];
-            let value = ImmutableRecord::from_registers(regs, regs.len());
+            let value = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
             tracing::trace!("before insert {}", i);
             tracing::debug!(
                 "=========== btree before ===========\n{}\n\n",
@@ -11136,7 +11140,7 @@ mod tests {
     fn insert_cell(cell_idx: u64, size: u16, page: PageRef, pager: Arc<Pager>) {
         let mut payload = Vec::new();
         let regs = &[Register::Value(Value::Blob(vec![0; size as usize]))];
-        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let mut fill_cell_payload_state = FillCellPayloadState::Start;
         let contents = page.get_contents();
         run_until_done(

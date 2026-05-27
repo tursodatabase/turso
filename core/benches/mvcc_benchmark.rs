@@ -101,7 +101,7 @@ fn bench(c: &mut Criterion) {
     });
 
     let db = bench_db();
-    let record = ImmutableRecord::from_values(&vec![Value::Text(Text::new("World"))], 1);
+    let record = ImmutableRecord::from_values(&vec![Value::Text(Text::new("World"))], 1).unwrap();
     let record_data = record.as_blob();
     group.bench_function("begin_tx-update-commit_tx", |b| {
         b.to_async(FuturesExecutor).iter(|| async {

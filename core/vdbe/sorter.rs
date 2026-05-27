@@ -25,7 +25,7 @@ use crate::{io_yield_one, return_if_io, CompletionError};
 /// A custom comparison function for sorting custom type columns.
 /// Takes two value references and returns an Ordering.
 /// Used when a custom type defines a `<` operator for correct sort behavior.
-pub type SortComparator = Arc<dyn Fn(&ValueRef, &ValueRef) -> Ordering + Send + Sync>;
+pub type SortComparator = Arc<dyn Fn(&ValueRef, &ValueRef) -> Result<Ordering> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy)]
 enum SortState {
@@ -216,10 +216,10 @@ impl Sorter {
                     match &mut self.current {
                         Some(record) => {
                             record.invalidate();
-                            record.start_serialization(payload);
+                            record.start_serialization(payload)?;
                         }
                         None => {
-                            self.current = Some(arena_record.to_immutable_record());
+                            self.current = Some(arena_record.to_immutable_record()?);
                         }
                     }
 
@@ -240,7 +240,7 @@ impl Sorter {
                     match &mut self.current {
                         Some(record) => {
                             record.invalidate();
-                            record.start_serialization(payload);
+                            record.start_serialization(payload)?;
                         }
                         None => {
                             self.current = Some(boxed_record.record);
@@ -595,10 +595,10 @@ impl SortedChunk {
                             }
                             buffer_offset += bytes_read;
 
-                            let mut record = ImmutableRecord::new(record_size);
+                            let mut record = ImmutableRecord::new(record_size)?;
                             record.start_serialization(
                                 &buffer[buffer_offset..buffer_offset + record_size],
-                            );
+                            )?;
                             buffer_offset += record_size;
 
                             self.records.try_push(record)?;
@@ -807,11 +807,11 @@ impl ArenaSortableRecord {
     }
 
     /// Create an ImmutableRecord by copying payload bytes out of the arena.
-    fn to_immutable_record(&self) -> ImmutableRecord {
+    fn to_immutable_record(&self) -> Result<ImmutableRecord> {
         let payload = self.payload();
-        let mut record = ImmutableRecord::new(payload.len());
-        record.start_serialization(payload);
-        record
+        let mut record = ImmutableRecord::new(payload.len())?;
+        record.start_serialization(payload)?;
+        Ok(record)
     }
 }
 
@@ -831,7 +831,7 @@ impl Ord for ArenaSortableRecord {
             .enumerate()
         {
             let cmp = if let Some(Some(comparator)) = comparators.get(i) {
-                comparator(&self_val, &other_val)
+                comparator(&self_val, &other_val).expect("Memory allocation failed here")
             } else {
                 match (self_val, other_val) {
                     (ValueRef::Text(left), ValueRef::Text(right)) => {
@@ -947,7 +947,7 @@ impl Ord for BoxedSortableRecord {
             .enumerate()
         {
             let cmp = if let Some(Some(comparator)) = self.comparators.get(i) {
-                comparator(&self_val, &other_val)
+                comparator(&self_val, &other_val).expect("Memory allocation failed here")
             } else {
                 match (self_val, other_val) {
                     (ValueRef::Text(left), ValueRef::Text(right)) => {
@@ -1058,7 +1058,7 @@ mod tests {
             for i in (0..num_records).rev() {
                 let mut values = try_vec![Value::from_i64(i)].unwrap();
                 values.append(&mut generate_values(&mut rng, &value_types));
-                let record = ImmutableRecord::from_values(&values, values.len());
+                let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
 
                 io.block(|| sorter.insert(&record))
                     .expect("Failed to insert the record");

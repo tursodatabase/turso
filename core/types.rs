@@ -1075,16 +1075,13 @@ mod immutable_record {
 
     fn values(payload: &[u8]) -> Result<Vec<ValueRef<'_>>> {
         let iter = iter(payload)?;
-        let mut values = Vec::with_capacity(iter.size_hint().0);
-        for value in iter {
-            values.push(value?);
-        }
+        let values = iter.try_collect::<Result<_>>()??;
         Ok(values)
     }
 
     fn values_range(payload: &[u8], range: std::ops::Range<usize>) -> Result<Vec<ValueRef<'_>>> {
         let mut iter = iter(payload)?;
-        let mut values = Vec::with_capacity(range.end - range.start);
+        let mut values = Vec::try_with_capacity_ext(range.end - range.start)?;
         if let Some(value) = iter.nth(range.start) {
             values.push(value?);
         } else {
@@ -1150,16 +1147,15 @@ mod immutable_record {
 
     fn values_owned(payload: &[u8]) -> Result<Vec<Value>> {
         let iter = iter(payload).expect("Failed to create payload iterator");
-        let mut values = Vec::with_capacity(iter.size_hint().0);
-        for value in iter {
-            values.push(value?.to_owned());
-        }
+        let values = iter
+            .map(|v| Ok::<_, LimboError>(v?.to_owned()))
+            .try_collect::<Result<_>>()??;
         Ok(values)
     }
 
     fn values_owned_range(payload: &[u8], range: std::ops::Range<usize>) -> Result<Vec<Value>> {
         let mut iter = iter(payload).expect("Failed to create payload iterator");
-        let mut values = Vec::with_capacity(range.end - range.start);
+        let mut values = Vec::try_with_capacity_ext(range.end - range.start)?;
         if let Some(value) = iter.nth(range.start) {
             values.push(value?.to_owned());
         } else {
@@ -1374,10 +1370,10 @@ mod immutable_record {
     }
 
     impl ImmutableRecord {
-        pub fn new(payload_capacity: usize) -> Self {
-            Self {
-                payload: Value::Blob(Vec::with_capacity(payload_capacity)),
-            }
+        pub fn new(payload_capacity: usize) -> Result<Self> {
+            Ok(Self {
+                payload: Value::Blob(Vec::try_with_capacity_ext(payload_capacity)?),
+            })
         }
 
         pub const fn from_bin_record(payload: Vec<u8>) -> Self {
@@ -1397,15 +1393,15 @@ mod immutable_record {
             // (without copying the data itself)
             registers: impl IntoIterator<Item = &'a Register, IntoIter = I>,
             len: usize,
-        ) -> Self {
+        ) -> Result<Self> {
             Self::from_values(registers.into_iter().map(|x| x.get_value()), len)
         }
 
         pub fn from_values<'a>(
             values: impl IntoIterator<Item = impl AsValueRef + 'a> + Clone,
             len: usize,
-        ) -> Self {
-            let mut serials = Vec::with_capacity(len);
+        ) -> Result<Self> {
+            let mut serials = Vec::try_with_capacity_ext(len)?;
             let mut size_header = 0;
             let mut size_values = 0;
 
@@ -1425,8 +1421,7 @@ mod immutable_record {
             let header_size = Record::calc_header_size(size_header);
 
             // 1. write header size
-            let mut buf = Vec::new();
-            buf.reserve_exact(header_size + size_values);
+            let mut buf = Vec::try_with_capacity_ext(header_size + size_values)?;
             assert_eq!(buf.capacity(), header_size + size_values);
             let n = write_varint(&mut serial_type_buf, header_size as u64);
 
@@ -1479,9 +1474,9 @@ mod immutable_record {
             }
 
             writer.assert_finish_capacity();
-            Self {
+            Ok(Self {
                 payload: Value::Blob(buf),
-            }
+            })
         }
 
         #[inline]
@@ -1514,8 +1509,11 @@ mod immutable_record {
         }
 
         #[inline]
-        pub fn start_serialization(&mut self, payload: &[u8]) {
-            self.as_blob_mut().extend_from_slice(payload);
+        pub fn start_serialization(&mut self, payload: &[u8]) -> Result<()> {
+            let blob = self.as_blob_mut();
+            blob.try_reserve(payload.len())?;
+            blob.extend_from_slice(payload);
+            Ok(())
         }
 
         #[inline]
@@ -3335,7 +3333,7 @@ mod tests {
 
     fn create_record(values: Vec<Value>) -> ImmutableRecord {
         let registers: Vec<Register> = values.into_iter().map(Register::Value).collect();
-        ImmutableRecord::from_registers(&registers, registers.len())
+        ImmutableRecord::from_registers(&registers, registers.len()).unwrap()
     }
 
     #[test]
@@ -4196,7 +4194,7 @@ mod tests {
         for num_values in 1..=10 {
             let values: Vec<Value> = (0..num_values).map(|i| Value::from_i64(i as i64)).collect();
 
-            let record = ImmutableRecord::from_values(&values, values.len());
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
             let cnt = record.column_count();
             assert_eq!(
                 cnt, num_values,

@@ -127,12 +127,12 @@ impl SortableIndexKey {
         Self { key, metadata }
     }
 
-    pub fn new_from_values(values: Vec<ValueRef>, metadata: Arc<IndexInfo>) -> Self {
+    pub fn new_from_values(values: Vec<ValueRef>, metadata: Arc<IndexInfo>) -> Result<Self> {
         let len = values.len();
-        Self {
-            key: ImmutableRecord::from_values(values, len),
+        Ok(Self {
+            key: ImmutableRecord::from_values(values, len)?,
             metadata,
-        }
+        })
     }
 
     fn compare(&self, other: &Self) -> Result<std::cmp::Ordering> {
@@ -2638,8 +2638,8 @@ impl StateTransition for WriteRowStateMachine {
                     None
                 } else {
                     let row_data = self.row.data.as_ref().expect("table rows should have data");
-                    let mut record = ImmutableRecord::new(row_data.len());
-                    record.start_serialization(row_data);
+                    let mut record = ImmutableRecord::new(row_data.len())?;
+                    record.start_serialization(row_data)?;
                     Some(record)
                 };
                 if self.requires_seek {
@@ -5384,7 +5384,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let values = (1..=5)
                     .map(|i| row.get_value(i).clone())
                     .collect::<Vec<_>>();
-                schema_rows.insert(rowid, ImmutableRecord::from_values(&values, values.len()));
+                schema_rows.insert(rowid, ImmutableRecord::from_values(&values, values.len())?);
                 Ok(())
             })?;
         }

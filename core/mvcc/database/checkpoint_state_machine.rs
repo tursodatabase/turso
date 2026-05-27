@@ -984,7 +984,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 Value::from_i64(new_i64),
             ],
             2,
-        );
+        )?;
         let row = Row::new_table_row(
             RowID::new(table_id, RowKey::Int(1)),
             record.get_payload().to_vec(),
@@ -1292,7 +1292,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
                         let mut values = record.get_values_owned()?;
                         values[3] = Value::from_i64(root_page as i64);
-                        let record = ImmutableRecord::from_values(&values, values.len());
+                        let record = ImmutableRecord::from_values(&values, values.len())?;
                         row_version.row.data = Some(record.get_payload().to_owned());
                         row_version.clone()
                     };
@@ -1325,7 +1325,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         let record = ImmutableRecordRef::from_bin_record(row_version.row.payload());
                         let mut values = record.get_values_owned()?;
                         values[3] = Value::from_i64(root_page as i64);
-                        let record = ImmutableRecord::from_values(&values, values.len());
+                        let record = ImmutableRecord::from_values(&values, values.len())?;
                         row_version.row.data = Some(record.get_payload().to_owned());
                         row_version.clone()
                     };
@@ -1820,7 +1820,8 @@ mod tests {
                 Value::build_text(format!("sql:{entry_type}:{name}:{root_page}")),
             ],
             5,
-        );
+        )
+        .unwrap();
         RowVersion {
             id: 1,
             begin: begin.map(TxTimestampOrID::Timestamp),
@@ -1942,7 +1943,8 @@ mod tests {
                 Value::from_i64(rowid),
             ],
             2,
-        );
+        )
+        .unwrap();
         let sortable_key = SortableIndexKey::new_from_record(key_record, index_info);
         let key_arc = Arc::new(sortable_key.clone());
         let row = Row::new_index_row(RowID::new(index_id, RowKey::Record(sortable_key)), 2);

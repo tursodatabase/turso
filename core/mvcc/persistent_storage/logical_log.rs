@@ -2471,7 +2471,8 @@ mod tests {
                     )), // sql
                 ],
                 5,
-            );
+            )
+            .unwrap();
             mvcc_store
                 .insert(
                     tx_id,
@@ -2542,7 +2543,8 @@ mod tests {
                     )), // sql
                 ],
                 5,
-            );
+            )
+            .unwrap();
             mvcc_store
                 .insert(
                     tx_id,
@@ -2655,7 +2657,8 @@ mod tests {
                     )), // sql
                 ],
                 5,
-            );
+            )
+            .unwrap();
             mvcc_store
                 .insert(
                     tx_id,
@@ -2798,7 +2801,8 @@ mod tests {
                     Value::from_i64(row_id),
                 ],
                 2,
-            );
+            )
+            .unwrap();
             let sortable_key = SortableIndexKey::new_from_record(key_record, index_info.clone());
             let index_rowid = RowID::new(index_id, RowKey::Record(sortable_key));
 
@@ -4182,7 +4186,8 @@ mod tests {
                 Value::from_i64(rowid),
             ],
             2,
-        );
+        )
+        .unwrap();
         let sortable_key = SortableIndexKey::new_from_record(
             key_record,
             Arc::new(IndexInfo {
