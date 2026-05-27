@@ -11,9 +11,76 @@ use std::{
 };
 use turso_core::{Connection, LimboError, StepResult};
 use turso_ext::{
-    AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarFunction,
-    StepFunction, Value as ExtValue, ValueDestructor, ValueType as ExtValueType,
+    AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarDerive,
+    ScalarFunc, ScalarFunction, StepFunction, Value as ExtValue, ValueDestructor,
+    ValueType as ExtValueType,
 };
+
+static CTX_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+static CTX_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+struct MultiplierState {
+    multiplier: i64,
+}
+
+impl Drop for MultiplierState {
+    fn drop(&mut self) {
+        CTX_DROP_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+}
+
+#[derive(ScalarDerive)]
+struct CtxMultiply;
+
+impl ScalarFunc for CtxMultiply {
+    type State = MultiplierState;
+    const NAME: &'static str = "ctx_multiply";
+
+    fn init() -> Self::State {
+        MultiplierState { multiplier: 3 }
+    }
+
+    fn call(state: &Self::State, args: &[ExtValue]) -> ExtValue {
+        CTX_CALL_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+        let n = args
+            .first()
+            .and_then(ExtValue::to_integer)
+            .unwrap_or_default();
+        ExtValue::from_integer(n * state.multiplier)
+    }
+}
+
+#[turso_macros::test]
+fn scalar_derive_state_is_shared_across_calls_and_dropped_once(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    CTX_CALL_COUNT.store(0, AtomicOrdering::SeqCst);
+    CTX_DROP_COUNT.store(0, AtomicOrdering::SeqCst);
+
+    let conn = tmp_db.connect_limbo();
+
+    // Register via the derive-generated entry point against this connection.
+    let api = unsafe { conn._build_turso_ext() };
+    let rc = unsafe { register_CtxMultiply(&api as *const _) };
+    unsafe { conn._free_extension_ctx(api) };
+    assert_eq!(rc, ResultCode::OK);
+
+    // State (multiplier = 3) is applied, and shared across multiple calls.
+    let first: Vec<(i64,)> = conn.exec_rows("SELECT ctx_multiply(5)");
+    assert_eq!(first, vec![(15,)]);
+    let second: Vec<(i64,)> = conn.exec_rows("SELECT ctx_multiply(10)");
+    assert_eq!(second, vec![(30,)]);
+    assert_eq!(CTX_CALL_COUNT.load(AtomicOrdering::SeqCst), 2);
+
+    // No destructor has fired while the registration is still live.
+    assert_eq!(CTX_DROP_COUNT.load(AtomicOrdering::SeqCst), 0);
+
+    // Dropping the connection drops its symbol table, which runs the state
+    // destructor exactly once.
+    drop(conn);
+    assert_eq!(CTX_DROP_COUNT.load(AtomicOrdering::SeqCst), 1);
+    Ok(())
+}
 
 #[turso_macros::test]
 fn sql_extension_loading_is_disabled_by_default(tmp_db: TempDatabase) -> anyhow::Result<()> {
