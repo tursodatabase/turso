@@ -2092,9 +2092,10 @@ mod tests {
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
         for i in 0..row_count as i64 {
             let version = committed_table_row_version(table_id, i);
-            mvstore
-                .rows
-                .insert(RowID::new(table_id, RowKey::Int(i)), Arc::new(RwLock::new(vec![version])));
+            mvstore.rows.insert(
+                RowID::new(table_id, RowKey::Int(i)),
+                Arc::new(RwLock::new(vec![version])),
+            );
         }
 
         // The first chunk fills up before the scan finishes, so it must yield.
