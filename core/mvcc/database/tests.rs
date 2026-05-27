@@ -9069,6 +9069,87 @@ fn repro_dropped_schema_commit_before_global_header_finalize_publishes_metadata(
     observer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 }
 
+#[test]
+fn repro_dropped_committed_tx_commits_temp_schema_snapshot() -> Result<()> {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    let writer = db.connect();
+    writer.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
+    writer.execute("BEGIN")?;
+    writer.execute("CREATE TEMP TABLE temp_control (id INTEGER PRIMARY KEY)")?;
+    writer.execute("INSERT INTO temp_control VALUES (3)")?;
+    writer.execute("COMMIT")?;
+    let rows = get_rows(&writer, "SELECT id FROM temp_control ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+
+    let injector = FixedYieldInjector::new([CommitYieldPoint::BeforeGlobalHeaderUpdate.point()]);
+    writer.set_yield_injector(Some(injector.clone()));
+    writer.execute("BEGIN CONCURRENT")?;
+    writer.execute("INSERT INTO t VALUES (1, 'main')")?;
+    writer.execute("CREATE TEMP TABLE temp_keep (id INTEGER PRIMARY KEY)")?;
+    writer.execute("INSERT INTO temp_keep VALUES (7)")?;
+
+    let mut commit = writer.prepare("COMMIT")?;
+    let mut yielded = false;
+    for _ in 0..256 {
+        match commit.step()? {
+            crate::StepResult::IO => {
+                if injector.is_empty() {
+                    yielded = true;
+                    break;
+                }
+            }
+            crate::StepResult::Done => {
+                panic!("COMMIT completed before BeforeGlobalHeaderUpdate yield fired")
+            }
+            other => panic!("unexpected commit step result: {other:?}"),
+        }
+    }
+    assert!(
+        yielded,
+        "COMMIT should yield after the MVCC tx is Committed but before normal VDBE finalization"
+    );
+
+    drop(commit);
+    writer.set_yield_injector(None);
+    writer.maybe_reparse_schema()?;
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+
+    let mut stmt = writer.prepare("SELECT id FROM temp_keep ORDER BY id")?;
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 7);
+
+    writer.execute("BEGIN")?;
+    writer.execute("CREATE TEMP TABLE temp_rolled_back (id INTEGER PRIMARY KEY)")?;
+    writer.execute("ROLLBACK")?;
+
+    let mut stmt = writer.prepare("SELECT id FROM temp_keep ORDER BY id")?;
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })?;
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        7,
+        "dropped committed COMMIT must snapshot temp_keep as committed so later ROLLBACK keeps it"
+    );
+    assert!(matches!(
+        writer.prepare("SELECT id FROM temp_rolled_back"),
+        Err(err) if err.to_string().contains("no such table")
+    ));
+    Ok(())
+}
+
 /// Regression guard for the `mv_store.txs` ↔ `connection.mv_tx_id` divergence
 /// originally observed in production as `Transaction <id> not found while
 /// releasing savepoint` (panic) and `NoSuchTransactionID(<id>)` (read-path
