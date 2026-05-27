@@ -33,6 +33,7 @@ members = [
     "perf/throughput/rusqlite",
     "perf/encryption",
     "perf/memory",
+    "perf/query-batch",
     "tools/dbhash",
     "sdk-kit",
     "sdk-kit-macros",
