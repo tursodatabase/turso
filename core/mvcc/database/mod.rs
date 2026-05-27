@@ -4422,12 +4422,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let tx = tx_entry.value();
 
                 let mut cursor = 0;
-                let drained = self.rewrite_committed_live_versions_batch(
-                    tx,
-                    end_ts,
-                    &mut cursor,
-                    usize::MAX,
-                );
+                let drained =
+                    self.rewrite_committed_live_versions_batch(tx, end_ts, &mut cursor, usize::MAX);
                 turso_assert!(drained, "dropped-commit rewrite must drain");
                 self.resolve_committed_dependents_and_unlock(tx);
                 self.publish_committed_header(tx, end_ts, did_commit_schema_change);
