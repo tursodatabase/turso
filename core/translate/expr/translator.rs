@@ -644,7 +644,7 @@ pub fn translate_expr(
             // First translate inner expr, then set the curr collation. If we set curr collation before,
             // it may be overwritten later by inner translate.
             translate_expr(program, referenced_tables, expr, target_register, resolver)?;
-            let collation = CollationSeq::new(collation.as_str())?;
+            let collation = resolver.resolve_collation(collation.as_str())?;
             program.set_collation(Some((collation, true)));
             Ok(target_register)
         }

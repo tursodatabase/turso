@@ -1,7 +1,7 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 use super::{
-    collate::{get_expr_collation_ctx, CollationSeq},
+    collate::{get_expr_collation_ctx_with_symbols, CollationSeq},
     compound_select::emit_program_for_compound_select,
     emitter::{
         delete::emit_program_for_delete, select::emit_program_for_select,
@@ -491,9 +491,20 @@ impl<'a> Resolver<'a> {
         needs_decode: bool,
         referenced_tables: &TableReferences,
     ) -> Result<()> {
-        let collation = get_expr_collation_ctx(expr.as_ref(), referenced_tables)?;
+        let collation = get_expr_collation_ctx_with_symbols(
+            expr.as_ref(),
+            referenced_tables,
+            Some(self.symbol_table),
+        )?;
         self.cache_expr_reg(expr, reg, needs_decode, collation);
         Ok(())
+    }
+
+    pub fn resolve_collation(&self, name: &str) -> Result<CollationSeq> {
+        if let Some(collation) = self.symbol_table.resolve_collation(name) {
+            return Ok(collation);
+        }
+        CollationSeq::new(name)
     }
 
     /// Returns the register, decode flag, and collation metadata for a previously translated expression.

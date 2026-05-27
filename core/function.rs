@@ -9,6 +9,14 @@ use turso_ext::{
 
 use crate::LimboError;
 
+pub type ContextCollationFunction = unsafe extern "C" fn(
+    context: usize,
+    left_ptr: *const u8,
+    left_len: usize,
+    right_ptr: *const u8,
+    right_len: usize,
+) -> i32;
+
 pub trait Deterministic: std::fmt::Display {
     fn is_deterministic(&self) -> bool;
 }
@@ -16,6 +24,45 @@ pub trait Deterministic: std::fmt::Display {
 pub struct ExternalFunc {
     pub name: String,
     pub func: ExtFunc,
+}
+
+pub struct ExternalCollation {
+    pub name: String,
+    pub context: usize,
+    pub callback: ContextCollationFunction,
+    pub context_destructor: Option<ContextDestructor>,
+}
+
+impl ExternalCollation {
+    pub fn new(
+        name: String,
+        context: usize,
+        callback: ContextCollationFunction,
+        context_destructor: Option<ContextDestructor>,
+    ) -> Self {
+        Self {
+            name,
+            context,
+            callback,
+            context_destructor,
+        }
+    }
+}
+
+impl Drop for ExternalCollation {
+    fn drop(&mut self) {
+        if let Some(destructor) = self.context_destructor {
+            unsafe { destructor(self.context) };
+        }
+    }
+}
+
+impl Debug for ExternalCollation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExternalCollation")
+            .field("name", &self.name)
+            .finish()
+    }
 }
 
 impl Deterministic for ExternalFunc {

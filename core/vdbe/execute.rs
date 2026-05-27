@@ -21,8 +21,8 @@ use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::types::{
-    compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions, IOResult,
-    ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
+    compare_immutable, compare_immutable_single, compare_records_generic, AsValueRef, Extendable,
+    IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers,
@@ -310,16 +310,54 @@ fn compare_with_collation(
     lhs: &Value,
     rhs: &Value,
     collation: Option<CollationSeq>,
-) -> std::cmp::Ordering {
-    match (lhs, rhs) {
+    collation_comparator: &Option<crate::vdbe::sorter::SortComparator>,
+) -> Result<std::cmp::Ordering> {
+    Ok(match (lhs, rhs) {
         (Value::Text(lhs_text), Value::Text(rhs_text)) => {
-            if let Some(coll) = collation {
+            if let Some(comparator) = collation_comparator {
+                comparator(&lhs.as_ref(), &rhs.as_ref())?
+            } else if let Some(coll) = collation {
                 coll.compare_strings(lhs_text.as_str(), rhs_text.as_str())
             } else {
                 lhs.cmp(rhs)
             }
         }
         _ => lhs.cmp(rhs),
+    })
+}
+
+fn compare_with_program_collation<V1, V2>(
+    program: &Program,
+    lhs: V1,
+    rhs: V2,
+    collation: CollationSeq,
+) -> Result<std::cmp::Ordering>
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+{
+    let lhs = lhs.as_value_ref();
+    let rhs = rhs.as_value_ref();
+    if collation.is_custom() {
+        if let (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) = (lhs, rhs) {
+            return program.connection.compare_external_collation(
+                collation,
+                lhs_text.as_str(),
+                rhs_text.as_str(),
+            );
+        }
+    }
+    Ok(compare_immutable_single(lhs, rhs, collation))
+}
+
+fn comparison_matches_order(op: ComparisonOp, order: std::cmp::Ordering) -> bool {
+    match op {
+        ComparisonOp::Eq => order.is_eq(),
+        ComparisonOp::Ne => !order.is_eq(),
+        ComparisonOp::Lt => order.is_lt(),
+        ComparisonOp::Le => order.is_le(),
+        ComparisonOp::Gt => order.is_gt(),
+        ComparisonOp::Ge => order.is_ge(),
     }
 }
 
@@ -826,7 +864,7 @@ pub fn op_not_null(
 }
 
 pub fn op_comparison(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -987,15 +1025,19 @@ pub fn op_comparison(
         affinity.convert_for_compare(rhs_value),
     );
 
-    let should_jump = op.compare(
-        new_lhs
-            .as_ref()
-            .map_or(Either::Left(lhs_value), Either::Right),
-        new_rhs
-            .as_ref()
-            .map_or(Either::Left(rhs_value), Either::Right),
-        collation,
-    );
+    let lhs_for_compare = new_lhs
+        .as_ref()
+        .map_or(Either::Left(lhs_value), Either::Right);
+    let rhs_for_compare = new_rhs
+        .as_ref()
+        .map_or(Either::Left(rhs_value), Either::Right);
+    let should_jump = if collation.is_custom() {
+        let order =
+            compare_with_program_collation(program, lhs_for_compare, rhs_for_compare, collation)?;
+        comparison_matches_order(op, order)
+    } else {
+        op.compare(lhs_for_compare, rhs_for_compare, collation)
+    };
 
     match (new_lhs, new_rhs) {
         (Some(new_lhs), None) => {
@@ -5998,7 +6040,7 @@ fn update_agg_payload(
                 let payload_ref = payload[0].as_ref();
                 cmp_fn(&arg_ref, &payload_ref)?
             } else {
-                compare_with_collation(&arg, &payload[0], Some(collation))
+                compare_with_collation(&arg, &payload[0], Some(collation), comparator)?
             };
             let should_update = match func {
                 AggFunc::Max => cmp == Ordering::Greater,
@@ -6188,7 +6230,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
 }
 
 pub fn op_agg_step(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -6237,8 +6279,16 @@ pub fn op_agg_step(
         };
     }
 
-    // Resolve custom type comparator for MIN/MAX if provided
-    let comparator = comparator.as_ref().map(make_sort_comparator).transpose()?;
+    let current_collation = state.current_collation.unwrap_or(CollationSeq::Binary);
+    let comparator = match comparator.as_ref() {
+        Some(comparator) => Some(make_sort_comparator(comparator)?),
+        None if current_collation.is_custom() => Some(
+            program
+                .connection
+                .make_collation_comparator(current_collation)?,
+        ),
+        None => None,
+    };
 
     // Step the aggregate
     match func {
@@ -6320,8 +6370,6 @@ pub fn op_agg_step(
                     }
                     _ => None,
                 };
-                let collation = state.current_collation.unwrap_or(CollationSeq::Binary);
-
                 // Now get mutable borrow on payload
                 let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
                     panic!(
@@ -6330,7 +6378,14 @@ pub fn op_agg_step(
                     );
                 };
                 let payload = agg.payload_mut();
-                update_agg_payload(func, arg, maybe_arg2, payload, collation, &comparator)?;
+                update_agg_payload(
+                    func,
+                    arg,
+                    maybe_arg2,
+                    payload,
+                    current_collation,
+                    &comparator,
+                )?;
             }
         }
     };
@@ -6475,16 +6530,25 @@ pub fn op_sorter_open(
         collations.push(coll.unwrap_or_default());
         nulls_orders.push(*nulls);
     }
-    let comparators = comparators
-        .iter()
-        .map(|c| c.as_ref().map(make_sort_comparator).transpose())
-        .collect::<Result<_>>()?;
+    let mut sort_comparators = Vec::with_capacity(order_collations_nulls.len());
+    for (idx, (_, coll, _)) in order_collations_nulls.iter().enumerate() {
+        let comparator = match comparators.get(idx).and_then(|c| c.as_ref()) {
+            Some(comparator) => Some(make_sort_comparator(comparator)?),
+            None => match coll {
+                Some(collation) if collation.is_custom() => {
+                    Some(program.connection.make_collation_comparator(*collation)?)
+                }
+                _ => None,
+            },
+        };
+        sort_comparators.push(comparator);
+    }
     let temp_store = program.connection.get_temp_store();
     let cursor = Sorter::new(
         &order,
         collations,
         nulls_orders,
-        comparators,
+        sort_comparators,
         max_buffer_size_bytes,
         page_size,
         pager.io.clone(),

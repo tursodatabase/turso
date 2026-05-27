@@ -1,13 +1,21 @@
 use super::*;
 use crate::alloc::TursoIteratorExt;
 
-pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<DistinctCtx> {
+pub fn init_distinct(
+    program: &mut ProgramBuilder,
+    plan: &SelectPlan,
+    resolver: &Resolver,
+) -> Result<DistinctCtx> {
     let collations = plan
         .result_columns
         .iter()
         .map(|col| {
-            get_collseq_from_expr(&col.expr, &plan.table_references)
-                .map(|c| c.unwrap_or(CollationSeq::Binary))
+            get_collseq_from_expr_with_symbols(
+                &col.expr,
+                &plan.table_references,
+                Some(resolver.symbol_table),
+            )
+            .map(|c| c.unwrap_or(CollationSeq::Binary))
         })
         .collect::<Result<Vec<_>>>()?;
     let hash_table_id = program.alloc_hash_table_id();
@@ -66,9 +74,12 @@ impl InitLoop {
                 1,
                 "DISTINCT aggregate functions must have exactly one argument"
             );
-            let collations =
-                vec![get_collseq_from_expr(&agg.original_expr, tables)?
-                    .unwrap_or(CollationSeq::Binary)];
+            let collations = vec![get_collseq_from_expr_with_symbols(
+                &agg.original_expr,
+                tables,
+                Some(t_ctx.resolver.symbol_table),
+            )?
+            .unwrap_or(CollationSeq::Binary)];
             let hash_table_id = program.alloc_hash_table_id();
             agg.distinctness = Distinctness::Distinct {
                 ctx: Some(DistinctCtx {

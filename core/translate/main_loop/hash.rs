@@ -136,15 +136,20 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                         join_key.get_build_expr(self.predicates),
                     ),
                 };
-                resolve_comparison_collseq(original_lhs, original_rhs, self.table_references)
-                    .unwrap_or(CollationSeq::Binary)
+                resolve_comparison_collseq_with_symbols(
+                    original_lhs,
+                    original_rhs,
+                    self.table_references,
+                    Some(self.t_ctx.resolver.symbol_table),
+                )
+                .unwrap_or(CollationSeq::Binary)
             })
             .collect();
 
         let use_bloom_filter = self.hash_join_op.use_bloom_filter
             && collations
                 .iter()
-                .all(|c| matches!(c, CollationSeq::Binary | CollationSeq::Unset));
+                .all(|c| matches!(*c, CollationSeq::Binary | CollationSeq::Unset));
 
         let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
         let (payload_columns, payload_signature_columns, use_materialized_keys, allow_seek) =
