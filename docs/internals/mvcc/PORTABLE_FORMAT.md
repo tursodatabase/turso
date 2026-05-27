@@ -1,222 +1,213 @@
-# Portable MVCC Logical Changes
+# Portable MVCC Log Metadata
 
-This design extends the MVCC logical log with portable change metadata for sync.
-The recovery log remains the source of truth for local crash recovery. Portable
-changes are an additional per-commit view that lets a raw-log consumer replay
-committed user-visible changes without access to the original database schema,
-connection state, or in-memory MVCC table-id map.
+The MVCC recovery log is the only operation stream. Portable metadata lets a
+raw-log consumer interpret that recovery stream outside the original database
+instance, where the in-memory schema and MVCC table-id map are no longer
+available.
 
 ## Goals
 
 - Keep MVCC recovery compact and authoritative.
-- Make row changes portable: require no additional context for consumers to replay logical transactions from the log 
-- Avoid excessive memory usage.
-- Avoid duplicating large row records in the portable extension when the same
-  bytes already exist in the recovery payload.
-- Keep table names and SQL out of repeated row operations.
-- Encrypt and authenticate portable metadata together with recovery records when
+- Avoid duplicating recovery rows, schema rows, and header updates in a second
+  portable operation stream.
+- Resolve negative MVCC table ids and uncheckpointed rootpages into portable
+  object names.
+- Keep sync-specific fields out of the core format by using generic transaction
+  metadata.
+- Encrypt and authenticate portable metadata with the recovery payload when
   database encryption is enabled.
 - Keep the encoding owned by `turso_core`, without depending on sync-engine or
   server protocol types.
 
-## Frame Placement
+## Frame Layout
 
-Portable changes live in an extension block appended to an MVCC transaction
-frame:
+An MVCC transaction frame has a recovery payload and may have an extension
+block:
 
 ```text
-TX_EXT_HEADER
-  payload_size            // recovery payload bytes only
+tx header:
+  payload_size            // recovery payload bytes
   op_count
   commit_ts
-  extension_size          // extension block bytes
+  extension_size
   extension_record_count
   frame_flags
 
-BODY
-  recovery payload
-  extension block
+body:
+  extension records
+  recovery ops
 
-TRAILER
-  chained crc
-  end magic
+trailer:
+  crc/auth tag/end magic
 ```
 
-The recovery payload is still parsed and replayed by MVCC recovery. The
-extension block is ignored by local recovery and consumed only by raw-log readers
-that ask for portable changes.
+Local recovery reads only the recovery ops. Raw-log consumers read the same
+frame in order: portable metadata first, then recovery ops whose table ids are
+resolved through that metadata.
 
-When encryption is enabled, the recovery payload and extension block are
-encrypted as one body:
+When encryption is enabled, the encrypted plaintext is:
 
 ```text
-plaintext = recovery_payload || extension_block
-on disk   = encrypted_chunks(plaintext)
+extension_block || recovery_payload
 ```
 
-The encrypted chunk AAD includes the log salt, op count, commit timestamp, chunk
-index, and final plaintext size. As a result, portable table names, SQL text,
-origin metadata, and row-delete records are not plaintext side data and cannot
-be modified independently of the recovery frame.
+Portable names, metadata, and operation-local extension bytes are therefore not
+plaintext side data.
 
-## Portable Transaction Envelope
+The transaction-scoped extension block intentionally precedes the recovery
+payload so streaming consumers can load the string table and object map before
+reading the first recovery op.
 
-The extension payload is a small protobuf-style envelope encoded inside
-`turso_core`. It contains:
+## Recovery Ops
 
-- `end_offset`: the raw-log cursor after this frame.
-- `commit_ts`: the MVCC commit timestamp.
-- `origin_client_id`: optional explicit origin metadata.
+The recovery payload describes all committed effects:
+
+- table upserts: `rowid_varint || table_record_bytes`
+- table deletes: `rowid_varint`
+- index upserts/deletes
+- database-header updates
+- `sqlite_schema` row upserts/deletes for DDL
+
+Schema changes and header changes are not repeated as portable operations.
+Schema DDL is represented by the recovery stream's `sqlite_schema` row changes,
+including the SQL stored in those rows. Header updates are represented by
+recovery header ops.
+
+## Transaction Extension
+
+The transaction extension is a protobuf-style envelope encoded inside
+`turso_core`. It currently contains only:
+
 - `string_table`: frame-local interned strings.
-- `object_map`: frame-local bindings from MVCC recovery ids to portable object
-  identities.
-- `ops`: portable logical operations.
+- `object_map`: bindings from MVCC table ids to interned names.
+- `meta`: generic string key/value transaction metadata.
 
-The string table and object map are the core portability mechanism, not just
-compression.
-
-## String Table
-
-Names and SQL are interned once per frame. Schema operations and object-map
-entries reference strings by index.
-
-This avoids repeating object names and `CREATE ...` SQL in every operation. More
-importantly, row operations never switch between "sometimes name" and "sometimes
-id" encodings. Rows always carry an MVCC table id; the object map gives that id
-portable meaning.
-
-## Object Map
-
-Each object-map entry binds the local id used by recovery records in this frame
-to a portable object identity:
+There are no portable row, schema, or header operations.
 
 ```text
-object_map {
+PortableTxn {
+  end_offset: uint64          // added by the frame wrapper
+  commit_ts: uint64           // added by the frame wrapper
+  repeated string_table: bytes
+  repeated object_map: ObjectMap
+  repeated meta: MetaField
+}
+
+ObjectMap {
   mv_table_id: sint64
-  logical_object_id: uint64
-  kind: table | index | trigger | view
-  name_ref: string table index
-  schema_epoch: commit timestamp
-  create_sql_ref: optional string table index
-  rootpage_debug: sint64
+  name_ref: uint64
+}
+
+MetaField {
+  key_ref: uint64
+  value_ref: uint64
 }
 ```
 
-`mv_table_id` is the id used by recovery ops. It may be negative because MVCC
-uses negative root pages for objects that exist only in the MV store.
+`mv_table_id` is the id used by recovery ops in the same frame. It may be
+negative because MVCC uses negative rootpages for objects that have not been
+checkpointed.
 
-`logical_object_id` is stable for rootpage-backed objects. For non-zero root
-pages it is `abs(rootpage)`, so an uncheckpointed negative rootpage and its later
-checkpointed positive rootpage refer to the same portable object.
+`name_ref` points into the frame string table. Row recovery ops keep the compact
+MVCC table id, and external readers resolve that id through the same-frame object
+map.
 
-Objects with rootpage `0`, such as views, triggers, and some virtual table
-schema rows, do not have rootpage-backed row identity. Their portable identity
-comes from schema events: kind, name, and SQL.
+## Operation Extensions
 
-`rootpage_debug` exists only to make producer behavior auditable. Consumers must
-not treat it as the portable identity.
-
-## Portable Operations
-
-Portable row operations are table mutations. Index recovery records are not
-portable mutations; a destination database maintains indexes by applying table
-changes normally.
+Recovery ops reserve `OP_FLAG_PORTABLE_EXTENSION` for operation-local protobuf
+bytes:
 
 ```text
-upsert_row {
-  mv_table_id: sint64
-  rowid: sint64
-}
-
-delete_row {
-  mv_table_id: sint64
-  rowid: sint64
-  old_record: optional bytes
+op {
+  tag
+  flags                  // includes OP_FLAG_PORTABLE_EXTENSION
+  table_id
+  payload_len
+  payload
+  extension_len
+  extension_bytes
 }
 ```
 
-Upserts do not duplicate the row record in the portable extension. The same row
-image already exists in the recovery payload in this frame. A raw-log consumer
-reads the recovery table op for bytes and resolves `mv_table_id` through the
-object map.
+The extension is attached to one recovery op, not to the frame as a parallel
+portable operation stream. Recovery must be able to ignore operation-local
+extensions. If data is required for crash recovery, it belongs in the main
+recovery payload.
 
-Deletes include the old row record when core still has it. This lets sync derive
-primary-key values for tables whose sync identity is not SQLite rowid. If no old
-record is available, the operation still has rowid fallback semantics.
-
-Schema operations describe user-visible object lifecycle:
+Current delete extension fields:
 
 ```text
-schema {
-  action: create | drop | refresh
-  kind: table | index | trigger | view
-  stable_table_id: optional uint64
-  name_ref: string table index
-  sql_ref: optional string table index
+DeleteExtension {
+  identity_record: bytes  // field 1, only for sqlite_schema deletes
+  pk_record: bytes        // field 2, SQLite record of primary-key values
+  rowid: sint64           // field 3, present for rowid-table deletes
 }
 ```
 
-Header operations carry database-header fields relevant to sync:
+For ordinary user-table deletes, core computes a primary-key projection while the
+committing connection still has schema context. The extension carries only that
+projected key record plus the rowid, not the full deleted row. For tables
+without an explicit primary key, `pk_record` is omitted and rowid is the delete
+identity. For `INTEGER PRIMARY KEY` aliases, the projected key uses the rowid
+value rather than the stored table-record slot, matching SQLite rowid semantics.
 
-```text
-update_header {
-  user_version: uint64
-  application_id: uint64
-}
-```
+`sqlite_schema` deletes are the exception. They attach the old schema record as
+`identity_record` because object-map construction needs the deleted object's
+name and rootpage.
 
-Row writes are modeled as idempotent upserts and deletes. The portable contract
-does not distinguish insert from update; it records the committed final state
-needed for replay.
+The same operation-extension mechanism can later carry fields such as DDL
+statement text for ALTER-style operations or trigger provenance, without
+changing the recovery op shape.
 
-## Commit-Time Construction
+## Construction
 
-The commit path builds the recovery payload first. Portable metadata is derived
-after that payload exists:
+At commit time:
 
-1. Parse the recovery payload with the same parser used by recovery.
-2. Decode `sqlite_schema` row changes into schema events.
-3. Retain only old row images needed for schema drops and delete primary-key
-   derivation. The writer does not keep a duplicate `Vec<RowVersion>` for all
-   committed changes.
-4. Resolve every table row mutation to an object-map entry while core still has
-   schema context.
-5. Emit row ops as references to `mv_table_id`.
-6. Emit the string table, object map, schema/header operations, row operations,
-   and optional origin metadata into the extension payload.
+1. Serialize each recovery op, attaching operation-local portable bytes only
+   when the operation needs local identity metadata.
+2. Build the recovery payload.
+3. Parse that payload with the recovery parser.
+4. Decode `sqlite_schema` row changes only to discover object-map entries.
+5. Resolve table row ops to object-map entries while core still has schema
+   context.
+6. Snapshot all per-connection MVCC log metadata as generic key/value fields.
+7. Emit the string table, object maps, and metadata as the transaction extension
+   payload.
 
-If portable logging is enabled and core cannot decode required schema context or
-resolve a table mutation to an object-map entry, commit fails. Silently omitting
-a portable mutation would make sync consumers diverge from local recovery.
+If portable logging is enabled and a user table mutation cannot be resolved to a
+portable object map, commit fails. Silently omitting a user table mapping would
+make external replay ambiguous.
 
-## Filtering And Metadata
+## Filtering
 
-Portable changes filter internal implementation tables: SQLite internal objects,
-Turso internal objects, and reserved CDC tables. These are not part of the user
-schema contract that sync should replay on clients.
+The portable extension skips implementation-owned objects:
 
-Origin metadata is explicit per-connection metadata. It is snapshot at commit
-time, not consumed, and setting metadata does not enable portable logging by
-itself. This avoids surprising behavior where metadata mutation changes log
-format or disappears after one commit.
+- `sqlite_*`
+- `__turso_internal_*`
+- `turso_sync_*`
+- reserved CDC bookkeeping tables
 
-Current trigger behavior is effect-based: portable row operations describe the
-final committed effects of the transaction, including trigger-produced writes.
-The log does not mark whether an individual write came directly from client DML
-or from trigger execution. Adding that provenance would require VDBE-level
-origin tracking and is outside this format change.
+These objects are SQLite implementation state, Turso local state, or sync/CDC
+bookkeeping that should be rebuilt by the receiving database. They are not part
+of the user schema contract the portable extension exposes.
 
-Memory growth is limited by deriving portable changes from the serialized
-recovery payload and retaining only old records needed for deletes/schema drops.
-The old design cloned every row version into a second structure.
+`sqlite_sequence` deserves special handling by consumers: it is an internal
+SQLite table, but sequence state is derived from user-visible inserts into
+`AUTOINCREMENT` tables. Replaying the user table writes is the portable source of
+truth; copying a producer's `sqlite_sequence` row would import local allocator
+state and can be wrong for a different receiver.
 
-Log growth is limited by not duplicating upsert row images and by interning names
-and SQL once per frame. Portable row ops are compact references plus optional
-old records for deletes.
+## Review Concerns Addressed
 
-Encryption is handled by placing the extension block inside the encrypted body
-instead of appending plaintext metadata after the recovery payload.
-
-Table identity is made explicit through the object map. Row ops use one
-consistent representation, `mv_table_id`, and raw consumers resolve it through
-the same-frame map to a stable logical object id and interned name/SQL.
+- Memory: there is no second portable row-op list and no side buffer for every
+  deleted row. Delete identity is projected during op serialization.
+- Log size: upsert rows, schema rows, and header updates are not duplicated.
+  Data-table deletes carry only primary-key projection and rowid, not full row
+  images.
+- Encryption: extension records are encrypted and authenticated with recovery
+  bytes.
+- Table ids: every user table id used by recovery has an explicit same-frame
+  object-map entry.
+- Names: names are interned once per frame and referenced from object maps.
+- Metadata: all connection metadata is preserved as generic key/value fields;
+  `"client"` is not special in the format.

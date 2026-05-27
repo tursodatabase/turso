@@ -7,14 +7,12 @@ use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
 use crate::mvcc::database::CommitYieldPoint;
 #[cfg(feature = "conn_raw_api")]
-use crate::mvcc::persistent_storage::logical_log::StreamingLogicalLogReader;
+use crate::mvcc::persistent_storage::logical_log::{ParsedOp, StreamingLogicalLogReader};
 use crate::mvcc::persistent_storage::logical_log::{
     ENCRYPTED_PAYLOAD_CHUNK_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,
 };
 #[cfg(feature = "conn_raw_api")]
-use crate::mvcc::portable_logical::{
-    PortableLogicalBuilder, PortableSchemaRow, LOGICAL_SCHEMA_CREATE, LOGICAL_SCHEMA_REFRESH,
-};
+use crate::mvcc::portable_logical::{PortableLogicalBuilder, PortableObjectMapEntry};
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
 use crate::state_machine::{StateTransition, TransitionResult};
@@ -11274,26 +11272,28 @@ fn collect_mvcc_portable_change_bytes_with_encryption(
 }
 
 #[cfg(feature = "conn_raw_api")]
+fn collect_mvcc_recovery_ops(conn: &Arc<Connection>) -> Vec<ParsedOp> {
+    let mv_store = conn
+        .mv_store()
+        .as_ref()
+        .expect("test database must be in MVCC mode")
+        .clone();
+    let io = conn.get_pager().io.clone();
+    let mut reader = StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), None);
+    reader.read_header(&io).unwrap();
+
+    let mut ops = Vec::new();
+    while let Some(frame_ops) = reader.next_frame(&io).unwrap() {
+        ops.extend(frame_ops);
+    }
+    ops
+}
+
+#[cfg(feature = "conn_raw_api")]
 fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
-}
-
-#[derive(Debug)]
-#[cfg(feature = "conn_raw_api")]
-struct DecodedPortableOp {
-    op_type: u64,
-    schema_action: Option<u64>,
-    schema_kind: Option<u64>,
-    table_name: String,
-    sql: String,
-    schema_name: String,
-    user_version: Option<u64>,
-    application_id: Option<u64>,
-    stable_table_id: Option<u64>,
-    mv_table_id: Option<i64>,
-    record_len: usize,
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -11333,18 +11333,22 @@ fn skip_proto_field(bytes: &[u8], offset: &mut usize, wire_type: u64) {
 #[cfg(feature = "conn_raw_api")]
 #[derive(Clone, Debug)]
 struct DecodedObjectMap {
-    stable_table_id: u64,
+    mv_table_id: i64,
     name: String,
-    sql: String,
 }
 
 #[cfg(feature = "conn_raw_api")]
-fn decode_object_map(bytes: &[u8], strings: &[String]) -> Option<(i64, DecodedObjectMap)> {
+#[derive(Clone, Debug, Default)]
+struct DecodedPortableTxn {
+    objects: Vec<DecodedObjectMap>,
+    metadata: std::collections::HashMap<String, String>,
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn decode_object_map(bytes: &[u8], strings: &[String]) -> Option<DecodedObjectMap> {
     let mut offset = 0usize;
     let mut mv_table_id = None;
-    let mut stable_table_id = None;
     let mut name = String::new();
-    let mut sql = String::new();
     while offset < bytes.len() {
         let key = read_proto_varint(bytes, &mut offset);
         let field = key >> 3;
@@ -11353,108 +11357,46 @@ fn decode_object_map(bytes: &[u8], strings: &[String]) -> Option<(i64, DecodedOb
             (1, 0) => {
                 mv_table_id = Some(decode_proto_sint64(read_proto_varint(bytes, &mut offset)))
             }
-            (2, 0) => stable_table_id = Some(read_proto_varint(bytes, &mut offset)),
-            (4, 0) => {
+            (2, 0) => {
                 let idx = read_proto_varint(bytes, &mut offset) as usize;
                 name = strings.get(idx).cloned().unwrap_or_default();
             }
-            (6, 0) => {
-                let idx = read_proto_varint(bytes, &mut offset) as usize;
-                sql = strings.get(idx).cloned().unwrap_or_default();
-            }
             _ => skip_proto_field(bytes, &mut offset, wire_type),
         }
     }
-    Some((
-        mv_table_id?,
-        DecodedObjectMap {
-            stable_table_id: stable_table_id?,
-            name,
-            sql,
-        },
-    ))
+    Some(DecodedObjectMap {
+        mv_table_id: mv_table_id?,
+        name,
+    })
 }
 
 #[cfg(feature = "conn_raw_api")]
-fn decode_portable_op(
-    bytes: &[u8],
-    strings: &[String],
-    object_maps: &std::collections::HashMap<i64, DecodedObjectMap>,
-) -> DecodedPortableOp {
-    let mut op = DecodedPortableOp {
-        op_type: u64::MAX,
-        schema_action: None,
-        schema_kind: None,
-        table_name: String::new(),
-        sql: String::new(),
-        schema_name: String::new(),
-        user_version: None,
-        application_id: None,
-        stable_table_id: None,
-        mv_table_id: None,
-        record_len: 0,
-    };
+fn decode_metadata(bytes: &[u8], strings: &[String]) -> Option<(String, String)> {
     let mut offset = 0usize;
+    let mut key = None;
+    let mut value = None;
     while offset < bytes.len() {
-        let key = read_proto_varint(bytes, &mut offset);
-        let field = key >> 3;
-        let wire_type = key & 7;
+        let field_key = read_proto_varint(bytes, &mut offset);
+        let field = field_key >> 3;
+        let wire_type = field_key & 7;
         match (field, wire_type) {
-            (1, 0) => op.op_type = read_proto_varint(bytes, &mut offset),
-            (6, 0) => op.user_version = Some(read_proto_varint(bytes, &mut offset)),
-            (7, 0) => op.application_id = Some(read_proto_varint(bytes, &mut offset)),
-            (8, 0) => op.schema_action = Some(read_proto_varint(bytes, &mut offset)),
-            (9, 0) => op.schema_kind = Some(read_proto_varint(bytes, &mut offset)),
-            (12, 0) => {
-                op.mv_table_id = Some(decode_proto_sint64(read_proto_varint(bytes, &mut offset)));
-            }
-            (13, 0) => {
+            (1, 0) => {
                 let idx = read_proto_varint(bytes, &mut offset) as usize;
-                op.sql = strings.get(idx).cloned().unwrap_or_default();
+                key = strings.get(idx).cloned();
             }
-            (14, 0) => {
+            (2, 0) => {
                 let idx = read_proto_varint(bytes, &mut offset) as usize;
-                op.schema_name = strings.get(idx).cloned().unwrap_or_default();
+                value = strings.get(idx).cloned();
             }
-            (4, 2) => {
-                let len = read_proto_varint(bytes, &mut offset) as usize;
-                op.record_len = len;
-                offset += len;
-            }
-            (2, 2) => {
-                let len = read_proto_varint(bytes, &mut offset) as usize;
-                op.table_name = String::from_utf8(bytes[offset..offset + len].to_vec()).unwrap();
-                offset += len;
-            }
-            (5, 2) => {
-                let len = read_proto_varint(bytes, &mut offset) as usize;
-                op.sql = String::from_utf8(bytes[offset..offset + len].to_vec()).unwrap();
-                offset += len;
-            }
-            (10, 2) => {
-                let len = read_proto_varint(bytes, &mut offset) as usize;
-                op.schema_name = String::from_utf8(bytes[offset..offset + len].to_vec()).unwrap();
-                offset += len;
-            }
-            (11, 0) => op.stable_table_id = Some(read_proto_varint(bytes, &mut offset)),
             _ => skip_proto_field(bytes, &mut offset, wire_type),
         }
     }
-    if let Some(mv_table_id) = op.mv_table_id {
-        if let Some(object) = object_maps.get(&mv_table_id) {
-            op.table_name = object.name.clone();
-            op.stable_table_id = Some(object.stable_table_id);
-            if op.sql.is_empty() {
-                op.sql = object.sql.clone();
-            }
-        }
-    }
-    op
+    Some((key?, value?))
 }
 
 #[cfg(feature = "conn_raw_api")]
-fn decode_portable_change_ops(portable_changes: &[u8]) -> Vec<DecodedPortableOp> {
-    let mut ops = Vec::new();
+fn decode_portable_change_txns(portable_changes: &[u8]) -> Vec<DecodedPortableTxn> {
+    let mut txns = Vec::new();
     let mut offset = 0usize;
     while offset < portable_changes.len() {
         let txn_len = read_proto_varint(portable_changes, &mut offset) as usize;
@@ -11464,107 +11406,73 @@ fn decode_portable_change_ops(portable_changes: &[u8]) -> Vec<DecodedPortableOp>
 
         let mut strings = Vec::new();
         let mut object_blobs = Vec::new();
-        let mut scan_offset = 0usize;
-        while scan_offset < txn.len() {
-            let key = read_proto_varint(txn, &mut scan_offset);
+        let mut meta_blobs = Vec::new();
+        let mut txn_offset = 0usize;
+        while txn_offset < txn.len() {
+            let key = read_proto_varint(txn, &mut txn_offset);
             let field = key >> 3;
             let wire_type = key & 7;
             match (field, wire_type) {
                 (12, 2) => {
-                    let len = read_proto_varint(txn, &mut scan_offset) as usize;
+                    let len = read_proto_varint(txn, &mut txn_offset) as usize;
                     strings.push(
-                        String::from_utf8(txn[scan_offset..scan_offset + len].to_vec()).unwrap(),
+                        String::from_utf8(txn[txn_offset..txn_offset + len].to_vec()).unwrap(),
                     );
-                    scan_offset += len;
+                    txn_offset += len;
                 }
                 (13, 2) => {
-                    let len = read_proto_varint(txn, &mut scan_offset) as usize;
-                    object_blobs.push(txn[scan_offset..scan_offset + len].to_vec());
-                    scan_offset += len;
+                    let len = read_proto_varint(txn, &mut txn_offset) as usize;
+                    object_blobs.push(txn[txn_offset..txn_offset + len].to_vec());
+                    txn_offset += len;
                 }
-                _ => skip_proto_field(txn, &mut scan_offset, wire_type),
+                (14, 2) => {
+                    let len = read_proto_varint(txn, &mut txn_offset) as usize;
+                    meta_blobs.push(txn[txn_offset..txn_offset + len].to_vec());
+                    txn_offset += len;
+                }
+                _ => skip_proto_field(txn, &mut txn_offset, wire_type),
             }
         }
-        let object_maps = object_blobs
+        let objects = object_blobs
             .iter()
             .filter_map(|object| decode_object_map(object, &strings))
-            .collect::<std::collections::HashMap<_, _>>();
-
-        let mut txn_offset = 0usize;
-        while txn_offset < txn.len() {
-            let key = read_proto_varint(txn, &mut txn_offset);
-            let field = key >> 3;
-            let wire_type = key & 7;
-            if field == 3 && wire_type == 2 {
-                let op_len = read_proto_varint(txn, &mut txn_offset) as usize;
-                ops.push(decode_portable_op(
-                    &txn[txn_offset..txn_offset + op_len],
-                    &strings,
-                    &object_maps,
-                ));
-                txn_offset += op_len;
-            } else {
-                skip_proto_field(txn, &mut txn_offset, wire_type);
+            .collect();
+        let mut metadata = std::collections::HashMap::new();
+        for meta in &meta_blobs {
+            if let Some((key, value)) = decode_metadata(meta, &strings) {
+                metadata.insert(key, value);
             }
         }
+        txns.push(DecodedPortableTxn { objects, metadata });
     }
-    ops
+    txns
 }
 
 #[cfg(feature = "conn_raw_api")]
-fn decode_portable_change_origins(portable_changes: &[u8]) -> Vec<String> {
-    let mut origins = Vec::new();
-    let mut offset = 0usize;
-    while offset < portable_changes.len() {
-        let txn_len = read_proto_varint(portable_changes, &mut offset) as usize;
-        let txn_end = offset + txn_len;
-        let txn = &portable_changes[offset..txn_end];
-        offset = txn_end;
-
-        let mut txn_offset = 0usize;
-        while txn_offset < txn.len() {
-            let key = read_proto_varint(txn, &mut txn_offset);
-            let field = key >> 3;
-            let wire_type = key & 7;
-            if field == 4 && wire_type == 2 {
-                let len = read_proto_varint(txn, &mut txn_offset) as usize;
-                origins
-                    .push(String::from_utf8(txn[txn_offset..txn_offset + len].to_vec()).unwrap());
-                txn_offset += len;
-            } else {
-                skip_proto_field(txn, &mut txn_offset, wire_type);
-            }
-        }
-    }
-    origins
+fn decoded_object_maps(txns: &[DecodedPortableTxn]) -> Vec<&DecodedObjectMap> {
+    txns.iter().flat_map(|txn| txn.objects.iter()).collect()
 }
 
 #[cfg(feature = "conn_raw_api")]
 #[test]
-fn test_mvcc_portable_changes_encoder_matches_logical_op_wire_golden() {
-    let row = PortableSchemaRow {
-        row_type: "view".to_string(),
-        name: "v".to_string(),
-        rootpage: 0,
-        sql: Some("CREATE VIEW v AS SELECT 1".to_string()),
-    };
+fn test_mvcc_portable_changes_encoder_matches_metadata_wire_golden() {
     let mut builder = PortableLogicalBuilder::new();
-    builder.encode_schema_logical_op(LOGICAL_SCHEMA_CREATE, &row, None);
-    let encoded = builder.finish(None);
+    builder.add_metadata("client", "client-a");
+    builder.add_object_map(PortableObjectMapEntry {
+        mv_table_id: -5,
+        name: "items",
+    });
+    let encoded = builder.finish();
 
     assert_eq!(
         encoded,
         vec![
-            0x62, 0x01, b'v', // PortableLogicalTxn.string_table[0] = "v"
-            0x62, 0x19, // PortableLogicalTxn.string_table[1] = SQL
-            b'C', b'R', b'E', b'A', b'T', b'E', b' ', b'V', b'I', b'E', b'W', b' ', b'v', b' ',
-            b'A', b'S', b' ', b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1', 0x1a,
-            0x0a, // PortableLogicalTxn.ops, length 10
-            0x08, 0x02, // LogicalOp.op_type = Schema
-            0x40, 0x00, // LogicalOp.schema_action = Create
-            0x48, 0x03, // LogicalOp.schema_kind = View
-            0x68, 0x01, // LogicalOp.sql_ref = 1
-            0x70, 0x00, // LogicalOp.schema_name_ref = 0
+            0x62, 0x06, b'c', b'l', b'i', b'e', b'n', b't', 0x62, 0x08, b'c', b'l', b'i', b'e',
+            b'n', b't', b'-', b'a', 0x62, 0x05, b'i', b't', b'e', b'm', b's', 0x6a, 0x04, 0x08,
+            0x09, // mv_table_id = -5
+            0x10, 0x02, // name_ref = "items"
+            0x72, 0x04, 0x08, 0x00, // metadata key_ref = "client"
+            0x10, 0x01, // metadata value_ref = "client-a"
         ]
     );
 }
@@ -11598,20 +11506,17 @@ fn test_mvcc_portable_changes_contains_user_schema_and_rows() {
         .unwrap();
 
     let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
-    let ops = decode_portable_change_ops(&portable_changes);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
 
-    assert!(ops.iter().any(|op| op.op_type == 2
-        && op.schema_name == "items"
-        && op.sql.contains("CREATE TABLE items")
-        && op.stable_table_id.unwrap_or_default() > 0));
-    assert!(ops.iter().any(|op| op.op_type == 0
-        && op.table_name == "items"
-        && op.stable_table_id.unwrap_or_default() > 0));
+    assert!(objects
+        .iter()
+        .any(|object| object.name == "items" && object.mv_table_id < 0));
 }
 
 #[cfg(feature = "conn_raw_api")]
 #[test]
-fn test_mvcc_portable_changes_keep_stable_table_id_across_rename() {
+fn test_mvcc_portable_changes_updates_name_mapping_across_rename() {
     let db = MvccTestDb::new();
     db.conn
         .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
@@ -11627,29 +11532,10 @@ fn test_mvcc_portable_changes_keep_stable_table_id_across_rename() {
         .unwrap();
 
     let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
-    let ops = decode_portable_change_ops(&portable_changes);
-    let before_id = ops
-        .iter()
-        .find(|op| op.op_type == 0 && op.table_name == "items")
-        .and_then(|op| op.stable_table_id)
-        .expect("create-time row should carry stable table id");
-    let after_id = ops
-        .iter()
-        .find(|op| op.op_type == 0 && op.table_name == "things")
-        .and_then(|op| op.stable_table_id)
-        .expect("post-rename row should carry stable table id");
-    let rename_id = ops
-        .iter()
-        .find(|op| {
-            op.op_type == 2
-                && op.schema_action == Some(LOGICAL_SCHEMA_REFRESH)
-                && op.schema_name == "things"
-        })
-        .and_then(|op| op.stable_table_id)
-        .expect("rename schema refresh should carry stable table id");
-
-    assert_eq!(before_id, after_id);
-    assert_eq!(before_id, rename_id);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+    assert!(objects.iter().any(|object| object.name == "items"));
+    assert!(objects.iter().any(|object| object.name == "things"));
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -11664,12 +11550,10 @@ fn test_mvcc_portable_changes_emit_refresh_for_same_rowid_schema_update() {
         .unwrap();
 
     let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
-    let ops = decode_portable_change_ops(&portable_changes);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
 
-    assert!(ops.iter().any(|op| op.op_type == 2
-        && op.schema_action == Some(2)
-        && op.schema_name == "items"
-        && op.sql.contains("note TEXT")));
+    assert!(objects.iter().any(|object| object.name == "items"));
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -11694,20 +11578,18 @@ fn test_mvcc_portable_changes_emit_drop_and_create_for_drop_recreate_same_name()
     db.conn.execute("COMMIT").unwrap();
 
     let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
-    let ops = decode_portable_change_ops(&portable_changes);
-
-    assert!(ops.iter().any(|op| op.op_type == 2
-        && op.schema_action == Some(1)
-        && op.schema_kind == Some(0)
-        && op.schema_name == "items"));
-    assert!(ops.iter().any(|op| op.op_type == 2
-        && op.schema_action == Some(0)
-        && op.schema_kind == Some(0)
-        && op.schema_name == "items"
-        && op.sql.contains("note TEXT")));
-    assert!(ops
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+    let item_table_ids = objects
         .iter()
-        .any(|op| op.op_type == 0 && op.stable_table_id.unwrap_or_default() > 0));
+        .filter(|object| object.name == "items")
+        .map(|object| object.mv_table_id)
+        .collect::<HashSet<_>>();
+
+    assert!(
+        item_table_ids.len() >= 2,
+        "drop/recreate should expose old and new table identities"
+    );
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -11724,19 +11606,14 @@ fn test_mvcc_portable_changes_resolve_rows_through_object_map_in_same_txn() {
     db.conn.execute("COMMIT").unwrap();
 
     let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
-    let ops = decode_portable_change_ops(&portable_changes);
-    let schema_id = ops
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+    let object = objects
         .iter()
-        .find(|op| op.op_type == 2 && op.schema_name == "items")
-        .and_then(|op| op.stable_table_id)
-        .expect("schema identity should carry stable table id");
-    let row_op = ops
-        .iter()
-        .find(|op| op.op_type == 0 && op.stable_table_id == Some(schema_id))
-        .expect("row op should carry matching stable table id");
+        .find(|object| object.name == "items")
+        .expect("object map should resolve same-transaction table writes");
 
-    assert_eq!(row_op.table_name, "items");
-    assert!(row_op.mv_table_id.is_some());
+    assert!(object.mv_table_id < 0);
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -11752,16 +11629,11 @@ fn test_mvcc_portable_changes_emit_index_drop_for_drop_table() {
     db.conn.execute("DROP TABLE items").unwrap();
 
     let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
-    let ops = decode_portable_change_ops(&portable_changes);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
 
-    assert!(ops.iter().any(|op| op.op_type == 2
-        && op.schema_action == Some(1)
-        && op.schema_kind == Some(0)
-        && op.schema_name == "items"));
-    assert!(ops.iter().any(|op| op.op_type == 2
-        && op.schema_action == Some(1)
-        && op.schema_kind == Some(1)
-        && op.schema_name == "items_payload_idx"));
+    assert!(objects.iter().any(|object| object.name == "items"));
+    assert!(!bytes_contain(&portable_changes, b"items_payload_idx"));
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -11784,23 +11656,16 @@ fn test_mvcc_portable_changes_emit_index_trigger_and_view_schema_ops() {
         .unwrap();
 
     let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
-    let ops = decode_portable_change_ops(&portable_changes);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
 
-    assert!(ops.iter().any(|op| op.op_type == 2
-        && op.schema_action == Some(0)
-        && op.schema_kind == Some(1)
-        && op.schema_name == "items_payload_idx"
-        && op.sql.contains("CREATE INDEX items_payload_idx")));
-    assert!(ops.iter().any(|op| op.op_type == 2
-        && op.schema_action == Some(0)
-        && op.schema_kind == Some(3)
-        && op.schema_name == "items_view"
-        && op.sql.contains("CREATE VIEW items_view")));
-    assert!(ops.iter().any(|op| op.op_type == 2
-        && op.schema_action == Some(0)
-        && op.schema_kind == Some(2)
-        && op.schema_name == "items_ai"
-        && op.sql.contains("CREATE TRIGGER items_ai")));
+    assert!(objects.iter().any(|object| object.name == "items"));
+    assert!(!bytes_contain(&portable_changes, b"items_payload_idx"));
+    assert!(!bytes_contain(&portable_changes, b"CREATE VIEW items_view"));
+    assert!(!bytes_contain(
+        &portable_changes,
+        b"CREATE TRIGGER items_ai"
+    ));
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -11831,26 +11696,9 @@ fn test_mvcc_portable_changes_emit_trigger_and_view_lifecycle_ops() {
     db.conn.execute("COMMIT").unwrap();
 
     let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
-    let ops = decode_portable_change_ops(&portable_changes);
 
-    assert!(ops.iter().any(|op| op.op_type == 2
-        && op.schema_action == Some(1)
-        && op.schema_kind == Some(3)
-        && op.schema_name == "items_view"));
-    assert!(ops.iter().any(|op| op.op_type == 2
-        && op.schema_action == Some(0)
-        && op.schema_kind == Some(3)
-        && op.schema_name == "items_view"
-        && op.sql.contains("CREATE VIEW items_view AS SELECT id")));
-    assert!(ops.iter().any(|op| op.op_type == 2
-        && op.schema_action == Some(1)
-        && op.schema_kind == Some(2)
-        && op.schema_name == "items_ai"));
-    assert!(ops.iter().any(|op| op.op_type == 2
-        && op.schema_action == Some(0)
-        && op.schema_kind == Some(2)
-        && op.schema_name == "items_ai"
-        && op.sql.contains("CREATE TRIGGER items_ai")));
+    assert!(!bytes_contain(&portable_changes, b"items_view"));
+    assert!(!bytes_contain(&portable_changes, b"items_ai"));
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -11861,16 +11709,16 @@ fn test_mvcc_portable_changes_emit_header_only_commits() {
     db.conn.execute("PRAGMA application_id = 1337").unwrap();
 
     let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
-    let ops = decode_portable_change_ops(&portable_changes);
-    let header_ops = ops.iter().filter(|op| op.op_type == 3).collect::<Vec<_>>();
+    let recovery_ops = collect_mvcc_recovery_ops(&db.conn);
 
-    assert_eq!(header_ops.len(), 2);
-    assert!(ops
-        .iter()
-        .any(|op| op.op_type == 3 && op.user_version == Some(42)));
-    assert!(ops
-        .iter()
-        .any(|op| op.op_type == 3 && op.application_id == Some(1337)));
+    assert!(portable_changes.is_empty());
+    assert_eq!(
+        recovery_ops
+            .iter()
+            .filter(|op| matches!(op, ParsedOp::UpdateHeader { .. }))
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -11900,16 +11748,10 @@ fn test_mvcc_portable_changes_use_checkpointed_schema_after_restart() {
             .unwrap();
 
         let portable_changes = collect_mvcc_portable_change_bytes(&conn);
-        let ops = decode_portable_change_ops(&portable_changes);
+        let txns = decode_portable_change_txns(&portable_changes);
+        let objects = decoded_object_maps(&txns);
 
-        assert!(ops
-            .iter()
-            .any(|op| op.op_type == 0 && op.table_name == "items"));
-        assert!(ops.iter().any(|op| op.op_type == 2
-            && op.schema_action == Some(2)
-            && op.schema_kind == Some(0)
-            && op.schema_name == "items"
-            && op.sql.contains("note TEXT")));
+        assert!(objects.iter().any(|object| object.name == "items"));
         conn.close().unwrap();
     }
 }
@@ -11935,24 +11777,15 @@ fn test_mvcc_portable_changes_emit_ddl_and_backfill_rows_in_same_transaction() {
     db.conn.execute("COMMIT").unwrap();
 
     let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
-    let ops = decode_portable_change_ops(&portable_changes);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
 
-    assert!(ops.iter().any(|op| op.op_type == 2
-        && op.schema_action == Some(2)
-        && op.schema_kind == Some(0)
-        && op.schema_name == "items"
-        && op.sql.contains("note TEXT")));
-    assert!(
-        ops.iter()
-            .filter(|op| op.op_type == 0 && op.stable_table_id.unwrap_or_default() > 0)
-            .count()
-            >= 2
-    );
+    assert!(objects.iter().any(|object| object.name == "items"));
 }
 
 #[cfg(feature = "conn_raw_api")]
 #[test]
-fn test_mvcc_portable_changes_delete_carries_old_record_for_primary_key_derivation() {
+fn test_mvcc_portable_changes_delete_carries_pk_projection_not_old_record() {
     let db = MvccTestDb::new();
     db.conn
         .execute("CREATE TABLE items(id TEXT PRIMARY KEY, payload TEXT)")
@@ -11964,12 +11797,31 @@ fn test_mvcc_portable_changes_delete_carries_old_record_for_primary_key_derivati
         .execute("DELETE FROM items WHERE id = 'item-a'")
         .unwrap();
 
-    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
-    let ops = decode_portable_change_ops(&portable_changes);
+    let recovery_ops = collect_mvcc_recovery_ops(&db.conn);
 
-    assert!(ops
-        .iter()
-        .any(|op| op.op_type == 1 && op.table_name == "items" && op.record_len > 0));
+    let delete_pk_record = recovery_ops.iter().find_map(|op| match op {
+        ParsedOp::DeleteTable {
+            rowid,
+            record_bytes,
+            pk_record_bytes,
+            ..
+        } if rowid.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID => {
+            assert!(
+                record_bytes.is_empty(),
+                "data DELETE must not duplicate the full row record"
+            );
+            Some(pk_record_bytes.clone())
+        }
+        _ => None,
+    });
+    let delete_pk_record = delete_pk_record.expect("expected data DELETE op");
+    let pk_values = ImmutableRecord::from_bin_record(delete_pk_record)
+        .get_values_owned()
+        .unwrap();
+    assert_eq!(
+        pk_values,
+        vec![Value::Text(Text::new("item-a".to_string()))]
+    );
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -11994,17 +11846,15 @@ fn test_mvcc_portable_changes_do_not_infer_origin_from_application_table() {
     db.conn.execute("COMMIT").unwrap();
 
     let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
-    let ops = decode_portable_change_ops(&portable_changes);
-    let origins = decode_portable_change_origins(&portable_changes);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
 
-    assert!(bytes_contain(
+    assert!(!bytes_contain(
         &portable_changes,
         b"turso_sync_last_change_id"
     ));
-    assert!(origins.is_empty());
-    assert!(ops
-        .iter()
-        .any(|op| op.op_type == 0 && op.table_name == "items"));
+    assert!(txns.iter().all(|txn| !txn.metadata.contains_key("client")));
+    assert!(objects.iter().any(|object| object.name == "items"));
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -12030,9 +11880,13 @@ fn test_mvcc_portable_changes_metadata_does_not_auto_enable_or_get_consumed() {
         .unwrap();
 
     let portable_changes = collect_mvcc_portable_change_bytes(&conn);
-    let origins = decode_portable_change_origins(&portable_changes);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let clients = txns
+        .iter()
+        .filter_map(|txn| txn.metadata.get("client").cloned())
+        .collect::<Vec<_>>();
     assert_eq!(
-        origins,
+        clients,
         vec!["client-a".to_string(), "client-a".to_string()]
     );
 }
@@ -12059,14 +11913,10 @@ fn test_mvcc_portable_changes_are_encrypted_with_log_body() {
     let key = EncryptionKey::from_hex_string(hex_key).unwrap();
     let enc_ctx = EncryptionContext::new(CipherMode::Aes256Gcm, &key, 4096).unwrap();
     let portable_changes = collect_mvcc_portable_change_bytes_with_encryption(&conn, enc_ctx);
-    let ops = decode_portable_change_ops(&portable_changes);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
 
-    assert!(ops
-        .iter()
-        .any(|op| op.op_type == 2 && op.schema_name == "secret_items"));
-    assert!(ops
-        .iter()
-        .any(|op| op.op_type == 0 && op.table_name == "secret_items"));
+    assert!(objects.iter().any(|object| object.name == "secret_items"));
 }
 
 /// Encrypted version of test_recovery_checkpoint_then_more_writes.
@@ -13870,8 +13720,10 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
             &self,
             log_record: &mut LogRecord,
             row_version: &RowVersion,
+            portable_extension: Option<&[u8]>,
         ) -> Result<()> {
-            self.inner.serialize_row_version(log_record, row_version)
+            self.inner
+                .serialize_row_version(log_record, row_version, portable_extension)
         }
         fn serialize_database_header(
             &self,

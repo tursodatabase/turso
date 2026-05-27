@@ -22,6 +22,7 @@ pub trait DurableStorage: Send + Sync + Debug {
         &self,
         log_record: &mut LogRecord,
         row_version: &RowVersion,
+        portable_extension: Option<&[u8]>,
     ) -> Result<()>;
 
     /// Append a `DatabaseHeader` op to `log_record`'s payload buffer.
@@ -142,35 +143,12 @@ impl DurableStorage for Storage {
         &self,
         log_record: &mut LogRecord,
         row_version: &RowVersion,
+        portable_extension: Option<&[u8]>,
     ) -> Result<()> {
-        serialize_op_entry(&mut log_record.buf, row_version)?;
+        serialize_op_entry(&mut log_record.buf, row_version, portable_extension)?;
         log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
             LimboError::InternalError("logical log op_count exceeds u32".to_string())
         })?;
-        #[cfg(feature = "conn_raw_api")]
-        if row_version.row.id.table_id == crate::mvcc::database::SQLITE_SCHEMA_MVCC_TABLE_ID
-            && matches!(
-                row_version.end,
-                Some(crate::mvcc::database::TxTimestampOrID::Timestamp(ts))
-                    if ts == log_record.tx_timestamp
-            )
-        {
-            log_record.portable_schema_deletes.push((
-                row_version.row.id.row_id.to_int_or_panic(),
-                row_version.row.payload().to_vec(),
-            ));
-        } else if matches!(
-            row_version.end,
-            Some(crate::mvcc::database::TxTimestampOrID::Timestamp(ts))
-                if ts == log_record.tx_timestamp
-        ) {
-            if let crate::mvcc::database::RowKey::Int(rowid) = row_version.row.id.row_id {
-                log_record.portable_deleted_table_rows.insert(
-                    (row_version.row.id.table_id, rowid),
-                    row_version.row.payload().to_vec(),
-                );
-            }
-        }
         Ok(())
     }
 

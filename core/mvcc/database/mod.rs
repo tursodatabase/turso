@@ -30,6 +30,8 @@ use crate::IOExt;
 use crate::LimboError;
 use crate::PageSize;
 use crate::Result;
+#[cfg(feature = "conn_raw_api")]
+use crate::Value;
 use crate::ValueRef;
 use crate::{
     contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case, Completion,
@@ -56,15 +58,18 @@ pub use checkpoint_state_machine::{
     sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
 };
 
+#[cfg(feature = "conn_raw_api")]
 use super::persistent_storage::logical_log::{
-    parse_ops_from_plaintext, HeaderReadResult, IndexOpKind, ParsedOp, StreamingLogicalLogReader,
-    StreamingResult, LOG_HDR_SIZE, LOG_RECORD_PREFIX_SIZE,
+    encode_delete_portable_extension, parse_ops_from_plaintext, LOG_RECORD_PREFIX_SIZE,
+};
+use super::persistent_storage::logical_log::{
+    HeaderReadResult, IndexOpKind, ParsedOp, StreamingLogicalLogReader, StreamingResult,
+    LOG_HDR_SIZE,
 };
 #[cfg(feature = "conn_raw_api")]
 use super::portable_logical::{
-    portable_schema_kind, portable_schema_row_from_record, stable_table_id_from_rootpage,
-    PortableLogicalBuilder, PortableObjectMapEntry, LOGICAL_OP_DELETE_ROW, LOGICAL_OP_UPSERT_ROW,
-    LOGICAL_SCHEMA_CREATE, LOGICAL_SCHEMA_DROP, LOGICAL_SCHEMA_REFRESH,
+    is_portable_logical_name, is_portable_table_schema_row, portable_schema_row_from_record,
+    PortableLogicalBuilder, PortableObjectMapEntry,
 };
 
 #[cfg(test)]
@@ -362,20 +367,10 @@ pub struct LogRecord {
     /// True once a `DatabaseHeader` op has been appended. At most one
     /// header op is allowed per transaction.
     pub has_header: bool,
-    /// Old sqlite_schema row images for schema deletes.
-    ///
-    /// Recovery delete ops only need a rowid. Portable schema-drop events also
-    /// need the deleted object's name/kind/sql, so keep only those rare rows
-    /// instead of duplicating every committed row image.
-    #[cfg(feature = "conn_raw_api")]
-    pub portable_schema_deletes: Vec<(i64, Vec<u8>)>,
-    #[cfg(feature = "conn_raw_api")]
-    pub portable_deleted_table_rows: HashMap<(MVTableId, i64), Vec<u8>>,
     /// Portable logical-change metadata stored alongside the MVCC recovery log.
     ///
-    /// Recovery ignores this field. It is present so raw-log consumers can
-    /// replay stable logical operations without reconstructing table/schema
-    /// identity from historical recovery records.
+    /// Recovery ignores this field. Raw-log consumers use it to resolve the
+    /// recovery ops' MVCC table ids and read transaction-level metadata.
     #[cfg(feature = "conn_raw_api")]
     pub portable_changes: Vec<u8>,
 }
@@ -393,10 +388,6 @@ impl LogRecord {
             buf: vec![0u8; crate::mvcc::persistent_storage::logical_log::LOG_RECORD_PREFIX_SIZE],
             op_count: 0,
             has_header: false,
-            #[cfg(feature = "conn_raw_api")]
-            portable_schema_deletes: Vec::new(),
-            #[cfg(feature = "conn_raw_api")]
-            portable_deleted_table_rows: HashMap::default(),
             #[cfg(feature = "conn_raw_api")]
             portable_changes: Vec::new(),
         }
@@ -440,31 +431,10 @@ impl LogRecord {
         crate::mvcc::persistent_storage::logical_log::serialize_op_entry(
             &mut self.buf,
             row_version,
+            None,
         )
         .expect("failed to serialize row version in test");
         self.op_count += 1;
-        #[cfg(feature = "conn_raw_api")]
-        if row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
-            && matches!(
-                row_version.end,
-                Some(TxTimestampOrID::Timestamp(ts)) if ts == self.tx_timestamp
-            )
-        {
-            self.portable_schema_deletes.push((
-                row_version.row.id.row_id.to_int_or_panic(),
-                row_version.row.payload().to_vec(),
-            ));
-        } else if matches!(
-            row_version.end,
-            Some(TxTimestampOrID::Timestamp(ts)) if ts == self.tx_timestamp
-        ) {
-            if let RowKey::Int(rowid) = row_version.row.id.row_id {
-                self.portable_deleted_table_rows.insert(
-                    (row_version.row.id.table_id, rowid),
-                    row_version.row.payload().to_vec(),
-                );
-            }
-        }
     }
 
     /// Test-only: append a `DatabaseHeader` op to the payload buffer.
@@ -490,10 +460,115 @@ fn portable_table_id_from_rootpage(rootpage: i64) -> MVTableId {
 #[cfg(feature = "conn_raw_api")]
 struct PortableTableRef {
     name: String,
-    stable_table_id: u64,
-    kind: u64,
-    sql: Option<String>,
-    rootpage_debug: i64,
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn rootpage_for_mv_table_id<Clock: LogicalClock>(
+    mvcc_store: &MvStore<Clock>,
+    table_id: MVTableId,
+) -> i64 {
+    mvcc_store
+        .table_id_to_rootpage
+        .get(&table_id)
+        .and_then(|entry| *entry.value())
+        .map(|rootpage| rootpage as i64)
+        .unwrap_or_else(|| i64::from(table_id))
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn portable_table_name_for_mv_table_id<Clock: LogicalClock>(
+    connection: &Connection,
+    mvcc_store: &MvStore<Clock>,
+    table_id: MVTableId,
+) -> Option<String> {
+    let rootpage = rootpage_for_mv_table_id(mvcc_store, table_id);
+    if rootpage == 0 {
+        return None;
+    }
+    let schema = connection.schema.read();
+    if let Some(name) = schema.table_name_for_root_page(rootpage) {
+        return Some(name.to_string());
+    }
+    let alternate_rootpage = -rootpage;
+    if alternate_rootpage == 0 {
+        return None;
+    }
+    schema
+        .table_name_for_root_page(alternate_rootpage)
+        .map(ToString::to_string)
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn portable_delete_op_extension_for_row_version<Clock: LogicalClock>(
+    connection: &Connection,
+    mvcc_store: &MvStore<Clock>,
+    row_version: &RowVersion,
+) -> Result<Option<Vec<u8>>> {
+    if !connection.portable_logical_changes_enabled() {
+        return Ok(None);
+    }
+    if !matches!(row_version.end, Some(TxTimestampOrID::Timestamp(_))) {
+        return Ok(None);
+    }
+    let RowKey::Int(rowid) = row_version.row.id.row_id else {
+        return Ok(None);
+    };
+
+    if row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+        let extension =
+            encode_delete_portable_extension(Some(row_version.row.payload()), None, Some(rowid));
+        return Ok((!extension.is_empty()).then_some(extension));
+    }
+
+    let Some(table_name) =
+        portable_table_name_for_mv_table_id(connection, mvcc_store, row_version.row.id.table_id)
+    else {
+        return Ok(None);
+    };
+    if !is_portable_logical_name(&table_name) {
+        return Ok(None);
+    }
+
+    let schema = connection.schema.read();
+    let Some(table) = schema.get_btree_table(&table_name) else {
+        return Ok(None);
+    };
+
+    let mut record_values = None;
+    let mut pk_values = Vec::with_capacity(table.primary_key_columns.len());
+    for (pk_name, _) in &table.primary_key_columns {
+        let Some((logical_column, column)) = table.get_column(pk_name) else {
+            return Err(LimboError::InternalError(format!(
+                "primary key column {pk_name} not found for table {table_name}"
+            )));
+        };
+        if column.is_rowid_alias() {
+            pk_values.push(Value::from_i64(rowid));
+            continue;
+        }
+        let values = match &record_values {
+            Some(values) => values,
+            None => record_values.insert(
+                ImmutableRecord::from_bin_record(row_version.row.payload().to_vec())
+                    .get_values_owned()?,
+            ),
+        };
+        let physical_column = table.logical_to_physical_column(logical_column);
+        let Some(value) = values.get(physical_column).cloned() else {
+            return Err(LimboError::Corrupt(format!(
+                "DELETE_TABLE record for {table_name} missing primary key column {pk_name}"
+            )));
+        };
+        pk_values.push(value);
+    }
+
+    let pk_record = if pk_values.is_empty() {
+        Vec::new()
+    } else {
+        ImmutableRecord::from_values(&pk_values, pk_values.len())?.into_payload()
+    };
+    let extension = encode_delete_portable_extension(None, Some(&pk_record), Some(rowid));
+    Ok((!extension.is_empty()).then_some(extension))
 }
 
 /// A transaction timestamp or ID.
@@ -1663,6 +1738,8 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 ))
             })?;
         let write_set_len = tx.write_set.lock().entries.len();
+        #[cfg(feature = "conn_raw_api")]
+        let connection = Arc::clone(&self.connection);
         let CommitState::BuildLogRecord(ctx) = &mut self.state else {
             unreachable!("step_build_log_record requires BuildLogRecord state")
         };
@@ -1957,9 +2034,19 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 entry_versions.push(committed_version);
             }
             for committed_version in &entry_versions {
-                mvcc_store
-                    .storage
-                    .serialize_row_version(log_record, committed_version)?;
+                #[cfg(feature = "conn_raw_api")]
+                let portable_extension = portable_delete_op_extension_for_row_version(
+                    &connection,
+                    mvcc_store,
+                    committed_version,
+                )?;
+                #[cfg(not(feature = "conn_raw_api"))]
+                let portable_extension: Option<Vec<u8>> = None;
+                mvcc_store.storage.serialize_row_version(
+                    log_record,
+                    committed_version,
+                    portable_extension.as_deref(),
+                )?;
             }
             Ok(())
         };
@@ -2049,18 +2136,19 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             }
 
             let mut builder = PortableLogicalBuilder::new();
-            let origin_client_id = if self.db_id == crate::MAIN_DB_ID {
-                self.connection
-                    .mvcc_log_meta_snapshot()
-                    .get("client")
-                    .cloned()
-            } else {
-                None
-            };
+            let mut metadata: Vec<_> = self
+                .connection
+                .mvcc_log_meta_snapshot()
+                .into_iter()
+                .collect();
+            metadata.sort_by(|a, b| a.0.cmp(&b.0));
+            for (key, value) in metadata {
+                builder.add_metadata(&key, &value);
+            }
 
-            // Portable changes are the durable, replay-ready representation of this
-            // commit. Build it while the committing connection still has the exact
-            // schema context that produced the recovery log record.
+            // The recovery payload is the single durable operation stream.
+            // The portable extension only adds the metadata required to interpret
+            // recovery table ids outside this database instance.
             let mut table_refs_by_id = HashMap::default();
             let recovery_payload = &log_record.buf[LOG_RECORD_PREFIX_SIZE..];
             let parsed_ops = parse_ops_from_plaintext(
@@ -2074,11 +2162,6 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             let mut schema_deletes = HashMap::default();
             let mut schema_rowids = Vec::new();
             let mut data_table_ids = HashSet::default();
-            for (rowid, record) in &log_record.portable_schema_deletes {
-                let row = portable_schema_row_from_record(record)?;
-                schema_rowids.push(*rowid);
-                schema_deletes.insert(*rowid, row);
-            }
             for op in &parsed_ops {
                 match op {
                     ParsedOp::UpsertTable {
@@ -2092,28 +2175,35 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                         schema_rowids.push(rowid);
                         schema_upserts.insert(rowid, row);
                     }
-                    ParsedOp::UpsertTable { table_id, .. }
-                    | ParsedOp::UpsertIndex { table_id, .. }
-                    | ParsedOp::DeleteIndex { table_id, .. } => {
-                        if !matches!(
-                            op,
-                            ParsedOp::UpsertIndex { .. } | ParsedOp::DeleteIndex { .. }
-                        ) {
-                            data_table_ids.insert(*table_id);
+                    ParsedOp::DeleteTable {
+                        rowid,
+                        record_bytes,
+                        ..
+                    } if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID => {
+                        if record_bytes.is_empty() {
+                            return Err(LimboError::Corrupt(
+                                "sqlite_schema DELETE_TABLE missing old record".to_string(),
+                            ));
                         }
+                        let schema_rowid = rowid.row_id.to_int_or_panic();
+                        let row = portable_schema_row_from_record(record_bytes)?;
+                        schema_rowids.push(schema_rowid);
+                        schema_deletes.insert(schema_rowid, row);
+                    }
+                    ParsedOp::UpsertTable { table_id, .. } => {
+                        data_table_ids.insert(*table_id);
                     }
                     ParsedOp::DeleteTable { rowid, .. } => {
                         if rowid.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
                             data_table_ids.insert(rowid.table_id);
                         }
                     }
-                    ParsedOp::UpdateHeader { header, .. } => {
-                        builder.encode_header_logical_op(header);
-                    }
+                    ParsedOp::UpsertIndex { .. }
+                    | ParsedOp::DeleteIndex { .. }
+                    | ParsedOp::UpdateHeader { .. } => {}
                 }
             }
 
-            let mut emitted_schema_stable_ids = HashSet::default();
             schema_rowids.sort_unstable();
             schema_rowids.dedup();
             for rowid in schema_rowids {
@@ -2121,85 +2211,41 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 let new_row = schema_upserts.get(&rowid);
                 match (old_row, new_row) {
                     (Some(old_row), Some(new_row)) => {
-                        if old_row.rootpage != 0 {
-                            let table_id = portable_table_id_from_rootpage(old_row.rootpage);
-                            table_refs_by_id.remove(&table_id);
+                        if is_portable_table_schema_row(old_row) {
+                            table_refs_by_id.insert(
+                                portable_table_id_from_rootpage(old_row.rootpage),
+                                PortableTableRef {
+                                    name: old_row.name.clone(),
+                                },
+                            );
                         }
-                        if new_row.rootpage != 0 {
-                            let table_id = portable_table_id_from_rootpage(new_row.rootpage);
-                            if let Some(stable_table_id) =
-                                stable_table_id_from_rootpage(new_row.rootpage)
-                            {
-                                if let Some(kind) = portable_schema_kind(&new_row.row_type) {
-                                    table_refs_by_id.insert(
-                                        table_id,
-                                        PortableTableRef {
-                                            name: new_row.name.clone(),
-                                            stable_table_id,
-                                            kind,
-                                            sql: new_row.sql.clone(),
-                                            rootpage_debug: new_row.rootpage,
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                        let stable_table_id = stable_table_id_from_rootpage(new_row.rootpage);
-                        if builder.encode_schema_logical_op(
-                            LOGICAL_SCHEMA_REFRESH,
-                            new_row,
-                            stable_table_id,
-                        ) {
-                            if let Some(stable_table_id) = stable_table_id {
-                                emitted_schema_stable_ids.insert(stable_table_id);
-                            }
+                        if is_portable_table_schema_row(new_row) {
+                            table_refs_by_id.insert(
+                                portable_table_id_from_rootpage(new_row.rootpage),
+                                PortableTableRef {
+                                    name: new_row.name.clone(),
+                                },
+                            );
                         }
                     }
                     (None, Some(new_row)) => {
-                        if new_row.rootpage != 0 {
-                            let table_id = portable_table_id_from_rootpage(new_row.rootpage);
-                            if let Some(stable_table_id) =
-                                stable_table_id_from_rootpage(new_row.rootpage)
-                            {
-                                if let Some(kind) = portable_schema_kind(&new_row.row_type) {
-                                    table_refs_by_id.insert(
-                                        table_id,
-                                        PortableTableRef {
-                                            name: new_row.name.clone(),
-                                            stable_table_id,
-                                            kind,
-                                            sql: new_row.sql.clone(),
-                                            rootpage_debug: new_row.rootpage,
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                        let stable_table_id = stable_table_id_from_rootpage(new_row.rootpage);
-                        if builder.encode_schema_logical_op(
-                            LOGICAL_SCHEMA_CREATE,
-                            new_row,
-                            stable_table_id,
-                        ) {
-                            if let Some(stable_table_id) = stable_table_id {
-                                emitted_schema_stable_ids.insert(stable_table_id);
-                            }
+                        if is_portable_table_schema_row(new_row) {
+                            table_refs_by_id.insert(
+                                portable_table_id_from_rootpage(new_row.rootpage),
+                                PortableTableRef {
+                                    name: new_row.name.clone(),
+                                },
+                            );
                         }
                     }
                     (Some(old_row), None) => {
-                        let stable_table_id = stable_table_id_from_rootpage(old_row.rootpage);
-                        if builder.encode_schema_logical_op(
-                            LOGICAL_SCHEMA_DROP,
-                            old_row,
-                            stable_table_id,
-                        ) {
-                            if let Some(stable_table_id) = stable_table_id {
-                                emitted_schema_stable_ids.insert(stable_table_id);
-                            }
-                        }
-                        if old_row.rootpage != 0 {
-                            let table_id = portable_table_id_from_rootpage(old_row.rootpage);
-                            table_refs_by_id.remove(&table_id);
+                        if is_portable_table_schema_row(old_row) {
+                            table_refs_by_id.insert(
+                                portable_table_id_from_rootpage(old_row.rootpage),
+                                PortableTableRef {
+                                    name: old_row.name.clone(),
+                                },
+                            );
                         }
                     }
                     (None, None) => {}
@@ -2217,78 +2263,63 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
 
             let mut unresolved_data_tables = Vec::new();
             let mut needed_rootpages = HashSet::default();
-            for table_id in data_table_ids {
-                if table_refs_by_id.contains_key(&table_id) {
+            for table_id in &data_table_ids {
+                if table_refs_by_id.contains_key(table_id) {
                     continue;
                 }
-                let rootpage = rootpage_for_table_id(table_id);
+                let rootpage = rootpage_for_table_id(*table_id);
                 if rootpage == 0 {
                     continue;
                 }
                 let root_table_id = portable_table_id_from_rootpage(rootpage);
                 if let Some(table_ref) = table_refs_by_id.get(&root_table_id).cloned() {
-                    table_refs_by_id.insert(table_id, table_ref);
+                    table_refs_by_id.insert(*table_id, table_ref);
                     continue;
                 }
                 needed_rootpages.insert(rootpage);
-                unresolved_data_tables.push((table_id, root_table_id));
+                unresolved_data_tables.push((*table_id, root_table_id));
             }
 
             if !needed_rootpages.is_empty() {
                 let schema = self.connection.schema.read();
                 for rootpage in needed_rootpages {
-                    let table_ref = if let Some(name) = schema.table_name_for_root_page(rootpage) {
-                        let Some(stable_table_id) = stable_table_id_from_rootpage(rootpage) else {
-                            continue;
-                        };
-                        PortableTableRef {
-                            name: name.to_string(),
-                            stable_table_id,
-                            kind: 0,
-                            sql: None,
-                            rootpage_debug: rootpage,
-                        }
+                    let (resolved_table_id, table_ref) = if let Some(name) =
+                        schema.table_name_for_root_page(rootpage)
+                    {
+                        (
+                            portable_table_id_from_rootpage(rootpage),
+                            PortableTableRef {
+                                name: name.to_string(),
+                            },
+                        )
                     } else if rootpage < 0 {
                         let checkpointed_rootpage = -rootpage;
                         let Some(name) = schema.table_name_for_root_page(checkpointed_rootpage)
                         else {
                             continue;
                         };
-                        let Some(stable_table_id) =
-                            stable_table_id_from_rootpage(checkpointed_rootpage)
-                        else {
-                            continue;
-                        };
-                        PortableTableRef {
-                            name: name.to_string(),
-                            stable_table_id,
-                            kind: 0,
-                            sql: None,
-                            rootpage_debug: checkpointed_rootpage,
-                        }
+                        (
+                            portable_table_id_from_rootpage(checkpointed_rootpage),
+                            PortableTableRef {
+                                name: name.to_string(),
+                            },
+                        )
                     } else if rootpage > 0 {
                         let uncheckpointed_rootpage = -rootpage;
                         let Some(name) = schema.table_name_for_root_page(uncheckpointed_rootpage)
                         else {
                             continue;
                         };
-                        let Some(stable_table_id) = stable_table_id_from_rootpage(rootpage) else {
-                            continue;
-                        };
-                        PortableTableRef {
-                            name: name.to_string(),
-                            stable_table_id,
-                            kind: 0,
-                            sql: None,
-                            rootpage_debug: rootpage,
-                        }
+                        (
+                            portable_table_id_from_rootpage(rootpage),
+                            PortableTableRef {
+                                name: name.to_string(),
+                            },
+                        )
                     } else {
                         continue;
                     };
-                    table_refs_by_id.insert(
-                        MVTableId::from(-(table_ref.stable_table_id as i64)),
-                        table_ref,
-                    );
+                    table_refs_by_id.insert(resolved_table_id, table_ref);
                 }
 
                 for (table_id, root_table_id) in unresolved_data_tables {
@@ -2299,86 +2330,31 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             }
 
             for (table_id, table_ref) in &table_refs_by_id {
-                builder.add_object_map(PortableObjectMapEntry {
+                if !is_portable_logical_name(&table_ref.name) {
+                    continue;
+                }
+                let added = builder.add_object_map(PortableObjectMapEntry {
                     mv_table_id: i64::from(*table_id),
-                    kind: table_ref.kind,
-                    logical_object_id: table_ref.stable_table_id,
                     name: &table_ref.name,
-                    schema_epoch: log_record.tx_timestamp,
-                    create_sql: table_ref.sql.as_deref(),
-                    rootpage_debug: table_ref.rootpage_debug,
                 });
+                turso_assert!(
+                    added,
+                    "portable object map unexpectedly rejected a user object"
+                );
             }
 
-            for op in &parsed_ops {
-                match op {
-                    ParsedOp::UpsertTable {
-                        table_id,
-                        rowid,
-                        record_bytes: _,
-                        ..
-                    } if *table_id != SQLITE_SCHEMA_MVCC_TABLE_ID => {
-                        let Some(table_ref) = table_refs_by_id.get(table_id) else {
-                            return Err(LimboError::InternalError(format!(
-                                "unable to encode MVCC row portable changes: table_id={table_id}"
-                            )));
-                        };
-                        if !emitted_schema_stable_ids.contains(&table_ref.stable_table_id) {
-                            builder.add_object_map(PortableObjectMapEntry {
-                                mv_table_id: i64::from(*table_id),
-                                kind: table_ref.kind,
-                                logical_object_id: table_ref.stable_table_id,
-                                name: &table_ref.name,
-                                schema_epoch: log_record.tx_timestamp,
-                                create_sql: table_ref.sql.as_deref(),
-                                rootpage_debug: table_ref.rootpage_debug,
-                            });
-                        }
-                        builder.encode_row_logical_op(
-                            LOGICAL_OP_UPSERT_ROW,
-                            i64::from(*table_id),
-                            rowid.row_id.to_int_or_panic(),
-                            &[],
-                        );
-                    }
-                    ParsedOp::DeleteTable { rowid, .. }
-                        if rowid.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID =>
-                    {
-                        let Some(table_ref) = table_refs_by_id.get(&rowid.table_id) else {
-                            return Err(LimboError::InternalError(format!(
-                                "unable to encode MVCC row portable changes: table_id={}",
-                                rowid.table_id
-                            )));
-                        };
-                        if !emitted_schema_stable_ids.contains(&table_ref.stable_table_id) {
-                            builder.add_object_map(PortableObjectMapEntry {
-                                mv_table_id: i64::from(rowid.table_id),
-                                kind: table_ref.kind,
-                                logical_object_id: table_ref.stable_table_id,
-                                name: &table_ref.name,
-                                schema_epoch: log_record.tx_timestamp,
-                                create_sql: table_ref.sql.as_deref(),
-                                rootpage_debug: table_ref.rootpage_debug,
-                            });
-                        }
-                        let rowid_int = rowid.row_id.to_int_or_panic();
-                        let deleted_record = log_record
-                            .portable_deleted_table_rows
-                            .get(&(rowid.table_id, rowid_int))
-                            .map(Vec::as_slice)
-                            .unwrap_or(&[]);
-                        builder.encode_row_logical_op(
-                            LOGICAL_OP_DELETE_ROW,
-                            i64::from(rowid.table_id),
-                            rowid_int,
-                            deleted_record,
-                        );
-                    }
-                    _ => {}
+            for table_id in data_table_ids {
+                let Some(table_ref) = table_refs_by_id.get(&table_id) else {
+                    return Err(LimboError::InternalError(format!(
+                        "unable to resolve MVCC table id for portable changes: table_id={table_id}"
+                    )));
+                };
+                if !is_portable_logical_name(&table_ref.name) {
+                    continue;
                 }
             }
 
-            log_record.portable_changes = builder.finish(origin_client_id);
+            log_record.portable_changes = builder.finish();
             Ok(())
         }
     }
