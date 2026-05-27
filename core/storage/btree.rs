@@ -3,6 +3,8 @@ use rustc_hash::FxHashMap as HashMap;
 #[cfg(debug_assertions)]
 use rustc_hash::FxHashSet as HashSet;
 use smallvec::SmallVec;
+#[cfg(any(test, injected_yields))]
+use strum::EnumCount;
 use tracing::{instrument, Level};
 
 use super::{
@@ -11,6 +13,7 @@ use super::{
         write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
     },
 };
+use crate::mvcc::yield_points::inject_io_yield;
 use crate::{
     io::CompletionGroup,
     io_yield_one,
@@ -39,6 +42,11 @@ use crate::{
     util::IOExt,
     vdbe::Register,
     Completion, MvStore,
+};
+#[cfg(any(test, injected_yields))]
+use crate::{
+    mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker},
+    mvcc::yield_points::YieldInjector,
 };
 use crate::{
     numeric::Numeric,
@@ -467,7 +475,30 @@ enum OverflowState {
     Start,
     ProcessPage { next_page: PageRef },
     FreePage { page: PageRef, next: u32 },
+    LoadPage { next_page_id: u32 },
     Done,
+}
+
+#[cfg(any(test, injected_yields))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
+#[repr(u8)]
+pub(crate) enum BTreeYieldPoint {
+    ClearOverflowPageFreed,
+}
+
+#[cfg(any(test, injected_yields))]
+impl YieldPointMarker for BTreeYieldPoint {
+    const POINT_COUNT: u8 = Self::COUNT as u8;
+
+    fn ordinal(self) -> u8 {
+        self as u8
+    }
+}
+
+#[cfg(any(test, injected_yields))]
+fn btree_yield_key(root_page: i64) -> u64 {
+    const BTREE_SELECTION_TAG: u64 = 0xB7EE_B7EE_B7EE_B7EE;
+    BTREE_SELECTION_TAG ^ root_page as u64
 }
 
 /// Holds a Record or RowId, so that these can be transformed into a SeekKey to restore
@@ -696,10 +727,26 @@ pub struct BTreeCursor {
     /// Reusable buffer for cell payloads during insert/update operations.
     /// This avoids allocating a new Vec for each write operation.
     reusable_cell_payload: Vec<u8>,
+    #[cfg(any(test, injected_yields))]
+    yield_injector: Option<Arc<dyn YieldInjector>>,
+    #[cfg(any(test, injected_yields))]
+    yield_instance_id: u64,
 }
 
 crate::assert::assert_send!(BTreeCursor);
 crate::assert::assert_sync!(BTreeCursor);
+
+#[cfg(any(test, injected_yields))]
+impl ProvidesYieldContext for BTreeCursor {
+    fn yield_context(&self) -> YieldContext {
+        YieldContext::new(
+            self.yield_injector.clone(),
+            None,
+            self.yield_instance_id,
+            btree_yield_key(self.root_page),
+        )
+    }
+}
 
 /// We store the cell index and cell count for each page in the stack.
 /// The reason we store the cell count is because we need to know when we are at the end of the page,
@@ -763,7 +810,21 @@ impl BTreeCursor {
             move_to_state: MoveToState::Start,
             skip_advance: false,
             reusable_cell_payload: Vec::new(),
+            #[cfg(any(test, injected_yields))]
+            yield_injector: None,
+            #[cfg(any(test, injected_yields))]
+            yield_instance_id: 0,
         }
+    }
+
+    #[cfg(any(test, injected_yields))]
+    pub(crate) fn set_yield_injector(
+        &mut self,
+        injector: Option<Arc<dyn YieldInjector>>,
+        instance_id: u64,
+    ) {
+        self.yield_injector = injector;
+        self.yield_instance_id = instance_id;
     }
 
     pub fn new_table(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
@@ -4588,13 +4649,17 @@ impl BTreeCursor {
                             self.overflow_state = OverflowState::Start;
                             return Err(LimboError::Corrupt("Invalid overflow page number".into()));
                         }
-                        let (page, c) = self.read_page(next as i64)?;
-                        self.overflow_state = OverflowState::ProcessPage { next_page: page };
-                        if let Some(c) = c {
-                            io_yield_one!(c);
-                        }
+                        self.overflow_state = OverflowState::LoadPage { next_page_id: next };
                     } else {
                         self.overflow_state = OverflowState::Done;
+                    }
+                    inject_io_yield!(self, BTreeYieldPoint::ClearOverflowPageFreed);
+                }
+                OverflowState::LoadPage { next_page_id } => {
+                    let (page, c) = self.read_page(next_page_id as i64)?;
+                    self.overflow_state = OverflowState::ProcessPage { next_page: page };
+                    if let Some(c) = c {
+                        io_yield_one!(c);
                     }
                 }
                 OverflowState::Done => {
@@ -8326,6 +8391,10 @@ mod tests {
     use super::*;
     use crate::{
         io::{Buffer, MemoryIO, OpenFlags, IO},
+        mvcc::{
+            yield_hooks::YieldPointMarker,
+            yield_points::{YieldInjector, YieldPoint},
+        },
         schema::IndexColumn,
         storage::{
             database::DatabaseFile, page_cache::PageCache, pager::default_page1,
@@ -8340,6 +8409,37 @@ mod tests {
     use std::{mem::transmute, ops::Deref, sync::Arc};
 
     use tempfile::TempDir;
+
+    #[derive(Debug)]
+    struct FixedYieldInjector {
+        remaining: crate::sync::Mutex<std::collections::HashSet<(u64, YieldPoint)>>,
+    }
+
+    impl FixedYieldInjector {
+        fn new_for_selection(
+            selection_key: u64,
+            points: impl IntoIterator<Item = YieldPoint>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                remaining: crate::sync::Mutex::new(
+                    points
+                        .into_iter()
+                        .map(|point| (selection_key, point))
+                        .collect(),
+                ),
+            })
+        }
+
+        fn is_empty(&self) -> bool {
+            self.remaining.lock().is_empty()
+        }
+    }
+
+    impl YieldInjector for FixedYieldInjector {
+        fn should_yield(&self, _instance_id: u64, selection_key: u64, point: YieldPoint) -> bool {
+            self.remaining.lock().remove(&(selection_key, point))
+        }
+    }
 
     use crate::{
         storage::{
@@ -9866,6 +9966,97 @@ mod tests {
             initial_freelist_pages + 2,
             "clear_overflow_pages must continue from the captured overflow next page"
         );
+
+        Ok(())
+    }
+
+    fn query_single_i64(conn: &Arc<Connection>, sql: &str) -> Result<i64> {
+        let mut value = None;
+        let mut stmt = conn
+            .query(sql)?
+            .ok_or_else(|| LimboError::InternalError("expected statement".to_string()))?;
+        stmt.run_with_row_callback(|row| {
+            turso_assert!(value.is_none(), "query_single_i64 expected one row");
+            value = Some(row.get::<i64>(0)?);
+            Ok(())
+        })?;
+        value.ok_or_else(|| LimboError::InternalError("query_single_i64 found no rows".to_string()))
+    }
+
+    #[test]
+    pub fn test_sql_update_large_unique_blob_resumes_overflow_clear_after_yield() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("antithesis-overflow-clear.db");
+        let db_path_str = db_path.to_str().unwrap().to_string();
+
+        {
+            let io = Arc::new(PlatformIO::new().unwrap());
+            let db = Database::open_file(io, &db_path_str)?;
+            let conn = db.connect()?;
+
+            conn.execute("PRAGMA journal_mode = WAL")?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS hot_leaf_125 (
+                    old_wind_27 NUMERIC NOT NULL PRIMARY KEY,
+                    wild_rock_991 NUMERIC NOT NULL,
+                    hot_leaf_250 TEXT UNIQUE,
+                    fast_lake_116 BLOB UNIQUE
+                );",
+            )?;
+            for row in 1..80 {
+                conn.execute(&format!(
+                    "INSERT INTO hot_leaf_125 (
+                        old_wind_27, wild_rock_991, hot_leaf_250, fast_lake_116
+                    ) VALUES ({row}, {row}, 'filler_{row}', x'{row:02x}');"
+                ))?;
+            }
+            conn.execute(
+                "INSERT INTO hot_leaf_125 (
+                    old_wind_27, wild_rock_991, hot_leaf_250, fast_lake_116
+                ) VALUES (693, 458, 'empty_cat_94', zeroblob(5625));",
+            )?;
+
+            let fast_lake_blob_index_root = query_single_i64(
+                &conn,
+                "SELECT rootpage
+                   FROM sqlite_schema
+                  WHERE name = 'sqlite_autoindex_hot_leaf_125_3';",
+            )?;
+            let injector = FixedYieldInjector::new_for_selection(
+                btree_yield_key(fast_lake_blob_index_root),
+                [BTreeYieldPoint::ClearOverflowPageFreed.point()],
+            );
+            conn.set_yield_injector(Some(injector.clone()));
+
+            conn.execute("BEGIN")?;
+            conn.execute("SAVEPOINT sp_86")?;
+            conn.execute(
+                "UPDATE hot_leaf_125
+                 SET wild_rock_991 = 294,
+                     hot_leaf_250 = 'sour_root_575',
+                     fast_lake_116 = x'6c696768745f7261696e5f383537'
+                 WHERE old_wind_27 = 693;",
+            )?;
+            conn.execute("RELEASE sp_86")?;
+            conn.execute("COMMIT")?;
+
+            conn.set_yield_injector(None);
+            assert!(
+                injector.is_empty(),
+                "UPDATE should hit the clear-overflow yield point"
+            );
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        }
+
+        let sqlite_copy = temp_dir.path().join("sqlite-integrity-copy.db");
+        std::fs::copy(&db_path, &sqlite_copy).unwrap();
+        let sqlite_conn = rusqlite::Connection::open(sqlite_copy).unwrap();
+        let sqlite_integrity = sqlite_conn
+            .query_row("SELECT * FROM pragma_integrity_check", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|err| LimboError::InternalError(err.to_string()))?;
+        assert_eq!(sqlite_integrity, "ok");
 
         Ok(())
     }
