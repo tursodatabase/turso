@@ -2490,6 +2490,7 @@ impl Program {
             pager.stop_use_subjournal();
             state.uses_subjournal = false;
         }
+        pager.reset_internal_states();
         state.auto_txn_cleanup = TxnCleanup::None;
         if let Some(err) = abort_error {
             return Err(err);
