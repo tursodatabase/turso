@@ -1282,6 +1282,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                     self.tx_id,
                     self.connection.as_ref(),
                     self.db_id,
+                    self.did_commit_schema_change,
                 );
             }
             self.end_read_tx_for_db();
@@ -1983,11 +1984,9 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             .map(|entry| entry.value())
             .ok_or_else(|| {
                 LimboError::NoSuchTransactionID(format!(
-                    "tx id {tx_id} not found in step_build_logical_record"
+                    "tx id {tx_id} not found in step_rewrite_live_versions"
                 ))
             })?;
-        let write_set = tx.write_set.lock();
-        let write_set_len = write_set.entries.len();
         let CommitState::RewriteLiveVersions(ctx) = &mut self.state else {
             unreachable!("step_rewrite_live_versions requires RewriteLiveVersions state")
         };
@@ -2002,26 +2001,12 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 "RewriteLiveVersions requires a committed transaction state"
             );
         }
-        let mut iterations = 0;
-        while ctx.cursor < write_set_len && iterations < MVCC_COMMIT_BATCH_SIZE {
-            let (_id, row_versions) = &write_set.entries[ctx.cursor];
-            let mut row_versions = row_versions.write();
-            for row_version in row_versions.iter_mut() {
-                if let Some(TxTimestampOrID::TxID(rv_id)) = row_version.begin {
-                    if rv_id == tx_id {
-                        row_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
-                    }
-                }
-                if let Some(TxTimestampOrID::TxID(rv_id)) = row_version.end {
-                    if rv_id == tx_id {
-                        row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
-                    }
-                }
-            }
-            ctx.cursor += 1;
-            iterations += 1;
-        }
-        if ctx.cursor < write_set_len {
+        if !mvcc_store.rewrite_committed_live_versions_batch(
+            tx,
+            end_ts,
+            &mut ctx.cursor,
+            MVCC_COMMIT_BATCH_SIZE,
+        ) {
             return Ok(TransitionResult::Io(IOCompletions::Single(
                 Completion::new_yield(),
             )));
@@ -2517,46 +2502,15 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                 let tx_unlocked = tx.value();
 
-                // Hekaton Section 3.3: "The transaction then processes all outgoing
-                // commit dependencies listed in its CommitDepSet. If it committed, it
-                // decrements the target transaction's CommitDepCounter."
-                // IOW since this txn committed, let's signal waiting transactions.
-                let dependents = std::mem::take(&mut *tx_unlocked.commit_dep_set.lock());
-                for dep_tx_id in dependents {
-                    if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
-                        dep_tx_entry
-                            .value()
-                            .commit_dep_counter
-                            .fetch_sub(1, Ordering::AcqRel);
-                    }
-                }
-
-                mvcc_store.unlock_commit_lock_if_held(tx_unlocked);
+                mvcc_store.resolve_committed_dependents_and_unlock(tx_unlocked);
 
                 inject_transition_yield!(self, CommitYieldPoint::BeforeGlobalHeaderUpdate);
 
-                let tx_header = *tx_unlocked.header.read();
-                {
-                    // Hold the header lock across the watermark update and header
-                    // publish so the guard decision and replacement are serialized.
-                    let mut global_header = mvcc_store.global_header.write();
-                    // Since we assign a commit timestamp and then we drive the commit to completion,
-                    // it is totally possible for so an older transaction can finish after a newer one.
-                    // In such case, we should not let older commit to set lower value than previous.
-                    // This value is used in checkpointing as a watermark boundary, and an incorrect
-                    // lower value can cause data loss / corruption.
-                    let last_committed_ts = mvcc_store
-                        .last_committed_tx_ts
-                        .fetch_max(*end_ts, Ordering::AcqRel);
-                    if last_committed_ts <= *end_ts {
-                        global_header.replace(tx_header);
-                    }
-                }
-                if self.did_commit_schema_change {
-                    mvcc_store
-                        .last_committed_schema_change_ts
-                        .fetch_max(*end_ts, Ordering::AcqRel);
-                }
+                mvcc_store.publish_committed_header(
+                    tx_unlocked,
+                    *end_ts,
+                    self.did_commit_schema_change,
+                );
 
                 // We have now updated all the versions with a reference to the
                 // transaction ID to a timestamp and can, therefore, remove the
@@ -4444,22 +4398,45 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.remove_tx(tx_id);
     }
 
-    fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
-        let tx_state = self.txs.get(&tx_id).map(|tx| tx.value().state.load());
-        match tx_state {
-            Some(TransactionState::Active | TransactionState::Preparing(_)) => {
+    fn cleanup_dropped_commit(
+        &self,
+        tx_id: TxID,
+        connection: &Connection,
+        db_id: usize,
+        did_commit_schema_change: bool,
+    ) {
+        let Some(tx_entry) = self.txs.get(&tx_id) else {
+            if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
+                connection.set_mv_tx_for_db(db_id, None);
+            }
+            if self.is_exclusive_tx(&tx_id) {
+                self.release_exclusive_tx(&tx_id);
+            }
+            return;
+        };
+        match tx_entry.value().state.load() {
+            TransactionState::Active | TransactionState::Preparing(_) => {
                 self.rollback_tx_inner(tx_id, Some(connection), db_id);
             }
-            Some(TransactionState::Committed(_)) => {
-                if let Some(tx) = self.txs.get(&tx_id) {
-                    self.unlock_commit_lock_if_held(tx.value());
-                }
+            TransactionState::Committed(end_ts) => {
+                let tx = tx_entry.value();
+
+                let mut cursor = 0;
+                let drained = self.rewrite_committed_live_versions_batch(
+                    tx,
+                    end_ts,
+                    &mut cursor,
+                    usize::MAX,
+                );
+                turso_assert!(drained, "dropped-commit rewrite must drain");
+                self.resolve_committed_dependents_and_unlock(tx);
+                self.publish_committed_header(tx, end_ts, did_commit_schema_change);
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
                 }
                 self.finish_committed_tx(tx_id, connection, db_id);
             }
-            Some(TransactionState::Aborted | TransactionState::Terminated) | None => {
+            TransactionState::Aborted | TransactionState::Terminated => {
                 if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
                     connection.set_mv_tx_for_db(db_id, None);
                 }
@@ -4467,6 +4444,92 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     self.release_exclusive_tx(&tx_id);
                 }
             }
+        }
+    }
+
+    fn rewrite_committed_live_versions_batch(
+        &self,
+        tx: &Transaction,
+        end_ts: u64,
+        cursor: &mut usize,
+        max_rowids: usize,
+    ) -> bool {
+        let write_set = tx.write_set.lock();
+        turso_assert!(
+            *cursor <= write_set.entries.len(),
+            "rewrite cursor advanced past write set length"
+        );
+        let tx_id = tx.tx_id;
+        let mut iterations = 0;
+        while *cursor < write_set.entries.len() && iterations < max_rowids {
+            let (_id, row_versions) = &write_set.entries[*cursor];
+            let mut row_versions = row_versions.write();
+            for row_version in row_versions.iter_mut() {
+                if let Some(TxTimestampOrID::TxID(rv_id)) = row_version.begin {
+                    if rv_id == tx_id {
+                        row_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                    }
+                }
+                if let Some(TxTimestampOrID::TxID(rv_id)) = row_version.end {
+                    if rv_id == tx_id {
+                        row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                    }
+                }
+            }
+            *cursor += 1;
+            iterations += 1;
+        }
+        *cursor == write_set.entries.len()
+    }
+
+    fn resolve_committed_dependents_and_unlock(&self, tx: &Transaction) {
+        // Hekaton Section 3.3: "The transaction then processes all outgoing
+        // commit dependencies listed in its CommitDepSet. If it committed, it
+        // decrements the target transaction's CommitDepCounter."
+        // IOW since this txn committed, let's signal waiting transactions.
+        let dependents = std::mem::take(&mut *tx.commit_dep_set.lock());
+        turso_assert!(
+            !dependents.contains(&tx.tx_id),
+            "committed transaction has itself in its own commit_dep_set"
+        );
+        for dep_tx_id in dependents {
+            if let Some(dep_tx_entry) = self.txs.get(&dep_tx_id) {
+                dep_tx_entry
+                    .value()
+                    .commit_dep_counter
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+
+        self.unlock_commit_lock_if_held(tx);
+    }
+
+    fn publish_committed_header(
+        &self,
+        tx: &Transaction,
+        end_ts: u64,
+        did_commit_schema_change: bool,
+    ) {
+        let tx_header = *tx.header.read();
+        {
+            // Hold the header lock across the watermark update and header
+            // publish so the guard decision and replacement are serialized.
+            let mut global_header = self.global_header.write();
+            // Since we assign a commit timestamp and then we drive the commit to completion,
+            // it is totally possible for so an older transaction can finish after a newer one.
+            // In such case, we should not let older commit to set lower value than previous.
+            // This value is used in checkpointing as a watermark boundary, and an incorrect
+            // lower value can cause data loss / corruption.
+            let last_committed_ts = self
+                .last_committed_tx_ts
+                .fetch_max(end_ts, Ordering::AcqRel);
+            if last_committed_ts <= end_ts {
+                global_header.replace(tx_header);
+            }
+        }
+        if did_commit_schema_change {
+            self.last_committed_schema_change_ts
+                .fetch_max(end_ts, Ordering::AcqRel);
         }
     }
 
@@ -6335,8 +6398,9 @@ fn register_commit_dependency(
     );
     let Some(depended_on) = txs.get(&depended_on_tx_id) else {
         // Transaction was already committed and removed from the map
-        // (CommitEnd calls remove_tx after setting Committed and draining
-        // CommitDepSet). Dependency is trivially resolved.
+        // (FinalizeCommit calls remove_tx after setting Committed and draining
+        // CommitDepSet; dropped-COMMIT cleanup follows the same path).
+        // Dependency is trivially resolved.
         return;
     };
     let depended_on = depended_on.value();
