@@ -1,7 +1,7 @@
 use crate::turso_debug_assert;
 use branches::{mark_unlikely, unlikely};
 use either::Either;
-use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
+use turso_ext::{AggCtx, ContextDestructor, FinalizeFunction, StepFunction, ValueDestructor};
 use turso_parser::ast::SortOrder;
 
 use crate::alloc::vec;
@@ -494,10 +494,13 @@ impl Value {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternalAggState {
+    pub context: usize,
     pub state: *mut AggCtx,
     pub argc: usize,
     pub step_fn: StepFunction,
     pub finalize_fn: FinalizeFunction,
+    pub aggregate_destructor: Option<ContextDestructor>,
+    pub value_destructor: Option<ValueDestructor>,
 }
 
 /// Please use Display trait for all limbo output so we have single origin of truth
@@ -728,8 +731,18 @@ pub enum AggContext {
 impl AggContext {
     pub fn compute_external(&self) -> Result<Value> {
         if let Self::External(ext_state) = self {
-            let final_value = unsafe { (ext_state.finalize_fn)(ext_state.state) };
-            Value::from_ffi(final_value)
+            let mut final_value =
+                unsafe { (ext_state.finalize_fn)(ext_state.context, ext_state.state) };
+            let value = Value::from_ffi_ref(&final_value);
+            if let Some(value_destructor) = ext_state.value_destructor {
+                unsafe { value_destructor(&mut final_value) };
+            } else {
+                unsafe { final_value.__free_internal_type() };
+            }
+            if let Some(aggregate_destructor) = ext_state.aggregate_destructor {
+                unsafe { aggregate_destructor(ext_state.state as usize) };
+            }
+            value
         } else {
             panic!("AggContext::compute_external() expected External, found {self:?}");
         }

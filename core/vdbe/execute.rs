@@ -73,7 +73,6 @@ use crate::{
         SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
         SQLITE_ERROR,
     },
-    ext::ExtValue,
     function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
         datetime::{
@@ -6210,15 +6209,22 @@ pub fn op_agg_step(
         state.registers[*acc_reg] = match func {
             AggFunc::External(ext_func) => match ext_func.as_ref() {
                 ExtFunc::Aggregate {
+                    context,
                     init,
                     step,
                     finalize,
                     argc,
+                    aggregate_destructor,
+                    value_destructor,
+                    ..
                 } => Register::Aggregate(AggContext::External(ExternalAggState {
-                    state: unsafe { (init)() },
-                    argc: *argc,
+                    context: *context,
+                    state: unsafe { (init)(*context) },
+                    argc: (*argc).max(0) as usize,
                     step_fn: *step,
                     finalize_fn: *finalize,
+                    aggregate_destructor: *aggregate_destructor,
+                    value_destructor: *value_destructor,
                 })),
                 _ => unreachable!("scalar function called in aggregate context"),
             },
@@ -6238,28 +6244,50 @@ pub fn op_agg_step(
     match func {
         AggFunc::External(_) => {
             // External aggregates use FFI and need special handling
-            let (step_fn, state_ptr, argc) = {
+            let (context, step_fn, state_ptr, argc, aggregate_destructor, value_destructor) = {
                 let Register::Aggregate(agg) = &state.registers[*acc_reg] else {
                     unreachable!();
                 };
                 let AggContext::External(agg_state) = agg else {
                     unreachable!();
                 };
-                (agg_state.step_fn, agg_state.state, agg_state.argc)
+                (
+                    agg_state.context,
+                    agg_state.step_fn,
+                    agg_state.state,
+                    agg_state.argc,
+                    agg_state.aggregate_destructor,
+                    agg_state.value_destructor,
+                )
             };
-            if argc == 0 {
-                unsafe { step_fn(state_ptr, 0, std::ptr::null()) };
-            } else {
+            let mut ext_values = Vec::with_capacity(argc);
+            if argc != 0 {
                 let register_slice = &state.registers[*col..*col + argc];
-                let mut ext_values: Vec<ExtValue> = Vec::with_capacity(argc);
                 for ov in register_slice.iter() {
                     ext_values.push(ov.get_value().to_ffi());
                 }
-                let argv_ptr = ext_values.as_ptr();
-                unsafe { step_fn(state_ptr, argc as i32, argv_ptr) };
-                for ext_value in ext_values {
-                    unsafe { ext_value.__free_internal_type() };
+            }
+            let argv_ptr = if ext_values.is_empty() {
+                std::ptr::null()
+            } else {
+                ext_values.as_ptr()
+            };
+            let mut result = unsafe { step_fn(context, state_ptr, argc as i32, argv_ptr) };
+            let value = Value::from_ffi_ref(&result);
+            if let Some(value_destructor) = value_destructor {
+                unsafe { value_destructor(&mut result) };
+            } else {
+                unsafe { result.__free_internal_type() };
+            }
+            for ext_value in ext_values {
+                unsafe { ext_value.__free_internal_type() };
+            }
+            if let Err(err) = value {
+                if let Some(aggregate_destructor) = aggregate_destructor {
+                    unsafe { aggregate_destructor(state_ptr as usize) };
                 }
+                state.registers[*acc_reg].set_value(Value::Null);
+                return Err(err);
             }
         }
         _ => {
@@ -6368,6 +6396,33 @@ pub fn op_agg_final(
                 AggFunc::JsonbGroupObject => {
                     state.registers[dest_reg]
                         .set_blob(json::jsonb::Jsonb::make_empty_obj(1).data())?;
+                }
+                AggFunc::External(ext_func) => {
+                    let value = match ext_func.as_ref() {
+                        ExtFunc::Aggregate {
+                            context,
+                            init,
+                            finalize,
+                            aggregate_destructor,
+                            value_destructor,
+                            ..
+                        } => {
+                            let aggregate_context = unsafe { init(*context) };
+                            let mut result = unsafe { finalize(*context, aggregate_context) };
+                            let value = Value::from_ffi_ref(&result);
+                            if let Some(value_destructor) = value_destructor {
+                                unsafe { value_destructor(&mut result) };
+                            } else {
+                                unsafe { result.__free_internal_type() };
+                            }
+                            if let Some(aggregate_destructor) = aggregate_destructor {
+                                unsafe { aggregate_destructor(aggregate_context as usize) };
+                            }
+                            value?
+                        }
+                        _ => unreachable!("scalar function called in aggregate context"),
+                    };
+                    state.registers[dest_reg].set_value(value);
                 }
                 _ => {}
             }

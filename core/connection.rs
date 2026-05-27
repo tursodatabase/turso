@@ -2920,7 +2920,7 @@ impl Connection {
             .map(|f| {
                 let is_agg = f.func.is_aggregate();
                 let argc = match &f.func {
-                    function::ExtFunc::Aggregate { argc, .. } => *argc as i32,
+                    function::ExtFunc::Aggregate { argc, .. } => *argc,
                     function::ExtFunc::Scalar { argc, .. } => *argc,
                 };
                 (
