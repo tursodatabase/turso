@@ -1212,7 +1212,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                     known_root_page as i64,
                                     index.as_ref(),
                                     num_columns,
-                                );
+                                )?;
                                 let cursor = Arc::new(RwLock::new(cursor));
                                 self.cursors.insert(root_page, cursor.clone());
                                 cursor
@@ -1479,7 +1479,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         root_page as i64,
                         index.as_ref(),
                         index.columns.len(),
-                    );
+                    )?;
                     let cursor = Arc::new(RwLock::new(cursor));
                     self.cursors.insert(root_page, cursor.clone());
                     cursor

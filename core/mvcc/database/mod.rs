@@ -5504,13 +5504,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 .unwrap_or_else(|| i64::from(index_id))
         };
 
-        let find_index_info = |schema: &Schema, root_page: i64| -> Option<Arc<IndexInfo>> {
+        let find_index_info = |schema: &Schema, root_page: i64| -> Result<Option<Arc<IndexInfo>>> {
             schema
                 .indexes
                 .values()
                 .flatten()
                 .find(|idx| idx.root_page == root_page)
-                .map(|idx| Arc::new(IndexInfo::new_from_index(idx.as_ref())))
+                .map(|idx| IndexInfo::new_from_index(idx.as_ref()).map(Arc::new))
+                .transpose()
         };
 
         let schema_has_index_root = |schema: &Schema, root_page: i64| -> bool {
@@ -5652,10 +5653,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     }
 
                     let root_page = root_page_for_index(index_id);
-                    let before = find_index_info(&current_schema, root_page);
+                    let before = find_index_info(&current_schema, root_page)?;
                     let after = schema_after
                         .as_ref()
-                        .and_then(|schema| find_index_info(schema, root_page));
+                        .map(|schema| find_index_info(schema, root_page))
+                        .transpose()?
+                        .flatten();
 
                     // The logical log tells us whether an index entry is being
                     // inserted or deleted, but it stores only encoded key bytes

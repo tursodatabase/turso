@@ -6499,12 +6499,9 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         .io
         .block(|| pager.btree_create(&crate::storage::pager::CreateBTreeFlags::new_index()))
         .unwrap() as i64;
-    let cursor = Arc::new(RwLock::new(BTreeCursor::new_index(
-        pager.clone(),
-        root_page,
-        &index,
-        index.columns.len(),
-    )));
+    let cursor = Arc::new(RwLock::new(
+        BTreeCursor::new_index(pager.clone(), root_page, &index, index.columns.len()).unwrap(),
+    ));
 
     for key in 1..=600 {
         let record =
@@ -6558,7 +6555,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         pager.as_ref(),
     )
     .unwrap();
-    let index_info = Arc::new(IndexInfo::new_from_index(&index));
+    let index_info = Arc::new(IndexInfo::new_from_index(&index).unwrap());
     let record = ImmutableRecord::from_values(
         &[Value::from_i64(interior_key), Value::from_i64(interior_key)],
         2,
