@@ -604,7 +604,7 @@ macro_rules! impl_int_from_value {
                 match val {
                     Value::Null => Err(LimboError::NullValue),
                     Value::Numeric(Numeric::Integer(i)) => Ok($cast(i)),
-                    _ => unreachable!("invalid value type"),
+                    _ => Err(LimboError::InvalidColumnType),
                 }
             }
         }
@@ -623,7 +623,7 @@ impl FromValue for f64 {
         match val {
             Value::Null => Err(LimboError::NullValue),
             Value::Numeric(Numeric::Float(f)) => Ok(f64::from(f)),
-            _ => unreachable!("invalid value type"),
+            _ => Err(LimboError::InvalidColumnType),
         }
     }
 }
@@ -634,7 +634,7 @@ impl FromValue for Vec<u8> {
         match val {
             Value::Null => Err(LimboError::NullValue),
             Value::Blob(blob) => Ok(blob),
-            _ => unreachable!("invalid value type"),
+            _ => Err(LimboError::InvalidColumnType),
         }
     }
 }
@@ -645,7 +645,7 @@ impl<const N: usize> FromValue for [u8; N] {
         match val {
             Value::Null => Err(LimboError::NullValue),
             Value::Blob(blob) => blob.try_into().map_err(|_| LimboError::InvalidBlobSize(N)),
-            _ => unreachable!("invalid value type"),
+            _ => Err(LimboError::InvalidColumnType),
         }
     }
 }
@@ -656,7 +656,7 @@ impl FromValue for String {
         match val {
             Value::Null => Err(LimboError::NullValue),
             Value::Text(s) => Ok(s.to_string()),
-            _ => unreachable!("invalid value type"),
+            _ => Err(LimboError::InvalidColumnType),
         }
     }
 }
@@ -671,7 +671,7 @@ impl FromValue for bool {
                 1 => Ok(true),
                 _ => Err(LimboError::InvalidColumnType),
             },
-            _ => unreachable!("invalid value type"),
+            _ => Err(LimboError::InvalidColumnType),
         }
     }
 }
