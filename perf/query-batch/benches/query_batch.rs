@@ -7,19 +7,6 @@
 //! SELECT id, name, value, is_active FROM test_table WHERE is_active = ?
 //! ```
 //!
-//! Both lanes use an equivalent mapper that materializes all four columns of
-//! every row into a `Record`. The structural difference under test:
-//!
-//! * SQLite (rusqlite) crosses into the query engine once and iterates rows in
-//!   a tight synchronous `sqlite3_step` loop.
-//! * Turso runs in MVCC mode and its `Rows::next()` is `async` (the engine
-//!   yields per row), so every row pays the runtime's poll/wake machinery even
-//!   when the next row is already available. MVCC mode is the dominant cost
-//!   here: it roughly quadruples the per-row time versus legacy mode.
-//!
-//! At small row counts the per-query fixed cost dominates and the two are
-//! comparable; as the row count grows the per-row `.await` overhead makes Turso
-//! progressively slower. Sweeping the row count makes the crossover visible.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tokio::runtime::Runtime;
