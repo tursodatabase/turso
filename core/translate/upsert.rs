@@ -667,7 +667,10 @@ pub fn emit_upsert(
                 dst_reg: r,
                 extra_amount: 0,
             });
-            program.emit_insn(Insn::MustBeInt { reg: r });
+            program.emit_insn(Insn::MustBeInt {
+                reg: r,
+                target_pc: None,
+            });
             new_rowid_reg = Some(r);
         }
     }

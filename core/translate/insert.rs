@@ -1198,6 +1198,7 @@ fn emit_check_for_user_provided_rowid(
     program.preassign_label_to_next_insn(must_be_int_label);
     program.emit_insn(Insn::MustBeInt {
         reg: insertion.key_register(),
+        target_pc: None,
     });
 
     program.emit_insn(Insn::Goto {
@@ -3912,7 +3913,11 @@ pub fn emit_fk_child_insert_checks(
                 dst_reg: tmp,
                 extra_amount: 0,
             });
-            program.emit_insn(Insn::MustBeInt { reg: tmp });
+            let violation = program.allocate_label();
+            program.emit_insn(Insn::MustBeInt {
+                reg: tmp,
+                target_pc: Some(violation),
+            });
 
             // If this is a self-reference *and* the child FK equals NEW rowid,
             // the constraint will be satisfied once this row is inserted
@@ -3926,7 +3931,6 @@ pub fn emit_fk_child_insert_checks(
                 });
             }
 
-            let violation = program.allocate_label();
             program.emit_insn(Insn::NotExists {
                 cursor: pcur,
                 rowid_reg: tmp,
@@ -3949,8 +3953,61 @@ pub fn emit_fk_child_insert_checks(
                 .parent_unique_index
                 .as_ref()
                 .expect("parent unique index required");
-            let icur = open_read_index(program, idx, database_id);
             let ncols = fk_ref.fk.child_columns.len();
+
+            if is_self_ref {
+                // A self-referential INSERT is checked before the new row has
+                // been written to the parent index. Without a shortcut, even
+                // an exact self-reference would look like a missing parent.
+                // SQLite handles that by comparing the pending INSERT registers
+                // directly before it builds the affinity-coerced index probe.
+                //
+                //   CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER UNIQUE,
+                //                  pk TEXT REFERENCES t(k));
+                //   INSERT INTO t(id, k, pk) VALUES (1, 1, '1');
+                //
+                // In that INSERT image, the child key is pk=TEXT '1' and this
+                // row's parent key is k=INTEGER 1. Those stored values are not
+                // the same, so the same-row shortcut must not fire.
+                //
+                // The normal parent-index probe asks a different question:
+                // "after applying the parent key affinity, does this child key
+                // match some parent row that is already in the index?" That is
+                // why cross-row checks may coerce TEXT '1' to INTEGER 1 before
+                // seeking t(k). For this same-row case there is no parent index
+                // entry yet, so reusing the coerced probe would invent a match
+                // that SQLite rejects.
+                let mismatch = program.allocate_label();
+                for (i, &child_pos) in fk_ref.child_pos.iter().enumerate() {
+                    let child_reg = if child_tbl.columns()[child_pos].is_rowid_alias() {
+                        new_rowid_reg
+                    } else {
+                        layout.to_register(new_start_reg, child_pos)
+                    };
+                    let parent_pos = fk_ref.parent_pos[i];
+                    let parent_reg = if child_tbl.columns()[parent_pos].is_rowid_alias() {
+                        new_rowid_reg
+                    } else {
+                        layout.to_register(new_start_reg, parent_pos)
+                    };
+                    program.emit_insn(Insn::Ne {
+                        lhs: child_reg,
+                        rhs: parent_reg,
+                        target_pc: mismatch,
+                        flags: CmpInsFlags::default().jump_if_null(),
+                        // Keep this as BINARY. Even with
+                        // `k TEXT COLLATE NOCASE UNIQUE, pk TEXT REFERENCES t(k)`,
+                        // SQLite rejects same-row INSERT `(k, pk)=('A', 'a')`;
+                        // NOCASE applies to the later parent-index lookup only.
+                        collation: Some(super::collate::CollationSeq::Binary),
+                    });
+                }
+                // All equal: same-row OK
+                program.emit_insn(Insn::Goto { target_pc: fk_ok });
+                program.preassign_label_to_next_insn(mismatch);
+            }
+
+            let icur = open_read_index(program, idx, database_id);
 
             // Build NEW child probe from child NEW values, apply parent-index affinities.
             let probe = {
@@ -3976,53 +4033,6 @@ pub fn emit_fk_child_insert_checks(
                 }
                 start
             };
-            if is_self_ref {
-                // Determine the parent column order to compare against:
-                let parent_cols: Vec<&str> =
-                    idx.columns.iter().map(|ic| ic.name.as_str()).collect();
-
-                // Build new parent-key image from this same row’s new values, in the index order.
-                let parent_new = program.alloc_registers(ncols);
-                for (i, pname) in parent_cols.iter().enumerate() {
-                    let (pos, col) = child_tbl.get_column(pname).unwrap();
-                    program.emit_insn(Insn::Copy {
-                        src_reg: if col.is_rowid_alias() {
-                            new_rowid_reg
-                        } else {
-                            new_start_reg + pos
-                        },
-                        dst_reg: parent_new + i,
-                        extra_amount: 0,
-                    });
-                }
-                if let Some(cnt) = NonZeroUsize::new(ncols) {
-                    program.emit_insn(Insn::Affinity {
-                        start_reg: parent_new,
-                        count: cnt,
-                        affinities: build_index_affinity_string(idx, &parent_tbl),
-                    });
-                }
-
-                // Compare child probe to NEW parent image column-by-column.
-                let mismatch = program.allocate_label();
-                for i in 0..ncols {
-                    let cont = program.allocate_label();
-                    program.emit_insn(Insn::Eq {
-                        lhs: probe + i,
-                        rhs: parent_new + i,
-                        target_pc: cont,
-                        flags: CmpInsFlags::default().jump_if_null(),
-                        collation: Some(super::collate::CollationSeq::Binary),
-                    });
-                    program.emit_insn(Insn::Goto {
-                        target_pc: mismatch,
-                    });
-                    program.preassign_label_to_next_insn(cont);
-                }
-                // All equal: same-row OK
-                program.emit_insn(Insn::Goto { target_pc: fk_ok });
-                program.preassign_label_to_next_insn(mismatch);
-            }
             index_probe(
                 program,
                 icur,

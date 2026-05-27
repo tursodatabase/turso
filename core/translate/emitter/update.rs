@@ -772,6 +772,7 @@ fn emit_update_column_values<'a>(
             )?;
             program.emit_insn(Insn::MustBeInt {
                 reg: rowid_set_clause_reg,
+                target_pc: None,
             });
         }
     }
@@ -817,6 +818,7 @@ fn emit_update_column_values<'a>(
 
                     program.emit_insn(Insn::MustBeInt {
                         reg: rowid_set_clause_reg,
+                        target_pc: None,
                     });
 
                     program.emit_null(target_reg, None);
@@ -1477,59 +1479,21 @@ fn emit_update_insns<'a>(
         )?;
     }
 
-    let mut deferred_new_key_plans = Vec::new();
+    // Build a complete NEW row image for FK code now, while the old cursor is
+    // still positioned. This is only data preparation. FK counters must not be
+    // touched yet because later CHECK/PK/UNIQUE conflict handling may still
+    // decide that `ON CONFLICT IGNORE` makes this row a no-op.
     if connection.foreign_keys_enabled() {
         let rowid_new_reg = effective_rowid_reg;
         if let Some(table_btree) = target_table.table.btree() {
-            let updated_set_columns: ColumnMask = set_clauses
-                .iter()
-                .filter_map(|set_clause| {
-                    (set_clause.column_index != ROWID_SENTINEL).then_some(set_clause.column_index)
-                })
-                .try_collect()?;
             stabilize_new_row_for_fk(
                 program,
                 &table_btree,
-                &updated_set_columns,
+                &updated_column_indices,
                 target_table_cursor_id,
                 start,
                 rowid_new_reg,
             )?;
-            // Child-side FK checks are deferred to AFTER custom type encoding (see below).
-            // This is because child FK checks probe the parent's index which contains
-            // encoded values, so the NEW values must also be encoded.
-
-            // Parent-side NO ACTION/RESTRICT checks must happen BEFORE the update.
-            // This checks that no child rows reference the old parent key values.
-            // CASCADE/SET NULL actions are fired AFTER the update (see below after Insert).
-            if t_ctx.resolver.with_schema(update_database_id, |s| {
-                s.any_resolved_fks_referencing(table_name)
-            }) {
-                let new_key_probe_mode = if any_effective_replace(
-                    program.flags.has_statement_conflict(),
-                    or_conflict,
-                    table_btree.rowid_alias_conflict_clause,
-                    indexes_to_update.iter().map(|idx| idx.on_conflict),
-                ) {
-                    ParentKeyNewProbeMode::AfterReplace
-                } else {
-                    ParentKeyNewProbeMode::BeforeWrite
-                };
-                deferred_new_key_plans = emit_fk_update_parent_actions(
-                    program,
-                    &table_btree,
-                    indexes_to_update.iter(),
-                    target_table_cursor_id,
-                    beg,
-                    start,
-                    rowid_new_reg,
-                    rowid_set_clause_reg,
-                    &updated_set_columns,
-                    new_key_probe_mode,
-                    update_database_id,
-                    &t_ctx.resolver,
-                )?;
-            }
         }
     }
 
@@ -1785,27 +1749,6 @@ fn emit_update_insns<'a>(
                 skip_row_label,
                 Some(&check_constraint_tables),
             )?;
-        }
-    }
-
-    // Child-side FK checks must run AFTER custom type encoding so that NEW values
-    // being probed against the parent's index are encoded (matching the index contents).
-    if connection.foreign_keys_enabled() {
-        if let Some(table_btree) = target_table.table.btree() {
-            if t_ctx.resolver.schema().has_child_fks(table_name) {
-                emit_fk_child_update_counters(
-                    program,
-                    &table_btree,
-                    table_name,
-                    target_table_cursor_id,
-                    start,
-                    effective_rowid_reg,
-                    &affected_columns,
-                    update_database_id,
-                    &t_ctx.resolver,
-                    &layout,
-                )?;
-            }
         }
     }
 
@@ -2148,6 +2091,82 @@ fn emit_update_insns<'a>(
             rowid_reg: beg,
             target_pc: row_not_found_label,
         });
+    }
+
+    // This is the first point where FK counter changes are safe:
+    //
+    // * `ON CONFLICT IGNORE` no-op paths for CHECK/PK/UNIQUE have already
+    //   jumped away. A skipped row must not increment or decrement the single
+    //   deferred FK counter.
+    // * No table or index entry has been rewritten yet. If an immediate FK
+    //   check fails, the statement can stop without leaving partial mutations
+    //   behind.
+    //
+    // Both parent-side and child-side FK checks below run against the
+    // pre-rewrite table image. Self-referential rows therefore need explicit
+    // handling: table scans see OLD values, while the NEW parent/child keys
+    // live in registers until the rewrite.
+    let mut deferred_new_key_plans = Vec::new();
+    if connection.foreign_keys_enabled() {
+        let rowid_new_reg = effective_rowid_reg;
+        if let Some(table_btree) = target_table.table.btree() {
+            // Parent-side checks scan child rows that point at the OLD parent
+            // key. Each match means this update may create a new violation:
+            // RESTRICT halts immediately, while NO ACTION increments the FK
+            // counter so the statement/transaction can fail later if nothing
+            // fixes it.
+            if t_ctx.resolver.with_schema(update_database_id, |s| {
+                s.any_resolved_fks_referencing(table_name)
+            }) {
+                let new_key_probe_mode = if any_effective_replace(
+                    program.flags.has_statement_conflict(),
+                    or_conflict,
+                    table_btree.rowid_alias_conflict_clause,
+                    indexes_to_update.iter().map(|idx| idx.on_conflict),
+                ) {
+                    ParentKeyNewProbeMode::AfterReplace
+                } else {
+                    ParentKeyNewProbeMode::BeforeWrite
+                };
+                deferred_new_key_plans = emit_fk_update_parent_actions(
+                    program,
+                    &table_btree,
+                    indexes_to_update.iter(),
+                    target_table_cursor_id,
+                    beg,
+                    start,
+                    rowid_new_reg,
+                    rowid_set_clause_reg,
+                    &updated_column_indices,
+                    new_key_probe_mode,
+                    update_database_id,
+                    &t_ctx.resolver,
+                )?;
+            }
+        }
+    }
+
+    // Child-side checks answer the opposite question: does the row's NEW child
+    // key have a parent? They also have to run after no-op conflict paths and
+    // before the physical rewrite, for the same counter and rollback reasons as
+    // the parent-side checks above.
+    if connection.foreign_keys_enabled() {
+        if let Some(table_btree) = target_table.table.btree() {
+            if t_ctx.resolver.schema().has_child_fks(table_name) {
+                emit_fk_child_update_counters(
+                    program,
+                    &table_btree,
+                    table_name,
+                    target_table_cursor_id,
+                    start,
+                    effective_rowid_reg,
+                    &affected_columns,
+                    update_database_id,
+                    &t_ctx.resolver,
+                    &layout,
+                )?;
+            }
+        }
     }
 
     // ---- Phase 2: Delete old index entries ----
