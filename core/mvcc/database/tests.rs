@@ -4274,7 +4274,6 @@ fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
         tx_id,
         begin_ts,
         write_set: Mutex::new(WriteSet::new()),
-        read_set: SkipSet::new(),
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
@@ -5849,16 +5848,11 @@ fn transaction_display() {
         write_set
     });
 
-    let read_set = SkipSet::new();
-    read_set.insert(RowID::new((-2).into(), RowKey::Int(17)));
-    read_set.insert(RowID::new((-2).into(), RowKey::Int(19)));
-
     let tx = Transaction {
         state,
         tx_id,
         begin_ts,
         write_set,
-        read_set,
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
@@ -5868,7 +5862,7 @@ fn transaction_display() {
         commit_dep_set: Mutex::new(HashSet::default()),
     };
 
-    let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }], read_set: [RowID { table_id: MVTableId(-2), row_id: Int(17) }, RowID { table_id: MVTableId(-2), row_id: Int(19) }] }";
+    let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }] }";
     let output = format!("{tx}");
     assert_eq!(output, expected);
 }

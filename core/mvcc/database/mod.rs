@@ -39,7 +39,7 @@ use crate::{
 };
 use crate::{Connection, Pager, SyncMode};
 use crossbeam_skiplist::map::Entry;
-use crossbeam_skiplist::{SkipMap, SkipSet};
+use crossbeam_skiplist::SkipMap;
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
 use std::collections::BTreeSet;
@@ -594,8 +594,6 @@ pub struct Transaction {
     begin_ts: u64,
     /// The transaction write set. Only writer is the [Transaction]'s own connection.
     write_set: Mutex<WriteSet>,
-    /// The transaction read set.
-    read_set: SkipSet<RowID>,
     /// The transaction header.
     header: RwLock<DatabaseHeader>,
     /// True when the transaction mutated its local database header snapshot.
@@ -626,7 +624,6 @@ impl Transaction {
             tx_id,
             begin_ts,
             write_set: Mutex::new(WriteSet::new()),
-            read_set: SkipSet::new(),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
             savepoint_stack: RwLock::new(Vec::new()),
@@ -635,10 +632,6 @@ impl Transaction {
             abort_now: AtomicBool::new(false),
             commit_dep_set: Mutex::new(HashSet::default()),
         }
-    }
-
-    fn insert_to_read_set(&self, id: RowID) {
-        self.read_set.insert(id);
     }
 
     fn insert_to_write_set(&self, id: RowID, row_versions: RowVersions) {
@@ -887,14 +880,6 @@ impl std::fmt::Display for Transaction {
                 write!(f, ", ")?
             }
             write!(f, "{id:?}")?;
-        }
-
-        write!(f, "], read_set: [")?;
-        for (i, v) in self.read_set.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
-            }
-            write!(f, "{:?}", *v.value())?;
         }
 
         write!(f, "] }}")
@@ -3732,7 +3717,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         .rev()
                         .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
                     {
-                        tx.insert_to_read_set(id.clone());
                         return Ok(Some(rv.row.clone()));
                     }
                 }
