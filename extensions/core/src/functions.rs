@@ -32,14 +32,19 @@ pub type RegisterAggFn = unsafe extern "C" fn(
     ctx: *mut c_void,
     name: *const c_char,
     args: i32,
+    context: usize,
     init: InitAggFunction,
     step: StepFunction,
     finalize: FinalizeFunction,
+    context_destructor: Option<ContextDestructor>,
+    aggregate_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ValueDestructor>,
 ) -> ResultCode;
 
-pub type InitAggFunction = unsafe extern "C" fn() -> *mut AggCtx;
-pub type StepFunction = unsafe extern "C" fn(ctx: *mut AggCtx, argc: i32, argv: *const Value);
-pub type FinalizeFunction = unsafe extern "C" fn(ctx: *mut AggCtx) -> Value;
+pub type InitAggFunction = unsafe extern "C" fn(context: usize) -> *mut AggCtx;
+pub type StepFunction =
+    unsafe extern "C" fn(context: usize, ctx: *mut AggCtx, argc: i32, argv: *const Value) -> Value;
+pub type FinalizeFunction = unsafe extern "C" fn(context: usize, ctx: *mut AggCtx) -> Value;
 
 #[repr(C)]
 pub struct AggCtx {

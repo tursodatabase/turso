@@ -170,18 +170,22 @@ pub(crate) unsafe extern "C" fn register_aggregate_function(
     ctx: *mut c_void,
     name: *const c_char,
     args: i32,
+    context: usize,
     init_func: InitAggFunction,
     step_func: StepFunction,
     finalize_func: FinalizeFunction,
+    context_destructor: Option<ContextDestructor>,
+    aggregate_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ValueDestructor>,
 ) -> ResultCode {
+    if ctx.is_null() || name.is_null() || args < -1 {
+        return ResultCode::InvalidArgs;
+    }
     let c_str = unsafe { CStr::from_ptr(name) };
     let name_str = match c_str.to_str() {
-        Ok(s) => s.to_string(),
+        Ok(s) => crate::util::normalize_ident(s),
         Err(_) => return ResultCode::InvalidArgs,
     };
-    if ctx.is_null() {
-        return ResultCode::Error;
-    }
     let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
     unsafe {
         (*ext_ctx.syms).functions.insert(
@@ -189,7 +193,11 @@ pub(crate) unsafe extern "C" fn register_aggregate_function(
             Arc::new(ExternalFunc::new_aggregate(
                 name_str,
                 args,
+                context,
                 (init_func, step_func, finalize_func),
+                context_destructor,
+                aggregate_destructor,
+                value_destructor,
             )),
         );
         if !ext_ctx.prepare_context_generation.is_null() {
