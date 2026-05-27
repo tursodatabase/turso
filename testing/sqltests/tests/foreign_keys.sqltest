@@ -503,6 +503,101 @@ expect {
 }
 
 @cross-check-integrity
+test fk-self-unique-parent-affinity-does-not-coerce-same-row-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k INTEGER UNIQUE,
+        pk TEXT REFERENCES t(k)
+    );
+    INSERT INTO t(id, k, pk) VALUES (1, 1, '1');
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-self-unique-parent-text-does-not-coerce-same-row-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k TEXT UNIQUE,
+        pk INTEGER REFERENCES t(k)
+    );
+    INSERT INTO t(id, k, pk) VALUES (1, '1', 1);
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-self-unique-parent-affinity-does-not-coerce-same-row-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k INTEGER UNIQUE,
+        pk TEXT REFERENCES t(k) DEFERRABLE INITIALLY DEFERRED
+    );
+    BEGIN;
+    INSERT INTO t(id, k, pk) VALUES (1, 1, '1');
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-self-unique-same-row-stored-values-match {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k INTEGER UNIQUE,
+        pk NUMERIC REFERENCES t(k)
+    );
+    INSERT INTO t(id, k, pk) VALUES (1, 1, '1');
+    SELECT typeof(k), typeof(pk), k, pk FROM t;
+}
+expect {
+    integer|integer|1|1
+}
+
+@cross-check-integrity
+test fk-cross-table-parent-affinity-still-coerces-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k INTEGER UNIQUE);
+    CREATE TABLE c(pk TEXT REFERENCES p(k));
+    INSERT INTO p VALUES (1);
+    INSERT INTO c VALUES ('1');
+    SELECT typeof(pk), pk FROM c;
+}
+expect {
+    text|1
+}
+
+@cross-check-integrity
+test fk-self-unique-parent-collation-does-not-satisfy-same-row-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k TEXT COLLATE NOCASE UNIQUE,
+        pk TEXT REFERENCES t(k)
+    );
+    INSERT INTO t(id, k, pk) VALUES (1, 'A', 'a');
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-cross-table-parent-collation-still-matches-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT COLLATE NOCASE UNIQUE);
+    CREATE TABLE c(pk TEXT REFERENCES p(k));
+    INSERT INTO p VALUES ('A');
+    INSERT INTO c VALUES ('a');
+    SELECT pk FROM c;
+}
+expect {
+    a
+}
+
+@cross-check-integrity
 test fk-self-unique-mismatch {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(
