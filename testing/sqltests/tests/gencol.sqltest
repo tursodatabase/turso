@@ -4344,6 +4344,21 @@ expect {
     1|y|1y
 }
 
+test gencol_update_trigger_virtual_col_from_new_rowid_alias {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, v AS (id * 10) VIRTUAL);
+    CREATE TABLE log(old_v, new_v, old_id, new_id);
+    CREATE TRIGGER tr AFTER UPDATE ON t1
+    BEGIN
+        INSERT INTO log VALUES(OLD.v, NEW.v, OLD.id, NEW.id);
+    END;
+    INSERT INTO t1(id) VALUES(1);
+    UPDATE t1 SET id = 2 WHERE id = 1;
+    SELECT old_v, new_v, old_id, new_id FROM log;
+}
+expect {
+    10|20|1|2
+}
+
 
 # Parent UPDATE with default NO ACTION should fail when gen-col FK changes
 @cross-check-integrity
@@ -4355,6 +4370,21 @@ test fk-gencol-unique-idx-update-no-action {
     INSERT INTO p(a) VALUES(1);
     INSERT INTO c(x) VALUES(2);
     UPDATE p SET a=3 WHERE a=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-gencol-rowid-alias-update-no-action {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(
+        id INTEGER PRIMARY KEY,
+        v INTEGER GENERATED ALWAYS AS (id * 10) VIRTUAL UNIQUE
+    );
+    CREATE TABLE c(x INTEGER REFERENCES p(v) ON UPDATE NO ACTION);
+    INSERT INTO p(id) VALUES(1);
+    INSERT INTO c(x) VALUES(10);
+    UPDATE p SET id = 2 WHERE id = 1;
 }
 expect error {
 }
