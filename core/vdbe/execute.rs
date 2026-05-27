@@ -6425,7 +6425,9 @@ pub fn op_agg_final(
             state.registers[dest_reg].set_value(value);
         }
         Register::Value(Value::Null) => {
-            // When the set is empty, return appropriate default
+            // No row was stepped: write the empty-set default explicitly.
+            // For window aggregates `dest_reg` differs from `acc_reg` and may
+            // still hold an earlier partition's result.
             match func {
                 AggFunc::Total => {
                     state.registers[dest_reg]
@@ -6479,7 +6481,9 @@ pub fn op_agg_final(
                     };
                     state.registers[dest_reg].set_value(value);
                 }
-                _ => {}
+                _ => {
+                    state.registers[dest_reg].set_value(Value::Null);
+                }
             }
         }
         other => {

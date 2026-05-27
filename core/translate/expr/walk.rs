@@ -1,4 +1,5 @@
 use super::*;
+use crate::function::{Deterministic, ExtFunc};
 
 pub enum WalkControl {
     Continue,     // Visit children
@@ -207,6 +208,78 @@ pub fn expr_references_any_subquery(expr: &ast::Expr) -> bool {
         Ok(WalkControl::Continue)
     });
     found
+}
+
+/// Returns true if this expression calls a scalar function whose result can
+/// change between calls.
+///
+/// This is used when deciding whether two repeated window expressions can use
+/// one `WindowFunction` entry. For example, two copies of `sum(x) OVER w` can
+/// use one entry. Two copies of
+/// `sum(x) FILTER (WHERE random() % 2 = 0) OVER w` cannot share the filter
+/// value, because SQLite runs `random()` separately at each place it appears.
+///
+/// FIXME: `walk_expr` does not descend into `Expr::Subquery`, `Expr::Exists`,
+/// or the `Select` side of `Expr::InSelect`. A nondeterministic call buried
+/// inside such a subquery in a FILTER predicate will not be detected, and the
+/// two FILTERs would be incorrectly deduped. Lift the walker's subquery TODO
+/// before relying on this for correctness in those cases.
+pub fn expr_contains_nondeterministic_scalar_function(
+    expr: &ast::Expr,
+    resolver: &Resolver<'_>,
+) -> Result<bool> {
+    fn is_nondeterministic_scalar_like_function(func: &Func) -> bool {
+        match func {
+            // Aggregate and window function calls themselves are not flagged
+            // at any nesting depth — their outputs are deterministic given the
+            // same input rows. The walker still descends into their args,
+            // FILTER, and OVER subexprs, so nondet scalars buried inside
+            // (e.g. `sum(random())`) are still caught. Note also that
+            // `AggFunc::is_deterministic` returns `false`, so the catch-all
+            // below would otherwise flag every aggregate call.
+            Func::Agg(_) | Func::Window(_) => false,
+
+            // User-defined scalar functions can do anything, so treat them
+            // like `random()`. User-defined aggregates are treated like
+            // built-in aggregates: two copies of `myagg(x) OVER w` should
+            // share one window entry when `x` and the FILTER/OVER clauses are
+            // stable.
+            Func::External(external) if matches!(external.func, ExtFunc::Aggregate { .. }) => false,
+
+            _ => !func.is_deterministic(),
+        }
+    }
+
+    let mut found = false;
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if found {
+            return Ok(WalkControl::SkipChildren);
+        }
+
+        let func = match e {
+            ast::Expr::FunctionCall { name, args, .. } => {
+                resolver.resolve_function(name.as_str(), args.len())?
+            }
+            ast::Expr::FunctionCallStar { name, .. } => {
+                resolver.resolve_function(name.as_str(), 0)?
+            }
+            _ => None,
+        };
+
+        // If the name is unknown here, leave the error to the normal resolver.
+        // This helper only answers "may repeated copies share work?"
+        if func
+            .as_ref()
+            .is_some_and(is_nondeterministic_scalar_like_function)
+        {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+
+        Ok(WalkControl::Continue)
+    })?;
+
+    Ok(found)
 }
 
 /// Walks a mutable expression, applying a function to each sub-expression.

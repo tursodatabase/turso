@@ -4,11 +4,14 @@ use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::collate::{get_collseq_from_expr, CollationSeq};
 use crate::translate::emitter::{Resolver, TranslateCtx};
-use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
+use crate::translate::expr::{
+    expr_contains_nondeterministic_scalar_function, translate_expr, walk_expr, walk_expr_mut,
+    WalkControl,
+};
 use crate::translate::order_by::EmitOrderBy;
 use crate::translate::plan::{
     Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination, ResultSetColumn,
-    SelectPlan, TableReferences, Window, WindowFunctionKind,
+    SelectPlan, TableReferences, Window, WindowFunction, WindowFunctionKind,
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
@@ -25,7 +28,7 @@ use crate::Result;
 use crate::{turso_assert, turso_assert_eq};
 use std::mem;
 use turso_parser::ast::Name;
-use turso_parser::ast::{Expr, FunctionTail, Literal, Over, SortOrder, TableInternalId};
+use turso_parser::ast::{Expr, Literal, Over, SortOrder, TableInternalId};
 
 const SUBQUERY_DATABASE_ID: usize = 0;
 
@@ -311,41 +314,30 @@ fn rewrite_terminal_expr(
                         {
                             rewrite_expr_as_subquery_column(expr, ctx, true);
                         }
-                    } else if let Some(window_function) = current_window
-                        .functions
-                        .iter_mut()
-                        .find(|f| exprs_are_equivalent(&f.original_expr, expr))
+                    } else if let Some(window_function) =
+                        find_window_function_entry(&mut current_window.functions, expr)
                     {
-                        // If the expression is a window function tied to the current window,
-                        // do not push it to the subquery. Instead, rewrite it so its child
-                        // expressions reference the subquery where needed.
-                        //
-                        // The same window function expression may appear in multiple places
-                        // (e.g. both in result columns and in ORDER BY, or twice in result
-                        // columns). The first occurrence performs the rewrite and caches the
-                        // result in `rewritten_expr`; subsequent occurrences just clone the
-                        // cached form so every reference points at the same window output.
+                        // Window function tied to the current window: rewrite its
+                        // children to reference the subquery, not the call itself.
                         if let Some(rewritten) = &window_function.rewritten_expr {
                             *expr = rewritten.clone();
                         } else {
+                            let window_name = current_window
+                                .name
+                                .clone()
+                                .expect("current_window must always have a name here");
                             rewrite_expr_referencing_current_window(
                                 aggregates,
-                                current_window
-                                    .name
-                                    .clone()
-                                    .expect("current_window must always have a name here"),
+                                window_name,
                                 ctx,
                                 expr,
+                                window_function,
                             )?;
-                            window_function.rewritten_expr = Some(expr.clone());
                         }
-
-                        // At this point, the expression and all its children now reference the subquery,
-                        // so further traversal is unnecessary.
                         return Ok(WalkControl::SkipChildren);
                     } else {
-                        // This is a window function referencing a different window (not the current one).
-                        // Push the entire expression to the subquery; it will be rewritten later.
+                        // Window function referencing a different window. Push the
+                        // whole expression to the subquery; it will be rewritten later.
                         rewrite_expr_as_subquery_column(expr, ctx, false);
                     }
                 }
@@ -367,93 +359,132 @@ fn rewrite_terminal_expr(
     )
 }
 
+/// Find the `WindowFunction` entry that this SQL occurrence corresponds to.
+/// Returns an entry that has not been rewritten yet when one exists, so
+/// repeated occurrences of a nondeterministic call each pick a distinct entry;
+/// otherwise returns any equivalent entry (the deduplicated case).
+fn find_window_function_entry<'a>(
+    functions: &'a mut [WindowFunction],
+    expr: &Expr,
+) -> Option<&'a mut WindowFunction> {
+    let mut fallback = None;
+    let mut chosen = None;
+    for (i, f) in functions.iter().enumerate() {
+        if !exprs_are_equivalent(&f.original_expr, expr) {
+            continue;
+        }
+        if f.rewritten_expr.is_none() {
+            chosen = Some(i);
+            break;
+        }
+        fallback.get_or_insert(i);
+    }
+    functions.get_mut(chosen.or(fallback)?)
+}
+
+/// Push `expr` into the input subquery as a result column and replace `*expr`
+/// in place with a reference to that column. Reuses an existing equivalent
+/// column when `expr` is deterministic; nondeterministic calls (e.g.
+/// `random()`) get a fresh column on every occurrence.
+fn push_into_input_subquery(
+    expr: &mut Expr,
+    aggregates: &mut Vec<Aggregate>,
+    ctx: &mut WindowSubqueryContext,
+) -> crate::Result<()> {
+    let contains_aggregates =
+        resolve_window_and_aggregate_functions(expr, ctx.resolver, aggregates, None)?;
+    if expr_contains_nondeterministic_scalar_function(expr, ctx.resolver)? {
+        push_new_subquery_column(expr, ctx, contains_aggregates);
+    } else {
+        rewrite_expr_as_subquery_column(expr, ctx, contains_aggregates);
+    }
+    Ok(())
+}
+
+/// Rewrite a window function call `expr` so its arguments and FILTER predicate
+/// reference the input subquery, then record the rewritten form and the
+/// rewritten filter predicate on `window_function` for later emission.
 fn rewrite_expr_referencing_current_window(
     aggregates: &mut Vec<Aggregate>,
     window_name: String,
     ctx: &mut WindowSubqueryContext,
     expr: &mut Expr,
+    window_function: &mut WindowFunction,
 ) -> crate::Result<()> {
-    fn normalize_over_clause(filter_over: &mut FunctionTail, window_name: &str) {
-        // FILTER clause is not supported yet. Proper checks elsewhere return appropriate
-        // error messages, and this ensures that nothing slips through unnoticed.
-        turso_assert!(
-            filter_over.filter_clause.is_none(),
-            "FILTER in window functions is not supported"
-        );
-
-        // Replace inline OVER clause with a reference to the named window.
-        // The window name may be user-provided or planner-generated.
-        *filter_over = FunctionTail {
-            filter_clause: None,
-            over_clause: Some(Over::Name(Name::exact(window_name.to_string()))),
-        };
-    }
-
-    match expr {
+    let filter_over = match expr {
         Expr::FunctionCall {
-            name: _,
-            distinctness: _,
             args,
             order_by,
             filter_over,
+            ..
         } => {
             for arg in args.iter_mut() {
-                let contains_aggregates =
-                    resolve_window_and_aggregate_functions(arg, ctx.resolver, aggregates, None)?;
-                rewrite_expr_as_subquery_column(arg, ctx, contains_aggregates);
+                push_into_input_subquery(arg, aggregates, ctx)?;
             }
             turso_assert!(
                 order_by.is_empty(),
                 "ORDER BY in window functions is not supported"
             );
-            normalize_over_clause(filter_over, &window_name);
+            filter_over
         }
-        Expr::FunctionCallStar {
-            filter_over,
-            name: _,
-        } => {
-            normalize_over_clause(filter_over, &window_name);
-        }
+        Expr::FunctionCallStar { filter_over, .. } => filter_over,
         _ => unreachable!("only functions can reference windows"),
+    };
+
+    if let Some(filter_expr) = filter_over.filter_clause.as_deref_mut() {
+        push_into_input_subquery(filter_expr, aggregates, ctx)?;
     }
+    window_function.filter_expr = filter_over.filter_clause.as_deref().cloned();
+    filter_over.over_clause = Some(Over::Name(Name::exact(window_name)));
+    window_function.rewritten_expr = Some(expr.clone());
     Ok(())
 }
 
-/// Rewrites an expression into a reference to a subquery column.
-/// If the expression was already pushed down, reuses the existing column index.
-/// Otherwise, adds it as a new column in the subquery's result set.
+/// Rewrites an expression into a reference to a subquery column. If an
+/// equivalent expression was already pushed down, reuses its column index.
 fn rewrite_expr_as_subquery_column(
     expr: &mut Expr,
     ctx: &mut WindowSubqueryContext,
     contains_aggregates: bool,
 ) {
-    let (column_idx, existing) = match ctx
+    if let Some(pos) = ctx
         .subquery_result_columns
         .iter()
         .position(|col| exprs_are_equivalent(&col.expr, expr))
     {
-        Some(pos) => (pos, true),
-        None => (ctx.subquery_result_columns.len(), false),
-    };
+        *expr = Expr::Column {
+            database: Some(SUBQUERY_DATABASE_ID),
+            table: *ctx.subquery_id,
+            column: pos,
+            is_rowid_alias: false,
+        };
+    } else {
+        push_new_subquery_column(expr, ctx, contains_aggregates);
+    }
+}
 
+/// Pushes `expr` as a fresh subquery column even if an equivalent column
+/// already exists. Use this for expressions containing nondeterministic calls
+/// like `random()`, which SQLite evaluates separately at each SQL occurrence.
+fn push_new_subquery_column(
+    expr: &mut Expr,
+    ctx: &mut WindowSubqueryContext,
+    contains_aggregates: bool,
+) {
+    let column_idx = ctx.subquery_result_columns.len();
     let subquery_ref = Expr::Column {
         database: Some(SUBQUERY_DATABASE_ID),
         table: *ctx.subquery_id,
         column: column_idx,
         is_rowid_alias: false,
     };
-
-    if existing {
-        *expr = subquery_ref;
-    } else {
-        let subquery_expr = mem::replace(expr, subquery_ref);
-        ctx.subquery_result_columns.push(ResultSetColumn {
-            expr: subquery_expr,
-            alias: None,
-            implicit_column_name: None,
-            contains_aggregates,
-        });
-    }
+    let subquery_expr = mem::replace(expr, subquery_ref);
+    ctx.subquery_result_columns.push(ResultSetColumn {
+        expr: subquery_expr,
+        alias: None,
+        implicit_column_name: None,
+        contains_aggregates,
+    });
 }
 
 #[derive(Debug)]
@@ -1014,6 +1045,28 @@ fn emit_aggregation_step(
         };
 
         let reg_acc_start = registers.acc_start + i;
+        // FILTER controls whether the current input row contributes to the
+        // running aggregate; it does not suppress the output row itself.
+        let filter_skip_label = if let Some(filter_expr) = &func.filter_expr {
+            let label = program.allocate_label();
+            let filter_reg = program.alloc_register();
+            translate_expr(
+                program,
+                Some(&plan.table_references),
+                filter_expr,
+                filter_reg,
+                resolver,
+            )?;
+            program.emit_insn(Insn::IfNot {
+                reg: filter_reg,
+                target_pc: label,
+                jump_if_null: true,
+            });
+            Some(label)
+        } else {
+            None
+        };
+
         translate_aggregation_step(
             program,
             &plan.table_references,
@@ -1021,6 +1074,9 @@ fn emit_aggregation_step(
             reg_acc_start,
             resolver,
         )?;
+        if let Some(label) = filter_skip_label {
+            program.preassign_label_to_next_insn(label);
+        }
     }
 
     Ok(())
