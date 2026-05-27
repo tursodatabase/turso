@@ -1629,6 +1629,7 @@ pub(crate) fn init_limit(
                         program.add_comment(program.offset(), "LIMIT counter");
                         program.emit_insn(Insn::MustBeInt {
                             reg: limit_ctx.reg_limit,
+                            target_pc: None,
                         });
                     }
                     _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
@@ -1637,7 +1638,10 @@ pub(crate) fn init_limit(
                     let r = limit_ctx.reg_limit;
 
                     _ = translate_expr(program, None, expr, r, &t_ctx.resolver)?;
-                    program.emit_insn(Insn::MustBeInt { reg: r });
+                    program.emit_insn(Insn::MustBeInt {
+                        reg: r,
+                        target_pc: None,
+                    });
                 }
             }
         }
@@ -1660,7 +1664,10 @@ pub(crate) fn init_limit(
                             value: value.into(),
                             dest: offset_reg,
                         });
-                        program.emit_insn(Insn::MustBeInt { reg: offset_reg });
+                        program.emit_insn(Insn::MustBeInt {
+                            reg: offset_reg,
+                            target_pc: None,
+                        });
                     }
                     _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
                 },
@@ -1669,7 +1676,10 @@ pub(crate) fn init_limit(
                 }
             }
             program.add_comment(program.offset(), "OFFSET counter");
-            program.emit_insn(Insn::MustBeInt { reg: offset_reg });
+            program.emit_insn(Insn::MustBeInt {
+                reg: offset_reg,
+                target_pc: None,
+            });
 
             let combined_reg = program.alloc_register();
             t_ctx.reg_limit_offset_sum = Some(combined_reg);

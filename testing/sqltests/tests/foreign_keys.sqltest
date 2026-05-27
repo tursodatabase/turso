@@ -351,6 +351,52 @@ test fk-self-ipk-single-mismatch {
 expect error {
 }
 
+@cross-check-integrity
+test fk-self-ipk-text-child-coerces-rowid-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        rid TEXT REFERENCES t(id)
+    );
+    INSERT INTO t(id, rid) VALUES(1, '1');
+    SELECT typeof(id), typeof(rid), id, rid FROM t;
+}
+expect {
+    integer|text|1|1
+}
+
+@cross-check-integrity
+test fk-deferred-self-ipk-invalid-text-child-is-deferred {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        rid TEXT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    BEGIN;
+    INSERT INTO t(id, rid) VALUES(1, 'abc');
+    SELECT count(*) FROM t;
+    ROLLBACK;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test fk-deferred-self-ipk-invalid-blob-child-is-deferred {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        rid BLOB REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    BEGIN;
+    INSERT INTO t(id, rid) VALUES(1, x'31');
+    SELECT count(*) FROM t;
+    ROLLBACK;
+}
+expect {
+    1
+}
+
 # Self-reference on composite PRIMARY KEY: single-row insert should pass
 @cross-check-integrity
 test fk-self-composite-single-ok {

@@ -77,13 +77,19 @@ pub fn emit_program_for_compound_select(
                                 .map_err(|_| LimboError::ParseError("invalid limit".to_string()))?;
                             program.emit_insn(Insn::Real { value, dest: reg });
                             program.add_comment(program.offset(), "LIMIT counter");
-                            program.emit_insn(Insn::MustBeInt { reg });
+                            program.emit_insn(Insn::MustBeInt {
+                                reg,
+                                target_pc: None,
+                            });
                         }
                     }
                     _ => {
                         _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
                         program.add_comment(program.offset(), "LIMIT counter");
-                        program.emit_insn(Insn::MustBeInt { reg });
+                        program.emit_insn(Insn::MustBeInt {
+                            reg,
+                            target_pc: None,
+                        });
                     }
                 }
                 Ok::<_, LimboError>(LimitCtx::new_shared(reg))
@@ -120,7 +126,10 @@ pub fn emit_program_for_compound_select(
                     }
                 }
                 program.add_comment(program.offset(), "OFFSET counter");
-                program.emit_insn(Insn::MustBeInt { reg });
+                program.emit_insn(Insn::MustBeInt {
+                    reg,
+                    target_pc: None,
+                });
                 let combined_reg = program.alloc_register();
                 program.add_comment(program.offset(), "OFFSET + LIMIT");
                 program.emit_insn(Insn::OffsetLimit {
@@ -991,13 +1000,19 @@ fn emit_compound_order_by(
                             .map_err(|_| LimboError::ParseError("invalid limit".to_string()))?;
                         program.emit_insn(Insn::Real { value, dest: reg });
                         program.add_comment(program.offset(), "LIMIT counter");
-                        program.emit_insn(Insn::MustBeInt { reg });
+                        program.emit_insn(Insn::MustBeInt {
+                            reg,
+                            target_pc: None,
+                        });
                     }
                 }
                 _ => {
                     _ = translate_expr(program, None, limit_expr, reg, &right_most_ctx.resolver);
                     program.add_comment(program.offset(), "LIMIT counter");
-                    program.emit_insn(Insn::MustBeInt { reg });
+                    program.emit_insn(Insn::MustBeInt {
+                        reg,
+                        target_pc: None,
+                    });
                 }
             }
             Ok::<_, LimboError>(reg)
@@ -1023,7 +1038,10 @@ fn emit_compound_order_by(
                 }
             }
             program.add_comment(program.offset(), "OFFSET counter");
-            program.emit_insn(Insn::MustBeInt { reg });
+            program.emit_insn(Insn::MustBeInt {
+                reg,
+                target_pc: None,
+            });
             if let Some(limit_reg) = limit_ctx {
                 let combined_reg = program.alloc_register();
                 program.add_comment(program.offset(), "OFFSET + LIMIT");

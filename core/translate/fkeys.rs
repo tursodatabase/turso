@@ -979,10 +979,13 @@ pub fn emit_fk_child_update_counters(
                         dst_reg: rid,
                         extra_amount: 0,
                     });
-                    program.emit_insn(Insn::MustBeInt { reg: rid });
 
                     // If NOT exists => decrement
                     let miss = program.allocate_label();
+                    program.emit_insn(Insn::MustBeInt {
+                        reg: rid,
+                        target_pc: Some(miss),
+                    });
                     program.emit_insn(Insn::NotExists {
                         cursor: pcur,
                         rowid_reg: rid,
@@ -1116,7 +1119,11 @@ pub fn emit_fk_child_update_counters(
                 dst_reg: tmp,
                 extra_amount: 0,
             });
-            program.emit_insn(Insn::MustBeInt { reg: tmp });
+            let violation = program.allocate_label();
+            program.emit_insn(Insn::MustBeInt {
+                reg: tmp,
+                target_pc: Some(violation),
+            });
 
             // Match the rowid lookup semantics before using the same-row fast
             // path. Without the MustBeInt-normalized value, TEXT '2' would not
@@ -1132,7 +1139,6 @@ pub fn emit_fk_child_update_counters(
                 });
             }
 
-            let violation = program.allocate_label();
             program.emit_insn(Insn::NotExists {
                 cursor: pcur,
                 rowid_reg: tmp,

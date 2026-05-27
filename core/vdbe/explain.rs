@@ -1492,10 +1492,13 @@ pub fn insn_to_row(
                 0,
                 format!("r[{rowid_reg}]=rowid"),
             ),
-            Insn::MustBeInt { reg } => (
+            Insn::MustBeInt { reg, target_pc } => (
                 "MustBeInt",
                 *reg as i64,
-                0,
+                target_pc
+                    .as_ref()
+                    .map(|target_pc| target_pc.as_offset_int())
+                    .unwrap_or_default() as i64,
                 0,
                 Value::build_text(""),
                 0,

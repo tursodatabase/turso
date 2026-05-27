@@ -1164,6 +1164,7 @@ pub enum Insn {
 
     MustBeInt {
         reg: usize,
+        target_pc: Option<BranchOffset>,
     },
 
     SoftNull {

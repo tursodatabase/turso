@@ -772,6 +772,7 @@ fn emit_update_column_values<'a>(
             )?;
             program.emit_insn(Insn::MustBeInt {
                 reg: rowid_set_clause_reg,
+                target_pc: None,
             });
         }
     }
@@ -817,6 +818,7 @@ fn emit_update_column_values<'a>(
 
                     program.emit_insn(Insn::MustBeInt {
                         reg: rowid_set_clause_reg,
+                        target_pc: None,
                     });
 
                     program.emit_null(target_reg, None);

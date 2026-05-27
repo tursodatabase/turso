@@ -10156,31 +10156,40 @@ fn new_rowid_inner(
     }
 }
 
+fn coerce_register_to_integer(state: &mut ProgramState, reg: usize) -> Result<bool> {
+    let converted = match state.registers[reg].get_value() {
+        Value::Numeric(Numeric::Integer(_)) => return Ok(true),
+        Value::Numeric(Numeric::Float(f)) => cast_real_to_integer(f64::from(*f)).ok(),
+        Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
+            Ok(Value::Numeric(Numeric::Integer(i))) => Some(i),
+            Ok(Value::Numeric(Numeric::Float(f))) => cast_real_to_integer(f64::from(f)).ok(),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    if let Some(i) = converted {
+        state.registers[reg].set_int(i);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 pub fn op_must_be_int(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(MustBeInt { reg }, insn);
-    match &state.registers[*reg].get_value() {
-        Value::Numeric(Numeric::Integer(_)) => {}
-        Value::Numeric(Numeric::Float(f)) => match cast_real_to_integer(f64::from(*f)) {
-            Ok(i) => state.registers[*reg].set_int(i),
-            Err(_) => bail_constraint_error!("datatype mismatch"),
-        },
-        Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
-            Ok(Value::Numeric(Numeric::Integer(i))) => state.registers[*reg].set_int(i),
-            Ok(Value::Numeric(Numeric::Float(f))) => match cast_real_to_integer(f64::from(f)) {
-                Ok(i) => state.registers[*reg].set_int(i),
-                Err(_) => bail_constraint_error!("datatype mismatch"),
-            },
-            _ => bail_constraint_error!("datatype mismatch"),
-        },
-        _ => {
-            bail_constraint_error!("datatype mismatch");
+    load_insn!(MustBeInt { reg, target_pc }, insn);
+    if !coerce_register_to_integer(state, *reg)? {
+        if let Some(target_pc) = target_pc {
+            state.pc = target_pc.as_offset_int();
+            return Ok(InsnFunctionStepResult::Step);
         }
-    };
+        bail_constraint_error!("datatype mismatch");
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

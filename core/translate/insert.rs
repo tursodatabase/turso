@@ -1198,6 +1198,7 @@ fn emit_check_for_user_provided_rowid(
     program.preassign_label_to_next_insn(must_be_int_label);
     program.emit_insn(Insn::MustBeInt {
         reg: insertion.key_register(),
+        target_pc: None,
     });
 
     program.emit_insn(Insn::Goto {
@@ -3912,7 +3913,11 @@ pub fn emit_fk_child_insert_checks(
                 dst_reg: tmp,
                 extra_amount: 0,
             });
-            program.emit_insn(Insn::MustBeInt { reg: tmp });
+            let violation = program.allocate_label();
+            program.emit_insn(Insn::MustBeInt {
+                reg: tmp,
+                target_pc: Some(violation),
+            });
 
             // If this is a self-reference *and* the child FK equals NEW rowid,
             // the constraint will be satisfied once this row is inserted
@@ -3926,7 +3931,6 @@ pub fn emit_fk_child_insert_checks(
                 });
             }
 
-            let violation = program.allocate_label();
             program.emit_insn(Insn::NotExists {
                 cursor: pcur,
                 rowid_reg: tmp,
