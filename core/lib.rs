@@ -165,6 +165,7 @@ pub use turso_macros::{
     turso_assert_sometimes_less_than, turso_assert_sometimes_less_than_or_equal,
     turso_assert_unreachable, turso_debug_assert, turso_soft_unreachable,
 };
+use types::IOCompletions;
 pub use types::{IOResult, Value, ValueRef};
 pub use util::IOExt;
 pub use vdbe::{
@@ -388,10 +389,86 @@ fn new_header_read_completion(buf: Arc<Buffer>) -> Completion {
 pub enum OpenDbAsyncPhase {
     #[default]
     Init,
+    /// Drives `Database::header_validation` (header validation + WAL recovery)
+    /// as a sub state machine so WAL recovery on open does not block.
+    ValidatingHeader,
     ReadingHeader,
     LoadingSchema,
     BootstrapMvStore,
     Done,
+}
+
+/// Sub state machine for [`Database::header_validation`], driven from
+/// [`OpenDbAsyncPhase::ValidatingHeader`]. Keeps WAL recovery on open
+/// non-blocking by yielding through its IO instead of `io.block`.
+/// Non-blocking read of the 512-byte database file header. Used by
+/// [`Database::init_pager`] to recover page size + reserved bytes without
+/// blocking on open.
+#[derive(Default)]
+enum DbHeaderReadState {
+    #[default]
+    Start,
+    Reading {
+        buf: Arc<Buffer>,
+        completion: Completion,
+    },
+}
+
+/// Sub state machine for [`Database::_init`], driven from
+/// [`HeaderValidationState::Start`]. Builds the `Pager` (reading page-size /
+/// reserved bytes from the DB header), begins a read transaction, then reads
+/// page 1 to determine the autovacuum mode — all without blocking.
+#[derive(Default)]
+enum InitState {
+    #[default]
+    Start,
+    /// Driving `init_pager` (its only IO is the DB-header read).
+    InitPager(DbHeaderReadState),
+    /// Pager built and read-tx open; reading page 1 for the autovacuum mode.
+    ReadPage1 { pager: Box<Pager> },
+}
+
+/// Sub state machine for [`Database::header_validation`], driven from
+/// [`OpenDbAsyncPhase::ValidatingHeader`]. Keeps WAL recovery on open
+/// non-blocking by yielding through its IO instead of `io.block`.
+enum HeaderValidationState {
+    Start {
+        init: InitState,
+    },
+    /// Pager created; (re-entrant) header reads + validation. Holds the owned
+    /// `Pager` because `set_wal` needs `&mut Pager`; it is `Arc`-wrapped only
+    /// once validation completes. `is_readonly`/`log_exists` are captured in
+    /// `Start` (before the autovacuum check may force ReadOnly) so re-entry
+    /// observes the original values.
+    Validate {
+        pager: Box<Pager>,
+        is_readonly: bool,
+        log_exists: bool,
+    },
+    /// A modified header (e.g. Legacy→WAL conversion) must be written to disk
+    /// before the WAL is attached. `completion` is the in-flight write.
+    WriteHeader {
+        pager: Box<Pager>,
+        page: PageRef,
+        open_mv_store: bool,
+        completion: Option<Completion>,
+    },
+    /// Open/recover the shared WAL. On non-host builds `driver` drives the
+    /// `OpenSharedWal` recovery scan; on host builds the WAL is produced
+    /// synchronously (native, where `io.step` pumps).
+    OpenWal {
+        pager: Box<Pager>,
+        open_mv_store: bool,
+        driver: Option<storage::wal::OpenSharedWal>,
+    },
+}
+
+impl Default for HeaderValidationState {
+    fn default() -> Self {
+        Self::Start {
+            init: InitState::default(),
+        }
+    }
 }
 
 /// State machine for async database opening
@@ -406,6 +483,11 @@ pub struct OpenDbAsyncState {
     schema_guard: Option<sync::ArcMutexGuard<Arc<Schema>>>,
     /// Registry key for insertion (computed once at start)
     registry_key: Option<DatabaseKey>,
+    /// The database being built, held across the ValidatingHeader phase yields
+    /// before it is wrapped in an `Arc`.
+    building_db: Option<Database>,
+    /// Sub state machine for `header_validation`, driven in ValidatingHeader.
+    header_validation_state: HeaderValidationState,
 }
 
 impl Default for OpenDbAsyncState {
@@ -425,6 +507,8 @@ impl OpenDbAsyncState {
             make_from_btree_state: schema::MakeFromBtreeState::new(),
             schema_guard: None,
             registry_key: None,
+            building_db: None,
+            header_validation_state: HeaderValidationState::default(),
         }
     }
 }
@@ -1187,7 +1271,30 @@ impl Database {
                     )?;
                     db.durable_storage.clone_from(&durable_storage);
 
-                    let pager = db.header_validation(encryption_key.as_ref())?;
+                    // Header validation + WAL recovery runs as a sub state
+                    // machine in the ValidatingHeader phase so it can yield
+                    // through IO instead of blocking. Stash the owned db and
+                    // the parsed key for that phase.
+                    state.building_db = Some(db);
+                    state.encryption_key = encryption_key;
+                    state.header_validation_state = HeaderValidationState::default();
+                    state.phase = OpenDbAsyncPhase::ValidatingHeader;
+                }
+
+                OpenDbAsyncPhase::ValidatingHeader => {
+                    let db = state
+                        .building_db
+                        .as_mut()
+                        .expect("building_db must be set in Init phase");
+                    let mut hv_state = std::mem::take(&mut state.header_validation_state);
+                    let result = db.header_validation(&mut hv_state, state.encryption_key.as_ref());
+                    state.header_validation_state = hv_state;
+                    let pager = return_if_io!(result);
+
+                    let mut db = state
+                        .building_db
+                        .take()
+                        .expect("building_db must be set in Init phase");
 
                     #[cfg(debug_assertions)]
                     {
@@ -1199,12 +1306,14 @@ impl Database {
                             "Either WAL or MVStore must be enabled"
                         );
                     }
+                    let _ = &mut db;
 
                     // Wrap db in Arc before connecting
                     let db = Arc::new(db);
 
                     // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
-                    let conn = db._connect(false, Some(pager.clone()), encryption_key.clone())?;
+                    let conn =
+                        db._connect(false, Some(pager.clone()), state.encryption_key.clone())?;
 
                     // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases
                     // to ensure schema_version and make_from_btree are atomic
@@ -1213,7 +1322,6 @@ impl Database {
                     state.db = Some(db);
                     state.pager = Some(pager);
                     state.conn = Some(conn);
-                    state.encryption_key = encryption_key;
                     state.schema_guard = Some(guard);
 
                     state.phase = OpenDbAsyncPhase::ReadingHeader;
@@ -1355,294 +1463,430 @@ impl Database {
 
     /// Necessary Pager initialization, so that we are prepared to read from Page 1.
     /// For encrypted databases, the encryption key must be provided to properly decrypt page 1.
+    /// Blocking shim over [`Database::_init_nonblock`], retained for the
+    /// synchronous callers (connection setup paths). The open state machine
+    /// uses `_init_nonblock` directly so a fresh open never blocks here.
     pub(crate) fn _init(&self, encryption_key: Option<&EncryptionKey>) -> Result<Pager> {
-        let pager = self.init_pager(None)?;
-        pager.enable_encryption(self.opts.enable_encryption);
+        let mut st = InitState::default();
+        self.io
+            .block(|| self._init_nonblock(&mut st, encryption_key))
+    }
 
-        // Set up encryption context BEFORE reading the header page.
-        // For encrypted databases, page 1 has:
-        // - Bytes 0-15: Turso magic header (replaces SQLite magic)
-        // - Bytes 16-100: Unencrypted header metadata
-        // - Bytes 100+: Encrypted content
-        // The encryption context is needed to properly decrypt page 1 when reopening.
-        if let Some(key) = encryption_key {
-            let cipher_mode = self.encryption_cipher_mode.get();
-            pager.set_encryption_context(cipher_mode, key)?;
-        }
-
-        // Start a read transaction before reading page 1 to prevent a concurrent
-        // checkpoint from truncating the WAL underneath bootstrap. Under heavy
-        // same-process connection churn, the shared WAL bootstrap path can
-        // briefly contend on short-lived in-process locks, so treat Busy here as
-        // a transient and retry rather than failing `connect()`.
-        let mut read_tx_attempts = 0u32;
+    /// Necessary Pager initialization, so that we are prepared to read from
+    /// Page 1. For encrypted databases, the encryption key must be provided to
+    /// properly decrypt page 1. Non-blocking: drives `init_pager` (DB-header
+    /// read) and the page-1 autovacuum read through their IO.
+    pub(crate) fn _init_nonblock(
+        &self,
+        st: &mut InitState,
+        encryption_key: Option<&EncryptionKey>,
+    ) -> Result<IOResult<Pager>> {
         loop {
-            match pager.begin_read_tx() {
-                Ok(()) => break,
-                Err(LimboError::Busy) => {
-                    read_tx_attempts += 1;
-                    if read_tx_attempts > 1 {
-                        return Err(LimboError::Busy);
-                    }
-                    pager.io.yield_now();
+            match st {
+                InitState::Start => {
+                    *st = InitState::InitPager(DbHeaderReadState::default());
                 }
-                Err(err) => return Err(err),
+                InitState::InitPager(hdr_st) => {
+                    let pager = return_if_io!(self.init_pager(None, hdr_st));
+                    pager.enable_encryption(self.opts.enable_encryption);
+
+                    // Set up encryption context BEFORE reading the header page.
+                    // For encrypted databases, page 1 has:
+                    // - Bytes 0-15: Turso magic header (replaces SQLite magic)
+                    // - Bytes 16-100: Unencrypted header metadata
+                    // - Bytes 100+: Encrypted content
+                    // The encryption context is needed to properly decrypt page 1 when reopening.
+                    if let Some(key) = encryption_key {
+                        let cipher_mode = self.encryption_cipher_mode.get();
+                        pager.set_encryption_context(cipher_mode, key)?;
+                    }
+
+                    // Start a read transaction before reading page 1 to prevent a concurrent
+                    // checkpoint from truncating the WAL underneath bootstrap. Under heavy
+                    // same-process connection churn, the shared WAL bootstrap path can
+                    // briefly contend on short-lived in-process locks, so treat Busy here as
+                    // a transient and retry rather than failing `connect()`.
+                    let mut read_tx_attempts = 0u32;
+                    loop {
+                        match pager.begin_read_tx() {
+                            Ok(()) => break,
+                            Err(LimboError::Busy) => {
+                                read_tx_attempts += 1;
+                                if read_tx_attempts > 1 {
+                                    return Err(LimboError::Busy);
+                                }
+                                pager.io.yield_now();
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
+
+                    *st = InitState::ReadPage1 {
+                        pager: Box::new(pager),
+                    };
+                }
+                InitState::ReadPage1 { pager } => {
+                    // Read page 1 within the read transaction to determine the
+                    // autovacuum mode. The read tx stays open across an IO
+                    // yield here (re-entry resumes the read); we only end it
+                    // once the read completes or errors.
+                    let mode = match HeaderRef::from_pager(pager) {
+                        Ok(IOResult::Done(header_ref)) => {
+                            let header = header_ref.borrow();
+                            if header.vacuum_mode_largest_root_page.get() > 0 {
+                                if header.incremental_vacuum_enabled.get() > 0 {
+                                    AutoVacuumMode::Incremental
+                                } else {
+                                    AutoVacuumMode::Full
+                                }
+                            } else {
+                                AutoVacuumMode::None
+                            }
+                        }
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Err(err) => {
+                            pager.end_read_tx();
+                            return Err(err);
+                        }
+                    };
+
+                    pager.end_read_tx();
+                    pager.set_auto_vacuum_mode(mode);
+
+                    let InitState::ReadPage1 { pager } = std::mem::take(st) else {
+                        unreachable!("state is ReadPage1");
+                    };
+                    return Ok(IOResult::Done(*pager));
+                }
             }
         }
-
-        // Read header within the read transaction, ensuring cleanup on error
-        let result = (|| -> Result<AutoVacuumMode> {
-            let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
-            let header = header_ref.borrow();
-
-            let mode = if header.vacuum_mode_largest_root_page.get() > 0 {
-                if header.incremental_vacuum_enabled.get() > 0 {
-                    AutoVacuumMode::Incremental
-                } else {
-                    AutoVacuumMode::Full
-                }
-            } else {
-                AutoVacuumMode::None
-            };
-
-            Ok(mode)
-        })();
-
-        // Always end read transaction, even on error
-        pager.end_read_tx();
-
-        let mode = result?;
-
-        pager.set_auto_vacuum_mode(mode);
-
-        Ok(pager)
     }
 
     /// Checks the Version numbers in the DatabaseHeader, and changes it according to the required options
     ///
-    /// Will also open MVStore and WAL if needed
-    fn header_validation(&mut self, encryption_key: Option<&EncryptionKey>) -> Result<Arc<Pager>> {
-        let log_exists = journal_mode::logical_log_exists(std::path::Path::new(&self.path));
-        let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
-
-        let mut pager = self._init(encryption_key)?;
-        turso_assert!(pager.wal.is_none(), "Pager should have no WAL yet");
-
-        let is_autovacuumed_db = self.io.block(|| {
-            pager.with_header(|header| {
-                header.vacuum_mode_largest_root_page.get() > 0
-                    || header.incremental_vacuum_enabled.get() > 0
-            })
-        })?;
-
-        if is_autovacuumed_db && !self.opts.enable_autovacuum {
-            tracing::warn!(
-                "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Opening in readonly mode."
-            );
-            self.open_flags |= OpenFlags::ReadOnly;
-        }
-
-        let header: HeaderRefMut = self.io.block(|| HeaderRefMut::from_pager(&pager))?;
-        let header_mut = header.borrow_mut();
-
-        if !header_mut.text_encoding.is_utf8() {
-            return Err(LimboError::UnsupportedEncoding(
-                header_mut.text_encoding.to_string(),
-            ));
-        }
-
-        let (read_version, write_version) = { (header_mut.read_version, header_mut.write_version) };
-
-        if encryption_key.is_none() && header_mut.magic != SQLITE_HEADER {
-            tracing::error!(
-                "invalid value of database header magic bytes: {:?}",
-                header_mut.magic
-            );
-            return Err(LimboError::NotADB);
-        }
-        // when we open fresh db with encryption params - header will be SQLite at this point
-        if encryption_key.is_some()
-            && (header_mut.magic != SQLITE_HEADER
-                && !header_mut.magic.starts_with(TURSO_HEADER_PREFIX))
-        {
-            tracing::error!(
-                "invalid value of database header magic bytes: {:?}",
-                header_mut.magic
-            );
-            return Err(LimboError::NotADB);
-        }
-
-        // TODO: right now we don't support READ ONLY and no READ or WRITE in the Version header
-        // https://www.sqlite.org/fileformat.html#file_format_version_numbers
-        if read_version != write_version {
-            return Err(LimboError::Corrupt(format!(
-                "Read version `{read_version:?}` is not equal to Write version `{write_version:?} in database header`"
-            )));
-        }
-
-        let (read_version, _write_version) = (
-            read_version
-                .to_version()
-                .map_err(|val| LimboError::Corrupt(format!("Invalid read_version: {val}")))?,
-            write_version
-                .to_version()
-                .map_err(|val| LimboError::Corrupt(format!("Invalid write_version: {val}")))?,
-        );
-
-        // Validate fixed header fields per SQLite spec
-        if header_mut.max_embed_frac != 64 {
-            return Err(LimboError::Corrupt(format!(
-                "Invalid max_embed_frac: expected 64, got {}",
-                header_mut.max_embed_frac
-            )));
-        }
-        if header_mut.min_embed_frac != 32 {
-            return Err(LimboError::Corrupt(format!(
-                "Invalid min_embed_frac: expected 32, got {}",
-                header_mut.min_embed_frac
-            )));
-        }
-        if header_mut.leaf_frac != 32 {
-            return Err(LimboError::Corrupt(format!(
-                "Invalid leaf_frac: expected 32, got {}",
-                header_mut.leaf_frac
-            )));
-        }
-        let schema_format = header_mut.schema_format.get();
-        // If the database is completely empty, if it has no schema, then the schema format number can be zero.
-        if !(0..=4).contains(&schema_format) {
-            return Err(LimboError::Corrupt(format!(
-                "Invalid schema_format: expected 1-4, got {schema_format}"
-            )));
-        }
-        if !matches!(
-            header_mut.text_encoding,
-            TextEncoding::Unset
-                | TextEncoding::Utf8
-                | TextEncoding::Utf16Le
-                | TextEncoding::Utf16Be
-        ) {
-            return Err(LimboError::Corrupt(format!(
-                "Invalid text_encoding: {}",
-                header_mut.text_encoding
-            )));
-        }
-        if !matches!(
-            header_mut.text_encoding,
-            TextEncoding::Unset | TextEncoding::Utf8
-        ) {
-            return Err(LimboError::Corrupt(format!(
-                "Only utf8 text_encoding is supported by tursodb: got={}",
-                header_mut.text_encoding
-            )));
-        }
-
-        // Determine if we should open in MVCC mode based on the database header version
-        // MVCC is controlled only by the database header (set via PRAGMA journal_mode)
-        let open_mv_store = matches!(read_version, Version::Mvcc);
-
-        // Now check the Header Version to see which mode the DB file really is on
-        // Track if header was modified so we can write it to disk
-        let header_modified = match read_version {
-            Version::Legacy => {
-                if is_readonly {
-                    tracing::warn!(
-                        "Database {} is opened in readonly mode, cannot convert Legacy mode to WAL. Running in Legacy mode.",
-                        self.path
-                    );
-                    false
-                } else {
-                    // Convert Legacy to WAL mode
-                    header_mut.read_version = RawVersion::from(Version::Wal);
-                    header_mut.write_version = RawVersion::from(Version::Wal);
-                    true
+    /// Will also open MVStore and WAL if needed.
+    ///
+    /// Driven as a sub state machine (see [`HeaderValidationState`]) from the
+    /// `ValidatingHeader` open phase so that WAL recovery on open yields
+    /// through its IO instead of blocking — this is what lets a fresh open
+    /// make progress on runtimes (e.g. WASM) that cannot pump `io.step`
+    /// synchronously.
+    fn header_validation(
+        &mut self,
+        st: &mut HeaderValidationState,
+        encryption_key: Option<&EncryptionKey>,
+    ) -> Result<IOResult<Arc<Pager>>> {
+        loop {
+            match st {
+                HeaderValidationState::Start { init } => {
+                    // `_init` does not modify `open_flags` (the autovacuum
+                    // override happens later in `Validate`), so capturing
+                    // `is_readonly` across the `_init` yields is stable.
+                    let pager = return_if_io!(self._init_nonblock(init, encryption_key));
+                    let log_exists =
+                        journal_mode::logical_log_exists(std::path::Path::new(&self.path));
+                    let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
+                    turso_assert!(pager.wal.is_none(), "Pager should have no WAL yet");
+                    *st = HeaderValidationState::Validate {
+                        pager: Box::new(pager),
+                        is_readonly,
+                        log_exists,
+                    };
                 }
-            }
-            Version::Wal => false,
-            Version::Mvcc => false,
-        };
+                HeaderValidationState::Validate {
+                    pager,
+                    is_readonly,
+                    log_exists,
+                } => {
+                    let is_readonly = *is_readonly;
+                    let log_exists = *log_exists;
 
-        // In WAL mode, a logical log is always unexpected.
-        // In MVCC mode, WAL and logical-log coexistence can happen across interrupted checkpoint
-        // recovery and is reconciled in MvStore::bootstrap().
-        if !open_mv_store && log_exists {
-            return Err(LimboError::Corrupt(format!(
-                "MVCC logical log file exists for database {}, but database header indicates WAL mode. The database may be corrupted.",
-                self.path
-            )));
-        }
-
-        // If header was modified, write it directly to disk before we clear the cache
-        // This must happen before WAL is attached since we need to write directly to the DB file
-        if header_modified {
-            let completion =
-                storage::sqlite3_ondisk::begin_write_btree_page(&pager, header.page())?;
-            self.io.wait_for_completion(completion)?;
-        }
-
-        drop(header);
-
-        let flags = self.open_flags;
-
-        // Always Open shared wal and set it in the Database and Pager.
-        // MVCC currently requires a WAL open to function
-        #[cfg(host_shared_wal)]
-        let shared_authority = self.open_shared_wal_coordination_for_open()?;
-        #[cfg(not(host_shared_wal))]
-        let shared_authority: Option<()> = None;
-
-        let shared_wal = {
-            #[cfg(host_shared_wal)]
-            {
-                if let Some(authority) = shared_authority.as_ref() {
-                    // The no-scan open path only works if the shared frame index
-                    // is complete. If the reserved shared index space was fully
-                    // exhausted, rebuild local WAL state from the file instead.
-                    if !authority.frame_index_overflowed() {
-                        WalFileShared::open_shared_from_authority_if_exists(
-                            &self.io,
-                            &self.wal_path,
-                            flags,
-                            authority,
-                            &self.db_file,
-                        )?
-                    } else {
-                        WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
+                    // Re-entrant reads: both `with_header` and `from_pager`
+                    // resume via their own state machines, and the autovacuum
+                    // flag update is idempotent.
+                    let is_autovacuumed_db = return_if_io!(pager.with_header(|header| {
+                        header.vacuum_mode_largest_root_page.get() > 0
+                            || header.incremental_vacuum_enabled.get() > 0
+                    }));
+                    if is_autovacuumed_db && !self.opts.enable_autovacuum {
+                        tracing::warn!(
+                            "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Opening in readonly mode."
+                        );
+                        self.open_flags |= OpenFlags::ReadOnly;
                     }
-                } else {
-                    WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
+
+                    let header: HeaderRefMut = return_if_io!(HeaderRefMut::from_pager(pager));
+                    let header_mut = header.borrow_mut();
+
+                    if !header_mut.text_encoding.is_utf8() {
+                        return Err(LimboError::UnsupportedEncoding(
+                            header_mut.text_encoding.to_string(),
+                        ));
+                    }
+
+                    let (read_version, write_version) =
+                        { (header_mut.read_version, header_mut.write_version) };
+
+                    if encryption_key.is_none() && header_mut.magic != SQLITE_HEADER {
+                        tracing::error!(
+                            "invalid value of database header magic bytes: {:?}",
+                            header_mut.magic
+                        );
+                        return Err(LimboError::NotADB);
+                    }
+                    // when we open fresh db with encryption params - header will be SQLite at this point
+                    if encryption_key.is_some()
+                        && (header_mut.magic != SQLITE_HEADER
+                            && !header_mut.magic.starts_with(TURSO_HEADER_PREFIX))
+                    {
+                        tracing::error!(
+                            "invalid value of database header magic bytes: {:?}",
+                            header_mut.magic
+                        );
+                        return Err(LimboError::NotADB);
+                    }
+
+                    // TODO: right now we don't support READ ONLY and no READ or WRITE in the Version header
+                    // https://www.sqlite.org/fileformat.html#file_format_version_numbers
+                    if read_version != write_version {
+                        return Err(LimboError::Corrupt(format!(
+                            "Read version `{read_version:?}` is not equal to Write version `{write_version:?} in database header`"
+                        )));
+                    }
+
+                    let (read_version, _write_version) = (
+                        read_version.to_version().map_err(|val| {
+                            LimboError::Corrupt(format!("Invalid read_version: {val}"))
+                        })?,
+                        write_version.to_version().map_err(|val| {
+                            LimboError::Corrupt(format!("Invalid write_version: {val}"))
+                        })?,
+                    );
+
+                    // Validate fixed header fields per SQLite spec
+                    if header_mut.max_embed_frac != 64 {
+                        return Err(LimboError::Corrupt(format!(
+                            "Invalid max_embed_frac: expected 64, got {}",
+                            header_mut.max_embed_frac
+                        )));
+                    }
+                    if header_mut.min_embed_frac != 32 {
+                        return Err(LimboError::Corrupt(format!(
+                            "Invalid min_embed_frac: expected 32, got {}",
+                            header_mut.min_embed_frac
+                        )));
+                    }
+                    if header_mut.leaf_frac != 32 {
+                        return Err(LimboError::Corrupt(format!(
+                            "Invalid leaf_frac: expected 32, got {}",
+                            header_mut.leaf_frac
+                        )));
+                    }
+                    let schema_format = header_mut.schema_format.get();
+                    // If the database is completely empty, if it has no schema, then the schema format number can be zero.
+                    if !(0..=4).contains(&schema_format) {
+                        return Err(LimboError::Corrupt(format!(
+                            "Invalid schema_format: expected 1-4, got {schema_format}"
+                        )));
+                    }
+                    if !matches!(
+                        header_mut.text_encoding,
+                        TextEncoding::Unset
+                            | TextEncoding::Utf8
+                            | TextEncoding::Utf16Le
+                            | TextEncoding::Utf16Be
+                    ) {
+                        return Err(LimboError::Corrupt(format!(
+                            "Invalid text_encoding: {}",
+                            header_mut.text_encoding
+                        )));
+                    }
+                    if !matches!(
+                        header_mut.text_encoding,
+                        TextEncoding::Unset | TextEncoding::Utf8
+                    ) {
+                        return Err(LimboError::Corrupt(format!(
+                            "Only utf8 text_encoding is supported by tursodb: got={}",
+                            header_mut.text_encoding
+                        )));
+                    }
+
+                    // Determine if we should open in MVCC mode based on the database header version
+                    // MVCC is controlled only by the database header (set via PRAGMA journal_mode)
+                    let open_mv_store = matches!(read_version, Version::Mvcc);
+
+                    // Now check the Header Version to see which mode the DB file really is on
+                    // Track if header was modified so we can write it to disk
+                    let header_modified = match read_version {
+                        Version::Legacy => {
+                            if is_readonly {
+                                tracing::warn!(
+                                    "Database {} is opened in readonly mode, cannot convert Legacy mode to WAL. Running in Legacy mode.",
+                                    self.path
+                                );
+                                false
+                            } else {
+                                // Convert Legacy to WAL mode
+                                header_mut.read_version = RawVersion::from(Version::Wal);
+                                header_mut.write_version = RawVersion::from(Version::Wal);
+                                true
+                            }
+                        }
+                        Version::Wal => false,
+                        Version::Mvcc => false,
+                    };
+
+                    // In WAL mode, a logical log is always unexpected.
+                    // In MVCC mode, WAL and logical-log coexistence can happen across interrupted checkpoint
+                    // recovery and is reconciled in MvStore::bootstrap().
+                    if !open_mv_store && log_exists {
+                        return Err(LimboError::Corrupt(format!(
+                            "MVCC logical log file exists for database {}, but database header indicates WAL mode. The database may be corrupted.",
+                            self.path
+                        )));
+                    }
+
+                    let page = header.page().clone();
+                    // `header` (a cheap Arc<Page> wrapper, no lock) is dropped
+                    // here; the page ref carries the (possibly modified) header
+                    // buffer forward.
+                    drop(header);
+
+                    // Move the owned pager out of the state to build the next.
+                    let HeaderValidationState::Validate { pager, .. } = std::mem::take(st) else {
+                        unreachable!("state is Validate");
+                    };
+                    *st = if header_modified {
+                        HeaderValidationState::WriteHeader {
+                            pager,
+                            page,
+                            open_mv_store,
+                            completion: None,
+                        }
+                    } else {
+                        HeaderValidationState::OpenWal {
+                            pager,
+                            open_mv_store,
+                            driver: None,
+                        }
+                    };
+                }
+                HeaderValidationState::WriteHeader {
+                    pager,
+                    page,
+                    open_mv_store,
+                    completion,
+                } => {
+                    // If header was modified, write it directly to disk before we attach the
+                    // WAL / clear the cache (must hit the DB file, not the WAL).
+                    let c = match completion.take() {
+                        Some(c) => c,
+                        None => storage::sqlite3_ondisk::begin_write_btree_page(pager, page)?,
+                    };
+                    if !c.succeeded() {
+                        *completion = Some(c.clone());
+                        io_yield_one!(c);
+                    }
+                    let open_mv_store = *open_mv_store;
+                    let HeaderValidationState::WriteHeader { pager, .. } = std::mem::take(st)
+                    else {
+                        unreachable!("state is WriteHeader");
+                    };
+                    *st = HeaderValidationState::OpenWal {
+                        pager,
+                        open_mv_store,
+                        driver: None,
+                    };
+                }
+                HeaderValidationState::OpenWal {
+                    open_mv_store,
+                    driver,
+                    ..
+                } => {
+                    // Always open shared WAL and set it in the Database and Pager.
+                    // MVCC currently requires a WAL open to function.
+                    let shared_wal = {
+                        #[cfg(not(host_shared_wal))]
+                        {
+                            if driver.is_none() {
+                                *driver = Some(WalFileShared::open_shared_if_exists_begin(
+                                    &self.io,
+                                    &self.wal_path,
+                                    self.open_flags,
+                                )?);
+                            }
+                            return_if_io!(driver.as_mut().expect("driver initialized above").poll())
+                        }
+                        #[cfg(host_shared_wal)]
+                        {
+                            // Native-only coordination path: `io.step` pumps
+                            // synchronously here, so the blocking shims are
+                            // fine. (Driver field is unused on host.)
+                            let _ = &driver;
+                            let flags = self.open_flags;
+                            let shared_authority = self.open_shared_wal_coordination_for_open()?;
+                            if let Some(authority) = shared_authority.as_ref() {
+                                if !authority.frame_index_overflowed() {
+                                    WalFileShared::open_shared_from_authority_if_exists(
+                                        &self.io,
+                                        &self.wal_path,
+                                        flags,
+                                        authority,
+                                        &self.db_file,
+                                    )?
+                                } else {
+                                    WalFileShared::open_shared_if_exists(
+                                        &self.io,
+                                        &self.wal_path,
+                                        flags,
+                                    )?
+                                }
+                            } else {
+                                WalFileShared::open_shared_if_exists(
+                                    &self.io,
+                                    &self.wal_path,
+                                    flags,
+                                )?
+                            }
+                        }
+                    };
+
+                    let open_mv_store = *open_mv_store;
+                    let HeaderValidationState::OpenWal { mut pager, .. } = std::mem::take(st)
+                    else {
+                        unreachable!("state is OpenWal");
+                    };
+
+                    self.shared_wal = shared_wal;
+                    let last_checksum_and_max_frame =
+                        self.shared_wal.read().last_checksum_and_max_frame();
+                    let wal =
+                        self.build_wal(last_checksum_and_max_frame, pager.buffer_pool.clone())?;
+                    pager.set_wal(wal);
+
+                    // Clear page cache after attaching WAL since pages may have been cached
+                    // from disk reads before WAL was attached. The WAL may contain newer
+                    // versions of these pages (e.g., page 1 with updated schema_cookie).
+                    pager.clear_page_cache(true);
+                    pager.set_schema_cookie(None);
+
+                    if open_mv_store {
+                        let canonical_path = self.get_database_canonical_path();
+                        let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
+                        let mv_store = journal_mode::open_mv_store(
+                            self.io.clone(),
+                            &canonical_path,
+                            self.open_flags,
+                            self.durable_storage.clone(),
+                            enc_ctx,
+                        )?;
+                        self.mv_store.store(Some(mv_store));
+                    }
+
+                    return Ok(IOResult::Done(Arc::new(*pager)));
                 }
             }
-            #[cfg(not(host_shared_wal))]
-            {
-                WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
-            }
-        };
-        self.shared_wal = shared_wal;
-        let last_checksum_and_max_frame = self.shared_wal.read().last_checksum_and_max_frame();
-        let wal = self.build_wal(last_checksum_and_max_frame, pager.buffer_pool.clone())?;
-        pager.set_wal(wal);
-
-        // Clear page cache after attaching WAL since pages may have been cached
-        // from disk reads before WAL was attached. The WAL may contain newer
-        // versions of these pages (e.g., page 1 with updated schema_cookie).
-        pager.clear_page_cache(true);
-        pager.set_schema_cookie(None);
-
-        if open_mv_store {
-            let canonical_path = self.get_database_canonical_path();
-            let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
-            let mv_store = journal_mode::open_mv_store(
-                self.io.clone(),
-                &canonical_path,
-                self.open_flags,
-                self.durable_storage.clone(),
-                enc_ctx,
-            )?;
-            self.mv_store.store(Some(mv_store));
         }
-
-        Ok(Arc::new(pager))
     }
 
     pub fn get_database_canonical_path(&self) -> String {
@@ -1771,44 +2015,37 @@ impl Database {
 
     /// If we do not have a physical WAL file, but we know the database file is initialized on disk,
     /// we need to read the page_size from the database header.
-    fn read_page_size_from_db_header(&self) -> Result<PageSize> {
-        turso_assert!(
-            self.initialized(),
-            "read_reserved_space_bytes_from_db_header called on uninitialized database"
-        );
-        turso_assert!(
-            PageSize::MIN % 512 == 0,
-            "header read must be a multiple of 512 for O_DIRECT"
-        );
-        let buf = Arc::new(Buffer::new_temporary(PageSize::MIN as usize));
-        let c = new_header_read_completion(buf.clone());
-        let c = self.db_file.read_header(c)?;
-        self.io.wait_for_completion(c)?;
-        let page_size = u16::from_be_bytes(buf.as_slice()[16..18].try_into().unwrap());
-        let page_size = PageSize::new_from_header_u16(page_size)?;
-        Ok(page_size)
+    /// Non-blocking read of the 512-byte database file header (page 1's
+    /// header region). Yields the read completion via the supplied state until
+    /// it finishes, then returns the filled buffer.
+    fn read_db_header_buf(&self, st: &mut DbHeaderReadState) -> Result<IOResult<Arc<Buffer>>> {
+        loop {
+            match st {
+                DbHeaderReadState::Start => {
+                    turso_assert!(
+                        PageSize::MIN % 512 == 0,
+                        "header read must be a multiple of 512 for O_DIRECT"
+                    );
+                    let buf = Arc::new(Buffer::new_temporary(PageSize::MIN as usize));
+                    let c = new_header_read_completion(buf.clone());
+                    let c = self.db_file.read_header(c)?;
+                    *st = DbHeaderReadState::Reading { buf, completion: c };
+                }
+                DbHeaderReadState::Reading { buf, completion } => {
+                    if !completion.succeeded() {
+                        let c = completion.clone();
+                        io_yield_one!(c);
+                    }
+                    return Ok(IOResult::Done(buf.clone()));
+                }
+            }
+        }
     }
 
-    fn read_reserved_space_bytes_from_db_header(&self) -> Result<u8> {
-        turso_assert!(
-            self.initialized(),
-            "read_reserved_space_bytes_from_db_header called on uninitialized database"
-        );
-        turso_assert!(
-            PageSize::MIN % 512 == 0,
-            "header read must be a multiple of 512 for O_DIRECT"
-        );
-        let buf = Arc::new(Buffer::new_temporary(PageSize::MIN as usize));
-        let c = new_header_read_completion(buf.clone());
-        let c = self.db_file.read_header(c)?;
-        self.io.wait_for_completion(c)?;
-        let reserved_bytes = u8::from_be_bytes(buf.as_slice()[20..21].try_into().unwrap());
-        Ok(reserved_bytes)
-    }
-
-    /// Read the page size in order of preference:
+    /// Determine the actual page size, in order of preference:
     /// 1. From the WAL header if it exists and is initialized
-    /// 2. From the database header if the database is initialized
+    /// 2. From `header_page_size` (read from the DB header by the caller) if
+    ///    the database is initialized
     ///
     /// Otherwise, fall back to, in order of preference:
     /// 1. From the requested page size if it is provided
@@ -1817,6 +2054,7 @@ impl Database {
         &self,
         shared_wal: &WalFileShared,
         requested_page_size: Option<usize>,
+        header_page_size: Option<PageSize>,
     ) -> Result<PageSize> {
         if shared_wal.metadata.enabled.load(Ordering::SeqCst) {
             let size_in_wal = shared_wal.page_size();
@@ -1827,8 +2065,8 @@ impl Database {
                 return Ok(page_size);
             }
         }
-        if self.initialized() {
-            Ok(self.read_page_size_from_db_header()?)
+        if let Some(page_size) = header_page_size {
+            Ok(page_size)
         } else {
             let Some(size) = requested_page_size else {
                 return Ok(PageSize::default());
@@ -1837,16 +2075,6 @@ impl Database {
                 bail_corrupt_error!("invalid requested page size: {size}");
             };
             Ok(page_size)
-        }
-    }
-
-    /// if the database is initialized i.e. it exists on disk, return the reserved space bytes from
-    /// the header or None
-    fn maybe_get_reserved_space_bytes(&self) -> Result<Option<u8>> {
-        if self.initialized() {
-            Ok(Some(self.read_reserved_space_bytes_from_db_header()?))
-        } else {
-            Ok(None)
         }
     }
 
@@ -2252,9 +2480,27 @@ impl Database {
         )))
     }
 
-    fn init_pager(&self, requested_page_size: Option<usize>) -> Result<Pager> {
+    fn init_pager(
+        &self,
+        requested_page_size: Option<usize>,
+        hdr_st: &mut DbHeaderReadState,
+    ) -> Result<IOResult<Pager>> {
         let cipher = self.encryption_cipher_mode.get();
-        let reserved_bytes = self.maybe_get_reserved_space_bytes()?.or_else(|| {
+
+        // For an existing (initialized) database, read the 512-byte header
+        // once (non-blocking) and recover both the reserved-space byte and the
+        // on-disk page size from it.
+        let (header_reserved_bytes, header_page_size) = if self.initialized() {
+            let buf = return_if_io!(self.read_db_header_buf(hdr_st));
+            let reserved = u8::from_be_bytes(buf.as_slice()[20..21].try_into().unwrap());
+            let ps_raw = u16::from_be_bytes(buf.as_slice()[16..18].try_into().unwrap());
+            let page_size = PageSize::new_from_header_u16(ps_raw)?;
+            (Some(reserved), Some(page_size))
+        } else {
+            (None, None)
+        };
+
+        let reserved_bytes = header_reserved_bytes.or_else(|| {
             if !matches!(cipher, CipherMode::None) {
                 // For encryption, use the cipher's metadata size
                 Some(cipher.metadata_size() as u8)
@@ -2271,7 +2517,8 @@ impl Database {
         // Check if WAL is enabled
         let shared_wal = self.shared_wal.read();
 
-        let page_size = self.determine_actual_page_size(&shared_wal, requested_page_size)?;
+        let page_size =
+            self.determine_actual_page_size(&shared_wal, requested_page_size, header_page_size)?;
 
         let buffer_pool = self.buffer_pool.clone();
         if self.initialized() {
@@ -2304,7 +2551,7 @@ impl Database {
             pager.reset_checksum_context();
         }
 
-        Ok(pager)
+        Ok(IOResult::Done(pager))
     }
 
     #[cfg(feature = "fs")]
