@@ -5651,6 +5651,23 @@ fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     rows
 }
 
+fn assert_write_set_has_no_txid_refs(write_set: &[(RowID, RowVersions)], tx_id: TxID) {
+    for (id, row_versions) in write_set {
+        for row_version in row_versions.read().iter() {
+            assert_ne!(
+                row_version.begin,
+                Some(TxTimestampOrID::TxID(tx_id)),
+                "row version for {id:?} still has begin=TxID({tx_id}) after committed cleanup"
+            );
+            assert_ne!(
+                row_version.end,
+                Some(TxTimestampOrID::TxID(tx_id)),
+                "row version for {id:?} still has end=TxID({tx_id}) after committed cleanup"
+            );
+        }
+    }
+}
+
 /// Any ddl specially CREATE INDEX must cause SchemaUpdated errors on ongoing INSERTS because
 /// we shouldn't commit an insert without inserting rows to this new index that is being created.
 /// Here we test that case by injecting in the middle of CREATE INDEX's commit and then doing a
@@ -8775,6 +8792,281 @@ fn test_build_log_record_yields_for_large_write_set() {
 
     drop(stmt);
     conn.close().unwrap();
+}
+
+#[test]
+fn repro_dropped_large_commit_after_rewrite_yield_skips_finalize() {
+    use super::MVCC_COMMIT_BATCH_SIZE;
+
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    let conn = db.connect();
+    let mv_store = db.get_mvcc_store();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    let n_rows = MVCC_COMMIT_BATCH_SIZE + 476;
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    for i in 1..=n_rows {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+            .unwrap();
+    }
+
+    let tx_id = conn
+        .get_mv_tx_id()
+        .expect("tx must be open after writes inside BEGIN CONCURRENT");
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    let mut committed_end_ts = None;
+    for _ in 0..32 {
+        match commit.step().unwrap() {
+            crate::StepResult::IO => {
+                let state = mv_store
+                    .txs
+                    .get(&tx_id)
+                    .map(|entry| entry.value().state.load());
+                if let Some(TransactionState::Committed(end_ts)) = state {
+                    committed_end_ts = Some(end_ts);
+                    break;
+                }
+            }
+            crate::StepResult::Done => {
+                panic!("commit completed before RewriteLiveVersions yielded")
+            }
+            other => panic!("unexpected commit step result: {other:?}"),
+        }
+    }
+    let committed_end_ts = committed_end_ts.expect("COMMIT never yielded after Committed state");
+    let write_set_snapshot = mv_store
+        .txs
+        .get(&tx_id)
+        .expect("committed tx should remain tracked until dropped cleanup")
+        .value()
+        .write_set
+        .lock()
+        .to_vec();
+
+    drop(commit);
+
+    assert_write_set_has_no_txid_refs(&write_set_snapshot, tx_id);
+    assert!(
+        !mv_store.txs.contains_key(&tx_id),
+        "dropped committed tx must be retired from txs"
+    );
+    assert!(
+        conn.get_mv_tx_id().is_none(),
+        "dropped committed tx must clear the connection mv_tx slot"
+    );
+    assert!(
+        mv_store.last_committed_tx_ts.load(Ordering::Acquire) >= committed_end_ts,
+        "dropped committed tx must publish the committed timestamp watermark"
+    );
+
+    conn.close().unwrap();
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT COUNT(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), n_rows as i64);
+    observer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+}
+
+#[test]
+fn repro_dropped_committed_tx_resolves_commit_dependencies() {
+    use super::MVCC_COMMIT_BATCH_SIZE;
+
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    let writer = db.connect();
+    let reader = db.connect();
+    let mv_store = db.get_mvcc_store();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    let n_rows = MVCC_COMMIT_BATCH_SIZE + 8;
+    for i in 1..=n_rows {
+        writer
+            .execute(format!("INSERT INTO t VALUES ({i}, 'base')"))
+            .unwrap();
+    }
+
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("UPDATE t SET v = 'writer'").unwrap();
+    let writer_tx_id = writer
+        .get_mv_tx_id()
+        .expect("writer tx must be open after UPDATE");
+
+    writer.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::CommitValidation.point(),
+    ])));
+    let mut commit = writer.prepare("COMMIT").unwrap();
+    let mut yielded_preparing = false;
+    for _ in 0..64 {
+        match commit.step().unwrap() {
+            crate::StepResult::IO => {
+                let state = mv_store
+                    .txs
+                    .get(&writer_tx_id)
+                    .map(|entry| entry.value().state.load());
+                if matches!(state, Some(TransactionState::Preparing(_))) {
+                    yielded_preparing = true;
+                    break;
+                }
+            }
+            crate::StepResult::Done => panic!("writer COMMIT completed before Preparing yield"),
+            other => panic!("unexpected writer COMMIT step result: {other:?}"),
+        }
+    }
+    assert!(yielded_preparing, "writer COMMIT should yield in Preparing");
+    writer.set_yield_injector(None);
+
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(&reader, "SELECT v FROM t WHERE id = 1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_text().unwrap(), "writer");
+    let reader_tx_id = reader
+        .get_mv_tx_id()
+        .expect("reader tx must stay open after speculative read");
+    let reader_tx = mv_store
+        .txs
+        .get(&reader_tx_id)
+        .expect("reader tx should be tracked");
+    assert_eq!(
+        reader_tx.value().commit_dep_counter.load(Ordering::Acquire),
+        1,
+        "reader should depend on the Preparing writer"
+    );
+    drop(reader_tx);
+    assert!(
+        mv_store
+            .txs
+            .get(&writer_tx_id)
+            .expect("writer tx should be tracked")
+            .value()
+            .commit_dep_set
+            .lock()
+            .contains(&reader_tx_id),
+        "writer commit_dep_set should contain the speculative reader"
+    );
+
+    let mut saw_committed_state_yield = false;
+    for _ in 0..256 {
+        match commit.step().unwrap() {
+            crate::StepResult::IO => {
+                let state = mv_store
+                    .txs
+                    .get(&writer_tx_id)
+                    .map(|entry| entry.value().state.load());
+                if matches!(state, Some(TransactionState::Committed(_))) {
+                    saw_committed_state_yield = true;
+                    break;
+                }
+            }
+            crate::StepResult::Done => {
+                panic!("writer COMMIT completed before committed-state drop point")
+            }
+            other => panic!("unexpected writer COMMIT step result: {other:?}"),
+        }
+    }
+    assert!(
+        saw_committed_state_yield,
+        "large writer COMMIT should yield after entering Committed state"
+    );
+
+    drop(commit);
+
+    let reader_tx = mv_store
+        .txs
+        .get(&reader_tx_id)
+        .expect("reader tx should still be active");
+    assert_eq!(
+        reader_tx.value().commit_dep_counter.load(Ordering::Acquire),
+        0,
+        "dropped committed writer must resolve dependent reader counter"
+    );
+    drop(reader_tx);
+    assert!(
+        !mv_store.txs.contains_key(&writer_tx_id),
+        "dropped committed writer must be retired from txs"
+    );
+
+    reader.execute("COMMIT").unwrap();
+    writer.close().unwrap();
+    reader.close().unwrap();
+}
+
+#[test]
+fn repro_dropped_schema_commit_before_global_header_finalize_publishes_metadata() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    let writer = db.connect();
+    let mv_store = db.get_mvcc_store();
+    let schema_cookie_before = mv_store
+        .with_header(|header| header.schema_cookie.get(), None)
+        .unwrap();
+
+    let injector = FixedYieldInjector::new([CommitYieldPoint::BeforeGlobalHeaderUpdate.point()]);
+    writer.set_yield_injector(Some(injector.clone()));
+    writer.execute("BEGIN").unwrap();
+    writer
+        .execute("CREATE TABLE dropped_commit_schema (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let tx_id = writer
+        .get_mv_tx_id()
+        .expect("schema transaction should have an MVCC tx");
+    let mut commit = writer.prepare("COMMIT").unwrap();
+    let mut yielded = false;
+    for _ in 0..256 {
+        match commit.step().unwrap() {
+            crate::StepResult::IO => {
+                if injector.is_empty() {
+                    yielded = true;
+                    break;
+                }
+            }
+            crate::StepResult::Done => {
+                panic!("COMMIT completed before BeforeGlobalHeaderUpdate yield fired")
+            }
+            other => panic!("unexpected commit step result: {other:?}"),
+        }
+    }
+    assert!(
+        yielded,
+        "COMMIT should yield in FinalizeCommit before global header publication"
+    );
+
+    drop(commit);
+    writer.set_yield_injector(None);
+    assert!(
+        !mv_store.txs.contains_key(&tx_id),
+        "dropped schema commit must retire the committed tx"
+    );
+    assert!(
+        writer.get_mv_tx_id().is_none(),
+        "dropped schema commit must clear the connection mv_tx slot"
+    );
+    assert!(
+        mv_store
+            .last_committed_schema_change_ts
+            .load(Ordering::Acquire)
+            > 0,
+        "dropped schema commit must publish the schema-change watermark"
+    );
+    let schema_cookie_after = mv_store
+        .with_header(|header| header.schema_cookie.get(), None)
+        .unwrap();
+    assert!(
+        schema_cookie_after > schema_cookie_before,
+        "dropped schema commit must publish the committed schema cookie"
+    );
+    writer.close().unwrap();
+
+    let observer = db.connect();
+    let rows = get_rows(
+        &observer,
+        "SELECT name FROM sqlite_schema WHERE name = 'dropped_commit_schema'",
+    );
+    assert_eq!(rows.len(), 1);
+    observer
+        .execute("INSERT INTO dropped_commit_schema VALUES (1)")
+        .unwrap();
+    observer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 }
 
 /// Regression guard for the `mv_store.txs` ↔ `connection.mv_tx_id` divergence
