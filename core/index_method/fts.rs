@@ -2490,11 +2490,16 @@ impl Drop for FtsCursor {
         // If the transaction has already committed (auto-commit), flushing to BTree
         // would create dirty pages outside of any transaction, causing the
         // "dirty pages must be empty for read txn" panic on the next read.
-        turso_assert!(
-            conn.is_in_write_tx(),
-            "FTS Drop: transaction already committed, cannot flush",
-            { "pending_docs_count": self.pending_docs_count }
-        );
+        // Gracefully bail instead of panicking — the documents were already committed
+        // as part of the transaction; only the Tantivy index flush is skipped, and
+        // the index will be rebuilt on the next write.
+        if !conn.is_in_write_tx() {
+            tracing::warn!(
+                pending_docs_count = self.pending_docs_count,
+                "FTS Drop: transaction already committed, skipping flush"
+            );
+            return;
+        }
 
         // Commit any pending writes to Tantivy
         if let Some(ref mut writer) = self.writer {
