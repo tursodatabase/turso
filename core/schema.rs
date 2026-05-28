@@ -859,7 +859,7 @@ impl Schema {
             }
             match self.type_registry.get(&current) {
                 Some(td) => {
-                    chain.push(Arc::clone(td));
+                    chain.try_push(Arc::clone(td))?;
                     current = td.base().to_lowercase();
                 }
                 None => {
@@ -921,14 +921,14 @@ impl Schema {
         for sql in type_sqls {
             self.add_type_from_sql(sql)?;
         }
-        self.resolve_all_custom_type_affinities();
+        self.resolve_all_custom_type_affinities()?;
         Ok(())
     }
 
     /// Resolve custom type affinities for all STRICT tables in the schema.
     /// Call this after loading user-defined types from __turso_internal_types
     /// so that columns declared with custom types use the BASE type's affinity.
-    pub fn resolve_all_custom_type_affinities(&mut self) {
+    pub fn resolve_all_custom_type_affinities(&mut self) -> Result<()> {
         let mut tables: SmallVec<[(String, Arc<Table>); 8]> = SmallVec::with_capacity(8);
         for (name, table) in self.tables.iter().filter(|(_, t)| {
             t.is_strict()
@@ -941,12 +941,13 @@ impl Schema {
             let bt = table.btree().expect("checked btree table");
             let mut modified = (*bt).clone();
             modified.resolve_custom_type_affinities(self);
-            modified.propagate_domain_constraints(self);
+            modified.propagate_domain_constraints(self)?;
             tables.push((name.clone(), Arc::new(Table::BTree(Arc::new(modified)))));
         }
         for (name, table) in tables {
             self.tables.insert(name, table);
         }
+        Ok(())
     }
 
     pub fn is_unique_idx_name(&self, name: &str) -> bool {
@@ -1820,7 +1821,7 @@ impl Schema {
 
                     let mut table = table;
                     table.resolve_custom_type_affinities(self);
-                    table.propagate_domain_constraints(self);
+                    table.propagate_domain_constraints(self)?;
                     self.add_btree_table(Arc::new(table))?;
                 }
             }
@@ -2904,9 +2905,9 @@ impl BTreeTable {
     /// - Sets the column's NOT NULL flag if any domain in the chain has NOT NULL
     /// - Adds domain CHECK constraints (with `value` rewritten to the column name)
     ///   to the table's check_constraints list
-    pub fn propagate_domain_constraints(&mut self, schema: &Schema) {
+    pub fn propagate_domain_constraints(&mut self, schema: &Schema) -> Result<()> {
         if !self.is_strict {
-            return;
+            return Ok(());
         }
         // Collect new constraints and notnull flags to avoid borrowing issues
         let mut new_checks = Vec::new();
@@ -2922,7 +2923,7 @@ impl BTreeTable {
             let col_name = col.name.as_deref().unwrap_or("").to_string();
             for td in &resolved.chain {
                 if td.not_null {
-                    notnull_cols.push(col_idx);
+                    notnull_cols.try_push(col_idx)?;
                 }
                 for (i, dc) in td.domain_checks.iter().enumerate() {
                     let rewritten = rewrite_value_to_column(&dc.check, &col_name);
@@ -2930,11 +2931,11 @@ impl BTreeTable {
                         .name
                         .clone()
                         .unwrap_or_else(|| format!("{}_{}", td.name, i));
-                    new_checks.push(CheckConstraint {
+                    new_checks.try_push(CheckConstraint {
                         name: Some(name),
                         expr: *rewritten,
                         column: Some(col_name.clone()),
-                    });
+                    })?;
                 }
             }
         }
@@ -2942,7 +2943,8 @@ impl BTreeTable {
         for col_idx in notnull_cols {
             self.columns[col_idx].set_notnull(true);
         }
-        self.check_constraints.extend(new_checks);
+        self.check_constraints.try_extend(new_checks)?;
+        Ok(())
     }
 
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {

@@ -1283,8 +1283,8 @@ pub fn translate_alter_table(
             // added column. Without this, columns typed with a domain would
             // silently skip domain-level enforcement after ALTER TABLE.
             resolver.with_schema(database_id, |schema| {
-                btree.propagate_domain_constraints(schema);
-            });
+                btree.propagate_domain_constraints(schema)
+            })?;
             // Refresh local `column` from btree so that domain NOT NULL is
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
