@@ -21,8 +21,9 @@ use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::types::{
-    compare_immutable, compare_immutable_single, compare_records_generic, AsValueRef, Extendable,
-    IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
+    compare_immutable, compare_immutable_single, compare_iter_with, compare_records_generic,
+    AsValueRef, Extendable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text,
+    ValueIterator,
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers,
@@ -707,7 +708,7 @@ pub fn op_null_row(
 }
 
 pub fn op_compare(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -724,6 +725,13 @@ pub fn op_compare(
     let start_reg_a = *start_reg_a;
     let start_reg_b = *start_reg_b;
     let count = *count;
+    if unlikely(key_info.len() != count) {
+        return Err(LimboError::InternalError(format!(
+            "Compare key_info/count mismatch: {} != {}",
+            key_info.len(),
+            count
+        )));
+    }
 
     if unlikely(start_reg_a + count > start_reg_b) {
         return Err(LimboError::InternalError(
@@ -734,10 +742,12 @@ pub fn op_compare(
     // (https://github.com/tursodatabase/turso/issues/2304): reusing logic from compare_immutable().
     // TODO: There are tons of cases like this where we could reuse this in a similar vein
     let a_range =
-        (start_reg_a..start_reg_a + count + 1).map(|idx| state.registers[idx].get_value());
+        (start_reg_a..start_reg_a + count).map(|idx| Ok(state.registers[idx].get_value()));
     let b_range =
-        (start_reg_b..start_reg_b + count + 1).map(|idx| state.registers[idx].get_value());
-    let cmp = compare_immutable(a_range, b_range, key_info);
+        (start_reg_b..start_reg_b + count).map(|idx| Ok(state.registers[idx].get_value()));
+    let cmp = compare_iter_with(a_range, b_range, key_info, |l, r, collation| {
+        compare_with_program_collation(program, l, r, collation)
+    })?;
 
     state.last_compare = Some(cmp);
     state.pc += 1;
