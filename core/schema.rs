@@ -1383,7 +1383,7 @@ impl Schema {
                     state.read_tx_active = true;
 
                     state.accumulators = Some(MakeFromBtreeAccumulators {
-                        from_sql_indexes: Vec::with_capacity(10),
+                        from_sql_indexes: Vec::try_with_capacity_ext(10)?,
                         automatic_indices: HashMap::with_capacity_and_hasher(10, FxBuildHasher),
                         dbsp_state_roots: HashMap::default(),
                         dbsp_state_index_roots: HashMap::default(),
@@ -1604,7 +1604,7 @@ impl Schema {
                 } else {
                     // Add composite unique index
                     let mut column_indices_and_sort_orders =
-                        Vec::with_capacity(unique_set.columns.len());
+                        Vec::try_with_capacity_ext(unique_set.columns.len())?;
                     for (col_name, sort_order) in unique_set.columns.iter() {
                         let Some((pos_in_table, _)) = table.get_column(col_name) else {
                             return Err(crate::LimboError::ParseError(format!(
@@ -1612,6 +1612,7 @@ impl Schema {
                                 col_name, table.name
                             )));
                         };
+                        // preallocated enough to no use try_push
                         column_indices_and_sort_orders.push((pos_in_table, *sort_order));
                     }
                     if let Some(index_entry) = automatic_indexes.pop() {
@@ -2000,7 +2001,7 @@ impl Schema {
             .get_btree_table(&target)
             .ok_or_else(|| fk_mismatch_err("<unknown>", &target))?;
 
-        let mut out = Vec::with_capacity(4); // arbitrary estimate
+        let mut out = Vec::try_with_capacity_ext(4)?; // arbitrary estimate
         for t in self.tables.values() {
             let Some(child) = t.btree() else {
                 continue;
@@ -2009,12 +2010,12 @@ impl Schema {
                 if !fk.parent_table.eq_ignore_ascii_case(&target) {
                     continue;
                 }
-                out.push(self.resolve_fk(
+                out.try_push(self.resolve_fk(
                     fk,
                     &child,
                     &parent_tbl,
                     /*require_unique=*/ false,
-                )?);
+                )?)?;
             }
         }
         Ok(out)
@@ -2029,12 +2030,13 @@ impl Schema {
             .get_btree_table(&child_name)
             .ok_or_else(|| fk_mismatch_err(&child_name, "<unknown>"))?;
 
-        let mut out = Vec::with_capacity(child.foreign_keys.len());
+        let mut out = Vec::try_with_capacity_ext(child.foreign_keys.len())?;
         for fk in &child.foreign_keys {
             let parent_name = normalize_ident(&fk.parent_table);
             let parent_tbl = self
                 .get_btree_table(&parent_name)
                 .ok_or_else(|| fk_mismatch_err(&child.name, &parent_name))?;
+            // Preallocated enough to not use try_push
             out.push(self.resolve_fk(fk, &child, &parent_tbl, /*require_unique=*/ true)?);
         }
         Ok(out)
@@ -2056,11 +2058,12 @@ impl Schema {
             return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
         }
 
-        let mut child_pos: Vec<usize> = Vec::with_capacity(fk.child_columns.len());
+        let mut child_pos: Vec<usize> = Vec::try_with_capacity_ext(fk.child_columns.len())?;
         for cname in fk.child_columns.iter() {
             let (i, _) = child
                 .get_column(cname)
                 .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?;
+            // Preallocated enough to not use try_push
             child_pos.push(i);
         }
 
@@ -2082,7 +2085,7 @@ impl Schema {
             return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
         }
 
-        let mut parent_pos: Vec<usize> = Vec::with_capacity(parent_cols.len());
+        let mut parent_pos: Vec<usize> = Vec::try_with_capacity_ext(parent_cols.len())?;
         for pc in parent_cols.iter() {
             let pos = parent_tbl.get_column(pc).map(|(i, _)| i).or_else(|| {
                 ROWID_STRS
@@ -2093,6 +2096,7 @@ impl Schema {
             let Some(p) = pos else {
                 return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
             };
+            // Preallocated enough to not use try_push
             parent_pos.push(p);
         }
 
@@ -2638,14 +2642,14 @@ impl GeneratedColGraph {
         }
 
         // Kahn's algorithm (topological sort) over direct_deps.
-        let mut topological_sort: Vec<usize> = Vec::with_capacity(n);
+        let mut topological_sort: Vec<usize> = Vec::try_with_capacity_ext(n)?;
         let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).try_collect()?;
         while let Some(i) = ready.pop() {
-            topological_sort.push(i);
+            topological_sort.try_push(i)?;
             for j in direct_dependents[i].iter() {
                 in_degree[j] -= 1;
                 if in_degree[j] == 0 {
-                    ready.push(j);
+                    ready.try_push(j)?;
                 }
             }
         }
@@ -3765,8 +3769,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     conflict_clause,
                 } = &c.constraint
                 {
-                    let mut unique_columns = Vec::with_capacity(columns.len());
+                    let mut unique_columns = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
+                        // preallocated enough to not need try_push
                         match column.expr.as_ref() {
                             Expr::Id(id) => unique_columns.push((
                                 id.as_str().to_string(),
@@ -5048,7 +5053,7 @@ impl Index {
         assert!(has_primary_key_index);
         let (index_name, root_page) = auto_index;
 
-        let mut primary_keys = Vec::with_capacity(column_count);
+        let mut primary_keys = Vec::try_with_capacity_ext(column_count)?;
         for (col_name, order) in table.primary_key_columns.iter() {
             let Some((pos_in_table, _)) = table.get_column(col_name) else {
                 return Err(crate::LimboError::ParseError(format!(
@@ -5057,6 +5062,7 @@ impl Index {
                 )));
             };
             let (_, column) = table.get_column(col_name).unwrap();
+            // preallocated enough to not need try_push
             primary_keys.push(IndexColumn {
                 name: normalize_ident(col_name),
                 order: *order,
@@ -5091,7 +5097,7 @@ impl Index {
     ) -> Result<Index> {
         let (index_name, root_page) = auto_index;
 
-        let mut unique_cols = Vec::with_capacity(column_indices_and_sort_orders.len());
+        let mut unique_cols = Vec::try_with_capacity_ext(column_indices_and_sort_orders.len())?;
         for (pos, sort_order) in &column_indices_and_sort_orders {
             let Some((pos_in_table, col)) = table
                 .columns
@@ -5104,6 +5110,7 @@ impl Index {
                     table.name
                 )));
             };
+            // preallocated enough to not need try_push
             unique_cols.push(IndexColumn {
                 name: normalize_ident(col.name.as_ref().unwrap()),
                 order: *sort_order,
