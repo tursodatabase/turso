@@ -82,6 +82,7 @@ where
                     ast::Expr::FunctionCall {
                         args,
                         order_by,
+                        within_group,
                         filter_over,
                         ..
                     } => {
@@ -90,6 +91,9 @@ where
                         }
                         if let Some(filter_clause) = &filter_over.filter_clause {
                             stack.push(WalkItem::Expr(filter_clause));
+                        }
+                        for sort_col in within_group.iter().rev() {
+                            stack.push(WalkItem::Expr(&sort_col.expr));
                         }
                         for sort_col in order_by.iter().rev() {
                             stack.push(WalkItem::Expr(&sort_col.expr));
@@ -287,6 +291,7 @@ where
                     ast::Expr::FunctionCall {
                         args,
                         order_by,
+                        within_group,
                         filter_over,
                         ..
                     } => {
@@ -295,6 +300,9 @@ where
                         }
                         if let Some(filter_clause) = &mut filter_over.filter_clause {
                             stack.push(WalkItem::Expr(filter_clause));
+                        }
+                        for sort_col in within_group.iter_mut().rev() {
+                            stack.push(WalkItem::Expr(&mut sort_col.expr));
                         }
                         for sort_col in order_by.iter_mut().rev() {
                             stack.push(WalkItem::Expr(&mut sort_col.expr));

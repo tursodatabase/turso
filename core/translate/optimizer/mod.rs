@@ -627,6 +627,7 @@ fn transform_match_to_fts_match(
                         distinctness: None,
                         args,
                         order_by: vec![],
+                        within_group: vec![],
                         filter_over: FunctionTail {
                             filter_clause: None,
                             over_clause: None,
@@ -3682,6 +3683,7 @@ mod tests {
             distinctness: None,
             args: args.into_iter().map(Box::new).collect(),
             order_by: vec![],
+            within_group: vec![],
             filter_over: no_tail(),
         }
     }

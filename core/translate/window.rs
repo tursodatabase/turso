@@ -395,6 +395,7 @@ fn rewrite_expr_referencing_current_window(
             distinctness: _,
             args,
             order_by,
+            within_group: _,
             filter_over,
         } => {
             for arg in args.iter_mut() {

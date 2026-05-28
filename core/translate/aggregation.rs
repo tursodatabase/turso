@@ -5,18 +5,19 @@ use crate::{
     schema::Table,
     sync::Arc,
     translate::collate::CollationSeq,
+    util::parse_numeric_literal,
     vdbe::{
         builder::ProgramBuilder,
         insn::{HashDistinctData, Insn},
     },
-    LimboError, Result,
+    LimboError, Numeric, Result, Value,
 };
 
 use super::{
     emitter::{OperationMode, Resolver, TranslateCtx},
     expr::{
         resolve_expr, translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
-        ConditionMetadata, NoConstantOptReason,
+        walk_expr, ConditionMetadata, NoConstantOptReason, WalkControl,
     },
     plan::{Aggregate, Distinctness, SelectPlan, TableReferences},
     result_row::emit_select_result,
@@ -330,6 +331,41 @@ impl<'a> AggArgumentSource<'a> {
     }
 }
 
+/// Evaluates a compile-time numeric constant expression (numeric literals combined with
+/// unary +/- and the basic arithmetic operators), or returns `None` if the expression is
+/// not such a constant. Numeric literals are parsed by the shared [`parse_numeric_literal`]
+/// (so hex, digit separators, etc. are handled consistently); only the arithmetic
+/// combination — which no existing helper provides — is done here. Used to range-check an
+/// ordered-set aggregate's fraction argument before execution, so an out-of-range constant
+/// is reported regardless of row count (matching PostgreSQL, which evaluates the direct
+/// argument once).
+fn constant_numeric_value(expr: &ast::Expr) -> Option<f64> {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Numeric(s)) => match parse_numeric_literal(s).ok()? {
+            Value::Numeric(Numeric::Integer(i)) => Some(i as f64),
+            Value::Numeric(Numeric::Float(f)) => Some(f64::from(f)),
+            _ => None,
+        },
+        ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
+            constant_numeric_value(inner).map(|v| -v)
+        }
+        ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => constant_numeric_value(inner),
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => constant_numeric_value(&exprs[0]),
+        ast::Expr::Binary(lhs, op, rhs) => {
+            let a = constant_numeric_value(lhs)?;
+            let b = constant_numeric_value(rhs)?;
+            match op {
+                ast::Operator::Add => Some(a + b),
+                ast::Operator::Subtract => Some(a - b),
+                ast::Operator::Multiply => Some(a * b),
+                ast::Operator::Divide => Some(a / b),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Emits the bytecode for processing an aggregate step.
 ///
 /// This is distinct from the final step, which is called after a single group has been entirely accumulated,
@@ -553,6 +589,90 @@ pub fn translate_aggregation_step(
                 col: expr_reg,
                 delimiter: 0,
                 func: AggFunc::ArrayAgg,
+                comparator: None,
+            });
+            target_register
+        }
+        AggFunc::Mode => {
+            // Planner rewrites `mode() WITHIN GROUP (ORDER BY x)` to a single arg `[x]`.
+            if num_args != 1 {
+                crate::bail_parse_error!("mode bad number of arguments");
+            }
+            let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            // Activate the value's collation so finalize can sort text correctly.
+            let expr = &agg_arg_source.arg_at(0);
+            emit_collseq_if_needed(program, referenced_tables, expr, resolver);
+            program.emit_insn(Insn::AggStep {
+                acc_reg: target_register,
+                col: value_reg,
+                delimiter: 0,
+                func: AggFunc::Mode,
+                comparator: None,
+            });
+            target_register
+        }
+        AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+            // Planner rewrites `percentile_*(fraction) WITHIN GROUP (ORDER BY x)` to
+            // args `[x, fraction]`: the value goes in `col`, the fraction in `delimiter`.
+            if num_args != 2 {
+                crate::bail_parse_error!("percentile bad number of arguments");
+            }
+            // The fraction is a "direct argument": it must be constant with respect to the
+            // aggregated rows, otherwise the result would silently depend on which row was
+            // stepped last. A reference to an outer (correlated) column is fine — it is
+            // constant for the inner aggregate — so only this query's own columns are
+            // rejected. A subquery may hide an input-column reference that is no longer
+            // visible here once it has been planned, so subqueries are rejected
+            // conservatively (PostgreSQL allows a non-correlated subquery; we are stricter
+            // rather than risk a wrong result).
+            let fraction_expr = agg_arg_source.arg_at(1);
+            let mut invalid_fraction = false;
+            walk_expr(fraction_expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+                match e {
+                    // `find_table_by_internal_id` returns `(is_outer, _)`; only a local
+                    // (non-outer) column makes the fraction vary per input row.
+                    ast::Expr::Column { table, .. }
+                        if matches!(
+                            referenced_tables.find_table_by_internal_id(*table),
+                            Some((false, _))
+                        ) =>
+                    {
+                        invalid_fraction = true;
+                    }
+                    ast::Expr::Subquery(_)
+                    | ast::Expr::Exists(_)
+                    | ast::Expr::SubqueryResult { .. } => {
+                        invalid_fraction = true;
+                    }
+                    _ => {}
+                }
+                Ok(WalkControl::Continue)
+            })?;
+            if invalid_fraction {
+                crate::bail_parse_error!(
+                    "the fraction argument of {}() must be a constant expression that does \
+                     not depend on the aggregated rows",
+                    func
+                );
+            }
+            // Validate a constant fraction's range at compile time so it is reported even
+            // when no rows are accumulated (empty input, all-NULL, or a FILTER excluding
+            // every row); PostgreSQL validates the fraction regardless of row count.
+            if let Some(frac) = constant_numeric_value(fraction_expr) {
+                if !(0.0..=1.0).contains(&frac) {
+                    crate::bail_parse_error!("percentile value {frac} is not between 0 and 1");
+                }
+            }
+            let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            let fraction_reg = agg_arg_source.translate(program, referenced_tables, resolver, 1)?;
+            // Activate the value's collation so percentile_disc sorts text correctly.
+            let expr = &agg_arg_source.arg_at(0);
+            emit_collseq_if_needed(program, referenced_tables, expr, resolver);
+            program.emit_insn(Insn::AggStep {
+                acc_reg: target_register,
+                col: value_reg,
+                delimiter: fraction_reg,
+                func: func.clone(),
                 comparator: None,
             });
             target_register

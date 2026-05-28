@@ -521,6 +521,7 @@ fn compose_update_set_clause(existing: &mut UpdateSetClause, expr: Box<Expr>) {
                 distinctness: None,
                 args: composed_args,
                 order_by: vec![],
+                within_group: vec![],
                 filter_over: turso_parser::ast::FunctionTail {
                     filter_clause: None,
                     over_clause: None,

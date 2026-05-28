@@ -1006,6 +1006,7 @@ impl IncrementalView {
                 distinctness,
                 filter_over,
                 order_by,
+                within_group,
             } => ast::Expr::FunctionCall {
                 name: name.clone(),
                 args: args
@@ -1015,6 +1016,7 @@ impl IncrementalView {
                 distinctness: *distinctness,
                 filter_over: filter_over.clone(),
                 order_by: order_by.clone(),
+                within_group: within_group.clone(),
             },
             ast::Expr::InList { lhs, not, rhs } => ast::Expr::InList {
                 lhs: Box::new(Self::unqualify_expression(lhs, table_name, aliases)),
