@@ -2088,6 +2088,7 @@ impl Connection {
                     slot.is_none(),
                     "yield injector should be empty before installing a new one"
                 );
+                self.get_pager().set_yield_injector(Some(injector.clone()));
                 *slot = Some(injector);
             }
             None => {
@@ -2095,6 +2096,7 @@ impl Connection {
                     slot.is_some(),
                     "yield injector should be installed before it is cleared"
                 );
+                self.get_pager().set_yield_injector(None);
                 *slot = None;
             }
         }
