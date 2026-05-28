@@ -650,8 +650,7 @@ fn bench_insert_rows(criterion: &mut Criterion) {
 
         #[allow(clippy::arc_with_non_send_sync)]
         let mvcc_io = Arc::new(PlatformIO::new().unwrap());
-        let mvcc_db =
-            Database::open_file(mvcc_io.clone(), mvcc_db_path.to_str().unwrap()).unwrap();
+        let mvcc_db = Database::open_file(mvcc_io.clone(), mvcc_db_path.to_str().unwrap()).unwrap();
         let mvcc_conn = mvcc_db.connect().unwrap();
         mvcc_conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         if disable_checkpoint {
