@@ -3,6 +3,7 @@ import { Session, type SessionConfig, type BatchMode } from './session.js';
 import { Statement } from './statement.js';
 import { type QueryOptions } from './protocol.js';
 import { normalizeArgs, splitBindParameters } from './args.js';
+import { createExpandedRow } from './row.js';
 
 export type { BatchMode } from './session.js';
 
@@ -156,9 +157,7 @@ export class Connection {
       const result = await this.session.execute(sql, normalizeArgs(params), this.defaultSafeIntegerMode, queryOptions);
       const row = result.rows[0];
       if (!row) return undefined;
-      const obj: any = {};
-      result.columns.forEach((col: string, i: number) => { obj[col] = row[i]; });
-      return obj;
+      return createExpandedRow(row, result.columns);
     } finally {
       this.execLock.release();
     }
@@ -173,11 +172,7 @@ export class Connection {
     await this.execLock.acquire();
     try {
       const result = await this.session.execute(sql, normalizeArgs(params), this.defaultSafeIntegerMode, queryOptions);
-      return result.rows.map((row: any) => {
-        const obj: any = {};
-        result.columns.forEach((col: string, i: number) => { obj[col] = row[i]; });
-        return obj;
-      });
+      return result.rows.map((row: any) => createExpandedRow(row, result.columns));
     } finally {
       this.execLock.release();
     }

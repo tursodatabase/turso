@@ -646,6 +646,22 @@ test.serial("Statement.get() [raw]", async (t) => {
   t.deepEqual(await stmt.raw().get(1), [1, "Alice", "alice@example.org"]);
 });
 
+test.serial("Database.all() preserves positional values for duplicate column names", async (t) => {
+  const db = t.context.db;
+
+  await db.exec("DROP TABLE IF EXISTS role; DROP TABLE IF EXISTS org_unit");
+  await db.exec("CREATE TABLE role(path TEXT); CREATE TABLE org_unit(path TEXT)");
+  await db.exec("INSERT INTO role VALUES ('/Employee'); INSERT INTO org_unit VALUES ('/')");
+
+  const [row] = await db.all("SELECT role.path, org_unit.path FROM role JOIN org_unit");
+
+  t.deepEqual(Object.keys(row), ["path"]);
+  t.is(row.path, "/");
+  t.is(row[0], "/Employee");
+  t.is(row[1], "/");
+  t.deepEqual(row, { path: "/" });
+});
+
 test.serial("Statement.get() values", async (t) => {
   const db = t.context.db;
 
