@@ -241,7 +241,7 @@ mod tests {
                         tracing::debug!("{prefix}: {i}");
                     }
                     if i % 10000 == 0 {
-                        let dropped = mvcc_store.drop_unused_row_versions();
+                        let dropped = mvcc_store.drop_unused_row_versions().unwrap();
                         tracing::debug!("garbage collected {dropped} versions");
                     }
                     let tx = loop {

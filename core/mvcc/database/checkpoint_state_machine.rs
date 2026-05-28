@@ -1,3 +1,4 @@
+use crate::alloc::*;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
@@ -312,7 +313,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         connection: Arc<Connection>,
         update_transaction_state: bool,
         sync_mode: SyncMode,
-    ) -> Self {
+    ) -> Result<Self> {
         let checkpoint_lock = mvstore.blocking_checkpoint_lock.clone();
         // Prevent stale per-connection schema during checkpoint by using the shared DB schema.
         // Unlike in WAL mode we actually write stuff from mv store to pager in checkpoint
@@ -329,7 +330,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     index.clone(),
                 )
             })
-            .collect();
+            .try_collect()?;
         let mvcc_meta_table = schema.get_btree_table(MVCC_META_TABLE_NAME).map(|table| {
             turso_assert!(
                 table.root_page != 0,
@@ -345,7 +346,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         let durable_txid_max_old = NonZeroU64::new(durable_tx_max);
         #[cfg(any(test, injected_yields))]
         let yield_instance_id = connection.next_yield_instance_id();
-        Self {
+        Ok(Self {
             state: CheckpointState::AcquireLock,
             lock_states: LockStates {
                 blocking_checkpoint_lock_held: false,
@@ -379,7 +380,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             collect_table_cursor: None,
             collect_index_tableid_cursor: None,
             collect_index_key_cursor: None,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -1897,7 +1898,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             CheckpointState::Finalize => {
                 tracing::debug!("Releasing blocking checkpoint lock");
-                self.mvstore.drop_unused_row_versions();
+                self.mvstore.drop_unused_row_versions()?;
                 self.checkpoint_lock.unlock();
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(
@@ -1943,6 +1944,7 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
     use crate::mvcc::database::tests::MvccTestDbNoConn;
     use crate::mvcc::database::SortableIndexKey;
     use crate::translate::collate::CollationSeq;
@@ -2117,7 +2119,8 @@ mod tests {
             conn.clone(),
             true,
             conn.get_sync_mode(),
-        );
+        )
+        .unwrap();
         checkpoint.durable_txid_max_old = std::num::NonZeroU64::new(10);
         checkpoint.durable_txid_max_new = 10;
 
@@ -2175,7 +2178,8 @@ mod tests {
             conn.clone(),
             true,
             conn.get_sync_mode(),
-        );
+        )
+        .unwrap();
 
         // More than one chunk worth of committed rows so collection must preempt.
         let table_id = MVTableId::from(-2);
@@ -2213,7 +2217,8 @@ mod tests {
             conn.clone(),
             true,
             conn.get_sync_mode(),
-        );
+        )
+        .unwrap();
 
         let index_id = MVTableId::from(-7);
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;

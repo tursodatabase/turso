@@ -1,3 +1,4 @@
+use crate::alloc::*;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 #[cfg(any(test, injected_yields))]
@@ -383,8 +384,8 @@ pub struct LogRecord {
 }
 
 impl LogRecord {
-    pub(crate) fn new(tx_timestamp: TxID) -> Self {
-        Self {
+    pub(crate) fn new(tx_timestamp: TxID) -> Result<Self> {
+        Ok(Self {
             tx_timestamp,
             // Pre-reserve the framing prefix at the front of buf:
             //   [LOG_HDR slot (56B) | TX_HEADER slot (24B) | <ops here>]
@@ -392,14 +393,14 @@ impl LogRecord {
             // a log file; otherwise it stays zero and the flush path wraps
             // the buf with `Buffer::new_with_start(..., LOG_HDR_SIZE)` so
             // those 56 bytes never reach disk.
-            buf: vec![0u8; crate::mvcc::persistent_storage::logical_log::LOG_RECORD_PREFIX_SIZE],
+            buf: try_vec![0u8; crate::mvcc::persistent_storage::logical_log::LOG_RECORD_PREFIX_SIZE]?,
             op_count: 0,
             has_header: false,
             #[cfg(feature = "conn_raw_api")]
             portable_changes: Vec::new(),
             #[cfg(feature = "conn_raw_api")]
             portable_changes_enabled: false,
-        }
+        })
     }
 
     /// True iff no ops (row versions or header) have been appended.
@@ -424,7 +425,7 @@ impl LogRecord {
         row_versions: &[RowVersion],
         header: Option<DatabaseHeader>,
     ) -> Self {
-        let mut record = Self::new(tx_timestamp);
+        let mut record = Self::new(tx_timestamp).unwrap();
         for rv in row_versions {
             record.push_row_version_for_test(rv);
         }
@@ -870,7 +871,7 @@ impl Transaction {
 
     /// Release a named savepoint. If this savepoint starts a transaction, returns
     /// [SavepointResult::Commit] to indicate the transaction should be committed.
-    fn release_named_savepoint(&self, name: &str) -> SavepointResult {
+    fn release_named_savepoint(&self, name: &str) -> Result<SavepointResult> {
         let mut savepoints = self.savepoint_stack.write();
         let Some(target_idx) = savepoints.iter().rposition(|savepoint| {
             matches!(
@@ -881,7 +882,7 @@ impl Transaction {
                 } if savepoint_name == name
             )
         }) else {
-            return SavepointResult::NotFound;
+            return Ok(SavepointResult::NotFound);
         };
 
         let commits_transaction = if matches!(
@@ -899,24 +900,24 @@ impl Transaction {
         if matches!(commits_transaction, SavepointResult::Commit) {
             // Defer mutation until transaction commit succeeds. If commit fails
             // (e.g. deferred FK violation), savepoints must remain intact.
-            return commits_transaction;
+            return Ok(commits_transaction);
         }
 
-        let drained: Vec<Savepoint> = savepoints.drain(target_idx..).collect();
+        let drained: Vec<Savepoint> = savepoints.drain(target_idx..).try_collect()?;
         if let Some(parent) = savepoints.last_mut() {
             for savepoint in drained {
                 parent.merge_from(savepoint);
             }
         }
-        commits_transaction
+        Ok(commits_transaction)
     }
 
     /// Find the named savepoint to rollback to and pop all savepoints above it. Returns the rolled
     /// back savepoints and net change in deferred FK violations for undoing changes to transaction
     /// state.
-    fn rollback_to_named_savepoint(&self, name: &str) -> Option<SavepointRollbackResult> {
+    fn rollback_to_named_savepoint(&self, name: &str) -> Result<Option<SavepointRollbackResult>> {
         let mut savepoints = self.savepoint_stack.write();
-        let target_idx = savepoints.iter().rposition(|savepoint| {
+        let Some(target_idx) = savepoints.iter().rposition(|savepoint| {
             matches!(
                 savepoint.kind,
                 SavepointKind::Named {
@@ -924,7 +925,9 @@ impl Transaction {
                     ..
                 } if savepoint_name == name
             )
-        })?;
+        }) else {
+            return Ok(None);
+        };
 
         let target_name = match &savepoints[target_idx].kind {
             SavepointKind::Named { name, .. } => name.clone(),
@@ -941,7 +944,7 @@ impl Transaction {
         let header = savepoints[target_idx].header;
         let header_dirty = savepoints[target_idx].header_dirty;
 
-        let drained: Vec<Savepoint> = savepoints.drain(target_idx..).collect();
+        let drained: Vec<Savepoint> = savepoints.drain(target_idx..).try_collect()?;
         savepoints.push(Savepoint::named(
             target_name,
             starts_transaction,
@@ -949,10 +952,10 @@ impl Transaction {
             header,
             header_dirty,
         ));
-        Some(SavepointRollbackResult {
+        Ok(Some(SavepointRollbackResult {
             rolledback_savepoints: drained,
             deferred_fk_violations,
-        })
+        }))
     }
 
     /// Record a version that was created during the current savepoint.
@@ -2136,7 +2139,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         // Move the assembled log record out and transition to
         // BeginCommitLogicalLog (or directly to CommitEnd if there is nothing
         // to log).
-        let mut log_record = std::mem::replace(&mut ctx.log_record, LogRecord::new(end_ts));
+        let mut log_record = std::mem::replace(&mut ctx.log_record, LogRecord::new(end_ts)?);
         self.populate_portable_changes(mvcc_store, &mut log_record)?;
         tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
 
@@ -2802,7 +2805,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 };
                 self.state = CommitState::BuildLogRecord(BuildLogRecordCtx {
                     end_ts,
-                    log_record: LogRecord::new(end_ts),
+                    log_record: LogRecord::new(end_ts)?,
                     cursor: 0,
                     schema_process: true,
                     pending_header,
@@ -3050,7 +3053,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         self.connection.clone(),
                         false,
                         self.connection.get_sync_mode(),
-                    ));
+                    )?);
                     let state_machine = Mutex::new(state_machine);
                     self.state = CommitState::Checkpoint { state_machine };
                     return Ok(TransitionResult::Continue);
@@ -3422,8 +3425,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Captures table-valued functions (e.g. generate_series) from the schema before
     /// reparse_schema() drops them. Built-in TVFs are registered programmatically and
     /// don't survive schema re-parsing from sqlite_schema; we save and re-inject them.
-    fn capture_table_valued_functions(schema: &Schema) -> Vec<Arc<crate::vtab::VirtualTable>> {
-        schema
+    fn capture_table_valued_functions(
+        schema: &Schema,
+    ) -> Result<Vec<Arc<crate::vtab::VirtualTable>>> {
+        Ok(schema
             .tables
             .values()
             .filter_map(|table| match table.as_ref() {
@@ -3434,7 +3439,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 }
                 _ => None,
             })
-            .collect()
+            .try_collect()?)
     }
 
     fn rehydrate_table_valued_functions(
@@ -3465,10 +3470,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn new(
         clock: Clock,
         storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             rows: SkipMap::new(),
-            table_id_to_rootpage: SkipMap::from_iter(vec![(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1))]), // table id 1 / root page 1 is always sqlite_schema.
+            // TODO: this will require allocations in the future so preemptively set this function as Result<Self>
+            table_id_to_rootpage: SkipMap::from_iter([(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1))]), // table id 1 / root page 1 is always sqlite_schema.
             index_rows: SkipMap::new(),
             txs: SkipMap::new(),
             finalized_tx_states: SkipMap::new(),
@@ -3486,7 +3492,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
-        }
+        })
     }
 
     /// Get the table ID from the root page.
@@ -3568,13 +3574,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// The caller must hold the MVCC vacuum gate and pass both the committed
     /// page-1 header and the schema parsed from the post-VACUUM physical
     /// database image.
-    pub(crate) fn reset_after_vacuum(&self, header: DatabaseHeader, schema: &Schema) {
+    pub(crate) fn reset_after_vacuum(&self, header: DatabaseHeader, schema: &Schema) -> Result<()> {
         turso_assert!(
             self.txs.is_empty(),
             "MVCC VACUUM reset requires no active transactions"
         );
         // see the test `test_mvcc_plain_vacuum_active_write_tx_returns_busy`
-        self.drop_unused_row_versions();
+        self.drop_unused_row_versions()?;
         let has_table_versions = self
             .rows
             .iter()
@@ -3616,13 +3622,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     .flatten()
                     .map(|index| index.root_page),
             )
-            .collect::<Vec<_>>();
-        for &root_page in &root_pages {
-            turso_assert!(
-                root_page > 0,
-                "post-VACUUM B-tree root page must be positive"
-            );
-        }
+            .inspect(|&root_page| {
+                turso_assert!(
+                    root_page > 0,
+                    "post-VACUUM B-tree root page must be positive"
+                );
+            });
         self.table_id_to_rootpage.clear();
         self.table_id_to_last_rowid.write().clear();
         self.insert_table_id_to_rootpage(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1));
@@ -3631,6 +3636,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.insert_table_id_to_rootpage(table_id, Some(root_page as u64));
         }
         self.global_header.write().replace(header);
+        Ok(())
     }
 
     /// Creates the `__turso_internal_mvcc_meta` table and seeds it with
@@ -3693,7 +3699,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// 6. Make sure schema changes reflected from deserialized logical log are captured in the schema
     pub fn bootstrap(&self, bootstrap_conn: Arc<Connection>) -> Result<()> {
         let preserved_table_valued_functions =
-            Self::capture_table_valued_functions(&bootstrap_conn.schema.read());
+            Self::capture_table_valued_functions(&bootstrap_conn.schema.read())?;
         self.maybe_complete_interrupted_checkpoint(&bootstrap_conn)?;
         bootstrap_conn.reparse_schema()?;
         self.rehydrate_connection_table_valued_functions(
@@ -4244,7 +4250,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn scan_row_ids(&self) -> Result<Vec<RowID>> {
         tracing::trace!("scan_row_ids");
         let keys = self.rows.iter().map(|entry| entry.key().clone());
-        Ok(keys.collect())
+        Ok(keys.try_collect()?)
     }
 
     pub fn get_row_id_range(
@@ -5037,7 +5043,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .txs
             .get(&tx_id)
             .unwrap_or_else(|| panic!("Transaction {tx_id} not found while releasing savepoint"));
-        Ok(tx.value().release_named_savepoint(name))
+        tx.value().release_named_savepoint(name)
     }
 
     /// Rolls back a savepoint within a transaction.
@@ -5073,7 +5079,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let Some(SavepointRollbackResult {
             rolledback_savepoints,
             deferred_fk_violations,
-        }) = tx.value().rollback_to_named_savepoint(name)
+        }) = tx.value().rollback_to_named_savepoint(name)?
         else {
             return Ok(None);
         };
@@ -5392,14 +5398,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Uses the low-water mark (LWM) to determine reclaimability in O(1) per version.
     /// Covers both table rows (`self.rows`) and index rows (`self.index_rows`).
     /// Returns the number of removed versions.
-    pub fn drop_unused_row_versions(&self) -> usize {
+    pub fn drop_unused_row_versions(&self) -> Result<usize> {
         let lwm = self.compute_lwm();
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
         let mut referenced_tx_ids = HashSet::default();
 
         let dropped = self.gc_table_row_versions(lwm, ckpt_max, &mut referenced_tx_ids)
             + self.gc_index_row_versions(lwm, ckpt_max, &mut referenced_tx_ids);
-        let pruned_finalized = self.prune_finalized_tx_states(&referenced_tx_ids);
+        let pruned_finalized = self.prune_finalized_tx_states(&referenced_tx_ids)?;
 
         tracing::trace!(
             "drop_unused_row_versions() -> dropped {dropped}, pruned_finalized={pruned_finalized}, txs: {}, finalized_tx_states: {}, rows: {}",
@@ -5407,7 +5413,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.finalized_tx_states.len(),
             self.rows.len()
         );
-        dropped
+        Ok(dropped)
     }
 
     fn gc_table_row_versions(
@@ -5463,9 +5469,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
-    fn prune_finalized_tx_states(&self, referenced_tx_ids: &HashSet<TxID>) -> usize {
+    fn prune_finalized_tx_states(&self, referenced_tx_ids: &HashSet<TxID>) -> Result<usize> {
         if self.finalized_tx_states.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         let to_remove: Vec<TxID> = self
@@ -5475,13 +5481,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let tx_id = *entry.key();
                 (!referenced_tx_ids.contains(&tx_id)).then_some(tx_id)
             })
-            .collect();
+            .try_collect()?;
 
         for tx_id in &to_remove {
             self.finalized_tx_states.remove(tx_id);
         }
 
-        to_remove.len()
+        Ok(to_remove.len())
     }
 
     /// Apply GC rules to a single version chain. Returns number of versions removed.
@@ -5955,7 +5961,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let enc_ctx = self.storage.encryption_ctx();
         let mut reader = StreamingLogicalLogReader::new(file.clone(), enc_ctx);
         let preserved_table_valued_functions =
-            Self::capture_table_valued_functions(&connection.schema.read());
+            Self::capture_table_valued_functions(&connection.schema.read())?;
 
         let header = match reader.try_read_header(&pager.io)? {
             HeaderReadResult::Valid(header) => Some(header),
@@ -6032,7 +6038,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let syms = connection.syms.read();
             let mv_store = connection.db.get_mv_store().clone();
 
-            let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
+            let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().try_collect()?;
             sorted_rowids.sort_unstable();
             for rowid in &sorted_rowids {
                 let record = &schema_rows[rowid];

@@ -1535,7 +1535,11 @@ fn install_mvcc_state_after_vacuum_commit(
     header: DatabaseHeader,
     schema: Arc<Schema>,
 ) {
-    mv_store.reset_after_vacuum(header, schema.as_ref());
+    // TODO: currently memory allocation makes this fallible. If Skiplist supported `retain` we could probably remove
+    // the allocation
+    mv_store
+        .reset_after_vacuum(header, schema.as_ref())
+        .expect("post-commit MVCC VACUUM metadata install must not fail: physical replacement image is already durable");
     replace_shared_schema_after_vacuum(source_db, schema);
 }
 

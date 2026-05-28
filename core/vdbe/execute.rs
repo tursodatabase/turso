@@ -605,7 +605,7 @@ pub fn op_checkpoint(
             program.connection.clone(),
             true,
             program.connection.get_sync_mode(),
-        );
+        )?;
         let CheckpointResult {
             wal_max_frame,
             wal_total_backfilled,
@@ -15063,7 +15063,7 @@ fn op_journal_mode_inner(
                                 program.connection.clone(),
                                 true,
                                 program.connection.get_sync_mode(),
-                            ))));
+                            )?)));
                     }
 
                     let ckpt_sm = state
