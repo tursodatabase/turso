@@ -2270,12 +2270,19 @@ pub fn translate_drop_table(
         // End loop to copy over row id's from the ephemeral table and then re-insert into the schema table with the correct root page
     }
 
-    // if drops table, sequence table should reset.
-    if let Some(seq_table) = resolver
-        .schema()
-        .get_table(SQLITE_SEQUENCE_TABLE_NAME)
-        .and_then(|t| t.btree())
-    {
+    // If the dropped table had AUTOINCREMENT, clear its `sqlite_sequence` row.
+    // Look up the table in the TARGET database's schema (not the main one).
+    // `resolver.schema()` returns the MAIN schema, so for `DROP TABLE aux.t`
+    // it would either (a) skip the cleanup entirely when main lacks
+    // `sqlite_sequence`, leaving a stale high-water-mark in `aux.sqlite_sequence`
+    // that the next AUTOINCREMENT INSERT into a same-named table would
+    // resume from, or (b) — worse — open the cursor against the attached
+    // database using main's root page, corrupting whatever lived there.
+    // The matching `OpenWrite` below passes `db: database_id`, so the root
+    // page must come from the same schema.
+    if let Some(seq_table) = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+    }) {
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
         let seq_table_name_reg = program.alloc_register();
         let dropped_table_name_reg =
