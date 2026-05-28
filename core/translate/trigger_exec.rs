@@ -13,7 +13,7 @@ use crate::translate::{
 };
 use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::insn::Insn;
+use crate::vdbe::insn::{Insn, Subprogram};
 use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, QueryMode, Result};
 use std::cell::RefCell;
@@ -681,7 +681,7 @@ fn execute_trigger_commands(
 
     program.emit_insn(Insn::Program {
         param_registers,
-        program: built_subprogram.prepared().clone(),
+        program: Subprogram::PreparedProgram(built_subprogram.prepared().clone()),
         ignore_jump_target,
     });
 

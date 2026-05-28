@@ -2227,6 +2227,228 @@ expect {
     0
 }
 
+# ON DELETE CASCADE - self-referential chain
+@cross-check-integrity
+test fk-cascade-delete-self-referential-chain {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    INSERT INTO t VALUES(1,NULL),(2,1),(3,2);
+    DELETE FROM t WHERE id=1;
+    SELECT id, pid FROM t ORDER BY id;
+}
+expect {
+}
+
+# ON DELETE CASCADE - longer self-referential chain
+@cross-check-integrity
+test fk-cascade-delete-self-referential-long-chain {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    INSERT INTO t VALUES
+        (1,NULL),(2,1),(3,2),(4,3),(5,4),(6,5),
+        (7,6),(8,7),(9,8),(10,9),(11,10),(12,11);
+    DELETE FROM t WHERE id=1;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# ON DELETE CASCADE - composite self-referential chain
+@cross-check-integrity
+test fk-cascade-delete-self-referential-composite-chain {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        a INTEGER,
+        b INTEGER,
+        pa INTEGER,
+        pb INTEGER,
+        PRIMARY KEY(a,b),
+        FOREIGN KEY(pa,pb) REFERENCES t(a,b) ON DELETE CASCADE
+    );
+    INSERT INTO t VALUES(1,1,NULL,NULL),(2,2,1,1),(3,3,2,2);
+    DELETE FROM t WHERE a=1 AND b=1;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# ON DELETE CASCADE - two self references to the same table
+@cross-check-integrity
+test fk-cascade-delete-self-referential-two-fks {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        p1 INTEGER REFERENCES t(id) ON DELETE CASCADE,
+        p2 INTEGER REFERENCES t(id) ON DELETE CASCADE
+    );
+    INSERT INTO t VALUES(1,NULL,NULL),(2,1,NULL),(3,NULL,1),(4,2,3);
+    DELETE FROM t WHERE id=1;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# ON DELETE CASCADE - deferred self-referential chain
+@cross-check-integrity
+test fk-cascade-delete-self-referential-deferred {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        pid INTEGER REFERENCES t(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO t VALUES(1,NULL),(2,1),(3,2);
+    BEGIN;
+    DELETE FROM t WHERE id=1;
+    SELECT count(*) FROM t;
+    COMMIT;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+    0
+}
+
+# ON DELETE CASCADE - more than one root row starts a self-referential cascade
+@cross-check-integrity
+test fk-cascade-delete-self-referential-multi-root {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    INSERT INTO t VALUES(1,NULL),(2,1),(3,2),(10,NULL),(11,10);
+    DELETE FROM t WHERE id IN (1,10);
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# ON DELETE CASCADE - multi-row parent delete on adjacent rows of a self-ref chain.
+# Each deleted root row references the next, so the parent scan and the cascade
+# target overlapping rows.
+@cross-check-integrity
+test fk-cascade-delete-self-referential-adjacent-rows {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    INSERT INTO t VALUES(1,NULL),(2,1),(3,2),(4,3),(5,4),(6,5),(7,6),(8,7);
+    DELETE FROM t WHERE id BETWEEN 1 AND 4;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# EXPLAIN should print the recursive FK action once and then stop.
+test fk-cascade-delete-self-referential-explain-terminates {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    EXPLAIN DELETE FROM t WHERE id=1;
+}
+expect pattern {
+    Program
+}
+
+# ON DELETE CASCADE - two tables cascade into each other
+@cross-check-integrity
+test fk-cascade-delete-two-table-cycle {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER REFERENCES b(id) ON DELETE CASCADE);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON DELETE CASCADE);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    DELETE FROM a WHERE id=1;
+    SELECT count(*) FROM a;
+    SELECT count(*) FROM b;
+}
+expect {
+    0
+    0
+}
+
+# ON DELETE CASCADE - three tables cascade into a cycle
+@cross-check-integrity
+test fk-cascade-delete-three-table-cycle {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, cid INTEGER REFERENCES c(id) ON DELETE CASCADE);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON DELETE CASCADE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, bid INTEGER REFERENCES b(id) ON DELETE CASCADE);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    INSERT INTO c VALUES(3,2);
+    UPDATE a SET cid=3 WHERE id=1;
+    DELETE FROM a WHERE id=1;
+    SELECT (SELECT count(*) FROM a),(SELECT count(*) FROM b),(SELECT count(*) FROM c);
+}
+expect {
+    0|0|0
+}
+
+# Two-table cycle with mixed cascade actions: a->b ON DELETE CASCADE,
+# b->a ON UPDATE CASCADE. Verifies the (fk, parent_change) compile-stack
+# key distinguishes ON DELETE from ON UPDATE for the same FK pair.
+@cross-check-integrity
+test fk-cascade-mixed-actions-two-table-cycle {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER REFERENCES b(id) ON DELETE CASCADE);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON UPDATE CASCADE);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    UPDATE a SET id=10 WHERE id=1;
+    SELECT 'after-update', a.id, a.bid, b.id, b.aid FROM a, b;
+    DELETE FROM b WHERE id=2;
+    SELECT 'after-delete-a', count(*) FROM a;
+    SELECT 'after-delete-b', count(*) FROM b;
+}
+expect {
+    after-update|10|2|2|10
+    after-delete-a|0
+    after-delete-b|0
+}
+
+# RESTRICT in a two-table cycle: must report a constraint violation rather
+# than recurse. The RESTRICT action does not emit a cascade
+# subprogram, but the cycle topology should not confuse the planner.
+@cross-check-integrity
+test fk-restrict-two-table-cycle {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER REFERENCES b(id) ON DELETE RESTRICT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON DELETE RESTRICT);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    DELETE FROM a WHERE id=1;
+}
+expect error {
+}
+
+# Cascade fires a trigger that issues an UPDATE that fires another cascade.
+# Exercises the interaction between fkeys.rs (cascade emission) and trigger_exec.rs.
+@cross-check-integrity
+test fk-cascade-trigger-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON UPDATE CASCADE);
+    CREATE TABLE gc(id INTEGER PRIMARY KEY, cid INTEGER REFERENCES c(id) ON UPDATE CASCADE);
+    CREATE TRIGGER tr AFTER UPDATE OF pid ON c BEGIN
+      UPDATE c SET id = id + 100 WHERE id = NEW.id;
+    END;
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(10, 1);
+    INSERT INTO gc VALUES(20, 10);
+    UPDATE p SET id=99 WHERE id=1;
+    SELECT 'p', id FROM p;
+    SELECT 'c', id, pid FROM c;
+    SELECT 'gc', id, cid FROM gc;
+}
+expect {
+    p|99
+    c|110|99
+    gc|20|110
+}
+
 # Basic ON UPDATE CASCADE - single child row
 @cross-check-integrity
 test fk-cascade-update-basic {
@@ -2257,6 +2479,37 @@ expect {
     10|99
     11|99
     12|99
+}
+
+# ON UPDATE CASCADE - self-referential hierarchy
+@cross-check-integrity
+test fk-cascade-update-self-referential-chain {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) ON UPDATE CASCADE);
+    INSERT INTO t VALUES(1,NULL),(2,1),(3,2);
+    UPDATE t SET id=id+10 WHERE id=1;
+    SELECT id, pid FROM t ORDER BY id;
+}
+expect {
+    2|11
+    3|2
+    11|
+}
+
+# ON UPDATE CASCADE - two tables update each other
+@cross-check-integrity
+test fk-cascade-update-two-table-cycle {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER REFERENCES b(id) ON UPDATE CASCADE);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON UPDATE CASCADE);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    UPDATE a SET id=10 WHERE id=1;
+    SELECT a.id,a.bid,b.id,b.aid FROM a,b;
+}
+expect {
+    10|2|2|10
 }
 
 # ON UPDATE CASCADE - composite key
@@ -2323,6 +2576,22 @@ expect {
     1||
 }
 
+# ON DELETE SET NULL - two tables clear each other's references
+@cross-check-integrity
+test fk-setnull-delete-two-table-cycle {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER REFERENCES b(id) ON DELETE SET NULL);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON DELETE SET NULL);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    DELETE FROM a WHERE id=1;
+    SELECT id, aid FROM b ORDER BY id;
+}
+expect {
+    2|
+}
+
 # Basic ON UPDATE SET NULL
 @cross-check-integrity
 test fk-setnull-update-basic {
@@ -2336,6 +2605,82 @@ test fk-setnull-update-basic {
 }
 expect {
     10|
+}
+
+# ON UPDATE SET NULL - two tables clear each other's references
+@cross-check-integrity
+test fk-setnull-update-two-table-cycle {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER REFERENCES b(id) ON UPDATE SET NULL);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON UPDATE SET NULL);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    UPDATE a SET id=10 WHERE id=1;
+    SELECT a.id,a.bid,b.id,b.aid FROM a,b;
+}
+expect {
+    10|2|2|
+}
+
+# ON DELETE SET DEFAULT - two tables reset each other's references to NULL
+@cross-check-integrity
+test fk-setdefault-delete-two-table-cycle-null-default {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER DEFAULT NULL REFERENCES b(id) ON DELETE SET DEFAULT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER DEFAULT NULL REFERENCES a(id) ON DELETE SET DEFAULT);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    DELETE FROM a WHERE id=1;
+    SELECT id, aid FROM b ORDER BY id;
+}
+expect {
+    2|
+}
+
+# ON UPDATE SET DEFAULT - two tables reset each other's references to NULL
+@cross-check-integrity
+test fk-setdefault-update-two-table-cycle-null-default {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER DEFAULT NULL REFERENCES b(id) ON UPDATE SET DEFAULT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER DEFAULT NULL REFERENCES a(id) ON UPDATE SET DEFAULT);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    UPDATE a SET id=10 WHERE id=1;
+    SELECT a.id,a.bid,b.id,b.aid FROM a,b;
+}
+expect {
+    10|2|2|
+}
+
+# ON DELETE SET DEFAULT - two-table cycle fails when the default has no parent row
+@cross-check-integrity
+test fk-setdefault-delete-two-table-cycle-missing-default-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER DEFAULT 999 REFERENCES b(id) ON DELETE SET DEFAULT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER DEFAULT 999 REFERENCES a(id) ON DELETE SET DEFAULT);
+    INSERT INTO a(id,bid) VALUES(1,NULL);
+    INSERT INTO b(id,aid) VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    DELETE FROM a WHERE id=1;
+}
+expect error {
+}
+
+# ON UPDATE SET DEFAULT - two-table cycle fails when the default has no parent row
+@cross-check-integrity
+test fk-setdefault-update-two-table-cycle-missing-default-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER DEFAULT 999 REFERENCES b(id) ON UPDATE SET DEFAULT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER DEFAULT 999 REFERENCES a(id) ON UPDATE SET DEFAULT);
+    INSERT INTO a(id,bid) VALUES(1,NULL);
+    INSERT INTO b(id,aid) VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    UPDATE a SET id=10 WHERE id=1;
+}
+expect error {
 }
 
 # ON DELETE CASCADE with ON UPDATE NO ACTION

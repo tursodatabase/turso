@@ -7,15 +7,117 @@ use crate::translate::plan::ColumnMask;
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef},
+    sync::{Arc, OnceLock, Weak},
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
     vdbe::{
         builder::{CursorType, DmlColumnContext, QueryMode},
-        insn::{CmpInsFlags, Insn},
-        BranchOffset,
+        insn::{CmpInsFlags, Insn, Subprogram},
+        BranchOffset, PreparedProgram,
     },
     Connection, LimboError, Result,
 };
-use std::{num::NonZero, num::NonZeroUsize, sync::Arc};
+use std::{cell::RefCell, num::NonZero, num::NonZeroUsize, rc::Rc};
+
+/// Tracks foreign-key action programs that are currently being compiled.
+///
+/// This is needed when generated foreign-key action SQL reaches the same
+/// foreign-key action again before the first copy has finished compiling.
+///
+/// Example: in `t(id PRIMARY KEY, parent REFERENCES t(id) ON DELETE CASCADE)`,
+/// deleting row `1` runs an action that deletes row `2`. Deleting row `2` must
+/// run the same action again to delete row `3`. While compiling that action,
+/// this stack lets the nested delete emit a call back to the action program
+/// already being built.
+///
+/// A two-table cycle needs the same mechanism: table `a` cascades to `b`, and
+/// `b` cascades back to `a`.
+#[derive(Clone, Default)]
+pub(super) struct FkActionCompileStack(Rc<RefCell<Vec<FkActionCompileStackEntry>>>);
+
+/// One foreign-key action program that is currently being compiled.
+struct FkActionCompileStackEntry {
+    /// The foreign key whose action program is being compiled.
+    foreign_key: Arc<ForeignKey>,
+    /// Whether the action started from a parent delete or a parent key update.
+    parent_change: FkActionParentChange,
+    /// The place where the finished action program will be stored.
+    ///
+    /// Recursive calls emitted during compilation hold a clone of this slot.
+    slot: Arc<OnceLock<Weak<PreparedProgram>>>,
+}
+
+impl FkActionCompileStack {
+    /// Find the unfinished action program for this foreign key and parent row change.
+    ///
+    /// Returning `Some` means the compiler is re-entering the same FK action.
+    /// The caller should emit a recursive call to that in-progress program
+    /// instead of compiling another copy of the action.
+    fn find(
+        &self,
+        foreign_key: &Arc<ForeignKey>,
+        parent_change: FkActionParentChange,
+    ) -> Option<Arc<OnceLock<Weak<PreparedProgram>>>> {
+        self.0
+            .borrow()
+            .iter()
+            .find(|entry| {
+                entry.parent_change == parent_change && Arc::ptr_eq(&entry.foreign_key, foreign_key)
+            })
+            .map(|entry| entry.slot.clone())
+    }
+
+    /// Remember that a foreign-key action program is being compiled.
+    ///
+    /// The returned guard removes the entry from the stack when compilation
+    /// ends, including when compilation returns an error.
+    fn push(
+        &self,
+        foreign_key: Arc<ForeignKey>,
+        parent_change: FkActionParentChange,
+    ) -> FkActionCompileStackGuard {
+        let slot = Arc::new(OnceLock::new());
+        self.0.borrow_mut().push(FkActionCompileStackEntry {
+            foreign_key,
+            parent_change,
+            slot: slot.clone(),
+        });
+        FkActionCompileStackGuard {
+            stack: self.clone(),
+            slot,
+        }
+    }
+}
+
+/// Removes a foreign-key action program from the compile stack when compilation ends.
+struct FkActionCompileStackGuard {
+    stack: FkActionCompileStack,
+    slot: Arc<OnceLock<Weak<PreparedProgram>>>,
+}
+
+impl Drop for FkActionCompileStackGuard {
+    fn drop(&mut self) {
+        let ended = self
+            .stack
+            .0
+            .borrow_mut()
+            .pop()
+            .expect("foreign-key action compilation stack underflow");
+        debug_assert!(Arc::ptr_eq(&ended.slot, &self.slot));
+    }
+}
+
+/// The parent-row change that started a foreign-key action.
+///
+/// Delete and update actions are different generated programs. A recursive
+/// delete action must call the in-progress delete action, not an update action
+/// for the same foreign key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FkActionParentChange {
+    /// The parent row was deleted.
+    Delete,
+    /// The parent key was updated.
+    Update,
+}
 
 #[inline]
 pub fn emit_guarded_fk_decrement(
@@ -1420,6 +1522,19 @@ impl FkActionContext {
             new_key_registers: Some(new_key_registers),
         }
     }
+
+    /// Return which generated action program this context runs.
+    ///
+    /// Delete actions only have old parent key values. Update actions have old
+    /// and new parent key values. The recursive compile stack uses this to keep
+    /// delete and update action programs separate for the same foreign key.
+    fn parent_change(&self) -> FkActionParentChange {
+        if self.new_key_registers.is_some() {
+            FkActionParentChange::Update
+        } else {
+            FkActionParentChange::Delete
+        }
+    }
 }
 
 /// Context for compiling FK action subprograms - maps parameter indices to column values
@@ -1541,45 +1656,69 @@ fn emit_key_change_check(
 /// Common options for FK action subprogram builders.
 const FK_SUBPROGRAM_OPTS: ProgramBuilderOpts = ProgramBuilderOpts::new(2, 32, 4);
 
-/// Compile and emit an FK action as a sub-program.
-/// This is the common implementation for CASCADE DELETE, SET NULL, SET DEFAULT, and CASCADE UPDATE.
+/// Compile and emit a foreign-key action as a subprogram.
+///
+/// This is the common implementation for CASCADE DELETE, SET NULL, SET DEFAULT,
+/// and CASCADE UPDATE. The recursive case is handled before compiling a new
+/// subprogram: if the same foreign-key action is already being compiled, this
+/// emits a call to that in-progress program instead of compiling forever.
+///
+/// This is required for self-referential cascades and foreign-key cycles. In
+/// both cases, the generated action SQL can fire the same action again before
+/// the first action program has finished compiling.
 fn emit_fk_action_subprogram(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     connection: &Arc<Connection>,
     stmt: ast::Stmt,
     ctx: &FkActionContext,
+    foreign_key: Arc<ForeignKey>,
     description: &'static str,
 ) -> Result<()> {
-    let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        program.capture_data_changes_info().clone(),
-        FK_SUBPROGRAM_OPTS,
-    );
-    subprogram_builder.prologue();
-    translate_inner(
-        stmt,
-        resolver,
-        &mut subprogram_builder,
-        connection,
-        description,
-    )?;
-    subprogram_builder.epilogue(resolver.schema());
-    let built_subprogram = subprogram_builder.build(connection.clone(), true, description)?;
+    let parent_change = ctx.parent_change();
+    let compile_stack = resolver.fk_action_compile_stack.clone();
 
-    // Build param_registers: OLD key register indices, then optionally NEW key register indices
-    let mut param_registers: Vec<usize> = ctx.old_key_registers.to_vec();
+    let subprogram = if let Some(slot) = compile_stack.find(&foreign_key, parent_change) {
+        assert!(
+            program.flags.is_subprogram(),
+            "recursive foreign-key action calls must be emitted from a foreign-key action subprogram"
+        );
+        Subprogram::Pending(slot)
+    } else {
+        let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
+            QueryMode::Normal,
+            program.capture_data_changes_info().clone(),
+            FK_SUBPROGRAM_OPTS,
+        );
+        let entry = compile_stack.push(foreign_key, parent_change);
+        subprogram_builder.prologue();
+        translate_inner(
+            stmt,
+            resolver,
+            &mut subprogram_builder,
+            connection,
+            description,
+        )?;
+        subprogram_builder.epilogue(resolver.schema());
+        let built = subprogram_builder.build(connection.clone(), true, description)?;
+        let prepared = built.prepared().clone();
+        entry
+            .slot
+            .set(Arc::downgrade(&prepared))
+            .expect("foreign-key action subprogram should be set exactly once");
+        Subprogram::PreparedProgram(prepared)
+    };
 
+    // Foreign-key action subprograms can't contain RAISE(IGNORE), so ignore_jump_target
+    // is a no-op that resolves to the next instruction (just falls through).
+    let mut param_registers = ctx.old_key_registers.to_vec();
     if let Some(new_regs) = &ctx.new_key_registers {
         param_registers.extend(new_regs.iter().copied());
     }
-
-    // FK action subprograms can't contain RAISE(IGNORE), so ignore_jump_target
-    // is a no-op that resolves to the next instruction (just falls through).
     let ignore_jump_target = program.allocate_label();
     program.emit_insn(Insn::Program {
         param_registers,
-        program: built_subprogram.prepared().clone(),
+        program: subprogram,
         ignore_jump_target,
     });
     program.preassign_label_to_next_insn(ignore_jump_target);
@@ -1786,6 +1925,7 @@ fn fire_fk_cascade_delete(
         connection,
         stmt,
         ctx,
+        fk_ref.fk.clone(),
         "fk cascade delete",
     )
 }
@@ -1813,7 +1953,15 @@ fn fire_fk_set_null(
         &subprog_ctx,
         db_name.as_deref(),
     );
-    emit_fk_action_subprogram(program, resolver, connection, stmt, ctx, "fk set null")
+    emit_fk_action_subprogram(
+        program,
+        resolver,
+        connection,
+        stmt,
+        ctx,
+        fk_ref.fk.clone(),
+        "fk set null",
+    )
 }
 
 /// Compile and emit an FK SET DEFAULT action as a sub-program.
@@ -1839,7 +1987,15 @@ fn fire_fk_set_default(
         &subprog_ctx,
         db_name.as_deref(),
     );
-    emit_fk_action_subprogram(program, resolver, connection, stmt, ctx, "fk set default")
+    emit_fk_action_subprogram(
+        program,
+        resolver,
+        connection,
+        stmt,
+        ctx,
+        fk_ref.fk.clone(),
+        "fk set default",
+    )
 }
 
 /// Compile and emit an FK CASCADE UPDATE action as a sub-program.
@@ -1872,6 +2028,7 @@ fn fire_fk_cascade_update(
         connection,
         stmt,
         ctx,
+        fk_ref.fk.clone(),
         "fk cascade update",
     )
 }

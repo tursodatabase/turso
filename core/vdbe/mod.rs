@@ -1233,8 +1233,24 @@ macro_rules! get_cursor {
 pub struct ExplainState {
     /// Subprograms queued for explain output, processed after the parent program finishes.
     pending: std::collections::VecDeque<Arc<PreparedProgram>>,
+    /// Prepared subprograms that have already been queued for explain output.
+    ///
+    /// Recursive foreign-key action programs can contain a `Program` instruction
+    /// that calls the same prepared program again. Without this set, EXPLAIN
+    /// keeps printing the same subprogram forever.
+    queued_subprograms: std::collections::HashSet<usize>,
     /// The subprogram currently being explained, if any.
     current: Option<Arc<PreparedProgram>>,
+}
+
+impl ExplainState {
+    /// Queue a subprogram for EXPLAIN output if this statement has not queued it before.
+    fn queue_subprogram_once(&mut self, subprogram: Arc<PreparedProgram>) {
+        let subprogram_id = Arc::as_ptr(&subprogram) as usize;
+        if self.queued_subprograms.insert(subprogram_id) {
+            self.pending.push_back(subprogram);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1448,10 +1464,11 @@ impl Program {
         let (row, subprogram) = if let Some(ref current) = explain_state.current {
             let (insn, _) = &current.insns[pc];
             let sub = if let Insn::Program {
-                program: prepared, ..
+                program: subprogram,
+                ..
             } = insn
             {
-                Some(prepared.clone())
+                Some(subprogram.prepared_program()?)
             } else {
                 None
             };
@@ -1464,10 +1481,11 @@ impl Program {
         } else {
             let (insn, _) = &self.insns[pc];
             let sub = if let Insn::Program {
-                program: prepared, ..
+                program: subprogram,
+                ..
             } = insn
             {
-                Some(prepared.clone())
+                Some(subprogram.prepared_program()?)
             } else {
                 None
             };
@@ -1479,7 +1497,7 @@ impl Program {
             (insn_to_row_with_comment(self, insn, comment), sub)
         };
         if let Some(sub) = subprogram {
-            explain_state.pending.push_back(sub);
+            explain_state.queue_subprogram_once(sub);
         }
         let (opcode, p1, p2, p3, p4, p5, comment) = row;
 
