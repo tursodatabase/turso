@@ -1110,45 +1110,62 @@ impl BTreeCursor {
                     }
                 }
             }
+            // Compute `next` / `to_read` and fetch the next chain page (if
+            // any) BEFORE applying the loop body's non-idempotent mutations,
+            // so that a spill yield from `read_page(next)` leaves
+            // `read_overflow_state` untouched and is safe to re-enter.
+            let (next, to_read, need_next_page) = {
+                let state = self.read_overflow_state.as_ref().unwrap();
+                turso_assert!(state.page.is_loaded(), "page should be loaded");
+                tracing::debug!(
+                    next_page = state.next_page,
+                    remaining_to_read = state.remaining_to_read,
+                    "reading overflow page"
+                );
+                // The first four bytes of each overflow page are a big-endian integer which is the page number of the next page in the chain, or zero for the final page in the chain.
+                let next = state.page.get_contents().read_u32_no_offset(0);
+                let to_read = state.remaining_to_read.min(self.pager.usable_space() - 4);
+                (
+                    next,
+                    to_read,
+                    state.remaining_to_read > to_read && next != 0,
+                )
+            };
+            let new_page_and_c = if need_next_page {
+                match self.read_page(next as i64)? {
+                    IOResult::Done(v) => Some(v),
+                    IOResult::IO(IOCompletions::Single(spill_c)) => {
+                        io_yield_one!(spill_c);
+                    }
+                }
+            } else {
+                None
+            };
+
             let ReadPayloadOverflow {
                 payload,
                 remaining_to_read,
                 next_page,
                 page,
-                ..
             } = self.read_overflow_state.as_mut().unwrap();
-
-            turso_assert!(page.is_loaded(), "page should be loaded");
-            tracing::debug!(next_page, remaining_to_read, "reading overflow page");
-            let contents = page.get_contents();
-            // The first four bytes of each overflow page are a big-endian integer which is the page number of the next page in the chain, or zero for the final page in the chain.
-            let next = contents.read_u32_no_offset(0);
-            let buf = contents.as_ptr();
-            let usable_space = self.pager.usable_space();
-            let to_read = (*remaining_to_read).min(usable_space - 4);
+            let buf = page.get_contents().as_ptr();
             payload.extend_from_slice(&buf[4..4 + to_read]);
             *remaining_to_read -= to_read;
 
-            if *remaining_to_read != 0 && next != 0 {
-                // Same invariant as the `is_none()` branch above: the spill
-                // yield must leave `read_overflow_state.page` pointing at the
-                // *previous* page so re-entry recomputes `next` from it.
-                match self.read_page(next as i64)? {
-                    IOResult::Done((new_page, c)) => {
-                        let ReadPayloadOverflow {
-                            next_page, page, ..
-                        } = self.read_overflow_state.as_mut().unwrap();
-                        *page = new_page;
-                        *next_page = next;
-                        if let Some(c) = c {
-                            io_yield_one!(c);
-                        }
-                        continue;
-                    }
-                    IOResult::IO(IOCompletions::Single(spill_c)) => {
-                        io_yield_one!(spill_c);
-                    }
+            if let Some((new_page, c)) = new_page_and_c {
+                *page = new_page;
+                *next_page = next;
+                // Re-entrancy: the four mutations above (payload extend,
+                // remaining decrement, page swap, next_page swap) together
+                // advance the state to "current page consumed, positioned on
+                // new_page". Yielding on `c` here is safe because re-entry
+                // resumes one iteration forward — the loop top reads from
+                // the new page, not the old one — so none of these mutations
+                // re-fire against the page they were applied to.
+                if let Some(c) = c {
+                    io_yield_one!(c);
                 }
+                continue;
             }
             if *remaining_to_read != 0 || next != 0 {
                 let chain_page = *next_page;
@@ -6012,12 +6029,10 @@ impl CursorTrait for BTreeCursor {
                     if contents.is_leaf() || cell_idx > contents.cell_count() {
                         loop {
                             if !self.stack.has_parent() {
-                                // All pages of the b-tree have been visited. Return successfully
-                                let c = return_if_io!(self.move_to_root_nonblock());
+                                // All pages of the b-tree have been visited. Return successfully.
+                                // Move the `move_to_root_nonblock` call into `Finish` so a spill
+                                // yield from it can't re-enter `Loop`'s `count += cell_count()`.
                                 self.count_state = CountState::Finish;
-                                if let Some(c) = c {
-                                    io_yield_one!(c);
-                                }
                                 continue 'outer;
                             }
 
@@ -6119,6 +6134,11 @@ impl CursorTrait for BTreeCursor {
                     }
                 }
                 CountState::Finish => {
+                    // Idempotent: a spill yield re-enters this same arm.
+                    let c = return_if_io!(self.move_to_root_nonblock());
+                    if let Some(c) = c {
+                        io_yield_one!(c);
+                    }
                     return Ok(IOResult::Done(self.count));
                 }
             }
