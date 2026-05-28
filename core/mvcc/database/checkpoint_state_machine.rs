@@ -253,10 +253,6 @@ struct SeqCompactDriver {
     /// The watermark key captured in `ReadWatermarkRowid`. The scan
     /// keeps the row at this key and deletes all others.
     watermark_key: Option<i64>,
-    /// Pending Delete rowid, set in `ScanReadRowid` when we decide the
-    /// current row must go and used by `ScanDelete` after the cursor
-    /// has been re-seeked into the to-delete position.
-    pending_delete: Option<i64>,
     /// Cached pager handle so cursor construction matches the original
     /// `BTreeCursor::new_table` signature.
     pager: Arc<Pager>,
@@ -397,7 +393,6 @@ impl SeqCompactDriver {
                 ));
                 self.phase = SeqCompactPhase::SeekWatermark;
                 self.watermark_key = None;
-                self.pending_delete = None;
             }
             let cursor = self
                 .cursor
@@ -484,7 +479,6 @@ impl SeqCompactDriver {
     fn advance_to_next_sequence(&mut self) {
         self.cursor = None;
         self.watermark_key = None;
-        self.pending_delete = None;
         self.current_idx += 1;
         self.phase = SeqCompactPhase::SeekWatermark;
     }
@@ -1967,7 +1961,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         cursor: None,
                         phase: SeqCompactPhase::SeekWatermark,
                         watermark_key: None,
-                        pending_delete: None,
                         pager: self.pager.clone(),
                     });
                 }
