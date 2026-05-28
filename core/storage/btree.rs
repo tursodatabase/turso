@@ -10269,6 +10269,76 @@ mod tests {
         Ok(())
     }
 
+    /// Forces a spill yield from `read_page(next-chain-page)` during
+    /// `process_overflow_read`'s loop and verifies the resulting record
+    /// holds the chain's bytes in order with no duplicates and no truncation.
+    #[test]
+    fn process_overflow_read_survives_spill_yield_from_next_chain_read() {
+        let pager = setup_test_env(5);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), 1, 5);
+        let usable = cursor.usable_space();
+        let data_per_page = usable - 4;
+
+        // Re-purpose pages 4 and 5 as a 2-page overflow chain: 4 -> 5 -> end.
+        let load_and_fill = |id: i64, next: u32, fill: u8| {
+            let (page, c) = cursor.read_page_blocking(id).unwrap();
+            if let Some(c) = c {
+                pager.io.wait_for_completion(c).unwrap();
+            }
+            while page.is_locked() {
+                pager.io.step().unwrap();
+            }
+            let buf = page.get_contents().as_ptr();
+            buf[0..4].copy_from_slice(&next.to_be_bytes());
+            buf[4..usable].fill(fill);
+        };
+        load_and_fill(4, 5, b'A');
+        load_and_fill(5, 0, b'B');
+
+        // Arm `read_page(5)` to yield IO once
+        pager.arm_spill_yield_on_read(5, 0);
+
+        let payload_size = (2 * data_per_page) as u64;
+        let cursor_pager = cursor.pager.clone();
+        run_until_done(
+            || cursor.process_overflow_read(b"", 4, payload_size),
+            &cursor_pager,
+        )
+        .unwrap();
+
+        let rec_slot = cursor.get_immutable_record_or_create().unwrap();
+        let bytes = rec_slot.as_ref().unwrap().get_payload();
+        assert_eq!(bytes.len(), 2 * data_per_page);
+        assert!(bytes[..data_per_page].iter().all(|&b| b == b'A'));
+        assert!(bytes[data_per_page..].iter().all(|&b| b == b'B'));
+    }
+
+    /// Forces a real spill yield from the finalization `move_to_root_nonblock`
+    /// at the end of `count`'s traversal and verifies the returned tally
+    /// equals the true cell count.
+    #[test]
+    fn count_survives_spill_yield_at_finalization() {
+        let (pager, root_page, _db, _conn) = empty_btree();
+        let n: u16 = 7;
+
+        // `count()` only reads cell_count from the header; no real cells needed.
+        let (root, _c) = pager.io.block(|| pager.read_page(root_page)).unwrap();
+        while root.is_locked() {
+            pager.io.step().unwrap();
+        }
+        root.get_contents().write_cell_count(n);
+
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 5);
+
+        // `count` calls `move_to_root_nonblock` -> `read_page(root)` twice:
+        // once in `Start` to push the root, and once at finalization. Skip
+        // the first; yield on the second.
+        pager.arm_spill_yield_on_read(root_page, 1);
+
+        let final_count = run_until_done(|| cursor.count(), &pager).unwrap();
+        assert_eq!(final_count, n as usize);
+    }
+
     #[test]
     pub fn test_clear_overflow_pages_no_overflow() -> Result<()> {
         let pager = setup_test_env(5);

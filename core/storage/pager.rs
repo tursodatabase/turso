@@ -1338,6 +1338,8 @@ pub struct Pager {
     /// `read_page_nonblock(idx)` reuses the stored `(page, disk_read)` pair
     /// instead of issuing a duplicate disk read.
     pending_reads: RwLock<HashMap<i64, PendingRead>>,
+    #[cfg(test)]
+    spill_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
     subjournal: RwLock<Option<Subjournal>>,
@@ -1395,6 +1397,50 @@ struct PendingRead {
     /// `None` if the page was satisfied from WAL/cache shortcut and no
     /// disk read completion needs to be surfaced to the caller.
     disk_read: Option<Completion>,
+}
+
+/// Test-only deterministic spill-yield injector for `Pager::read_page`. When
+/// armed, the next matching call (after `skip` ignored matches) returns
+/// `IO(yield)` once, then disarms itself.
+#[cfg(test)]
+struct SpillYieldHook {
+    /// `-1` = disarmed; otherwise the `page_idx` to fire on.
+    target: std::sync::atomic::AtomicI64,
+    /// Number of matching calls to ignore before firing.
+    skip: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl SpillYieldHook {
+    const fn new() -> Self {
+        Self {
+            target: std::sync::atomic::AtomicI64::new(-1),
+            skip: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn arm(&self, page_id: i64, skip: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.skip.store(skip, Relaxed);
+        self.target.store(page_id, Relaxed);
+    }
+
+    /// Returns true exactly once per arming, when the (`skip + 1`)th call for
+    /// the armed page id arrives. Internal load-then-store is fine because
+    /// tests using this hook are single-threaded.
+    fn should_yield_for(&self, page_idx: i64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.target.load(Relaxed) != page_idx {
+            return false;
+        }
+        if self.skip.load(Relaxed) == 0 {
+            self.target.store(-1, Relaxed);
+            true
+        } else {
+            self.skip.fetch_sub(1, Relaxed);
+            false
+        }
+    }
 }
 
 #[cfg(not(feature = "omit_autovacuum"))]
@@ -1537,6 +1583,8 @@ impl Pager {
             page_cache: Arc::new(RwLock::new(page_cache)),
             io,
             pending_reads: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            spill_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
@@ -3020,6 +3068,10 @@ impl Pager {
     pub fn read_page(&self, page_idx: i64) -> Result<IOResult<(PageRef, Option<Completion>)>> {
         turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
         tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
+        #[cfg(test)]
+        if self.spill_yield.should_yield_for(page_idx) {
+            io_yield_one!(crate::Completion::new_yield());
+        }
         let pending = self.pending_reads.read().get(&page_idx).cloned();
         let (page, c_disk) = if let Some(pending) = pending {
             // Re-entry: previous call yielded on spill before completing
@@ -3115,6 +3167,13 @@ impl Pager {
             IOResult::Done(false) => Err(LimboError::Busy),
             IOResult::IO(c) => Ok(IOResult::IO(c)),
         }
+    }
+
+    /// Test-only: arm `read_page` to return `IO(yield)` once for `page_id`
+    /// after `skip` matching calls have passed through.
+    #[cfg(test)]
+    pub(crate) fn arm_spill_yield_on_read(&self, page_id: i64, skip: usize) {
+        self.spill_yield.arm(page_id, skip);
     }
 
     // Get a page from the cache, if it exists.
