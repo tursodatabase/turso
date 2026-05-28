@@ -320,6 +320,35 @@ pub fn scalar(attr: TokenStream, input: TokenStream) -> TokenStream {
     ext::scalar(attr, input)
 }
 
+/// Derive a context-aware scalar function for your extension by deriving
+/// `ScalarDerive` on a struct that implements the `ScalarFunc` trait.
+///
+/// The associated `State` is built once per registration via `init`, shared by
+/// reference across every call, and dropped when the function is unregistered or
+/// the owning connection is dropped. The derived `register_<Struct>` entry point
+/// can be listed directly in the `scalars: { .. }` section of `register_extension!`.
+/// ```ignore
+/// use turso_ext::{register_extension, ScalarDerive, ScalarFunc, Value};
+///
+/// #[derive(ScalarDerive)]
+/// struct Multiply;
+///
+/// impl ScalarFunc for Multiply {
+///     type State = i64;
+///     const NAME: &'static str = "ctx_multiply";
+///     fn init() -> Self::State {
+///         3
+///     }
+///     fn call(state: &Self::State, args: &[Value]) -> Value {
+///         Value::from_integer(args[0].to_integer().unwrap_or_default() * *state)
+///     }
+/// }
+/// ```
+#[proc_macro_derive(ScalarDerive)]
+pub fn derive_scalar(input: TokenStream) -> TokenStream {
+    ext::derive_scalar(input)
+}
+
 /// Define an aggregate function for your extension by deriving
 /// AggregateDerive on a struct that implements the AggFunc trait.
 /// ```ignore

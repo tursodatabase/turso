@@ -427,6 +427,14 @@ def _test_kv(exec_name, ext_path):
         lambda res: "no such module: kv_store" in res,
     )
     turso.execute_dot(f".load {ext_path}")
+    # test_ctx_scalar is only registered by the turso test extension, not the
+    # sqlite3-compat one.
+    if exec_name is None:
+        turso.run_test_fn(
+            "SELECT test_ctx_scalar(40, 2);",
+            lambda res: "142" == res,
+            "can call ScalarDerive context-aware extension function",
+        )
     turso.execute_dot(
         "create virtual table t using kv_store;",
     )
