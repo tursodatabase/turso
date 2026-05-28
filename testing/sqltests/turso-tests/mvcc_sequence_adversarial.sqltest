@@ -142,6 +142,108 @@ expect {
     2|b
 }
 
+# --- Backing-table compaction gate under MVCC ---
+
+# MVCC autocommit-write takes the SKIPPED path in
+# `op_sequence_begin_inner_tx` (autocommit Write is treated as
+# exclusive: it holds `pager_commit_lock` for the duration), so the
+# inline compaction fires and the backing table stays at one row even
+# without an MVCC checkpoint. Pre-gate the WAL path leaked a row per
+# nextval; MVCC autocommit was unaffected only because the checkpoint
+# compactor caught up later.
+test mvcc-autocommit-non-cycle-backing-table-compacts-inline {
+    PRAGMA journal_mode='mvcc';
+    CREATE SEQUENCE s;
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT count(*), max(value) FROM "__turso_internal_seq_s";
+}
+expect {
+    mvcc
+    1
+    2
+    3
+    4
+    1|4
+}
+
+# MVCC `BEGIN ... COMMIT` (exclusive outer) → SKIPPED path → compaction
+# fires inside the user's transaction. Watermark survives the commit.
+test mvcc-exclusive-tx-non-cycle-backing-table-compacts-inline {
+    PRAGMA journal_mode='mvcc';
+    CREATE SEQUENCE s;
+    BEGIN;
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT nextval('s');
+    COMMIT;
+    SELECT count(*), max(value) FROM "__turso_internal_seq_s";
+    SELECT nextval('s');
+}
+expect {
+    mvcc
+    1
+    2
+    3
+    1|3
+    4
+}
+
+# MVCC `BEGIN CONCURRENT` (WRAPPED path) deliberately SKIPS inline
+# compaction to avoid WW conflicts on the shared prior-watermark row.
+# Rows accumulate until the MVCC checkpoint's `SeqCompactDriver`
+# reclaims them. Pinned so any future change to the gate has to make
+# a deliberate decision about the contention tradeoff.
+test mvcc-concurrent-tx-non-cycle-backing-table-accumulates {
+    PRAGMA journal_mode='mvcc';
+    CREATE SEQUENCE s;
+    BEGIN CONCURRENT;
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT nextval('s');
+    COMMIT;
+    -- Each nextval committed its autonomous inner tx, leaving N rows
+    -- (one per nextval) for the checkpoint compactor to reclaim.
+    SELECT count(*), max(value) FROM "__turso_internal_seq_s";
+}
+expect {
+    mvcc
+    1
+    2
+    3
+    3|3
+}
+
+# CYCLE keeps unconditional inline compaction (load-bearing for
+# wrap-correctness on the WRAPPED path too — Last/Rewind would
+# otherwise return a pre-wrap extreme). Regression guard.
+test mvcc-cycle-non-cycle-gate-does-not-bypass-cycle-compaction {
+    PRAGMA journal_mode='mvcc';
+    CREATE SEQUENCE c START WITH 1 INCREMENT BY 1 MINVALUE 1 MAXVALUE 3 CYCLE;
+    BEGIN CONCURRENT;
+    SELECT nextval('c');
+    SELECT nextval('c');
+    SELECT nextval('c');
+    SELECT nextval('c');
+    COMMIT;
+    -- Even under WRAPPED (BEGIN CONCURRENT), CYCLE must keep the
+    -- backing table at one row so the post-wrap value (1) is what
+    -- Last reads next.
+    SELECT count(*), value FROM "__turso_internal_seq_c";
+    SELECT nextval('c');
+}
+expect {
+    mvcc
+    1
+    2
+    3
+    1
+    1|1
+    2
+}
+
 # --- ALTER TABLE RENAME on AUTOINCREMENT under MVCC ---
 
 # Pre-fix this CRASHED MVCC inserts after RENAME with

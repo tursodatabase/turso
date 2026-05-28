@@ -290,33 +290,55 @@ pub fn emit_disk_read_nextval(
         table_name: seq_name.to_string(),
     });
 
-    // Inline backing-table compaction is emitted ONLY for CYCLE
-    // sequences. Two reasons to keep the asymmetry:
+    // Inline backing-table compaction has two distinct cases:
     //
-    //   * Non-CYCLE: every nextval produces a *new* value, and
-    //     `value INTEGER PRIMARY KEY` guarantees the row lands on a
-    //     distinct B-tree key. The watermark is recoverable from
-    //     Last/Rewind regardless of how many historical rows sit in
-    //     the table. Compaction here would only serve disk-space
-    //     bookkeeping — and would do so by writing a *shared* row
-    //     (the prior watermark) that every concurrent allocator also
-    //     wants to delete, producing avoidable WW conflicts on the
-    //     hot path. Disk-space cleanup belongs at checkpoint, async,
-    //     not in the nextval RMW.
+    //   * CYCLE: load-bearing for wrap-correctness. After a wrap the
+    //     new value re-enters a range whose rows the backing table
+    //     still holds, so Last/Rewind can pick up the *old* row
+    //     rather than the wrapped one. Compaction must run on every
+    //     nextval regardless of path. The contention this creates
+    //     under MVCC concurrent is fundamental to CYCLE semantics
+    //     (every wrap is a logical "advance the shared pointer" that
+    //     PG also serializes); the inner-tx retry budget absorbs it.
     //
-    //   * CYCLE: after a wrap the new value re-enters a range whose
-    //     rows the backing table still holds, so Last/Rewind can pick
-    //     up the *old* row rather than the wrapped one. Compaction is
-    //     load-bearing for wrap-correctness. The contention this
-    //     creates is fundamental to CYCLE semantics — every CYCLE
-    //     wrap is a logical "advance the shared pointer" that PG
-    //     also serializes. The inner-tx retry budget absorbs it.
+    //   * Non-CYCLE: bookkeeping only. Every nextval produces a *new*
+    //     value, and `value INTEGER PRIMARY KEY` guarantees the row
+    //     lands on a distinct B-tree key. The watermark is
+    //     recoverable from Last/Rewind regardless of how many
+    //     historical rows sit in the table. We therefore gate the
+    //     compaction loop on `path_kind_reg`:
     //
-    // The doc comment on the `cycle` discrimination here is the
-    // contract the `test_nextval_no_inner_tx_retry_on_concurrent_mvcc`
-    // regression test enforces.
+    //       - SKIPPED path (0) — WAL single-writer OR MVCC exclusive
+    //         outer tx. No concurrent allocator can race the prior-
+    //         watermark row, so the original WW-on-shared-row
+    //         argument doesn't apply. Compact inline so the backing
+    //         table stays at one row per sequence instead of
+    //         accumulating one row per nextval forever. Especially
+    //         important in WAL/rollback mode, where there is no
+    //         checkpoint-time `SeqCompactDriver` and a long-running
+    //         workload would otherwise bloat the DB without bound.
+    //
+    //       - WRAPPED path (1) — MVCC autocommit or BEGIN CONCURRENT.
+    //         Skip compaction; deleting the shared prior-watermark
+    //         row would produce avoidable WW conflicts on the hot
+    //         path. The MVCC checkpoint's `SeqCompactDriver`
+    //         reclaims the rows asynchronously.
+    //
+    // The "MVCC concurrent stays conflict-free" half of this contract
+    // is enforced by `test_nextval_no_inner_tx_retry_on_concurrent_mvcc`.
     if seq.cycle {
         emit_backing_table_compaction(program, cursor_id, seq_name, target_register);
+    } else {
+        let skip_compact_label = program.allocate_label();
+        // If path_kind_reg is truthy (== SEQ_PATH_WRAPPED), jump past
+        // the compaction loop; fall through and compact otherwise.
+        program.emit_insn(Insn::If {
+            reg: path_kind_reg,
+            target_pc: skip_compact_label,
+            jump_if_null: false,
+        });
+        emit_backing_table_compaction(program, cursor_id, seq_name, target_register);
+        program.preassign_label_to_next_insn(skip_compact_label);
     }
 
     program.emit_insn(Insn::Close { cursor_id });
@@ -487,15 +509,27 @@ pub fn emit_disk_advance_past(
         seq_name_reg,
         value_reg,
     });
-    // Inline compaction is gated the same way as the nextval path:
-    // only CYCLE seqs need it (wrap correctness — see the comment in
-    // `emit_disk_read_nextval`). `advance_past` is only emitted for
-    // AUTOINCREMENT, which is never CYCLE, so in practice this branch
-    // never compacts here today — but keeping the same gate keeps the
-    // two emit paths consistent and lets the no-contention regression
-    // test cover them with the same invariant.
+    // Inline compaction is gated the same way as the nextval path —
+    // see the long comment in `emit_disk_read_nextval` for the
+    // SKIPPED-vs-WRAPPED contract. `advance_past` is only emitted for
+    // AUTOINCREMENT (its call sites are gated on `mv_store_for_db`),
+    // and AUTOINCREMENT sequences are never CYCLE, so the CYCLE arm
+    // here is unreachable today. The non-CYCLE arm fires in the
+    // narrow case of an explicit-rowid INSERT inside `BEGIN ... COMMIT`
+    // (MVCC exclusive → SKIPPED path) and is otherwise skipped on the
+    // WRAPPED path. Keeping symmetry with the nextval gate avoids a
+    // bookkeeping divergence between the two emit paths.
     if seq.cycle {
         emit_backing_table_compaction(program, cursor_id, seq_name, value_reg);
+    } else {
+        let skip_compact_label = program.allocate_label();
+        program.emit_insn(Insn::If {
+            reg: path_kind_reg,
+            target_pc: skip_compact_label,
+            jump_if_null: false,
+        });
+        emit_backing_table_compaction(program, cursor_id, seq_name, value_reg);
+        program.preassign_label_to_next_insn(skip_compact_label);
     }
 
     // Mirror the watermark into `sqlite_sequence` ONLY when the

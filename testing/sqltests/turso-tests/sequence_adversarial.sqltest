@@ -45,6 +45,56 @@ expect {
     1
 }
 
+# --- Backing-table compaction on the SKIPPED (non-MVCC-concurrent) path ---
+
+# WAL/rollback mode: the inline compaction gate fires every nextval
+# because path_kind_reg resolved to SEQ_PATH_SKIPPED (no MVCC). The
+# backing table must stay at one row regardless of how many nextvals
+# ran, and `Last`/`Rewind` on that single row must still return the
+# correct watermark. Pre-fix WAL non-CYCLE backing tables grew without
+# bound (one row per nextval) because the only post-write compactor —
+# MVCC's SeqCompactDriver — does not run in WAL mode.
+test wal-non-cycle-backing-table-stays-at-one-row {
+    CREATE SEQUENCE s;
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT count(*), max(value) FROM "__turso_internal_seq_s";
+    SELECT nextval('s');
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    1|5
+    6
+}
+
+# Descending non-CYCLE follows the same gate. After the compaction
+# leaves only the most-advanced (= lowest) row, `Rewind` must still
+# pick up the right watermark.
+test wal-descending-non-cycle-backing-table-stays-at-one-row {
+    CREATE SEQUENCE d START WITH 10 INCREMENT BY -1 MINVALUE 0 MAXVALUE 10;
+    SELECT nextval('d');
+    SELECT nextval('d');
+    SELECT nextval('d');
+    SELECT nextval('d');
+    SELECT count(*), min(value) FROM "__turso_internal_seq_d";
+    SELECT nextval('d');
+}
+expect {
+    10
+    9
+    8
+    7
+    1|7
+    6
+}
+
 # --- ALTER TABLE RENAME on AUTOINCREMENT (WAL/rollback mode) ---
 
 # WAL: rename must update the backing-table sqlite_schema row + sqlite_sequence
