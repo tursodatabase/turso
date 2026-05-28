@@ -607,9 +607,7 @@ impl TursoDatabase {
                     ));
                 }
                 Some(vfs) => {
-                    return Err(TursoError::Error(format!(
-                        "unsupported VFS backend: '{vfs}'"
-                    )))
+                    Database::io_for_vfs(vfs).map_err(|e| TursoError::Error(format!("{e}")))?
                 }
                 None => match self.config.path.as_str() {
                     ":memory:" => Arc::new(turso_core::MemoryIO::new()),
