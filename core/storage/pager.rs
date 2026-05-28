@@ -1671,22 +1671,16 @@ impl Pager {
                         return Ok(IOResult::Done(page1));
                     }
 
-                    // On `IO(spill_c)` we keep the state at `Start` so
+                    // On spill `return_if_io!` propagates IO up unchanged so
                     // re-entry resumes here via the pager's `pending_reads`
                     // memoization (no duplicate disk read).
-                    match self.read_page(DatabaseHeader::PAGE_ID as i64)? {
-                        IOResult::Done((page, c)) => {
-                            *self.header_ref_state.write() = HeaderRefState::CreateHeader {
-                                page,
-                                completion: c.clone(),
-                            };
-                            if let Some(c) = c {
-                                io_yield_one!(c);
-                            }
-                        }
-                        IOResult::IO(IOCompletions::Single(spill_c)) => {
-                            io_yield_one!(spill_c);
-                        }
+                    let (page, c) = return_if_io!(self.read_page(DatabaseHeader::PAGE_ID as i64));
+                    *self.header_ref_state.write() = HeaderRefState::CreateHeader {
+                        page,
+                        completion: c.clone(),
+                    };
+                    if let Some(c) = c {
+                        io_yield_one!(c);
                     }
                 }
                 HeaderRefState::CreateHeader { page, completion } => {
@@ -2260,22 +2254,15 @@ impl Pager {
                         ptrmap_pg_no
                     );
 
-                    // On `IO(spill_c)` keep `ptrmap_get_state` at `Start` so
-                    // re-entry resumes via the pager's pending-read tracking.
-                    match self.read_page(ptrmap_pg_no as i64)? {
-                        IOResult::Done((ptrmap_page, c)) => {
-                            self.vacuum_state.write().ptrmap_get_state =
-                                PtrMapGetState::Deserialize {
-                                    ptrmap_page,
-                                    offset_in_ptrmap_page,
-                                };
-                            if let Some(c) = c {
-                                io_yield_one!(c);
-                            }
-                        }
-                        IOResult::IO(IOCompletions::Single(spill_c)) => {
-                            io_yield_one!(spill_c);
-                        }
+                    // `return_if_io!` keeps `ptrmap_get_state` at `Start` on
+                    // spill so re-entry resumes via pending-read tracking.
+                    let (ptrmap_page, c) = return_if_io!(self.read_page(ptrmap_pg_no as i64));
+                    self.vacuum_state.write().ptrmap_get_state = PtrMapGetState::Deserialize {
+                        ptrmap_page,
+                        offset_in_ptrmap_page,
+                    };
+                    if let Some(c) = c {
+                        io_yield_one!(c);
                     }
                 }
                 PtrMapGetState::Deserialize {
@@ -2369,22 +2356,15 @@ impl Pager {
                         offset_in_ptrmap_page
                     );
 
-                    // On `IO(spill_c)` keep `ptrmap_put_state` at `Start` so
-                    // re-entry resumes via the pager's pending-read tracking.
-                    match self.read_page(ptrmap_pg_no as i64)? {
-                        IOResult::Done((ptrmap_page, c)) => {
-                            self.vacuum_state.write().ptrmap_put_state =
-                                PtrMapPutState::Deserialize {
-                                    ptrmap_page,
-                                    offset_in_ptrmap_page,
-                                };
-                            if let Some(c) = c {
-                                io_yield_one!(c);
-                            }
-                        }
-                        IOResult::IO(IOCompletions::Single(spill_c)) => {
-                            io_yield_one!(spill_c);
-                        }
+                    // `return_if_io!` keeps `ptrmap_put_state` at `Start` on
+                    // spill so re-entry resumes via pending-read tracking.
+                    let (ptrmap_page, c) = return_if_io!(self.read_page(ptrmap_pg_no as i64));
+                    self.vacuum_state.write().ptrmap_put_state = PtrMapPutState::Deserialize {
+                        ptrmap_page,
+                        offset_in_ptrmap_page,
+                    };
+                    if let Some(c) = c {
+                        io_yield_one!(c);
                     }
                 }
                 PtrMapPutState::Deserialize {
@@ -4800,12 +4780,7 @@ impl Pager {
                             }
                             (page, None)
                         }
-                        None => match self.read_page(page_id as i64)? {
-                            IOResult::Done(v) => v,
-                            IOResult::IO(IOCompletions::Single(spill_c)) => {
-                                io_yield_one!(spill_c);
-                            }
-                        },
+                        None => return_if_io!(self.read_page(page_id as i64)),
                     };
                     header.freelist_pages = (header.freelist_pages.get() + 1).into();
 
@@ -4833,12 +4808,7 @@ impl Pager {
                     // `pending_reads` returns the same `trunk_page`, and the
                     // writes are byte-identical (we haven't written yet so
                     // `number_of_leaf_pages` is unchanged).
-                    let (trunk_page, c) = match self.read_page(trunk_page_id as i64)? {
-                        IOResult::Done(v) => v,
-                        IOResult::IO(IOCompletions::Single(spill_c)) => {
-                            io_yield_one!(spill_c);
-                        }
-                    };
+                    let (trunk_page, c) = return_if_io!(self.read_page(trunk_page_id as i64));
                     if let Some(c) = c {
                         if !c.succeeded() {
                             io_yield_one!(c);
@@ -5059,17 +5029,12 @@ impl Pager {
                     // Spill yield routes back through `Start`; the ptrmap
                     // allocation above is idempotent and `trunk_page.pin()`
                     // happens only after `Done`, so no double-pin.
-                    match self.read_page(first_freelist_trunk_page_id as i64)? {
-                        IOResult::Done((trunk_page, c)) => {
-                            trunk_page.pin();
-                            *state = AllocatePageState::SearchAvailableFreeListLeaf { trunk_page };
-                            if let Some(c) = c {
-                                io_yield_one!(c);
-                            }
-                        }
-                        IOResult::IO(IOCompletions::Single(spill_c)) => {
-                            io_yield_one!(spill_c);
-                        }
+                    let (trunk_page, c) =
+                        return_if_io!(self.read_page(first_freelist_trunk_page_id as i64));
+                    trunk_page.pin();
+                    *state = AllocatePageState::SearchAvailableFreeListLeaf { trunk_page };
+                    if let Some(c) = c {
+                        io_yield_one!(c);
                     }
                 }
                 AllocatePageState::SearchAvailableFreeListLeaf { trunk_page } => {
@@ -5092,32 +5057,27 @@ impl Pager {
                             page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR);
                         // Pin + state-advance happen only on `Done` so a
                         // spill yield doesn't double-pin the leaf page.
-                        match self.read_page(next_leaf_page_id as i64)? {
-                            IOResult::Done((leaf_page, c)) => {
-                                turso_assert!(
-                                    number_of_freelist_leaves > 0,
-                                    "Freelist trunk page has no leaves",
-                                    { "page_id": trunk_page.get().id }
-                                );
+                        let (leaf_page, c) =
+                            return_if_io!(self.read_page(next_leaf_page_id as i64));
+                        turso_assert!(
+                            number_of_freelist_leaves > 0,
+                            "Freelist trunk page has no leaves",
+                            { "page_id": trunk_page.get().id }
+                        );
 
-                                // Pin leaf_page to prevent eviction while stored in state machine
-                                // trunk_page is already pinned from previous state
-                                leaf_page.pin();
+                        // Pin leaf_page to prevent eviction while stored in state machine
+                        // trunk_page is already pinned from previous state
+                        leaf_page.pin();
 
-                                *state = AllocatePageState::ReuseFreelistLeaf {
-                                    trunk_page: trunk_page.clone(),
-                                    leaf_page,
-                                    number_of_freelist_leaves,
-                                };
-                                if let Some(c) = c {
-                                    io_yield_one!(c);
-                                }
-                                continue;
-                            }
-                            IOResult::IO(IOCompletions::Single(spill_c)) => {
-                                io_yield_one!(spill_c);
-                            }
+                        *state = AllocatePageState::ReuseFreelistLeaf {
+                            trunk_page: trunk_page.clone(),
+                            leaf_page,
+                            number_of_freelist_leaves,
+                        };
+                        if let Some(c) = c {
+                            io_yield_one!(c);
                         }
+                        continue;
                     }
 
                     // No freelist leaves on this trunk page.

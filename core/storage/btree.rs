@@ -887,19 +887,14 @@ impl BTreeCursor {
             let state = self.is_empty_table_state.clone();
             match state {
                 EmptyTableState::Start => {
-                    // On `IO(spill_c)` we have not produced a page yet — leave
-                    // the state at `Start` so re-entry restarts here and the
-                    // pager's pending-read tracking returns the same PageRef.
-                    match self.pager.read_page(self.root_page)? {
-                        IOResult::Done((page, c)) => {
-                            self.is_empty_table_state = EmptyTableState::ReadPage { page };
-                            if let Some(c) = c {
-                                io_yield_one!(c);
-                            }
-                        }
-                        IOResult::IO(IOCompletions::Single(spill_c)) => {
-                            io_yield_one!(spill_c);
-                        }
+                    // On spill `return_if_io!` propagates `IO` up unchanged —
+                    // we have not produced a page yet, the state stays at
+                    // `Start`, and re-entry resumes here with the pager's
+                    // pending-read tracking returning the same PageRef.
+                    let (page, c) = return_if_io!(self.pager.read_page(self.root_page));
+                    self.is_empty_table_state = EmptyTableState::ReadPage { page };
+                    if let Some(c) = c {
+                        io_yield_one!(c);
                     }
                 }
                 EmptyTableState::ReadPage { page } => {
@@ -925,19 +920,13 @@ impl BTreeCursor {
                 if let Some(IterationPendingDescent::Backwards(target)) =
                     self.iteration_pending_descent
                 {
-                    match self.pager.read_page(target)? {
-                        IOResult::Done((mem_page, c)) => {
-                            self.iteration_pending_descent = None;
-                            self.descend_backwards(mem_page);
-                            if let Some(c) = c {
-                                io_yield_one!(c);
-                            }
-                            continue;
-                        }
-                        IOResult::IO(IOCompletions::Single(spill_c)) => {
-                            io_yield_one!(spill_c);
-                        }
+                    let (mem_page, c) = return_if_io!(self.pager.read_page(target));
+                    self.iteration_pending_descent = None;
+                    self.descend_backwards(mem_page);
+                    if let Some(c) = c {
+                        io_yield_one!(c);
                     }
+                    continue;
                 }
                 let (old_top_idx, page_type, is_index, is_leaf, cell_count) = {
                     let page = self.stack.top_ref();
@@ -964,19 +953,13 @@ impl BTreeCursor {
                         // descend; the loop's outer match on `cell_idx ==
                         // i32::MAX` would not re-fire if `set_cell_index`
                         // had moved us past it.
-                        match self.read_page(rightmost_pointer as i64)? {
-                            IOResult::Done((page, c)) => {
-                                self.stack.set_cell_index(past_rightmost_pointer);
-                                self.descend_backwards(page);
-                                if let Some(c) = c {
-                                    io_yield_one!(c);
-                                }
-                                continue;
-                            }
-                            IOResult::IO(IOCompletions::Single(spill_c)) => {
-                                io_yield_one!(spill_c);
-                            }
+                        let (page, c) = return_if_io!(self.read_page(rightmost_pointer as i64));
+                        self.stack.set_cell_index(past_rightmost_pointer);
+                        self.descend_backwards(page);
+                        if let Some(c) = c {
+                            io_yield_one!(c);
                         }
+                        continue;
                     }
                 }
 
@@ -1092,23 +1075,17 @@ impl BTreeCursor {
                 // would leave `read_overflow_state` half-initialized on a
                 // page that doesn't exist yet, and re-entry would skip the
                 // `is_none()` branch entirely.
-                match self.read_page(start_next_page as i64)? {
-                    IOResult::Done((page, c)) => {
-                        self.read_overflow_state.replace(ReadPayloadOverflow {
-                            payload: payload.to_vec(),
-                            next_page: start_next_page,
-                            remaining_to_read,
-                            page,
-                        });
-                        if let Some(c) = c {
-                            io_yield_one!(c);
-                        }
-                        continue;
-                    }
-                    IOResult::IO(IOCompletions::Single(spill_c)) => {
-                        io_yield_one!(spill_c);
-                    }
+                let (page, c) = return_if_io!(self.read_page(start_next_page as i64));
+                self.read_overflow_state.replace(ReadPayloadOverflow {
+                    payload: payload.to_vec(),
+                    next_page: start_next_page,
+                    remaining_to_read,
+                    page,
+                });
+                if let Some(c) = c {
+                    io_yield_one!(c);
                 }
+                continue;
             }
             // Compute `next` / `to_read` and fetch the next chain page (if
             // any) BEFORE applying the loop body's non-idempotent mutations,
@@ -1132,12 +1109,7 @@ impl BTreeCursor {
                 )
             };
             let new_page_and_c = if need_next_page {
-                match self.read_page(next as i64)? {
-                    IOResult::Done(v) => Some(v),
-                    IOResult::IO(IOCompletions::Single(spill_c)) => {
-                        io_yield_one!(spill_c);
-                    }
-                }
+                Some(return_if_io!(self.read_page(next as i64)))
             } else {
                 None
             };
@@ -1225,19 +1197,13 @@ impl BTreeCursor {
                 if let Some(IterationPendingDescent::Forwards(target)) =
                     self.iteration_pending_descent
                 {
-                    match self.pager.read_page(target)? {
-                        IOResult::Done((mem_page, c)) => {
-                            self.iteration_pending_descent = None;
-                            self.descend(mem_page);
-                            if let Some(c) = c {
-                                io_yield_one!(c);
-                            }
-                            continue;
-                        }
-                        IOResult::IO(IOCompletions::Single(spill_c)) => {
-                            io_yield_one!(spill_c);
-                        }
+                    let (mem_page, c) = return_if_io!(self.pager.read_page(target));
+                    self.iteration_pending_descent = None;
+                    self.descend(mem_page);
+                    if let Some(c) = c {
+                        io_yield_one!(c);
                     }
+                    continue;
                 }
                 let mem_page = self.stack.top_ref();
                 let contents = mem_page.get_contents();
@@ -1436,16 +1402,10 @@ impl BTreeCursor {
         self.seek_state = CursorSeekState::Start;
         self.going_upwards = false;
         tracing::trace!(root_page = self.root_page);
-        match self.read_page(self.root_page)? {
-            IOResult::Done((mem_page, c)) => {
-                self.stack.clear();
-                self.stack.push(mem_page);
-                Ok(IOResult::Done(c))
-            }
-            IOResult::IO(IOCompletions::Single(spill_c)) => {
-                io_yield_one!(spill_c);
-            }
-        }
+        let (mem_page, c) = return_if_io!(self.read_page(self.root_page));
+        self.stack.clear();
+        self.stack.push(mem_page);
+        Ok(IOResult::Done(c))
     }
 
     /// Move the cursor to the rightmost record in the btree.
@@ -1496,17 +1456,12 @@ impl BTreeCursor {
                             // re-reads the same parent contents and retries the
                             // descent — the disk-read for this child is memoized
                             // in `pending_reads`, so no duplicate IO is issued.
-                            match self.read_page(right_most_pointer as i64)? {
-                                IOResult::Done((mem_page, c)) => {
-                                    self.stack.set_cell_index(contents.cell_count() as i32 + 1);
-                                    self.stack.push(mem_page);
-                                    if let Some(c) = c {
-                                        io_yield_one!(c);
-                                    }
-                                }
-                                IOResult::IO(IOCompletions::Single(spill_c)) => {
-                                    io_yield_one!(spill_c);
-                                }
+                            let (mem_page, c) =
+                                return_if_io!(self.read_page(right_most_pointer as i64));
+                            self.stack.set_cell_index(contents.cell_count() as i32 + 1);
+                            self.stack.push(mem_page);
+                            if let Some(c) = c {
+                                io_yield_one!(c);
                             }
                         }
                         None => {
@@ -4856,17 +4811,10 @@ impl BTreeCursor {
                         }
                         // No mutations precede this read in the Start branch,
                         // so a spill yield safely re-enters here.
-                        match self.read_page(next_page as i64)? {
-                            IOResult::Done((page, c)) => {
-                                self.overflow_state =
-                                    OverflowState::ProcessPage { next_page: page };
-                                if let Some(c) = c {
-                                    io_yield_one!(c);
-                                }
-                            }
-                            IOResult::IO(IOCompletions::Single(spill_c)) => {
-                                io_yield_one!(spill_c);
-                            }
+                        let (page, c) = return_if_io!(self.read_page(next_page as i64));
+                        self.overflow_state = OverflowState::ProcessPage { next_page: page };
+                        if let Some(c) = c {
+                            io_yield_one!(c);
                         }
                     } else {
                         self.overflow_state = OverflowState::Done;
@@ -4906,17 +4854,13 @@ impl BTreeCursor {
                         self.overflow_state = OverflowState::Done;
                     }
                 }
-                OverflowState::ReadNext { next } => match self.pager.read_page(next as i64)? {
-                    IOResult::Done((page, c)) => {
-                        self.overflow_state = OverflowState::ProcessPage { next_page: page };
-                        if let Some(c) = c {
-                            io_yield_one!(c);
-                        }
+                OverflowState::ReadNext { next } => {
+                    let (page, c) = return_if_io!(self.pager.read_page(next as i64));
+                    self.overflow_state = OverflowState::ProcessPage { next_page: page };
+                    if let Some(c) = c {
+                        io_yield_one!(c);
                     }
-                    IOResult::IO(IOCompletions::Single(spill_c)) => {
-                        io_yield_one!(spill_c);
-                    }
-                },
+                }
                 OverflowState::Done => {
                     self.overflow_state = OverflowState::Start;
                     return Ok(IOResult::Done(()));
@@ -5151,22 +5095,18 @@ impl BTreeCursor {
                         _ => panic!("unexpected cell type"),
                     }
                 }
-                DestroyState::PendingDescent { target } => match self.pager.read_page(target)? {
-                    IOResult::Done((child_page, c)) => {
-                        self.stack.push(child_page);
-                        let destroy_info = self
-                            .state
-                            .mut_destroy_info()
-                            .expect("unable to get a mut reference to destroy state in cursor");
-                        destroy_info.state = DestroyState::LoadPage;
-                        if let Some(c) = c {
-                            io_yield_one!(c);
-                        }
+                DestroyState::PendingDescent { target } => {
+                    let (child_page, c) = return_if_io!(self.pager.read_page(target));
+                    self.stack.push(child_page);
+                    let destroy_info = self
+                        .state
+                        .mut_destroy_info()
+                        .expect("unable to get a mut reference to destroy state in cursor");
+                    destroy_info.state = DestroyState::LoadPage;
+                    if let Some(c) = c {
+                        io_yield_one!(c);
                     }
-                    IOResult::IO(IOCompletions::Single(spill_c)) => {
-                        io_yield_one!(spill_c);
-                    }
-                },
+                }
                 DestroyState::FreePage => {
                     let page = self.stack.top();
                     let page_id = page.get().id;
@@ -6119,18 +6059,12 @@ impl CursorTrait for BTreeCursor {
                     // Resume after a spill yield from `CountState::Loop` mid-
                     // descent. The loop-top mutations are already applied for
                     // this step; finish the descent and return to `Loop`.
-                    match self.pager.read_page(target)? {
-                        IOResult::Done((child, c)) => {
-                            self.stack.advance();
-                            self.stack.push(child);
-                            self.count_state = CountState::Loop;
-                            if let Some(c) = c {
-                                io_yield_one!(c);
-                            }
-                        }
-                        IOResult::IO(IOCompletions::Single(spill_c)) => {
-                            io_yield_one!(spill_c);
-                        }
+                    let (child, c) = return_if_io!(self.pager.read_page(target));
+                    self.stack.advance();
+                    self.stack.push(child);
+                    self.count_state = CountState::Loop;
+                    if let Some(c) = c {
+                        io_yield_one!(c);
                     }
                 }
                 CountState::Finish => {
@@ -6248,17 +6182,12 @@ impl CursorTrait for BTreeCursor {
 
                     match contents.rightmost_pointer()? {
                         Some(right_most_pointer) => {
-                            match self.read_page(right_most_pointer as i64)? {
-                                IOResult::Done((child, c)) => {
-                                    self.stack.set_cell_index(contents.cell_count() as i32 + 1); // invalid on interior
-                                    self.stack.push(child);
-                                    if let Some(c) = c {
-                                        io_yield_one!(c);
-                                    }
-                                }
-                                IOResult::IO(IOCompletions::Single(spill_c)) => {
-                                    io_yield_one!(spill_c);
-                                }
+                            let (child, c) =
+                                return_if_io!(self.read_page(right_most_pointer as i64));
+                            self.stack.set_cell_index(contents.cell_count() as i32 + 1); // invalid on interior
+                            self.stack.push(child);
+                            if let Some(c) = c {
+                                io_yield_one!(c);
                             }
                         }
                         None => unreachable!("interior page must have rightmost pointer"),
@@ -6554,18 +6483,12 @@ pub fn integrity_check(
                 // On `IO(spill_c)` we leave `state.page = None` so re-entry
                 // re-takes this None branch and resumes via the pager's
                 // `pending_reads` memoization.
-                match pager.read_page(page_idx)? {
-                    IOResult::Done((page, c)) => {
-                        state.page = Some(page);
-                        if let Some(c) = c {
-                            io_yield_one!(c);
-                        }
-                        state.page.take().expect("page should be present")
-                    }
-                    IOResult::IO(IOCompletions::Single(spill_c)) => {
-                        io_yield_one!(spill_c);
-                    }
+                let (page, c) = return_if_io!(pager.read_page(page_idx));
+                state.page = Some(page);
+                if let Some(c) = c {
+                    io_yield_one!(c);
                 }
+                state.page.take().expect("page should be present")
             }
         };
         turso_assert!(page.is_loaded(), "page should be loaded");
