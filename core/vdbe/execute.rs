@@ -13875,6 +13875,42 @@ pub fn op_rename_table(
             schema.triggers.insert(normalized_to.to_owned(), triggers);
         }
 
+        // If the renamed table owned an implicit AUTOINCREMENT sequence,
+        // the sequence's name (`__turso_internal_autoincrement_<old>`) and
+        // its backing table's name (`__turso_internal_seq_<…>`) are both
+        // derived from the parent table. The bytecode-side rewrite in
+        // `emit_rename_autoincrement_backing_table_entry` already updated
+        // the persistent sqlite_schema row; here we mirror the rename in
+        // the in-memory `schema.sequences` and `schema.tables` maps so a
+        // subsequent INSERT under MVCC can find the sequence via
+        // `autoincrement_sequence_name(<new>)`. Without this, every
+        // INSERT into the renamed table would error with "missing
+        // implicit sequence for AUTOINCREMENT table" until the next
+        // schema reparse.
+        let old_seq_name = crate::schema::autoincrement_sequence_name(&normalized_from);
+        if let Some(mut seq_arc) = schema.sequences.remove(&old_seq_name) {
+            let new_seq_name = crate::schema::autoincrement_sequence_name(&normalized_to);
+            // Mutate the Sequence's `name` field so its internal identity
+            // tracks the new table. `seq.name` is used by the exhaustion
+            // error message in `op_sequence_compute_next` and by the
+            // `AUTOINCREMENT_SEQ_PREFIX` strip-check in
+            // `emit_autoincrement_sqlite_sequence_sync` — keeping it in
+            // sync with the map key avoids a misleading error and a
+            // missed sqlite_sequence mirror.
+            Arc::make_mut(&mut seq_arc).name.clone_from(&new_seq_name);
+            let old_backing_table =
+                crate::translate::sequence::sequence_backing_table_name(&old_seq_name);
+            let new_backing_table =
+                crate::translate::sequence::sequence_backing_table_name(&new_seq_name);
+            schema.sequences.insert(new_seq_name, seq_arc);
+            if let Some(mut backing_arc) = schema.tables.remove(&old_backing_table) {
+                if let Table::BTree(btree_arc) = Arc::make_mut(&mut backing_arc) {
+                    Arc::make_mut(btree_arc).name.clone_from(&new_backing_table);
+                }
+                schema.tables.insert(new_backing_table, backing_arc);
+            }
+        }
+
         // Also update triggers on OTHER tables that reference the renamed table
         // in their body commands (e.g., INSERT INTO old_name in a trigger on another table)
         for (_, triggers) in schema.triggers.iter_mut() {

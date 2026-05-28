@@ -142,6 +142,53 @@ expect {
     2|b
 }
 
+# --- ALTER TABLE RENAME on AUTOINCREMENT under MVCC ---
+
+# Pre-fix this CRASHED MVCC inserts after RENAME with
+# `Internal error: missing implicit sequence for AUTOINCREMENT table
+# "<new>"` because the hidden sequence
+# `__turso_internal_autoincrement_<old>` was never renamed to track the
+# parent. Now both the in-memory `schema.sequences` and `schema.tables`
+# entries and the persistent sqlite_schema row for the backing table
+# follow the rename.
+test mvcc-alter-rename-autoincrement-table-keeps-sequence-attached {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE old(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO old(v) VALUES('a'),('b');
+    ALTER TABLE old RENAME TO new;
+    INSERT INTO new(v) VALUES('c'),('d');
+    SELECT id, v FROM new ORDER BY id;
+    SELECT name FROM sqlite_schema WHERE name LIKE '__turso_internal_seq_%';
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    mvcc
+    1|a
+    2|b
+    3|c
+    4|d
+    __turso_internal_seq___turso_internal_autoincrement_new
+    new|4
+}
+
+# After the rename, DROP TABLE on the *new* name must release the
+# (renamed) implicit sequence. Combined regression for the rename +
+# orphan-cleanup paths.
+test mvcc-rename-then-drop-table-releases-renamed-sequence {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE old(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO old(v) VALUES('a'),('b');
+    ALTER TABLE old RENAME TO new;
+    DROP TABLE new;
+    SELECT count(*) FROM sqlite_schema WHERE name LIKE '__turso_internal_seq_%';
+    SELECT count(*) FROM sqlite_sequence;
+}
+expect {
+    mvcc
+    0
+    0
+}
+
 # Same tradeoff applies to user CREATE SEQUENCE under BEGIN CONCURRENT:
 # nextval in a rolled-back concurrent tx burns the value.
 test mvcc-concurrent-tx-rollback-burns-nextval {

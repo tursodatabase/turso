@@ -45,6 +45,40 @@ expect {
     1
 }
 
+# --- ALTER TABLE RENAME on AUTOINCREMENT (WAL/rollback mode) ---
+
+# WAL: rename must update the backing-table sqlite_schema row + sqlite_sequence
+# entry. Persistence is implicit (the in-memory schema is reparsed on next
+# session); covered separately for MVCC where the in-memory rename is
+# load-bearing.
+test alter-rename-autoincrement-table-preserves-watermark {
+    CREATE TABLE old(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO old(v) VALUES('a'),('b');
+    ALTER TABLE old RENAME TO new;
+    INSERT INTO new(v) VALUES('c');
+    SELECT id, v FROM new ORDER BY id;
+    SELECT name FROM sqlite_schema WHERE name LIKE '__turso_internal_seq_%';
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    1|a
+    2|b
+    3|c
+    __turso_internal_seq___turso_internal_autoincrement_new
+    new|3
+}
+
+# Rename to a name conflicting with an existing __turso_internal_ prefix
+# must be rejected at the validate stage (RESERVED_TABLE_PREFIXES guard) —
+# regression so a user can't shadow their own sequence's backing table.
+test alter-rename-rejects-internal-prefix-target {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    ALTER TABLE t RENAME TO __turso_internal_evil;
+}
+expect error {
+    .*
+}
+
 # --- DROP / re-CREATE SEQUENCE round-trip ---
 
 # Re-creating a sequence with the same name after DROP must use the new

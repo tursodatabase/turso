@@ -694,7 +694,12 @@ pub fn allow_user_dml(table_name: &str) -> bool {
 /// disk by `Insn::SequenceComputeNext` + surrounding cursor bytecode on
 /// every nextval/setval call. See `core/translate/sequence.rs` and the
 /// disk-only design notes above.
-#[derive(Debug)]
+///
+/// `Clone` is implemented so `Arc::make_mut` can in-place edit the `name`
+/// field during `ALTER TABLE … RENAME TO …` on an AUTOINCREMENT table —
+/// keeping the sequence's identity in sync with the parent table's new
+/// name without forcing a schema reparse.
+#[derive(Debug, Clone)]
 pub struct Sequence {
     pub name: String,
     pub start_value: i64,
