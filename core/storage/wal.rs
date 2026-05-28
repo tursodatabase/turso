@@ -40,6 +40,7 @@ use crate::storage::sqlite3_ondisk::{
     write_pages_vectored, PageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
 use crate::types::{IOCompletions, IOResult};
+use crate::util::IOExt as _;
 use crate::{
     bail_corrupt_error, io_yield_one, Buffer, Completion, CompletionError, IOContext, LimboError,
     Result,
@@ -2688,6 +2689,23 @@ pub struct WalSharedRuntime {
     /// Tracks how far the process-local `frame_cache` is known to be complete
     /// for overflow fallback in the current WAL generation.
     pub overflow_fallback_coverage: Arc<SpinLock<OverflowFallbackCoverage>>,
+}
+
+/// Drivable result of [`WalFileShared::open_shared_if_exists_begin`]. Either an
+/// immediate no-op WAL (readonly, file absent) or an in-progress recovery scan
+/// to be pumped via [`OpenSharedWal::poll`] until it returns `Done`.
+pub enum OpenSharedWal {
+    Noop(Arc<RwLock<WalFileShared>>),
+    Build(sqlite3_ondisk::BuildSharedWal),
+}
+
+impl OpenSharedWal {
+    pub fn poll(&mut self) -> Result<IOResult<Arc<RwLock<WalFileShared>>>> {
+        match self {
+            OpenSharedWal::Noop(wal) => Ok(IOResult::Done(wal.clone())),
+            OpenSharedWal::Build(driver) => driver.poll(),
+        }
+    }
 }
 
 /// WalFileShared holds process-wide WAL metadata plus process-local coordination state.
@@ -5370,6 +5388,18 @@ impl WalFileShared {
         path: &str,
         flags: crate::OpenFlags,
     ) -> Result<Arc<RwLock<WalFileShared>>> {
+        let mut driver = Self::open_shared_if_exists_begin(io, path, flags)?;
+        io.block(|| driver.poll())
+    }
+
+    /// Non-blocking entry point for [`WalFileShared::open_shared_if_exists`].
+    /// Performs only the synchronous file open (and readonly/NotFound noop
+    /// handling); the WAL recovery scan is driven via [`OpenSharedWal::poll`].
+    pub fn open_shared_if_exists_begin(
+        io: &Arc<dyn IO>,
+        path: &str,
+        flags: crate::OpenFlags,
+    ) -> Result<OpenSharedWal> {
         let file = match io.open_file(path, flags, false) {
             Ok(file) => file,
             Err(LimboError::CompletionError(CompletionError::IOError(
@@ -5378,18 +5408,13 @@ impl WalFileShared {
             ))) if flags.contains(crate::OpenFlags::ReadOnly) => {
                 // In readonly mode, if the WAL file doesn't exist, we just return a noop WAL
                 // since there's nothing to read from.
-                return Ok(WalFileShared::new_noop());
+                return Ok(OpenSharedWal::Noop(WalFileShared::new_noop()));
             }
             Err(e) => return Err(e),
         };
-        let wal_file_shared = sqlite3_ondisk::build_shared_wal(&file, io)?;
-        turso_assert!(
-            wal_file_shared
-                .try_read()
-                .is_some_and(|wfs| wfs.metadata.loaded.load(Ordering::Acquire)),
-            "Unable to read WAL shared state"
-        );
-        Ok(wal_file_shared)
+        Ok(OpenSharedWal::Build(sqlite3_ondisk::BuildSharedWal::begin(
+            &file,
+        )?))
     }
 
     pub fn is_initialized(&self) -> Result<bool> {
