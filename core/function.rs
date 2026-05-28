@@ -460,22 +460,87 @@ pub enum AggFunc {
     External(Arc<ExtFunc>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
+#[derive(Debug, Clone, strum::EnumIter)]
 pub enum WindowFunc {
     RowNumber,
+    Rank,
+    DenseRank,
+    PercentRank,
+    CumeDist,
+    Ntile,
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    NthValue,
+    #[strum(disabled)]
+    External(Arc<ExtFunc>),
 }
 
 impl WindowFunc {
     pub fn arities(&self) -> &'static [i32] {
         match self {
-            Self::RowNumber => &[0],
+            Self::RowNumber | Self::Rank | Self::DenseRank | Self::PercentRank | Self::CumeDist => {
+                &[0]
+            }
+            Self::Ntile | Self::FirstValue | Self::LastValue => &[1],
+            Self::NthValue => &[2],
+            Self::Lag | Self::Lead => &[1, 2, 3],
+            Self::External(_) => unreachable!(
+                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
+            ),
+        }
+    }
+
+    /// Whether name resolution + runtime dispatch are wired up. Stub variants
+    /// must not be advertised via `pragma_function_list`, or introspection
+    /// drifts ahead of the resolver and users get "no such function" when
+    /// they try to call them.
+    pub fn is_implemented(&self) -> bool {
+        matches!(self, Self::RowNumber)
+    }
+}
+
+impl PartialEq for WindowFunc {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::RowNumber, Self::RowNumber)
+            | (Self::Rank, Self::Rank)
+            | (Self::DenseRank, Self::DenseRank)
+            | (Self::PercentRank, Self::PercentRank)
+            | (Self::CumeDist, Self::CumeDist)
+            | (Self::Ntile, Self::Ntile)
+            | (Self::Lag, Self::Lag)
+            | (Self::Lead, Self::Lead)
+            | (Self::FirstValue, Self::FirstValue)
+            | (Self::LastValue, Self::LastValue)
+            | (Self::NthValue, Self::NthValue) => true,
+            (Self::External(a), Self::External(b)) => Arc::ptr_eq(a, b),
+            _ => false,
         }
     }
 }
 
+impl Eq for WindowFunc {}
+
 impl Deterministic for WindowFunc {
     fn is_deterministic(&self) -> bool {
-        true
+        match self {
+            Self::RowNumber
+            | Self::Rank
+            | Self::DenseRank
+            | Self::PercentRank
+            | Self::CumeDist
+            | Self::Ntile
+            | Self::Lag
+            | Self::Lead
+            | Self::FirstValue
+            | Self::LastValue
+            | Self::NthValue => true,
+            Self::External(_) => unreachable!(
+                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
+            ),
+        }
     }
 }
 
@@ -483,6 +548,19 @@ impl std::fmt::Display for WindowFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RowNumber => write!(f, "row_number"),
+            Self::Rank => write!(f, "rank"),
+            Self::DenseRank => write!(f, "dense_rank"),
+            Self::PercentRank => write!(f, "percent_rank"),
+            Self::CumeDist => write!(f, "cume_dist"),
+            Self::Ntile => write!(f, "ntile"),
+            Self::Lag => write!(f, "lag"),
+            Self::Lead => write!(f, "lead"),
+            Self::FirstValue => write!(f, "first_value"),
+            Self::LastValue => write!(f, "last_value"),
+            Self::NthValue => write!(f, "nth_value"),
+            Self::External(_) => unreachable!(
+                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
+            ),
         }
     }
 }
@@ -1721,8 +1799,11 @@ impl Func {
             push(f.to_string(), "w", f.arities(), f.is_deterministic());
         }
 
-        // Window functions.
+        // Window functions (skip stub variants until they're wired up).
         for f in WindowFunc::iter() {
+            if !f.is_implemented() {
+                continue;
+            }
             push(f.to_string(), "w", f.arities(), f.is_deterministic());
         }
 
