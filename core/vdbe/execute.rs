@@ -6401,6 +6401,7 @@ pub fn op_agg_step(
         },
         insn
     );
+    let func = func.expect_agg();
 
     // Initialize aggregate state if not already done
     if let Register::Value(Value::Null) = state.registers[*acc_reg] {
@@ -6592,6 +6593,7 @@ pub fn op_agg_final(
         } => (*acc_reg, *dest_reg, func),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
+    let func = func.expect_agg();
 
     match &state.registers[acc_reg] {
         Register::Aggregate(agg) => {

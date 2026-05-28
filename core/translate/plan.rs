@@ -1,6 +1,6 @@
 use crate::{
     alloc::{self, TursoIteratorExt},
-    function::{AggFunc, WindowFunc},
+    function::{AccumulatorFunc, AggFunc},
     schema::{
         BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table, Type, ROWID_SENTINEL,
     },
@@ -3090,12 +3090,6 @@ impl Window {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum WindowFunctionKind {
-    Agg(AggFunc),
-    Window(WindowFunc),
-}
-
 /// One window function call belonging to a `Window`.
 ///
 /// Window queries are planned by wrapping the original FROM/WHERE in a
@@ -3108,7 +3102,7 @@ pub enum WindowFunctionKind {
 pub struct WindowFunction {
     /// The resolved function. Aggregate window functions and specialized window
     /// functions such as ROW_NUMBER() are supported.
-    pub func: WindowFunctionKind,
+    pub func: AccumulatorFunc,
     /// The expression from which the function was resolved. Used as the lookup
     /// key when matching SQL occurrences back to this entry during rewriting.
     pub original_expr: Expr,

@@ -1,4 +1,4 @@
-use crate::function::WindowFunc;
+use crate::function::{AccumulatorFunc, WindowFunc};
 use crate::schema::{BTreeCharacteristics, BTreeTable, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
@@ -11,7 +11,7 @@ use crate::translate::expr::{
 use crate::translate::order_by::EmitOrderBy;
 use crate::translate::plan::{
     Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination, ResultSetColumn,
-    RewrittenWindowCall, SelectPlan, TableReferences, Window, WindowFunction, WindowFunctionKind,
+    RewrittenWindowCall, SelectPlan, TableReferences, Window, WindowFunction,
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
@@ -895,7 +895,7 @@ fn emit_reset_state_if_new_partition(
         dest_end: Some(registers.acc_start + window.functions.len() - 1),
     });
     for (i, func) in window.functions.iter().enumerate() {
-        if matches!(func.func, WindowFunctionKind::Window(WindowFunc::RowNumber)) {
+        if matches!(func.func, AccumulatorFunc::Window(WindowFunc::RowNumber)) {
             program.emit_int(0, registers.acc_result_start + i);
         }
     }
@@ -1027,7 +1027,7 @@ fn emit_aggregation_step(
     registers: &WindowRegisters,
 ) -> crate::Result<()> {
     for (i, func) in window.functions.iter().enumerate() {
-        let WindowFunctionKind::Agg(agg_func) = &func.func else {
+        let AccumulatorFunc::Agg(agg_func) = &func.func else {
             continue;
         };
         // The aggregation step is performed incrementally as each row from the subquery is
@@ -1161,11 +1161,11 @@ fn emit_return_buffered_rows(
     } = t_ctx.meta_window.as_ref().expect("missing window metadata");
 
     for (i, func) in window.functions.iter().enumerate() {
-        if let WindowFunctionKind::Agg(agg_func) = &func.func {
+        if let AccumulatorFunc::Agg(agg_func) = &func.func {
             program.emit_insn(Insn::AggValue {
                 acc_reg: registers.acc_start + i,
                 dest_reg: registers.acc_result_start + i,
-                func: agg_func.clone(),
+                func: AccumulatorFunc::Agg(agg_func.clone()),
             });
         }
     }
@@ -1175,7 +1175,7 @@ fn emit_return_buffered_rows(
     let reg_one = window
         .functions
         .iter()
-        .any(|func| matches!(func.func, WindowFunctionKind::Window(WindowFunc::RowNumber)))
+        .any(|func| matches!(func.func, AccumulatorFunc::Window(WindowFunc::RowNumber)))
         .then(|| {
             let reg = program.alloc_register();
             program.emit_int(1, reg);
@@ -1191,7 +1191,7 @@ fn emit_return_buffered_rows(
         program.emit_column_or_rowid(cursors.buffer_read, *col_idx, reg_result);
     }
     for (i, func) in window.functions.iter().enumerate() {
-        if let WindowFunctionKind::Window(WindowFunc::RowNumber) = &func.func {
+        if let AccumulatorFunc::Window(WindowFunc::RowNumber) = &func.func {
             let reg_one = reg_one.expect("row_number must allocate reg_one");
             let reg_row_number = registers.acc_result_start + i;
             program.emit_insn(Insn::Add {
