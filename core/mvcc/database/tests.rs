@@ -107,7 +107,6 @@ impl MvccTestDb {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:").unwrap();
         let conn = db.connect().unwrap();
-        conn.set_portable_logical_changes_enabled(true);
         // Enable MVCC via PRAGMA
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         let mvcc_store = db.get_mv_store().clone().unwrap();
@@ -116,6 +115,13 @@ impl MvccTestDb {
             db,
             conn,
         }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    fn new_with_portable_logical_changes() -> Self {
+        let db = Self::new();
+        db.conn.set_portable_logical_changes_enabled(true);
+        db
     }
 }
 
@@ -11497,7 +11503,7 @@ fn test_mvcc_portable_changes_disabled_by_default() {
 #[cfg(feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_contains_user_schema_and_rows() {
-    let db = MvccTestDb::new();
+    let db = MvccTestDb::new_with_portable_logical_changes();
     db.conn
         .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
         .unwrap();
@@ -11517,7 +11523,7 @@ fn test_mvcc_portable_changes_contains_user_schema_and_rows() {
 #[cfg(feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_updates_name_mapping_across_rename() {
-    let db = MvccTestDb::new();
+    let db = MvccTestDb::new_with_portable_logical_changes();
     db.conn
         .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
         .unwrap();
@@ -11541,7 +11547,7 @@ fn test_mvcc_portable_changes_updates_name_mapping_across_rename() {
 #[cfg(feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_emit_refresh_for_same_rowid_schema_update() {
-    let db = MvccTestDb::new();
+    let db = MvccTestDb::new_with_portable_logical_changes();
     db.conn
         .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
         .unwrap();
@@ -11559,7 +11565,7 @@ fn test_mvcc_portable_changes_emit_refresh_for_same_rowid_schema_update() {
 #[cfg(feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_emit_drop_and_create_for_drop_recreate_same_name() {
-    let db = MvccTestDb::new();
+    let db = MvccTestDb::new_with_portable_logical_changes();
     db.conn
         .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
         .unwrap();
@@ -11595,7 +11601,7 @@ fn test_mvcc_portable_changes_emit_drop_and_create_for_drop_recreate_same_name()
 #[cfg(feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_resolve_rows_through_object_map_in_same_txn() {
-    let db = MvccTestDb::new();
+    let db = MvccTestDb::new_with_portable_logical_changes();
     db.conn.execute("BEGIN").unwrap();
     db.conn
         .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
@@ -11619,7 +11625,7 @@ fn test_mvcc_portable_changes_resolve_rows_through_object_map_in_same_txn() {
 #[cfg(feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_emit_index_drop_for_drop_table() {
-    let db = MvccTestDb::new();
+    let db = MvccTestDb::new_with_portable_logical_changes();
     db.conn
         .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
         .unwrap();
@@ -11639,7 +11645,7 @@ fn test_mvcc_portable_changes_emit_index_drop_for_drop_table() {
 #[cfg(feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_emit_index_trigger_and_view_schema_ops() {
-    let db = MvccTestDb::new();
+    let db = MvccTestDb::new_with_portable_logical_changes();
     db.conn
         .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
         .unwrap();
@@ -11671,7 +11677,7 @@ fn test_mvcc_portable_changes_emit_index_trigger_and_view_schema_ops() {
 #[cfg(feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_emit_trigger_and_view_lifecycle_ops() {
-    let db = MvccTestDb::new();
+    let db = MvccTestDb::new_with_portable_logical_changes();
     db.conn
         .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
         .unwrap();
@@ -11704,7 +11710,7 @@ fn test_mvcc_portable_changes_emit_trigger_and_view_lifecycle_ops() {
 #[cfg(feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_emit_header_only_commits() {
-    let db = MvccTestDb::new();
+    let db = MvccTestDb::new_with_portable_logical_changes();
     db.conn.execute("PRAGMA user_version = 42").unwrap();
     db.conn.execute("PRAGMA application_id = 1337").unwrap();
 
@@ -11759,7 +11765,7 @@ fn test_mvcc_portable_changes_use_checkpointed_schema_after_restart() {
 #[cfg(feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_emit_ddl_and_backfill_rows_in_same_transaction() {
-    let db = MvccTestDb::new();
+    let db = MvccTestDb::new_with_portable_logical_changes();
     db.conn
         .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
         .unwrap();
@@ -11786,7 +11792,7 @@ fn test_mvcc_portable_changes_emit_ddl_and_backfill_rows_in_same_transaction() {
 #[cfg(feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_delete_carries_pk_projection_not_old_record() {
-    let db = MvccTestDb::new();
+    let db = MvccTestDb::new_with_portable_logical_changes();
     db.conn
         .execute("CREATE TABLE items(id TEXT PRIMARY KEY, payload TEXT)")
         .unwrap();
@@ -11827,7 +11833,7 @@ fn test_mvcc_portable_changes_delete_carries_pk_projection_not_old_record() {
 #[cfg(feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_do_not_infer_origin_from_application_table() {
-    let db = MvccTestDb::new();
+    let db = MvccTestDb::new_with_portable_logical_changes();
     db.conn
         .execute(
             "CREATE TABLE turso_sync_last_change_id(client_id TEXT PRIMARY KEY, pull_gen INTEGER, change_id INTEGER)",

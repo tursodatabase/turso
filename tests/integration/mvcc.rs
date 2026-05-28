@@ -49,8 +49,10 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         &self,
         log_record: &mut turso_core::mvcc::database::LogRecord,
         row_version: &turso_core::mvcc::database::RowVersion,
+        portable_extension: Option<&[u8]>,
     ) -> turso_core::Result<()> {
-        self.inner.serialize_row_version(log_record, row_version)
+        self.inner
+            .serialize_row_version(log_record, row_version, portable_extension)
     }
 
     fn serialize_database_header(
