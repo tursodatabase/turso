@@ -573,6 +573,9 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
 fn bench_insert_rows(criterion: &mut Criterion) {
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
+    // When set, disable auto-checkpoint in all three engines so per-iter time
+    // reflects pure insert cost without amortized checkpoint stalls.
+    let disable_checkpoint = std::env::var("DISABLE_CHECKPOINT_BENCHMARK").is_ok();
 
     let mut group = criterion.benchmark_group("Insert rows in batches");
 
@@ -585,6 +588,9 @@ fn bench_insert_rows(criterion: &mut Criterion) {
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io.clone(), db_path.to_str().unwrap()).unwrap();
         let limbo_conn = db.connect().unwrap();
+        if disable_checkpoint {
+            limbo_conn.wal_auto_actions_disable();
+        }
 
         let mut stmt = limbo_conn
             .query("CREATE TABLE test (id INTEGER, value TEXT)")
@@ -638,6 +644,74 @@ fn bench_insert_rows(criterion: &mut Criterion) {
             });
         });
 
+        // Same workload under MVCC. Separate db so the WAL/MVCC files don't collide.
+        let mvcc_temp_dir = tempfile::tempdir().unwrap();
+        let mvcc_db_path = mvcc_temp_dir.path().join("bench.db");
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let mvcc_io = Arc::new(PlatformIO::new().unwrap());
+        let mvcc_db =
+            Database::open_file(mvcc_io.clone(), mvcc_db_path.to_str().unwrap()).unwrap();
+        let mvcc_conn = mvcc_db.connect().unwrap();
+        mvcc_conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        if disable_checkpoint {
+            mvcc_conn
+                .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                .unwrap();
+            mvcc_conn.wal_auto_actions_disable();
+        }
+
+        let mut stmt = mvcc_conn
+            .query("CREATE TABLE test (id INTEGER, value TEXT)")
+            .unwrap()
+            .unwrap();
+        loop {
+            match stmt.step().unwrap() {
+                turso_core::StepResult::IO => {
+                    mvcc_db.io.step().unwrap();
+                }
+                turso_core::StepResult::Done => {
+                    break;
+                }
+                turso_core::StepResult::Row => {
+                    unreachable!();
+                }
+                turso_core::StepResult::Interrupt | turso_core::StepResult::Busy => {
+                    unreachable!();
+                }
+            }
+        }
+
+        group.bench_function(format!("limbo_mvcc_insert_{batch_size}_rows"), |b| {
+            let mut values = String::from("INSERT INTO test VALUES ");
+            for i in 0..batch_size {
+                if i > 0 {
+                    values.push(',');
+                }
+                values.push_str(&format!("({}, '{}')", i, format_args!("value_{i}")));
+            }
+            let mut stmt = mvcc_conn.prepare(&values).unwrap();
+            b.iter(|| {
+                loop {
+                    match stmt.step().unwrap() {
+                        turso_core::StepResult::IO => {
+                            mvcc_db.io.step().unwrap();
+                        }
+                        turso_core::StepResult::Done => {
+                            break;
+                        }
+                        turso_core::StepResult::Row => {
+                            unreachable!();
+                        }
+                        turso_core::StepResult::Interrupt | turso_core::StepResult::Busy => {
+                            unreachable!();
+                        }
+                    }
+                }
+                stmt.reset().unwrap();
+            });
+        });
+
         if enable_rusqlite {
             let temp_dir = tempfile::tempdir().unwrap();
             let db_path = temp_dir.path().join("bench.db");
@@ -651,6 +725,11 @@ fn bench_insert_rows(criterion: &mut Criterion) {
             sqlite_conn
                 .pragma_update(None, "locking_mode", "EXCLUSIVE")
                 .unwrap();
+            if disable_checkpoint {
+                sqlite_conn
+                    .pragma_update(None, "wal_autocheckpoint", 0)
+                    .unwrap();
+            }
             let journal_mode = sqlite_conn
                 .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
                 .unwrap();
