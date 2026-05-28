@@ -39,37 +39,24 @@ pub enum Subprogram {
     /// from `t`, so it must call the same action program that is being built.
     /// The slot is filled after compilation finishes. The stored reference is
     /// weak so the finished program does not own itself.
-    RecursiveFkActionBeingCompiled(Arc<OnceLock<Weak<PreparedProgram>>>),
+    Pending(Arc<OnceLock<Weak<PreparedProgram>>>),
 }
 
 impl Subprogram {
     /// Return the finished program that `Insn::Program` should run.
     ///
-    /// `RecursiveFkActionBeingCompiled` must have been filled during
-    /// compilation before execution reaches the instruction. If it has not been
-    /// filled, compilation emitted a recursive foreign-key action call without
-    /// connecting it to the finished action program.
+    /// `Pending` must have been filled during compilation before execution
+    /// reaches the instruction. If it has not been filled, compilation emitted
+    /// a recursive foreign-key action call without connecting it to the
+    /// finished action program.
     pub(super) fn prepared_program(&self) -> crate::Result<Arc<PreparedProgram>> {
         match self {
             Self::PreparedProgram(program) => Ok(program.clone()),
-            Self::RecursiveFkActionBeingCompiled(program) => {
-                program.get().and_then(Weak::upgrade).ok_or_else(|| {
-                    crate::LimboError::InternalError(
-                        "recursive foreign-key action subprogram was not resolved".into(),
-                    )
-                })
-            }
-        }
-    }
-
-    /// Return whether the finished program is read-only.
-    ///
-    /// A recursive foreign-key action is treated as writable while it is still
-    /// being compiled. Foreign-key actions can modify child rows.
-    fn is_readonly(&self) -> bool {
-        match self {
-            Self::PreparedProgram(program) => program.is_readonly(),
-            Self::RecursiveFkActionBeingCompiled(_) => false,
+            Self::Pending(program) => program.get().and_then(Weak::upgrade).ok_or_else(|| {
+                crate::LimboError::InternalError(
+                    "recursive foreign-key action subprogram was not resolved".into(),
+                )
+            }),
         }
     }
 }
@@ -2110,7 +2097,12 @@ impl Insn {
             | Self::JournalMode { .. }
             | Self::Vacuum { .. } => false,
             Self::MaxPgcnt { new_max, .. } => *new_max == 0,
-            Self::Program { program, .. } => program.is_readonly(),
+            // A recursive foreign-key action is treated as writable while it's still being
+            // compiled; only fully-prepared subprograms can declare themselves read-only.
+            Self::Program { program, .. } => match program {
+                Subprogram::PreparedProgram(p) => p.is_readonly(),
+                Subprogram::Pending(_) => false,
+            },
             _ => true,
         }
     }

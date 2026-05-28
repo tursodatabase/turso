@@ -32,12 +32,10 @@ use std::{cell::RefCell, num::NonZero, num::NonZeroUsize, rc::Rc};
 /// A two-table cycle needs the same mechanism: table `a` cascades to `b`, and
 /// `b` cascades back to `a`.
 #[derive(Clone, Default)]
-pub(super) struct RecursiveFkActionCompileStack(
-    Rc<RefCell<Vec<RecursiveFkActionCompileStackEntry>>>,
-);
+pub(super) struct FkActionCompileStack(Rc<RefCell<Vec<FkActionCompileStackEntry>>>);
 
 /// One foreign-key action program that is currently being compiled.
-struct RecursiveFkActionCompileStackEntry {
+struct FkActionCompileStackEntry {
     /// The foreign key whose action program is being compiled.
     foreign_key: Arc<ForeignKey>,
     /// Whether the action started from a parent delete or a parent key update.
@@ -45,16 +43,16 @@ struct RecursiveFkActionCompileStackEntry {
     /// The place where the finished action program will be stored.
     ///
     /// Recursive calls emitted during compilation hold a clone of this slot.
-    prepared_program_slot: Arc<OnceLock<Weak<PreparedProgram>>>,
+    slot: Arc<OnceLock<Weak<PreparedProgram>>>,
 }
 
-impl RecursiveFkActionCompileStack {
+impl FkActionCompileStack {
     /// Find the unfinished action program for this foreign key and parent row change.
     ///
     /// Returning `Some` means the compiler is re-entering the same FK action.
     /// The caller should emit a recursive call to that in-progress program
     /// instead of compiling another copy of the action.
-    fn program_being_compiled_for(
+    fn find(
         &self,
         foreign_key: &Arc<ForeignKey>,
         parent_change: FkActionParentChange,
@@ -62,55 +60,49 @@ impl RecursiveFkActionCompileStack {
         self.0
             .borrow()
             .iter()
-            .find(|compiling| {
-                compiling.parent_change == parent_change
-                    && Arc::ptr_eq(&compiling.foreign_key, foreign_key)
+            .find(|entry| {
+                entry.parent_change == parent_change && Arc::ptr_eq(&entry.foreign_key, foreign_key)
             })
-            .map(|compiling| compiling.prepared_program_slot.clone())
+            .map(|entry| entry.slot.clone())
     }
 
     /// Remember that a foreign-key action program is being compiled.
     ///
     /// The returned guard removes the entry from the stack when compilation
     /// ends, including when compilation returns an error.
-    fn push_compile_stack_entry(
+    fn push(
         &self,
         foreign_key: Arc<ForeignKey>,
         parent_change: FkActionParentChange,
-    ) -> RecursiveFkActionCompileStackGuard {
-        let program = Arc::new(OnceLock::new());
-        self.0
-            .borrow_mut()
-            .push(RecursiveFkActionCompileStackEntry {
-                foreign_key,
-                parent_change,
-                prepared_program_slot: program.clone(),
-            });
-        RecursiveFkActionCompileStackGuard {
-            compile_stack: self.clone(),
-            prepared_program_slot: program,
+    ) -> FkActionCompileStackGuard {
+        let slot = Arc::new(OnceLock::new());
+        self.0.borrow_mut().push(FkActionCompileStackEntry {
+            foreign_key,
+            parent_change,
+            slot: slot.clone(),
+        });
+        FkActionCompileStackGuard {
+            stack: self.clone(),
+            slot,
         }
     }
 }
 
 /// Removes a foreign-key action program from the compile stack when compilation ends.
-struct RecursiveFkActionCompileStackGuard {
-    compile_stack: RecursiveFkActionCompileStack,
-    prepared_program_slot: Arc<OnceLock<Weak<PreparedProgram>>>,
+struct FkActionCompileStackGuard {
+    stack: FkActionCompileStack,
+    slot: Arc<OnceLock<Weak<PreparedProgram>>>,
 }
 
-impl Drop for RecursiveFkActionCompileStackGuard {
+impl Drop for FkActionCompileStackGuard {
     fn drop(&mut self) {
         let ended = self
-            .compile_stack
+            .stack
             .0
             .borrow_mut()
             .pop()
             .expect("foreign-key action compilation stack underflow");
-        debug_assert!(Arc::ptr_eq(
-            &ended.prepared_program_slot,
-            &self.prepared_program_slot
-        ));
+        debug_assert!(Arc::ptr_eq(&ended.slot, &self.slot));
     }
 }
 
@@ -1326,7 +1318,7 @@ impl FkActionContext {
     /// Delete actions only have old parent key values. Update actions have old
     /// and new parent key values. The recursive compile stack uses this to keep
     /// delete and update action programs separate for the same foreign key.
-    fn parent_change_that_runs_action(&self) -> FkActionParentChange {
+    fn parent_change(&self) -> FkActionParentChange {
         if self.new_key_registers.is_some() {
             FkActionParentChange::Update
         } else {
@@ -1454,38 +1446,6 @@ fn emit_key_change_check(
 /// Common options for FK action subprogram builders.
 const FK_SUBPROGRAM_OPTS: ProgramBuilderOpts = ProgramBuilderOpts::new(2, 32, 4);
 
-/// Emit the `Program` instruction that runs a foreign-key action subprogram.
-///
-/// For a normal action, `subprogram` is a finished generated action program.
-/// For a recursive action, it points to the action program currently being
-/// compiled. The parent key registers are passed as SQL parameters to the
-/// generated action statement.
-fn emit_fk_action_program_insn(
-    program: &mut ProgramBuilder,
-    ctx: &FkActionContext,
-    subprogram: Subprogram,
-    action_subprogram_context: &FkSubprogramContext,
-) {
-    // Foreign-key action subprograms can't contain RAISE(IGNORE), so ignore_jump_target
-    // is a no-op that resolves to the next instruction (just falls through).
-    let mut param_registers = ctx.old_key_registers.to_vec();
-    if action_subprogram_context.new_param_start.is_some() {
-        let new_regs = ctx
-            .new_key_registers
-            .as_ref()
-            .expect("new key registers required for update cascade params");
-        param_registers.extend(new_regs.iter().copied());
-    }
-
-    let ignore_jump_target = program.allocate_label();
-    program.emit_insn(Insn::Program {
-        param_registers,
-        program: subprogram,
-        ignore_jump_target,
-    });
-    program.preassign_label_to_next_insn(ignore_jump_target);
-}
-
 /// Compile and emit a foreign-key action as a subprogram.
 ///
 /// This is the common implementation for CASCADE DELETE, SET NULL, SET DEFAULT,
@@ -1496,7 +1456,6 @@ fn emit_fk_action_program_insn(
 /// This is required for self-referential cascades and foreign-key cycles. In
 /// both cases, the generated action SQL can fire the same action again before
 /// the first action program has finished compiling.
-#[allow(clippy::too_many_arguments)]
 fn emit_fk_action_subprogram(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
@@ -1505,61 +1464,54 @@ fn emit_fk_action_subprogram(
     ctx: &FkActionContext,
     foreign_key: Arc<ForeignKey>,
     description: &'static str,
-    action_subprogram_context: &FkSubprogramContext,
 ) -> Result<()> {
-    let parent_change = ctx.parent_change_that_runs_action();
-    let recursive_fk_action_compile_stack = resolver.recursive_fk_action_compile_stack.clone();
-    if let Some(recursive_action_program) =
-        recursive_fk_action_compile_stack.program_being_compiled_for(&foreign_key, parent_change)
-    {
+    let parent_change = ctx.parent_change();
+    let compile_stack = resolver.fk_action_compile_stack.clone();
+
+    let subprogram = if let Some(slot) = compile_stack.find(&foreign_key, parent_change) {
         assert!(
             program.flags.is_subprogram(),
             "recursive foreign-key action calls must be emitted from a foreign-key action subprogram"
         );
-        emit_fk_action_program_insn(
-            program,
-            ctx,
-            Subprogram::RecursiveFkActionBeingCompiled(recursive_action_program),
-            action_subprogram_context,
+        Subprogram::Pending(slot)
+    } else {
+        let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
+            QueryMode::Normal,
+            program.capture_data_changes_info().clone(),
+            FK_SUBPROGRAM_OPTS,
         );
-        return Ok(());
+        let entry = compile_stack.push(foreign_key, parent_change);
+        subprogram_builder.prologue();
+        translate_inner(
+            stmt,
+            resolver,
+            &mut subprogram_builder,
+            connection,
+            description,
+        )?;
+        subprogram_builder.epilogue(resolver.schema());
+        let built = subprogram_builder.build(connection.clone(), true, description)?;
+        let prepared = built.prepared().clone();
+        entry
+            .slot
+            .set(Arc::downgrade(&prepared))
+            .expect("foreign-key action subprogram should be set exactly once");
+        Subprogram::PreparedProgram(prepared)
+    };
+
+    // Foreign-key action subprograms can't contain RAISE(IGNORE), so ignore_jump_target
+    // is a no-op that resolves to the next instruction (just falls through).
+    let mut param_registers = ctx.old_key_registers.to_vec();
+    if let Some(new_regs) = &ctx.new_key_registers {
+        param_registers.extend(new_regs.iter().copied());
     }
-
-    let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        program.capture_data_changes_info().clone(),
-        FK_SUBPROGRAM_OPTS,
-    );
-    let built_subprogram = {
-        let compile_stack_entry =
-            recursive_fk_action_compile_stack.push_compile_stack_entry(foreign_key, parent_change);
-        (|| -> Result<_> {
-            subprogram_builder.prologue();
-            translate_inner(
-                stmt,
-                resolver,
-                &mut subprogram_builder,
-                connection,
-                description,
-            )?;
-            subprogram_builder.epilogue(resolver.schema());
-            let built_subprogram =
-                subprogram_builder.build(connection.clone(), true, description)?;
-            let prepared_subprogram = built_subprogram.prepared().clone();
-            compile_stack_entry
-                .prepared_program_slot
-                .set(Arc::downgrade(&prepared_subprogram))
-                .expect("foreign-key action subprogram should be set exactly once");
-            Ok(prepared_subprogram)
-        })()
-    }?;
-
-    emit_fk_action_program_insn(
-        program,
-        ctx,
-        Subprogram::PreparedProgram(built_subprogram),
-        action_subprogram_context,
-    );
+    let ignore_jump_target = program.allocate_label();
+    program.emit_insn(Insn::Program {
+        param_registers,
+        program: subprogram,
+        ignore_jump_target,
+    });
+    program.preassign_label_to_next_insn(ignore_jump_target);
 
     Ok(())
 }
@@ -1765,7 +1717,6 @@ fn fire_fk_cascade_delete(
         ctx,
         fk_ref.fk.clone(),
         "fk cascade delete",
-        &subprog_ctx,
     )
 }
 
@@ -1800,7 +1751,6 @@ fn fire_fk_set_null(
         ctx,
         fk_ref.fk.clone(),
         "fk set null",
-        &subprog_ctx,
     )
 }
 
@@ -1835,7 +1785,6 @@ fn fire_fk_set_default(
         ctx,
         fk_ref.fk.clone(),
         "fk set default",
-        &subprog_ctx,
     )
 }
 
@@ -1871,7 +1820,6 @@ fn fire_fk_cascade_update(
         ctx,
         fk_ref.fk.clone(),
         "fk cascade update",
-        &subprog_ctx,
     )
 }
 

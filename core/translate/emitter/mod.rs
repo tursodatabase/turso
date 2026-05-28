@@ -28,7 +28,7 @@ use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
     EXPR_INDEX_SENTINEL,
 };
-use crate::translate::fkeys::RecursiveFkActionCompileStack;
+use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::ColumnMask;
 use crate::vdbe::{
     affinity::Affinity,
@@ -187,7 +187,7 @@ pub struct Resolver<'a> {
     /// the resolver while compiling generated foreign-key action SQL. Without
     /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
     /// that its own action program is already being built.
-    pub(super) recursive_fk_action_compile_stack: RecursiveFkActionCompileStack,
+    pub(super) fk_action_compile_stack: FkActionCompileStack,
 }
 
 #[derive(Clone)]
@@ -294,7 +294,7 @@ impl<'a> Resolver<'a> {
             dqs_dml,
             trigger_context: None,
             has_temp_schema,
-            recursive_fk_action_compile_stack: RecursiveFkActionCompileStack::default(),
+            fk_action_compile_stack: FkActionCompileStack::default(),
         }
     }
 
@@ -323,7 +323,7 @@ impl<'a> Resolver<'a> {
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
-            recursive_fk_action_compile_stack: self.recursive_fk_action_compile_stack.clone(),
+            fk_action_compile_stack: self.fk_action_compile_stack.clone(),
         }
     }
 
@@ -344,7 +344,7 @@ impl<'a> Resolver<'a> {
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
-            recursive_fk_action_compile_stack: self.recursive_fk_action_compile_stack.clone(),
+            fk_action_compile_stack: self.fk_action_compile_stack.clone(),
         }
     }
 
