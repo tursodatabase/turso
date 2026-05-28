@@ -139,12 +139,21 @@ use super::{make_record, Program, ProgramState, Register};
 use crate::connection::resolve_ext_path;
 use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
 
-#[cfg(any(test, injected_yields))]
-fn install_btree_yield_injector(program: &Program, cursor: &mut BTreeCursor) {
-    cursor.set_yield_injector(
-        program.connection.yield_injector(),
-        program.connection.next_yield_instance_id(),
-    );
+fn install_btree_yield_injector(program: &Program, cursor: BTreeCursor) -> BTreeCursor {
+    #[cfg(any(test, injected_yields))]
+    {
+        let mut cursor = cursor;
+        cursor.set_yield_injector(
+            program.connection.yield_injector(),
+            program.connection.next_yield_instance_id(),
+        );
+        cursor
+    }
+    #[cfg(not(any(test, injected_yields)))]
+    {
+        let _ = program;
+        cursor
+    }
 }
 
 /// Macro to destructure an Insn enum variant, only to be used when it
@@ -1162,14 +1171,14 @@ pub fn op_open_read(
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
 
-            let mut btree_cursor = BTreeCursor::new_table(
-                pager.clone(),
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
-                num_columns,
-            );
-            #[cfg(any(test, injected_yields))]
-            install_btree_yield_injector(program, &mut btree_cursor);
-            let btree_cursor = Box::new(btree_cursor);
+            let btree_cursor = Box::new(install_btree_yield_injector(
+                program,
+                BTreeCursor::new_table(
+                    pager.clone(),
+                    maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                    num_columns,
+                ),
+            ));
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
 
             // Get the view name and look up or create its transaction state
@@ -1200,24 +1209,24 @@ pub fn op_open_read(
                 ));
             }
             let btree_cursor: Box<dyn CursorTrait> = if table.has_rowid {
-                let mut cursor = BTreeCursor::new_table(
-                    pager,
-                    maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
-                    num_columns,
-                );
-                #[cfg(any(test, injected_yields))]
-                install_btree_yield_injector(program, &mut cursor);
-                Box::new(cursor)
+                Box::new(install_btree_yield_injector(
+                    program,
+                    BTreeCursor::new_table(
+                        pager,
+                        maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                        num_columns,
+                    ),
+                ))
             } else {
-                let mut cursor = BTreeCursor::new_without_rowid_table(
-                    pager,
-                    maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
-                    table.as_ref(),
-                    num_columns,
-                );
-                #[cfg(any(test, injected_yields))]
-                install_btree_yield_injector(program, &mut cursor);
-                Box::new(cursor)
+                Box::new(install_btree_yield_injector(
+                    program,
+                    BTreeCursor::new_without_rowid_table(
+                        pager,
+                        maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                        table.as_ref(),
+                        num_columns,
+                    ),
+                ))
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
@@ -1226,15 +1235,15 @@ pub fn op_open_read(
                 .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(index) => {
-            let mut btree_cursor = BTreeCursor::new_index(
-                pager,
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
-                index.as_ref(),
-                num_columns,
-            );
-            #[cfg(any(test, injected_yields))]
-            install_btree_yield_injector(program, &mut btree_cursor);
-            let btree_cursor = Box::new(btree_cursor);
+            let btree_cursor = Box::new(install_btree_yield_injector(
+                program,
+                BTreeCursor::new_index(
+                    pager,
+                    maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                    index.as_ref(),
+                    num_columns,
+                ),
+            ));
             let index_info = Arc::new(IndexInfo::new_from_index(index));
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
@@ -10490,15 +10499,15 @@ pub fn op_open_write(
         };
         if let Some(index) = maybe_index {
             let num_columns = index.columns.len();
-            let mut btree_cursor = BTreeCursor::new_index(
-                pager,
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                index.as_ref(),
-                num_columns,
-            );
-            #[cfg(any(test, injected_yields))]
-            install_btree_yield_injector(program, &mut btree_cursor);
-            let btree_cursor = Box::new(btree_cursor);
+            let btree_cursor = Box::new(install_btree_yield_injector(
+                program,
+                BTreeCursor::new_index(
+                    pager,
+                    maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                    index.as_ref(),
+                    num_columns,
+                ),
+            ));
             let index_info = Arc::new(IndexInfo::new_from_index(index));
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
@@ -10524,26 +10533,24 @@ pub fn op_open_write(
 
             let btree_cursor: Box<dyn CursorTrait> = match cursor_type {
                 CursorType::BTreeTable(table_rc) if !table_rc.has_rowid => {
-                    let mut cursor = BTreeCursor::new_without_rowid_table(
+                    Box::new(install_btree_yield_injector(
+                        program,
+                        BTreeCursor::new_without_rowid_table(
+                            pager,
+                            maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                            table_rc.as_ref(),
+                            num_columns,
+                        ),
+                    ))
+                }
+                _ => Box::new(install_btree_yield_injector(
+                    program,
+                    BTreeCursor::new_table(
                         pager,
                         maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                        table_rc.as_ref(),
                         num_columns,
-                    );
-                    #[cfg(any(test, injected_yields))]
-                    install_btree_yield_injector(program, &mut cursor);
-                    Box::new(cursor)
-                }
-                _ => {
-                    let mut cursor = BTreeCursor::new_table(
-                        pager,
-                        maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                        num_columns,
-                    );
-                    #[cfg(any(test, injected_yields))]
-                    install_btree_yield_injector(program, &mut cursor);
-                    Box::new(cursor)
-                }
+                    ),
+                )),
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
