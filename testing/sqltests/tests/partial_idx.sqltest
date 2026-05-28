@@ -523,6 +523,33 @@ expect {
     1|a@test|active|new
 }
 
+@cross-check-integrity
+test upsert-partial-target-where-function-name-case-insensitive {
+    CREATE TABLE u1wf(id INTEGER PRIMARY KEY, email TEXT, status TEXT, note TEXT);
+    CREATE UNIQUE INDEX idx_active_email_wf ON u1wf(email) WHERE LOWER(status)='active';
+    INSERT INTO u1wf VALUES (1,'a@test','active','old');
+    INSERT INTO u1wf(email,status,note)
+        VALUES('a@test','active','new')
+        ON CONFLICT(email) WHERE lower(status)='active' DO UPDATE SET note=excluded.note;
+    SELECT id,email,status,note FROM u1wf;
+}
+expect {
+    1|a@test|active|new
+}
+
+@cross-check-integrity
+test upsert-partial-target-where-must-preserve-binary-operand-order {
+    CREATE TABLE u1wo(k INTEGER, x INTEGER, note TEXT);
+    CREATE UNIQUE INDEX idx_u1wo ON u1wo(k) WHERE x=1;
+    INSERT INTO u1wo VALUES (1,1,'old');
+    INSERT INTO u1wo VALUES (1,1,'new')
+        ON CONFLICT(k) WHERE 1=x
+        DO UPDATE SET note='updated';
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
 # https://github.com/tursodatabase/turso/issues/7083
 @cross-check-integrity
 test uspsert-partial-unique {

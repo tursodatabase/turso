@@ -23,6 +23,17 @@ expect {
     1|99|20
 }
 
+@cross-check-integrity
+test upsert-expr-index-binary-op-swapped-target-does-not-match {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+    CREATE UNIQUE INDEX idx_sum ON t(a + b);
+    INSERT INTO t VALUES(1, 10, 20);
+    INSERT INTO t(a, b) VALUES(15, 15) ON CONFLICT(b + a) DO UPDATE SET a = 99;
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
 test upsert-expr-index-do-nothing {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
     CREATE UNIQUE INDEX idx_lower ON t(lower(val));
