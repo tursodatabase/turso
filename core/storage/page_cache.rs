@@ -227,6 +227,20 @@ impl PageCache {
         self._insert(key, value, true, true)
     }
 
+    /// Insert a page without enforcing the cache capacity.
+    ///
+    /// SQLite treats `PRAGMA cache_size` as a soft target. When the cache is
+    /// full of dirty or otherwise unevictable pages and spilling cannot make
+    /// room, pager callers may temporarily exceed capacity rather than fail a
+    /// statement with Busy.
+    pub fn insert_over_capacity(
+        &mut self,
+        key: PageCacheKey,
+        value: PageRef,
+    ) -> Result<(), CacheError> {
+        self._insert(key, value, false, true)
+    }
+
     pub fn _insert(
         &mut self,
         key: PageCacheKey,
