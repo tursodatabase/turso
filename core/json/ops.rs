@@ -43,7 +43,7 @@ pub fn json_patch(
         target = patch;
     } else {
         if target.element_type()? != super::jsonb::ElementType::OBJECT {
-            target = super::jsonb::Jsonb::make_empty_obj(0);
+            target = super::jsonb::Jsonb::make_empty_obj(0)?;
         }
         target.patch(&patch)?;
     }
@@ -75,7 +75,7 @@ pub fn jsonb_patch(
         target = patch;
     } else {
         if target.element_type()? != super::jsonb::ElementType::OBJECT {
-            target = super::jsonb::Jsonb::make_empty_obj(0);
+            target = super::jsonb::Jsonb::make_empty_obj(0)?;
         }
         target.patch(&patch)?;
     }
