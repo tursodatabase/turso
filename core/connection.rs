@@ -3046,6 +3046,17 @@ impl Connection {
         self.sequence_currvals.read().get(&normalized).copied()
     }
 
+    /// Drop this connection's currval entry for a sequence. Called on DROP
+    /// SEQUENCE (and implicit drops via DROP TABLE on AUTOINCREMENT) so that
+    /// a subsequent `CREATE SEQUENCE <same-name>` does not silently inherit
+    /// the stale per-session currval from the prior sequence — `currval()`
+    /// on the fresh sequence must error with "not yet defined in this
+    /// session" until a nextval/setval establishes it.
+    pub fn clear_sequence_currval(&self, name: &str) {
+        let normalized = crate::util::normalize_ident(name);
+        self.sequence_currvals.write().remove(&normalized);
+    }
+
     /// Total times this connection's autonomous sequence inner-tx ran into
     /// a transient conflict (`WriteWriteConflict` / `BusySnapshot` /
     /// `Conflict(_)`) and was retried by `op_sequence_commit_inner_tx`.
@@ -3177,9 +3188,8 @@ impl Connection {
     pub(crate) fn sync_autoincrement_backing_tables_from_sqlite_sequence(
         self: &Arc<Connection>,
     ) -> Result<()> {
-        use crate::schema::{
-            AUTOINCREMENT_SEQ_PREFIX, SEQ_BACKING_TABLE_PREFIX, SQLITE_SEQUENCE_TABLE_NAME,
-        };
+        use crate::schema::{autoincrement_sequence_name, SQLITE_SEQUENCE_TABLE_NAME};
+        use crate::translate::sequence::sequence_backing_table_name;
 
         let has_seq_table = self.with_schema(MAIN_DB_ID, |s| {
             s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME).is_some()
@@ -3207,7 +3217,7 @@ impl Connection {
 
         for (table_name, watermark) in rows {
             let backing_table_name =
-                format!("{SEQ_BACKING_TABLE_PREFIX}{AUTOINCREMENT_SEQ_PREFIX}{table_name}");
+                sequence_backing_table_name(&autoincrement_sequence_name(&table_name));
             let has_backing = self.with_schema(MAIN_DB_ID, |s| {
                 s.get_btree_table(&backing_table_name).is_some()
             });

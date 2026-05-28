@@ -843,33 +843,30 @@ pub fn translate_create_sequence(
     Ok(())
 }
 
-/// Translate DROP SEQUENCE into bytecode that removes the definition from sqlite_schema.
-pub fn translate_drop_sequence(
-    seq_name: &ast::QualifiedName,
-    if_exists: bool,
-    resolver: &Resolver,
+/// Emit the cursor / sqlite_schema-delete / Destroy / DropSequence bytecode
+/// for removing a single sequence from `database_id`. Callers must wrap this
+/// with their own `begin_write_on_database` + `SetCookie` (so that callers
+/// dropping several schema objects in one statement — e.g. `DROP TABLE` on an
+/// AUTOINCREMENT table cleaning up its implicit sequence — share a single
+/// schema-cookie bump).
+///
+/// Returns `Ok(true)` when the sequence existed and cleanup bytecode was
+/// emitted; `Ok(false)` when the sequence (or its backing table) is absent,
+/// so the caller can decide whether that's a no-op or an error.
+pub(crate) fn emit_drop_sequence_cleanup(
     program: &mut ProgramBuilder,
-) -> Result<()> {
-    let database_id = resolver.resolve_database_id(seq_name)?;
-    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie)?;
-
-    let normalized_name = normalize_ident(seq_name.name.as_str());
-
-    // Check existence and get the root page from the backing table
-    let backing_table_name = sequence_backing_table_name(&normalized_name);
+    resolver: &Resolver,
+    database_id: usize,
+    seq_name: &str,
+) -> Result<bool> {
+    let backing_table_name = sequence_backing_table_name(seq_name);
     let root_page = resolver.with_schema(database_id, |s| {
-        s.get_sequence(&normalized_name)?;
+        s.get_sequence(seq_name)?;
         Some(s.get_btree_table(&backing_table_name)?.root_page)
     });
-
-    if root_page.is_none() {
-        if if_exists {
-            return Ok(());
-        }
-        bail_parse_error!("sequence \"{}\" does not exist", normalized_name);
-    }
-    let root_page = root_page.unwrap();
+    let Some(root_page) = root_page else {
+        return Ok(false);
+    };
 
     // Open sqlite_schema for writing (in the target database)
     let schema_table =
@@ -881,10 +878,8 @@ pub fn translate_drop_sequence(
         db: database_id,
     });
 
-    // Allocate registers for searching
     let seq_name_reg = program.alloc_register();
     let type_str_reg = program.alloc_register();
-
     program.emit_insn(Insn::String8 {
         dest: seq_name_reg,
         value: backing_table_name,
@@ -894,26 +889,19 @@ pub fn translate_drop_sequence(
         value: "table".to_string(),
     });
 
-    // Scan sqlite_schema for type='table' AND name=normalized_name, then delete
+    // Scan sqlite_schema for (type='table' AND name=backing_table_name) and delete the row.
     let end_loop_label = program.allocate_label();
     let loop_start_label = program.allocate_label();
-
     program.emit_insn(Insn::Rewind {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_empty: end_loop_label,
     });
     program.preassign_label_to_next_insn(loop_start_label);
-
-    // Column 0 = type, Column 1 = name
     let col0_reg = program.alloc_register();
     let col1_reg = program.alloc_register();
-
     program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, col0_reg);
     program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, col1_reg);
-
     let skip_delete_label = program.allocate_label();
-
-    // Compare type
     program.emit_insn(Insn::Ne {
         lhs: col0_reg,
         rhs: type_str_reg,
@@ -921,8 +909,6 @@ pub fn translate_drop_sequence(
         flags: CmpInsFlags::default(),
         collation: program.curr_collation(),
     });
-
-    // Compare name
     program.emit_insn(Insn::Ne {
         lhs: col1_reg,
         rhs: seq_name_reg,
@@ -930,20 +916,16 @@ pub fn translate_drop_sequence(
         flags: CmpInsFlags::default(),
         collation: program.curr_collation(),
     });
-
-    // Found — delete the row
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id,
         table_name: "sqlite_schema".to_string(),
         is_part_of_update: false,
     });
-
     program.preassign_label_to_next_insn(skip_delete_label);
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: loop_start_label,
     });
-
     program.preassign_label_to_next_insn(end_loop_label);
 
     // Destroy the B-tree root page
@@ -958,8 +940,30 @@ pub fn translate_drop_sequence(
     // Remove from the in-memory schema (sequences + tables maps)
     program.emit_insn(Insn::DropSequence {
         db: database_id,
-        seq_name: normalized_name,
+        seq_name: seq_name.to_string(),
     });
+    Ok(true)
+}
+
+/// Translate DROP SEQUENCE into bytecode that removes the definition from sqlite_schema.
+pub fn translate_drop_sequence(
+    seq_name: &ast::QualifiedName,
+    if_exists: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let database_id = resolver.resolve_database_id(seq_name)?;
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie)?;
+
+    let normalized_name = normalize_ident(seq_name.name.as_str());
+    let dropped = emit_drop_sequence_cleanup(program, resolver, database_id, &normalized_name)?;
+    if !dropped {
+        if if_exists {
+            return Ok(());
+        }
+        bail_parse_error!("sequence \"{}\" does not exist", normalized_name);
+    }
 
     // Bump schema version so other connections detect the change
     program.emit_insn(Insn::SetCookie {

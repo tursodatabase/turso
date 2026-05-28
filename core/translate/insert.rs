@@ -1,4 +1,4 @@
-use crate::schema::{ColumnLayout, AUTOINCREMENT_SEQ_PREFIX};
+use crate::schema::ColumnLayout;
 use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
 use crate::turso_debug_assert;
 use crate::{
@@ -674,7 +674,7 @@ pub fn translate_insert(
             // the user-supplied rowid so the next auto-generated rowid is
             // strictly greater. The helper is a no-op when the explicit
             // rowid is already <= current watermark.
-            let seq_name = format!("{AUTOINCREMENT_SEQ_PREFIX}{}", ctx.table.name);
+            let seq_name = crate::schema::autoincrement_sequence_name(&ctx.table.name);
             let seq = resolver
                 .with_schema(ctx.database_id, |s| s.get_sequence(&seq_name).cloned())
                 .ok_or_else(|| {
@@ -1458,7 +1458,7 @@ fn emit_rowid_generation(
     is_mvcc: bool,
 ) -> Result<()> {
     if ctx.table.has_autoincrement && is_mvcc {
-        let seq_name = format!("{AUTOINCREMENT_SEQ_PREFIX}{}", ctx.table.name);
+        let seq_name = crate::schema::autoincrement_sequence_name(&ctx.table.name);
         let seq = resolver
             .with_schema(ctx.database_id, |s| s.get_sequence(&seq_name).cloned())
             .ok_or_else(|| {

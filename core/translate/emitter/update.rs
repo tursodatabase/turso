@@ -1,7 +1,7 @@
 use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
 use crate::alloc::TursoIteratorExt;
-use crate::schema::{Column, ColumnLayout, GeneratedType, Table, AUTOINCREMENT_SEQ_PREFIX};
+use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
@@ -2343,7 +2343,7 @@ fn emit_update_insns<'a>(
                 && table.has_autoincrement
                 && connection.mv_store_for_db(update_database_id).is_some()
             {
-                let seq_name = format!("{AUTOINCREMENT_SEQ_PREFIX}{}", target_table.identifier);
+                let seq_name = crate::schema::autoincrement_sequence_name(&target_table.identifier);
                 let seq = t_ctx
                     .resolver
                     .with_schema(update_database_id, |s| s.get_sequence(&seq_name).cloned())

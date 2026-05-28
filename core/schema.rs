@@ -186,6 +186,11 @@ pub const SEQ_BACKING_TABLE_PREFIX: &str = "__turso_internal_seq_";
 // by applying SEQ_BACKING_TABLE_PREFIX to the full sequence name.
 pub const AUTOINCREMENT_SEQ_PREFIX: &str = "__turso_internal_autoincrement_";
 
+/// Name of the hidden sequence owned by an AUTOINCREMENT table.
+pub fn autoincrement_sequence_name(table_name: &str) -> String {
+    String::from(AUTOINCREMENT_SEQ_PREFIX) + table_name
+}
+
 struct SequenceBackingTableSource {
     sequence_name: String,
     root_page: i64,
@@ -2119,7 +2124,7 @@ impl Schema {
                     // the physical table is the corresponding
                     // `__turso_internal_seq_<sequence-name>` backing table.
                     if has_autoinc {
-                        let seq_name = format!("{AUTOINCREMENT_SEQ_PREFIX}{tbl_name}");
+                        let seq_name = autoincrement_sequence_name(&tbl_name);
                         if let std::collections::hash_map::Entry::Vacant(e) =
                             self.sequences.entry(normalize_ident(&seq_name))
                         {

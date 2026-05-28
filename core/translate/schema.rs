@@ -5,8 +5,8 @@ use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, BTreeCharacteristics, BTreeTable, ColDef,
-    Column, SchemaObjectType, Table, Type, AUTOINCREMENT_SEQ_PREFIX, RESERVED_TABLE_PREFIXES,
-    SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
+    TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -1399,7 +1399,7 @@ pub fn translate_create_table(
     // `__turso_internal_seq_<sequence-name>` table.
     // Skip if it already exists (e.g. VACUUM INTO copies all tables first).
     if has_autoincrement {
-        let autoinc_seq_name = format!("{AUTOINCREMENT_SEQ_PREFIX}{normalized_tbl_name}");
+        let autoinc_seq_name = crate::schema::autoincrement_sequence_name(&normalized_tbl_name);
         let backing_table_name =
             crate::translate::sequence::sequence_backing_table_name(&autoinc_seq_name);
         let already_exists = resolver.with_schema(database_id, |s| {
@@ -2385,6 +2385,28 @@ pub fn translate_drop_table(
         _p3: 0,
         table_name: tbl_name.name.as_str().to_string(),
     });
+
+    // If the dropped table owned an implicit AUTOINCREMENT sequence, tear
+    // down its backing table too: destroy the B-tree root, remove the
+    // sqlite_schema entry, and drop the in-memory `Sequence`. Without this
+    // the `__turso_internal_seq_<…>` backing table outlives its parent,
+    // and a subsequent `CREATE TABLE <name>` with the same name and
+    // AUTOINCREMENT under MVCC would resume nextval at the old watermark
+    // (and the orphan table bloats the DB indefinitely in WAL mode).
+    // Schema-cookie bump is shared with the table-drop below; the helper
+    // never touches it. No-op when has_autoincrement is false or the
+    // sequence/backing-table is somehow already missing — same idempotency
+    // contract as DROP SEQUENCE IF EXISTS.
+    if table.btree().is_some_and(|bt| bt.has_autoincrement) {
+        let seq_name =
+            crate::schema::autoincrement_sequence_name(&normalize_ident(tbl_name.name.as_str()));
+        crate::translate::sequence::emit_drop_sequence_cleanup(
+            program,
+            resolver,
+            database_id,
+            &seq_name,
+        )?;
+    }
 
     let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {

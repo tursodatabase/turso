@@ -11519,6 +11519,13 @@ pub fn op_drop_sequence(
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_sequence(seq_name);
     });
+    // Drop this connection's stale currval. Otherwise a same-session
+    // DROP SEQUENCE + CREATE SEQUENCE <same name> would let currval()
+    // return the prior sequence's last value instead of erroring with
+    // "not yet defined in this session" — covered by the regression
+    // test `currval-after-drop-then-recreate-uses-new-sequence-currval`
+    // in `sequence_adversarial.sqltest`.
+    conn.clear_sequence_currval(seq_name);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
