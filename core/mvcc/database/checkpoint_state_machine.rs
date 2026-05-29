@@ -768,7 +768,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             let row_versions = entry.value().read();
 
             for version in self.maybe_get_checkpointable_versions(&row_versions, key.table_id) {
-                let is_delete = version.end.is_some();
+                // Only a committed delete (`Some(Timestamp(_))`) is a real delete;
+                // a speculative tombstone (`Some(TxID(_))`) was admitted by the
+                // filter as an `is_uncheckpointed_insert` (end_ts is None for the
+                // collector), so treating its raw end as a delete here would route
+                // a still-live row to DROP/destroy handling and a missing-btree-row
+                // bail downstream.
+                let is_delete = matches!(version.end, Some(TxTimestampOrID::Timestamp(_)));
 
                 let mut special_write = None;
                 // Set to true for schema deletes of never-checkpointed tables/indexes.
@@ -940,7 +946,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.collect_index_key_cursor = Some(entry.key().clone());
 
                 for version in self.maybe_get_checkpointable_versions(&versions, index_id) {
-                    let is_delete = version.end.is_some();
+                    // Only a committed delete is a real delete -- see the
+                    // collector and the table-write dispatcher for the same
+                    // discriminator and reasoning.
+                    let is_delete =
+                        matches!(version.end, Some(TxTimestampOrID::Timestamp(_)));
 
                     // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
                     // the database file.
@@ -1804,8 +1814,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             )
                         })?;
 
-                // Check if this is an insert or delete
-                if row_version.end.is_some() {
+                // A committed delete carries `end = Some(Timestamp(_))`; a speculative
+                // tombstone from an in-flight writer is `end = Some(TxID(_))`, which
+                // `maybe_get_checkpointable_versions` treats as "no end" (the row is
+                // still live at our snapshot, since the writer might still abort) and
+                // picks up as an `is_uncheckpointed_insert`. The dispatch must use the
+                // SAME discriminator -- otherwise a speculative tombstone gets routed
+                // to `DeleteRowStateMachine`, whose btree seek finds no row and bails
+                // with `"MVCC delete: rowid {N} not found"` (the row was never in the
+                // btree to begin with).
+                if matches!(row_version.end, Some(TxTimestampOrID::Timestamp(_))) {
                     // This is a delete operation.
                     // Don't write the deletion record to the b-tree if the b-tree was just created; we can no-op in this case,
                     // since there is no existing row to delete.
@@ -1826,7 +1844,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     self.delete_row_state_machine = Some(state_machine);
                     self.state = CheckpointState::DeleteRowStateMachine { write_set_index };
                 } else {
-                    // This is an insert/update operation
+                    // This is an insert/update (including a row whose speculative
+                    // delete by an in-flight writer has not yet committed -- still
+                    // live at our snapshot; a later checkpoint applies the delete if
+                    // the writer commits).
                     let state_machine =
                         self.mvstore
                             .write_row_to_pager(&row_version.row, cursor, requires_seek)?;
