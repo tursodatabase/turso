@@ -439,7 +439,9 @@ fn database_open_reuses_trusted_tshm_snapshot_without_disk_scan_when_no_backfill
         snapshot_before.nbackfills, 0,
         "this coverage only applies when no positive backfill proof is required"
     );
-    let frames_before = authority.iter_latest_frames(0, snapshot_before.max_frame);
+    let frames_before = authority
+        .iter_latest_frames(0, snapshot_before.max_frame)
+        .unwrap();
     assert!(
         !frames_before.is_empty(),
         "trusted-tail reopen coverage requires a populated durable frame index"
@@ -469,7 +471,9 @@ fn database_open_reuses_trusted_tshm_snapshot_without_disk_scan_when_no_backfill
         "trusted reopen must preserve the authoritative WAL snapshot"
     );
     assert_eq!(
-        reopened_authority.iter_latest_frames(0, snapshot_before.max_frame),
+        reopened_authority
+            .iter_latest_frames(0, snapshot_before.max_frame)
+            .unwrap(),
         frames_before,
         "trusted reopen must preserve durable frame-index content"
     );
@@ -1577,7 +1581,9 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
         snapshot_before.max_frame > snapshot_before.nbackfills,
         "disk-scan reopen coverage requires live WAL frames beyond the backfill point"
     );
-    let frames_before = authority.iter_latest_frames(0, snapshot_before.max_frame);
+    let frames_before = authority
+        .iter_latest_frames(0, snapshot_before.max_frame)
+        .unwrap();
     assert!(
         !frames_before.is_empty(),
         "setup should publish durable frame-index entries before reopen repair"
@@ -1609,7 +1615,9 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
     let reopened_authority = reopened.shared_wal_coordination().unwrap().unwrap();
     assert_eq!(reopened_authority.snapshot(), snapshot_before);
     assert_eq!(
-        reopened_authority.iter_latest_frames(0, snapshot_before.max_frame),
+        reopened_authority
+            .iter_latest_frames(0, snapshot_before.max_frame)
+            .unwrap(),
         frames_before,
         "reopen repair must preserve durable frame-index content while the child reader is still alive"
     );
@@ -1664,6 +1672,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
     assert!(
         !authority
             .iter_latest_frames(0, snapshot.max_frame)
+            .unwrap()
             .is_empty(),
         "overflow reopen coverage requires a populated durable frame index before it is discarded"
     );
@@ -1674,6 +1683,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
     assert!(
         authority
             .iter_latest_frames(0, snapshot.max_frame)
+            .unwrap()
             .is_empty(),
         "test setup should clear durable frame-index entries before reopen"
     );
@@ -1706,6 +1716,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
     assert!(
         !reopened_authority
             .iter_latest_frames(0, snapshot.max_frame)
+            .unwrap()
             .is_empty(),
         "disk-scan reopen should repopulate the durable frame index from the WAL"
     );

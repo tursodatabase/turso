@@ -2394,7 +2394,7 @@ impl Connection {
         shared_wal.page_size() != 0 || shared_wal.last_checksum_and_max_frame().1 != 0
     }
 
-    fn install_database_wal_on_pager(db: &Arc<Database>, pager: &mut Arc<Pager>) {
+    fn install_database_wal_on_pager(db: &Arc<Database>, pager: &mut Arc<Pager>) -> Result<()> {
         let shared_wal = db.shared_wal.clone();
         let last_checksum_and_max_frame = shared_wal.read().last_checksum_and_max_frame();
         let wal = Arc::new(crate::storage::wal::WalFile::new(
@@ -2402,11 +2402,12 @@ impl Connection {
             shared_wal,
             last_checksum_and_max_frame,
             db.buffer_pool.clone(),
-        ));
+        )?);
 
         let pager = Arc::get_mut(pager)
             .expect("fresh attached pager must not be shared before bootstrap or publication");
         pager.set_wal(wal);
+        Ok(())
     }
 
     fn set_mvcc_journal_mode_fresh_db(pager: &Pager) -> Result<()> {
@@ -2627,7 +2628,7 @@ impl Connection {
         // write and MVCC bootstrap agree on the target mode.
         if self.mvcc_enabled() && !db.mvcc_enabled() {
             Self::set_mvcc_journal_mode_fresh_db(&pager)?;
-            Self::install_database_wal_on_pager(&db, &mut pager);
+            Self::install_database_wal_on_pager(&db, &mut pager)?;
             let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
             let mv_store = journal_mode::open_mv_store(
                 db.io.clone(),

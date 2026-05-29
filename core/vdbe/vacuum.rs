@@ -2061,7 +2061,7 @@ fn vacuum_in_place_step(
                 let prepared = prev_prepared
                     .as_ref()
                     .expect("VACUUM WriteWalBatch phase requires prepared frames");
-                wal.commit_prepared_frames(std::slice::from_ref(prepared.as_ref()));
+                wal.commit_prepared_frames(std::slice::from_ref(prepared.as_ref()))?;
 
                 // More pages to copy?
                 if *next_page <= *total_pages {
