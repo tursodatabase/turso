@@ -1040,58 +1040,96 @@ fn emit_aggregation_step(
     plan: &SelectPlan,
     registers: &WindowRegisters,
 ) -> crate::Result<()> {
-    for (i, func) in window.functions.iter().enumerate() {
-        let AccumulatorFunc::Agg(agg_func) = &func.func else {
-            continue;
-        };
-        // The aggregation step is performed incrementally as each row from the subquery is
-        // processed. Therefore, we don’t need to access the buffer table and can obtain argument
-        // values directly by evaluating the expressions that reference the subquery result columns.
-        // Use the rewritten form when available so the args reference the subquery
-        // rather than the (no-longer-visible) original tables.
-        let args = match func.current_expr() {
-            Expr::FunctionCall { args, .. } => args.iter().map(|a| (**a).clone()).collect(),
-            Expr::FunctionCallStar { .. } => vec![],
-            _ => unreachable!(
-                "All window functions should be either FunctionCall or FunctionCallStar expressions"
-            ),
-        };
+    // Only iterate over functions whose accumulator is advanced once per
+    // input row read from the subquery. Aggregate window functions always
+    // qualify; window functions qualify when they produce one value per
+    // peer group (rank-family). row_number and the positional functions
+    // are handled entirely inside the per-row loop in
+    // `emit_peer_group_flush`.
+    let accumulates_per_input_row = |func: &WindowFunction| match &func.func {
+        AccumulatorFunc::Agg(_) => true,
+        AccumulatorFunc::Window(w) => w.one_value_per_peer_group(),
+    };
 
+    for (i, func) in window
+        .functions
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| accumulates_per_input_row(f))
+    {
         let reg_acc_start = registers.acc_start + i;
-        // FILTER controls whether the current input row contributes to the
-        // running aggregate; it does not suppress the output row itself.
-        let filter_skip_label = if let Some(filter_expr) =
-            func.rewritten.as_ref().and_then(|r| r.filter_expr.as_ref())
-        {
-            let label = program.allocate_label();
-            let filter_reg = program.alloc_register();
-            translate_expr(
-                program,
-                Some(&plan.table_references),
-                filter_expr,
-                filter_reg,
-                resolver,
-            )?;
-            program.emit_insn(Insn::IfNot {
-                reg: filter_reg,
-                target_pc: label,
-                jump_if_null: true,
-            });
-            Some(label)
-        } else {
-            None
-        };
+        match &func.func {
+            AccumulatorFunc::Agg(agg_func) => {
+                // The aggregation step is performed incrementally as each row from the subquery is
+                // processed. Therefore, we don’t need to access the buffer table and can obtain
+                // argument values directly by evaluating the expressions that reference the
+                // subquery result columns. Use the rewritten form when available so the args
+                // reference the subquery rather than the (no-longer-visible) original tables.
+                let args = match func.current_expr() {
+                    Expr::FunctionCall { args, .. } => {
+                        args.iter().map(|a| (**a).clone()).collect()
+                    }
+                    Expr::FunctionCallStar { .. } => vec![],
+                    _ => unreachable!(
+                        "All window functions should be either FunctionCall or FunctionCallStar expressions"
+                    ),
+                };
 
-        translate_aggregation_step(
-            program,
-            &plan.table_references,
-            AggArgumentSource::new_from_expression(agg_func, &args, &Distinctness::NonDistinct),
-            reg_acc_start,
-            resolver,
-            None,
-        )?;
-        if let Some(label) = filter_skip_label {
-            program.preassign_label_to_next_insn(label);
+                // FILTER controls whether the current input row contributes to the
+                // running aggregate; it does not suppress the output row itself.
+                let filter_skip_label = if let Some(filter_expr) =
+                    func.rewritten.as_ref().and_then(|r| r.filter_expr.as_ref())
+                {
+                    let label = program.allocate_label();
+                    let filter_reg = program.alloc_register();
+                    translate_expr(
+                        program,
+                        Some(&plan.table_references),
+                        filter_expr,
+                        filter_reg,
+                        resolver,
+                    )?;
+                    program.emit_insn(Insn::IfNot {
+                        reg: filter_reg,
+                        target_pc: label,
+                        jump_if_null: true,
+                    });
+                    Some(label)
+                } else {
+                    None
+                };
+
+                translate_aggregation_step(
+                    program,
+                    &plan.table_references,
+                    AggArgumentSource::new_from_expression(
+                        agg_func,
+                        &args,
+                        &Distinctness::NonDistinct,
+                    ),
+                    reg_acc_start,
+                    resolver,
+                    None,
+                )?;
+                if let Some(label) = filter_skip_label {
+                    program.preassign_label_to_next_insn(label);
+                }
+            }
+            AccumulatorFunc::Window(win_func) => {
+                // Rank-family functions take no arguments. Emit `AggStep`
+                // here, inside the input-scan loop, so the function's
+                // internal counter and peer-detection state advance once for
+                // every row read from the subquery. `AggValue` is NOT emitted
+                // here — the accumulator is read later, once per peer-group
+                // flush, in `emit_peer_group_flush`.
+                program.emit_insn(Insn::AggStep {
+                    acc_reg: reg_acc_start,
+                    col: 0,
+                    delimiter: 0,
+                    func: AccumulatorFunc::Window(win_func.clone()),
+                    comparator: None,
+                });
+            }
         }
     }
 
@@ -1143,7 +1181,7 @@ pub fn emit_window_results(
         pc_if_empty: label_empty,
     });
 
-    emit_return_buffered_rows(program, window, t_ctx, plan)?;
+    emit_peer_group_flush(program, window, t_ctx, plan)?;
 
     program.preassign_label_to_next_insn(label_empty);
 
@@ -1160,7 +1198,7 @@ pub fn emit_window_results(
     Ok(())
 }
 
-fn emit_return_buffered_rows(
+fn emit_peer_group_flush(
     program: &mut ProgramBuilder,
     window: &Window,
     t_ctx: &mut TranslateCtx,
@@ -1174,15 +1212,23 @@ fn emit_return_buffered_rows(
         ..
     } = t_ctx.meta_window.as_ref().expect("missing window metadata");
 
-    // Aggregate window functions: capture the running accumulator value once
-    // per flush. Every buffered row in the just-finished peer group sees the
-    // same value (RANGE UNBOUNDED PRECEDING TO CURRENT ROW semantics).
+    // For aggregate window functions and the rank-family, the accumulator
+    // has already been advanced once per source row during the input scan.
+    // Emit one `AggValue` per such function here, before entering the loop
+    // over buffered rows: this reads the accumulator into the result
+    // register exactly once per peer-group flush. The per-row loop below
+    // will copy that register's contents into the output for every buffered
+    // row in the group (RANGE UNBOUNDED PRECEDING TO CURRENT ROW semantics).
     for (i, func) in window.functions.iter().enumerate() {
-        if let AccumulatorFunc::Agg(agg_func) = &func.func {
+        let value_pre_loop = match &func.func {
+            AccumulatorFunc::Agg(_) => true,
+            AccumulatorFunc::Window(w) => w.one_value_per_peer_group(),
+        };
+        if value_pre_loop {
             program.emit_insn(Insn::AggValue {
                 acc_reg: registers.acc_start + i,
                 dest_reg: registers.acc_result_start + i,
-                func: AccumulatorFunc::Agg(agg_func.clone()),
+                func: func.func.clone(),
             });
         }
     }
@@ -1198,13 +1244,20 @@ fn emit_return_buffered_rows(
         let reg_result = registers.result_columns_start + i;
         program.emit_column_or_rowid(cursors.csr_current, *col_idx, reg_result);
     }
-    // Pure window functions (e.g. row_number) advance their accumulator and
-    // read it out once per buffered row as the buffer is replayed. Aggregate
-    // window functions instead advance their accumulator once per source row
-    // (in emit_aggregation_step) and only their final value is read out per
-    // emitted row (the AggValue loop earlier in this function).
+    // For row_number, ntile, lag, lead and first/last/nth_value no
+    // `AggStep` ran during the input scan. Emit `AggStep` + `AggValue` here,
+    // inside the per-row loop over buffered rows: `AggStep` advances the
+    // function's state for the current row, then `AggValue` reads the
+    // resulting value into the result register that gets written to this
+    // row's output. This is the site that gives every buffered row in a
+    // peer group a distinct value. Functions where
+    // `one_value_per_peer_group()` is true were handled above the loop and
+    // are skipped here.
     for (i, func) in window.functions.iter().enumerate() {
         if let AccumulatorFunc::Window(win_func) = &func.func {
+            if win_func.one_value_per_peer_group() {
+                continue;
+            }
             let acc_reg = registers.acc_start + i;
             let dest_reg = registers.acc_result_start + i;
             program.emit_insn(Insn::AggStep {
