@@ -3725,6 +3725,32 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    /// Like the table branch of [`read_from_table_or_index`], but reads from an
+    /// already-resolved version chain instead of looking the row up in
+    /// `self.rows`. Used on the scan path where the cursor's range iterator
+    /// already located the `Arc`, so the second skiplist traversal is avoided.
+    pub(crate) fn read_visible_from_versions(
+        &self,
+        tx_id: TxID,
+        versions: &RowVersions,
+    ) -> Result<Option<Row>> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let tx = tx.value();
+        turso_assert_eq!(tx.state, TransactionState::Active);
+        let versions = versions.read();
+        if let Some(rv) = versions
+            .iter()
+            .rev()
+            .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
+        {
+            return Ok(Some(rv.row.clone()));
+        }
+        Ok(None)
+    }
+
     /// Gets all row ids in the database.
     pub fn scan_row_ids(&self) -> Result<Vec<RowID>> {
         tracing::trace!("scan_row_ids");
@@ -3767,7 +3793,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         table_id: MVTableId,
         mv_store_iterator: &mut Option<MvccIterator<'static, RowID>>,
         tx_id: TxID,
-    ) -> Option<RowID> {
+    ) -> Option<(RowID, RowVersions)> {
         let mv_store_iterator = mv_store_iterator.as_mut().expect(
             "mv_store_iterator must be initialized when calling get_row_id_for_table_in_direction",
         );
@@ -3874,13 +3900,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         &self,
         tx: &Transaction,
         row: &Entry<'_, RowID, Arc<RwLock<Vec<RowVersion>>>>,
-    ) -> Option<RowID> {
+    ) -> Option<(RowID, RowVersions)> {
         row.value()
             .read()
             .iter()
             .rev()
             .find(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-            .map(|_| row.key().clone())
+            .map(|_| (row.key().clone(), row.value().clone()))
     }
 
     fn find_last_visible_index_version(
@@ -3919,7 +3945,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tx: &Transaction,
         mut rows: I,
         table_id: MVTableId,
-    ) -> Option<RowID>
+    ) -> Option<(RowID, RowVersions)>
     where
         I: Iterator<Item = Entry<'a, RowID, Arc<RwLock<Vec<RowVersion>>>>>,
     {
@@ -3978,6 +4004,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = tx.value();
 
         self.find_next_visible_table_row(tx, mv_store_iterator, table_id)
+            .map(|(row_id, _versions)| row_id)
     }
 
     pub fn seek_index(

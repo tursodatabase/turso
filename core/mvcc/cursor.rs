@@ -34,6 +34,11 @@ enum CursorPosition {
         row_id: RowID,
         /// Indicates whether the rowid is pointing BTreeCursor or MVCC index.
         in_btree: bool,
+        /// Resolved MVCC version chain for this row, captured from the range
+        /// iterator so `read_mvcc_current_row` can skip a second `self.rows.get`.
+        /// `Some` only for MVCC table rows reached via the scan path; `None`
+        /// (btree rows, index rows, seek/insert positions) falls back to a lookup.
+        versions: Option<RowVersions>,
     },
     /// We have reached the end of the table.
     End,
@@ -190,8 +195,9 @@ struct DualCursorPeek {
 }
 
 impl DualCursorPeek {
-    /// Returns the next row key and whether the row is from the BTree.
-    fn get_next(&self, dir: IterationDirection) -> Option<(RowKey, bool)> {
+    /// Returns the next row key, whether the row is from the BTree, and (for
+    /// MVCC winners) the resolved version chain captured during iteration.
+    fn get_next(&self, dir: IterationDirection) -> Option<(RowKey, bool, Option<RowVersions>)> {
         tracing::trace!(
             "get_next: mvcc_key: {:?}, btree_key: {:?}",
             self.mvcc_peek.get_row_key(),
@@ -202,19 +208,21 @@ impl DualCursorPeek {
                 if dir == IterationDirection::Forwards {
                     // In forwards iteration we want the smaller of the two keys
                     if mvcc_key <= btree_key {
-                        Some((mvcc_key.clone(), false))
+                        Some((mvcc_key.clone(), false, self.mvcc_peek.get_versions()))
                     } else {
-                        Some((btree_key.clone(), true))
+                        Some((btree_key.clone(), true, None))
                     }
                 // In backwards iteration we want the larger of the two keys
                 } else if mvcc_key >= btree_key {
-                    Some((mvcc_key.clone(), false))
+                    Some((mvcc_key.clone(), false, self.mvcc_peek.get_versions()))
                 } else {
-                    Some((btree_key.clone(), true))
+                    Some((btree_key.clone(), true, None))
                 }
             }
-            (Some(mvcc_key), None) => Some((mvcc_key.clone(), false)),
-            (None, Some(btree_key)) => Some((btree_key.clone(), true)),
+            (Some(mvcc_key), None) => {
+                Some((mvcc_key.clone(), false, self.mvcc_peek.get_versions()))
+            }
+            (None, Some(btree_key)) => Some((btree_key.clone(), true, None)),
             (None, None) => None,
         }
     }
@@ -226,12 +234,13 @@ impl DualCursorPeek {
         dir: IterationDirection,
     ) -> CursorPosition {
         match self.get_next(dir) {
-            Some((row_key, in_btree)) => CursorPosition::Loaded {
+            Some((row_key, in_btree, versions)) => CursorPosition::Loaded {
                 row_id: RowID {
                     table_id,
                     row_id: row_key,
                 },
                 in_btree,
+                versions,
             },
             None => match dir {
                 IterationDirection::Forwards => CursorPosition::End,
@@ -261,14 +270,26 @@ impl DualCursorPeek {
 enum CursorPeek {
     #[default]
     Uninitialized,
-    Row(RowKey),
+    Row {
+        key: RowKey,
+        /// Resolved MVCC version chain, set when this peek came from the MVCC
+        /// table iterator. `None` for btree peeks and index peeks.
+        versions: Option<RowVersions>,
+    },
     Exhausted,
 }
 
 impl CursorPeek {
     pub fn get_row_key(&self) -> Option<&RowKey> {
         match self {
-            CursorPeek::Row(k) => Some(k),
+            CursorPeek::Row { key, .. } => Some(key),
+            _ => None,
+        }
+    }
+
+    pub fn get_versions(&self) -> Option<RowVersions> {
+        match self {
+            CursorPeek::Row { versions, .. } => versions.clone(),
             _ => None,
         }
     }
@@ -406,6 +427,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             CursorPosition::Loaded {
                 row_id: _,
                 in_btree,
+                ..
             } => {
                 if *in_btree {
                     self.btree_cursor.record()
@@ -434,10 +456,19 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 
     pub fn read_mvcc_current_row(&self) -> Result<Option<Row>> {
-        let row_id = match &self.current_pos {
-            CursorPosition::Loaded { row_id, in_btree } if !in_btree => row_id,
+        let (row_id, versions) = match &self.current_pos {
+            CursorPosition::Loaded {
+                row_id,
+                in_btree,
+                versions,
+            } if !in_btree => (row_id, versions),
             _ => panic!("invalid position to read current mvcc row"),
         };
+        // Scan path: the range iterator already resolved this row's version
+        // chain, so read it directly instead of a second skiplist lookup.
+        if let Some(versions) = versions {
+            return self.db.read_visible_from_versions(self.tx_id, versions);
+        }
         let maybe_index_id = match &self.mv_cursor_type {
             MvccCursorType::Index(_) => Some(self.table_id),
             MvccCursorType::Table => None,
@@ -528,19 +559,28 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
 
     /// Advance MVCC iterator and return next visible row key in the direction that the iterator was initialized in.
     fn advance_mvcc_iterator(&mut self) {
-        let next = match &self.mv_cursor_type {
-            MvccCursorType::Table => self.db.advance_cursor_and_get_row_id_for_table(
+        let new_peek_state = match &self.mv_cursor_type {
+            MvccCursorType::Table => match self.db.advance_cursor_and_get_row_id_for_table(
                 self.table_id,
                 &mut self.table_iterator,
                 self.tx_id,
-            ),
-            MvccCursorType::Index(_) => self
+            ) {
+                Some((row_id, versions)) => CursorPeek::Row {
+                    key: row_id.row_id,
+                    versions: Some(versions),
+                },
+                None => CursorPeek::Exhausted,
+            },
+            MvccCursorType::Index(_) => match self
                 .db
-                .advance_cursor_and_get_row_id_for_index(&mut self.index_iterator, self.tx_id),
-        };
-        let new_peek_state = match next {
-            Some(k) => CursorPeek::Row(k.row_id),
-            None => CursorPeek::Exhausted,
+                .advance_cursor_and_get_row_id_for_index(&mut self.index_iterator, self.tx_id)
+            {
+                Some(row_id) => CursorPeek::Row {
+                    key: row_id.row_id,
+                    versions: None,
+                },
+                None => CursorPeek::Exhausted,
+            },
         };
         self.dual_peek.mvcc_peek = new_peek_state;
     }
@@ -578,7 +618,10 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     let key = self.get_btree_current_key()?;
                     match key {
                         Some(k) if self.query_btree_version_is_valid(&k) => {
-                            self.dual_peek.btree_peek = CursorPeek::Row(k);
+                            self.dual_peek.btree_peek = CursorPeek::Row {
+                                key: k,
+                                versions: None,
+                            };
                             self.btree_advance_state = None;
                             return Ok(IOResult::Done(()));
                         }
@@ -609,7 +652,10 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     let key = self.get_btree_current_key()?;
                     if let Some(key) = key {
                         if self.query_btree_version_is_valid(&key) {
-                            self.dual_peek.btree_peek = CursorPeek::Row(key);
+                            self.dual_peek.btree_peek = CursorPeek::Row {
+                                key,
+                                versions: None,
+                            };
                             self.btree_advance_state = None;
                             return Ok(IOResult::Done(()));
                         }
@@ -660,7 +706,10 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     let key = self.get_btree_current_key()?;
                     match key {
                         Some(k) if self.query_btree_version_is_valid(&k) => {
-                            self.dual_peek.btree_peek = CursorPeek::Row(k);
+                            self.dual_peek.btree_peek = CursorPeek::Row {
+                                key: k,
+                                versions: None,
+                            };
                             self.btree_advance_state = None;
                             return Ok(IOResult::Done(()));
                         }
@@ -691,7 +740,10 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     let key = self.get_btree_current_key()?;
                     match key {
                         Some(k) if self.query_btree_version_is_valid(&k) => {
-                            self.dual_peek.btree_peek = CursorPeek::Row(k);
+                            self.dual_peek.btree_peek = CursorPeek::Row {
+                                key: k,
+                                versions: None,
+                            };
                             self.btree_advance_state = None;
                             return Ok(IOResult::Done(()));
                         }
@@ -827,7 +879,10 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     let key = self.get_btree_current_key()?;
                     match key {
                         Some(k) if self.query_btree_version_is_valid(&k) => {
-                            self.dual_peek.btree_peek = CursorPeek::Row(k);
+                            self.dual_peek.btree_peek = CursorPeek::Row {
+                                key: k,
+                                versions: None,
+                            };
                             return Ok(IOResult::Done(()));
                         }
                         Some(_) => {
@@ -926,7 +981,10 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             ) {
                 Some(k) => {
                     tracing::trace!("last: mvcc_key: {:?}", k);
-                    self.dual_peek.mvcc_peek = CursorPeek::Row(k);
+                    self.dual_peek.mvcc_peek = CursorPeek::Row {
+                        key: k,
+                        versions: None,
+                    };
                 }
                 None => {
                     self.dual_peek.mvcc_peek = CursorPeek::Exhausted;
@@ -938,7 +996,10 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 &mut self.index_iterator,
             ) {
                 Some(k) => {
-                    self.dual_peek.mvcc_peek = CursorPeek::Row(k);
+                    self.dual_peek.mvcc_peek = CursorPeek::Row {
+                        key: k,
+                        versions: None,
+                    };
                 }
                 None => {
                     self.dual_peek.mvcc_peek = CursorPeek::Exhausted;
@@ -1129,6 +1190,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             CursorPosition::Loaded {
                 row_id,
                 in_btree: _,
+                ..
             } => match &row_id.row_id {
                 RowKey::Int(id) => Some(*id),
                 RowKey::Record(sortable_key) => {
@@ -1260,7 +1322,10 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                             // Set MVCC peek
                             {
                                 self.dual_peek.mvcc_peek = match &mvcc_rowid {
-                                    Some(rid) => CursorPeek::Row(rid.row_id.clone()),
+                                    Some(rid) => CursorPeek::Row {
+                                        key: rid.row_id.clone(),
+                                        versions: None,
+                                    },
                                     None => CursorPeek::Exhausted,
                                 };
                             }
@@ -1293,7 +1358,10 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                             // Set MVCC peek
                             {
                                 self.dual_peek.mvcc_peek = match &mvcc_rowid {
-                                    Some(rid) => CursorPeek::Row(rid.row_id.clone()),
+                                    Some(rid) => CursorPeek::Row {
+                                        key: rid.row_id.clone(),
+                                        versions: None,
+                                    },
                                     None => CursorPeek::Exhausted,
                                 };
                             }
@@ -1321,13 +1389,14 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     // Clear seek state
                     self.state = None;
 
-                    if let Some((winner_key, in_btree)) = winner {
+                    if let Some((winner_key, in_btree, winner_versions)) = winner {
                         self.current_pos = CursorPosition::Loaded {
                             row_id: RowID {
                                 table_id: self.table_id,
                                 row_id: winner_key.clone(),
                             },
                             in_btree,
+                            versions: winner_versions,
                         };
 
                         if op.eq_only() {
@@ -1422,6 +1491,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             CursorPosition::Loaded {
                 row_id: current_row_id,
                 in_btree,
+                ..
             } => *in_btree && *current_row_id == row.id,
             _ => false,
         };
@@ -1429,6 +1499,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         self.current_pos = CursorPosition::Loaded {
             row_id: row.id.clone(),
             in_btree: was_btree_resident,
+            versions: None,
         };
         let maybe_index_id = match &self.mv_cursor_type {
             MvccCursorType::Index(_) => Some(self.table_id),
@@ -1466,7 +1537,9 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
     fn delete(&mut self) -> Result<IOResult<()>> {
         let (rowid, in_btree) = match self.get_current_pos() {
-            CursorPosition::Loaded { row_id, in_btree } => (row_id, in_btree),
+            CursorPosition::Loaded {
+                row_id, in_btree, ..
+            } => (row_id, in_btree),
             _ => panic!("Cannot delete: no current row"),
         };
         if in_btree {
@@ -1569,13 +1642,17 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
             // If found in MVCC, update dual_peek and return true
             if mvcc_exists {
-                self.dual_peek.mvcc_peek = CursorPeek::Row(RowKey::Int(*int_key));
+                self.dual_peek.mvcc_peek = CursorPeek::Row {
+                    key: RowKey::Int(*int_key),
+                    versions: None,
+                };
                 self.current_pos = CursorPosition::Loaded {
                     row_id: RowID {
                         table_id: self.table_id,
                         row_id: RowKey::Int(*int_key),
                     },
                     in_btree: false,
+                    versions: None,
                 };
                 self.state = None;
                 return Ok(IOResult::Done(true));
@@ -1625,13 +1702,17 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
             if is_valid {
                 // B-tree row is visible (not shadowed), update dual_peek
-                self.dual_peek.btree_peek = CursorPeek::Row(row_key.clone());
+                self.dual_peek.btree_peek = CursorPeek::Row {
+                    key: row_key.clone(),
+                    versions: None,
+                };
                 self.current_pos = CursorPosition::Loaded {
                     row_id: RowID {
                         table_id: self.table_id,
                         row_id: row_key,
                     },
                     in_btree: true,
+                    versions: None,
                 };
                 self.state = None;
                 Ok(IOResult::Done(true))
@@ -1674,6 +1755,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     if let CursorPosition::Loaded {
                         row_id: _,
                         in_btree: _,
+                        ..
                     } = self.get_current_pos()
                     {
                         self.count_state
