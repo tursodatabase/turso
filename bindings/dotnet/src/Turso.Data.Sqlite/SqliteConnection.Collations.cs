@@ -15,10 +15,15 @@ public partial class SqliteConnection
         if (comparison is null)
         {
             _collations.Remove(name);
+            if (_database is not null)
+                TursoBindings.UnregisterCollation(DatabaseHandle, name);
             return;
         }
 
-        throw new NotSupportedException(AdvancedExtensionApisNotSupportedMessage);
+        var registration = new CollationRegistration(name, comparison);
+        _collations[name] = registration;
+        if (_database is not null)
+            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
     }
 
     private void RegisterCollations()

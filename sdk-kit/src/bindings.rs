@@ -45,6 +45,200 @@ pub enum turso_type_t {
     TURSO_TYPE_BLOB = 4,
     TURSO_TYPE_NULL = 5,
 }
+pub const turso_extension_value_type_t_TURSO_EXTENSION_VALUE_NULL: turso_extension_value_type_t = 0;
+pub const turso_extension_value_type_t_TURSO_EXTENSION_VALUE_INTEGER: turso_extension_value_type_t =
+    1;
+pub const turso_extension_value_type_t_TURSO_EXTENSION_VALUE_FLOAT: turso_extension_value_type_t =
+    2;
+pub const turso_extension_value_type_t_TURSO_EXTENSION_VALUE_TEXT: turso_extension_value_type_t = 3;
+pub const turso_extension_value_type_t_TURSO_EXTENSION_VALUE_BLOB: turso_extension_value_type_t = 4;
+pub const turso_extension_value_type_t_TURSO_EXTENSION_VALUE_ERROR: turso_extension_value_type_t =
+    5;
+pub type turso_extension_value_type_t = ::std::os::raw::c_uint;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_OK: turso_extension_result_code_t =
+    0;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_ERROR:
+    turso_extension_result_code_t = 1;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_INVALID_ARGS:
+    turso_extension_result_code_t = 2;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_UNKNOWN:
+    turso_extension_result_code_t = 3;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_OOM: turso_extension_result_code_t =
+    4;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_CORRUPT:
+    turso_extension_result_code_t = 5;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_NOT_FOUND:
+    turso_extension_result_code_t = 6;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_ALREADY_EXISTS:
+    turso_extension_result_code_t = 7;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_PERMISSION_DENIED:
+    turso_extension_result_code_t = 8;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_ABORTED:
+    turso_extension_result_code_t = 9;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_OUT_OF_RANGE:
+    turso_extension_result_code_t = 10;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_UNIMPLEMENTED:
+    turso_extension_result_code_t = 11;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_INTERNAL:
+    turso_extension_result_code_t = 12;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_UNAVAILABLE:
+    turso_extension_result_code_t = 13;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_CUSTOM_ERROR:
+    turso_extension_result_code_t = 14;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_EOF: turso_extension_result_code_t =
+    15;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_READ_ONLY:
+    turso_extension_result_code_t = 16;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_ROWID:
+    turso_extension_result_code_t = 17;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_ROW: turso_extension_result_code_t =
+    18;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_INTERRUPT:
+    turso_extension_result_code_t = 19;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_BUSY: turso_extension_result_code_t =
+    20;
+pub const turso_extension_result_code_t_TURSO_EXTENSION_RESULT_CONSTRAINT_VIOLATION:
+    turso_extension_result_code_t = 21;
+pub type turso_extension_result_code_t = ::std::os::raw::c_uint;
+pub const turso_extension_text_subtype_t_TURSO_EXTENSION_TEXT_TEXT: turso_extension_text_subtype_t =
+    0;
+pub const turso_extension_text_subtype_t_TURSO_EXTENSION_TEXT_JSON: turso_extension_text_subtype_t =
+    1;
+pub type turso_extension_text_subtype_t = ::std::os::raw::c_uint;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct turso_extension_text_t {
+    pub subtype: turso_extension_text_subtype_t,
+    pub text: *const u8,
+    pub len: u32,
+}
+impl Default for turso_extension_text_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct turso_extension_blob_t {
+    pub data: *const u8,
+    pub size: u64,
+}
+impl Default for turso_extension_blob_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct turso_extension_error_t {
+    pub code: turso_extension_result_code_t,
+    pub message: *mut turso_extension_text_t,
+}
+impl Default for turso_extension_error_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union turso_extension_value_data_t {
+    pub int_value: i64,
+    pub float_value: f64,
+    pub text: *const turso_extension_text_t,
+    pub blob: *const turso_extension_blob_t,
+    pub error: *const turso_extension_error_t,
+}
+impl Default for turso_extension_value_data_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct turso_value_t {
+    pub value_type: turso_extension_value_type_t,
+    pub value: turso_extension_value_data_t,
+}
+impl Default for turso_value_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct turso_agg_ctx_t {
+    pub state: *mut ::std::os::raw::c_void,
+}
+impl Default for turso_agg_ctx_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " Frees per-registration state supplied to scalar, aggregate, or collation callbacks."]
+pub type turso_context_destructor_t = ::std::option::Option<unsafe extern "C" fn(context: usize)>;
+#[doc = " Frees a value returned by a managed scalar or aggregate callback after Turso copies it."]
+pub type turso_value_destructor_t =
+    ::std::option::Option<unsafe extern "C" fn(result: *mut turso_value_t)>;
+#[doc = " Scalar callback. argv points to argc immutable turso_value_t entries valid only for the call."]
+pub type turso_scalar_function_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        context: usize,
+        argc: i32,
+        argv: *const turso_value_t,
+        context_destructor: turso_context_destructor_t,
+        value_destructor: turso_value_destructor_t,
+    ) -> turso_value_t,
+>;
+#[doc = " Aggregate initializer. Return value is passed unchanged to step/final/destructor callbacks."]
+pub type turso_aggregate_init_function_t =
+    ::std::option::Option<unsafe extern "C" fn(context: usize) -> *mut turso_agg_ctx_t>;
+#[doc = " Aggregate step callback. argv points to argc immutable turso_value_t entries valid only for the call."]
+pub type turso_aggregate_step_function_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        context: usize,
+        aggregate_context: *mut turso_agg_ctx_t,
+        argc: i32,
+        argv: *const turso_value_t,
+    ) -> turso_value_t,
+>;
+#[doc = " Aggregate final callback. The aggregate_context is the value returned by the initializer."]
+pub type turso_aggregate_final_function_t = ::std::option::Option<
+    unsafe extern "C" fn(context: usize, aggregate_context: *mut turso_agg_ctx_t) -> turso_value_t,
+>;
+#[doc = " Collation callback. Byte ranges are UTF-8 text valid only for the call. Return follows strcmp ordering."]
+pub type turso_collation_function_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        context: usize,
+        left_ptr: *const u8,
+        left_len: usize,
+        right_ptr: *const u8,
+        right_len: usize,
+    ) -> i32,
+>;
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum turso_tracing_level_t {
@@ -180,6 +374,79 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Get last insert rowid for the connection or 0 if no inserts happened before"]
     pub fn turso_connection_last_insert_rowid(self_: *const turso_connection_t) -> i64;
+}
+unsafe extern "C" {
+    #[doc = " Register or replace a per-connection managed scalar function."]
+    pub fn turso_connection_register_scalar_function(
+        self_: *const turso_connection_t,
+        name: *const ::std::os::raw::c_char,
+        argc: i32,
+        deterministic: bool,
+        context: usize,
+        callback: turso_scalar_function_t,
+        context_destructor: turso_context_destructor_t,
+        value_destructor: turso_value_destructor_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Register or replace a per-connection managed aggregate function."]
+    pub fn turso_connection_register_aggregate_function(
+        self_: *const turso_connection_t,
+        name: *const ::std::os::raw::c_char,
+        argc: i32,
+        context: usize,
+        init: turso_aggregate_init_function_t,
+        step: turso_aggregate_step_function_t,
+        finalize: turso_aggregate_final_function_t,
+        context_destructor: turso_context_destructor_t,
+        aggregate_destructor: turso_context_destructor_t,
+        value_destructor: turso_value_destructor_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Unregister a per-connection managed scalar or aggregate function."]
+    pub fn turso_connection_unregister_function(
+        self_: *const turso_connection_t,
+        name: *const ::std::os::raw::c_char,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Register or replace a per-connection managed collation."]
+    pub fn turso_connection_register_collation(
+        self_: *const turso_connection_t,
+        name: *const ::std::os::raw::c_char,
+        context: usize,
+        callback: turso_collation_function_t,
+        context_destructor: turso_context_destructor_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Unregister a per-connection managed collation."]
+    pub fn turso_connection_unregister_collation(
+        self_: *const turso_connection_t,
+        name: *const ::std::os::raw::c_char,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Enable or disable SQL load_extension() for this connection."]
+    pub fn turso_connection_enable_load_extension(
+        self_: *const turso_connection_t,
+        enabled: bool,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Load an extension library on this connection using Turso's native extension loader."]
+    pub fn turso_connection_load_extension(
+        self_: *const turso_connection_t,
+        path: *const ::std::os::raw::c_char,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Prepare single statement in a connection"]

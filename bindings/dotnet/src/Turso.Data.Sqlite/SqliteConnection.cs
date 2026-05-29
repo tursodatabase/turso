@@ -11,8 +11,6 @@ public partial class SqliteConnection : DbConnection
 {
     private const int SQLITE_ERROR = 1;
     private const int SQLITE_CANTOPEN = 14;
-    private const string AdvancedExtensionApisNotSupportedMessage =
-        "SQLite-compatible user-defined functions, aggregates, collations, and extension loading require Turso core managed extension support.";
     private static readonly object SharedMemoryLock = new();
     private static readonly Dictionary<string, int> SharedMemoryReferences = new(StringComparer.OrdinalIgnoreCase);
 
@@ -26,6 +24,8 @@ public partial class SqliteConnection : DbConnection
     private bool _recursiveTriggers;
     private bool _readUncommitted;
     private string? _sharedMemoryPath;
+    private bool _extensionsEnabled;
+    private readonly List<(string File, string? Proc)> _pendingExtensions = [];
 
     public SqliteConnection()
     {
@@ -103,10 +103,12 @@ public partial class SqliteConnection : DbConnection
             _dataSource = filename;
             _readOnly = readOnly;
             _sharedMemoryPath = sharedMemoryPath;
+            ApplyExtensionSettings();
             ApplyConnectionOptions();
             RegisterScalarFunctions();
             RegisterAggregateFunctions();
             RegisterCollations();
+            LoadPendingExtensions();
             OnStateChange(new StateChangeEventArgs(originalState, State));
         }
         catch (TursoException ex)
@@ -312,7 +314,9 @@ public partial class SqliteConnection : DbConnection
 
     public virtual void EnableExtensions(bool enable = true)
     {
-        throw new NotSupportedException(AdvancedExtensionApisNotSupportedMessage);
+        _extensionsEnabled = enable;
+        if (_database is not null)
+            TursoBindings.EnableLoadExtension(DatabaseHandle, enable);
     }
 
     public virtual void LoadExtension(string file, string? proc = null)
@@ -321,7 +325,13 @@ public partial class SqliteConnection : DbConnection
         if (proc is not null)
             throw new NotSupportedException("Custom extension entry points are not yet supported by the Turso SQLite-compatible provider.");
 
-        throw new NotSupportedException(AdvancedExtensionApisNotSupportedMessage);
+        if (_database is null)
+        {
+            _pendingExtensions.Add((file, proc));
+            return;
+        }
+
+        LoadExtensionCore(file, proc);
     }
 
     public virtual void BackupDatabase(SqliteConnection destination)
@@ -432,6 +442,19 @@ public partial class SqliteConnection : DbConnection
             ExecuteNonQuery("PRAGMA foreign_keys = " + (_connectionOptions.ForeignKeys.Value ? "1" : "0") + ";");
         if (_connectionOptions.RecursiveTriggers)
             _recursiveTriggers = true;
+    }
+
+    private void ApplyExtensionSettings()
+    {
+        if (_extensionsEnabled)
+            TursoBindings.EnableLoadExtension(DatabaseHandle, true);
+    }
+
+    private void LoadPendingExtensions()
+    {
+        foreach (var (file, proc) in _pendingExtensions)
+            LoadExtensionCore(file, proc);
+        _pendingExtensions.Clear();
     }
 
     private void LoadExtensionCore(string file, string? proc)
