@@ -1239,6 +1239,23 @@ impl StreamingLogicalLogReader {
         }
 
         let header_bytes = self.read_exact_at(io, 0, LOG_HDR_SIZE)?;
+        // An all-zero header region is *absence*, not *corruption*: no log header
+        // was ever durably written here (a fsync'd header carries LOG_MAGIC and,
+        // being synced, always survives a crash). It is the residue of a commit
+        // that crashed before its fsync — NOT a torn truncate (truncate is atomic
+        // and never leaves a half-written file). On an empty log (fresh, or one a
+        // checkpoint atomically truncated to 0), a commit writes its header page
+        // (offset 0) and a frame page un-fsynced; un-fsynced writes have no
+        // ordering guarantee, so a crash can keep the frame (file size non-zero)
+        // while losing the header write (offset 0 reads back as the zeroed floor).
+        // There are no acknowledged commits in such a file, so treat it as NoLog
+        // and recover from the durable boundary / WAL, rather than failing closed
+        // and refusing to open. A header with ANY non-zero structure but an invalid
+        // magic/len/CRC (a torn rewrite of a once-valid header) is genuine
+        // corruption and still fails closed.
+        if header_bytes.iter().all(|&b| b == 0) {
+            return Ok(HeaderReadResult::NoLog);
+        }
         let hdr_len = u16::from_le_bytes([header_bytes[6], header_bytes[7]]) as usize;
         if hdr_len != LOG_HDR_SIZE {
             self.set_invalid_header_state();
