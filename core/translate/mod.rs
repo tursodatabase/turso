@@ -521,6 +521,7 @@ mod tests {
     use crate::alloc::TryClone;
     use crate::io::MemoryIO;
     use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
+    use crate::vdbe::insn::Insn;
     use crate::Database;
     use crate::SqliteDialect;
 
@@ -556,6 +557,41 @@ mod tests {
         assert!(
             err.contains("no such function: regexp"),
             "expected 'no such function: regexp', got: {err}"
+        );
+    }
+
+    #[test]
+    fn nth_value_reads_from_saved_rows_without_an_accumulator() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE items(value)").unwrap();
+
+        let statement = conn
+            .prepare("SELECT nth_value(value, 2) OVER (ORDER BY value) FROM items")
+            .unwrap();
+        let instructions = &statement.get_program().insns;
+
+        let missing_row_target = instructions
+            .iter()
+            .find_map(|(instruction, _)| match instruction {
+                Insn::SeekRowid { target_pc, .. } => Some(target_pc.as_offset_int() as usize),
+                _ => None,
+            })
+            .expect("nth_value must read its answer from the saved window rows");
+        assert!(
+            matches!(
+                &instructions[missing_row_target].0,
+                Insn::Halt { on_error: None, .. }
+            ),
+            "a missing saved row must stop execution instead of returning NULL"
+        );
+        assert!(
+            instructions.iter().all(|(instruction, _)| !matches!(
+                instruction,
+                Insn::AggStep { .. } | Insn::AggValue { .. }
+            )),
+            "nth_value must not keep another copy of saved values in an accumulator"
         );
     }
 

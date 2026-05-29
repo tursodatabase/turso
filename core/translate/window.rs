@@ -11,8 +11,8 @@ use crate::translate::expr::{
 };
 use crate::translate::order_by::EmitOrderBy;
 use crate::translate::plan::{
-    Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination, ResultSetColumn,
-    RewrittenWindowCall, SelectPlan, TableReferences, Window, WindowFunction,
+    Aggregate, Distinctness, FrameBoundary, JoinOrderMember, JoinedTable, QueryDestination,
+    ResultSetColumn, RewrittenWindowCall, SelectPlan, TableReferences, Window, WindowFunction,
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
@@ -21,7 +21,7 @@ use crate::types::KeyInfo;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
-    to_u16, {InsertFlags, Insn},
+    to_u16, {CmpInsFlags, InsertFlags, Insn},
 };
 use crate::vdbe::{BranchOffset, CursorID};
 use crate::Connection;
@@ -29,7 +29,7 @@ use crate::Result;
 use crate::{turso_assert, turso_assert_eq};
 use std::mem;
 use turso_parser::ast::Name;
-use turso_parser::ast::{Expr, Literal, Over, SortOrder, TableInternalId};
+use turso_parser::ast::{Expr, Literal, Over, ResolveType, SortOrder, TableInternalId};
 
 const SUBQUERY_DATABASE_ID: usize = 0;
 
@@ -504,12 +504,64 @@ pub struct WindowMetadata<'a> {
     pub labels: WindowLabels,
     pub registers: WindowRegisters,
     pub cursors: WindowCursors,
+    buffer_mode: WindowBufferMode,
+    pub nth_value: Option<NthValueMetadata>,
     /// Number of input columns in the source subquery.
     pub src_column_count: usize,
     /// Maps expressions in the current query that reference subquery columns
     /// to their corresponding column indexes in the subquery’s result.
     pub expressions_referencing_subquery: Vec<(&'a Expr, usize)>,
     pub buffer_table_name: String,
+}
+
+/// Controls whether a window may discard a saved row after returning it.
+/// Keeping a whole partition is more expensive, so it is only used when a
+/// later result may need to read an earlier row again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowBufferMode {
+    DeleteReturnedRows,
+    KeepPartitionRows { rowid_one_register: usize },
+}
+
+impl WindowBufferMode {
+    fn for_window(window: &Window, program: &mut ProgramBuilder) -> Self {
+        let keeps_partition_rows = window.functions.iter().any(|function| {
+            matches!(
+                &function.func,
+                AccumulatorFunc::Window(window_function)
+                    if window_function.needs_rows_after_returning_them()
+            )
+        });
+        if keeps_partition_rows {
+            let rowid_one_register = program.alloc_register();
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: rowid_one_register,
+            });
+            Self::KeepPartitionRows { rowid_one_register }
+        } else {
+            Self::DeleteReturnedRows
+        }
+    }
+
+    fn keeps_partition_rows(self) -> bool {
+        matches!(self, Self::KeepPartitionRows { .. })
+    }
+}
+
+/// State used to find an `nth_value` result in the saved rows. Saved rows get
+/// rowids 1, 2, 3, and so on in window order within each partition. Custom
+/// frames are not supported, so every frame starts at rowid 1 and the position
+/// argument is also the rowid to read.
+#[derive(Debug)]
+pub struct NthValueMetadata {
+    /// Finds a saved row by its ordered position without moving the cursor
+    /// that returns rows.
+    pub row_by_position_cursor: CursorID,
+    /// Holds the rowid of the last row in the current window frame. The first
+    /// row of the next sort group is saved before the current group is
+    /// returned, so the lookup must not read beyond this rowid.
+    pub frame_end_rowid_register: usize,
 }
 
 #[derive(Debug)]
@@ -551,9 +603,8 @@ pub struct WindowRegisters {
     pub prev_order_by_columns_start: Option<usize>,
 }
 
-/// Cursors on the ephemeral "buffer" B-tree that holds rows of the current
-/// partition. Naming mirrors SQLite's allocation in `sqlite3WindowCodeStep`
-/// (`window.c`).
+/// Cursors that can move independently over the saved rows. Separate cursors
+/// are needed because inserting a row must not move the row being returned.
 #[derive(Debug)]
 pub struct WindowCursors {
     /// Used to `Insert` newly-buffered source rows. Position is implicit
@@ -598,7 +649,9 @@ impl EmitWindow {
         let order_by_len = window.order_by.len();
         let window_function_count = window.functions.len();
 
-        // An ephemeral table used to buffer rows for the current frame
+        // Save rows because a window result may depend on rows that arrived
+        // earlier. `nth_value` keeps every row already seen in the current
+        // partition so it can find one by its ordered position.
         let buffer_table = Arc::new(BTreeTable::new(
             0,
             // TODO: Generating the name this way may cause collisions with real tables in the
@@ -629,6 +682,32 @@ impl EmitWindow {
             original_cursor_id: cursor_csr_current,
             new_cursor_id: cursor_csr_write,
         });
+        let buffer_mode = WindowBufferMode::for_window(window, program);
+        let has_nth_value = window.functions.iter().any(|func| {
+            matches!(
+                &func.func,
+                AccumulatorFunc::Window(crate::function::WindowFunc::NthValue)
+            )
+        });
+        let nth_value = if has_nth_value {
+            turso_assert!(
+                matches!(&window.frame.start, FrameBoundary::UnboundedPreceding),
+                "nth_value row lookup requires a frame that starts at the first partition row"
+            );
+            let row_by_position_cursor =
+                program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
+            program.emit_insn(Insn::OpenDup {
+                original_cursor_id: cursor_csr_current,
+                new_cursor_id: row_by_position_cursor,
+            });
+            let frame_end_rowid_register = program.alloc_registers_and_init_w_null(1);
+            Some(NthValueMetadata {
+                row_by_position_cursor,
+                frame_end_rowid_register,
+            })
+        } else {
+            None
+        };
 
         // Window function processing is similar to aggregation processing in how results are mapped
         // to registers. Each function expression is stored in `expr_to_reg_cache` along with its
@@ -691,6 +770,8 @@ impl EmitWindow {
                 csr_write: cursor_csr_write,
                 csr_current: cursor_csr_current,
             },
+            buffer_mode,
+            nth_value,
             src_column_count,
             expressions_referencing_subquery,
             buffer_table_name: buffer_table.name.clone(),
@@ -701,8 +782,9 @@ impl EmitWindow {
     /// Emits bytecode to process a single row of the window’s input (always a subquery).
     ///
     /// Note:
-    /// The **buffer table** mentioned below is an ephemeral B-tree that temporarily
-    /// stores rows for the current window frame.
+    /// The **buffer table** mentioned below saves rows because a window result may
+    /// depend on rows that arrived earlier. Most rows are removed after they are
+    /// returned. `nth_value` keeps them because later results may refer back to them.
     ///
     /// High-level overview:
     /// - Each row from the subquery is read, and its ORDER BY columns are loaded into
@@ -723,6 +805,8 @@ impl EmitWindow {
             labels,
             registers,
             cursors,
+            buffer_mode,
+            nth_value,
             src_column_count: input_column_count,
             buffer_table_name,
             ..
@@ -730,17 +814,52 @@ impl EmitWindow {
         let window = plan.window.as_ref().expect("missing window");
 
         emit_load_order_by_columns(program, window, registers);
-        emit_flush_buffer_if_new_partition(program, labels, registers, window, plan)?;
-        emit_reset_state_if_new_partition(program, registers, window);
-        emit_flush_buffer_if_not_peer(program, labels, registers, window, plan)?;
-        emit_insert_row_into_buffer(
+        emit_flush_buffer_if_new_partition(
             program,
+            labels,
             registers,
             cursors,
-            input_column_count,
-            buffer_table_name,
-        );
+            *buffer_mode,
+            window,
+            plan,
+        )?;
+        emit_reset_state_if_new_partition(program, registers, nth_value.as_ref(), window);
+        if let WindowBufferMode::KeepPartitionRows { rowid_one_register } = *buffer_mode {
+            // Keep the return cursor on the first row of the next sort group,
+            // as SQLite does. That row must be inserted before the completed
+            // group is returned so the cursor does not run past the table.
+            emit_insert_row_into_buffer(
+                program,
+                registers,
+                cursors,
+                input_column_count,
+                buffer_table_name,
+            );
+            emit_rewind_return_cursor_for_first_partition_row(
+                program,
+                cursors.csr_current,
+                registers.rowid,
+                rowid_one_register,
+            );
+            emit_flush_buffer_if_not_peer(program, labels, registers, window, plan)?;
+        } else {
+            emit_flush_buffer_if_not_peer(program, labels, registers, window, plan)?;
+            emit_insert_row_into_buffer(
+                program,
+                registers,
+                cursors,
+                input_column_count,
+                buffer_table_name,
+            );
+        }
         emit_aggregation_step(program, window, &t_ctx.resolver, plan, registers)?;
+        if let Some(nth_value) = nth_value {
+            program.emit_insn(Insn::Copy {
+                src_reg: registers.rowid,
+                dst_reg: nth_value.frame_end_rowid_register,
+                extra_amount: 0,
+            });
+        }
 
         Ok(())
     }
@@ -803,6 +922,8 @@ fn emit_flush_buffer_if_new_partition(
     program: &mut ProgramBuilder,
     labels: &WindowLabels,
     registers: &WindowRegisters,
+    cursors: &WindowCursors,
+    buffer_mode: WindowBufferMode,
     window: &Window,
     plan: &SelectPlan,
 ) -> Result<()> {
@@ -862,6 +983,11 @@ fn emit_flush_buffer_if_new_partition(
             target_pc: labels.flush_buffer,
             return_reg: registers.flush_buffer_return_offset,
         });
+        if buffer_mode.keeps_partition_rows() {
+            program.emit_insn(Insn::ResetSorter {
+                cursor_id: cursors.csr_current,
+            });
+        }
         // Reset rowid to signal the start of processing a new partition.
         program.emit_insn(Insn::Null {
             dest: registers.rowid,
@@ -882,6 +1008,7 @@ fn emit_flush_buffer_if_new_partition(
 fn emit_reset_state_if_new_partition(
     program: &mut ProgramBuilder,
     registers: &WindowRegisters,
+    nth_value: Option<&NthValueMetadata>,
     window: &Window,
 ) {
     let label_skip_reset_state = program.allocate_label();
@@ -913,6 +1040,12 @@ fn emit_reset_state_if_new_partition(
         dest: registers.acc_start,
         dest_end: Some(registers.acc_start + window.functions.len() - 1),
     });
+    if let Some(nth_value) = nth_value {
+        program.emit_insn(Insn::Null {
+            dest: nth_value.frame_end_rowid_register,
+            dest_end: None,
+        });
+    }
 
     program.preassign_label_to_next_insn(label_skip_reset_state);
 }
@@ -933,27 +1066,11 @@ fn emit_flush_buffer_if_not_peer(
             .expect("prev_order_by_columns_start must exist");
 
         program.add_comment(program.offset(), "compare ORDER BY columns to detect peer");
-        let mut compare_key_info = (0..window.order_by.len())
-            .map(|_| KeyInfo {
-                sort_order: SortOrder::Asc,
-                collation: CollationSeq::default(),
-                nulls_order: None,
-            })
-            .collect::<Vec<_>>();
-        for (i, c) in compare_key_info
-            .iter_mut()
-            .enumerate()
-            .take(window.order_by.len())
-        {
-            let maybe_collation =
-                get_collseq_from_expr(&window.order_by[i].0, &plan.table_references)?;
-            c.collation = maybe_collation.unwrap_or_default();
-        }
         program.emit_insn(Insn::Compare {
             start_reg_a: reg_prev_order_by_columns_start,
             start_reg_b: reg_new_order_by_columns_start,
             count: order_by_len,
-            key_info: compare_key_info,
+            key_info: window_order_by_key_info(window, plan)?,
         });
         program.emit_insn(Insn::Jump {
             target_pc_lt: label_not_peer,
@@ -977,6 +1094,20 @@ fn emit_flush_buffer_if_not_peer(
     }
 
     Ok(())
+}
+
+fn window_order_by_key_info(window: &Window, plan: &SelectPlan) -> Result<Vec<KeyInfo>> {
+    window
+        .order_by
+        .iter()
+        .map(|(expr, _, _)| {
+            Ok(KeyInfo {
+                sort_order: SortOrder::Asc,
+                collation: get_collseq_from_expr(expr, &plan.table_references)?.unwrap_or_default(),
+                nulls_order: None,
+            })
+        })
+        .collect()
 }
 
 fn emit_load_order_by_columns(
@@ -1033,6 +1164,27 @@ fn emit_insert_row_into_buffer(
     });
 }
 
+fn emit_rewind_return_cursor_for_first_partition_row(
+    program: &mut ProgramBuilder,
+    return_cursor: CursorID,
+    inserted_rowid_register: usize,
+    rowid_one_register: usize,
+) {
+    let cursor_ready = program.allocate_label();
+    program.emit_insn(Insn::Ne {
+        lhs: inserted_rowid_register,
+        rhs: rowid_one_register,
+        target_pc: cursor_ready,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::Rewind {
+        cursor_id: return_cursor,
+        pc_if_empty: cursor_ready,
+    });
+    program.preassign_label_to_next_insn(cursor_ready);
+}
+
 fn emit_aggregation_step(
     program: &mut ProgramBuilder,
     window: &Window,
@@ -1040,22 +1192,19 @@ fn emit_aggregation_step(
     plan: &SelectPlan,
     registers: &WindowRegisters,
 ) -> crate::Result<()> {
-    // Only iterate over functions whose accumulator is advanced once per
-    // input row read from the subquery. Aggregate window functions always
-    // qualify; window functions qualify when they produce one value per
-    // peer group (rank-family). row_number and the positional functions
-    // are handled entirely inside the per-row loop in
-    // `emit_peer_group_flush`.
-    let accumulates_per_input_row = |func: &WindowFunction| match &func.func {
-        AccumulatorFunc::Agg(_) => true,
-        AccumulatorFunc::Window(w) => w.one_value_per_peer_group(),
-    };
-
     for (i, func) in window
         .functions
         .iter()
         .enumerate()
-        .filter(|(_, f)| accumulates_per_input_row(f))
+        .filter(|(_, func)| match &func.func {
+            // Aggregates and these window functions build their answers while
+            // input rows arrive. Functions that wait for a result row are
+            // handled later, when that row is returned.
+            AccumulatorFunc::Agg(_) => true,
+            AccumulatorFunc::Window(window_func) => {
+                !window_func.calculates_answer_when_row_is_returned()
+            }
+        })
     {
         let reg_acc_start = registers.acc_start + i;
         match &func.func {
@@ -1116,26 +1265,22 @@ fn emit_aggregation_step(
                 }
             }
             AccumulatorFunc::Window(win_func) => {
-                // Emit `AggStep` here, inside the input-scan loop, so the
-                // function's internal state advances once for every row read
-                // from the subquery. `AggValue` is NOT emitted here — the
-                // accumulator is read later, once per peer-group flush, in
-                // `emit_peer_group_flush`. Rank-family functions take no
-                // arguments; first_value/last_value take one, evaluated into
-                // a register so the runtime step can capture it.
-                let arg_reg = match func.current_expr() {
-                    Expr::FunctionCall { args, .. } if !args.is_empty() => {
-                        let reg = program.alloc_register();
-                        translate_expr(
-                            program,
-                            Some(&plan.table_references),
-                            &args[0],
-                            reg,
-                            resolver,
-                        )?;
-                        reg
-                    }
-                    _ => 0,
+                // These functions need at most their first argument while
+                // input rows arrive. Arguments that may differ for each result
+                // row are read later from that saved row.
+                let first_arg = match func.current_expr() {
+                    Expr::FunctionCall { args, .. } => args.first(),
+                    Expr::FunctionCallStar { .. } => None,
+                    _ => unreachable!("window function must be a function call"),
+                };
+                let arg_reg = if let Some(arg) = first_arg {
+                    let reg = program.alloc_register();
+                    translate_expr(program, Some(&plan.table_references), arg, reg, resolver)?;
+                    reg
+                } else {
+                    // TODO: Make `AggStep::col` optional. It currently requires a
+                    // register number, so reserved register 0 means no argument.
+                    0
                 };
                 program.emit_insn(Insn::AggStep {
                     acc_reg: reg_acc_start,
@@ -1168,41 +1313,53 @@ pub fn emit_window_results(
         labels,
         registers,
         cursors,
+        buffer_mode,
         ..
     } = t_ctx.meta_window.as_ref().expect("missing window metadata");
     let window = plan.window.as_ref().expect("missing window");
 
     let label_empty = program.allocate_label();
     let label_window_processing_end = labels.window_processing_end;
+    let label_flush_buffer = labels.flush_buffer;
     let reg_flush_buffer_return_offset = registers.flush_buffer_return_offset;
     let cursor_csr_current = cursors.csr_current;
+    let keeps_partition_rows = buffer_mode.keeps_partition_rows();
 
     // All source rows have already been processed at this point.
     // In fallthrough mode, we are not returning to a caller — we just flush
     // the buffered rows and continue execution.
     program.add_comment(program.offset(), "return remaining buffered rows");
     program.emit_insn(Insn::Null {
-        dest: registers.flush_buffer_return_offset,
+        dest: reg_flush_buffer_return_offset,
         dest_end: None,
     });
 
     // If control jumps here (labels.flush_buffer), we are in subroutine mode.
     // In that case, after flushing the buffer, execution will return to the
     // address stored in `flush_buffer_return_offset`.
-    program.preassign_label_to_next_insn(labels.flush_buffer);
+    program.preassign_label_to_next_insn(label_flush_buffer);
 
-    program.emit_insn(Insn::Rewind {
-        cursor_id: cursor_csr_current,
-        pc_if_empty: label_empty,
-    });
+    if keeps_partition_rows {
+        program.emit_insn(Insn::IsNull {
+            reg: registers.rowid,
+            target_pc: label_empty,
+        });
+    } else {
+        program.emit_insn(Insn::Rewind {
+            cursor_id: cursor_csr_current,
+            pc_if_empty: label_empty,
+        });
+    }
 
     emit_peer_group_flush(program, window, t_ctx, plan)?;
 
     program.preassign_label_to_next_insn(label_empty);
 
-    program.emit_insn(Insn::ResetSorter {
-        cursor_id: cursor_csr_current,
-    });
+    if !keeps_partition_rows {
+        program.emit_insn(Insn::ResetSorter {
+            cursor_id: cursor_csr_current,
+        });
+    }
     program.emit_insn(Insn::Return {
         return_reg: reg_flush_buffer_return_offset,
         can_fallthrough: true,
@@ -1223,23 +1380,23 @@ fn emit_peer_group_flush(
         labels,
         registers,
         cursors,
+        buffer_mode,
+        nth_value,
         expressions_referencing_subquery,
         ..
     } = t_ctx.meta_window.as_ref().expect("missing window metadata");
 
-    // For aggregate window functions and the rank-family, the accumulator
-    // has already been advanced once per source row during the input scan.
-    // Emit one `AggValue` per such function here, before entering the loop
-    // over buffered rows: this reads the accumulator into the result
-    // register exactly once per peer-group flush. The per-row loop below
-    // will copy that register's contents into the output for every buffered
-    // row in the group (RANGE UNBOUNDED PRECEDING TO CURRENT ROW semantics).
+    // Calculate shared answers before returning rows with equal sort values,
+    // so every such row reuses the same answer. `nth_value` is calculated
+    // below because its second argument is read separately from each row.
     for (i, func) in window.functions.iter().enumerate() {
-        let value_pre_loop = match &func.func {
+        let answer_is_shared = match &func.func {
             AccumulatorFunc::Agg(_) => true,
-            AccumulatorFunc::Window(w) => w.one_value_per_peer_group(),
+            AccumulatorFunc::Window(window_func) => {
+                !window_func.calculates_answer_when_row_is_returned()
+            }
         };
-        if value_pre_loop {
+        if answer_is_shared {
             program.emit_insn(Insn::AggValue {
                 acc_reg: registers.acc_start + i,
                 dest_reg: registers.acc_result_start + i,
@@ -1259,22 +1416,109 @@ fn emit_peer_group_flush(
         let reg_result = registers.result_columns_start + i;
         program.emit_column_or_rowid(cursors.csr_current, *col_idx, reg_result);
     }
-    // For row_number, ntile, lag, lead and first/last/nth_value no
-    // `AggStep` ran during the input scan. Emit `AggStep` + `AggValue` here,
-    // inside the per-row loop over buffered rows: `AggStep` advances the
-    // function's state for the current row, then `AggValue` reads the
-    // resulting value into the result register that gets written to this
-    // row's output. This is the site that gives every buffered row in a
-    // peer group a distinct value. Functions where
-    // `one_value_per_peer_group()` is true were handled above the loop and
-    // are skipped here.
+    // Calculate these answers while returning each row because rows with equal
+    // sort values may still have different answers.
     for (i, func) in window.functions.iter().enumerate() {
         if let AccumulatorFunc::Window(win_func) = &func.func {
-            if win_func.one_value_per_peer_group() {
+            if !win_func.calculates_answer_when_row_is_returned() {
                 continue;
             }
-            let acc_reg = registers.acc_start + i;
             let dest_reg = registers.acc_result_start + i;
+            if matches!(win_func, crate::function::WindowFunc::NthValue) {
+                let Expr::FunctionCall { args, .. } = func.current_expr() else {
+                    unreachable!("nth_value must be a function call");
+                };
+                let Expr::Column {
+                    column: value_column,
+                    ..
+                } = args[0].as_ref()
+                else {
+                    unreachable!("rewritten nth_value value must be a subquery column");
+                };
+                let Expr::Column {
+                    column: position_column,
+                    ..
+                } = args[1].as_ref()
+                else {
+                    unreachable!("rewritten nth_value position argument must be a subquery column");
+                };
+                let nth_value = nth_value
+                    .as_ref()
+                    .expect("nth_value requires a partition lookup cursor");
+                let position_lookup_done = program.allocate_label();
+                let missing_saved_row = program.allocate_label();
+                let invalid_position = program.allocate_label();
+                let valid_position = program.allocate_label();
+                let position_register = program.alloc_register();
+                let zero_register = program.alloc_register();
+                program.emit_insn(Insn::Null {
+                    dest: dest_reg,
+                    dest_end: None,
+                });
+                program.emit_column_or_rowid(
+                    cursors.csr_current,
+                    *position_column,
+                    position_register,
+                );
+                program.emit_insn(Insn::MustBeInt {
+                    reg: position_register,
+                    target_pc: Some(invalid_position),
+                });
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: zero_register,
+                });
+                program.emit_insn(Insn::Gt {
+                    lhs: position_register,
+                    rhs: zero_register,
+                    target_pc: valid_position,
+                    flags: CmpInsFlags::default(),
+                    collation: None,
+                });
+                program.preassign_label_to_next_insn(invalid_position);
+                program.emit_insn(Insn::Halt {
+                    err_code: crate::error::SQLITE_ERROR,
+                    description: "second argument to nth_value must be a positive integer"
+                        .to_string(),
+                    on_error: Some(ResolveType::Abort),
+                    description_reg: None,
+                });
+                program.preassign_label_to_next_insn(valid_position);
+                program.emit_insn(Insn::Gt {
+                    lhs: position_register,
+                    rhs: nth_value.frame_end_rowid_register,
+                    target_pc: position_lookup_done,
+                    flags: CmpInsFlags::default(),
+                    collation: None,
+                });
+                program.emit_insn(Insn::SeekRowid {
+                    cursor_id: nth_value.row_by_position_cursor,
+                    src_reg: position_register,
+                    target_pc: missing_saved_row,
+                });
+                program.emit_column_or_rowid(
+                    nth_value.row_by_position_cursor,
+                    *value_column,
+                    dest_reg,
+                );
+                program.emit_insn(Insn::Goto {
+                    target_pc: position_lookup_done,
+                });
+                program.preassign_label_to_next_insn(missing_saved_row);
+                program.emit_insn(Insn::Halt {
+                    err_code: crate::error::SQLITE_ERROR,
+                    description: "nth_value could not find a saved row within its frame"
+                        .to_string(),
+                    on_error: None,
+                    description_reg: None,
+                });
+                program.preassign_label_to_next_insn(position_lookup_done);
+                continue;
+            }
+
+            let acc_reg = registers.acc_start + i;
+            // TODO: Make `AggStep::col` optional. It currently requires a
+            // register number, so reserved register 0 means no argument.
             program.emit_insn(Insn::AggStep {
                 acc_reg,
                 col: 0,
@@ -1317,10 +1561,50 @@ fn emit_peer_group_flush(
         program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
     }
 
-    program.emit_insn(Insn::Next {
-        cursor_id: cursors.csr_current,
-        pc_if_next: label_loop_start,
-    });
+    let must_stop_return_cursor_at_next_peer_group =
+        buffer_mode.keeps_partition_rows() && !window.order_by.is_empty();
+    if must_stop_return_cursor_at_next_peer_group {
+        // The first row of the next sort group was inserted before this group
+        // was returned. Stop on that row so this cursor can continue from it
+        // when the next group is ready.
+        let next_row_found = program.allocate_label();
+        let finished_returning_group = program.allocate_label();
+        program.emit_insn(Insn::Next {
+            cursor_id: cursors.csr_current,
+            pc_if_next: next_row_found,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: finished_returning_group,
+        });
+
+        program.preassign_label_to_next_insn(next_row_found);
+        let current_order_by_start = program.alloc_registers(window.order_by.len());
+        for (i, (expr, _, _)) in window.order_by.iter().enumerate() {
+            let Expr::Column { column, .. } = expr else {
+                unreachable!("rewritten window ORDER BY term must be a subquery column");
+            };
+            program.emit_column_or_rowid(cursors.csr_current, *column, current_order_by_start + i);
+        }
+        program.emit_insn(Insn::Compare {
+            start_reg_a: registers
+                .prev_order_by_columns_start
+                .expect("window ORDER BY values must be saved"),
+            start_reg_b: current_order_by_start,
+            count: window.order_by.len(),
+            key_info: window_order_by_key_info(window, plan)?,
+        });
+        program.emit_insn(Insn::Jump {
+            target_pc_lt: finished_returning_group,
+            target_pc_eq: label_loop_start,
+            target_pc_gt: finished_returning_group,
+        });
+        program.preassign_label_to_next_insn(finished_returning_group);
+    } else {
+        program.emit_insn(Insn::Next {
+            cursor_id: cursors.csr_current,
+            pc_if_next: label_loop_start,
+        });
+    }
 
     Ok(())
 }

@@ -9,7 +9,7 @@ sidebarTitle: Window
 Window functions perform calculations across a set of rows that are related to the current row. Unlike aggregate functions with GROUP BY, window functions do not collapse rows into a single output row. Every input row produces a corresponding output row, with the window function result appended.
 
 <Info>
-Turso supports aggregate functions used as window functions with the default frame definition, the `row_number()` ranking function, and the `FILTER (WHERE ...)` clause. The remaining dedicated window functions (`rank`, `dense_rank`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`) and custom frame specifications (ROWS, RANGE, or GROUPS with explicit bounds) are not yet supported.
+Turso supports aggregate functions used as window functions with the default frame definition, `row_number()`, `rank()`, `dense_rank()`, `first_value()`, `last_value()`, `nth_value()`, and the `FILTER (WHERE ...)` clause. Other dedicated window functions and custom frame specifications (ROWS, RANGE, or GROUPS with explicit bounds) are not yet supported.
 </Info>
 
 ## Syntax
@@ -276,14 +276,9 @@ The following window function features are not yet supported in Turso:
 
 | Feature | Status |
 |---------|--------|
-| `rank()` | Not supported |
-| `dense_rank()` | Not supported |
 | `ntile(N)` | Not supported |
 | `lag(expr, offset, default)` | Not supported |
 | `lead(expr, offset, default)` | Not supported |
-| `first_value(expr)` | Not supported |
-| `last_value(expr)` | Not supported |
-| `nth_value(expr, N)` | Not supported |
 | `cume_dist()` | Not supported |
 | `percent_rank()` | Not supported |
 | Custom frame: `ROWS BETWEEN ...` | Not supported |
@@ -291,7 +286,7 @@ The following window function features are not yet supported in Turso:
 | Custom frame: `GROUPS BETWEEN ...` | Not supported |
 | `EXCLUDE` clause | Not supported |
 
-`row_number()` and `FILTER (WHERE ...)` are supported — see the sections above.
+The supported functions listed above use the default frame definition.
 
 ## See Also
 
