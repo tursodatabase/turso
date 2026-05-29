@@ -1864,6 +1864,146 @@ expect error {
     ambiguous column name: main.x._ROWID_
 }
 
+# UPDATE target alias collides with a FROM-side alias in USING/NATURAL joins.
+# Qualified refs to that alias must stay ambiguous (SQLite behavior).
+test update-from-target-alias-collision-using-set-qualified-is-ambiguous {
+    CREATE TABLE dst(a INT, val INT);
+    INSERT INTO dst VALUES(100,0);
+    CREATE TABLE l(a INT);
+    INSERT INTO l VALUES(5);
+    CREATE TABLE r(a INT);
+    INSERT INTO r VALUES(5);
+    UPDATE dst AS x
+       SET val = x.a
+      FROM l JOIN r AS x USING(a)
+     WHERE val = 0;
+}
+expect error {
+    ambiguous column name: x.a
+}
+
+test update-from-target-alias-collision-using-where-qualified-is-ambiguous {
+    CREATE TABLE dst(a INT, val INT);
+    INSERT INTO dst VALUES(100,0);
+    CREATE TABLE l(a INT);
+    INSERT INTO l VALUES(5);
+    CREATE TABLE r(a INT);
+    INSERT INTO r VALUES(5);
+    UPDATE dst AS x
+       SET val = 1
+      FROM l JOIN r AS x USING(a)
+     WHERE x.a = 100;
+}
+expect error {
+    ambiguous column name: x.a
+}
+
+test update-from-target-alias-collision-natural-set-qualified-is-ambiguous {
+    CREATE TABLE dst(a INT, b INT, val INT);
+    INSERT INTO dst VALUES(100,7,0);
+    CREATE TABLE l(a INT, b INT);
+    INSERT INTO l VALUES(5,50);
+    CREATE TABLE r(a INT, b INT);
+    INSERT INTO r VALUES(5,50);
+    UPDATE dst AS x
+       SET val = x.b
+      FROM l NATURAL JOIN r AS x
+     WHERE val = 0;
+}
+expect error {
+    ambiguous column name: x.b
+}
+
+test update-from-target-alias-collision-natural-where-qualified-is-ambiguous {
+    CREATE TABLE dst(a INT, b INT, val INT);
+    INSERT INTO dst VALUES(100,7,0);
+    CREATE TABLE l(a INT, b INT);
+    INSERT INTO l VALUES(5,50);
+    CREATE TABLE r(a INT, b INT);
+    INSERT INTO r VALUES(5,50);
+    UPDATE dst AS x
+       SET val = 1
+      FROM l NATURAL JOIN r AS x
+     WHERE x.b = 7;
+}
+expect error {
+    ambiguous column name: x.b
+}
+
+# Correlated subqueries must preserve the same ambiguity behavior for qualified
+# references that resolve through outer-query bindings.
+test update-from-target-alias-collision-using-correlated-qualified-is-ambiguous {
+    CREATE TABLE dst(a INT, val INT);
+    INSERT INTO dst VALUES(100,0);
+    CREATE TABLE l(a INT);
+    INSERT INTO l VALUES(5);
+    CREATE TABLE r(a INT);
+    INSERT INTO r VALUES(5);
+    UPDATE dst AS x
+       SET val = 1
+      FROM l JOIN r AS x USING(a)
+     WHERE EXISTS (SELECT 1 WHERE x.a = 100);
+}
+expect error {
+    ambiguous column name: x.a
+}
+
+test update-from-target-alias-collision-natural-correlated-qualified-is-ambiguous {
+    CREATE TABLE dst(a INT, b INT, val INT);
+    INSERT INTO dst VALUES(100,7,0);
+    CREATE TABLE l(a INT, b INT);
+    INSERT INTO l VALUES(5,50);
+    CREATE TABLE r(a INT, b INT);
+    INSERT INTO r VALUES(5,50);
+    UPDATE dst AS x
+       SET val = 1
+      FROM l NATURAL JOIN r AS x
+     WHERE EXISTS (SELECT 1 WHERE x.b = 7);
+}
+expect error {
+    ambiguous column name: x.b
+}
+
+# Positive sanity check: the qualified-ambiguity fix above must not
+# over-reject a legitimate USING join when the source aliases are unique and
+# the qualified reference points unambiguously at a single FROM table.
+test update-from-target-alias-collision-fix-still-allows-unambiguous-using {
+    CREATE TABLE dst(a INT, val INT);
+    INSERT INTO dst VALUES(5,0);
+    CREATE TABLE l(a INT, lx INT);
+    INSERT INTO l VALUES(5,100);
+    CREATE TABLE r(a INT, rx INT);
+    INSERT INTO r VALUES(5,200);
+    UPDATE dst AS d
+       SET val = l.a
+      FROM l JOIN r USING(a)
+     WHERE l.a = d.a;
+    SELECT * FROM dst;
+}
+expect {
+    5|5
+}
+
+# Multi-USING chain with right-side aliases colliding with the UPDATE target.
+# Ensure duplicate-identifier ambiguity still triggers before column resolution.
+test update-from-target-alias-collision-using-chain-self-aliased {
+    CREATE TABLE dst(a INT, val INT);
+    INSERT INTO dst VALUES(100,0);
+    CREATE TABLE l(a INT);
+    INSERT INTO l VALUES(5);
+    CREATE TABLE r(a INT);
+    INSERT INTO r VALUES(5);
+    CREATE TABLE s(a INT);
+    INSERT INTO s VALUES(5);
+    UPDATE dst AS x
+       SET val = 1
+      FROM l JOIN r AS x USING(a) JOIN s AS x USING(a)
+     WHERE val = 0;
+}
+expect error {
+    ambiguous column name: main.x._ROWID_
+}
+
 #-----------------------------------------------------------------------
 # Duplicate unaliased table in FROM should error (same table name, no alias).
 #-----------------------------------------------------------------------
