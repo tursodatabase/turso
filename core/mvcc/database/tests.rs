@@ -4267,9 +4267,9 @@ Terminated   | Irrelevant         | Reread V’s End field. TE has terminated so
 or not found |                    | the timestamp.
 */
 
-fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
+fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Arc<Transaction> {
     let state = state.into();
-    Transaction {
+    Arc::new(Transaction {
         state,
         tx_id,
         begin_ts,
@@ -4281,14 +4281,14 @@ fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
-    }
+    })
 }
 
 /// What this test checks: MVCC transaction visibility and conflict handling follow the intended isolation behavior.
 /// Why this matters: Concurrency bugs are correctness bugs: they create anomalies users can observe as wrong query results.
 #[test]
 fn test_snapshot_isolation_tx_visible1() {
-    let txs: SkipMap<TxID, Transaction> = SkipMap::from_iter([
+    let txs: SkipMap<TxID, Arc<Transaction>> = SkipMap::from_iter([
         (1, new_tx(1, 1, TransactionState::Committed(2))),
         (2, new_tx(2, 2, TransactionState::Committed(5))),
         (3, new_tx(3, 3, TransactionState::Aborted)),
@@ -4398,7 +4398,7 @@ fn test_snapshot_isolation_tx_visible1() {
 
 #[test]
 fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
-    let txs: SkipMap<TxID, Transaction> = SkipMap::new();
+    let txs: SkipMap<TxID, Arc<Transaction>> = SkipMap::new();
     let finalized_tx_states: SkipMap<TxID, TransactionState> =
         SkipMap::from_iter([(42, TransactionState::Committed(5))]);
     let reader = new_tx(7, 10, TransactionState::Active);
@@ -4483,7 +4483,7 @@ fn test_drop_unused_row_versions_prunes_unreferenced_finalized_tx_states() {
 /// and adds to CommitDepSet.
 #[test]
 fn test_commit_dependency_speculative_read() {
-    let txs: SkipMap<TxID, Transaction> =
+    let txs: SkipMap<TxID, Arc<Transaction>> =
         SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
     let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
@@ -4516,7 +4516,7 @@ fn test_commit_dependency_speculative_read() {
 /// and decrements their CommitDepCounter.
 #[test]
 fn test_commit_dependency_cascade_abort() {
-    let txs: SkipMap<TxID, Transaction> =
+    let txs: SkipMap<TxID, Arc<Transaction>> =
         SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
     let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
@@ -4560,7 +4560,7 @@ fn test_commit_dependency_cascade_abort() {
 /// Test that registering a dependency on an already-committed tx is a no-op.
 #[test]
 fn test_commit_dependency_already_committed() {
-    let txs: SkipMap<TxID, Transaction> =
+    let txs: SkipMap<TxID, Arc<Transaction>> =
         SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Committed(5)))]);
 
     let reader = new_tx(2, 10, TransactionState::Active);
@@ -4574,7 +4574,7 @@ fn test_commit_dependency_already_committed() {
 /// Test that registering a dependency on an already-aborted tx sets AbortNow.
 #[test]
 fn test_commit_dependency_already_aborted() {
-    let txs: SkipMap<TxID, Transaction> =
+    let txs: SkipMap<TxID, Arc<Transaction>> =
         SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Aborted))]);
 
     let reader = new_tx(2, 10, TransactionState::Active);
@@ -4588,7 +4588,7 @@ fn test_commit_dependency_already_aborted() {
 /// Test speculative ignore in is_end_visible registers dependency.
 #[test]
 fn test_commit_dependency_speculative_ignore() {
-    let txs: SkipMap<TxID, Transaction> = SkipMap::from_iter([
+    let txs: SkipMap<TxID, Arc<Transaction>> = SkipMap::from_iter([
         (1, new_tx(1, 1, TransactionState::Committed(2))),
         (3, new_tx(3, 3, TransactionState::Preparing(5))),
     ]);
@@ -4620,7 +4620,7 @@ fn test_commit_dependency_speculative_ignore() {
 /// register one commit dependency (dedup).
 #[test]
 fn test_commit_dependency_multiple_reads_dedup() {
-    let txs: SkipMap<TxID, Transaction> =
+    let txs: SkipMap<TxID, Arc<Transaction>> =
         SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
     let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
@@ -5060,7 +5060,7 @@ fn test_commit_dep_threaded_readonly_abort_cascades() {
 /// a concurrent drain could fetch_sub(1) on a zero counter, wrapping to MAX.
 #[test]
 fn test_commit_dependency_counter_no_underflow() {
-    let txs: SkipMap<TxID, Transaction> =
+    let txs: SkipMap<TxID, Arc<Transaction>> =
         SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
     let reader = new_tx(2, 10, TransactionState::Active);
 
@@ -5082,7 +5082,7 @@ fn test_commit_dependency_counter_no_underflow() {
 /// tx from txs, so register_commit_dependency saw None and assumed "committed."
 #[test]
 fn test_commit_dependency_terminated_tx_sets_abort() {
-    let txs: SkipMap<TxID, Transaction> =
+    let txs: SkipMap<TxID, Arc<Transaction>> =
         SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Terminated))]);
 
     let reader = new_tx(2, 10, TransactionState::Active);
@@ -5106,7 +5106,7 @@ fn test_commit_dependency_terminated_tx_sets_abort() {
 /// from the map (Issue #3 fix ensures this).
 #[test]
 fn test_commit_dependency_missing_tx_assumes_committed() {
-    let txs: SkipMap<TxID, Transaction> = SkipMap::new();
+    let txs: SkipMap<TxID, Arc<Transaction>> = SkipMap::new();
 
     let reader = new_tx(2, 10, TransactionState::Active);
     register_commit_dependency(&txs, &reader, 99);
@@ -10597,7 +10597,7 @@ fn test_speculative_delete_hides_committed_version() {
     // simulate the UPSERT code path that bypasses eager conflict detection).
     let row_v2 = generate_simple_string_row(table_id, 1, "v2");
     db.mvcc_store
-        .insert_btree_resident_to_table_or_index(tx2, row_v2, None)
+        .insert_btree_resident_to_table_or_index(&db.mvcc_store.get_tx(tx2).unwrap(), row_v2, None)
         .unwrap();
 
     // T2: commit → must fail with WriteWriteConflict.
@@ -10653,7 +10653,7 @@ fn test_committed_delete_tombstone_conflict() {
     // T2: insert_btree_resident for the same row.
     let row_v2 = generate_simple_string_row(table_id, 1, "v2");
     db.mvcc_store
-        .insert_btree_resident_to_table_or_index(tx2, row_v2, None)
+        .insert_btree_resident_to_table_or_index(&db.mvcc_store.get_tx(tx2).unwrap(), row_v2, None)
         .unwrap();
 
     // T2: commit → must detect conflict with Td.
@@ -10707,7 +10707,7 @@ fn test_committed_update_version_conflict() {
     // T2: insert_btree_resident for the same row.
     let row_v2 = generate_simple_string_row(table_id, 1, "v2");
     db.mvcc_store
-        .insert_btree_resident_to_table_or_index(tx2, row_v2, None)
+        .insert_btree_resident_to_table_or_index(&db.mvcc_store.get_tx(tx2).unwrap(), row_v2, None)
         .unwrap();
 
     // T2: commit → must detect conflict with Td.

@@ -5,6 +5,7 @@ use crossbeam_skiplist::SkipMap;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersions, SortableIndexKey,
+    Transaction,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -352,6 +353,9 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
     mv_cursor_type: MvccCursorType,
     table_id: MVTableId,
     tx_id: u64,
+    // Cache transaction struct to use instead of trying to get it from the txs map.
+    // Txs is a SkipList which can be heavy to query to the Transaction.
+    cached_tx: Arc<Transaction>,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: Option<ImmutableRecord>,
     btree_cursor: Box<dyn CursorTrait>,
@@ -391,6 +395,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             "BTreeCursor expected for mvcc cursor"
         );
         let table_id = db.get_table_id_from_root_page(root_page_or_table_id);
+        // Resolve the cursor's transaction once; it stays in `txs` for the
+        // cursor's whole lifetime, so we never look it up again per row.
+        let cached_tx = db
+            .get_tx(tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         #[cfg(not(any(test, injected_yields)))]
         let _ = connection;
         Ok(Self {
@@ -400,6 +409,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             #[cfg(any(test, injected_yields))]
             connection: connection.clone(),
             tx_id,
+            cached_tx,
             table_iterator: None,
             index_iterator: None,
             mv_cursor_type,
@@ -467,14 +477,14 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         // Scan path: the range iterator already resolved this row's version
         // chain, so read it directly instead of a second skiplist lookup.
         if let Some(versions) = versions {
-            return self.db.read_visible_from_versions(self.tx_id, versions);
+            return self.db.read_visible_from_versions(self.tx(), versions);
         }
         let maybe_index_id = match &self.mv_cursor_type {
             MvccCursorType::Index(_) => Some(self.table_id),
             MvccCursorType::Table => None,
         };
         self.db
-            .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)
+            .read_from_table_or_index(self.tx(), row_id, maybe_index_id)
     }
 
     pub fn close(self) -> Result<()> {
@@ -554,16 +564,26 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> bool {
         self.db
-            .query_btree_version_is_valid(self.table_id, key, self.tx_id)
+            .query_btree_version_is_valid(self.table_id, key, self.tx())
+    }
+
+    /// Lazily cache the reader's own transaction handle so the scan hot path
+    /// doesn't re-fetch the same `txs` entry (a skiplist `get` + epoch pin) for
+    /// every row.
+    /// The cursor's own transaction, resolved once at construction.
+    #[inline]
+    fn tx(&self) -> &Transaction {
+        self.cached_tx.as_ref()
     }
 
     /// Advance MVCC iterator and return next visible row key in the direction that the iterator was initialized in.
     fn advance_mvcc_iterator(&mut self) {
+        let tx = self.cached_tx.as_ref();
         let new_peek_state = match &self.mv_cursor_type {
             MvccCursorType::Table => match self.db.advance_cursor_and_get_row_id_for_table(
                 self.table_id,
                 &mut self.table_iterator,
-                self.tx_id,
+                tx,
             ) {
                 Some((row_id, versions)) => CursorPeek::Row {
                     key: row_id.row_id,
@@ -573,7 +593,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             },
             MvccCursorType::Index(_) => match self
                 .db
-                .advance_cursor_and_get_row_id_for_index(&mut self.index_iterator, self.tx_id)
+                .advance_cursor_and_get_row_id_for_index(&mut self.index_iterator, tx)
             {
                 Some(row_id) => CursorPeek::Row {
                     key: row_id.row_id,
@@ -1273,7 +1293,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     };
                     if self
                         .db
-                        .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
+                        .read_from_table_or_index(self.tx(), row_id, maybe_index_id)?
                         .is_some()
                     {
                         // We need to clear the null flag for the table cursor before seeking,
@@ -1315,7 +1335,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                                 rowid.clone(),
                                 inclusive,
                                 direction,
-                                self.tx_id,
+                                self.cached_tx.as_ref(),
                                 &mut self.table_iterator,
                             );
 
@@ -1351,7 +1371,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                                 sortable_key.clone(),
                                 inclusive,
                                 direction,
-                                self.tx_id,
+                                self.cached_tx.as_ref(),
                                 &mut self.index_iterator,
                             );
 
@@ -1508,11 +1528,11 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         // FIXME: set btree to somewhere close to this rowid?
         if self
             .db
-            .read_from_table_or_index(self.tx_id, &row.id, maybe_index_id)?
+            .read_from_table_or_index(self.tx(), &row.id, maybe_index_id)?
             .is_some()
         {
             self.db
-                .update_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .update_to_table_or_index(self.tx(), row, maybe_index_id)
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
@@ -1520,13 +1540,13 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             // The row exists in B-tree but not in MvStore - mark it as B-tree resident
             // so that checkpoint knows to write deletes to the B-tree file.
             self.db
-                .insert_btree_resident_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .insert_btree_resident_to_table_or_index(self.tx(), row, maybe_index_id)
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
         } else {
             self.db
-                .insert_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .insert_to_table_or_index(self.tx(), row, maybe_index_id)
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
@@ -1564,7 +1584,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         }
         let was_deleted =
             self.db
-                .delete_from_table_or_index(self.tx_id, rowid.clone(), maybe_index_id)?;
+                .delete_from_table_or_index(self.tx(), rowid.clone(), maybe_index_id)?;
         // If was_deleted is false, this can ONLY happen when we have a row that only exists
         // in the btree but not the mv store. In this case, we create a tombstone for the row
         // based on the btree row.
@@ -1592,7 +1612,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 MvccCursorType::Index(_) => Row::new_index_row(rowid.clone(), column_count),
             };
             self.db
-                .insert_tombstone_to_table_or_index(self.tx_id, rowid, row, maybe_index_id)?;
+                .insert_tombstone_to_table_or_index(self.tx(), rowid, row, maybe_index_id)?;
         }
         self.invalidate_record();
         Ok(IOResult::Done(()))
@@ -1623,7 +1643,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 },
                 inclusive,
                 IterationDirection::Forwards,
-                self.tx_id,
+                self.cached_tx.as_ref(),
                 &mut self.table_iterator,
             );
 
