@@ -448,7 +448,7 @@ setup named_window_rank_data {
 }
 
 @setup named_window_rank_data
-@skip-if sqlite "TODO: rank() and dense_rank() are not yet implemented."
+@skip-if sqlite "TODO: dense_rank() is not yet implemented."
 test named-window-rank-dense-rank {
     SELECT a, rank() OVER w1, dense_rank() OVER w1
     FROM t_nw_rank
@@ -456,7 +456,7 @@ test named-window-rank-dense-rank {
     ORDER BY a;
 }
 expect error {
-    no such function: rank
+    no such function: dense_rank
 }
 
 setup named_window_ntile_data {
@@ -571,7 +571,6 @@ setup named_window_group_data {
 }
 
 @setup named_window_group_data
-@skip-if sqlite "TODO: rank() is not yet implemented."
 test named-window-with-group-by {
     SELECT a, sum(b) AS s, rank() OVER w1
     FROM t_nw_grp
@@ -579,8 +578,10 @@ test named-window-with-group-by {
     WINDOW w1 AS (ORDER BY sum(b))
     ORDER BY a;
 }
-expect error {
-    no such function: rank
+expect {
+    x|3|1
+    y|7|3
+    z|5|2
 }
 
 @setup named_window_data
