@@ -518,7 +518,7 @@ impl WindowFunc {
     /// drifts ahead of the resolver and users get "no such function" when
     /// they try to call them.
     pub fn is_implemented(&self) -> bool {
-        matches!(self, Self::RowNumber)
+        matches!(self, Self::RowNumber | Self::Rank)
     }
 
     /// The hardcoded frame this built-in evaluates over, overriding any
