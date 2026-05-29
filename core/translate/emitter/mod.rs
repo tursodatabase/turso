@@ -1,15 +1,15 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 use super::{
-    collate::{get_expr_collation_ctx_with_symbols, CollationSeq},
+    collate::{CollationSeq, get_expr_collation_ctx_with_symbols},
     compound_select::emit_program_for_compound_select,
     emitter::{
         delete::emit_program_for_delete, select::emit_program_for_select,
         update::emit_program_for_update,
     },
     expr::{
-        bind_and_rewrite_expr, emit_table_column, translate_expr, translate_expr_no_constant_opt,
-        walk_expr, BindingBehavior, ExprAffinityInfo, NoConstantOptReason, WalkControl,
+        BindingBehavior, ExprAffinityInfo, NoConstantOptReason, WalkControl, bind_and_rewrite_expr,
+        emit_table_column, translate_expr, translate_expr_no_constant_opt, walk_expr,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
@@ -18,26 +18,27 @@ use super::{
         BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn,
         TableReferences,
     },
-    planner::{TableMask, ROWID_STRS},
+    planner::{ROWID_STRS, TableMask},
     trigger_exec::{get_triggers_including_temp, has_triggers_including_temp},
     window::WindowMetadata,
 };
 use crate::alloc::TursoIteratorExt;
 use crate::instrument;
 use crate::schema::{
-    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
-    EXPR_INDEX_SENTINEL,
+    BTreeTable, CheckConstraint, Column, ColumnLayout, EXPR_INDEX_SENTINEL, GeneratedType,
+    IndexColumn, Schema, Table,
 };
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::ColumnMask;
 use crate::vdbe::{
+    BranchOffset, CursorID,
     affinity::Affinity,
     builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
-    insn::{to_u16, InsertFlags, Insn},
-    BranchOffset, CursorID,
+    insn::{InsertFlags, Insn, to_u16},
 };
 use crate::{
-    bail_parse_error,
+    CaptureDataChangesExt, Connection, Database, DatabaseCatalog, LimboError, Result, RwLock,
+    SymbolTable, bail_parse_error,
     error::SQLITE_CONSTRAINT_CHECK,
     function::Func,
     sync::Arc,
@@ -45,8 +46,6 @@ use crate::{
     util::{
         check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
     },
-    CaptureDataChangesExt, Connection, Database, DatabaseCatalog, LimboError, Result, RwLock,
-    SymbolTable,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
@@ -1767,28 +1766,46 @@ pub(crate) fn emit_columns_and_dependencies(
 
     let mut extra_idx = 0;
     let pairs = table.columns().iter().enumerate().map(|(idx, col)| {
-        let reg = if col.is_rowid_alias() {
-            rowid_reg
-        } else if let Some(pos) = targets.iter().position(|&t| t == idx) {
+        let reg = if let Some(pos) = targets.iter().position(|&t| t == idx) {
+            // Keep requested target columns contiguous even when one is a rowid alias.
+            // Some callers pass this contiguous span directly to record/probe opcodes.
             let reg = target_base + pos;
-            if !col.is_virtual_generated() {
+            if col.is_rowid_alias() {
+                program.emit_insn(Insn::Copy {
+                    src_reg: rowid_reg,
+                    dst_reg: reg,
+                    extra_amount: 0,
+                });
+            } else if !col.is_virtual_generated() {
                 program.emit_column_or_rowid(cursor_id, idx, reg);
             }
             reg
         } else if dependencies.get(idx) {
             let reg = extra_base + extra_idx;
-            program.emit_column_or_rowid(cursor_id, idx, reg);
+            if col.is_rowid_alias() {
+                program.emit_insn(Insn::Copy {
+                    src_reg: rowid_reg,
+                    dst_reg: reg,
+                    extra_amount: 0,
+                });
+            } else {
+                program.emit_column_or_rowid(cursor_id, idx, reg);
+            }
             extra_idx += 1;
             reg
+        } else if col.is_rowid_alias() {
+            rowid_reg
         } else {
             0
         };
         (col, reg)
     });
     let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
-    debug_assert!(targets
-        .windows(2)
-        .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));
+    debug_assert!(
+        targets
+            .windows(2)
+            .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 })
+    );
 
     let table_arc = Arc::new(table.clone());
     gencol::compute_virtual_columns(
