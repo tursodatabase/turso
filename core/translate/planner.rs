@@ -474,8 +474,19 @@ fn link_with_window(
         {
             return Ok(());
         }
+        use crate::translate::plan::{Frame, FrameBoundary};
+        use turso_parser::ast::FrameMode;
+        // Built-ins whose `coerced_frame()` returns `None` (first_value
+        // / last_value / nth_value), and aggregates, share the standard
+        // default frame.
+        let frame = match &func {
+            AccumulatorFunc::Window(w) => w.coerced_frame(),
+            AccumulatorFunc::Agg(_) => None,
+        }
+        .unwrap_or_default();
         window.functions.push(WindowFunction {
             func,
+            frame,
             original_expr: expr.clone(),
             rewritten: None,
         });

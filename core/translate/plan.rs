@@ -3111,6 +3111,38 @@ impl Window {
     }
 }
 
+/// One bound of a window function's effective frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameBoundary {
+    UnboundedPreceding,
+    Preceding(Box<Expr>),
+    CurrentRow,
+    Following(Box<Expr>),
+    UnboundedFollowing,
+}
+
+/// A window function's effective frame. The bounds are interpreted per `mode`:
+/// `Rows` counts physical rows, `Range` and `Groups` work over peer groups of
+/// the window's ORDER BY values.
+///
+/// Example: `<mode: RANGE> <start: UNBOUNDED PRECEDING> TO <end: CURRENT ROW>`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame {
+    pub mode: ast::FrameMode,
+    pub start: FrameBoundary,
+    pub end: FrameBoundary,
+}
+
+impl Default for Frame {
+    fn default() -> Self {
+        Self {
+            mode: ast::FrameMode::Range,
+            start: FrameBoundary::UnboundedPreceding,
+            end: FrameBoundary::CurrentRow,
+        }
+    }
+}
+
 /// One window function call belonging to a `Window`.
 ///
 /// Window queries are planned by wrapping the original FROM/WHERE in a
@@ -3124,6 +3156,11 @@ pub struct WindowFunction {
     /// The resolved function. Aggregate window functions and specialized window
     /// functions such as ROW_NUMBER() are supported.
     pub func: AccumulatorFunc,
+    /// The frame this function evaluates over, after per-function coercion.
+    /// Built-in window functions get their fixed frame from
+    /// `WindowFunc::coerced_frame()`; aggregate window functions inherit the
+    /// default `RANGE UNBOUNDED PRECEDING TO CURRENT ROW`.
+    pub frame: Frame,
     /// The expression from which the function was resolved. Used as the lookup
     /// key when matching SQL occurrences back to this entry during rewriting.
     pub original_expr: Expr,
