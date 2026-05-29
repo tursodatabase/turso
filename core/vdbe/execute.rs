@@ -6753,6 +6753,47 @@ fn ordered_set_percentile_disc(values: &[Value], fraction: f64, collation: Colla
     sorted[index.min(n - 1)].clone()
 }
 
+/// Coerces a Value to a positive i64 using SQLite's
+/// `sqlite3_value_numeric_type` strictness — pure integers parse, clean
+/// floats truncate iff exact, partial-numeric text ("2abc") is rejected.
+/// Returns the integer or the `InvalidArgument` whose message matches
+/// SQLite's `nth_valueStepFunc`.
+fn nth_value_validate_n(value: &Value) -> Result<i64> {
+    const ERR: &str = "second argument to nth_value must be a positive integer";
+    let (i, f) = match value {
+        Value::Numeric(Numeric::Integer(i)) => (Some(*i), None),
+        Value::Numeric(Numeric::Float(f)) => (None, Some(f64::from(*f))),
+        Value::Text(t) => match try_for_float(t.as_str().as_bytes()) {
+            (NumericParseResult::PureInteger, ParsedNumber::Integer(i)) => (Some(i), None),
+            (NumericParseResult::HasDecimalOrExp, ParsedNumber::Float(f)) => (None, Some(f)),
+            _ => return Err(LimboError::InvalidArgument(ERR.into())),
+        },
+        _ => return Err(LimboError::InvalidArgument(ERR.into())),
+    };
+    let n = match (i, f) {
+        (Some(i), _) => i,
+        (None, Some(f)) => {
+            let as_i = f as i64;
+            if as_i as f64 != f {
+                return Err(LimboError::InvalidArgument(ERR.into()));
+            }
+            as_i
+        }
+        _ => unreachable!(),
+    };
+    if n <= 0 {
+        return Err(LimboError::InvalidArgument(ERR.into()));
+    }
+    Ok(n)
+}
+
+/// Per-row step for pure window functions (those carried in
+/// `AccumulatorFunc::Window`). Mirrors `op_agg_step` but with no FILTER and
+/// per-function state semantics. State lives in the same
+/// `Register::Aggregate(AggContext::Builtin(_))` slot used by built-in
+/// aggregates so AggValue can read it back via the standard path. The `col`
+/// argument is the register holding the function's single argument (when it
+/// has one — 0-ary functions like row_number ignore it).
 fn op_window_step(
     state: &mut ProgramState,
     acc_reg: usize,
@@ -6875,6 +6916,59 @@ fn op_window_step(
             };
             payload[0] = arg_value;
         }
+        // nth_value(expr, N) — captures the arg of the Nth source row of the
+        // partition and keeps it. Same shape as first_value's capture-once
+        // pattern, except the trigger is "rows_seen == N" instead of "first
+        // step ever". N is validated per step (matching SQLite's
+        // nth_valueStepFunc, which errors if the 2nd arg isn't a positive
+        // integer).
+        //
+        // State: payload[0] = captured value (Null until captured),
+        //        payload[1] = rows-seen counter,
+        //        payload[2] = captured flag (so a NULL expr at row N is
+        //                     preserved instead of being re-captured later).
+        WindowFunc::NthValue => {
+            if let Register::Value(Value::Null) = state.registers[acc_reg] {
+                state.registers[acc_reg] =
+                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
+                        Value::Null,
+                        Value::from_i64(0),
+                        Value::from_i64(0),
+                    ]?));
+            }
+            let n = nth_value_validate_n(state.registers[arg_reg + 1].get_value())?;
+            // Bump rows_seen unconditionally; only clone + store the expr
+            // when this is the Nth row and we haven't captured yet.
+            let (rows_seen, already_captured) = {
+                let Register::Aggregate(AggContext::Builtin(payload)) =
+                    &mut state.registers[acc_reg]
+                else {
+                    unreachable!("nth_value accumulator must be a Builtin payload");
+                };
+                let Value::Numeric(Numeric::Integer(rows_seen)) = &mut payload[1] else {
+                    unreachable!("nth_value rows_seen counter must be Integer");
+                };
+                *rows_seen += 1;
+                let rows_seen = *rows_seen;
+                let Value::Numeric(Numeric::Integer(captured)) = &payload[2] else {
+                    unreachable!("nth_value capture flag must be Integer");
+                };
+                (rows_seen, *captured != 0)
+            };
+            if !already_captured && rows_seen == n {
+                let arg_value = state.registers[arg_reg].get_value().clone();
+                let Register::Aggregate(AggContext::Builtin(payload)) =
+                    &mut state.registers[acc_reg]
+                else {
+                    unreachable!("nth_value accumulator must be a Builtin payload");
+                };
+                payload[0] = arg_value;
+                let Value::Numeric(Numeric::Integer(captured)) = &mut payload[2] else {
+                    unreachable!("nth_value capture flag must be Integer");
+                };
+                *captured = 1;
+            }
+        }
         // dense_rank() — mirrors SQLite's CallCount-based dense_rankStepFunc.
         //
         // State (payload):
@@ -6944,14 +7038,14 @@ fn op_window_value(
             };
             std::mem::replace(&mut payload[0], Value::from_i64(0))
         }
-        WindowFunc::FirstValue => {
-            // first_value captures payload[0] once per partition; every
-            // peer-group flush in the partition reads the same slot, so
-            // we have to clone instead of taking ownership.
+        WindowFunc::FirstValue | WindowFunc::NthValue => {
+            // first_value / nth_value capture payload[0] once per partition;
+            // every peer-group flush in the partition reads the same slot,
+            // so we have to clone instead of taking ownership.
             let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
             else {
                 return Err(LimboError::InternalError(format!(
-                    "first_value accumulator in unexpected register state: {:?}",
+                    "{func} accumulator in unexpected register state: {:?}",
                     state.registers[acc_reg]
                 )));
             };

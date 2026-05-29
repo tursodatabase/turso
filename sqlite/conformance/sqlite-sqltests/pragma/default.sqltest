@@ -312,12 +312,19 @@ expect {
     last_value|w|1
 }
 
+test pragma-function-list-window-nth-value {
+    SELECT name, type, narg FROM pragma_function_list WHERE name = 'nth_value';
+}
+expect {
+    nth_value|w|2
+}
+
 @skip-if sqlite "sqlite implements these window functions; we don't yet, so they must not be advertised in pragma_function_list"
 test pragma-function-list-omits-unimplemented-window-functions {
     SELECT COUNT(*) FROM pragma_function_list
     WHERE name IN (
         'percent_rank','cume_dist','ntile',
-        'lag','lead','nth_value'
+        'lag','lead'
     );
 }
 expect {

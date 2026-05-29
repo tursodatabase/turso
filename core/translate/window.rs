@@ -1121,19 +1121,23 @@ fn emit_aggregation_step(
                 // from the subquery. `AggValue` is NOT emitted here — the
                 // accumulator is read later, once per peer-group flush, in
                 // `emit_peer_group_flush`. Rank-family functions take no
-                // arguments; first_value/last_value take one, evaluated into
-                // a register so the runtime step can capture it.
+                // arguments; first_value/last_value/nth_value do, evaluated
+                // into a contiguous register block — the runtime reads
+                // arg_reg, arg_reg + 1, ... per the function's declared
+                // arity.
                 let arg_reg = match func.current_expr() {
                     Expr::FunctionCall { args, .. } if !args.is_empty() => {
-                        let reg = program.alloc_register();
-                        translate_expr(
-                            program,
-                            Some(&plan.table_references),
-                            &args[0],
-                            reg,
-                            resolver,
-                        )?;
-                        reg
+                        let start = program.alloc_registers(args.len());
+                        for (i, arg) in args.iter().enumerate() {
+                            translate_expr(
+                                program,
+                                Some(&plan.table_references),
+                                arg,
+                                start + i,
+                                resolver,
+                            )?;
+                        }
+                        start
                     }
                     _ => 0,
                 };

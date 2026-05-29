@@ -1,0 +1,219 @@
+@database :memory:
+
+setup nth_base {
+    CREATE TABLE nth_items(id INTEGER PRIMARY KEY, g TEXT, v INTEGER);
+    INSERT INTO nth_items VALUES
+        (1, 'a', 10),
+        (2, 'a', 20),
+        (3, 'a', 30),
+        (4, 'b', 100),
+        (5, 'b', 200);
+}
+
+# N=1 captures the partition's first row; equivalent to first_value(expr).
+@setup nth_base
+test nth-value-first-row {
+    SELECT id, v, nth_value(v, 1) OVER (PARTITION BY g ORDER BY v) FROM nth_items ORDER BY id;
+}
+expect {
+    1|10|10
+    2|20|10
+    3|30|10
+    4|100|100
+    5|200|100
+}
+
+# N=2 captures the partition's second row. Rows preceding the Nth see NULL
+# because the frame hasn't reached that row yet.
+@setup nth_base
+test nth-value-second-row {
+    SELECT id, v, nth_value(v, 2) OVER (PARTITION BY g ORDER BY v) FROM nth_items ORDER BY id;
+}
+expect {
+    1|10|
+    2|20|20
+    3|30|20
+    4|100|
+    5|200|200
+}
+
+# N beyond the partition size — capture flag stays unset, all rows return NULL.
+@setup nth_base
+test nth-value-out-of-bounds {
+    SELECT id, v, nth_value(v, 10) OVER (PARTITION BY g ORDER BY v) FROM nth_items ORDER BY id;
+}
+expect {
+    1|10|
+    2|20|
+    3|30|
+    4|100|
+    5|200|
+}
+
+setup nth_nulls {
+    CREATE TABLE nth_n(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO nth_n VALUES (1, 10), (2, NULL), (3, 30);
+}
+
+# When the Nth row's expression is NULL, the captured value is NULL. The
+# capture flag distinguishes this from "not yet captured", so subsequent
+# rows don't re-trigger a capture from a later non-NULL row.
+@setup nth_nulls
+test nth-value-captures-null {
+    SELECT id, v, nth_value(v, 2) OVER (ORDER BY id) FROM nth_n ORDER BY id;
+}
+expect {
+    1|10|
+    2||
+    3|30|
+}
+
+setup nth_peers {
+    CREATE TABLE nth_p(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO nth_p VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 3);
+}
+
+# Peer groups don't collapse the row counter: nth_value(_, 3) targets the
+# 3rd row in source order, not the 3rd peer group.
+@setup nth_peers
+test nth-value-counts-rows-not-peers {
+    SELECT id, v, nth_value(v, 3) OVER (ORDER BY id) FROM nth_p ORDER BY id;
+}
+expect {
+    1|1|
+    2|1|
+    3|2|2
+    4|2|2
+    5|3|2
+}
+
+setup nth_empty {
+    CREATE TABLE nth_e(v INTEGER);
+}
+
+@setup nth_empty
+test nth-value-empty-input {
+    SELECT nth_value(v, 1) OVER (ORDER BY v) FROM nth_e;
+}
+expect {
+}
+
+@setup nth_base
+test nth-value-expression-argument {
+    SELECT id, nth_value(v * 10, 2) OVER (ORDER BY v) FROM nth_items ORDER BY id;
+}
+expect {
+    1|
+    2|200
+    3|200
+    4|200
+    5|200
+}
+
+@setup nth_base
+test nth-value-with-first-and-last-value {
+    SELECT id, v,
+           first_value(v) OVER (ORDER BY v),
+           nth_value(v, 2) OVER (ORDER BY v),
+           nth_value(v, 3) OVER (ORDER BY v),
+           last_value(v) OVER (ORDER BY v)
+    FROM nth_items ORDER BY id;
+}
+expect {
+    1|10|10|||10
+    2|20|10|20||20
+    3|30|10|20|30|30
+    4|100|10|20|30|100
+    5|200|10|20|30|200
+}
+
+setup nth_text {
+    CREATE TABLE nth_t(v TEXT);
+    INSERT INTO nth_t VALUES ('apple'), ('banana'), ('cherry');
+}
+
+@setup nth_text
+test nth-value-text-argument {
+    SELECT v, nth_value(v, 2) OVER (ORDER BY v) FROM nth_t ORDER BY v;
+}
+expect {
+    apple|
+    banana|banana
+    cherry|banana
+}
+
+@setup nth_base
+test nth-value-float-n-converts-losslessly {
+    SELECT id, nth_value(v, 2.0) OVER (ORDER BY v) FROM nth_items ORDER BY id;
+}
+expect {
+    1|
+    2|20
+    3|20
+    4|20
+    5|20
+}
+
+# SQLite applies numeric affinity to the N argument, so a text-typed integer
+# is accepted just like an integer literal.
+@setup nth_base
+test nth-value-text-n-coerces {
+    SELECT id, nth_value(v, '2') OVER (ORDER BY v) FROM nth_items ORDER BY id;
+}
+expect {
+    1|
+    2|20
+    3|20
+    4|20
+    5|20
+}
+
+# Negative-path validation: N must coerce to a positive integer. Any other
+# input — zero, negative, non-integer float, non-numeric text — errors at
+# step time with the same message SQLite emits from nth_valueStepFunc.
+@setup nth_base
+test nth-value-n-zero-errors {
+    SELECT nth_value(v, 0) OVER (ORDER BY v) FROM nth_items;
+}
+expect error {
+}
+
+@setup nth_base
+test nth-value-n-negative-errors {
+    SELECT nth_value(v, -1) OVER (ORDER BY v) FROM nth_items;
+}
+expect error {
+}
+
+@setup nth_base
+test nth-value-n-lossy-float-errors {
+    SELECT nth_value(v, 1.5) OVER (ORDER BY v) FROM nth_items;
+}
+expect error {
+}
+
+@setup nth_base
+test nth-value-n-non-numeric-text-errors {
+    SELECT nth_value(v, 'abc') OVER (ORDER BY v) FROM nth_items;
+}
+expect error {
+    second argument to nth_value must be a positive integer
+}
+
+# Text whose numeric prefix is followed by junk fails strict numeric
+# affinity, matching SQLite's `sqlite3_value_numeric_type` rejection.
+@setup nth_base
+test nth-value-n-text-prefix-errors {
+    SELECT nth_value(v, '2abc') OVER (ORDER BY v) FROM nth_items;
+}
+expect error {
+    second argument to nth_value must be a positive integer
+}
+
+@setup nth_base
+test nth-value-n-null-errors {
+    SELECT nth_value(v, NULL) OVER (ORDER BY v) FROM nth_items;
+}
+expect error {
+    second argument to nth_value must be a positive integer
+}

@@ -520,7 +520,12 @@ impl WindowFunc {
     pub fn is_implemented(&self) -> bool {
         matches!(
             self,
-            Self::RowNumber | Self::Rank | Self::DenseRank | Self::FirstValue | Self::LastValue
+            Self::RowNumber
+                | Self::Rank
+                | Self::DenseRank
+                | Self::FirstValue
+                | Self::LastValue
+                | Self::NthValue
         )
     }
 
@@ -587,9 +592,9 @@ impl WindowFunc {
     ///   before the loop over buffered rows, reading the accumulator into a
     ///   result register. The loop then writes that one register's contents
     ///   into the output for every buffered row in the group.
-    /// * false (row_number, ntile, lag, lead, nth_value): nothing is
-    ///   emitted in `emit_aggregation_step`. Both `AggStep` and `AggValue`
-    ///   are emitted inside the per-row loop in `emit_peer_group_flush`,
+    /// * false (row_number, ntile, lag, lead): nothing is emitted in
+    ///   `emit_aggregation_step`. Both `AggStep` and `AggValue` are
+    ///   emitted inside the per-row loop in `emit_peer_group_flush`,
     ///   so they run once per buffered row and produce a distinct value for
     ///   each output row.
     ///
@@ -615,13 +620,13 @@ impl WindowFunc {
     ///
     /// Functions returning true: `rank`, `dense_rank`, `percent_rank`,
     /// `cume_dist` — their value is determined entirely by where the peer
-    /// group sits in the partition's ordering — plus `first_value` and
-    /// `last_value`, whose default frame (`RANGE UNBOUNDED PRECEDING TO
-    /// CURRENT ROW`) ends at the current peer group, so every row in the
-    /// group sees the same frame contents.
-    /// Functions returning false: `row_number`, `ntile`, `lag`, `lead`,
-    /// `nth_value` — all depend on a row's position within the
-    /// partition/frame, not just its peer group.
+    /// group sits in the partition's ordering — plus `first_value`,
+    /// `last_value`, and `nth_value`, whose default frame (`RANGE UNBOUNDED
+    /// PRECEDING TO CURRENT ROW`) ends at the current peer group, so every
+    /// row in the group sees the same frame contents.
+    /// Functions returning false: `row_number`, `ntile`, `lag`, `lead` —
+    /// all depend on a row's position within the partition/frame, not just
+    /// its peer group.
     pub fn one_value_per_peer_group(&self) -> bool {
         match self {
             Self::Rank
@@ -629,13 +634,9 @@ impl WindowFunc {
             | Self::PercentRank
             | Self::CumeDist
             | Self::FirstValue
-            | Self::LastValue => true,
-            Self::RowNumber
-            | Self::Ntile
-            | Self::Lag
-            | Self::Lead
-            | Self::NthValue
-            | Self::External(_) => false,
+            | Self::LastValue
+            | Self::NthValue => true,
+            Self::RowNumber | Self::Ntile | Self::Lag | Self::Lead | Self::External(_) => false,
         }
     }
 }
