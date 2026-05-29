@@ -520,6 +520,55 @@ impl WindowFunc {
     pub fn is_implemented(&self) -> bool {
         matches!(self, Self::RowNumber)
     }
+
+    /// The hardcoded frame this built-in evaluates over, overriding any
+    /// user-written FRAME clause.
+    /// - `Some(frame)` = even if the user provides an explicit frame, it's ignored in favor of this hardcoded frame.
+    /// - `None` = the function honors the user's frame, falling back to Frame::default() when user hasn't specified one.
+    ///
+    /// This is taken from SQLite's `sqlite3WindowUpdate` table at `window.c:699-708`.
+    pub fn coerced_frame(&self) -> Option<crate::translate::plan::Frame> {
+        use crate::translate::plan::{Frame, FrameBoundary};
+        use turso_parser::ast::{Expr, FrameMode, Literal};
+        match self {
+            Self::RowNumber | Self::Lag => Some(Frame {
+                mode: FrameMode::Rows,
+                start: FrameBoundary::UnboundedPreceding,
+                end: FrameBoundary::CurrentRow,
+            }),
+            Self::Rank | Self::DenseRank => Some(Frame {
+                mode: FrameMode::Range,
+                start: FrameBoundary::UnboundedPreceding,
+                end: FrameBoundary::CurrentRow,
+            }),
+            Self::PercentRank => Some(Frame {
+                mode: FrameMode::Groups,
+                start: FrameBoundary::CurrentRow,
+                end: FrameBoundary::UnboundedFollowing,
+            }),
+            Self::CumeDist => Some(Frame {
+                mode: FrameMode::Groups,
+                start: FrameBoundary::Following(Box::new(Expr::Literal(Literal::Numeric(
+                    "1".to_string(),
+                )))),
+                end: FrameBoundary::UnboundedFollowing,
+            }),
+            Self::Ntile => Some(Frame {
+                mode: FrameMode::Rows,
+                start: FrameBoundary::CurrentRow,
+                end: FrameBoundary::UnboundedFollowing,
+            }),
+            Self::Lead => Some(Frame {
+                mode: FrameMode::Rows,
+                start: FrameBoundary::UnboundedPreceding,
+                end: FrameBoundary::UnboundedFollowing,
+            }),
+            Self::FirstValue | Self::LastValue | Self::NthValue => None,
+            Self::External(_) => unreachable!(
+                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
+            ),
+        }
+    }
 }
 
 impl PartialEq for WindowFunc {
