@@ -604,10 +604,22 @@ pub fn is_system_table(table_name: &str) -> bool {
         .any(|prefix| table_name.to_lowercase().starts_with(prefix))
 }
 
+pub fn is_main_schema_table_name(table_name: &str) -> bool {
+    table_name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME)
+        || table_name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME_ALT)
+}
+
+pub fn is_temp_schema_table_name(table_name: &str) -> bool {
+    table_name.eq_ignore_ascii_case(TEMP_SCHEMA_TABLE_NAME)
+        || table_name.eq_ignore_ascii_case(TEMP_SCHEMA_TABLE_NAME_ALT)
+}
+
+pub fn is_schema_table_name(table_name: &str) -> bool {
+    is_main_schema_table_name(table_name) || is_temp_schema_table_name(table_name)
+}
+
 pub fn allow_user_dml(table_name: &str) -> bool {
-    const NAMES: [&str; 2] = [SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT];
-    !(NAMES.iter().any(|n| n.eq_ignore_ascii_case(table_name))
-        || table_name.starts_with(TURSO_INTERNAL_PREFIX)) // internal name wouldn't be uppercase
+    !(is_schema_table_name(table_name) || table_name.starts_with(TURSO_INTERNAL_PREFIX))
 }
 
 /// Type of schema object for conflict checking
@@ -719,10 +731,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
 impl Schema {
     fn normalize_table_lookup_name(&self, name: &str) -> String {
         let name = normalize_ident(name);
-        if name.eq(SCHEMA_TABLE_NAME_ALT)
-            || name.eq(TEMP_SCHEMA_TABLE_NAME)
-            || name.eq(TEMP_SCHEMA_TABLE_NAME_ALT)
-        {
+        if is_schema_table_name(&name) {
             SCHEMA_TABLE_NAME.to_string()
         } else {
             name

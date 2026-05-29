@@ -589,29 +589,33 @@ impl<'a> Resolver<'a> {
     }
 
     fn resolve_schema_table_database_id(table_name: &str) -> Option<usize> {
-        if table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME)
-            || table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT)
-        {
-            return Some(crate::TEMP_DB_ID);
+        if crate::schema::is_temp_schema_table_name(table_name) {
+            Some(crate::TEMP_DB_ID)
+        } else if crate::schema::is_main_schema_table_name(table_name) {
+            Some(crate::MAIN_DB_ID)
+        } else {
+            None
         }
-
-        if table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME)
-            || table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME_ALT)
-        {
-            return Some(crate::MAIN_DB_ID);
-        }
-
-        None
     }
 
     pub(crate) fn resolve_existing_table_database_id_qualified(
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<usize> {
-        if qualified_name.db_name.is_some() {
-            return self.resolve_database_id(qualified_name);
+        let Some(db_name) = qualified_name.db_name.as_ref() else {
+            return self.resolve_existing_table_database_id(qualified_name.name.as_str());
+        };
+        let database_id = self.resolve_database_id(qualified_name)?;
+        if database_id != crate::TEMP_DB_ID
+            && crate::schema::is_temp_schema_table_name(qualified_name.name.as_str())
+        {
+            bail_parse_error!(
+                "no such table: {}.{}",
+                db_name.as_str(),
+                qualified_name.name.as_str()
+            );
         }
-        self.resolve_existing_table_database_id(qualified_name.name.as_str())
+        Ok(database_id)
     }
 
     pub(crate) fn resolve_existing_table_database_id(&self, table_name: &str) -> Result<usize> {
