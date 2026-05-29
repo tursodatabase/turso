@@ -1,5 +1,5 @@
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
-use crate::function::AlterTableFunc;
+use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
@@ -6385,6 +6385,63 @@ fn ordered_set_percentile_disc(values: &[Value], fraction: f64, collation: Colla
     sorted[index.min(n - 1)].clone()
 }
 
+fn op_window_step(
+    state: &mut ProgramState,
+    acc_reg: usize,
+    func: &WindowFunc,
+) -> Result<InsnFunctionStepResult> {
+    match func {
+        WindowFunc::RowNumber => {
+            if let Register::Value(Value::Null) = state.registers[acc_reg] {
+                state.registers[acc_reg] =
+                    Register::Aggregate(AggContext::Builtin(vec![Value::from_i64(0)]));
+            }
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                unreachable!("row_number accumulator must be a Builtin payload");
+            };
+            let Value::Numeric(Numeric::Integer(counter)) = &mut payload[0] else {
+                unreachable!("row_number counter must be Integer");
+            };
+            *counter += 1;
+        }
+        other => {
+            return Err(LimboError::InternalError(format!(
+                "window function {other} reached runtime dispatch but has no handler"
+            )))
+        }
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Per-row value read for pure window functions.
+fn op_window_value(
+    state: &mut ProgramState,
+    acc_reg: usize,
+    dest_reg: usize,
+    func: &WindowFunc,
+) -> Result<InsnFunctionStepResult> {
+    let value = match func {
+        WindowFunc::RowNumber => match &state.registers[acc_reg] {
+            Register::Aggregate(AggContext::Builtin(payload)) => payload[0].clone(),
+            other => {
+                return Err(LimboError::InternalError(format!(
+                    "row_number accumulator in unexpected register state: {other:?}"
+                )))
+            }
+        },
+        other => {
+            return Err(LimboError::InternalError(format!(
+                "window function {other} reached runtime dispatch but has no handler"
+            )))
+        }
+    };
+    state.registers[dest_reg].set_value(value);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_agg_step(
     program: &Program,
     state: &mut ProgramState,
@@ -6401,6 +6458,10 @@ pub fn op_agg_step(
         },
         insn
     );
+
+    if let AccumulatorFunc::Window(win_func) = func {
+        return op_window_step(state, *acc_reg, win_func);
+    }
     let func = func.expect_agg();
 
     // Initialize aggregate state if not already done
@@ -6593,6 +6654,10 @@ pub fn op_agg_final(
         } => (*acc_reg, *dest_reg, func),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
+
+    if let AccumulatorFunc::Window(win_func) = func {
+        return op_window_value(state, acc_reg, dest_reg, win_func);
+    }
     let func = func.expect_agg();
 
     match &state.registers[acc_reg] {
