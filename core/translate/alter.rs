@@ -16,7 +16,7 @@ use crate::{
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
-        plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
+        plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
         trigger::create_trigger_to_sql,
     },
     util::{
@@ -851,7 +851,7 @@ pub fn translate_alter_table(
                             identifier: table_name.to_string(),
                             internal_id: TableInternalId::from(0),
                             table: Table::BTree(Arc::new(btree.clone())),
-                            using_dedup_hidden_cols: ColumnMask::default(),
+                            using_hidden_columns: vec![],
                             col_used_mask: ColumnUsedMask::default(),
                             cte_select: None,
                             cte_explicit_columns: vec![],
