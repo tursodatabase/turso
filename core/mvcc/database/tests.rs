@@ -559,6 +559,9 @@ fn advance_checkpoint_until_wal_has_commit_frame(
         conn.clone(),
         true,
         conn.get_sync_mode(),
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
     );
 
     for _ in 0..10_000 {
@@ -1155,6 +1158,91 @@ fn test_recovery_checkpoint_then_more_writes() {
     assert_eq!(rows[2][1].to_string(), "c");
 }
 
+/// What this test checks: a *Passive* checkpoint leaves a non-empty WAL plus a
+/// truncated logical log; commits after it append fresh log frames above the
+/// durable boundary. After a restart, recovery must BOTH reconcile the
+/// committed WAL (rows durable at checkpoint time) AND replay the log frames
+/// above the boundary (rows committed afterwards), with no loss or duplication.
+/// Why this matters: this is the realistic auto-checkpoint steady state. The
+/// Truncate analog (`test_recovery_checkpoint_then_more_writes`) empties the
+/// WAL, so it never exercises non-empty-WAL reconcile + log replay together.
+/// Constructed purely from on-disk artifacts, so it does not depend on whether
+/// recovery is blocking or async.
+#[turso_macros::test(encryption)]
+fn test_recovery_passive_checkpoint_then_more_writes() {
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
+    let db_path = db.path.as_ref().unwrap().clone();
+    let wal_path = wal_path_for_db(&db_path);
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        // Passive: backfill WAL -> DB, leave the WAL non-empty, truncate the
+        // logical log to 0.
+        conn.checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+        assert!(
+            wal_path.metadata().map(|m| m.len()).unwrap_or(0) > 0,
+            "Passive checkpoint must leave a non-empty WAL"
+        );
+        // These commits append fresh log frames above the durable boundary.
+        conn.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+        conn.execute("INSERT INTO t VALUES (4, 'd')").unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    let expected = [(1, "a"), (2, "b"), (3, "c"), (4, "d")];
+    assert_eq!(rows.len(), expected.len());
+    for (row, (id, v)) in rows.iter().zip(expected) {
+        assert_eq!(row[0].as_int().unwrap(), id);
+        assert_eq!(row[1].to_string(), v);
+    }
+}
+
+/// What this test checks: a *Passive* checkpoint with no subsequent writes
+/// leaves the pure Case-2 startup shape (committed WAL + truncated/NoLog log).
+/// Recovery must reconcile it AND be idempotent — a second restart with no
+/// intervening writes must reproduce the identical state, never re-corrupting
+/// or double-applying. The first restart reconciles + truncates the WAL, so the
+/// second restart boots from the post-reconciliation image; both must agree.
+/// Why this matters: recovery's multi-step disk sequence (backfill, fsync,
+/// fresh-header write, WAL truncate) runs again on every boot; re-running it
+/// must converge. Complements `test_passive_checkpoint_interrupted_*`, which
+/// reaches Case 2 mid-checkpoint, by reaching it via the completed primitive.
+#[turso_macros::test(encryption)]
+fn test_recovery_passive_checkpoint_no_writes_idempotent() {
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        conn.checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    }
+
+    let expected = [(1, "a"), (2, "b")];
+    for pass in 0..2 {
+        db.restart();
+        let conn = db.connect();
+        let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+        assert_eq!(rows.len(), expected.len(), "pass {pass}: row count");
+        for (row, (id, v)) in rows.iter().zip(expected) {
+            assert_eq!(row[0].as_int().unwrap(), id, "pass {pass}: id");
+            assert_eq!(row[1].to_string(), v, "pass {pass}: v");
+        }
+    }
+}
+
 /// This test checks that after MVCC restart, the auto-indexes for PRIMARY KEY and UNIQUE
 /// constraints stay associated with the columns they were created for.
 #[test]
@@ -1511,6 +1599,9 @@ fn test_checkpoint_truncates_wal_last() {
         conn.clone(),
         true,
         conn.get_sync_mode(),
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
     );
 
     let mut saw_truncate_log_state_with_wal = false;
@@ -1558,6 +1649,127 @@ fn test_checkpoint_truncates_wal_last() {
     );
 }
 
+/// Proves that MVCC reads work when the data lives only in WAL frames, i.e.
+/// MvStore has been GC'd for those rows AND the DB file has not been
+/// backfilled yet. This is the in-between state the unlocked checkpoint
+/// reorder relies on: if reads here returned wrong/missing data, the
+/// reorder would be unsound.
+///
+/// The split is exposed via `Connection::mvcc_flush_to_wal()` (PrepareCheckpoint
+/// → CommitPagerTxn → publish markers → GC → release lock) followed by a
+/// regular `Connection::checkpoint(...)` (which sees an empty write_set and
+/// runs the backfill half).
+#[test]
+fn test_mvcc_flush_to_wal_then_read_must_consult_wal() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path.as_ref().unwrap().clone();
+    let wal_path = wal_path_for_db(&db_path);
+    let db_file_path = std::path::PathBuf::from(&db_path);
+
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    const N: i64 = 50;
+    for i in 1..=N {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+            .unwrap();
+    }
+
+    let mvcc_store = db.get_mvcc_store();
+
+    let root_page = get_rows(
+        &conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = mvcc_store.get_table_id_from_root_page(root_page);
+
+    let mv_rows_before = mvcc_store
+        .rows
+        .iter()
+        .filter(|e| e.key().table_id == table_id)
+        .count();
+    assert_eq!(
+        mv_rows_before, N as usize,
+        "all rows must be in MvStore before flush"
+    );
+
+    let db_size_before = std::fs::metadata(&db_file_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    // --- Flush half: WAL gets frames, MvStore gets GC'd, DB file untouched. ---
+    conn.mvcc_flush_to_wal()
+        .expect("flush_to_wal must not error")
+        .expect("flush_to_wal must return a result when MVCC is enabled");
+
+    let wal_size_after_flush = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
+    assert!(
+        wal_size_after_flush > 0,
+        "WAL must have frames after flush_to_wal"
+    );
+
+    let db_size_after_flush = std::fs::metadata(&db_file_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    assert_eq!(
+        db_size_before, db_size_after_flush,
+        "DB file must be unchanged after flush_to_wal (no backfill yet)"
+    );
+
+    let mv_rows_after_flush = mvcc_store
+        .rows
+        .iter()
+        .filter(|e| e.key().table_id == table_id)
+        .count();
+    assert_eq!(
+        mv_rows_after_flush, 0,
+        "MvStore must be drained for table rows after flush — they only live in WAL now, so any subsequent read must consult WAL frames"
+    );
+
+    // --- The proof: SELECT must return all rows correctly via pager → WAL. ---
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(
+        rows.len(),
+        N as usize,
+        "must read all {N} rows from WAL via pager.read_page"
+    );
+    for (i, row) in rows.iter().enumerate() {
+        let id = row[0].as_int().unwrap();
+        let v_text = match &row[1] {
+            Value::Text(t) => t.as_str().to_string(),
+            other => panic!("expected text in column v, got {other:?}"),
+        };
+        assert_eq!(id, (i + 1) as i64);
+        assert_eq!(v_text, format!("v{}", i + 1));
+    }
+
+    // --- Backfill half: empty write_set → Passive CheckpointWal backfills
+    // WAL → DB. The Passive checkpoint does NOT synchronously zero the WAL
+    // (that would need TRUNCATE exclusivity, which fights concurrent readers);
+    // the WAL resets later via restart-on-write. So we assert the DATA is
+    // intact after the backfill, not that the WAL file is empty. ---
+    conn.checkpoint(CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    })
+    .unwrap();
+
+    // --- Same read, now served from DB file (post-backfill). Identical results. ---
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), N as usize);
+    for (i, row) in rows.iter().enumerate() {
+        let id = row[0].as_int().unwrap();
+        let v_text = match &row[1] {
+            Value::Text(t) => t.as_str().to_string(),
+            other => panic!("expected text in column v, got {other:?}"),
+        };
+        assert_eq!(id, (i + 1) as i64);
+        assert_eq!(v_text, format!("v{}", i + 1));
+    }
+}
+
 /// What this test checks: Checkpoint accepts sqlite_schema index-row updates for already-checkpointed indexes
 /// (e.g. column rename), without requiring create/destroy special writes.
 /// Why this matters: RENAME COLUMN on indexed tables rewrites sqlite_schema index SQL text while preserving rootpage.
@@ -1583,10 +1795,15 @@ fn test_checkpoint_allows_index_schema_update_after_rename_column() {
     assert_eq!(rows[0][1].as_int().unwrap(), 2);
 }
 
-/// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
-/// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
+/// What this test checks: a committed WAL with a missing/empty logical log
+/// (`NoLog`) recovers rather than failing closed. `NoLog` cannot be told
+/// apart from a Passive checkpoint that truncated the log to 0 while leaving
+/// the WAL non-empty — the normal steady state — so the committed WAL is the
+/// authoritative durable source and recovery completes the backfill.
+/// Why this matters: Passive checkpoints leave exactly this artifact; failing
+/// closed here would make every Passive-checkpointed database unopenable.
 #[test]
-fn test_bootstrap_rejects_committed_wal_without_log_file() {
+fn test_bootstrap_recovers_committed_wal_without_log_file() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     {
@@ -1607,13 +1824,14 @@ fn test_bootstrap_rejects_committed_wal_without_log_file() {
     std::fs::remove_file(&log_path).unwrap();
 
     let io = Arc::new(PlatformIO::new().unwrap());
-    match Database::open_file(io, &db_path) {
-        Ok(db) => match db.connect() {
-            Ok(_) => panic!("expected connect to fail with Corrupt"),
-            Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
-        },
-        Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
-    }
+    let db = Database::open_file(io, &db_path).expect("open should recover, not fail closed");
+    let conn = db
+        .connect()
+        .expect("connect should recover the committed WAL");
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1, "committed row must survive recovery");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "x");
 }
 
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
@@ -2241,6 +2459,9 @@ fn test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit() {
             conn.clone(),
             true,
             conn.get_sync_mode(),
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
         );
 
         for _ in 0..50_000 {
@@ -2613,6 +2834,9 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
         conn.clone(),
         true,
         conn.get_sync_mode(),
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
     );
     let mut reached_truncate = false;
     for _ in 0..50_000 {
@@ -2642,7 +2866,16 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
     );
 
     let sync_mode = conn.get_sync_mode();
-    let checkpoint_sm2 = CheckpointStateMachine::new(pager, mvcc_store, conn, true, sync_mode);
+    let checkpoint_sm2 = CheckpointStateMachine::new(
+        pager,
+        mvcc_store,
+        conn,
+        true,
+        sync_mode,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
     let (old_boundary, _) = checkpoint_sm2.checkpoint_bounds_for_test();
     assert!(
         old_boundary.unwrap_or_default() >= ts1,
@@ -2710,6 +2943,9 @@ fn test_checkpoint_resamples_boundary_before_starting() {
         delayed_conn.clone(),
         true,
         delayed_conn.get_sync_mode(),
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
     );
     let (old_boundary, _) = delayed_checkpoint.checkpoint_bounds_for_test();
     assert_eq!(old_boundary, Some(first_boundary));
@@ -2722,6 +2958,9 @@ fn test_checkpoint_resamples_boundary_before_starting() {
         interrupted_conn.clone(),
         true,
         interrupted_conn.get_sync_mode(),
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
     );
     let mut reached_wal_checkpoint = false;
     for _ in 0..50_000 {
@@ -2776,12 +3015,16 @@ fn test_checkpoint_resamples_boundary_before_starting() {
     assert_eq!(&integrity[0][0].to_string(), "ok");
 }
 
-/// What this test checks: a checkpoint state machine created before another checkpoint
-/// advances the durable boundary must resample that boundary after taking the checkpoint lock.
-/// Why this matters: otherwise a delayed checkpoint can replay an already-durable unique-index
-/// delete and fail.
+/// What this test checks: when a checkpoint state machine is paused
+/// mid-flow (between the pager-commit phase and TakeLock), a concurrent
+/// second-checkpoint request must NOT run in parallel and must not corrupt
+/// the durable boundary. With the `checkpoint_in_progress` orchestrator
+/// gate, the second request is a no-op, and the paused one resumes
+/// cleanly. The original variant of this test relied on two state
+/// machines racing past AcquireLock; that race no longer exists by
+/// construction.
 #[test]
-fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
+fn test_concurrent_checkpoint_request_serializes_via_gate() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
@@ -2837,23 +3080,33 @@ fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
         "first checkpoint should yield before acquiring the checkpoint lock"
     );
 
+    // While the delayed checkpoint is paused holding `checkpoint_in_progress`,
+    // a second checkpoint request must short-circuit at the gate (no-op),
+    // not run a competing pager-commit + marker-publish sequence.
     let interleaving_conn = db.connect();
-    interleaving_conn.set_failure_injector(Some(FixedFailureInjector::new([(
-        CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
-        LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
-    )])));
     interleaving_conn
         .execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        .expect_err("interleaving checkpoint should fail after advancing durable boundary");
-    interleaving_conn.set_failure_injector(None);
+        .expect("interleaving checkpoint short-circuits at the gate, no error");
+
+    // The boundary is bumped in TakeLock (after the yield), so at this
+    // point — while delayed is still paused at BeforeAcquireLock — it must
+    // still be at the previous value. The interleaving call short-circuited
+    // at the gate, so it can't have advanced it either.
     assert_eq!(
         mvcc_store.durable_txid_max.load(Ordering::SeqCst),
-        update_ts
+        first_boundary,
+        "neither paused-delayed nor short-circuited-interleaving should have moved the boundary yet"
     );
 
     let journal_mode_rows = delayed_checkpoint.run_collect_rows().unwrap();
     assert_eq!(journal_mode_rows.len(), 1);
     assert_eq!(&journal_mode_rows[0][0].to_string(), "wal");
+
+    // After delayed resumes, TakeLock runs and the boundary advances.
+    assert!(
+        mvcc_store.durable_txid_max.load(Ordering::SeqCst) >= update_ts,
+        "delayed checkpoint must have advanced the boundary after resuming"
+    );
 
     let rows = get_rows(
         &conn,
@@ -2869,6 +3122,365 @@ fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
     let integrity = get_rows(&conn, "PRAGMA integrity_check");
     assert_eq!(integrity.len(), 1);
     assert_eq!(&integrity[0][0].to_string(), "ok");
+}
+
+// ---------------------------------------------------------------------------
+// Exhaustive checkpoint correctness: read-at-every-yield + fault-at-every-point
+//
+// These two tests deterministically pause / fail the checkpoint at EVERY
+// yield point in `CheckpointYieldPoint` (enumerated via strum), and assert
+// that committed data stays correct and complete. The goal is to prove
+// correctness does not depend on lucky timing: at no point in the pipeline
+// can a concurrent reader (or a post-failure / post-restart reader) see
+// missing, partial, or wrong data.
+// ---------------------------------------------------------------------------
+
+/// Number of rows checkpointed in a prior pass (live in the B-tree).
+const EXHAUSTIVE_BASE_ROWS: i64 = 3;
+/// Number of rows committed but NOT yet checkpointed (live in MvStore) when
+/// the checkpoint under test runs. >= 2 so the per-row WriteRow yield points
+/// (`AfterFirstTableRow`) are reachable.
+const EXHAUSTIVE_EXTRA_ROWS: i64 = 4;
+
+fn exhaustive_expected_rows() -> Vec<(i64, String)> {
+    (1..=EXHAUSTIVE_BASE_ROWS + EXHAUSTIVE_EXTRA_ROWS)
+        .map(|i| (i, format!("v{i}")))
+        .collect()
+}
+
+/// Set up a file-backed MVCC db with `EXHAUSTIVE_BASE_ROWS` already
+/// checkpointed into the B-tree and `EXHAUSTIVE_EXTRA_ROWS` committed but
+/// still in MvStore. The returned connection has the extra rows pending a
+/// checkpoint. An index is created so the index-row checkpoint states are
+/// exercised too.
+fn exhaustive_setup() -> MvccTestDbNoConn {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    for i in 1..=EXHAUSTIVE_BASE_ROWS {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+            .unwrap();
+    }
+    // Push the base rows + schema into the B-tree, empty the WAL + log.
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    // Commit the extra rows; they live in MvStore until the checkpoint under
+    // test flushes them.
+    for i in EXHAUSTIVE_BASE_ROWS + 1..=EXHAUSTIVE_BASE_ROWS + EXHAUSTIVE_EXTRA_ROWS {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+            .unwrap();
+    }
+    setup.close().unwrap();
+    db
+}
+
+/// Read `SELECT id, v FROM t ORDER BY id` on `conn`. Returns the rows, or
+/// `Err(Busy)` if a held checkpoint lock blocks the read transaction.
+fn exhaustive_try_read(conn: &Arc<Connection>) -> Result<Vec<(i64, String)>, LimboError> {
+    let mut stmt = conn.prepare("SELECT id, v FROM t ORDER BY id")?;
+    let rows = stmt.run_collect_rows()?;
+    Ok(rows
+        .into_iter()
+        .map(|vals| {
+            let id = vals[0].as_int().expect("id is integer");
+            let v = match &vals[1] {
+                Value::Text(t) => t.as_str().to_string(),
+                other => panic!("v column should be text, got {other:?}"),
+            };
+            (id, v)
+        })
+        .collect())
+}
+
+/// Assert a successful read returns exactly the expected rows — correct and
+/// complete, in order.
+fn exhaustive_assert_complete(conn: &Arc<Connection>, ctx: &str) {
+    let rows = exhaustive_try_read(conn)
+        .unwrap_or_else(|e| panic!("[{ctx}] read should succeed, got {e:?}"));
+    assert_eq!(
+        rows,
+        exhaustive_expected_rows(),
+        "[{ctx}] read returned wrong or incomplete data"
+    );
+}
+
+/// For EVERY checkpoint yield point: drive a checkpoint until it pauses at
+/// that point, then on a separate connection assert a concurrent reader sees
+/// correct + complete data (or Busy if the blocking lock is held — never
+/// partial/wrong). Resume to completion and assert again. Restart the
+/// database and assert again. No randomization, no timing dependence.
+#[test]
+fn test_checkpoint_concurrent_read_correct_at_every_yield_point() {
+    use strum::IntoEnumIterator;
+
+    for yield_point in CheckpointYieldPoint::iter() {
+        let ctx = format!("{yield_point:?}");
+        let mut db = exhaustive_setup();
+
+        // Scope all Arc-holding state (state machine, pager, mvstore, conns)
+        // so they drop before `db.restart()` reopens the file.
+        {
+            let mvstore = db.get_mvcc_store();
+            let ckpt_conn = db.connect();
+            let reader_conn = db.connect();
+
+            let injector = FixedYieldInjector::new([yield_point.point()]);
+            ckpt_conn.set_yield_injector(Some(injector.clone()));
+
+            let pager = ckpt_conn.pager.load().clone();
+            let mut sm = CheckpointStateMachine::new(
+                pager.clone(),
+                mvstore.clone(),
+                ckpt_conn.clone(),
+                true,
+                ckpt_conn.get_sync_mode(),
+                // Passive matches the production auto-checkpoint path and leaves
+                // a non-empty WAL + truncated logical log, so the post-restart
+                // assertion exercises Case-2 recovery.
+                CheckpointMode::Passive {
+                    upper_bound_inclusive: None,
+                },
+            );
+
+            // Drive the checkpoint. The instant the injector fires (becomes
+            // empty), the state machine is frozen exactly at `yield_point` —
+            // run the concurrent reader before resuming.
+            let mut ran_concurrent_read = false;
+            let mut finished = false;
+            for _ in 0..200_000 {
+                match sm.step(&()) {
+                    Ok(TransitionResult::Continue) => {}
+                    Ok(TransitionResult::Done(_)) => {
+                        finished = true;
+                        break;
+                    }
+                    Ok(TransitionResult::Io(io)) => {
+                        if !ran_concurrent_read && injector.is_empty() {
+                            ran_concurrent_read = true;
+                            match exhaustive_try_read(&reader_conn) {
+                                Ok(rows) => assert_eq!(
+                                    rows,
+                                    exhaustive_expected_rows(),
+                                    "[{ctx}] concurrent reader at yield point saw wrong/incomplete data"
+                                ),
+                                Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => {
+                                    // Acceptable: a held checkpoint lock blocks
+                                    // the reader's BEGIN. The point is it never
+                                    // sees partial/wrong data, only "try again".
+                                }
+                                Err(e) => {
+                                    panic!("[{ctx}] concurrent read failed unexpectedly: {e:?}")
+                                }
+                            }
+                        }
+                        io.wait(pager.io.as_ref())
+                            .unwrap_or_else(|e| panic!("[{ctx}] io.wait failed: {e:?}"));
+                    }
+                    Err(e) => panic!("[{ctx}] checkpoint step failed: {e:?}"),
+                }
+            }
+            assert!(finished, "[{ctx}] checkpoint did not finish");
+            // Coverage guard: every point in this workload must actually be
+            // reached, otherwise the iteration silently tests nothing.
+            assert!(
+                ran_concurrent_read && injector.is_empty(),
+                "[{ctx}] yield point was never reached — the iteration did not pause here, so this point is untested"
+            );
+
+            // After the checkpoint completes, the reader MUST see everything.
+            exhaustive_assert_complete(&reader_conn, &format!("{ctx} post-complete"));
+
+            ckpt_conn.close().unwrap();
+            reader_conn.close().unwrap();
+        }
+
+        // Restart the database and assert recovery sees everything too.
+        db.restart();
+        let after_restart = db.connect();
+        exhaustive_assert_complete(&after_restart, &format!("{ctx} post-restart"));
+        after_restart.close().unwrap();
+    }
+}
+
+/// For EVERY checkpoint yield point: inject a synthetic failure there, run the
+/// checkpoint (expect it to fail or be a no-op), and assert the committed data
+/// is still fully readable. Then run a clean checkpoint to completion and
+/// assert again, and restart and assert again. Finds any point where a
+/// mid-checkpoint failure loses or corrupts committed data.
+#[test]
+fn test_checkpoint_fault_at_every_point_preserves_data() {
+    use strum::IntoEnumIterator;
+
+    for fault_point in CheckpointYieldPoint::iter() {
+        let ctx = format!("{fault_point:?}");
+        let mut db = exhaustive_setup();
+
+        // Scope Arc-holding state so it drops before `db.restart()`.
+        {
+            let mvstore = db.get_mvcc_store();
+            let ckpt_conn = db.connect();
+
+            let failure = FixedFailureInjector::new([(
+                fault_point.point(),
+                LimboError::TxError(format!("synthetic checkpoint failure at {ctx}")),
+            )]);
+            ckpt_conn.set_failure_injector(Some(failure.clone()));
+
+            // Run the checkpoint to completion-or-failure via the direct state
+            // machine. A failure at `fault_point` surfaces as Err; some points
+            // may not be reached for this workload (e.g. no schema changes),
+            // in which case the checkpoint simply succeeds.
+            let pager = ckpt_conn.pager.load().clone();
+            let mut sm = CheckpointStateMachine::new(
+                pager.clone(),
+                mvstore.clone(),
+                ckpt_conn.clone(),
+                true,
+                ckpt_conn.get_sync_mode(),
+                // Passive matches the production auto-checkpoint path and leaves
+                // a non-empty WAL + truncated logical log, so the post-restart
+                // assertion exercises Case-2 recovery.
+                CheckpointMode::Passive {
+                    upper_bound_inclusive: None,
+                },
+            );
+            for _ in 0..200_000 {
+                match sm.step(&()) {
+                    Ok(TransitionResult::Continue) => {}
+                    Ok(TransitionResult::Done(_)) => break,
+                    Ok(TransitionResult::Io(io)) => {
+                        io.wait(pager.io.as_ref())
+                            .unwrap_or_else(|e| panic!("[{ctx}] io.wait failed: {e:?}"));
+                    }
+                    Err(_) => {
+                        // step() already ran cleanup_after_external_io_error
+                        // before returning Err.
+                        break;
+                    }
+                }
+            }
+            drop(sm);
+            // Coverage guard: every fault point in this workload must actually
+            // be reached and fire, otherwise the iteration tests nothing.
+            assert!(
+                failure.is_empty(),
+                "[{ctx}] fault point was never reached — fault did not fire, so this point is untested"
+            );
+            ckpt_conn.set_failure_injector(None);
+
+            // The committed data must survive the failed/aborted checkpoint.
+            exhaustive_assert_complete(&ckpt_conn, &format!("{ctx} post-fault"));
+
+            // A clean checkpoint must now succeed and data stays complete.
+            ckpt_conn
+                .checkpoint(CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                })
+                .unwrap_or_else(|e| panic!("[{ctx}] clean checkpoint after fault failed: {e:?}"));
+            exhaustive_assert_complete(&ckpt_conn, &format!("{ctx} post-clean-checkpoint"));
+
+            ckpt_conn.close().unwrap();
+        }
+
+        // Restart and assert recovery is correct + complete.
+        db.restart();
+        let after_restart = db.connect();
+        exhaustive_assert_complete(&after_restart, &format!("{ctx} post-restart"));
+        after_restart.close().unwrap();
+    }
+}
+
+/// Crash-recovery coverage for the Passive auto-checkpoint. For EVERY yield
+/// point: drive a Passive checkpoint until it freezes exactly there, then
+/// abandon it mid-flight WITHOUT resuming (no io.wait on the synthetic yield,
+/// no completion) and restart the database from its on-disk artifacts. This
+/// simulates a process crash at that exact point.
+///
+/// Recovery must reconstruct the full committed row set from whatever durable
+/// state exists. Under Passive the WAL is never truncated, so it stays the
+/// authoritative source at every interruption point: an interruption before
+/// logical-log truncation recovers via startup case 1 (log header still valid),
+/// and one after recovers via case 2 (log truncated to 0 / NoLog + committed
+/// WAL frames).
+/// Distinct from `test_checkpoint_concurrent_read_correct_at_every_yield_point`,
+/// which restarts only after the checkpoint *completes*; this one restarts
+/// while it is still in-flight. No randomization, no timing dependence.
+#[test]
+fn test_passive_checkpoint_interrupted_at_every_yield_point_recovers() {
+    use strum::IntoEnumIterator;
+
+    for yield_point in CheckpointYieldPoint::iter() {
+        let ctx = format!("{yield_point:?}");
+        let mut db = exhaustive_setup();
+
+        // Scope all Arc-holding state (state machine, pager, mvstore, conn) so
+        // it drops before `db.restart()` reopens the file.
+        {
+            let mvstore = db.get_mvcc_store();
+            let ckpt_conn = db.connect();
+
+            let injector = FixedYieldInjector::new([yield_point.point()]);
+            ckpt_conn.set_yield_injector(Some(injector.clone()));
+
+            let pager = ckpt_conn.pager.load().clone();
+            let mut sm = CheckpointStateMachine::new(
+                pager.clone(),
+                mvstore.clone(),
+                ckpt_conn.clone(),
+                true,
+                ckpt_conn.get_sync_mode(),
+                CheckpointMode::Passive {
+                    upper_bound_inclusive: None,
+                },
+            );
+
+            // Drive until the injector fires (frozen exactly at `yield_point`),
+            // then STOP — do not wait on the synthetic yield, do not resume.
+            let mut interrupted = false;
+            for _ in 0..200_000 {
+                match sm.step(&()) {
+                    Ok(TransitionResult::Continue) => {}
+                    Ok(TransitionResult::Done(_)) => break,
+                    Ok(TransitionResult::Io(io)) => {
+                        if injector.is_empty() {
+                            interrupted = true;
+                            break;
+                        }
+                        io.wait(pager.io.as_ref())
+                            .unwrap_or_else(|e| panic!("[{ctx}] io.wait failed: {e:?}"));
+                    }
+                    Err(e) => {
+                        panic!("[{ctx}] checkpoint step failed before reaching point: {e:?}")
+                    }
+                }
+            }
+            // Coverage guard: the point must actually be reached, otherwise the
+            // iteration silently tests a completed checkpoint, not an interruption.
+            assert!(
+                interrupted && injector.is_empty(),
+                "[{ctx}] yield point was never reached — no interruption happened, so this point is untested"
+            );
+
+            // Abandon the in-flight checkpoint: release the lock + orchestrator
+            // gate it may still hold. Disk state is unaffected — a WAL rollback
+            // just forgets uncommitted frames, which is what a real crash leaves
+            // behind; committed frames (post pager-commit points) stay.
+            sm.cleanup_after_external_io_error();
+            drop(sm);
+            ckpt_conn.set_yield_injector(None);
+            ckpt_conn.close().unwrap();
+        }
+
+        // Crash + restart: reopen from the on-disk files and recover.
+        db.restart();
+        let after_restart = db.connect();
+        exhaustive_assert_complete(&after_restart, &format!("{ctx} post-interrupt-restart"));
+        after_restart.close().unwrap();
+    }
 }
 
 /// What this test checks: if one checkpoint makes a unique-index delete durable in the B-tree
@@ -5926,36 +6538,37 @@ fn test_insert_with_checkpoint() {
     }
 }
 
-/// What this test checks: Checkpoint transitions preserve DB/WAL/log ordering and watermark updates for the tested edge case.
-/// Why this matters: Incorrect ordering breaks crash safety, replay boundaries, or durability guarantees.
+/// What this test checks: an auto-checkpoint that hits Busy at the
+/// blocking-lock acquisition does NOT bubble up through the committing
+/// statement — commit succeeds regardless.
+///
+/// Regression context: before, an auto-checkpoint returning Busy used to
+/// abort/rollback the committed statement after its tx was already removed
+/// from the MVCC store. With the unlocked-prelude checkpoint reorder, the
+/// Busy now happens at TakeLock (after the unlocked pager write phase) when
+/// another tx is holding `blocking_checkpoint_lock.read()`. The commit must
+/// still swallow it the same way.
 #[test]
 fn test_auto_checkpoint_busy_is_ignored() {
-    let db = MvccTestDb::new();
-    db.mvcc_store.set_checkpoint_threshold(0);
-
-    // Keep a second transaction open to hold the checkpoint read lock.
-    let tx1 = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
-    let tx2 = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
-        .unwrap();
+    let mvcc_store = db.get_mvcc_store();
+    mvcc_store.set_checkpoint_threshold(0);
 
-    let row = generate_simple_string_row((-2).into(), 1, "Hello");
-    db.mvcc_store.insert(tx1, row).unwrap();
+    // Keep an unrelated read tx open. Every active MVCC tx holds
+    // `blocking_checkpoint_lock.read()` (via acquire_exclusive_tx), which
+    // means the auto-checkpoint's TakeLock cannot acquire `.write()` and
+    // returns Busy. The committing statement must not surface that Busy.
+    let blocker_tx = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
 
-    // Regression: auto-checkpoint returning Busy used to bubble up and cause
-    // statement abort/rollback after the tx was removed.
-    // Commit should succeed even if the auto-checkpoint is busy.
-    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
 
-    // Cleanup: release the read lock held by tx2.
-    db.mvcc_store.rollback_tx(
-        tx2,
-        db.conn.pager.load().clone(),
-        &db.conn,
+    mvcc_store.rollback_tx(
+        blocker_tx,
+        conn.pager.load().clone(),
+        &conn,
         crate::MAIN_DB_ID,
     );
 }
@@ -12706,8 +13319,8 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
         fn update_header(&self) -> Result<Completion> {
             self.inner.update_header()
         }
-        fn truncate(&self) -> Result<Completion> {
-            self.inner.truncate()
+        fn truncate(&self, checkpointed_through_ts: u64) -> Result<Completion> {
+            self.inner.truncate(checkpointed_through_ts)
         }
         fn get_logical_log_file(&self) -> Arc<dyn File> {
             self.inner.get_logical_log_file()

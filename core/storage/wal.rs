@@ -168,7 +168,7 @@ pub enum CheckpointMode {
 }
 
 impl CheckpointMode {
-    fn should_restart_log(&self) -> bool {
+    pub(crate) fn should_restart_log(&self) -> bool {
         matches!(
             self,
             CheckpointMode::Truncate { .. } | CheckpointMode::Restart
@@ -3249,11 +3249,12 @@ impl Wal for WalFile {
     /// Find the latest frame containing a page.
     #[instrument(skip_all, level = Level::DEBUG)]
     fn find_frame(&self, page_id: u64, frame_watermark: Option<u64>) -> Result<Option<u64>> {
-        #[cfg(not(feature = "conn_raw_api"))]
-        turso_assert!(
-            frame_watermark.is_none(),
-            "unexpected use of frame_watermark optional argument"
-        );
+        // The strict `frame_watermark.is_none()` assertion that used to guard
+        // this path outside `conn_raw_api` is removed because the MVCC read
+        // path now passes a watermark equal to the connection's pinned WAL
+        // snapshot, so concurrent unlocked checkpoint appends don't leak past
+        // a long-held reader's BEGIN CONCURRENT. The remaining bound checks
+        // below stay — they enforce the real invariants on the watermark.
 
         turso_assert!(
             frame_watermark.unwrap_or(0) <= self.max_frame.load(Ordering::Acquire),

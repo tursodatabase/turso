@@ -32,8 +32,21 @@ const COLLECT_PREEMPTION_THRESHOLD: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointState {
-    AcquireLock,
+    /// Unlocked prelude: claim `MvStore::checkpoint_in_progress` (the
+    /// single-orchestrator gate, which the off-lock design makes explicit since
+    /// `blocking_checkpoint_lock` is no longer the first thing taken), capture a
+    /// `snapshot_ts` upper bound, and `refresh_checkpoint_bounds`. Collection then
+    /// runs through the preemptible `CollectTableRows`/`CollectIndexRows` states.
+    /// No `blocking_checkpoint_lock` is held.
+    PrepareCheckpoint,
+    /// Preemptible collection of committed table-row versions into `write_set`,
+    /// yielding every `COLLECT_PREEMPTION_THRESHOLD` rows (resumed via
+    /// `collect_table_cursor`). Runs off-lock; `maybe_get_checkpointable_versions`
+    /// filters by `snapshot_ts`, so concurrent commits are deferred to the next pass.
     CollectTableRows,
+    /// Preemptible collection of committed index-row versions (resumed via
+    /// `collect_index_tableid_cursor` / `collect_index_key_cursor`). Off-lock, same
+    /// `snapshot_ts` filtering as `CollectTableRows`.
     CollectIndexRows,
     BeginPagerTxn,
     WriteRow {
@@ -57,6 +70,11 @@ pub enum CheckpointState {
         index_write_set_index: usize,
     },
     CommitPagerTxn,
+    /// Take `blocking_checkpoint_lock.write()` after the unlocked pager work has
+    /// committed (WAL frames are durable). Held for the remainder of the state
+    /// machine — through CheckpointWal / SyncDbFile / TruncateLog / Truncate WAL /
+    /// GC / marker publication / Finalize.
+    TakeLock,
     CheckpointWal,
     /// Fsync the database file after checkpoint, before truncating WAL.
     /// This ensures durability: if we crash after WAL truncation but before DB fsync,
@@ -69,12 +87,58 @@ pub enum CheckpointState {
     Finalize,
 }
 
+/// Every resumable boundary in the checkpoint pipeline. The variants are in
+/// execution order. Tests enumerate them (via `strum::IntoEnumIterator`) to
+/// deterministically pause / fail at *every* point and assert that committed
+/// data stays correct and complete — so correctness never depends on lucky
+/// timing.
+///
+/// "(unlocked)" points run before `blocking_checkpoint_lock` is held, so a
+/// concurrent reader can run there. "(locked)" points run with the lock held,
+/// so a concurrent reader's `BEGIN` returns Busy — for those, the data
+/// assertion is made once the checkpoint releases the lock.
 #[cfg(any(test, injected_yields))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount, strum_macros::EnumIter)]
 #[repr(u8)]
 pub(crate) enum CheckpointYieldPoint {
+    /// (unlocked) PrepareCheckpoint done: gate claimed, write_set + index
+    /// write_set collected, durable_txid_max_new computed, mvcc_meta staged.
+    /// Nothing written to the pager yet.
+    AfterPrepare,
+    /// (unlocked) BeginPagerTxn done: pager read+write tx open, zero rows
+    /// written to the B-tree.
+    AfterBeginPagerTxn,
+    /// (unlocked) Exactly one table row has been written into the pager cache
+    /// (partial B-tree write) — exercises reads while the B-tree is half-built.
+    AfterFirstTableRow,
+    /// (unlocked) All table rows written into the pager cache.
+    AfterTableRows,
+    /// (unlocked) All index rows written into the pager cache.
+    AfterIndexRows,
+    /// (unlocked) CommitPagerTxn done: page-1 header staged in the dirty
+    /// cache. No WAL commit frame yet.
+    AfterStageHeader,
+    /// (unlocked) TakeLock entry, before acquiring `blocking_checkpoint_lock`.
     BeforeAcquireLock,
+    /// (locked) Lock acquired, before the pager commit. Nothing visible yet.
+    AfterAcquireLock,
+    /// (locked) pager.commit_tx done: WAL commit frame written, write tx
+    /// ended. In-memory markers NOT yet published.
+    AfterPagerCommit,
+    /// (locked) Markers published: durable_txid_max bumped, global_header
+    /// replaced, schema roots published, root_page allocations drained.
+    /// GC has not run yet.
     AfterDurableBoundaryAdvanced,
+    /// (locked) WAL frames backfilled into the DB file.
+    AfterCheckpointWal,
+    /// (locked) DB file fsynced.
+    AfterSyncDbFile,
+    /// (locked) Logical log truncated to 0.
+    AfterTruncateLogicalLog,
+    /// (locked) Logical log fsynced.
+    AfterFsyncLogicalLog,
+    /// (locked) WAL truncated. About to GC + unlock in Finalize.
+    AfterTruncateWal,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -161,6 +225,15 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     update_transaction_state: bool,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
+    /// The WAL checkpoint mode this run should apply when it reaches
+    /// `CheckpointWal`/`TruncateWal`. Auto-checkpoints (post-commit) use
+    /// `Passive` so the WAL→DB backfill runs off the lock without fighting
+    /// concurrent readers/writers; explicit `PRAGMA wal_checkpoint(TRUNCATE)`,
+    /// journal-mode migrations, and `Connection::checkpoint(mode)` pass the
+    /// requested mode so a user-requested TRUNCATE actually empties the WAL.
+    /// `should_restart_log()` (Truncate/Restart) gates the explicit WAL file
+    /// truncation in `TruncateWal`; under `Passive` that step is a pass-through.
+    mode: CheckpointMode,
     /// Internal metadata table info for persisting `persistent_tx_ts_max` atomically with pager commit.
     mvcc_meta_table: Option<(MVTableId, usize)>,
     /// File-backed databases must persist replay boundary durably.
@@ -169,9 +242,65 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     staged_checkpoint_header: Option<DatabaseHeader>,
     /// Guard to avoid restaging page 1 across CommitPagerTxn async retries.
     header_staged_for_commit: bool,
+    /// Preemptible-collection resume cursors: the last (table, index) positions
+    /// processed before a `CollectTableRows`/`CollectIndexRows` yield.
     collect_table_cursor: Option<RowID>,
     collect_index_tableid_cursor: Option<MVTableId>,
     collect_index_key_cursor: Option<Arc<SortableIndexKey>>,
+    /// Snapshot of `MvStore::last_committed_tx_ts` captured at the start of the
+    /// unlocked PrepareCheckpoint state. Used as the upper-bound filter in
+    /// `maybe_get_checkpointable_versions` so concurrent commits with a higher
+    /// `begin_ts` arriving during the unlocked collection/write phase aren't
+    /// partially picked up — they get picked up by the next checkpoint pass.
+    /// Also drives `durable_txid_max_new`, so the marker can never claim a
+    /// version durable that we did not actually flush.
+    snapshot_ts: u64,
+    /// `true` iff this state machine successfully claimed
+    /// `MvStore::checkpoint_in_progress`. Required so that the matching
+    /// `store(false)` happens exactly when this state machine releases the
+    /// gate — in Finalize on success, in cleanup_after_external_io_error on
+    /// error, and in Drop as a safety net.
+    owns_checkpoint_in_progress: bool,
+    /// `true` for the "flush half" of a split checkpoint. When set, after
+    /// TakeLock publishes the durable markers + GCs MvStore, the state machine
+    /// releases the lock and jumps straight to Finalize without running the
+    /// WAL → DB → log-truncate → WAL-truncate sequence. The next regular
+    /// checkpoint() (which finds an empty write_set) does the backfill half.
+    /// Production paths leave this `false`; the test path uses `flush_to_wal`
+    /// to exercise the in-between state where WAL has frames, DB doesn't, and
+    /// MvStore has GC'd — so reads MUST come through the pager/WAL path.
+    stop_after_flush: bool,
+    /// Set in TakeLock when `stop_after_flush` ran the gc + unlock prelude, so
+    /// Finalize knows to skip the redundant work and just clean up the gate.
+    flush_completed: bool,
+    /// Root pages allocated during this checkpoint's WriteRow phase (the
+    /// SpecialWrite::BTreeCreate / BTreeCreateIndex branches). These cannot
+    /// be published into `MvStore::table_id_to_rootpage` from the unlocked
+    /// write phase, because `maybe_transform_root_page_to_positive` reads
+    /// that map to translate a connection's still-negative cached root_page
+    /// to its real one — a concurrent INSERT would then open a cursor on
+    /// the new positive root_page and call `pager.read_page` for a frame
+    /// that hasn't yet been published into its own snapshot's max_frame,
+    /// fall back to the DB file (where the page does not exist), and hit
+    /// ShortRead. The map is drained into MvStore under
+    /// `blocking_checkpoint_lock.write()` in TakeLock, alongside the other
+    /// marker publications.
+    pending_root_page_allocations: HashMap<MVTableId, u64>,
+    /// Re-entrancy guard for TakeLock: set once pager.commit_tx has completed
+    /// (WAL commit frame written). Lets a yield between commit and marker
+    /// publication re-enter TakeLock without re-committing.
+    lock_commit_done: bool,
+    /// Re-entrancy guard for TakeLock: set once the in-memory markers have
+    /// been published. Lets a yield after publication re-enter without
+    /// double-publishing (which would, e.g., fail on the already-taken
+    /// staged header).
+    markers_published: bool,
+    /// Re-entrancy guard for TakeLock: set once the targeted GC has run and
+    /// the blocking_checkpoint_lock has been released. Everything after this
+    /// point (the Passive WAL->DB backfill, DB fsync, logical-log + WAL
+    /// truncation) runs unlocked, so readers and writers are no longer
+    /// blocked by the checkpoint.
+    gc_and_unlock_done: bool,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -292,6 +421,22 @@ fn is_schema_metadata_only_rewrite(current: &RowVersion, next: Option<&RowVersio
 }
 
 impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
+    /// Resolve a table_id (or index_id) to its root_page, checking the
+    /// state-machine-local pending allocations first and falling back to
+    /// the published `MvStore::table_id_to_rootpage`. Used by WriteRow
+    /// and WriteIndexRow so the unlocked write phase can use the new
+    /// root_page internally without leaking it to concurrent readers
+    /// before TakeLock publishes it.
+    fn resolve_root_page(&self, table_id: MVTableId) -> Option<u64> {
+        if let Some(&rp) = self.pending_root_page_allocations.get(&table_id) {
+            return Some(rp);
+        }
+        self.mvstore
+            .table_id_to_rootpage
+            .get(&table_id)
+            .and_then(|e| *e.value())
+    }
+
     fn refresh_checkpoint_bounds(&mut self) {
         let durable_tx_max = self.mvstore.durable_txid_max.load(Ordering::SeqCst);
         self.durable_txid_max_old = NonZeroU64::new(durable_tx_max);
@@ -304,6 +449,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         connection: Arc<Connection>,
         update_transaction_state: bool,
         sync_mode: SyncMode,
+        mode: CheckpointMode,
     ) -> Self {
         let checkpoint_lock = mvstore.blocking_checkpoint_lock.clone();
         // Prevent stale per-connection schema during checkpoint by using the shared DB schema.
@@ -338,7 +484,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         #[cfg(any(test, injected_yields))]
         let yield_instance_id = connection.next_yield_instance_id();
         Self {
-            state: CheckpointState::AcquireLock,
+            state: CheckpointState::PrepareCheckpoint,
             lock_states: LockStates {
                 blocking_checkpoint_lock_held: false,
                 pager_read_tx: false,
@@ -364,6 +510,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             checkpoint_result: None,
             update_transaction_state,
             sync_mode,
+            mode,
             mvcc_meta_table,
             durable_mvcc_metadata,
             staged_checkpoint_header: None,
@@ -371,7 +518,45 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             collect_table_cursor: None,
             collect_index_tableid_cursor: None,
             collect_index_key_cursor: None,
+            snapshot_ts: 0,
+            owns_checkpoint_in_progress: false,
+            stop_after_flush: false,
+            flush_completed: false,
+            pending_root_page_allocations: HashMap::default(),
+            lock_commit_done: false,
+            markers_published: false,
+            gc_and_unlock_done: false,
         }
+    }
+
+    /// Construct a state machine that performs only the "flush half" of a
+    /// checkpoint: PrepareCheckpoint → BeginPagerTxn → ... → CommitPagerTxn →
+    /// TakeLock (publish markers + GC) → release lock → Finalize.
+    /// The WAL → DB backfill and log/WAL truncation are NOT performed; the
+    /// next regular checkpoint covers them naturally because it sees an
+    /// empty write_set and falls straight through TakeLock → CheckpointWal.
+    pub fn new_flush_only(
+        pager: Arc<Pager>,
+        mvstore: Arc<MvStore<Clock>>,
+        connection: Arc<Connection>,
+        update_transaction_state: bool,
+        sync_mode: SyncMode,
+    ) -> Self {
+        // The flush half never reaches CheckpointWal/TruncateWal (it jumps to
+        // Finalize after the marker publish + GC), so the WAL mode is moot;
+        // Passive is the inert choice.
+        let mut sm = Self::new(
+            pager,
+            mvstore,
+            connection,
+            update_transaction_state,
+            sync_mode,
+            CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            },
+        );
+        sm.stop_after_flush = true;
+        sm
     }
 
     #[cfg(test)]
@@ -418,9 +603,27 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             self.checkpoint_lock.unlock();
             self.lock_states.blocking_checkpoint_lock_held = false;
         }
+
+        // Release the single-orchestrator gate. The error path can be hit at
+        // any state past PrepareCheckpoint, including during the unlocked pager
+        // write phase where `blocking_checkpoint_lock` was never taken — so
+        // this is tied to `owns_checkpoint_in_progress`, not the lock state.
+        if self.owns_checkpoint_in_progress {
+            self.mvstore
+                .checkpoint_in_progress
+                .store(false, Ordering::Release);
+            self.owns_checkpoint_in_progress = false;
+        }
     }
 
-    /// Returns all checkpointable [RowVersion]s for that `table_id`
+    /// Returns all checkpointable [RowVersion]s for that `table_id`.
+    ///
+    /// Filters by `self.snapshot_ts`: any version with `begin_ts > snapshot_ts`
+    /// (or `end_ts > snapshot_ts`) is considered "arrived after we started this
+    /// checkpoint" and is excluded from this pass. The next pass picks it up.
+    /// This is the upper-bound counterpart to the existing `durable_txid_max_old`
+    /// lower-bound check, and it's what makes the unlocked collection safe under
+    /// concurrent commits.
     fn maybe_get_checkpointable_versions(
         &self,
         versions: &[RowVersion],
@@ -445,6 +648,19 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             if begin_ts.is_none() && end_ts.is_none() {
                 // Rolled-back garbage and active TxID-only placeholders are not part of
                 // the durable row history, so they must not influence DB-file existence.
+                continue;
+            }
+            // Upper-bound filter: skip versions that arrived after this checkpoint
+            // pass started. They'll be picked up by the next pass. Note that
+            // `exists_in_db_file` is determined by older versions in the same
+            // chain; if a newer version is skipped, the older state still
+            // correctly reflects what's in the DB file.
+            if begin_ts.is_some_and(|b| b > self.snapshot_ts) {
+                continue;
+            }
+            if end_ts.is_some_and(|e| e > self.snapshot_ts) {
+                // Tombstone arrived after our snapshot; treat the row as still
+                // present from this pass's perspective.
                 continue;
             }
             // Rows marked btree_resident existed in the DB file before MVCC tracked them.
@@ -797,20 +1013,34 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
     /// Truncate the logical log file
     fn truncate_logical_log(&self) -> Result<Completion> {
-        self.mvstore.storage.truncate()
+        // Pass the published boundary so the log preserves frames for commits
+        // that landed (above this boundary) during the off-lock prepare phase and
+        // were excluded from this checkpoint's backfill.
+        self.mvstore.storage.truncate(self.durable_txid_max_new)
     }
 
-    /// Perform a TRUNCATE checkpoint on the WAL
+    /// Perform a PASSIVE checkpoint on the WAL (WAL->DB backfill).
     fn checkpoint_wal(&self) -> Result<IOResult<CheckpointResult>> {
         let Some(wal) = &self.pager.wal else {
             panic!("No WAL to checkpoint");
         };
-        match wal.checkpoint(
-            &self.pager,
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-        )? {
+        // The mode is set at construction (see `mode` field):
+        //
+        // - Passive (auto-checkpoint after commit): backfill up to the safe
+        //   frame WITHOUT WAL writer exclusivity, so it does not fight
+        //   concurrent workers' WAL read marks the way TRUNCATE does. Runs
+        //   UNLOCKED (blocking_checkpoint_lock released in TakeLock after the
+        //   marker flip + targeted GC). The WAL is NOT reset here; it resets
+        //   via restart-on-write. The WAL is left non-empty as a normal steady
+        //   state — recovery treats a committed WAL + truncated logical log as
+        //   the Passive steady state (see `maybe_complete_interrupted_checkpoint`,
+        //   startup case 2) and recovers it.
+        //
+        // - Truncate/Restart (explicit `PRAGMA wal_checkpoint(TRUNCATE)`,
+        //   journal-mode migration, `Connection::checkpoint`): backfill ALL
+        //   frames with writer exclusivity and reset the WAL so `TruncateWal`
+        //   can zero the file (SQLite-compatible explicit truncation).
+        match wal.checkpoint(&self.pager, self.mode)? {
             IOResult::Done(result) => Ok(IOResult::Done(result)),
             IOResult::IO(io) => Ok(IOResult::IO(io)),
         }
@@ -1052,19 +1282,42 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
     fn step_inner(&mut self, _context: &()) -> Result<TransitionResult<CheckpointResult>> {
         match &self.state {
-            CheckpointState::AcquireLock => {
-                inject_transition_yield!(self, CheckpointYieldPoint::BeforeAcquireLock);
-
-                tracing::debug!("Acquiring blocking checkpoint lock");
-                let locked = self.checkpoint_lock.write();
-                if !locked {
-                    return Err(crate::LimboError::Busy);
+            CheckpointState::PrepareCheckpoint => {
+                // Single-orchestrator gate. Multiple commits may have triggered
+                // `should_checkpoint()` concurrently; only one runs the checkpoint,
+                // the rest skip and let the in-flight one cover their work. This
+                // was previously implicit in `blocking_checkpoint_lock` being the
+                // first thing taken; now that the lock is moved past the pager
+                // write phase, we need an explicit flag.
+                if self
+                    .mvstore
+                    .checkpoint_in_progress
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    // Another checkpoint is already running. Return a no-op result;
+                    // the auto-checkpoint caller swallows this and the user-facing
+                    // checkpoint caller will see "nothing was backfilled."
+                    // Transition to Finalize so the StateMachine wrapper's
+                    // is_finalized() assertion is satisfied. We did no work
+                    // and own no resources, so the Finalize body's cleanup
+                    // is skipped for the skip path.
+                    self.state = CheckpointState::Finalize;
+                    return Ok(TransitionResult::Done(CheckpointResult::default()));
                 }
-                self.lock_states.blocking_checkpoint_lock_held = true;
+                self.owns_checkpoint_in_progress = true;
+
+                // Capture an upper bound for what we'll consider "committed enough
+                // to flush this pass." Concurrent commits arriving with a higher
+                // begin_ts during the unlocked write phase get picked up by the
+                // next checkpoint. `durable_txid_max_new` is derived from
+                // snapshot_ts, so the marker never claims a version durable that
+                // we did not actually flush.
+                self.snapshot_ts = self.mvstore.last_committed_tx_ts.load(Ordering::Acquire);
 
                 // Checkpoint state machines can be created before they are run.
-                // Resample after serializing with other checkpoints so already-durable
-                // index deletes are not replayed.
+                // Resample after serializing (via `checkpoint_in_progress`) so
+                // already-durable index deletes are not replayed.
                 self.refresh_checkpoint_bounds();
                 self.state = CheckpointState::CollectTableRows;
                 Ok(TransitionResult::Continue)
@@ -1082,21 +1335,21 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     return Ok(TransitionResult::Io(io));
                 }
                 tracing::debug!("Collected {} index row changes", self.index_write_set.len());
-                // Checkpoint boundary is derived from a stable snapshot under the blocking lock:
-                // old durable boundary plus the latest committed tx watermark. This covers both
-                // row/index commits and header-only commits.
+                // Checkpoint boundary uses the snapshot_ts captured above. This
+                // is the SAME atomic source as the old `committed_max` read, but
+                // captured BEFORE collection so versions ≤ snapshot_ts in the
+                // write_set are bounded by the same watermark we'll publish.
                 let durable_old = self.durable_txid_max_old.map(u64::from).unwrap_or_default();
-                let committed_max = self.mvstore.last_committed_tx_ts.load(Ordering::Acquire);
                 #[cfg(any(test, debug_assertions))]
                 {
                     let collected_max = self.max_collected_version_timestamp();
                     turso_assert!(
-                        committed_max >= collected_max,
-                        "MVCC checkpoint collected version timestamp above committed watermark",
-                        { "collected_max": collected_max, "committed_max": committed_max }
+                        self.snapshot_ts >= collected_max,
+                        "MVCC checkpoint collected version timestamp above snapshot_ts",
+                        { "collected_max": collected_max, "snapshot_ts": self.snapshot_ts }
                     );
                 }
-                self.durable_txid_max_new = durable_old.max(committed_max);
+                self.durable_txid_max_new = durable_old.max(self.snapshot_ts);
                 self.maybe_stage_mvcc_metadata_write()?;
 
                 self.mvstore
@@ -1104,14 +1357,148 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     .on_checkpoint_start(self.durable_txid_max_new)?;
 
                 if self.write_set.is_empty() && self.index_write_set.is_empty() {
-                    // Nothing to checkpoint, skip pager txn and go straight to WAL checkpoint.
-                    self.state = CheckpointState::CheckpointWal;
+                    // Nothing to checkpoint at the pager layer. Skip the pager
+                    // write phase and go directly to taking the lock for the
+                    // backfill + marker publication.
+                    self.state = CheckpointState::TakeLock;
                 } else {
                     self.state = CheckpointState::BeginPagerTxn;
                 }
                 Ok(TransitionResult::Continue)
             }
+            CheckpointState::TakeLock => {
+                // This state is re-entrant across yields. The three phases
+                // (acquire lock / pager commit / marker publish) are each
+                // guarded by a flag so a yield between them can resume
+                // without redoing the prior phase. The lock is held across
+                // all three; it is released only in Finalize (or the
+                // stop_after_flush early-exit, or the error path).
+                inject_transition_failure!(self, CheckpointYieldPoint::BeforeAcquireLock);
+                inject_transition_yield!(self, CheckpointYieldPoint::BeforeAcquireLock);
+                if !self.lock_states.blocking_checkpoint_lock_held {
+                    tracing::debug!("Acquiring blocking checkpoint lock");
+                    let locked = self.checkpoint_lock.write();
+                    if !locked {
+                        // No other checkpoint is running (the in-progress gate
+                        // serialises that). The only other writer that can hold
+                        // a conflicting lock here is VACUUM. Returning Busy
+                        // propagates through `step()` to
+                        // `cleanup_after_external_io_error`, which calls
+                        // `pager.rollback_tx` — that drops the dirty pages,
+                        // rolls the WAL coordination back to its pre-checkpoint
+                        // max_frame (uncommitted frames sit in the WAL file as
+                        // junk until overwritten, invisible to recovery), and
+                        // hands the freelist back to its pre-checkpoint state.
+                        // Auto-checkpoint callers swallow this Busy; user-facing
+                        // callers surface it.
+                        return Err(crate::LimboError::Busy);
+                    }
+                    self.lock_states.blocking_checkpoint_lock_held = true;
+                }
+
+                inject_transition_failure!(self, CheckpointYieldPoint::AfterAcquireLock);
+                inject_transition_yield!(self, CheckpointYieldPoint::AfterAcquireLock);
+
+                // We hold the lock — now publish the checkpoint atomically.
+                // The pager tx is still alive: WriteRow's dirty pages, the
+                // staged page-1 header from CommitPagerTxn, and any
+                // freelist mutations from btree_create are all uncommitted.
+                // commit_tx flushes them + writes the WAL commit frame.
+                // The commit frame becoming visible is what makes the
+                // checkpoint's WAL frames part of the durable BTree state.
+                // Pair it with the in-memory marker publication below so
+                // recovery and concurrent readers see all-or-nothing.
+                //
+                // Empty write_set / index_write_set means CommitPagerTxn was
+                // skipped (PrepareCheckpoint transitioned directly to TakeLock),
+                // so there is no pager tx to commit either.
+                let has_pager_work = !self.write_set.is_empty() || !self.index_write_set.is_empty();
+                if has_pager_work && !self.lock_commit_done {
+                    let commit_result = self
+                        .pager
+                        .commit_tx(&self.connection, self.update_transaction_state)?;
+                    match commit_result {
+                        IOResult::Done(_) => {}
+                        IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
+                    }
+                    self.lock_states.pager_read_tx = false;
+                    self.lock_states.pager_write_tx = false;
+                    self.lock_commit_done = true;
+                }
+
+                inject_transition_failure!(self, CheckpointYieldPoint::AfterPagerCommit);
+                inject_transition_yield!(self, CheckpointYieldPoint::AfterPagerCommit);
+
+                if has_pager_work && !self.markers_published {
+                    // Drain the staged root_page allocations into MvStore
+                    // BEFORE publish_checkpointed_schema_roots, which reads
+                    // `table_id_to_rootpage` to translate still-negative
+                    // schema entries to their real root_page.
+                    for (table_id, root_page) in self.pending_root_page_allocations.drain() {
+                        self.mvstore
+                            .insert_table_id_to_rootpage(table_id, Some(root_page));
+                    }
+                    self.mvstore
+                        .durable_txid_max
+                        .store(self.durable_txid_max_new, Ordering::SeqCst);
+                    let header = self.staged_checkpoint_header.take().ok_or_else(|| {
+                        LimboError::InternalError(
+                            "checkpoint header was not staged before pager commit".to_string(),
+                        )
+                    })?;
+                    self.mvstore.global_header.write().replace(header);
+                    self.publish_checkpointed_schema_roots();
+                    self.markers_published = true;
+                }
+                inject_transition_failure!(
+                    self,
+                    CheckpointYieldPoint::AfterDurableBoundaryAdvanced
+                );
+                inject_transition_yield!(self, CheckpointYieldPoint::AfterDurableBoundaryAdvanced);
+
+                // Targeted GC under the lock, then RELEASE the lock. This is
+                // the end of the locked region for ALL paths. Everything after
+                // this — the Passive WAL->DB backfill, the DB fsync, and the
+                // logical-log + WAL truncation — runs unlocked, so concurrent
+                // readers and writers are no longer blocked by the checkpoint.
+                // The lock now covers only: commit_tx (the WAL commit frame) +
+                // the in-memory marker flip + this targeted GC.
+                if !self.gc_and_unlock_done {
+                    // Idempotent for the has-pager-work path (already set in
+                    // the marker block); required for the empty-write_set
+                    // backfill-only path that skipped that block.
+                    self.mvstore
+                        .durable_txid_max
+                        .store(self.durable_txid_max_new, Ordering::SeqCst);
+                    self.gc_checkpointed_versions();
+                    self.checkpoint_lock.unlock();
+                    self.lock_states.blocking_checkpoint_lock_held = false;
+                    // Full-store reclamation runs WITHOUT the reader-blocking
+                    // lock: drop_unused_row_versions is lwm-driven and uses
+                    // per-chain locking + lazy SkipMap removal (it never does
+                    // the TOCTOU-prone SkipMap remove that
+                    // gc_checkpointed_versions does), so it is safe to run
+                    // concurrently with readers and writers.
+                    self.mvstore.drop_unused_row_versions();
+                    self.gc_and_unlock_done = true;
+                }
+
+                if self.stop_after_flush {
+                    // Flush-only path: leave the WAL non-empty (no backfill),
+                    // so a subsequent reader exercising MvccLazyCursor must
+                    // consult pager.read_page → WAL.
+                    self.checkpoint_result = Some(CheckpointResult::default());
+                    self.flush_completed = true;
+                    self.state = CheckpointState::Finalize;
+                    return Ok(TransitionResult::Continue);
+                }
+
+                self.state = CheckpointState::CheckpointWal;
+                Ok(TransitionResult::Continue)
+            }
             CheckpointState::BeginPagerTxn => {
+                inject_transition_failure!(self, CheckpointYieldPoint::AfterPrepare);
+                inject_transition_yield!(self, CheckpointYieldPoint::AfterPrepare);
                 tracing::debug!("Beginning pager transaction");
                 // Start a pager transaction to write committed versions to B-tree
                 let read_tx_active = self
@@ -1147,7 +1534,22 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let write_set_index = *write_set_index;
                 let requires_seek = *requires_seek;
 
+                // write_set_index == 0: pager write tx open, no row written.
+                // write_set_index == 1: exactly one table row written (partial
+                // B-tree). Both are re-entrant: the yield is before this
+                // index's row is processed.
+                #[cfg(any(test, injected_yields))]
+                if write_set_index == 0 {
+                    inject_transition_failure!(self, CheckpointYieldPoint::AfterBeginPagerTxn);
+                    inject_transition_yield!(self, CheckpointYieldPoint::AfterBeginPagerTxn);
+                } else if write_set_index == 1 {
+                    inject_transition_failure!(self, CheckpointYieldPoint::AfterFirstTableRow);
+                    inject_transition_yield!(self, CheckpointYieldPoint::AfterFirstTableRow);
+                }
+
                 if !self.has_more_rows(write_set_index) {
+                    inject_transition_failure!(self, CheckpointYieldPoint::AfterTableRows);
+                    inject_transition_yield!(self, CheckpointYieldPoint::AfterTableRows);
                     // Done writing all table rows, now process index rows
                     if self.index_write_set.is_empty() {
                         // No index rows to write, skip to commit
@@ -1185,10 +1587,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             let created_root_page: u32 = self.pager.io.block(|| {
                                 self.pager.btree_create(&CreateBTreeFlags::new_table())
                             })?;
-                            self.mvstore.insert_table_id_to_rootpage(
-                                table_id,
-                                Some(created_root_page as u64),
-                            );
+                            // Stage the allocation locally — publishing it
+                            // into `MvStore::table_id_to_rootpage` here would
+                            // be visible to concurrent readers before the
+                            // matching WAL frames are part of their snapshot.
+                            // Drained into MvStore in TakeLock.
+                            self.pending_root_page_allocations
+                                .insert(table_id, created_root_page as u64);
                         }
                         SpecialWrite::BTreeDestroy {
                             table_id,
@@ -1230,10 +1635,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             let created_root_page: u32 = self.pager.io.block(|| {
                                 self.pager.btree_create(&CreateBTreeFlags::new_index())
                             })?;
-                            self.mvstore.insert_table_id_to_rootpage(
-                                index_id,
-                                Some(created_root_page as u64),
-                            );
+                            // See BTreeCreate above — staged locally, drained
+                            // into MvStore under the lock in TakeLock.
+                            self.pending_root_page_allocations
+                                .insert(index_id, created_root_page as u64);
                             // Index struct should already be stored in index_id_to_index from collect_committed_versions
                             turso_assert!(
                                 self.index_id_to_index.contains_key(&index_id),
@@ -1299,26 +1704,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     return Ok(TransitionResult::Continue);
                 }
 
-                let root_page = {
-                    let root_page = self
-                        .mvstore
-                        .table_id_to_rootpage
-                        .get(&table_id)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "Table ID does not have a root page: {table_id}, row_version: {:?}",
-                                self.get_current_row_version(write_set_index)
-                                    .expect("row version should exist")
-                            )
-                        });
-                    root_page.value().unwrap_or_else(|| {
-                        panic!(
-                            "Table ID does not have a root page: {table_id}, row_version: {:?}",
-                            self.get_current_row_version(write_set_index)
-                                .expect("row version should exist")
-                        )
-                    })
-                };
+                let root_page = self.resolve_root_page(table_id).unwrap_or_else(|| {
+                    panic!(
+                        "Table ID does not have a root page: {table_id}, row_version: {:?}",
+                        self.get_current_row_version(write_set_index)
+                            .expect("row version should exist")
+                    )
+                });
 
                 // If a table was created, it now has a real root page allocated for it, but the 'root_page' field in the sqlite_schema record is still the table id.
                 // So we need to rewrite the row version to use the real root page.
@@ -1327,16 +1719,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     sqlite_schema_rowid,
                 }) = special_write
                 {
-                    let root_page = {
-                        let root_page = self
-                            .mvstore
-                            .table_id_to_rootpage
-                            .get(&table_id)
-                            .expect("Table ID does not have a root page");
-                        root_page
-                            .value()
-                            .expect("Table ID does not have a root page")
-                    };
+                    let root_page = self
+                        .resolve_root_page(table_id)
+                        .expect("Table ID does not have a root page");
                     let row_version = {
                         let (row_version, _) = self
                             .get_current_row_version_mut(write_set_index)
@@ -1361,16 +1746,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }) = special_write
                 {
                     // Same for index btrees.
-                    let root_page = {
-                        let root_page = self
-                            .mvstore
-                            .table_id_to_rootpage
-                            .get(&index_id)
-                            .expect("Index ID does not have a root page");
-                        root_page
-                            .value()
-                            .expect("Index ID does not have a root page")
-                    };
+                    let root_page = self
+                        .resolve_root_page(index_id)
+                        .expect("Index ID does not have a root page");
                     let row_version = {
                         let (row_version, _) = self
                             .get_current_row_version_mut(write_set_index)
@@ -1493,6 +1871,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let requires_seek = *requires_seek;
 
                 if index_write_set_index >= self.index_write_set.len() {
+                    inject_transition_failure!(self, CheckpointYieldPoint::AfterIndexRows);
+                    inject_transition_yield!(self, CheckpointYieldPoint::AfterIndexRows);
                     // Done writing all index rows
                     self.state = CheckpointState::CommitPagerTxn;
                     return Ok(TransitionResult::Continue);
@@ -1517,14 +1897,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 )
                 });
 
-                // Get root page for this index
+                // Get root page for this index — staged allocations first.
                 let root_page = self
-                    .mvstore
-                    .table_id_to_rootpage
-                    .get(index_id)
-                    .unwrap_or_else(|| panic!("Index ID {index_id} does not have a root page"));
-                let root_page = root_page
-                    .value()
+                    .resolve_root_page(*index_id)
                     .unwrap_or_else(|| panic!("Index ID {index_id} does not have a root page"));
 
                 // Get or create cursor for this index
@@ -1625,6 +2000,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
 
             CheckpointState::CommitPagerTxn => {
+                // Stage the new page-1 header into the pager's dirty cache.
+                // The actual pager `commit_tx` — which writes the WAL commit
+                // frame, ends the write tx, and makes everything visible
+                // through find_frame — is deferred to TakeLock so it lands
+                // atomically with the in-memory marker publication. If
+                // TakeLock can't acquire the lock, `pager.rollback_tx` in
+                // `cleanup_after_external_io_error` discards the dirty pages,
+                // uncommitted WAL frames, and freelist mutations together —
+                // there is no half-committed checkpoint state for recovery
+                // to choke on.
                 if !self.header_staged_for_commit {
                     let mut checkpoint_header =
                         *self.mvstore.global_header.read().as_ref().ok_or_else(|| {
@@ -1652,49 +2037,20 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     self.staged_checkpoint_header = Some(staged_header);
                     self.header_staged_for_commit = true;
                 }
-                // If commit_tx fails, the `?` propagates to step() which rolls back
-                // the pager transaction. durable_txid_max is NOT advanced (only happens
-                // on success below), so a retry will re-stage from the previous boundary.
-                // The logical log is also unaffected — its offset is not advanced here.
-                tracing::debug!("Committing pager transaction");
-                let result = self
-                    .pager
-                    .commit_tx(&self.connection, self.update_transaction_state)?;
-                match result {
-                    IOResult::Done(_) => {
-                        // Pager commit atomically staged data + metadata into WAL.
-                        // Advance the in-memory durable boundary immediately so that if
-                        // later checkpoint phases fail, a same-process retry starts from
-                        // this durable prefix instead of re-staging older versions.
-                        self.mvstore
-                            .durable_txid_max
-                            .store(self.durable_txid_max_new, Ordering::SeqCst);
-                        self.state = CheckpointState::CheckpointWal;
-                        self.lock_states.pager_read_tx = false;
-                        self.lock_states.pager_write_tx = false;
-                        // Publish the exact page-1 snapshot that was staged into the pager txn.
-                        let header = self.staged_checkpoint_header.take().ok_or_else(|| {
-                            LimboError::InternalError(
-                                "checkpoint header was not staged before pager commit".to_string(),
-                            )
-                        })?;
-                        self.mvstore.global_header.write().replace(header);
-                        self.publish_checkpointed_schema_roots();
-                        inject_transition_failure!(
-                            self,
-                            CheckpointYieldPoint::AfterDurableBoundaryAdvanced
-                        );
-                        inject_transition_yield!(
-                            self,
-                            CheckpointYieldPoint::AfterDurableBoundaryAdvanced
-                        );
-                        Ok(TransitionResult::Continue)
-                    }
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
-                }
+                // No pager.commit_tx here. Pager tx stays alive through
+                // TakeLock; lock_states.pager_{read,write}_tx remain set so
+                // the rollback path in cleanup_after_external_io_error knows
+                // to roll us back if anything between here and TakeLock's
+                // commit fails.
+                inject_transition_failure!(self, CheckpointYieldPoint::AfterStageHeader);
+                inject_transition_yield!(self, CheckpointYieldPoint::AfterStageHeader);
+                self.state = CheckpointState::TakeLock;
+                Ok(TransitionResult::Continue)
             }
 
             CheckpointState::TruncateLogicalLog => {
+                inject_transition_failure!(self, CheckpointYieldPoint::AfterSyncDbFile);
+                inject_transition_yield!(self, CheckpointYieldPoint::AfterSyncDbFile);
                 tracing::debug!("Truncating logical log file");
                 let c = self.truncate_logical_log()?;
                 self.state = CheckpointState::FsyncLogicalLog;
@@ -1707,6 +2063,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
 
             CheckpointState::FsyncLogicalLog => {
+                inject_transition_failure!(self, CheckpointYieldPoint::AfterTruncateLogicalLog);
+                inject_transition_yield!(self, CheckpointYieldPoint::AfterTruncateLogicalLog);
                 // Skip fsync when synchronous mode is off
                 if self.sync_mode == SyncMode::Off {
                     tracing::debug!("Skipping fsync of logical log file (synchronous=off)");
@@ -1729,7 +2087,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 match self.checkpoint_wal()? {
                     IOResult::Done(result) => {
                         self.checkpoint_result = Some(result);
+                        // State advanced before the yield so a resume lands in
+                        // SyncDbFile rather than re-running the backfill.
                         self.state = CheckpointState::SyncDbFile;
+                        inject_transition_failure!(self, CheckpointYieldPoint::AfterCheckpointWal);
+                        inject_transition_yield!(self, CheckpointYieldPoint::AfterCheckpointWal);
                         Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
@@ -1773,38 +2135,61 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
 
             CheckpointState::TruncateWal => {
-                // Truncate WAL file after DB file is safely synced.
-                // This must be done explicitly because MVCC calls wal.checkpoint() directly,
-                // bypassing the pager's TruncateWalFile phase.
-                let Some(wal) = &self.pager.wal else {
-                    panic!("No WAL to truncate");
-                };
-                let checkpoint_result = self
-                    .checkpoint_result
-                    .as_mut()
-                    .expect("checkpoint_result should be set");
-                match wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())? {
-                    IOResult::Done(()) => {
-                        self.state = CheckpointState::Finalize;
-                        Ok(TransitionResult::Continue)
+                inject_transition_failure!(self, CheckpointYieldPoint::AfterFsyncLogicalLog);
+                inject_transition_yield!(self, CheckpointYieldPoint::AfterFsyncLogicalLog);
+                if self.mode.should_restart_log() {
+                    // Truncate/Restart: the backfill above ran with writer
+                    // exclusivity and reset the WAL's max_frame, so zeroing the
+                    // WAL file is safe and required for an empty-WAL restart
+                    // (SQLite-compatible explicit truncation). truncate_wal is
+                    // resumable: it re-enters here on IO until Done. The
+                    // one-shot AfterFsyncLogicalLog yield above does not re-fire.
+                    let Some(wal) = &self.pager.wal else {
+                        panic!("No WAL to truncate");
+                    };
+                    let checkpoint_result = self
+                        .checkpoint_result
+                        .as_mut()
+                        .expect("checkpoint_result should be set");
+                    if let IOResult::IO(io) =
+                        wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())?
+                    {
+                        return Ok(TransitionResult::Io(io));
                     }
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
                 }
+                // Passive: no explicit WAL truncation. The backfill above does
+                // NOT reset the WAL's max_frame, so zeroing the WAL file here
+                // would orphan max_frame past an empty file (ShortReadWalFrame).
+                // The WAL resets via restart-on-write.
+                self.state = CheckpointState::Finalize;
+                inject_transition_failure!(self, CheckpointYieldPoint::AfterTruncateWal);
+                inject_transition_yield!(self, CheckpointYieldPoint::AfterTruncateWal);
+                Ok(TransitionResult::Continue)
             }
 
             CheckpointState::Finalize => {
-                tracing::debug!("Releasing blocking checkpoint lock");
                 turso_assert!(
                     !self.has_pending_root_publication(),
                     "checkpoint finalized after pager writes without publishing schema changes"
                 );
+                // The marker flip, targeted GC, and blocking_checkpoint_lock
+                // release all happened in TakeLock; the backfill/sync/truncate
+                // that followed ran unlocked. Finalize only releases the
+                // single-orchestrator gate and returns the result.
+                turso_assert!(
+                    !self.lock_states.blocking_checkpoint_lock_held,
+                    "blocking_checkpoint_lock should already be released by TakeLock before Finalize"
+                );
 
-                self.mvstore
-                    .durable_txid_max
-                    .store(self.durable_txid_max_new, Ordering::SeqCst);
-                self.gc_checkpointed_versions();
-                self.mvstore.drop_unused_row_versions();
-                self.checkpoint_lock.unlock();
+                // Release the single-orchestrator gate AFTER unlocking
+                // blocking_checkpoint_lock so the next checkpoint can take the
+                // lock cleanly. Drop is the safety net for error paths.
+                if self.owns_checkpoint_in_progress {
+                    self.mvstore
+                        .checkpoint_in_progress
+                        .store(false, Ordering::Release);
+                    self.owns_checkpoint_in_progress = false;
+                }
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(
                     self.checkpoint_result.take().ok_or_else(|| {
@@ -1847,6 +2232,20 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
 
     fn is_finalized(&self) -> bool {
         matches!(self.state, CheckpointState::Finalize)
+    }
+}
+
+impl<Clock: LogicalClock> Drop for CheckpointStateMachine<Clock> {
+    /// Safety net for `checkpoint_in_progress`. The flag is normally cleared
+    /// by `Finalize` on success or by `cleanup_after_external_io_error` on
+    /// error; this guard covers paths where the state machine is dropped
+    /// without going through either (e.g. a panic during step).
+    fn drop(&mut self) {
+        if self.owns_checkpoint_in_progress {
+            self.mvstore
+                .checkpoint_in_progress
+                .store(false, Ordering::Release);
+        }
     }
 }
 
@@ -2027,6 +2426,9 @@ mod tests {
             conn.clone(),
             true,
             conn.get_sync_mode(),
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
         );
         checkpoint.durable_txid_max_old = std::num::NonZeroU64::new(10);
         checkpoint.durable_txid_max_new = 10;
@@ -2085,7 +2487,15 @@ mod tests {
             conn.clone(),
             true,
             conn.get_sync_mode(),
+            CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            },
         );
+        // This drives collect_*_rows() directly, bypassing PrepareCheckpoint (which
+        // in production captures snapshot_ts from last_committed_tx_ts). Off-lock
+        // collection skips versions with begin_ts > snapshot_ts, so set it to admit
+        // all committed rows — this test is about preemption, not the snapshot bound.
+        checkpoint.snapshot_ts = u64::MAX;
 
         // More than one chunk worth of committed rows so collection must preempt.
         let table_id = MVTableId::from(-2);
@@ -2123,7 +2533,13 @@ mod tests {
             conn.clone(),
             true,
             conn.get_sync_mode(),
+            CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            },
         );
+        // See collect_table_rows_preempts_on_large_scan: this bypasses
+        // PrepareCheckpoint, so snapshot_ts must admit the committed rows.
+        checkpoint.snapshot_ts = u64::MAX;
 
         let index_id = MVTableId::from(-7);
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;

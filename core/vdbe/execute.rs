@@ -605,6 +605,7 @@ pub fn op_checkpoint(
             program.connection.clone(),
             true,
             program.connection.get_sync_mode(),
+            *checkpoint_mode,
         );
         let CheckpointResult {
             wal_max_frame,
@@ -3540,7 +3541,9 @@ pub fn op_transaction_inner(
                         if !pager.holds_read_lock() {
                             pager.begin_read_tx()?;
                         }
-                        pager.mvcc_refresh_if_db_changed();
+                        // begin_read_tx pins the snapshot + clears the page
+                        // cache on change; don't refresh again (would advance
+                        // pinned max_frame mid-tx and break snapshot iso).
 
                         let current_mv_tx = conn.get_mv_tx_for_db(*db);
                         if current_mv_tx.is_none() {
@@ -3603,9 +3606,16 @@ pub fn op_transaction_inner(
                             if conn.get_auto_commit() {
                                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                             }
+                            // Cache + snapshot are already aligned by begin_read_tx
+                            // (it clears the page cache on snapshot change). No
+                            // need for the legacy mvcc_refresh_if_db_changed step
+                            // here — and crucially, refreshing on every statement
+                            // inside an open BEGIN CONCURRENT used to silently
+                            // advance the connection's pinned WAL max_frame to
+                            // the latest coordination snapshot, which broke
+                            // snapshot isolation under the unlocked-checkpoint
+                            // reorder.
                         }
-                        // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
-                        pager.mvcc_refresh_if_db_changed();
                         // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
                         // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
                         // for both.
@@ -14718,6 +14728,10 @@ fn op_journal_mode_inner(
                                 program.connection.clone(),
                                 true,
                                 program.connection.get_sync_mode(),
+                                // Migrating off MVCC: fully flush + empty the WAL.
+                                CheckpointMode::Truncate {
+                                    upper_bound_inclusive: None,
+                                },
                             ))));
                     }
 

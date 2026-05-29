@@ -2566,6 +2566,12 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         self.connection.clone(),
                         false,
                         self.connection.get_sync_mode(),
+                        // Auto-checkpoint runs Passive so the WAL→DB backfill
+                        // happens off the blocking_checkpoint_lock and does not
+                        // fight concurrent readers/writers for WAL exclusivity.
+                        crate::storage::wal::CheckpointMode::Passive {
+                            upper_bound_inclusive: None,
+                        },
                     ));
                     let state_machine = Mutex::new(state_machine);
                     self.state = CommitState::Checkpoint { state_machine };
@@ -2909,14 +2915,26 @@ pub struct MvStore<Clock: LogicalClock> {
     exclusive_tx: AtomicU64,
     commit_coordinator: Arc<CommitCoordinator>,
     global_header: Arc<RwLock<Option<DatabaseHeader>>>,
-    /// MVCC checkpoints are always TRUNCATE, plus they block all other transactions.
-    /// This guarantees that never need to let transactions read from the SQLite WAL.
-    /// In MVCC, the checkpoint procedure is roughly as follows:
-    /// - Take the blocking_checkpoint_lock
-    /// - Write everything in the logical log to the pager, and from there commit to the SQLite WAL.
-    /// - Immediately TRUNCATE checkpoint the WAL into the database file.
-    /// - Release the blocking_checkpoint_lock.
+    /// MVCC checkpoints lock readers and writers out of the engine only during the
+    /// in-memory marker-publication and metadata-mutation phase. The MvStore → WAL
+    /// write-out (BeginPagerTxn → WriteRow → WriteIndexRow → CommitPagerTxn) runs
+    /// WITHOUT this lock, so concurrent `BEGIN CONCURRENT`s don't observe the writer
+    /// flag and don't return Busy during the I/O-heavy portion of the checkpoint.
+    /// The procedure is:
+    /// - (unlocked) Snapshot MvStore via snapshot_ts; collect committed versions;
+    ///   begin pager txn; write rows; commit pager txn (WAL has the data, fsynced).
+    /// - (locked) Take the blocking_checkpoint_lock; truncate logical log; fsync;
+    ///   CheckpointWal → SyncDbFile → TruncateWal; GC; publish durable_txid_max;
+    ///   release the lock.
     blocking_checkpoint_lock: Arc<TursoRwLock>,
+    /// Single-orchestrator gate for MVCC checkpoints. Set when a CheckpointStateMachine
+    /// is actively running its unlocked write-out phase; cleared on completion or
+    /// error. Multiple commits triggering `should_checkpoint()` race to set this;
+    /// only one wins and runs the checkpoint, the others skip it. Necessary because
+    /// the previously-implicit single-orchestrator invariant (provided by
+    /// `blocking_checkpoint_lock` being acquired in AcquireLock as the *first* state)
+    /// no longer holds once the lock is moved past the pager-write phase.
+    checkpoint_in_progress: AtomicBool,
     /// The highest transaction ID that has been made durable in the WAL.
     /// Used to skip checkpointing transactions from mv store to WAL that have already been processed.
     durable_txid_max: AtomicU64,
@@ -2998,6 +3016,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             commit_coordinator: Arc::new(CommitCoordinator::new()),
             global_header: Arc::new(RwLock::new(None)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
+            checkpoint_in_progress: AtomicBool::new(false),
             durable_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
@@ -5264,20 +5283,40 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             ));
         }
 
-        let header = match header_result {
-            HeaderReadResult::Valid(header) => header,
+        match header_result {
+            HeaderReadResult::Valid(header) => {
+                // Interrupted checkpoint with the logical log still present.
+                // Reuse its header so the fresh-header write below keeps the
+                // existing salt chain.
+                self.storage.set_header(header);
+            }
             HeaderReadResult::NoLog => {
-                return Err(LimboError::Corrupt(
-                    "WAL has committed frames but logical log header is missing".to_string(),
-                ))
+                // The committed WAL frames hold the durable B-tree state plus
+                // the `__turso_internal_mvcc_meta` boundary row; an
+                // empty/truncated logical log means there are no
+                // uncheckpointed ops to replay. This is the normal steady
+                // state of a non-stop-the-world (Passive) checkpoint, which
+                // truncates the logical log to 0 but intentionally leaves the
+                // WAL non-empty. Complete the materialization below
+                // (backfill WAL → DB, write a fresh log header, truncate WAL)
+                // exactly as for an interrupted checkpoint. Nothing to set:
+                // update_header writes a fresh header.
+                //
+                // NOTE: `NoLog` cannot distinguish a deliberately-truncated
+                // log from a deleted one, so a deleted log on top of a
+                // committed WAL also recovers here rather than failing closed.
+                // That is the correct outcome — the WAL is the authoritative
+                // durable state and no committed data is lost.
             }
             HeaderReadResult::Invalid => {
+                // A header that is present but fails to decode is a torn
+                // header write / genuine corruption, not a clean truncation —
+                // fail closed.
                 return Err(LimboError::Corrupt(
                     "WAL has committed frames but logical log header is invalid".to_string(),
-                ))
+                ));
             }
-        };
-        self.storage.set_header(header);
+        }
 
         // NOTE: this uses `CheckpointMode::Truncate` to drive WAL backfill only; we still
         // truncate the WAL explicitly below to preserve WAL-last ordering in recovery.
@@ -5855,7 +5894,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         StreamingResult::DeleteTableRow {
                             rowid,
                             commit_ts,
-                            btree_resident,
+                            // Intentionally ignored: see DeleteIndexRow — the log op's residency
+                            // is a commit-time snapshot that a passive checkpoint can make stale;
+                            // recovery re-derives it from the boundary in the tombstone branches.
+                            btree_resident: _,
                         } => {
                             max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
                             if commit_ts <= replay_cutoff_ts {
@@ -5894,24 +5936,35 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         }) {
                             existing.end = Some(TxTimestampOrID::Timestamp(commit_ts));
                         } else {
+                            // No live in-memory predecessor: the deleted row's insert committed
+                            // at/below the durable boundary (skipped on replay) and was already
+                            // checkpointed, so it IS in the db-file B-tree. Mark the tombstone
+                            // btree_resident=true so the next checkpoint deletes it from the
+                            // B-tree. begin = None here, so the begin_ts <= boundary existence
+                            // signal cannot apply; this flag is the only way to express it. The
+                            // log op's residency is not used (it can be a stale `false` captured
+                            // by a delete that raced a non-blocking checkpoint).
                             let version_id = self.get_version_id();
                             let row_version = RowVersion {
                                 id: version_id,
                                 begin: None,
                                 end: Some(TxTimestampOrID::Timestamp(commit_ts)),
                                 row: tombstone_row.clone(),
-                                btree_resident,
+                                btree_resident: true,
                             };
                             self.insert_version_raw(&mut versions, row_version);
                         }
                             } else {
+                                // Same as the branch above: a delete with no in-memory version
+                                // at all. The row was checkpointed below the boundary and is in
+                                // the db-file B-tree, so the tombstone is btree_resident=true.
                                 let version_id = self.get_version_id();
                                 let row_version = RowVersion {
                                     id: version_id,
                                     begin: None,
                                     end: Some(TxTimestampOrID::Timestamp(commit_ts)),
                                     row: tombstone_row,
-                                    btree_resident,
+                                    btree_resident: true,
                                 };
                                 let versions = self.rows.get_or_insert_with(rowid.clone(), || {
                                     Arc::new(RwLock::new(Vec::new()))
@@ -5980,7 +6033,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             row,
                             rowid,
                             commit_ts,
-                            btree_resident,
+                            // Intentionally ignored: the log op records residency as of the
+                            // delete's commit time, which a non-blocking (passive) checkpoint
+                            // can make stale. Recovery re-derives it below from the boundary.
+                            btree_resident: _,
                         } => {
                             max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
                             if commit_ts <= replay_cutoff_ts {
@@ -6003,13 +6059,25 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             }
                                 }
                             }
+                            // Synthetic tombstone for an index entry whose delete has no live
+                            // in-memory predecessor. Reaching here means the deleted entry's
+                            // creating insert committed at/below the durable boundary (it was
+                            // skipped on replay), so a prior checkpoint already wrote it to the
+                            // db-file B-tree — the entry IS durable. Mark the tombstone
+                            // btree_resident=true so the next checkpoint emits the B-tree delete
+                            // and removes it. `begin = None` here, so the checkpoint's other
+                            // existence signal (begin_ts <= boundary) cannot fire; residency must
+                            // be carried by this flag. An UPDATE changes the index *key* (old vs
+                            // new value are different B-tree entries), so failing to delete the
+                            // old one leaves a stale entry — which is exactly how a passive
+                            // checkpoint's stale `false` corrupted idx_v after crash recovery.
                             let version_id = self.get_version_id();
                             let row_version = RowVersion {
                                 id: version_id,
                                 begin: None,
                                 end: Some(TxTimestampOrID::Timestamp(commit_ts)),
                                 row: row.clone(),
-                                btree_resident,
+                                btree_resident: true,
                             };
                             self.insert_index_version(rowid.table_id, sortable_key, row_version);
                         }

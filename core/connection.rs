@@ -1628,6 +1628,7 @@ impl Connection {
                 self.clone(),
                 true,
                 self.get_sync_mode(),
+                mode,
             );
             loop {
                 match ckpt_sm.step(&()) {
@@ -1646,6 +1647,52 @@ impl Connection {
             self.pager
                 .load()
                 .blocking_checkpoint(mode, self.get_sync_mode())
+        }
+    }
+
+    /// MVCC-only: flush half of a split checkpoint. Runs the MvStore→WAL write
+    /// out + marker publication + MvStore GC, then releases the lock without
+    /// backfilling the DB file or truncating the WAL. After this, the durable
+    /// data lives in WAL frames (not the DB file), and MvStore has dropped the
+    /// checkpointed versions — so any subsequent read must come through
+    /// `pager.read_page` → WAL. The matching `Connection::checkpoint(...)`
+    /// finds an empty write_set and finishes the backfill/truncate half.
+    ///
+    /// Exposed for tests that prove WAL-tolerant reads work; not on the
+    /// production call path. Returns `Ok(None)` when there is no MVCC store
+    /// or another checkpoint is already in progress (the orchestrator gate
+    /// makes this a no-op).
+    pub fn mvcc_flush_to_wal(self: &Arc<Self>) -> Result<Option<CheckpointResult>> {
+        use crate::mvcc::database::CheckpointStateMachine;
+        use crate::state_machine::{StateTransition, TransitionResult};
+        if self.is_closed() {
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+        let mv_store_holder = self.mv_store();
+        let Some(mv_store) = mv_store_holder.as_ref() else {
+            return Ok(None);
+        };
+        let pager = self.pager.load().clone();
+        let io = pager.io.clone();
+        let mut ckpt_sm = CheckpointStateMachine::new_flush_only(
+            pager,
+            mv_store.clone(),
+            self.clone(),
+            true,
+            self.get_sync_mode(),
+        );
+        loop {
+            match ckpt_sm.step(&()) {
+                Ok(TransitionResult::Continue) => {}
+                Ok(TransitionResult::Done(result)) => return Ok(Some(result)),
+                Ok(TransitionResult::Io(iocompletions)) => {
+                    if let Err(err) = iocompletions.wait(io.as_ref()) {
+                        ckpt_sm.cleanup_after_external_io_error();
+                        return Err(err);
+                    }
+                }
+                Err(err) => return Err(err),
+            }
         }
     }
 

@@ -3073,8 +3073,21 @@ impl Pager {
                 }
             }
 
-            tracing::debug!("read_page_nonblock(page_idx = {page_idx}) = reading page from disk");
-            let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
+            tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
+            // Pass this connection's pinned WAL max_frame as the watermark so we
+            // only see frames that were durable at the time of `begin_read_tx`.
+            // Critical for MVCC: a concurrent checkpoint can be appending new
+            // frames to the WAL right now (the off-lock write phase), and without
+            // a snapshot watermark a long-held reader's sample reads would see
+            // those newer frames mid-transaction, which would violate snapshot
+            // isolation.
+            //
+            // For callers without an active read tx (autocommit reads issue a
+            // begin/end pair internally), `get_max_frame` returns the snapshot
+            // captured at the last begin_read_tx — which is the most-recently-
+            // installed state, exactly what we want.
+            let frame_watermark = self.wal.as_ref().map(|wal| wal.get_max_frame());
+            let (page, c) = self.read_page_no_cache(page_idx, frame_watermark, false)?;
             self.pending_reads.write().insert(
                 page_idx,
                 PendingRead {
@@ -3092,7 +3105,7 @@ impl Pager {
             }
             IOResult::IO(IOCompletions::Single(spill_c)) => {
                 // Leave the pending entry in place; the next call to
-                // `read_page_nonblock(page_idx)` will recover it and retry
+                // `read_page(page_idx)` will recover it and retry
                 // `cache_insert` without re-issuing the disk read.
                 io_yield_one!(spill_c);
             }
