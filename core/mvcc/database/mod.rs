@@ -2175,7 +2175,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         {
             let _ = mvcc_store;
             let _ = log_record;
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(feature = "conn_raw_api")]
@@ -2845,7 +2845,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     &mut self.state,
                     CommitState::UpgradeLogicalLogHeader {
                         end_ts,
-                        log_record: LogRecord::new(end_ts),
+                        log_record: LogRecord::new(end_ts)?,
                     },
                 ) {
                     CommitState::BeginCommitLogicalLog { log_record, .. } => log_record,
@@ -2865,7 +2865,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     &mut self.state,
                     CommitState::WriteLogicalLog {
                         end_ts,
-                        log_record: LogRecord::new(end_ts),
+                        log_record: LogRecord::new(end_ts)?,
                     },
                 ) {
                     CommitState::UpgradeLogicalLogHeader { log_record, .. } => log_record,
@@ -5811,7 +5811,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn logical_log_header_crc_valid(&self, pager: &Arc<Pager>) -> Result<bool> {
         let file = self.get_logical_log_file();
         // Header is never encrypted; no need to pass EncryptionContext here.
-        let mut reader = StreamingLogicalLogReader::new(file, None);
+        let mut reader = StreamingLogicalLogReader::new(file, None)?;
         match reader.try_read_header(&pager.io)? {
             HeaderReadResult::Valid(_) => Ok(true),
             HeaderReadResult::NoLog | HeaderReadResult::Invalid => Ok(false),
@@ -5838,7 +5838,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let wal_max_frame = wal.get_max_frame_in_wal();
         let file = self.get_logical_log_file();
         // This method only reads the header (never encrypted); no need to pass EncryptionContext.
-        let mut reader = StreamingLogicalLogReader::new(file, None);
+        let mut reader = StreamingLogicalLogReader::new(file, None)?;
         let header_result = reader.try_read_header(&pager.io)?;
 
         let is_readonly = connection.db.is_readonly();
@@ -5965,7 +5965,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let pager = connection.pager.load().clone();
         let file = self.get_logical_log_file();
         let enc_ctx = self.storage.encryption_ctx();
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), enc_ctx);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), enc_ctx)?;
         let preserved_table_valued_functions =
             Self::capture_table_valued_functions(&connection.schema.read())?;
 
@@ -6036,7 +6036,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             fresh.generated_columns_enabled =
                 connection.db.experimental_generated_columns_enabled();
             fresh.schema_version = cookie;
-            let mut from_sql_indexes = Vec::with_capacity(10);
+            let mut from_sql_indexes = Vec::try_with_capacity_ext(10)?;
             let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::default();
             let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
             let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();

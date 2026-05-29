@@ -231,6 +231,7 @@
 //! Frame-level atomicity only: torn tails are discarded; partially written frames are not salvaged.
 #![allow(dead_code)]
 
+use crate::alloc::TursoTryWithCapacityExt;
 use crate::io::FileSyncType;
 use crate::sync::Arc;
 use crate::sync::RwLock;
@@ -1445,7 +1446,7 @@ pub(crate) fn parse_ops_from_plaintext(
             plaintext.len()
         )));
     }
-    let mut ops = Vec::with_capacity((op_count as usize).min(1024));
+    let mut ops = Vec::try_with_capacity_ext((op_count as usize).min(1024))?;
     let mut cursor = 0usize;
     for _ in 0..op_count {
         match try_parse_one_op_from_buf(&plaintext[cursor..], commit_ts)? {
@@ -1705,17 +1706,20 @@ impl StreamingLogicalLogReader {
         file: Arc<dyn File>,
         encryption_ctx: Option<EncryptionContext>,
         encrypted_payload_chunk_size: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         let file_size = file.size().expect("failed to get file size") as usize;
         let decrypt_scratch = encryption_ctx
             .as_ref()
-            .map(|enc_ctx| Vec::with_capacity(encrypted_payload_chunk_size + enc_ctx.tag_size()))
+            .map(|enc_ctx| {
+                Vec::try_with_capacity_ext(encrypted_payload_chunk_size + enc_ctx.tag_size())
+            })
+            .transpose()?
             .unwrap_or_default();
-        Self {
+        Ok(Self {
             file,
             offset: 0,
             header: None,
-            buffer: Arc::new(RwLock::new(Vec::with_capacity(4096))),
+            buffer: Arc::new(RwLock::new(Vec::try_with_capacity_ext(4096)?)),
             buffer_offset: 0,
             file_size,
             state: StreamingState::NeedTransactionStart,
@@ -1726,10 +1730,10 @@ impl StreamingLogicalLogReader {
             #[cfg(test)]
             pending_ops: std::collections::VecDeque::new(),
             decrypt_scratch,
-        }
+        })
     }
 
-    pub fn new(file: Arc<dyn File>, encryption_ctx: Option<EncryptionContext>) -> Self {
+    pub fn new(file: Arc<dyn File>, encryption_ctx: Option<EncryptionContext>) -> Result<Self> {
         Self::new_internal(file, encryption_ctx, ENCRYPTED_PAYLOAD_CHUNK_SIZE)
     }
 
@@ -1738,7 +1742,7 @@ impl StreamingLogicalLogReader {
         file: Arc<dyn File>,
         encryption_ctx: Option<EncryptionContext>,
         encrypted_payload_chunk_size: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_internal(file, encryption_ctx, encrypted_payload_chunk_size)
     }
 
@@ -2200,10 +2204,10 @@ impl StreamingLogicalLogReader {
         // it is possible that op might split between two chunks (or even multiple), in that case
         // we need to keep the previous payload, then decrypt the next chunk. Only when we have the
         // full payload, we parse it.
-        let mut carry = Vec::with_capacity(self.encrypted_payload_chunk_size);
+        let mut carry = Vec::try_with_capacity_ext(self.encrypted_payload_chunk_size)?;
         // we allocate some space to keep a vector of parsed ops, we set the 1024 as upper bound
         // size and extend the vector as required.
-        let mut parsed_ops = Vec::with_capacity((op_count as usize).min(1024));
+        let mut parsed_ops = Vec::try_with_capacity_ext((op_count as usize).min(1024))?;
         let chunk_count =
             encrypted_payload_chunk_count(payload_size, self.encrypted_payload_chunk_size);
 
@@ -2358,7 +2362,7 @@ impl StreamingLogicalLogReader {
         commit_ts: u64,
         mut running_crc: u32,
     ) -> Result<PayloadParseResult> {
-        let mut parsed_ops = Vec::with_capacity((op_count as usize).min(1024));
+        let mut parsed_ops = Vec::try_with_capacity_ext((op_count as usize).min(1024))?;
         let mut payload_bytes_read: u64 = 0;
 
         for _ in 0..op_count {
@@ -3287,7 +3291,7 @@ impl StreamingLogicalLogReader {
 
     fn read_exact_at(&self, io: &Arc<dyn crate::IO>, pos: u64, len: usize) -> Result<Vec<u8>> {
         let header_buf = Arc::new(Buffer::new_temporary(len));
-        let out = Arc::new(RwLock::new(Vec::with_capacity(len)));
+        let out = Arc::new(RwLock::new(Vec::try_with_capacity_ext(len)?));
         let out_clone = out.clone();
         let completion: Box<ReadComplete> = Box::new(move |res| {
             let out = out_clone.clone();
@@ -3593,7 +3597,7 @@ mod tests {
     }
 
     fn read_table_ops(file: Arc<dyn crate::File>, io: &Arc<dyn crate::IO>) -> Vec<ExpectedTableOp> {
-        let mut reader = StreamingLogicalLogReader::new(file, None);
+        let mut reader = StreamingLogicalLogReader::new(file, None).unwrap();
         reader.read_header(io).unwrap();
         let mut ops = Vec::new();
         while let Some(frame) = reader.next_frame(io).unwrap() {
@@ -3665,7 +3669,7 @@ mod tests {
         let file = io
             .open_file("logical_log_varint_decode_tmp", OpenFlags::Create, false)
             .unwrap();
-        let mut reader = StreamingLogicalLogReader::new(file, None);
+        let mut reader = StreamingLogicalLogReader::new(file, None).unwrap();
         reader.buffer.write().extend_from_slice(bytes);
         reader.consume_varint_bytes(&io)
     }
@@ -4118,7 +4122,7 @@ mod tests {
                 .unwrap();
             io.wait_for_completion(c).unwrap();
 
-            let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+            let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
             reader.read_header(&io).unwrap();
             let mut seen = 0;
             loop {
@@ -4207,7 +4211,7 @@ mod tests {
 
         append_single_table_op_tx(&mut log, &io, table_id, 7, 11, false, false, "min");
 
-        let mut reader = StreamingLogicalLogReader::new(file, None);
+        let mut reader = StreamingLogicalLogReader::new(file, None).unwrap();
         reader.read_header(&io).unwrap();
         let frame = reader.next_frame(&io).unwrap().expect("expected one frame");
         assert_eq!(frame.len(), 1);
@@ -4312,7 +4316,7 @@ mod tests {
         io.wait_for_completion(c).unwrap();
 
         // Flip one byte in the op data (varint payload_len).
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
         reader.read_header(&io).unwrap();
         // After read_header, reader.offset = LOG_HDR_SIZE.
         // Skip frame header (TX_HEADER_SIZE) + fixed op prefix (tag+flags+table_id = 6 bytes).
@@ -4323,7 +4327,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
         reader.read_header(&io).unwrap();
         let res = reader.next_frame(&io);
         assert!(res.unwrap().is_none());
@@ -4395,7 +4399,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
         reader.read_header(&io).unwrap();
         let res = reader.next_frame(&io);
         assert!(res.unwrap().is_none());
@@ -4421,7 +4425,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
         reader.read_header(&io).unwrap();
         let res = reader.next_frame(&io);
         assert!(res.unwrap().is_none());
@@ -4443,7 +4447,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
         reader.read_header(&io).unwrap();
         let res = reader.next_frame(&io);
         assert!(res.unwrap().is_none());
@@ -4464,7 +4468,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
         reader.read_header(&io).unwrap();
         let res = reader.next_frame(&io);
         assert!(res.unwrap().is_none());
@@ -4535,7 +4539,7 @@ mod tests {
         let c = file.pwrite(0, bad, Completion::new_write(|_| {})).unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
         let res = reader.read_header(&io);
         assert!(res.is_err());
     }
@@ -4558,7 +4562,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
         let res = reader.read_header(&io);
         assert!(res.is_err());
     }
@@ -4595,7 +4599,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
         let res = reader.read_header(&io);
         assert!(res.is_err());
 
@@ -4615,7 +4619,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file, None);
+        let mut reader = StreamingLogicalLogReader::new(file, None).unwrap();
         let result = reader.try_read_header(&io).unwrap();
         assert!(
             matches!(result, HeaderReadResult::Invalid),
@@ -4657,7 +4661,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
         let res = reader.read_header(&io);
         assert!(res.is_err());
     }
@@ -4680,7 +4684,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
         reader.read_header(&io).unwrap();
         let res = reader.next_frame(&io);
         assert!(res.unwrap().is_none());
@@ -4704,7 +4708,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
         reader.read_header(&io).unwrap();
         let res = reader.next_frame(&io);
         assert!(res.unwrap().is_none());
@@ -4737,7 +4741,7 @@ mod tests {
         let c = log.log_tx(header_tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
         reader.read_header(&io).unwrap();
 
         // The reader skips the empty frame and returns the UpdateHeader from frame 2.
@@ -4803,7 +4807,7 @@ mod tests {
                     .unwrap();
                 io.wait_for_completion(c).unwrap();
 
-                let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+                let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
                 reader.read_header(&io).unwrap();
                 let res = reader.next_frame(&io);
                 match res {
@@ -5078,7 +5082,7 @@ mod tests {
             "payload_size at bytes [4..12] must be non-zero for a non-empty op"
         );
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
         reader.read_header(&io).unwrap();
         let frame = reader.next_frame(&io).unwrap().expect("expected one frame");
         assert_eq!(frame.len(), 1);
@@ -5119,7 +5123,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
         reader.read_header(&io).unwrap();
         let header = reader.header().unwrap();
         assert_eq!(header.version, LOG_VERSION_V2);
@@ -5177,7 +5181,7 @@ mod tests {
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file, None);
+        let mut reader = StreamingLogicalLogReader::new(file, None).unwrap();
         let result = reader.try_read_header(&io).unwrap();
         assert!(matches!(result, HeaderReadResult::Invalid));
     }
@@ -5211,7 +5215,7 @@ mod tests {
         append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 20, false, false, "b");
 
         // Reader should see only the new frame (old data was truncated)
-        let mut reader = StreamingLogicalLogReader::new(file, None);
+        let mut reader = StreamingLogicalLogReader::new(file, None).unwrap();
         assert!(matches!(
             reader.try_read_header(&io).unwrap(),
             HeaderReadResult::Valid(_)
@@ -5254,7 +5258,7 @@ mod tests {
         append_single_table_op_tx(&mut log, &io, (-2).into(), 3, 30, false, false, "ccc");
 
         // Without corruption, all 3 frames should read back
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
+        let mut reader = StreamingLogicalLogReader::new(file.clone(), None).unwrap();
         assert!(matches!(
             reader.try_read_header(&io).unwrap(),
             HeaderReadResult::Valid(_)
@@ -5278,7 +5282,7 @@ mod tests {
 
         // Now frame 1 should fail CRC, and frames 2+3 should NOT be returned
         // (chained CRC means the reader stops at the first invalid frame)
-        let mut reader = StreamingLogicalLogReader::new(file, None);
+        let mut reader = StreamingLogicalLogReader::new(file, None).unwrap();
         assert!(matches!(
             reader.try_read_header(&io).unwrap(),
             HeaderReadResult::Valid(_)
@@ -5353,7 +5357,7 @@ mod tests {
         io.wait_for_completion(c).unwrap();
 
         // Read log A — should get 1 valid frame (A's own), then reject the spliced frame
-        let mut reader = StreamingLogicalLogReader::new(file_a, None);
+        let mut reader = StreamingLogicalLogReader::new(file_a, None).unwrap();
         assert!(matches!(
             reader.try_read_header(&io).unwrap(),
             HeaderReadResult::Valid(_)
@@ -5544,7 +5548,7 @@ mod tests {
         if file_size == 0 {
             return Vec::new();
         }
-        let reader = StreamingLogicalLogReader::new(file, None);
+        let reader = StreamingLogicalLogReader::new(file, None).unwrap();
         reader.read_exact_at(io, 0, file_size).unwrap()
     }
 
@@ -5667,7 +5671,7 @@ mod tests {
         io: &Arc<dyn crate::IO>,
         enc_ctx: &crate::storage::encryption::EncryptionContext,
     ) -> Vec<ParsedOp> {
-        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone())).unwrap();
         reader.read_header(io).unwrap();
         let ops = match reader.parse_next_transaction(io).unwrap() {
             ParseResult::Frame(frame) => frame.ops,
@@ -5690,7 +5694,8 @@ mod tests {
             file,
             Some(enc_ctx.clone()),
             encrypted_payload_chunk_size,
-        );
+        )
+        .unwrap();
         reader.read_header(io).unwrap();
         let ops = match reader.parse_next_transaction(io).unwrap() {
             ParseResult::Frame(frame) => frame.ops,
@@ -5713,7 +5718,8 @@ mod tests {
             file,
             Some(enc_ctx.clone()),
             encrypted_payload_chunk_size,
-        );
+        )
+        .map_err(|e| format!("failed to create fuzz log reader: {e}"))?;
         reader
             .read_header(io)
             .map_err(|e| format!("failed to read fuzz log header: {e}"))?;
@@ -6059,7 +6065,7 @@ mod tests {
         io: &Arc<dyn crate::IO>,
         enc_ctx: crate::storage::encryption::EncryptionContext,
     ) {
-        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx)).unwrap();
         reader.read_header(io).unwrap();
         match reader.parse_next_transaction(io).unwrap() {
             ParseResult::InvalidFrame => {}
@@ -6134,7 +6140,7 @@ mod tests {
         );
 
         // ── Roundtrip read ──
-        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx)).unwrap();
         reader.read_header(&io).unwrap();
 
         let ops = match reader.parse_next_transaction(&io).unwrap() {
@@ -6445,7 +6451,7 @@ mod tests {
         let c = log.log_tx(sync_tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file, None);
+        let mut reader = StreamingLogicalLogReader::new(file, None).unwrap();
         reader.read_header(&io).unwrap();
         assert_eq!(reader.header().unwrap().version, LOG_VERSION);
         let first = reader.next_portable_change_frame(&io).unwrap().unwrap();
@@ -6535,7 +6541,7 @@ mod tests {
         io.wait_for_completion(file.pwrite(0, buffer, c).unwrap())
             .unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file, None);
+        let mut reader = StreamingLogicalLogReader::new(file, None).unwrap();
         reader.read_header(&io).unwrap();
         assert_eq!(reader.last_valid_offset(), LOG_HDR_SIZE);
         assert!(reader.next_portable_change_frame(&io).unwrap().is_none());
@@ -6682,7 +6688,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx)).unwrap();
         reader.read_header(&io).unwrap();
         match reader.parse_next_transaction(&io).unwrap() {
             ParseResult::InvalidFrame => {}
@@ -6950,7 +6956,7 @@ mod tests {
             append_encrypted_tx(&mut log, &io, tx);
         }
 
-        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx)).unwrap();
         reader.read_header(&io).unwrap();
 
         for i in 0..5u64 {
@@ -6996,7 +7002,8 @@ mod tests {
             );
             append_encrypted_tx(&mut log, &io, tx);
 
-            let mut reader = StreamingLogicalLogReader::new(file, Some(wrong_key_enc_ctx()));
+            let mut reader =
+                StreamingLogicalLogReader::new(file, Some(wrong_key_enc_ctx())).unwrap();
             reader.read_header(&io).unwrap();
 
             match reader.parse_next_transaction(&io).unwrap() {
@@ -7029,7 +7036,7 @@ mod tests {
             io.wait_for_completion(file.pwrite(corrupt_offset, byte_buf, c).unwrap())
                 .unwrap();
 
-            let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
+            let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone())).unwrap();
             reader.read_header(&io).unwrap();
 
             match reader.parse_next_transaction(&io).unwrap() {
@@ -7060,7 +7067,7 @@ mod tests {
             io.wait_for_completion(file.pwrite(corrupt_offset, byte_buf, c).unwrap())
                 .unwrap();
 
-            let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+            let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx)).unwrap();
             reader.read_header(&io).unwrap();
 
             match reader.parse_next_transaction(&io).unwrap() {
@@ -7100,7 +7107,7 @@ mod tests {
         io.wait_for_completion(file.truncate(truncate_at, c).unwrap())
             .unwrap();
 
-        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
+        let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx)).unwrap();
         reader.read_header(&io).unwrap();
 
         // First frame should parse fine.
@@ -7232,7 +7239,8 @@ mod tests {
                 .unwrap();
             overwrite_file_bytes(file.clone(), &io, &bytes);
             if allow_eof {
-                let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
+                let mut reader =
+                    StreamingLogicalLogReader::new(file, Some(enc_ctx.clone())).unwrap();
                 reader.read_header(&io).unwrap();
                 match reader.parse_next_transaction(&io).unwrap() {
                     ParseResult::InvalidFrame | ParseResult::Eof => {}
@@ -7315,7 +7323,7 @@ mod tests {
                 .unwrap();
             overwrite_file_bytes(file.clone(), &io, &base_bytes[..cut]);
 
-            let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
+            let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone())).unwrap();
             reader.read_header(&io).unwrap();
             match reader.parse_next_transaction(&io).unwrap() {
                 ParseResult::Frame(frame) => {

@@ -2249,7 +2249,8 @@ mod tests {
             conn.clone(),
             true,
             conn.get_sync_mode(),
-        );
+        )
+        .unwrap();
         checkpoint.lock_states.blocking_checkpoint_lock_held = true;
         checkpoint.durable_txid_max_new = 5;
 
@@ -2295,7 +2296,8 @@ mod tests {
             conn.clone(),
             true,
             conn.get_sync_mode(),
-        );
+        )
+        .unwrap();
         checkpoint.lock_states.blocking_checkpoint_lock_held = true;
         checkpoint.durable_txid_max_new = 5;
 

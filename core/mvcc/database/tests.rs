@@ -11351,7 +11351,7 @@ fn collect_mvcc_portable_change_bytes(conn: &Arc<Connection>) -> Vec<u8> {
         .expect("test database must be in MVCC mode")
         .clone();
     let io = conn.get_pager().io.clone();
-    let mut reader = StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), None);
+    let mut reader = StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), None).unwrap();
     reader.read_header(&io).unwrap();
 
     let mut portable_changes = Vec::new();
@@ -11373,7 +11373,8 @@ fn collect_mvcc_portable_change_bytes_with_encryption(
         .clone();
     let io = conn.get_pager().io.clone();
     let mut reader =
-        StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), Some(encryption_ctx));
+        StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), Some(encryption_ctx))
+            .unwrap();
     reader.read_header(&io).unwrap();
 
     let mut portable_changes = Vec::new();
@@ -11391,7 +11392,7 @@ fn collect_mvcc_recovery_ops(conn: &Arc<Connection>) -> Vec<ParsedOp> {
         .expect("test database must be in MVCC mode")
         .clone();
     let io = conn.get_pager().io.clone();
-    let mut reader = StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), None);
+    let mut reader = StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), None).unwrap();
     reader.read_header(&io).unwrap();
 
     let mut ops = Vec::new();
