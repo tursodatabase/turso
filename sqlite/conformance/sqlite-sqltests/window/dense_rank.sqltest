@@ -1,0 +1,173 @@
+@database :memory:
+
+setup dr_base {
+    CREATE TABLE dr_items(id INTEGER PRIMARY KEY, g TEXT, v INTEGER);
+    INSERT INTO dr_items VALUES
+        (1, 'a', 10),
+        (2, 'a', 10),
+        (3, 'a', 20),
+        (4, 'b', 5),
+        (5, 'b', 5),
+        (6, 'b', 5),
+        (7, 'c', 100);
+}
+
+# dense_rank gives no gaps after a peer group: peers share the rank, the
+# next group is just +1 (vs rank which jumps by the group size).
+@setup dr_base
+test dense-rank-basic-with-peers {
+    SELECT id, v, dense_rank() OVER (ORDER BY v) FROM dr_items ORDER BY id;
+}
+expect {
+    1|10|2
+    2|10|2
+    3|20|3
+    4|5|1
+    5|5|1
+    6|5|1
+    7|100|4
+}
+
+@setup dr_base
+test dense-rank-partition-by-group {
+    SELECT id, g, v, dense_rank() OVER (PARTITION BY g ORDER BY v) FROM dr_items ORDER BY id;
+}
+expect {
+    1|a|10|1
+    2|a|10|1
+    3|a|20|2
+    4|b|5|1
+    5|b|5|1
+    6|b|5|1
+    7|c|100|1
+}
+
+@setup dr_base
+test dense-rank-no-order-by {
+    SELECT id, dense_rank() OVER (PARTITION BY g) FROM dr_items ORDER BY id;
+}
+expect {
+    1|1
+    2|1
+    3|1
+    4|1
+    5|1
+    6|1
+    7|1
+}
+
+setup dr_nulls {
+    CREATE TABLE dr_n(v INTEGER);
+    INSERT INTO dr_n VALUES (NULL), (NULL), (1), (2), (2);
+}
+
+@setup dr_nulls
+test dense-rank-null-values-share-rank {
+    SELECT v, dense_rank() OVER (ORDER BY v) FROM dr_n ORDER BY v;
+}
+expect {
+    |1
+    |1
+    1|2
+    2|3
+    2|3
+}
+
+setup dr_empty {
+    CREATE TABLE dr_e(v INTEGER);
+}
+
+@setup dr_empty
+test dense-rank-empty-input {
+    SELECT v, dense_rank() OVER (ORDER BY v) FROM dr_e;
+}
+expect {
+}
+
+@setup dr_base
+test dense-rank-alongside-rank-and-row-number {
+    SELECT id, v,
+           rank() OVER (ORDER BY v),
+           dense_rank() OVER (ORDER BY v),
+           row_number() OVER (ORDER BY v)
+    FROM dr_items ORDER BY id;
+}
+expect {
+    1|10|4|2|4
+    2|10|4|2|5
+    3|20|6|3|6
+    4|5|1|1|1
+    5|5|1|1|2
+    6|5|1|1|3
+    7|100|7|4|7
+}
+
+setup dr_multikey {
+    CREATE TABLE dr_mk(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+    INSERT INTO dr_mk VALUES
+        (1, 1, 1),
+        (2, 1, 1),
+        (3, 1, 2),
+        (4, 2, 1);
+}
+
+@setup dr_multikey
+test dense-rank-multi-column-order-by {
+    SELECT id, a, b, dense_rank() OVER (ORDER BY a, b) FROM dr_mk ORDER BY id;
+}
+expect {
+    1|1|1|1
+    2|1|1|1
+    3|1|2|2
+    4|2|1|3
+}
+
+@setup dr_multikey
+test dense-rank-order-by-desc {
+    SELECT id, a, dense_rank() OVER (ORDER BY a DESC) FROM dr_mk ORDER BY id;
+}
+expect {
+    1|1|2
+    2|1|2
+    3|1|2
+    4|2|1
+}
+
+setup dr_collate {
+    CREATE TABLE dr_c(v TEXT COLLATE NOCASE);
+    INSERT INTO dr_c VALUES ('Apple'), ('apple'), ('Banana'), ('banana');
+}
+
+@setup dr_collate
+test dense-rank-collate-nocase-peers {
+    SELECT v, dense_rank() OVER (ORDER BY v) FROM dr_c ORDER BY v;
+}
+expect {
+    Apple|1
+    apple|1
+    Banana|2
+    banana|2
+}
+
+setup dr_partition_repeated {
+    CREATE TABLE dr_pr(g TEXT, v INTEGER);
+    INSERT INTO dr_pr VALUES
+        ('a', 1), ('a', 1), ('a', 2),
+        ('b', 1), ('b', 2), ('b', 2), ('b', 3);
+}
+
+# Values reappear across partitions; dense_rank must reset to 1 at each
+# partition boundary regardless of what came before.
+@setup dr_partition_repeated
+test dense-rank-resets-across-partitions {
+    SELECT g, v, dense_rank() OVER (PARTITION BY g ORDER BY v) FROM dr_pr;
+}
+expect {
+    a|1|1
+    a|1|1
+    a|2|2
+    b|1|1
+    b|2|2
+    b|2|2
+    b|3|3
+}
