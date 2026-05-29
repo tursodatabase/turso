@@ -1,4 +1,5 @@
 use super::*;
+use crate::{translate::alter::literal_default_value, types::ValueType};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ExprAffinityInfo {
@@ -97,6 +98,63 @@ pub fn get_expr_affinity(
     resolver: Option<&Resolver>,
 ) -> Affinity {
     get_expr_affinity_info(expr, referenced_tables, resolver).affinity
+}
+
+/// Mirrors SQLite's `sqlite3ExprDataType()` (expr.c): a bitmask of the storage
+/// classes an expression could yield. Used to combine column affinities across
+/// the arms of a compound (UNION/INTERSECT/EXCEPT) subquery.
+///
+///   0x01 = numeric, 0x02 = text, 0x04 = blob; 0x00 = always NULL.
+pub(crate) fn expr_data_type(expr: &ast::Expr, referenced_tables: Option<&TableReferences>) -> u8 {
+    match expr {
+        ast::Expr::Collate(inner, _) | ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
+            expr_data_type(inner, referenced_tables)
+        }
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            expr_data_type(exprs.first().unwrap(), referenced_tables)
+        }
+        // A literal's storage class is its data type; reuse the literal->Value
+        // inference rather than re-deriving the class from the AST here.
+        ast::Expr::Literal(lit) => match literal_default_value(lit).map(|v| v.value_type()) {
+            Ok(ValueType::Null) => 0x00,
+            Ok(ValueType::Text) => 0x02,
+            Ok(ValueType::Blob) => 0x04,
+            // Integer/Float (and the fallback for keyword literals) are numeric.
+            _ => 0x01,
+        },
+        ast::Expr::Binary(_, ast::Operator::Concat, _) => 0x06,
+        ast::Expr::FunctionCall { .. }
+        | ast::Expr::FunctionCallStar { .. }
+        | ast::Expr::Variable(_) => 0x07,
+        ast::Expr::Column { .. }
+        | ast::Expr::RowId { .. }
+        | ast::Expr::Cast { .. }
+        | ast::Expr::Subquery(_) => {
+            let aff = get_expr_affinity(expr, referenced_tables, None);
+            if aff.is_numeric() {
+                0x05
+            } else if matches!(aff, Affinity::Text) {
+                0x06
+            } else {
+                0x07
+            }
+        }
+        ast::Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } => {
+            let mut res = 0;
+            for (_, then) in when_then_pairs {
+                res |= expr_data_type(then, referenced_tables);
+            }
+            if let Some(else_expr) = else_expr {
+                res |= expr_data_type(else_expr, referenced_tables);
+            }
+            res
+        }
+        _ => 0x01,
+    }
 }
 
 pub fn comparison_affinity(

@@ -289,7 +289,7 @@ fn emit_delete_sqlite_sequence_entry(
     });
 }
 
-fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
+pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
     match literal {
         ast::Literal::Numeric(val) => parse_numeric_literal(val),
         ast::Literal::String(s) => Ok(Value::from_text(crate::translate::expr::sanitize_string(s))),
