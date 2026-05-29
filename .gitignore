@@ -70,6 +70,9 @@ settings.local.json
 !testing/sqltests/database/*
 testing/sqltests/database/integrity_*.db
 
+# Track committed integration-test fixture databases
+!tests/integration/fixtures/*.db
+
 
 # For simulator redo
 test.sql

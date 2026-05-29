@@ -8697,18 +8697,22 @@ pub fn op_function(
                     };
                     let rename_to = normalize_ident(original_rename_to.as_str());
 
+                    // sqlite_schema stores names with their original case, so match the old
+                    // name case-insensitively (ASCII) and write the new name with the
+                    // user-provided case, matching SQLite.
+                    let normalized_name = normalize_ident(&name);
                     let new_name = if let Some(column) =
-                        &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
+                        normalized_name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
                     {
-                        format!("sqlite_autoindex_{rename_to}_{column}")
-                    } else if name == rename_from {
-                        rename_to.clone()
+                        format!("sqlite_autoindex_{}_{column}", original_rename_to.as_str())
+                    } else if normalized_name == rename_from {
+                        original_rename_to.as_str().to_string()
                     } else {
                         name
                     };
 
-                    let new_tbl_name = if tbl_name == rename_from {
-                        rename_to.clone()
+                    let new_tbl_name = if normalize_ident(&tbl_name) == rename_from {
+                        original_rename_to.as_str().to_string()
                     } else {
                         tbl_name
                     };
@@ -13198,10 +13202,15 @@ pub fn op_rename_table(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RenameTable { db, from, to }, insn);
 
-    let normalized_from = normalize_ident(from.as_str());
+    let raw_normalized_from = normalize_ident(from.as_str());
     let normalized_to = normalize_ident(to.as_str());
 
     let conn = program.connection.clone();
+
+    // Resolve `from` through the legacy alias fallback so that a table loaded from a pre-fix
+    // (#5730) database — keyed by its Unicode-lowercased name — is found, instead of panicking
+    // on a missing entry.
+    let normalized_from = conn.with_schema(*db, |s| s.normalize_table_lookup_name(from.as_str()));
 
     conn.with_database_schema_mut(*db, |schema| -> crate::Result<()> {
         if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
@@ -13245,6 +13254,10 @@ pub fn op_rename_table(
                 }
 
                 normalized_to.clone_into(&mut btree.name);
+                // Track the user-typed new name as the display name so SQLite-compatible
+                // metadata writes (e.g. sqlite_sequence) and subsequent renames see the
+                // post-rename original case, not the stale create-time identifier.
+                btree.name_display = Some(to.as_str().to_string());
             }
             Table::Virtual(vtab) => {
                 Arc::make_mut(vtab).name.clone_from(&normalized_to);
@@ -13255,6 +13268,14 @@ pub fn op_rename_table(
         #[cfg(feature = "conn_raw_api")]
         schema.register_table_root_page(&normalized_to, table.as_ref());
         schema.tables.insert(normalized_to.to_owned(), table);
+
+        // Any legacy alias pointing at the renamed key is now stale: the entry under
+        // `normalized_from` is gone, so an alias `cŒur -> cœur` (or similar) would resolve to a
+        // missing entry. Drop those entries so subsequent CREATE TABLE/index lookups behave like
+        // the post-rename state.
+        schema
+            .legacy_case_aliases
+            .retain(|_, key| key != &normalized_from);
 
         for (tname, t_arc) in schema.tables.iter_mut() {
             // skip the table we just renamed
@@ -13302,11 +13323,11 @@ pub fn op_rename_table(
         conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| -> crate::Result<()> {
             for triggers in schema.triggers.values_mut() {
                 for trigger_arc in triggers.iter_mut() {
-                    if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
+                    if !sql_might_reference_identifier(&trigger_arc.sql, &raw_normalized_from) {
                         continue;
                     }
                     let trigger = Arc::make_mut(trigger_arc);
-                    rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                    rewrite_trigger_for_table_rename(trigger, &raw_normalized_from, &normalized_to);
                 }
             }
             Ok(())

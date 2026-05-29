@@ -603,7 +603,7 @@ pub const RESERVED_TABLE_PREFIXES: [&str; 2] = ["sqlite_", "__turso_internal_"];
 pub fn is_system_table(table_name: &str) -> bool {
     RESERVED_TABLE_PREFIXES
         .iter()
-        .any(|prefix| table_name.to_lowercase().starts_with(prefix))
+        .any(|prefix| table_name.to_ascii_lowercase().starts_with(prefix))
 }
 
 pub fn allow_user_dml(table_name: &str) -> bool {
@@ -625,6 +625,14 @@ pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
     #[cfg(feature = "conn_raw_api")]
     pub(crate) table_names_by_root_page: HashMap<i64, String>,
+
+    /// Aliases for tables persisted by a pre-fix Turso version affected by
+    /// https://github.com/tursodatabase/turso/issues/5730 (Unicode-lowercased
+    /// identifiers). Maps the ASCII-folded original name (from the `sql` column)
+    /// to the key the table is actually stored under in `tables` (the ASCII-fold
+    /// of the lowercased name persisted on disk). Used as a lookup fallback so such
+    /// a table stays addressable by its original case, e.g. `CŒUR`.
+    pub legacy_case_aliases: HashMap<String, String>,
 
     /// Track which tables are actually materialized views
     pub materialized_view_names: HashSet<String>,
@@ -721,16 +729,23 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
 }
 
 impl Schema {
-    fn normalize_table_lookup_name(&self, name: &str) -> String {
+    pub(crate) fn normalize_table_lookup_name(&self, name: &str) -> String {
         let name = normalize_ident(name);
         if name.eq(SCHEMA_TABLE_NAME_ALT)
             || name.eq(TEMP_SCHEMA_TABLE_NAME)
             || name.eq(TEMP_SCHEMA_TABLE_NAME_ALT)
         {
-            SCHEMA_TABLE_NAME.to_string()
-        } else {
-            name
+            return SCHEMA_TABLE_NAME.to_string();
         }
+        // Fallback for databases written by a pre-fix Turso version (#5730): if nothing is keyed
+        // under this ASCII-folded name but it is the original case of a table whose persisted name
+        // was Unicode-lowercased, resolve to that table's stored key.
+        if !self.tables.contains_key(&name) {
+            if let Some(key) = self.legacy_case_aliases.get(&name) {
+                return key.clone();
+            }
+        }
+        name
     }
 
     /// Create a schema with custom types enabled.
@@ -776,6 +791,7 @@ impl Schema {
             tables,
             #[cfg(feature = "conn_raw_api")]
             table_names_by_root_page,
+            legacy_case_aliases: HashMap::default(),
             materialized_view_names,
             materialized_view_sql,
             incremental_views,
@@ -1119,7 +1135,7 @@ impl Schema {
         Ok(())
     }
     pub fn remove_triggers_for_table(&mut self, table_name: &str) {
-        let table_name = normalize_ident(table_name);
+        let table_name = self.normalize_table_lookup_name(table_name);
         self.triggers.remove(&table_name);
     }
 
@@ -1210,7 +1226,10 @@ impl Schema {
     }
 
     pub fn remove_table(&mut self, table_name: &str) {
-        let name = normalize_ident(table_name);
+        // Resolve through the legacy alias fallback so a table loaded from a pre-fix(#5730)
+        // database (keyed by its Unicode-lowercased name) is actually removed; otherwise a stale
+        // in-memory entry would keep referencing the now-freed root page.
+        let name = self.normalize_table_lookup_name(table_name);
         #[cfg(feature = "conn_raw_api")]
         {
             if let Some(table) = self.tables.remove(&name) {
@@ -1221,6 +1240,7 @@ impl Schema {
         {
             self.tables.remove(&name);
         }
+        self.legacy_case_aliases.retain(|_, key| key != &name);
         self.analyze_stats.remove_table(&name);
 
         // If this was a materialized view, also clean up the metadata
@@ -1256,7 +1276,10 @@ impl Schema {
 
     pub fn add_index(&mut self, index: Arc<Index>) -> Result<()> {
         self.check_object_name_conflict(&index.name)?;
-        let table_name = normalize_ident(&index.table_name);
+        // Alias-aware so that an index created on a table loaded from a pre-fix(#5730) database
+        // (keyed by its Unicode-lowercased name) gets stored under the same key as its table.
+        // Without this the index lands under a key no lookup for the actual table hits.
+        let table_name = self.normalize_table_lookup_name(&index.table_name);
         // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
         // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
         // then we would evaluate ON CONFLICT DO UPDATE clauses in the wrong index iteration order and UPDATE the wrong row.
@@ -1292,7 +1315,7 @@ impl Schema {
     }
 
     pub fn get_indices(&self, table_name: &str) -> impl Iterator<Item = &Arc<Index>> {
-        let name = normalize_ident(table_name);
+        let name = self.normalize_table_lookup_name(table_name);
         self.indexes
             .get(&name)
             .map(|v| v.iter())
@@ -1310,7 +1333,7 @@ impl Schema {
     }
 
     pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
-        let name = normalize_ident(table_name);
+        let name = self.normalize_table_lookup_name(table_name);
         self.indexes
             .get(&name)?
             .iter()
@@ -1318,13 +1341,15 @@ impl Schema {
     }
 
     pub fn remove_indices_for_table(&mut self, table_name: &str) {
-        let name = normalize_ident(table_name);
+        // Fallback-aware so indices of a table loaded from a pre-fix(#5730) database
+        // (keyed by its Unicode-lowercased name) are removed on DROP.
+        let name = self.normalize_table_lookup_name(table_name);
         self.indexes.remove(&name);
         self.analyze_stats.remove_table(&name);
     }
 
     pub fn remove_index(&mut self, idx: &Index) {
-        let name = normalize_ident(&idx.table_name);
+        let name = self.normalize_table_lookup_name(&idx.table_name);
         self.indexes
             .get_mut(&name)
             .expect("Must have the index")
@@ -1333,12 +1358,13 @@ impl Schema {
     }
 
     pub fn table_has_indexes(&self, table_name: &str) -> bool {
-        let name = normalize_ident(table_name);
+        let name = self.normalize_table_lookup_name(table_name);
         self.has_indexes.contains(&name)
     }
 
     pub fn table_set_has_index(&mut self, table_name: &str) {
-        self.has_indexes.insert(table_name.to_string());
+        let name = self.normalize_table_lookup_name(table_name);
+        self.has_indexes.insert(name);
     }
 
     /// Update [Schema] by scanning the first root page (sqlite_schema)
@@ -1707,6 +1733,7 @@ impl Schema {
                 BTreeTable::build_logical_to_physical_map(&cols, &[], true);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
+                name_display: None,
                 root_page: main_root,
                 columns: cols,
                 primary_key_columns: Vec::new(),
@@ -1820,6 +1847,25 @@ impl Schema {
                     }
 
                     let mut table = table;
+                    // Compatibility with databases written by an older Turso version affected by
+                    // https://github.com/tursodatabase/turso/issues/5730, which folded identifiers
+                    // with Unicode lowercasing. Such a version persisted e.g. a table created as
+                    // `CŒUR` as `cœur` in sqlite_schema.name while the `sql` column kept the original
+                    // mixed/upper case. Folding is now ASCII-only, so the name parsed from `sql`
+                    // (`table.name`) no longer ASCII-fold-matches the lowercased name on disk. When
+                    // we detect that mismatch (lowercased stored name vs mixed-case sql), we know
+                    // this row predates the fix; key the table by the persisted name so it stays
+                    // addressable by what is physically stored and DROP/ALTER can match it.
+                    let stored_key = normalize_ident(name);
+                    if stored_key != table.name {
+                        // Record an alias from the original ASCII-folded name (`table.name`, taken
+                        // from `sql`) to the persisted key, so the table stays addressable by its
+                        // original case (e.g. `CŒUR`) via normalize_table_lookup_name's fallback,
+                        // then key it by what is physically stored so DROP/ALTER can match the row.
+                        self.legacy_case_aliases
+                            .insert(table.name.clone(), stored_key.clone());
+                        table.name = stored_key;
+                    }
                     table.resolve_custom_type_affinities(self);
                     table.propagate_domain_constraints(self)?;
                     self.add_btree_table(Arc::new(table))?;
@@ -2184,8 +2230,17 @@ impl Schema {
 
     /// Returns the type of schema object with the given name, if one exists.
     /// Checks tables, views, and indexes.
+    ///
+    /// This is used for CREATE-time conflict checks, so it intentionally does NOT apply the
+    /// legacy-Unicode alias fallback: a name that ASCII-folds distinct from an existing entry
+    /// must be creatable, even if the alias map would otherwise route it to that entry. The
+    /// alias is for runtime *lookup* (resolving an existing legacy table by its original case),
+    /// not for *blocking* the creation of a sibling identifier that happens to share the alias
+    /// key. With the fallback applied here, e.g. `CREATE TABLE CŒUR` on a legacy db that
+    /// already holds `cœur` would falsely report a conflict because both fold to `cŒur` and the
+    /// alias resolves it to `cœur`.
     pub fn get_object_type(&self, name: &str) -> Option<SchemaObjectType> {
-        let normalized_name = self.normalize_table_lookup_name(name);
+        let normalized_name = normalize_ident(name);
 
         if self.tables.contains_key(&normalized_name) {
             return Some(SchemaObjectType::Table);
@@ -2285,6 +2340,7 @@ impl Clone for Schema {
             tables,
             #[cfg(feature = "conn_raw_api")]
             table_names_by_root_page: self.table_names_by_root_page.clone(),
+            legacy_case_aliases: self.legacy_case_aliases.clone(),
             materialized_view_names,
             materialized_view_sql,
             incremental_views,
@@ -2699,6 +2755,12 @@ impl GeneratedColGraph {
 pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
+    /// Original-case identifier captured from the user's CREATE TABLE statement (or the SQL
+    /// stored in `sqlite_schema.sql`). `name` is the ASCII-folded lookup key used everywhere
+    /// internally; `name_display` preserves the case the user wrote, which is what must be
+    /// persisted alongside the row in tables like `sqlite_sequence` to match SQLite. Defaults
+    /// to `None`, in which case [`Self::display_name`] falls back to `name`.
+    pub name_display: Option<String>,
     pub primary_key_columns: Vec<(String, SortOrder)>,
     columns: Vec<Column>,
     pub has_rowid: bool,
@@ -2765,6 +2827,7 @@ impl BTreeTable {
         Self {
             root_page,
             name,
+            name_display: None,
             primary_key_columns,
             columns,
             has_rowid,
@@ -2778,6 +2841,13 @@ impl BTreeTable {
             logical_to_physical_map,
             column_dependencies: Default::default(),
         }
+    }
+
+    /// Returns the original-case identifier suitable for persisting in SQLite-compatible
+    /// metadata tables (e.g. `sqlite_sequence`). Falls back to the normalized lookup key when
+    /// no display name was captured.
+    pub fn display_name(&self) -> &str {
+        self.name_display.as_deref().unwrap_or(&self.name)
     }
 
     pub fn columns(&self) -> &[Column] {
@@ -3697,6 +3767,10 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
 
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
+    // `tbl_name` arrives un-normalized here (either typed by the user at CREATE TABLE time, or
+    // parsed straight from `sqlite_schema.sql`), so it preserves the original case. Keep it so
+    // it can be persisted alongside the row in SQLite-compatible metadata tables.
+    let table_name_display = tbl_name.to_string();
     trace!("Creating table {}", table_name);
     let has_rowid;
     let mut has_autoincrement = false;
@@ -4195,6 +4269,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut table = BTreeTable {
         root_page,
         name: table_name,
+        name_display: Some(table_name_display),
         has_rowid,
         primary_key_columns,
         has_autoincrement,
@@ -4908,6 +4983,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
     BTreeTable {
         root_page: 1,
         name: "sqlite_schema".to_string(),
+        name_display: None,
         has_rowid: true,
         is_strict: false,
         has_autoincrement: false,
@@ -5702,6 +5778,7 @@ mod tests {
         let table = BTreeTable {
             root_page: 0,
             name: "t1".to_string(),
+            name_display: None,
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,

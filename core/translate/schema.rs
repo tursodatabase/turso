@@ -10,6 +10,7 @@ use crate::schema::{
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
@@ -1131,6 +1132,10 @@ pub fn translate_create_table(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
+    // Original-case name persisted into sqlite_schema (name/tbl_name), matching SQLite.
+    // `normalized_tbl_name` is kept for case-insensitive validation, conflict checks and
+    // in-memory schema keys.
+    let display_tbl_name = tbl_name.name.as_str().to_string();
     validate(&body, &normalized_tbl_name, resolver, connection)?;
 
     // Gate array column types behind the experimental custom types flag.
@@ -1372,8 +1377,8 @@ pub fn translate_create_table(
         sqlite_schema_cursor_id,
         cdc_table.as_ref().map(|x| x.0),
         SchemaEntryType::Table,
-        &normalized_tbl_name,
-        &normalized_tbl_name,
+        &display_tbl_name,
+        &display_tbl_name,
         table_root_reg,
         Some(sql),
     )?;
@@ -1382,7 +1387,7 @@ pub fn translate_create_table(
         for (idx, index_reg) in index_regs.into_iter().enumerate() {
             let index_name = format!(
                 "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_{}",
-                normalized_tbl_name,
+                display_tbl_name,
                 idx + 1
             );
             emit_schema_entry(
@@ -1392,7 +1397,7 @@ pub fn translate_create_table(
                 None,
                 SchemaEntryType::Index,
                 &index_name,
-                &normalized_tbl_name,
+                &display_tbl_name,
                 index_reg,
                 None,
             )?;
@@ -1409,7 +1414,12 @@ pub fn translate_create_table(
     });
 
     // TODO: remove format, it sucks for performance but is convenient
-    let escaped_tbl_name = escape_sql_string_literal(&normalized_tbl_name);
+    // Match the verbatim name we just persisted into sqlite_schema; the row whose tbl_name we
+    // are looking up was inserted by this same CREATE TABLE statement using this exact string,
+    // so a case-sensitive equality is sufficient (this is what SQLite's `sqlite3EndTable` does).
+    // Avoiding COLLATE NOCASE here also keeps op_parse_schema off the global collation registry
+    // lock, which deadlocks the shuttle scheduler when entered from a nested statement.
+    let escaped_tbl_name = escape_sql_string_literal(&display_tbl_name);
     let mut parse_schema_where_clause =
         format!("tbl_name = '{escaped_tbl_name}' AND type != 'trigger'");
     if created_sequence_table {
@@ -1819,7 +1829,10 @@ pub fn translate_drop_table(
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);
     let table_name_and_root_page_register = program.alloc_register(); //  r2, this register is special because it's first used to track table name and then moved root page
-    let table_reg = program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str())); //  r3
+                                                                      // Match by the resolved table's stored name (not the typed name): on a pre-fix(#5730)
+                                                                      // database the persisted name is the Unicode-lowercased form, which is what `table` is keyed
+                                                                      // by, so this is what the sqlite_schema rows actually contain.
+    let table_reg = program.emit_string8_new_reg(normalize_ident(table.get_name())); //  r3
     program.mark_last_insn_constant();
     let _table_type = program.emit_string8_new_reg("trigger".to_string()); //  r4
     program.mark_last_insn_constant();
@@ -1853,12 +1866,14 @@ pub fn translate_drop_table(
         table_name_and_root_page_register,
     );
     let next_label = program.allocate_label();
+    // Match sqlite_schema rows by tbl_name case-insensitively (ASCII), since names are now
+    // stored with their original case. NOCASE keeps `café` and `CAFÉ` distinct.
     program.emit_insn(Insn::Ne {
         lhs: table_name_and_root_page_register,
         rhs: table_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: Some(CollationSeq::NoCase),
     });
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id_0,
@@ -2256,8 +2271,11 @@ pub fn translate_drop_table(
     {
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
         let seq_table_name_reg = program.alloc_register();
+        // sqlite_sequence row names are now persisted in original case (matching SQLite).
+        // Emit the user-typed name and use NOCASE so we still match rows written by a pre-fix
+        // Turso version that lowercased them.
         let dropped_table_name_reg =
-            program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()));
+            program.emit_string8_new_reg(tbl_name.name.as_str().to_string());
         program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {
@@ -2284,7 +2302,7 @@ pub fn translate_drop_table(
             rhs: dropped_table_name_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: Some(CollationSeq::NoCase),
         });
 
         program.emit_insn(Insn::Delete {

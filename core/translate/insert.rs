@@ -1625,7 +1625,10 @@ fn open_autoincrement_state(
         db: ctx.database_id,
     });
 
-    let table_name_reg = program.emit_string8_new_reg(ctx.table.name.clone());
+    // sqlite_sequence stores the table name with its original case, matching SQLite. Lookups
+    // against existing rows use NOCASE so this still finds rows persisted by a pre-fix Turso
+    // version (which lowercased the stored name).
+    let table_name_reg = program.emit_string8_new_reg(ctx.table.display_name().to_string());
     let r_seq = program.alloc_register();
     let r_seq_rowid = program.alloc_register();
 
@@ -1676,12 +1679,14 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
 
     let name_col_reg = program.alloc_register();
     program.emit_column_or_rowid(seq_cursor_id, 0, name_col_reg);
+    // NOCASE so we still find rows written by a pre-fix Turso version that lowercased the
+    // stored name (table_name_reg now holds the original case).
     program.emit_insn(Insn::Ne {
         lhs: table_name_reg,
         rhs: name_col_reg,
         target_pc: found_label,
         flags: Default::default(),
-        collation: None,
+        collation: Some(crate::translate::collate::CollationSeq::NoCase),
     });
 
     program.emit_column_or_rowid(seq_cursor_id, 1, r_seq);
@@ -3319,7 +3324,10 @@ fn ensure_sequence_initialized(
         db: database_id,
     });
 
-    let table_name_reg = program.emit_string8_new_reg(table.name.clone());
+    // sqlite_sequence stores the table name in its original case to match SQLite. NOCASE keeps
+    // lookups working against rows persisted by a pre-fix Turso version, which lowercased the
+    // stored name.
+    let table_name_reg = program.emit_string8_new_reg(table.display_name().to_string());
 
     let loop_start_label = program.allocate_label();
     let entry_exists_label = program.allocate_label();
@@ -3341,7 +3349,7 @@ fn ensure_sequence_initialized(
         rhs: name_col_reg,
         target_pc: entry_exists_label,
         flags: Default::default(),
-        collation: None,
+        collation: Some(crate::translate::collate::CollationSeq::NoCase),
     });
 
     program.emit_insn(Insn::Next {

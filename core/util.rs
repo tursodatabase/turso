@@ -119,8 +119,9 @@ const QUOTE_PAIRS: &[(char, char)] = &[
 ];
 
 pub fn normalize_ident(identifier: &str) -> String {
-    // quotes normalization already happened in the parser layer (see Name ast node implementation)
-    // so, we only need to apply SQLite's ASCII-only identifier case folding.
+    // Quote normalization already happened in the parser layer (see Name ast node implementation).
+    // Identifier folding is ASCII-only, matching SQLite: 'A'..='Z' fold to lowercase, but
+    // non-ASCII letters are left untouched, so e.g. `cœur` and `CŒUR` are distinct identifiers.
     identifier.to_ascii_lowercase()
 }
 
@@ -4781,7 +4782,10 @@ pub mod tests {
     fn test_normalize_ident() {
         assert_eq!(normalize_ident("foo"), "foo");
         assert_eq!(normalize_ident("FOO"), "foo");
-        // SQLite folds only ASCII; non-ASCII bytes pass through untouched.
+        // Folding is ASCII-only, matching SQLite: ASCII letters fold, non-ASCII are left as-is.
+        // So `café`/`CAFÉ` and `cœur`/`CŒUR` remain distinct identifiers.
+        assert_eq!(normalize_ident("CAFÉ"), "cafÉ");
+        assert_eq!(normalize_ident("CŒUR"), "cŒur");
         assert_eq!(normalize_ident("ὈΔΥΣΣΕΎΣ"), "ὈΔΥΣΣΕΎΣ");
         assert_eq!(normalize_ident("Foo_ΔΥΣ"), "foo_ΔΥΣ");
     }
