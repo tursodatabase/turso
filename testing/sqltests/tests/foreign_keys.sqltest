@@ -72,6 +72,139 @@ expect error {
 }
 
 @cross-check-integrity
+test fk-delete-parent-null-key-scan-no-match {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER UNIQUE);
+    CREATE TABLE c(x INTEGER REFERENCES p(a));
+    INSERT INTO p(a) VALUES(NULL),(5);
+    INSERT INTO c(x) VALUES(5);
+    DELETE FROM p WHERE a IS NULL;
+    SELECT a FROM p ORDER BY a;
+}
+expect {
+    5
+}
+
+@cross-check-integrity
+test fk-delete-parent-null-key-index-no-match {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER UNIQUE);
+    CREATE TABLE c(x INTEGER REFERENCES p(a));
+    CREATE INDEX c_x ON c(x);
+    INSERT INTO p(a) VALUES(NULL),(5);
+    INSERT INTO c(x) VALUES(5),(NULL);
+    DELETE FROM p WHERE a IS NULL;
+    SELECT a FROM p ORDER BY a;
+}
+expect {
+    5
+}
+
+@cross-check-integrity
+test fk-selfref-delete-parent-null-key-scan-no-match {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        a INTEGER UNIQUE,
+        FOREIGN KEY(a) REFERENCES t(a)
+    );
+    INSERT INTO t(id,a) VALUES(1,NULL),(2,5);
+    DELETE FROM t WHERE id=1;
+    SELECT id,a FROM t ORDER BY id;
+}
+expect {
+    2|5
+}
+
+@cross-check-integrity
+test fk-selfref-update-parent-null-key-index-no-match {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        a INTEGER UNIQUE,
+        FOREIGN KEY(a) REFERENCES t(a)
+    );
+    INSERT INTO t(id,a) VALUES(1,NULL);
+    UPDATE t SET a=5 WHERE id=1;
+    SELECT id,a FROM t;
+}
+expect {
+    1|5
+}
+
+@cross-check-integrity
+test fk-delete-parent-blocked-child-rowid-alias-scan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER PRIMARY KEY REFERENCES p(id));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    DELETE FROM p WHERE id=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-delete-parent-blocked-child-virtual-generated-scan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER UNIQUE);
+    CREATE TABLE c(
+        raw INT,
+        fk INT GENERATED ALWAYS AS (raw * 2) VIRTUAL,
+        FOREIGN KEY(fk) REFERENCES p(a)
+    );
+    INSERT INTO p VALUES(10);
+    INSERT INTO c(raw) VALUES(5);
+    DELETE FROM p WHERE a=10;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-delete-parent-blocked-child-rowid-alias-plus-virtual-generated-scan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, a INT, UNIQUE(id,a));
+    CREATE TABLE child(
+        pid INTEGER PRIMARY KEY,
+        raw INT,
+        fk INT GENERATED ALWAYS AS (raw * 2) VIRTUAL,
+        FOREIGN KEY(pid, fk) REFERENCES parent(id, a)
+    );
+    INSERT INTO parent(id,a) VALUES(1,10);
+    INSERT INTO child(pid,raw) VALUES(1,5);
+    DELETE FROM parent WHERE id=1 AND a=10;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-parent-null-insert-does-not-clear-unrelated {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER UNIQUE);
+    CREATE TABLE c(x REFERENCES p(a) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES(5);
+    INSERT INTO p VALUES(NULL);
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-parent-null-insert-index-does-not-clear-unrelated {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER UNIQUE);
+    CREATE TABLE c(x REFERENCES p(a) DEFERRABLE INITIALLY DEFERRED);
+    CREATE INDEX c_x ON c(x);
+    BEGIN;
+    INSERT INTO c VALUES(5);
+    INSERT INTO p VALUES(NULL);
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
 test fk-delete-parent-ok-when-no-child {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
@@ -706,6 +839,23 @@ test fk-deferred-fix-before-commit-succeeds {
 }
 expect {
     99
+}
+
+@cross-check-integrity
+test fk-deferred-fix-before-commit-succeeds-child-rowid-alias {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(
+        pid INTEGER PRIMARY KEY REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    BEGIN;
+    INSERT INTO c(pid) VALUES(1);
+    INSERT INTO p(id) VALUES(1);
+    COMMIT;
+    SELECT pid FROM c;
+}
+expect {
+    1
 }
 
 #  ROLLBACK clears deferred state; a new tx can still fail if violation persists
@@ -2056,6 +2206,19 @@ test fk-update-parent-int-pk {
 expect error {
 }
 
+# Single column INTEGER PRIMARY KEY with child rowid alias FK column
+@cross-check-integrity
+test fk-update-parent-int-pk-child-rowid-alias-scan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(pid INTEGER PRIMARY KEY REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(1);
+    UPDATE parent SET id = 2 WHERE id = 1;
+}
+expect error {
+}
+
 # Single column TEXT PRIMARY KEY
 @cross-check-integrity
 test fk-update-parent-text-pk {
@@ -3055,6 +3218,35 @@ test fk-drop-parent-with-child-references {
     CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
     INSERT INTO parent VALUES(1);
     INSERT INTO child VALUES(10, 1);
+    DROP TABLE parent;
+}
+expect error {
+}
+
+# DROP parent table should fail when child FK is a rowid alias that references it
+@cross-check-integrity
+test fk-drop-parent-with-child-rowid-alias-reference {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(pid INTEGER PRIMARY KEY REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(1);
+    DROP TABLE parent;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-drop-parent-with-child-virtual-generated-reference {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INTEGER UNIQUE);
+    CREATE TABLE child(
+        raw INT,
+        fk INT GENERATED ALWAYS AS (raw * 2) VIRTUAL,
+        FOREIGN KEY(fk) REFERENCES parent(a)
+    );
+    INSERT INTO parent VALUES(10);
+    INSERT INTO child(raw) VALUES(5);
     DROP TABLE parent;
 }
 expect error {
