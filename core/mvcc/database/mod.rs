@@ -903,12 +903,17 @@ impl Transaction {
             return Ok(commits_transaction);
         }
 
-        let drained: Vec<Savepoint> = savepoints.drain(target_idx..).try_collect()?;
-        if let Some(parent) = savepoints.last_mut() {
-            for savepoint in drained {
-                parent.merge_from(savepoint);
+        // Instead of using drain and collecting into a Vector, we can split the vec in 2 and then mem::take and then later
+        // just truncate the savepoints Vec
+        if let Some((rest, drained)) = savepoints.split_at_mut_checked(target_idx) {
+            if let Some(parent) = rest.last_mut() {
+                for savepoint in drained {
+                    parent.merge_from(std::mem::take(savepoint));
+                }
             }
-        }
+            savepoints.truncate(target_idx);
+        };
+
         Ok(commits_transaction)
     }
 
@@ -945,6 +950,7 @@ impl Transaction {
         let header_dirty = savepoints[target_idx].header_dirty;
 
         let drained: Vec<Savepoint> = savepoints.drain(target_idx..).try_collect()?;
+        // Should be safe to use this method as we just drained the Savepoints vec so it should have capacity
         savepoints.push(Savepoint::named(
             target_name,
             starts_transaction,
