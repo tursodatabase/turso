@@ -6505,10 +6505,10 @@ fn test_should_checkpoint_after_recovery_uses_recovered_offset() {
     let _conn = db.connect();
     let mv_store = db.get_mvcc_store();
 
-    // We used to assert on the concrete logical-log offset here, but MVCC durable storage
-    // is now abstracted behind a trait object (to allow injecting custom implementations).
-    // Validate behavior instead: after recovery, the recovered offset should be reflected
-    // in should_checkpoint() when the threshold is set very low.
+    // Durable storage is behind a trait object (custom implementations can be
+    // injected), so validate behavior rather than the concrete logical-log offset:
+    // after recovery the recovered offset should make should_checkpoint() fire once
+    // the threshold is set very low.
     mv_store.set_checkpoint_threshold(1);
     assert!(
         mv_store.storage.should_checkpoint(),
@@ -13844,5 +13844,1514 @@ fn test_global_header_regression_would_lose_committed_user_version() {
         rows[0][0].as_int().unwrap(),
         42,
         "older out-of-order FinalizeCommit regressed committed PRAGMA user_version"
+    );
+}
+
+// ===========================================================================
+// Model-based crash fuzzing: Quint generates the sequences, the adapter crashes
+// every IO and interleaves commits into the checkpoint's unlocked phase.
+//
+// `docs/internals/mvcc/checkpoint.qnt` specifies the checkpoint durability
+// contract (invariant `recoverySafe`): from any reachable durable state recovery
+// reconstructs exactly the committed set. The checkpoint is modeled as a
+// multi-phase, NON-BLOCKING process — a commit may interleave during its unlocked
+// prepare phase and must survive. `mbt_gen.py` exports diverse sequences (commit
+// / checkpointStart / checkpointFillWal / checkpointBackfillDb /
+// checkpointTruncateLog) into `mbt_traces.mbt`.
+//
+// The adapter groups each trace into episodes (a standalone commit, or a
+// checkpoint with the commits that interleaved its prepare phase) and crash-tests
+// each at every mutating IO under strict + probabilistic durability:
+//   - commit episode     -> crash the INSERT; assert atomicity (all-or-nothing).
+//   - checkpoint episode -> crash conn.checkpoint() at every IO; assert the
+//       snapshot set recovers. When commits interleaved, ALSO drive the real
+//       CheckpointStateMachine, freeze it at BeforeAcquireLock (the last unlocked
+//       point), issue the interleaved commits on a 2nd connection, then crash the
+//       locked phase at every IO; assert the snapshot AND the interleaved commits
+//       recover (the concurrency contract).
+//   - full sequence      -> crash recovery itself at every IO; assert convergence.
+// After each crash it reopens and asserts visible rows == the spec's committed
+// set, no duplication, integrity ok — the observable form of `recoverySafe`.
+// ===========================================================================
+
+/// One step of a replayed Quint trace: the action token and the committed live
+/// contents (sorted (key, value) pairs) the spec expects after the step.
+struct MbtStep {
+    action: String,
+    contents: Vec<(i64, i64)>,
+}
+
+/// Load the Quint-generated MBT traces. The file is NOT committed (it is generated
+/// from `checkpoint.qnt` by `mbt_gen.py`, which needs quint); the dedicated CI job
+/// regenerates it before this test runs. If it is absent — e.g. a local
+/// `--ignored` run — regenerate it via the Python+quint generator, so the test
+/// works wherever quint is on PATH.
+fn load_mbt_traces() -> String {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/mvcc/database/mbt_traces.mbt");
+    if !std::path::Path::new(path).exists() {
+        let gen = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../docs/internals/mvcc/mbt_gen.py"
+        );
+        let status = std::process::Command::new("python3")
+            .arg(gen)
+            .status()
+            .unwrap_or_else(|e| {
+                panic!("MBT traces missing and could not run {gen}: {e} (need python3 + quint on PATH)")
+            });
+        assert!(
+            status.success(),
+            "mbt_gen.py failed to generate traces (need quint on PATH)"
+        );
+    }
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read generated MBT traces at {path}: {e}"))
+}
+
+/// Parse `mbt_traces.mbt`. Each non-marker line is `<action> <key>:<value>...` —
+/// the committed contents (a key->value map) after the step.
+fn parse_mbt_traces(text: &str) -> Vec<Vec<MbtStep>> {
+    let mut traces: Vec<Vec<MbtStep>> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == "TRACE" {
+            traces.push(Vec::new());
+            continue;
+        }
+        let mut toks = line.split_whitespace();
+        let action = toks.next().expect("trace line missing action").to_string();
+        let mut contents: Vec<(i64, i64)> = toks
+            .map(|t| {
+                let (k, v) = t.split_once(':').expect("contents token must be key:value");
+                (
+                    k.parse::<i64>().expect("bad key"),
+                    v.parse::<i64>().expect("bad value"),
+                )
+            })
+            .collect();
+        contents.sort_unstable();
+        traces
+            .last_mut()
+            .expect("trace step before any TRACE marker")
+            .push(MbtStep { action, contents });
+    }
+    traces
+}
+
+/// A committed operation, derived from the change in contents between two steps.
+#[derive(Clone, Copy, Debug)]
+enum MbtOp {
+    /// Write (insert or update) `key` to `value`.
+    Write { key: i64, value: i64 },
+    /// Delete `key`.
+    Delete { key: i64 },
+}
+
+/// Derive the ops a transaction performed from before/after contents: every key
+/// whose value changed (a write to the new value) and every key removed (a
+/// delete). A multi-row txn changes several keys at once, so this returns a Vec
+/// applied as ONE atomic transaction. Empty == no-op (e.g. a txn that only
+/// rewrote keys to the value they already held, or deleted absent keys — such
+/// ops are invisible in the contents and harmlessly dropped from replay).
+fn mbt_diff_txn(before: &[(i64, i64)], after: &[(i64, i64)]) -> Vec<MbtOp> {
+    let b: std::collections::BTreeMap<i64, i64> = before.iter().copied().collect();
+    let a: std::collections::BTreeMap<i64, i64> = after.iter().copied().collect();
+    let mut ops = Vec::new();
+    for (&k, &v) in &a {
+        if b.get(&k) != Some(&v) {
+            ops.push(MbtOp::Write { key: k, value: v });
+        }
+    }
+    for &k in b.keys() {
+        if !a.contains_key(&k) {
+            ops.push(MbtOp::Delete { key: k });
+        }
+    }
+    ops
+}
+
+/// The text payload a write stores for a model `value`. Value 1 stays small
+/// (`"v1"`); values >= 2 get a large, overflow-page-sized payload so the table
+/// cells and the `idx_v` index entries spill onto overflow pages and the file
+/// spans multiple pages — putting crashes in size-dependent paths (overflow
+/// chains, multi-page writes) instead of always in a one-page file. The tag
+/// keeps the value recoverable so a stale-version recovery is still caught.
+fn mbt_payload(value: i64) -> String {
+    let tag = format!("v{value}");
+    if value >= 2 {
+        format!("{tag}:{}", "p".repeat(4500))
+    } else {
+        tag
+    }
+}
+
+/// Apply `op` to the engine via `conn`. Returns whether it succeeded (false => it
+/// faulted mid-flight). A write is an upsert; a delete of an absent key is a
+/// harmless no-op at the engine level.
+fn mbt_apply_op(conn: &Arc<crate::Connection>, op: MbtOp) -> bool {
+    match op {
+        MbtOp::Write { key, value } => conn
+            .execute(format!(
+                "INSERT OR REPLACE INTO t VALUES ({key}, '{}')",
+                mbt_payload(value)
+            ))
+            .is_ok(),
+        MbtOp::Delete { key } => conn
+            .execute(format!("DELETE FROM t WHERE id = {key}"))
+            .is_ok(),
+    }
+}
+
+/// Apply a whole transaction ATOMICALLY (one BEGIN..COMMIT) via `conn`. Returns
+/// whether it committed; false => it faulted mid-flight, and since the engine
+/// transaction is all-or-nothing the uncommitted txn is discarded by recovery. A
+/// single-op txn keeps the bare auto-commit path (so its IO-fault behavior is
+/// identical to before); an empty txn is a no-op.
+fn mbt_apply_txn(conn: &Arc<crate::Connection>, txn: &[MbtOp]) -> bool {
+    match txn {
+        [] => true,
+        [op] => mbt_apply_op(conn, *op),
+        _ => {
+            if conn.execute("BEGIN").is_err() {
+                return false;
+            }
+            for &op in txn {
+                if !mbt_apply_op(conn, op) {
+                    return false;
+                }
+            }
+            conn.execute("COMMIT").is_ok()
+        }
+    }
+}
+
+/// Apply `op` to an in-memory contents map (for computing expected results).
+fn mbt_apply_op_to_contents(contents: &[(i64, i64)], op: MbtOp) -> Vec<(i64, i64)> {
+    let mut m: std::collections::BTreeMap<i64, i64> = contents.iter().copied().collect();
+    match op {
+        MbtOp::Write { key, value } => {
+            m.insert(key, value);
+        }
+        MbtOp::Delete { key } => {
+            m.remove(&key);
+        }
+    }
+    m.into_iter().collect()
+}
+
+/// Apply a whole transaction to an in-memory contents map (expected results).
+fn mbt_apply_txn_to_contents(contents: &[(i64, i64)], txn: &[MbtOp]) -> Vec<(i64, i64)> {
+    let mut c = contents.to_vec();
+    for &op in txn {
+        c = mbt_apply_op_to_contents(&c, op);
+    }
+    c
+}
+
+/// A trace grouped into replayable episodes.
+enum MbtEpisode {
+    /// A standalone commit (no checkpoint in flight): the txn's ops (applied
+    /// atomically) + contents before/after it.
+    Commit {
+        ops: Vec<MbtOp>,
+        before: Vec<(i64, i64)>,
+        after: Vec<(i64, i64)>,
+    },
+    /// A checkpoint plus the transactions that interleaved its unlocked prepare
+    /// phase (each an atomic txn = Vec<MbtOp>), and the contents before (the
+    /// snapshot) / after. `mode` is the checkpoint mode; only passive permits
+    /// interleaved commits (the model gates the others).
+    Checkpoint {
+        interleaved: Vec<Vec<MbtOp>>,
+        before: Vec<(i64, i64)>,
+        after: Vec<(i64, i64)>,
+        mode: String,
+    },
+}
+
+/// Map a trace's mode tag to the engine `CheckpointMode`.
+fn mbt_checkpoint_mode(mode: &str) -> CheckpointMode {
+    match mode {
+        "passive" => CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+        "full" => CheckpointMode::Full,
+        "restart" => CheckpointMode::Restart,
+        "truncate" => CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+        other => panic!("unknown checkpoint mode '{other}'"),
+    }
+}
+
+/// Group a raw trace into episodes. A commit's op is derived from the contents
+/// change; a no-op commit (delete of an absent key) is dropped. Commits between a
+/// `checkpointStart` and its `checkpointTruncateLog` are the interleaved ops.
+fn mbt_episodes(steps: &[MbtStep]) -> Vec<MbtEpisode> {
+    let mut eps = Vec::new();
+    let mut prev: Vec<(i64, i64)> = Vec::new();
+    let mut in_ckpt = false;
+    let mut snapshot_before: Vec<(i64, i64)> = Vec::new();
+    let mut interleaved: Vec<Vec<MbtOp>> = Vec::new();
+    let mut ckpt_mode = String::new();
+    for step in steps {
+        let action = step.action.as_str();
+        match action {
+            "init" => {}
+            "commit" => {
+                let txn = mbt_diff_txn(&prev, &step.contents);
+                if !txn.is_empty() {
+                    if in_ckpt {
+                        interleaved.push(txn);
+                    } else {
+                        eps.push(MbtEpisode::Commit {
+                            ops: txn,
+                            before: prev.clone(),
+                            after: step.contents.clone(),
+                        });
+                    }
+                }
+                // else: no-op commit (only same-value rewrites / deletes of absent
+                // keys) — invisible in the contents, nothing to replay.
+            }
+            a if a.starts_with("checkpointStart") => {
+                in_ckpt = true;
+                snapshot_before = prev.clone();
+                interleaved.clear();
+                ckpt_mode = a
+                    .strip_prefix("checkpointStart:")
+                    .unwrap_or("passive")
+                    .to_string();
+            }
+            "checkpointFillWal" | "checkpointBackfillDb" => {}
+            "checkpointTruncateLog" => {
+                in_ckpt = false;
+                eps.push(MbtEpisode::Checkpoint {
+                    interleaved: std::mem::take(&mut interleaved),
+                    before: snapshot_before.clone(),
+                    after: step.contents.clone(),
+                    mode: std::mem::take(&mut ckpt_mode),
+                });
+            }
+            other => panic!("unknown trace action {other}"),
+        }
+        prev = step.contents.clone();
+    }
+    eps
+}
+
+/// A trailing, never-completed checkpoint: a trace cut at MAX_STEPS may end while
+/// a checkpoint is in flight (no `checkpointTruncateLog`). `mbt_episodes` drops
+/// it; this is the terminal mid-checkpoint state the model generated.
+struct MbtTrailing {
+    /// Snapshot contents at the trailing checkpoint's start (its `before`).
+    before: Vec<(i64, i64)>,
+    /// Transactions that interleaved its prepare phase.
+    interleaved: Vec<Vec<MbtOp>>,
+    mode: String,
+}
+
+/// Detect a trace that ENDS mid-checkpoint (a `checkpointStart` with no matching
+/// `checkpointTruncateLog`). Returns that trailing checkpoint so the crash/recovery
+/// tests can exercise the mid-checkpoint terminal state instead of discarding it
+/// (the common case: 12 of 16 generated traces are cut mid-checkpoint). Mirrors
+/// the checkpoint bookkeeping in `mbt_episodes`. `None` if the trace ends cleanly
+/// (after a commit or a completed checkpoint).
+fn mbt_trailing_checkpoint(steps: &[MbtStep]) -> Option<MbtTrailing> {
+    let mut prev: Vec<(i64, i64)> = Vec::new();
+    let mut in_ckpt = false;
+    let mut before: Vec<(i64, i64)> = Vec::new();
+    let mut interleaved: Vec<Vec<MbtOp>> = Vec::new();
+    let mut mode = String::new();
+    for step in steps {
+        let a = step.action.as_str();
+        match a {
+            "commit" => {
+                if in_ckpt {
+                    let txn = mbt_diff_txn(&prev, &step.contents);
+                    if !txn.is_empty() {
+                        interleaved.push(txn);
+                    }
+                }
+            }
+            x if x.starts_with("checkpointStart") => {
+                in_ckpt = true;
+                before = prev.clone();
+                interleaved.clear();
+                mode = x
+                    .strip_prefix("checkpointStart:")
+                    .unwrap_or("passive")
+                    .to_string();
+            }
+            "checkpointTruncateLog" => in_ckpt = false,
+            _ => {}
+        }
+        prev = step.contents.clone();
+    }
+    in_ckpt.then_some(MbtTrailing {
+        before,
+        interleaved,
+        mode,
+    })
+}
+
+/// Aggregated crash outcomes across an MBT run, used for the non-vacuity guards.
+#[derive(Default)]
+struct MbtAgg {
+    any_faulted: bool,
+    strict_lost: usize,
+    prob_retained: usize,
+    /// An interleaved commit was crashed mid-flight at least once (the
+    /// commit-in-flight-during-checkpoint path was exercised).
+    in_flight_seen: bool,
+}
+
+impl MbtAgg {
+    fn add(&mut self, loss_p: f64, s: super::crash_io::CrashStats) {
+        if loss_p == 1.0 {
+            self.strict_lost += s.pages_lost;
+        } else {
+            self.prob_retained += s.pages_retained;
+        }
+    }
+}
+
+/// Seeded random crash runs per episode. Crashing at *every* IO (the old
+/// exhaustive `fault_n x loss_probs` sweep) is poor ROI on tiny scenarios and
+/// never reaches large-file states; a few randomized runs over many (and larger)
+/// Quint traces samples the space the way real crash-sim fuzzers do. Each run is
+/// seeded by its `case`, so a failure reproduces exactly — randomized, never
+/// wall-clock nondeterministic.
+const MBT_RANDOM_RUNS: usize = 6;
+
+/// Crash parameters for run `r`, seeded by `ci`: a random *valid* mutating-IO
+/// index in `[1, io_count]` to crash at, and a loss fraction — 1.0 (strict
+/// data-loss, and the trigger for the F4 carry-forward) on run 0, random in
+/// (0,1) (the duplication path) otherwise. Returns the rng so the same seeded
+/// stream then feeds `crash()`.
+fn mbt_crash_params(ci: u64, r: usize, io_count: i64) -> (rand::rngs::StdRng, i64, f64) {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(ci);
+    let fault_n = rng.random_range(1..=io_count.max(1));
+    let loss_p = if r == 0 {
+        1.0
+    } else {
+        rng.random_range(0.0..1.0)
+    };
+    (rng, fault_n, loss_p)
+}
+
+/// Count an operation's mutating IOs: build the prefix, arm a fault far past the
+/// operation (so it never fires, only counts), run it, and read the counter — so
+/// a random crash point can be drawn from `[1, count]` instead of crashing at
+/// every IO. The dry-run image is discarded; crash runs rebuild fresh.
+fn mbt_count_prefix_op(
+    eps: &[MbtEpisode],
+    ep_i: usize,
+    run: impl FnOnce(&Arc<Database>, &Arc<crate::Connection>),
+) -> i64 {
+    let crash_io = Arc::new(super::crash_io::CrashIO::new());
+    let db = mbt_build_prefix("/mbt_iocount.db", &crash_io, eps, ep_i);
+    let conn = db
+        .connect()
+        .unwrap_or_else(|e| panic!("[mbt iocount] connect: {e:?}"));
+    crash_io.arm_fault_at_io(i64::MAX);
+    run(&db, &conn);
+    let c = crash_io.armed_io_count();
+    crash_io.disarm_fault();
+    c.max(1)
+}
+
+/// Visible rows as (id, value) pairs, sorted by id — the observable contents.
+/// Asserting the value (not just the id) catches a recovery that places the wrong
+/// payload at a rowid (e.g. a misapplied frame) or an index pointing at the wrong
+/// row, which a presence-only `SELECT id` check would miss.
+fn mbt_visible_rows(conn: &Arc<crate::Connection>) -> Vec<(i64, String)> {
+    get_rows(conn, "SELECT id, v FROM t ORDER BY id")
+        .iter()
+        .map(|r| (r[0].as_int().unwrap(), r[1].to_string()))
+        .collect()
+}
+
+/// Expected (id, value) rows for committed contents (a key->value map): each live
+/// key K with value V is the row `(K, "vV")`. The value encodes the version (the
+/// write's ts), so a stale-version recovery is caught.
+fn mbt_expected_rows(contents: &[(i64, i64)]) -> Vec<(i64, String)> {
+    let mut rows: Vec<(i64, String)> = contents.iter().map(|&(k, v)| (k, mbt_payload(v))).collect();
+    rows.sort();
+    rows
+}
+
+/// `count(*)` matches the row scan (no duplication) and `integrity_check` is ok
+/// (no table/index divergence) after recovery.
+fn mbt_assert_consistent(conn: &Arc<crate::Connection>, n_rows: usize, ctx: &str) {
+    let cnt = get_rows(conn, "SELECT count(*) FROM t");
+    assert_eq!(
+        cnt[0][0].as_int().unwrap() as usize,
+        n_rows,
+        "[{ctx}] count(*) disagrees with row scan — duplicated rows?"
+    );
+    let ic = get_rows(conn, "PRAGMA integrity_check");
+    assert_eq!(
+        ic[0][0].to_string(),
+        "ok",
+        "[{ctx}] integrity_check failed (table/index divergence?): {ic:?}"
+    );
+}
+
+/// F4: carry a recovered image FORWARD. After a crash-test recovers and asserts
+/// its contents, continue on that image — commit a fresh row, checkpoint, and
+/// reopen (a SECOND recovery) — then re-assert. A recovery that leaves a subtly
+/// wrong internal state (e.g. an off-by-one `persistent_tx_ts_max` or MVCC clock)
+/// passes the first contents check but corrupts or loses data on the NEXT
+/// commit+checkpoint+recovery; replaying onto the live recovered image (instead
+/// of a freshly re-derived clean prefix) is what surfaces it. Consumes the
+/// recovered `db`/`conn` handles.
+fn mbt_continue_and_reassert(
+    db: Arc<Database>,
+    conn: Arc<crate::Connection>,
+    crash_io: &Arc<super::crash_io::CrashIO>,
+    path: &str,
+    recovered: &[(i64, String)],
+    marker: u64,
+    ctx: &str,
+) {
+    let key = 1_000_000i64; // well outside the model's key universe (a fresh insert, never a replace)
+    let value = format!("cont{marker}");
+    // NARROWING: close the recovered handles, then re-open WITHOUT any ops — is
+    // recovery idempotent? If integrity fails here, the recovered durable image is
+    // already broken (first recovery's in-memory check passed but a second
+    // recovery sees a diverged index).
+    drop(conn);
+    drop(db);
+    let db_a = Database::open_file(crash_io.clone(), path)
+        .unwrap_or_else(|e| panic!("[{ctx}] bare re-reopen: {e:?}"));
+    let conn_a = db_a
+        .connect()
+        .unwrap_or_else(|e| panic!("[{ctx}] bare re-reopen connect: {e:?}"));
+    let bare = mbt_visible_rows(&conn_a);
+    mbt_assert_consistent(&conn_a, bare.len(), &format!("{ctx} bare-rereopen"));
+    // Now the follow-up commit + checkpoint on the (idempotently) recovered image.
+    assert!(
+        conn_a
+            .execute(format!(
+                "INSERT OR REPLACE INTO t VALUES ({key}, '{value}')"
+            ))
+            .is_ok(),
+        "[{ctx}] continuation commit failed on the recovered image"
+    );
+    mbt_assert_consistent(&conn_a, bare.len() + 1, &format!("{ctx} after-insert"));
+    conn_a
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap_or_else(|e| panic!("[{ctx}] continuation checkpoint: {e:?}"));
+    mbt_assert_consistent(&conn_a, bare.len() + 1, &format!("{ctx} after-checkpoint"));
+    drop(conn_a);
+    drop(db_a);
+    let db3 = Database::open_file(crash_io.clone(), path)
+        .unwrap_or_else(|e| panic!("[{ctx}] continuation reopen: {e:?}"));
+    let conn3 = db3
+        .connect()
+        .unwrap_or_else(|e| panic!("[{ctx}] continuation recovery/connect: {e:?}"));
+    let visible = mbt_visible_rows(&conn3);
+    let mut expected: Vec<(i64, String)> = recovered.to_vec();
+    expected.push((key, value));
+    expected.sort();
+    assert_eq!(
+        visible, expected,
+        "[{ctx}] recovered image did not survive a follow-up commit+checkpoint+reopen (subtly-wrong recovered state?)"
+    );
+    mbt_assert_consistent(&conn3, visible.len(), &format!("{ctx} after-continuation"));
+}
+
+/// Build the on-disk state produced by replaying episodes `eps[0..upto]` for
+/// real (no crash) on a fresh CrashIO-backed database, and return the open db.
+/// Schema matches the crash fuzzers (table + secondary index) so
+/// `integrity_check` can catch table/index divergence after recovery. A
+/// checkpoint episode runs to completion then applies its interleaved commits;
+/// the resulting committed set equals the episode's `after` either way, which is
+/// all a later episode's prefix needs (the during-vs-after distinction matters
+/// only for the concurrency crash test).
+fn mbt_build_prefix(
+    path: &str,
+    crash_io: &Arc<super::crash_io::CrashIO>,
+    eps: &[MbtEpisode],
+    upto: usize,
+) -> Arc<Database> {
+    let db = Database::open_file(crash_io.clone(), path)
+        .unwrap_or_else(|e| panic!("[mbt prefix] open failed: {e:?}"));
+    {
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+        for ep in eps.iter().take(upto) {
+            match ep {
+                MbtEpisode::Commit { ops, .. } => {
+                    assert!(
+                        mbt_apply_txn(&conn, ops),
+                        "[mbt prefix] txn failed: {ops:?}"
+                    );
+                }
+                MbtEpisode::Checkpoint {
+                    interleaved, mode, ..
+                } => {
+                    conn.checkpoint(mbt_checkpoint_mode(mode)).unwrap();
+                    for txn in interleaved {
+                        assert!(
+                            mbt_apply_txn(&conn, txn),
+                            "[mbt prefix] interleaved txn failed: {txn:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    db
+}
+
+/// The unlocked checkpoint yield points, in checkpoint order — the off-lock
+/// prepare-phase boundaries where a concurrent commit can legitimately land
+/// (writers are not yet blocked). Locked points (`AfterAcquireLock`..) would
+/// deadlock an interleaved commit behind the blocking checkpoint lock.
+const MBT_UNLOCKED_POINTS: [CheckpointYieldPoint; 7] = [
+    CheckpointYieldPoint::AfterPrepare,
+    CheckpointYieldPoint::AfterBeginPagerTxn,
+    CheckpointYieldPoint::AfterFirstTableRow,
+    CheckpointYieldPoint::AfterTableRows,
+    CheckpointYieldPoint::AfterIndexRows,
+    CheckpointYieldPoint::AfterStageHeader,
+    CheckpointYieldPoint::BeforeAcquireLock,
+];
+
+/// Drive a real Passive checkpoint while interleaving commits at a SCHEDULE of
+/// unlocked yield points. For each `(point, ids)` in order: freeze the checkpoint
+/// at `point`, commit those ids on a SECOND connection (recording which returned
+/// Ok), then release and continue. After the schedule, if `fault` is set, arm it
+/// otherwise run to completion. The fault is armed from the START, so it can land
+/// on a checkpoint prepare IO, on an interleaved commit's IO (crashing it
+/// MID-FLIGHT), or in the locked phase. Returns (ids that committed successfully,
+/// the interleaved commit crashed in-flight if any, whether the fault fired).
+/// `schedule`'s points must be unlocked and listed in checkpoint order.
+fn run_checkpoint_with_interleaving(
+    db: &Arc<Database>,
+    ckpt_conn: &Arc<crate::Connection>,
+    schedule: &[(CheckpointYieldPoint, Vec<Vec<MbtOp>>)],
+    fault: Option<(&Arc<super::crash_io::CrashIO>, i64)>,
+    ctx: &str,
+) -> (Vec<Vec<MbtOp>>, Option<Vec<MbtOp>>, bool) {
+    let mvstore = db.get_mv_store().clone().unwrap();
+    let pager = ckpt_conn.pager.load().clone();
+    let mut sm = CheckpointStateMachine::new(
+        pager.clone(),
+        mvstore,
+        ckpt_conn.clone(),
+        true,
+        ckpt_conn.get_sync_mode(),
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+
+    // Arm the fault up front so it can land anywhere: a prepare IO, an interleaved
+    // commit (in-flight crash), or the locked phase.
+    if let Some((cio, n)) = fault {
+        cio.arm_fault_at_io(n);
+    }
+
+    let mut succeeded: Vec<Vec<MbtOp>> = Vec::new();
+    let mut in_flight: Option<Vec<MbtOp>> = None;
+    let mut aborted = false;
+
+    // Walk the schedule: freeze at each point, interleave its txns, release.
+    'schedule: for (point, txns) in schedule {
+        let injector = FixedYieldInjector::new([point.point()]);
+        ckpt_conn.set_yield_injector(Some(injector.clone()));
+        for _ in 0..200_000 {
+            match sm.step(&()) {
+                Ok(TransitionResult::Continue) => {}
+                Ok(TransitionResult::Done(_)) => break,
+                Ok(TransitionResult::Io(io)) => {
+                    if injector.is_empty() {
+                        // Frozen at `point` (off-lock). conn2 has its own (empty)
+                        // injector. The fault is live, so a commit here may crash
+                        // mid-flight (all-or-nothing).
+                        let conn2 = db
+                            .connect()
+                            .unwrap_or_else(|e| panic!("[{ctx}] 2nd connect: {e:?}"));
+                        for txn in txns {
+                            if mbt_apply_txn(&conn2, txn) {
+                                succeeded.push(txn.clone());
+                            } else {
+                                in_flight = Some(txn.clone());
+                                aborted = true;
+                                break;
+                            }
+                        }
+                        // Release the synthetic yield (not a CrashIO op, can't fault)
+                        // unless a commit already crashed (then we abandon).
+                        if !aborted {
+                            let _ = io.wait(pager.io.as_ref());
+                        }
+                        break;
+                    } else if io.wait(pager.io.as_ref()).is_err() {
+                        // Crash on a checkpoint prepare IO, before this freeze.
+                        aborted = true;
+                        break;
+                    }
+                }
+                Err(_) => {
+                    aborted = true;
+                    break;
+                }
+            }
+        }
+        ckpt_conn.set_yield_injector(None);
+        if aborted {
+            break 'schedule;
+        }
+    }
+
+    // After the schedule (if not already crashed): run the rest to completion or
+    // crash in the locked phase.
+    if !aborted {
+        for _ in 0..200_000 {
+            match sm.step(&()) {
+                Ok(TransitionResult::Continue) => {}
+                Ok(TransitionResult::Done(_)) => break,
+                Ok(TransitionResult::Io(io)) => {
+                    if io.wait(pager.io.as_ref()).is_err() {
+                        aborted = true;
+                        break;
+                    }
+                }
+                Err(_) => {
+                    aborted = true;
+                    break;
+                }
+            }
+        }
+    }
+    if let Some((cio, _)) = fault {
+        cio.disarm_fault();
+    }
+    // Model a true crash: drop the SM without graceful cleanup.
+    drop(sm);
+    (succeeded, in_flight, aborted)
+}
+
+/// All commit yield points (`CommitYieldPoint`), used to pause an interleaved
+/// commit at a random stage of its durability path so the checkpoint can make
+/// progress BETWEEN the commit's own internal steps.
+const MBT_COMMIT_POINTS: [CommitYieldPoint; 7] = [
+    CommitYieldPoint::CommitValidation,
+    CommitYieldPoint::WaitForDependencies,
+    CommitYieldPoint::BuildLogRecordStart,
+    CommitYieldPoint::LogRecordPrepared,
+    CommitYieldPoint::BeforeGlobalHeaderUpdate,
+    CommitYieldPoint::BeforeFinishCommittedTx,
+    CommitYieldPoint::AfterRemoveTx,
+];
+
+/// Outcome of advancing one cooperative machine (checkpoint or commit) by a single
+/// scheduler quantum.
+enum MbtAdvance {
+    /// Paused at the injected yield point; still runnable.
+    Parked,
+    /// Ran to completion.
+    Done,
+    /// An IO fault (or error) crashed it.
+    Faulted,
+}
+
+/// Advance the checkpoint SM until it pauses at `point` (a single injected yield),
+/// or — when `point` is `None` — to completion. Real IO is pumped (and may fault);
+/// the injected yield is a pre-completed completion, so a pause needs no pumping.
+fn mbt_advance_ckpt(
+    sm: &mut CheckpointStateMachine<crate::mvcc::MvccClock>,
+    ckpt_conn: &Arc<crate::Connection>,
+    point: Option<CheckpointYieldPoint>,
+    pager_io: &dyn crate::IO,
+) -> MbtAdvance {
+    // `set_yield_injector(Some)` requires the slot to be None and `(None)` requires
+    // it Some, so install only when there is a point and restore None on EVERY exit.
+    let inj = point.map(|p| FixedYieldInjector::new([p.point()]));
+    if let Some(ref i) = inj {
+        ckpt_conn.set_yield_injector(Some(i.clone() as Arc<dyn YieldInjector>));
+    }
+    let mut steps = 0u32;
+    let outcome = loop {
+        steps += 1;
+        assert!(
+            steps < 200_000,
+            "checkpoint SM did not settle within 200k steps"
+        );
+        match sm.step(&()) {
+            Ok(TransitionResult::Continue) => {}
+            Ok(TransitionResult::Done(_)) => break MbtAdvance::Done,
+            Ok(TransitionResult::Io(io)) => {
+                if inj.as_ref().is_some_and(|i| i.is_empty()) {
+                    // Paused at `point` (pre-completed yield) — stop without pumping.
+                    break MbtAdvance::Parked;
+                }
+                if io.wait(pager_io).is_err() {
+                    break MbtAdvance::Faulted;
+                }
+            }
+            Err(_) => break MbtAdvance::Faulted,
+        }
+    };
+    if inj.is_some() {
+        ckpt_conn.set_yield_injector(None);
+    }
+    outcome
+}
+
+/// Advance a commit's prepared `COMMIT` statement until it pauses at `point`, or to
+/// completion. Mirrors `mbt_advance_ckpt` for the commit side: a real IO is pumped
+/// (and may fault), the injected yield is pre-completed so a pause needs none.
+fn mbt_advance_commit(
+    conn: &Arc<crate::Connection>,
+    stmt: &mut crate::Statement,
+    point: CommitYieldPoint,
+    pager_io: &dyn crate::IO,
+) -> MbtAdvance {
+    let inj = FixedYieldInjector::new([point.point()]);
+    conn.set_yield_injector(Some(inj.clone()));
+    let mut steps = 0u32;
+    let outcome = loop {
+        steps += 1;
+        assert!(steps < 200_000, "commit did not settle within 200k steps");
+        match stmt.step() {
+            Ok(StepResult::Done) => break MbtAdvance::Done,
+            Ok(StepResult::IO) => {
+                if inj.is_empty() {
+                    // Paused at `point` (pre-completed yield) — stop without pumping.
+                    break MbtAdvance::Parked;
+                }
+                if pager_io.step().is_err() {
+                    break MbtAdvance::Faulted;
+                }
+            }
+            // A `COMMIT` yields no result rows; treat any other terminal result as
+            // a non-commit (e.g. Busy/Interrupt) and a step error as a fault.
+            Ok(_) => {}
+            Err(_) => break MbtAdvance::Faulted,
+        }
+    };
+    conn.set_yield_injector(None);
+    outcome
+}
+
+/// Like `run_checkpoint_with_interleaving`, but drives the checkpoint AND the
+/// interleaved commits as cooperative state machines under a seeded random
+/// scheduler. Each quantum advances either the checkpoint (to its next unlocked
+/// yield point, in order) or the active commit (to a RANDOM commit yield point), so
+/// the checkpoint observes a concurrent commit at every stage of its own
+/// durability path — the fine-grained interleaving a single-threaded event loop
+/// actually produces, rather than running each commit to completion at one freeze.
+///
+/// Commits are driven SEQUENTIALLY (one active at a time): the model's interleaved
+/// commits are distinct sequential ts that merely land in the checkpoint's prepare
+/// window, so the concurrency under test is commit-vs-checkpoint, not
+/// commit-vs-commit (which would also raise spurious write-write conflicts). The
+/// checkpoint is held inside its unlocked window — never acquiring the blocking
+/// lock — until every commit has drained. Same return contract as
+/// `run_checkpoint_with_interleaving`: (txns that committed, the txn left
+/// ambiguous in-flight if any, whether the fault fired).
+fn run_checkpoint_with_scheduled_interleaving(
+    db: &Arc<Database>,
+    ckpt_conn: &Arc<crate::Connection>,
+    txns: &[Vec<MbtOp>],
+    sched_seed: u64,
+    fault: Option<(&Arc<super::crash_io::CrashIO>, i64)>,
+    ctx: &str,
+) -> (Vec<Vec<MbtOp>>, Option<Vec<MbtOp>>, bool) {
+    use rand::SeedableRng as _;
+    let mvstore = db.get_mv_store().clone().unwrap();
+    let pager = ckpt_conn.pager.load().clone();
+    let pager_io = pager.io.clone();
+    let mut sm = CheckpointStateMachine::new(
+        pager.clone(),
+        mvstore,
+        ckpt_conn.clone(),
+        true,
+        ckpt_conn.get_sync_mode(),
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+
+    // Arm the fault up front so it can land on a checkpoint IO, a commit IO
+    // (in-flight crash), or the locked phase.
+    if let Some((cio, n)) = fault {
+        cio.arm_fault_at_io(n);
+    }
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(sched_seed);
+    let mut succeeded: Vec<Vec<MbtOp>> = Vec::new();
+    let mut in_flight: Option<Vec<MbtOp>> = None;
+    let mut aborted = false;
+
+    // Checkpoint progress: index into MBT_UNLOCKED_POINTS of the point it is paused
+    // at (-1 = not started). While a commit is live the checkpoint may only advance
+    // within this unlocked window, so it never acquires the lock mid-interleave.
+    let last_unlocked: i32 = MBT_UNLOCKED_POINTS.len() as i32 - 1;
+    let mut ckpt_pos: i32 = -1;
+    let mut ckpt_done = false;
+
+    // The active interleaved commit (built lazily) + index of the next txn.
+    let mut active: Option<(Arc<crate::Connection>, crate::Statement, Vec<MbtOp>)> = None;
+    let mut next_txn = 0usize;
+
+    'sched: loop {
+        // Start the next commit if none is active: open a fresh connection and stage
+        // its writes (BEGIN + ops). A staging read can fault.
+        if active.is_none() && next_txn < txns.len() {
+            let txn = txns[next_txn].clone();
+            next_txn += 1;
+            let cconn = db
+                .connect()
+                .unwrap_or_else(|e| panic!("[{ctx}] commit connect: {e:?}"));
+            let mut staged_ok = cconn.execute("BEGIN").is_ok();
+            if staged_ok {
+                for &op in &txn {
+                    if !mbt_apply_op(&cconn, op) {
+                        staged_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !staged_ok {
+                in_flight = Some(txn);
+                aborted = true;
+                break 'sched;
+            }
+            let stmt = cconn
+                .prepare("COMMIT")
+                .unwrap_or_else(|e| panic!("[{ctx}] prepare COMMIT: {e:?}"));
+            active = Some((cconn, stmt, txn));
+        }
+
+        let commit_live = active.is_some();
+        let ckpt_advanceable = !ckpt_done && (!commit_live || ckpt_pos < last_unlocked);
+
+        let pick_ckpt = match (commit_live, ckpt_advanceable) {
+            (false, false) => break 'sched, // everything has finished
+            (false, true) => true,
+            (true, false) => false,
+            (true, true) => rand::Rng::random_bool(&mut rng, 0.5),
+        };
+
+        if pick_ckpt {
+            let outcome = if commit_live {
+                ckpt_pos += 1;
+                mbt_advance_ckpt(
+                    &mut sm,
+                    ckpt_conn,
+                    Some(MBT_UNLOCKED_POINTS[ckpt_pos as usize]),
+                    pager_io.as_ref(),
+                )
+            } else {
+                mbt_advance_ckpt(&mut sm, ckpt_conn, None, pager_io.as_ref())
+            };
+            match outcome {
+                MbtAdvance::Done => ckpt_done = true,
+                MbtAdvance::Parked => {}
+                MbtAdvance::Faulted => {
+                    // A commit parked mid-publish when the checkpoint crashed has
+                    // ambiguous durability — report it as the in-flight victim.
+                    if let Some((_c, _s, txn)) = active.take() {
+                        in_flight = Some(txn);
+                    }
+                    aborted = true;
+                    break 'sched;
+                }
+            }
+        } else {
+            let point =
+                MBT_COMMIT_POINTS[rand::Rng::random_range(&mut rng, 0..MBT_COMMIT_POINTS.len())];
+            let outcome = {
+                let (cconn, stmt, _txn) = active.as_mut().unwrap();
+                mbt_advance_commit(cconn, stmt, point, pager_io.as_ref())
+            };
+            match outcome {
+                MbtAdvance::Done => {
+                    let (_cconn, _stmt, txn) = active.take().unwrap();
+                    succeeded.push(txn);
+                }
+                MbtAdvance::Parked => {}
+                MbtAdvance::Faulted => {
+                    let (_cconn, _stmt, txn) = active.take().unwrap();
+                    in_flight = Some(txn);
+                    aborted = true;
+                    break 'sched;
+                }
+            }
+        }
+    }
+
+    // Commits drained (or crashed). Finish the checkpoint if it is still pending.
+    if !aborted && !ckpt_done {
+        if let MbtAdvance::Faulted = mbt_advance_ckpt(&mut sm, ckpt_conn, None, pager_io.as_ref()) {
+            aborted = true;
+        }
+    }
+
+    if let Some((cio, _)) = fault {
+        cio.disarm_fault();
+    }
+    // Model a true crash: drop the SM without graceful cleanup. (The advance
+    // helpers already restored each connection's yield-injector slot to None.)
+    drop(sm);
+    (succeeded, in_flight, aborted)
+}
+
+/// Single-point wrapper used by the trace-replay MBT: freeze at `BeforeAcquireLock`,
+/// interleave `interleaved` (all of which must commit successfully), optionally
+/// crash. Returns whether the checkpoint faulted.
+fn mbt_run_checkpoint_episode(
+    db: &Arc<Database>,
+    ckpt_conn: &Arc<crate::Connection>,
+    interleaved: &[Vec<MbtOp>],
+    fault: Option<(&Arc<super::crash_io::CrashIO>, i64)>,
+    ctx: &str,
+) -> bool {
+    let schedule = [(
+        CheckpointYieldPoint::BeforeAcquireLock,
+        interleaved.to_vec(),
+    )];
+    let (succeeded, _in_flight, faulted) =
+        run_checkpoint_with_interleaving(db, ckpt_conn, &schedule, fault, ctx);
+    assert_eq!(
+        succeeded.len(),
+        interleaved.len(),
+        "[{ctx}] not every interleaved txn succeeded"
+    );
+    faulted
+}
+
+/// Crash-test a standalone `commit` episode: for every IO of the INSERT (× loss
+/// probabilities), build the prefix fresh, crash the INSERT there, apply the
+/// durability crash, reopen, and assert recovery is **atomic** — visible is
+/// exactly the pre- or post-commit set, never partial.
+#[allow(clippy::too_many_arguments)] // test helper: trace/episode coords + crash + aggregator
+fn mbt_crash_test_commit(
+    trace_idx: usize,
+    eps: &[MbtEpisode],
+    ep_i: usize,
+    ops: &[MbtOp],
+    before: &[(i64, i64)],
+    after: &[(i64, i64)],
+    case_seed: &mut u64,
+    agg: &mut MbtAgg,
+) {
+    let b = mbt_expected_rows(before);
+    let a = mbt_expected_rows(after);
+    let io_count = mbt_count_prefix_op(eps, ep_i, |_db, conn| {
+        let _ = mbt_apply_txn(conn, ops);
+    });
+    for r in 0..MBT_RANDOM_RUNS {
+        let ci = *case_seed;
+        *case_seed += 1;
+        let (mut rng, fault_n, loss_p) = mbt_crash_params(ci, r, io_count);
+        let ctx = format!(
+            "trace {trace_idx} ep {ep_i} commit {ops:?} run={r} fault={fault_n}/{io_count} loss_p={loss_p:.3} case={ci}"
+        );
+        let path = format!("/mbt_commit_{ci}.db");
+        let crash_io = Arc::new(super::crash_io::CrashIO::new());
+        let db = mbt_build_prefix(&path, &crash_io, eps, ep_i);
+        let conn = db
+            .connect()
+            .unwrap_or_else(|e| panic!("[{ctx}] connect: {e:?}"));
+        crash_io.arm_fault_at_io(fault_n);
+        let ok = mbt_apply_txn(&conn, ops);
+        crash_io.disarm_fault();
+        if !ok {
+            agg.any_faulted = true;
+        }
+        agg.add(loss_p, crash_io.crash(loss_p, &mut rng));
+        drop(conn);
+        drop(db);
+        let db2 = Database::open_file(crash_io.clone(), &path)
+            .unwrap_or_else(|e| panic!("[{ctx}] reopen: {e:?}"));
+        let conn2 = db2
+            .connect()
+            .unwrap_or_else(|e| panic!("[{ctx}] recovery/connect: {e:?}"));
+        let visible = mbt_visible_rows(&conn2);
+        assert!(
+            visible == b || visible == a,
+            "[{ctx}] commit not atomic on recovery: visible={visible:?}, expected {b:?} or {a:?}"
+        );
+        mbt_assert_consistent(&conn2, visible.len(), &ctx);
+        // F4: on the strict-crash run, carry the recovered image forward — a fresh
+        // commit + checkpoint + reopen must round-trip.
+        if loss_p == 1.0 {
+            mbt_continue_and_reassert(db2, conn2, &crash_io, &path, &visible, ci, &ctx);
+        }
+    }
+}
+
+/// Crash-test a `checkpoint` episode WITHOUT interleaving, in its trace-chosen
+/// `mode` (passive/full/restart/truncate): for every IO of `conn.checkpoint(mode)`
+/// (× loss probabilities), build the prefix fresh, crash the checkpoint there,
+/// reopen, and assert recovery reconstructs exactly the snapshot set (`before`) —
+/// a checkpoint never changes what is committed, whatever its WAL handling.
+fn mbt_crash_test_checkpoint(
+    trace_idx: usize,
+    eps: &[MbtEpisode],
+    ep_i: usize,
+    snapshot: &[(i64, i64)],
+    mode: &str,
+    case_seed: &mut u64,
+    agg: &mut MbtAgg,
+) {
+    let expected = mbt_expected_rows(snapshot);
+    let io_count = mbt_count_prefix_op(eps, ep_i, |_db, conn| {
+        let _ = conn.checkpoint(mbt_checkpoint_mode(mode));
+    });
+    for r in 0..MBT_RANDOM_RUNS {
+        let ci = *case_seed;
+        *case_seed += 1;
+        let (mut rng, fault_n, loss_p) = mbt_crash_params(ci, r, io_count);
+        let ctx = format!(
+            "trace {trace_idx} ep {ep_i} checkpoint({mode}) run={r} fault={fault_n}/{io_count} loss_p={loss_p:.3} case={ci}"
+        );
+        let path = format!("/mbt_ckpt_{ci}.db");
+        let crash_io = Arc::new(super::crash_io::CrashIO::new());
+        let db = mbt_build_prefix(&path, &crash_io, eps, ep_i);
+        let conn = db
+            .connect()
+            .unwrap_or_else(|e| panic!("[{ctx}] connect: {e:?}"));
+        crash_io.arm_fault_at_io(fault_n);
+        let res = conn.checkpoint(mbt_checkpoint_mode(mode));
+        crash_io.disarm_fault();
+        if res.is_err() {
+            agg.any_faulted = true;
+        }
+        agg.add(loss_p, crash_io.crash(loss_p, &mut rng));
+        drop(conn);
+        drop(db);
+        let db2 = Database::open_file(crash_io.clone(), &path)
+            .unwrap_or_else(|e| panic!("[{ctx}] reopen: {e:?}"));
+        let conn2 = db2
+            .connect()
+            .unwrap_or_else(|e| panic!("[{ctx}] recovery/connect: {e:?}"));
+        let visible = mbt_visible_rows(&conn2);
+        assert_eq!(
+            visible, expected,
+            "[{ctx}] checkpoint crash lost/duplicated committed data"
+        );
+        mbt_assert_consistent(&conn2, visible.len(), &ctx);
+        if loss_p == 1.0 {
+            mbt_continue_and_reassert(db2, conn2, &crash_io, &path, &visible, ci, &ctx);
+        }
+    }
+}
+
+/// Crash-test a `checkpoint` episode WITH concurrent commits: for every IO of the
+/// checkpoint's locked phase (× loss probabilities), build the prefix fresh,
+/// drive the real state machine, freeze it off-lock, interleave the commits on a
+/// 2nd connection, crash the locked phase there, reopen, and assert recovery
+/// reconstructs the snapshot AND the interleaved commits (`after`). This is the
+/// non-blocking-checkpoint concurrency contract: a commit that lands during the
+/// checkpoint's off-lock window must survive a crash of the checkpoint.
+fn mbt_crash_test_checkpoint_concurrent(
+    trace_idx: usize,
+    eps: &[MbtEpisode],
+    ep_i: usize,
+    interleaved: &[Vec<MbtOp>],
+    before: &[(i64, i64)],
+    case_seed: &mut u64,
+    agg: &mut MbtAgg,
+) {
+    // Drive the checkpoint and the interleaved commits under a seeded random
+    // scheduler (fixed across this call's runs so the interleaving is stable while
+    // the crash point varies): the checkpoint advances through its unlocked points
+    // while each commit advances through its OWN yield points, so a concurrent
+    // commit is observed at every stage of the checkpoint's durability path. The
+    // seed is derived from the entry `case_seed` so it is stable for the io-count
+    // pass and every crash run below.
+    let sched_seed = (*case_seed).wrapping_mul(0x9E3779B97F4A7C15);
+
+    let io_count = mbt_count_prefix_op(eps, ep_i, |db, conn| {
+        let _ = run_checkpoint_with_scheduled_interleaving(
+            db,
+            conn,
+            interleaved,
+            sched_seed,
+            None,
+            "iocount",
+        );
+    });
+    for r in 0..MBT_RANDOM_RUNS {
+        let ci = *case_seed;
+        *case_seed += 1;
+        let (mut rng, fault_n, loss_p) = mbt_crash_params(ci, r, io_count);
+        let ctx = format!(
+            "trace {trace_idx} ep {ep_i} concurrent-ckpt run={r} fault={fault_n}/{io_count} loss_p={loss_p:.3} case={ci}"
+        );
+        let path = format!("/mbt_cc_{ci}.db");
+        let crash_io = Arc::new(super::crash_io::CrashIO::new());
+        let db = mbt_build_prefix(&path, &crash_io, eps, ep_i);
+        let conn = db
+            .connect()
+            .unwrap_or_else(|e| panic!("[{ctx}] connect: {e:?}"));
+        let (succeeded, in_flight, faulted) = run_checkpoint_with_scheduled_interleaving(
+            &db,
+            &conn,
+            interleaved,
+            sched_seed,
+            Some((&crash_io, fault_n)),
+            &ctx,
+        );
+        if faulted {
+            agg.any_faulted = true;
+        }
+        if in_flight.is_some() {
+            agg.in_flight_seen = true;
+        }
+        agg.add(loss_p, crash_io.crash(loss_p, &mut rng));
+        drop(conn);
+        drop(db);
+        let db2 = Database::open_file(crash_io.clone(), &path)
+            .unwrap_or_else(|e| panic!("[{ctx}] reopen: {e:?}"));
+        let conn2 = db2
+            .connect()
+            .unwrap_or_else(|e| panic!("[{ctx}] recovery/connect: {e:?}"));
+        let visible = mbt_visible_rows(&conn2);
+        // The snapshot (committed before this checkpoint) plus every interleaved
+        // txn that returned success MUST recover; the txn crashed in-flight (if
+        // any) is all-or-nothing.
+        let mut must_contents = before.to_vec();
+        for txn in &succeeded {
+            must_contents = mbt_apply_txn_to_contents(&must_contents, txn);
+        }
+        let must = mbt_expected_rows(&must_contents);
+        let with_victim = in_flight
+            .map(|txn| mbt_expected_rows(&mbt_apply_txn_to_contents(&must_contents, &txn)));
+        let ok = visible == must || with_victim.as_ref().is_some_and(|m| *m == visible);
+        assert!(
+            ok,
+            "[{ctx}] recovery not atomic: visible={visible:?}, expected {must:?}{}",
+            with_victim
+                .as_ref()
+                .map_or(String::new(), |m| format!(" or {m:?}"))
+        );
+        mbt_assert_consistent(&conn2, visible.len(), &ctx);
+        if loss_p == 1.0 {
+            mbt_continue_and_reassert(db2, conn2, &crash_io, &path, &visible, ci, &ctx);
+        }
+    }
+}
+
+/// Crash-test recovery itself on the full sequence: replay the whole trace to a
+/// recovery-requiring state, reopen with a fault armed at every recovery IO so
+/// recovery aborts mid-flight, apply the durability crash, reopen cleanly, and
+/// assert recovery converges to exactly the committed set. Conversion-proof
+/// (faults at the IO layer, so it holds whether recovery is `io.block` or async).
+fn mbt_crash_test_recovery(
+    trace_idx: usize,
+    eps: &[MbtEpisode],
+    committed: &[(i64, i64)],
+    case_seed: &mut u64,
+    agg: &mut MbtAgg,
+) {
+    let expected = mbt_expected_rows(committed);
+    // Count recovery's mutating IOs (open the post-prefix image with a fault far
+    // past it, so recovery runs to completion and just counts).
+    let io_count = {
+        let crash_io = Arc::new(super::crash_io::CrashIO::new());
+        drop(mbt_build_prefix(
+            "/mbt_iocount.db",
+            &crash_io,
+            eps,
+            eps.len(),
+        ));
+        crash_io.arm_fault_at_io(i64::MAX);
+        let _ = Database::open_file(crash_io.clone(), "/mbt_iocount.db");
+        let c = crash_io.armed_io_count();
+        crash_io.disarm_fault();
+        c.max(1)
+    };
+    for r in 0..MBT_RANDOM_RUNS {
+        let ci = *case_seed;
+        *case_seed += 1;
+        let (mut rng, fault_n, loss_p) = mbt_crash_params(ci, r, io_count);
+        let ctx = format!(
+            "trace {trace_idx} recovery run={r} fault={fault_n}/{io_count} loss_p={loss_p:.3} case={ci}"
+        );
+        let path = format!("/mbt_recovery_{ci}.db");
+        let crash_io = Arc::new(super::crash_io::CrashIO::new());
+        drop(mbt_build_prefix(&path, &crash_io, eps, eps.len()));
+
+        crash_io.arm_fault_at_io(fault_n);
+        if Database::open_file(crash_io.clone(), &path).is_err() {
+            agg.any_faulted = true;
+        }
+        crash_io.disarm_fault();
+
+        agg.add(loss_p, crash_io.crash(loss_p, &mut rng));
+
+        let db2 = Database::open_file(crash_io.clone(), &path)
+            .unwrap_or_else(|e| panic!("[{ctx}] second reopen: {e:?}"));
+        let conn2 = db2
+            .connect()
+            .unwrap_or_else(|e| panic!("[{ctx}] recovery/connect: {e:?}"));
+        let visible = mbt_visible_rows(&conn2);
+        assert_eq!(
+            visible, expected,
+            "[{ctx}] recovery did not converge to the committed set"
+        );
+        mbt_assert_consistent(&conn2, visible.len(), &ctx);
+        if loss_p == 1.0 {
+            mbt_continue_and_reassert(db2, conn2, &crash_io, &path, &visible, ci, &ctx);
+        }
+    }
+}
+
+/// Model-based crash fuzzer (see the section header). Quint supplies the
+/// sequences (incl. commits interleaved into a checkpoint's prepare phase); the
+/// adapter supplies per-IO crash thoroughness and the concurrency interleaving.
+///
+/// `#[ignore]`d so the fast PR unit-test run skips it: it needs quint (to generate
+/// the traces, which are NOT committed) and is heavy. It runs as its own release
+/// CI job (`.github/workflows/quint-mbt.yml`), and locally via
+/// `cargo test ... -- --ignored` (the loader regenerates the traces if absent).
+#[test]
+#[ignore = "heavy; needs quint-generated traces — run via the quint-mbt CI job or `--ignored`"]
+fn test_mbt_checkpoint_traces_match_spec() {
+    let traces = parse_mbt_traces(&load_mbt_traces());
+    assert!(
+        traces.len() >= 5,
+        "expected several MBT traces, got {}",
+        traces.len()
+    );
+    use rand::SeedableRng as _;
+    let mut agg = MbtAgg::default();
+    let mut case_seed = 0u64;
+    let mut concurrency_episodes = 0usize;
+    let mut trailing_checkpoints = 0usize;
+    let mut modes_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Per trace, drive CALLS_PER_TRACE *random* crash targets rather than
+    // iterating every episode: cost is linear in trace length (not O(n^2)) so
+    // traces can be long, and the crash point is genuinely random. A target is a
+    // random episode (crash that op), the full-trace recovery, or the trailing
+    // mid-checkpoint (F7). Each crash helper replays the full prefix up to its
+    // target and crashes there — random IO, random loss, and (for an interleaved
+    // passive checkpoint) a random yield point.
+    const CALLS_PER_TRACE: usize = 12;
+
+    for (ti, trace) in traces.iter().enumerate() {
+        let eps = mbt_episodes(trace);
+        let trailing = mbt_trailing_checkpoint(trace);
+        let n = eps.len();
+        if n == 0 && trailing.is_none() {
+            continue;
+        }
+        let final_committed: Vec<(i64, i64)> = match eps.last() {
+            Some(MbtEpisode::Commit { after, .. } | MbtEpisode::Checkpoint { after, .. }) => {
+                after.clone()
+            }
+            None => Vec::new(),
+        };
+        // Targets: 0..n crash episode i; n = crash full-trace recovery; n+1 =
+        // crash the trailing mid-checkpoint (only when the trace ends mid-ckpt).
+        let n_targets = n + 1 + trailing.is_some() as usize;
+        for c in 0..CALLS_PER_TRACE {
+            // Choose the target deterministically but decorrelated from the crash
+            // RNG the helpers derive from `case_seed`; mix in `c` so a skipped
+            // (no-op) target still advances the choice.
+            let target = {
+                let seed = case_seed
+                    .wrapping_add((c as u64).wrapping_mul(0x9E3779B97F4A7C15))
+                    .wrapping_mul(0xD1B54A32D192ED03);
+                let mut tsel = rand::rngs::StdRng::seed_from_u64(seed);
+                rand::Rng::random_range(&mut tsel, 0..n_targets)
+            };
+            if target < n {
+                match &eps[target] {
+                    MbtEpisode::Commit { ops, before, after } => {
+                        mbt_crash_test_commit(
+                            ti,
+                            &eps,
+                            target,
+                            ops,
+                            before,
+                            after,
+                            &mut case_seed,
+                            &mut agg,
+                        );
+                    }
+                    MbtEpisode::Checkpoint {
+                        interleaved,
+                        before,
+                        mode,
+                        ..
+                    } => {
+                        modes_seen.insert(mode.clone());
+                        if interleaved.is_empty() {
+                            mbt_crash_test_checkpoint(
+                                ti,
+                                &eps,
+                                target,
+                                before,
+                                mode,
+                                &mut case_seed,
+                                &mut agg,
+                            );
+                        } else {
+                            assert_eq!(
+                                mode, "passive",
+                                "trace {ti} ep {target}: interleaved commits during a non-passive checkpoint"
+                            );
+                            concurrency_episodes += 1;
+                            mbt_crash_test_checkpoint_concurrent(
+                                ti,
+                                &eps,
+                                target,
+                                interleaved,
+                                before,
+                                &mut case_seed,
+                                &mut agg,
+                            );
+                        }
+                    }
+                }
+            } else if target == n {
+                if n > 0 {
+                    mbt_crash_test_recovery(ti, &eps, &final_committed, &mut case_seed, &mut agg);
+                }
+            } else {
+                let tr = trailing.as_ref().unwrap();
+                trailing_checkpoints += 1;
+                modes_seen.insert(tr.mode.clone());
+                if tr.interleaved.is_empty() {
+                    mbt_crash_test_checkpoint(
+                        ti,
+                        &eps,
+                        n,
+                        &tr.before,
+                        &tr.mode,
+                        &mut case_seed,
+                        &mut agg,
+                    );
+                } else {
+                    assert_eq!(
+                        tr.mode, "passive",
+                        "trace {ti}: interleaved commits during a non-passive trailing checkpoint"
+                    );
+                    concurrency_episodes += 1;
+                    mbt_crash_test_checkpoint_concurrent(
+                        ti,
+                        &eps,
+                        n,
+                        &tr.interleaved,
+                        &tr.before,
+                        &mut case_seed,
+                        &mut agg,
+                    );
+                }
+            }
+        }
+    }
+
+    // Teeth guards: faults must actually fire; strict crashes must drop pages;
+    // probabilistic crashes must retain some (the duplication path); and at least
+    // one checkpoint episode must have had an interleaved commit (concurrency).
+    assert!(agg.any_faulted, "MBT never injected an IO fault — vacuous");
+    assert!(
+        agg.strict_lost > 0,
+        "strict crashes never dropped an un-fsynced page — vacuous"
+    );
+    assert!(
+        agg.prob_retained > 0,
+        "probabilistic crashes never retained an un-fsynced page — duplication path untested"
+    );
+    assert!(
+        concurrency_episodes > 0,
+        "no checkpoint episode had an interleaved commit — concurrency contract untested"
+    );
+    assert!(
+        trailing_checkpoints > 0,
+        "no trace ended mid-checkpoint — the trailing-checkpoint recovery path (F7) is untested"
+    );
+    assert!(
+        agg.in_flight_seen,
+        "no interleaved commit was ever crashed mid-flight — the commit-in-flight-during-checkpoint path is untested"
+    );
+    // All four checkpoint modes must actually be crash-tested — guards against a
+    // generation gap (a mode never produced) or a selection gap (a mode never
+    // chosen as a crash target).
+    let all_modes: std::collections::BTreeSet<String> = ["passive", "full", "restart", "truncate"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    assert_eq!(
+        modes_seen, all_modes,
+        "not every checkpoint mode was exercised as a crash target — saw {modes_seen:?}"
+    );
+}
+
+/// Regression (no crash): a commit that lands during a Passive checkpoint's
+/// unlocked prepare phase — fsynced, success returned, but excluded from this
+/// checkpoint's backfill (`snapshot_ts`) — must survive the checkpoint completing
+/// and a reopen. The bug (new with the off-lock checkpoint): the checkpoint
+/// truncated the logical log to 0, destroying that commit's uncheckpointed frame.
+/// Fixed by `LogicalLog::truncate` preserving frames above the checkpoint
+/// boundary. This isolates the loss from any crash mechanics — it is the
+/// checkpoint itself that must not drop the commit.
+#[test]
+fn test_concurrent_commit_during_checkpoint_survives_reopen() {
+    use super::crash_io::CrashIO;
+    let path = "/concurrent_commit_ckpt.db";
+    let crash_io = Arc::new(CrashIO::new());
+    let db = Database::open_file(crash_io.clone(), path).unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+        for i in 1..=7 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, '{}')", mbt_payload(i)))
+                .unwrap();
+        }
+        // Drive a checkpoint, freeze it off-lock, commit id 8 on a 2nd connection
+        // during that window, then run the checkpoint to completion (no fault).
+        let faulted = mbt_run_checkpoint_episode(
+            &db,
+            &conn,
+            &[vec![MbtOp::Write { key: 8, value: 8 }]],
+            None,
+            "concurrent-commit",
+        );
+        assert!(
+            !faulted,
+            "no fault was armed, yet the episode reported a fault"
+        );
+    }
+    drop(db);
+    let db2 = Database::open_file(crash_io, path).unwrap();
+    let conn2 = db2.connect().unwrap();
+    let visible = mbt_visible_rows(&conn2);
+    let expected = mbt_expected_rows(&[
+        (1, 1),
+        (2, 2),
+        (3, 3),
+        (4, 4),
+        (5, 5),
+        (6, 6),
+        (7, 7),
+        (8, 8),
+    ]);
+    assert_eq!(
+        visible, expected,
+        "concurrent commit (8) lost by the checkpoint's log truncation"
     );
 }

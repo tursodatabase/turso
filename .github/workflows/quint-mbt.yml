@@ -1,0 +1,71 @@
+name: Quint MBT Checkpoint
+
+# Model-based crash/concurrency test for the MVCC non-blocking checkpoint. Quint
+# (docs/internals/mvcc/checkpoint.qnt) generates the scenario traces; the Rust
+# adapter (test_mbt_checkpoint_traces_match_spec) replays them against the real
+# engine with per-IO crash injection and a randomized commit/checkpoint yield
+# scheduler. The traces are generated here, not committed, and the test is run in
+# RELEASE so it is fast enough to replay deep traces. The test is #[ignore]d, so
+# the regular PR unit-test run skips it; this job is the only place it runs in CI.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    # Nightly at 3:30am UTC
+    - cron: "30 3 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quint-mbt:
+    name: Quint MBT checkpoint crash/concurrency (release)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+
+      - uses: "./.github/shared/setup-sccache"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Set up Python 3.10
+        uses: useblacksmith/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install quint
+        run: npm install -g @informalsystems/quint
+
+      - name: Generate MBT traces from the Quint spec
+        run: python3 docs/internals/mvcc/mbt_gen.py
+
+      - name: Run MBT checkpoint crash/concurrency test (release)
+        run: cargo nextest run --release -p turso_core --all-features -E 'test(test_mbt_checkpoint_traces_match_spec)' --run-ignored all --failure-output=final
+        timeout-minutes: 45

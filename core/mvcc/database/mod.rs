@@ -62,6 +62,8 @@ use super::persistent_storage::logical_log::{
 };
 
 #[cfg(test)]
+pub mod crash_io;
+#[cfg(test)]
 pub mod hermitage_tests;
 #[cfg(test)]
 pub mod tests;
