@@ -1,20 +1,20 @@
 use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
-use super::{ProgramBuilder, ProgramBuilderOpts, translate_inner};
+use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::translate::emitter::emit_columns_and_dependencies;
 use crate::translate::expr::emit_table_column_for_dml;
 use crate::translate::plan::ColumnMask;
 use crate::{
-    Connection, LimboError, Result,
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef},
     sync::{Arc, OnceLock, Weak},
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
     vdbe::{
-        BranchOffset, PreparedProgram,
         builder::{CursorType, DmlColumnContext, QueryMode},
         insn::{CmpInsFlags, Insn, Subprogram},
+        BranchOffset, PreparedProgram,
     },
+    Connection, LimboError, Result,
 };
 use std::{cell::RefCell, num::NonZero, num::NonZeroUsize, rc::Rc};
 

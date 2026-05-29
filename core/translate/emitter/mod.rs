@@ -1,15 +1,15 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 use super::{
-    collate::{CollationSeq, get_expr_collation_ctx_with_symbols},
+    collate::{get_expr_collation_ctx_with_symbols, CollationSeq},
     compound_select::emit_program_for_compound_select,
     emitter::{
         delete::emit_program_for_delete, select::emit_program_for_select,
         update::emit_program_for_update,
     },
     expr::{
-        BindingBehavior, ExprAffinityInfo, NoConstantOptReason, WalkControl, bind_and_rewrite_expr,
-        emit_table_column, translate_expr, translate_expr_no_constant_opt, walk_expr,
+        bind_and_rewrite_expr, emit_table_column, translate_expr, translate_expr_no_constant_opt,
+        walk_expr, BindingBehavior, ExprAffinityInfo, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
@@ -18,27 +18,26 @@ use super::{
         BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn,
         TableReferences,
     },
-    planner::{ROWID_STRS, TableMask},
+    planner::{TableMask, ROWID_STRS},
     trigger_exec::{get_triggers_including_temp, has_triggers_including_temp},
     window::WindowMetadata,
 };
 use crate::alloc::TursoIteratorExt;
 use crate::instrument;
 use crate::schema::{
-    BTreeTable, CheckConstraint, Column, ColumnLayout, EXPR_INDEX_SENTINEL, GeneratedType,
-    IndexColumn, Schema, Table,
+    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
+    EXPR_INDEX_SENTINEL,
 };
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::ColumnMask;
 use crate::vdbe::{
-    BranchOffset, CursorID,
     affinity::Affinity,
     builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
-    insn::{InsertFlags, Insn, to_u16},
+    insn::{to_u16, InsertFlags, Insn},
+    BranchOffset, CursorID,
 };
 use crate::{
-    CaptureDataChangesExt, Connection, Database, DatabaseCatalog, LimboError, Result, RwLock,
-    SymbolTable, bail_parse_error,
+    bail_parse_error,
     error::SQLITE_CONSTRAINT_CHECK,
     function::Func,
     sync::Arc,
@@ -46,6 +45,8 @@ use crate::{
     util::{
         check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
     },
+    CaptureDataChangesExt, Connection, Database, DatabaseCatalog, LimboError, Result, RwLock,
+    SymbolTable,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
@@ -1801,11 +1802,9 @@ pub(crate) fn emit_columns_and_dependencies(
         (col, reg)
     });
     let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
-    debug_assert!(
-        targets
-            .windows(2)
-            .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 })
-    );
+    debug_assert!(targets
+        .windows(2)
+        .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));
 
     let table_arc = Arc::new(table.clone());
     gencol::compute_virtual_columns(
