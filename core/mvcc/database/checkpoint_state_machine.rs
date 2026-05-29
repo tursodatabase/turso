@@ -192,7 +192,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     collect_index_key_cursor: Option<Arc<SortableIndexKey>>,
     /// Async driver for `CheckpointState::CompactSequences`. Lazily set
     /// on first entry to that state; cleared when the driver completes.
-    seq_compact: Option<SeqCompactDriver>,
+    seq_compact: Option<SeqCompactDriver<Clock>>,
 }
 
 /// One pending compaction job in the per-checkpoint sequence sweep.
@@ -200,6 +200,13 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
 struct SeqCompaction {
     backing_root: i64,
     backing_num_cols: usize,
+    /// MVCC table id derived from `backing_root` at sweep-plan time.
+    /// Cached here so the per-row purge in `ScanDelete` doesn't re-scan
+    /// `mvstore.table_id_to_rootpage` on every deletion. The driver uses
+    /// it together with the deleted row's `value` (= rowid alias) to
+    /// build the `RowID` it passes to
+    /// `MvStore::purge_row_versions_during_checkpoint`.
+    table_id: MVTableId,
     /// `true` for ascending sequences (watermark = `Last`), `false` for
     /// descending (watermark = `Rewind`). Direction-aware because the
     /// "current value" of a sequence is the max for ascending and the
@@ -240,7 +247,15 @@ enum SeqCompactPhase {
 /// cursor op yields up to the caller on page IO, so a `step()` call
 /// from inside the checkpoint state machine can propagate a yield
 /// upward without ever blocking the executor.
-struct SeqCompactDriver {
+///
+/// Generic over `Clock` so it can hold an `Arc<MvStore<Clock>>` — the
+/// driver paired-deletes from the B-tree (via the cursor) AND from the
+/// MVCC version chain (via `purge_row_versions_during_checkpoint`) so
+/// the two layers stay consistent. Skipping the version-chain purge
+/// would leave entries with `btree_resident: true` pointing at B-tree
+/// rows that no longer exist, surviving until `drop_unused_row_versions`
+/// Rule 3 catches up.
+struct SeqCompactDriver<Clock: LogicalClock> {
     /// Remaining backing tables to compact, in arbitrary order.
     pending: Vec<SeqCompaction>,
     /// Index of the in-flight compaction within `pending`.
@@ -253,9 +268,19 @@ struct SeqCompactDriver {
     /// The watermark key captured in `ReadWatermarkRowid`. The scan
     /// keeps the row at this key and deletes all others.
     watermark_key: Option<i64>,
+    /// Row key (= `value` column, since `value INTEGER PRIMARY KEY`)
+    /// captured in `ScanReadRowid` when we decide the current row must
+    /// go. Consumed by `ScanDelete` AFTER `cursor.delete()` returns
+    /// `Done` to build the matching `RowID` for the MVCC purge call.
+    /// Stored on the driver (not as a phase payload) so a yield mid-
+    /// `cursor.delete()` doesn't lose the rowid across re-entry.
+    pending_delete_rowid: Option<i64>,
     /// Cached pager handle so cursor construction matches the original
     /// `BTreeCursor::new_table` signature.
     pager: Arc<Pager>,
+    /// MVCC store used to purge version-chain entries paired with each
+    /// B-tree delete. See the struct-level comment for the invariant.
+    mvstore: Arc<MvStore<Clock>>,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -375,7 +400,7 @@ fn is_schema_metadata_only_rewrite(current: &RowVersion, next: Option<&RowVersio
     }
 }
 
-impl SeqCompactDriver {
+impl<Clock: LogicalClock> SeqCompactDriver<Clock> {
     /// Drive one step of the compaction sweep. Returns `IOResult::IO` on
     /// any cursor page IO so the caller can yield up; returns
     /// `IOResult::Done(())` when every pending backing table has been
@@ -393,6 +418,7 @@ impl SeqCompactDriver {
                 ));
                 self.phase = SeqCompactPhase::SeekWatermark;
                 self.watermark_key = None;
+                self.pending_delete_rowid = None;
             }
             let cursor = self
                 .cursor
@@ -444,7 +470,15 @@ impl SeqCompactDriver {
                         Some(k) if Some(k) == self.watermark_key => {
                             self.phase = SeqCompactPhase::ScanNext;
                         }
-                        Some(_) => {
+                        Some(k) => {
+                            // Stash the key for the paired MVCC purge that
+                            // ScanDelete performs after `cursor.delete()`
+                            // returns Done. This branch and the transition
+                            // are synchronous (no yield between them), so
+                            // ScanDelete is guaranteed to observe
+                            // `pending_delete_rowid = Some(k)` on the
+                            // current iteration.
+                            self.pending_delete_rowid = Some(k);
                             self.phase = SeqCompactPhase::ScanDelete;
                         }
                         None => {
@@ -457,6 +491,24 @@ impl SeqCompactDriver {
                     if let IOResult::IO(io) = r {
                         return Ok(IOResult::IO(io));
                     }
+                    // Pair the B-tree delete with the MVCC version-chain
+                    // purge so a snapshot reader can't observe the row
+                    // via `RowVersion.row` after the B-tree row is gone.
+                    // `pending_delete_rowid` was set in ScanReadRowid for
+                    // the row the cursor was on when we entered this
+                    // phase; consume it with `take()` so it doesn't leak
+                    // into the next scan iteration. See the
+                    // `purge_row_versions_during_checkpoint` doc comment
+                    // for the caller contract this depends on
+                    // (pager_commit_lock serializing nextval allocators).
+                    let rowid = self
+                        .pending_delete_rowid
+                        .take()
+                        .expect("pending_delete_rowid must be set when ScanDelete completes");
+                    self.mvstore.purge_row_versions_during_checkpoint(RowID {
+                        table_id: seq.table_id,
+                        row_id: RowKey::Int(rowid),
+                    });
                     // After Delete the cursor is positioned at the slot
                     // the deleted row used to occupy; the next Next
                     // advances to the following row.
@@ -479,6 +531,7 @@ impl SeqCompactDriver {
     fn advance_to_next_sequence(&mut self) {
         self.cursor = None;
         self.watermark_key = None;
+        self.pending_delete_rowid = None;
         self.current_idx += 1;
         self.phase = SeqCompactPhase::SeekWatermark;
     }
@@ -518,9 +571,17 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     let backing_name = format!("{SEQ_BACKING_TABLE_PREFIX}{}", seq.name);
                     let bt = schema.get_btree_table(&backing_name)?;
                     let backing_root = resolve_root(bt.root_page)?;
+                    // Resolve the MVCC table_id once per sequence so the
+                    // per-row purge in `ScanDelete` doesn't re-scan
+                    // `table_id_to_rootpage` on every deletion. Uses the
+                    // schema-side root (pre-resolve) because
+                    // `get_table_id_from_root_page` already understands
+                    // the negative uncheckpointed-sentinel encoding.
+                    let table_id = self.mvstore.get_table_id_from_root_page(bt.root_page);
                     Some(SeqCompaction {
                         backing_root,
                         backing_num_cols: bt.columns().len(),
+                        table_id,
                         increment_positive: seq.increment_by >= 0,
                     })
                 })
@@ -1961,7 +2022,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         cursor: None,
                         phase: SeqCompactPhase::SeekWatermark,
                         watermark_key: None,
+                        pending_delete_rowid: None,
                         pager: self.pager.clone(),
+                        mvstore: self.mvstore.clone(),
                     });
                 }
                 let driver = self.seq_compact.as_mut().expect("seq_compact set above");

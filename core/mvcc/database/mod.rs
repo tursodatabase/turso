@@ -5723,6 +5723,32 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(state_machine)
     }
 
+    /// Clear every version-chain entry for `rowid`. Used by checkpoint-time
+    /// compaction that deletes the corresponding B-tree row outside the
+    /// normal MVCC delete path (e.g. `SeqCompactDriver` for sequence
+    /// backing tables) so the two layers stay in sync — without this the
+    /// version chain would keep `RowVersion { begin: Timestamp(T), end:
+    /// None, btree_resident: true }` entries pointing at B-tree rows that
+    /// no longer exist, until `drop_unused_row_versions` Rule 3 caught up.
+    ///
+    /// **Caller contract** — the caller must hold a guarantee that no
+    /// concurrent reader can observe mid-purge state. Today the only
+    /// caller is `SeqCompactDriver`, which runs inside the checkpoint
+    /// while the `pager_commit_lock` is held; nextval allocators serialize
+    /// through that same lock, so they cannot see the chain in a partially
+    /// purged state. Callers without that guarantee must add proper
+    /// tombstones via the normal write path instead.
+    ///
+    /// Empty chain slots are left in the `SkipMap` (lazy removal). The
+    /// same TOCTOU rationale as `gc_table_row_versions` applies: removing
+    /// the slot would race a concurrent `get_or_insert_with` from a future
+    /// write to the same key.
+    pub fn purge_row_versions_during_checkpoint(&self, rowid: RowID) {
+        if let Some(entry) = self.rows.get(&rowid) {
+            entry.value().write().clear();
+        }
+    }
+
     pub fn get_last_table_rowid(
         &self,
         table_id: MVTableId,
