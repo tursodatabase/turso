@@ -130,7 +130,12 @@ fn prepare_window_subquery(
         return Ok(());
     }
 
-    let mut current_window = windows.swap_remove(0);
+    // Layer windows in their declaration order: the first-declared window
+    // becomes the outermost subquery (its PARTITION/ORDER drives the
+    // user-visible row order), and later-declared windows nest deeper. Each
+    // window function evaluates against rows in its own layer's order, so
+    // the relative position of unordered windows like `OVER ()` matters.
+    let mut current_window = windows.remove(0);
     let mut subquery_result_columns = Vec::new();
     let mut subquery_order_by = Vec::new();
     let subquery_id = program.table_reference_counter.next();
