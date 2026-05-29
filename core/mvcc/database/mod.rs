@@ -36,6 +36,7 @@ use crate::ValueRef;
 use crate::{
     contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case, Completion,
 };
+use crate::{io::FileSyncType, io_yield_one, return_if_io};
 use crate::{
     turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable, Numeric,
 };
@@ -3363,6 +3364,38 @@ pub struct RowidAllocator {
     initialized: AtomicBool,
 }
 
+/// Sub state machine for [`MvStore::bootstrap_nonblock`]. Carried by the
+/// open state machine (`OpenDbAsyncPhase::BootstrapMvStore`) across the
+/// metadata-bootstrap IO chain so opening an MVCC database does not block on
+/// the log-header truncate / write / fsync sequence.
+#[derive(Default)]
+pub enum BootstrapState {
+    #[default]
+    Start,
+    MetadataIo(MetadataIoInFlight),
+    AwaitingGlobalHeader,
+}
+
+#[doc(hidden)]
+pub struct MetadataIoInFlight {
+    pub completion: Completion,
+    pub sync_type: FileSyncType,
+    pub next: MetadataIoStep,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub enum MetadataIoStep {
+    /// `log_file.truncate(0)` just finished. If the log was <= header size we
+    /// still need to write a fresh header (and maybe fsync). `log_size` is the
+    /// original on-disk size; `sync_mode_off` records whether sync is disabled.
+    AfterTruncate { log_size: u64, sync_mode_off: bool },
+    /// `storage.update_header` just finished. Maybe issue `storage.sync`.
+    AfterUpdateHeader { sync_mode_off: bool },
+    /// `storage.sync` just finished — metadata IO chain done.
+    AfterSync,
+}
+
 /// A multi-version concurrency control database.
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock> {
@@ -3717,58 +3750,190 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// 4. Promote the bootstrap connection to a regular connection so that it reads from the MV store again
     /// 5. Recover the logical log
     /// 6. Make sure schema changes reflected from deserialized logical log are captured in the schema
+    ///
+    /// Blocking shim retained for [`Connection::attach_database_inner`] and the
+    /// `op_journal_mode_inner` VDBE opcode — both of which are synchronous
+    /// public/VDBE entry points. The open state machine drives
+    /// [`MvStore::bootstrap_nonblock`] directly so a WAL/log header write
+    /// during open does not block.
     pub fn bootstrap(&self, bootstrap_conn: Arc<Connection>) -> Result<()> {
-        let preserved_table_valued_functions =
-            Self::capture_table_valued_functions(&bootstrap_conn.schema.read());
-        self.maybe_complete_interrupted_checkpoint(&bootstrap_conn)?;
-        bootstrap_conn.reparse_schema()?;
-        self.rehydrate_connection_table_valued_functions(
-            &bootstrap_conn,
-            &preserved_table_valued_functions,
-        );
+        let mut st = BootstrapState::default();
+        let io = bootstrap_conn.db.io.clone();
+        io.block(|| self.bootstrap_nonblock(&bootstrap_conn, &mut st))
+    }
 
-        if self.uses_durable_mvcc_metadata(&bootstrap_conn) {
-            match self.try_read_persistent_tx_ts_max(&bootstrap_conn)? {
-                Some(_) => {}
-                None => {
-                    let log_size = self.get_logical_log_file().size()?;
+    #[doc(hidden)]
+    pub fn bootstrap_nonblock(
+        &self,
+        bootstrap_conn: &Arc<Connection>,
+        st: &mut BootstrapState,
+    ) -> Result<IOResult<()>> {
+        loop {
+            match st {
+                BootstrapState::Start => {
+                    self.bootstrap_pre_metadata(bootstrap_conn)?;
+                    if let Some(next) = self.bootstrap_begin_metadata_io(bootstrap_conn)? {
+                        *st = BootstrapState::MetadataIo(next);
+                    } else {
+                        // No metadata IO needed (either non-durable mode, or
+                        // persistent_tx_ts already set). Run the post-metadata
+                        // sync work and transition.
+                        self.bootstrap_post_metadata_setup(bootstrap_conn)?;
+                        *st = BootstrapState::AwaitingGlobalHeader;
+                    }
+                }
+                BootstrapState::MetadataIo(phase) => {
+                    if !phase.completion.succeeded() {
+                        let c = phase.completion.clone();
+                        io_yield_one!(c);
+                    }
                     let pager = bootstrap_conn.pager.load().clone();
-                    if bootstrap_conn.db.is_readonly() {
-                        return Err(LimboError::Corrupt(
-                            "Missing MVCC metadata table in read-only mode".to_string(),
-                        ));
-                    }
-                    if log_size > LOG_HDR_SIZE as u64 {
-                        return Err(LimboError::Corrupt(
-                            "Missing MVCC metadata table while logical log state exists"
-                                .to_string(),
-                        ));
-                    }
-                    // First-time MVCC bootstrap: ensure a durable logical-log header exists
-                    // before any metadata-table writes can commit into WAL.
-                    // If a previous crash left a torn header tail (0 < size < LOG_HDR_SIZE),
-                    // clear it before rewriting the header.
-                    if log_size > 0 && log_size < LOG_HDR_SIZE as u64 {
-                        let log_file = self.get_logical_log_file();
-                        let c = log_file.truncate(0, Completion::new_trunc(|_| {}))?;
-                        bootstrap_conn.db.io.wait_for_completion(c)?;
-                    }
-                    if log_size <= LOG_HDR_SIZE as u64 {
-                        let c = self.storage.update_header()?;
-                        pager.io.wait_for_completion(c)?;
-                        if bootstrap_conn.get_sync_mode() != SyncMode::Off {
-                            let c = self.storage.sync(pager.get_sync_type())?;
-                            pager.io.wait_for_completion(c)?;
+                    let sync_type = phase.sync_type;
+                    match phase.next {
+                        MetadataIoStep::AfterTruncate {
+                            log_size,
+                            sync_mode_off,
+                        } => {
+                            // Truncate done. Maybe issue update_header next.
+                            if log_size <= LOG_HDR_SIZE as u64 {
+                                let c = self.storage.update_header()?;
+                                *phase = MetadataIoInFlight {
+                                    completion: c,
+                                    sync_type,
+                                    next: MetadataIoStep::AfterUpdateHeader { sync_mode_off },
+                                };
+                                // Loop to re-check succeeded immediately
+                            } else {
+                                self.bootstrap_finish_metadata_io(bootstrap_conn)?;
+                                self.bootstrap_post_metadata_setup(bootstrap_conn)?;
+                                *st = BootstrapState::AwaitingGlobalHeader;
+                            }
+                        }
+                        MetadataIoStep::AfterUpdateHeader { sync_mode_off } => {
+                            if !sync_mode_off {
+                                let c = self.storage.sync(sync_type)?;
+                                *phase = MetadataIoInFlight {
+                                    completion: c,
+                                    sync_type,
+                                    next: MetadataIoStep::AfterSync,
+                                };
+                            } else {
+                                self.bootstrap_finish_metadata_io(bootstrap_conn)?;
+                                self.bootstrap_post_metadata_setup(bootstrap_conn)?;
+                                *st = BootstrapState::AwaitingGlobalHeader;
+                            }
+                            let _ = pager; // silence unused on this arm
+                        }
+                        MetadataIoStep::AfterSync => {
+                            self.bootstrap_finish_metadata_io(bootstrap_conn)?;
+                            self.bootstrap_post_metadata_setup(bootstrap_conn)?;
+                            *st = BootstrapState::AwaitingGlobalHeader;
                         }
                     }
-                    self.initialize_mvcc_metadata_table(&bootstrap_conn)?;
-                    // Metadata bootstrap writes land in SQLite WAL first; reconcile immediately so
-                    // subsequent opens (including read-only opens) do not depend on WAL replay.
-                    self.maybe_complete_interrupted_checkpoint(&bootstrap_conn)?;
+                }
+                BootstrapState::AwaitingGlobalHeader => {
+                    if self.global_header.read().is_none() {
+                        let pager = bootstrap_conn.pager.load();
+                        let header = return_if_io!(pager.with_header(|header| *header));
+                        self.global_header.write().replace(header);
+                    }
+                    return Ok(IOResult::Done(()));
                 }
             }
         }
+    }
 
+    /// Synchronous prelude to bootstrap: capture vtabs, run the first
+    /// checkpoint reconciliation, reparse schema, rehydrate vtabs.
+    fn bootstrap_pre_metadata(&self, bootstrap_conn: &Arc<Connection>) -> Result<()> {
+        let preserved_table_valued_functions =
+            Self::capture_table_valued_functions(&bootstrap_conn.schema.read());
+        self.maybe_complete_interrupted_checkpoint(bootstrap_conn)?;
+        bootstrap_conn.reparse_schema()?;
+        self.rehydrate_connection_table_valued_functions(
+            bootstrap_conn,
+            &preserved_table_valued_functions,
+        );
+        Ok(())
+    }
+
+    /// Decide whether the metadata-bootstrap IO chain is required and, if so,
+    /// issue its first completion. Returns `Some(MetadataIoInFlight)` carrying
+    /// the in-flight completion and the next step to take after it completes;
+    /// returns `None` if the chain is not required (either the database does
+    /// not use durable MVCC metadata, or the persistent tx-ts max is already
+    /// set, or the log is in a clean state).
+    fn bootstrap_begin_metadata_io(
+        &self,
+        bootstrap_conn: &Arc<Connection>,
+    ) -> Result<Option<MetadataIoInFlight>> {
+        if !self.uses_durable_mvcc_metadata(bootstrap_conn) {
+            return Ok(None);
+        }
+        if self
+            .try_read_persistent_tx_ts_max(bootstrap_conn)?
+            .is_some()
+        {
+            return Ok(None);
+        }
+
+        let log_size = self.get_logical_log_file().size()?;
+        let pager = bootstrap_conn.pager.load().clone();
+        if bootstrap_conn.db.is_readonly() {
+            return Err(LimboError::Corrupt(
+                "Missing MVCC metadata table in read-only mode".to_string(),
+            ));
+        }
+        if log_size > LOG_HDR_SIZE as u64 {
+            return Err(LimboError::Corrupt(
+                "Missing MVCC metadata table while logical log state exists".to_string(),
+            ));
+        }
+        let sync_type = pager.get_sync_type();
+        let sync_mode_off = bootstrap_conn.get_sync_mode() == SyncMode::Off;
+
+        // First-time MVCC bootstrap: ensure a durable logical-log header exists
+        // before any metadata-table writes can commit into WAL. If a previous
+        // crash left a torn header tail (0 < size < LOG_HDR_SIZE), clear it
+        // before rewriting the header.
+        if log_size > 0 && log_size < LOG_HDR_SIZE as u64 {
+            let log_file = self.get_logical_log_file();
+            let completion = log_file.truncate(0, Completion::new_trunc(|_| {}))?;
+            return Ok(Some(MetadataIoInFlight {
+                completion,
+                sync_type,
+                next: MetadataIoStep::AfterTruncate {
+                    log_size,
+                    sync_mode_off,
+                },
+            }));
+        }
+        if log_size <= LOG_HDR_SIZE as u64 {
+            let completion = self.storage.update_header()?;
+            return Ok(Some(MetadataIoInFlight {
+                completion,
+                sync_type,
+                next: MetadataIoStep::AfterUpdateHeader { sync_mode_off },
+            }));
+        }
+        // Shouldn't reach here given the earlier error returns, but be safe.
+        Ok(None)
+    }
+
+    /// Once the metadata-bootstrap IO chain has finished, initialize the MVCC
+    /// metadata table and reconcile any interrupted checkpoint immediately so
+    /// that subsequent opens (including read-only opens) do not depend on WAL
+    /// replay of those metadata writes.
+    fn bootstrap_finish_metadata_io(&self, bootstrap_conn: &Arc<Connection>) -> Result<()> {
+        self.initialize_mvcc_metadata_table(bootstrap_conn)?;
+        self.maybe_complete_interrupted_checkpoint(bootstrap_conn)?;
+        Ok(())
+    }
+
+    /// Sync work between the metadata IO chain (or its skip) and the final
+    /// global-header read: build the schema mapping, recover the logical log,
+    /// and promote the bootstrap connection to a regular MVCC connection.
+    fn bootstrap_post_metadata_setup(&self, bootstrap_conn: &Arc<Connection>) -> Result<()> {
         {
             let schema = bootstrap_conn.schema.read();
             let sqlite_schema_root_pages = {
@@ -3800,9 +3965,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         // Recover logical log while bootstrap connection still reads from pager-backed schema.
         // This lets recovery merge checkpointed sqlite_schema rows with non-checkpointed rows from log replay.
-        // Return value indicates whether recovery replayed any frames; unused here because
-        // global_header initialization below is unconditional (guarded by is_none() instead).
-        // The return value is still used by tests to verify recovery behavior.
         let _recovered = self.maybe_recover_logical_log(bootstrap_conn.clone())?;
 
         // Recovery is done, switch back to regular MVCC reads.
@@ -3832,15 +3994,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // we surface them to the caller as a hard bootstrap failure.
         bootstrap_conn.sync_autoincrement_backing_tables_from_sqlite_sequence()?;
         *bootstrap_conn.db.schema.lock() = bootstrap_conn.schema.read().clone();
-
-        if self.global_header.read().is_none() {
-            let pager = bootstrap_conn.pager.load();
-            let header = pager
-                .io
-                .block(|| pager.with_header(|header| *header))
-                .expect("failed to read database header");
-            self.global_header.write().replace(header);
-        }
 
         Ok(())
     }

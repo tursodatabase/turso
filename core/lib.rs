@@ -487,6 +487,12 @@ pub struct OpenDbAsyncState {
     building_db: Option<Database>,
     /// Sub state machine for `header_validation`, driven in ValidatingHeader.
     header_validation_state: HeaderValidationState,
+    /// The dedicated bootstrap connection used by `BootstrapMvStore`, held
+    /// across yields from `MvStore::bootstrap_nonblock`.
+    mvcc_bootstrap_conn: Option<Arc<Connection>>,
+    /// Sub state machine for `MvStore::bootstrap_nonblock`, driven in
+    /// `BootstrapMvStore`.
+    mvcc_bootstrap_state: mvcc::database::BootstrapState,
 }
 
 impl Default for OpenDbAsyncState {
@@ -508,6 +514,8 @@ impl OpenDbAsyncState {
             registry_key: None,
             building_db: None,
             header_validation_state: HeaderValidationState::default(),
+            mvcc_bootstrap_conn: None,
+            mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
         }
     }
 }
@@ -1444,9 +1452,22 @@ impl Database {
                         .expect("pager must be initialized in Init phase");
 
                     if let Some(mv_store) = db.get_mv_store().as_ref() {
-                        let mvcc_bootstrap_conn =
-                            db._connect(true, Some(pager.clone()), state.encryption_key.clone())?;
-                        mv_store.bootstrap(mvcc_bootstrap_conn)?;
+                        // Create the dedicated bootstrap connection once and
+                        // hold it across yields. Re-entry reuses the existing
+                        // connection and the persisted `BootstrapState`.
+                        if state.mvcc_bootstrap_conn.is_none() {
+                            state.mvcc_bootstrap_conn = Some(db._connect(
+                                true,
+                                Some(pager.clone()),
+                                state.encryption_key.clone(),
+                            )?);
+                        }
+                        let conn = state.mvcc_bootstrap_conn.as_ref().expect("created above");
+                        return_if_io!(
+                            mv_store.bootstrap_nonblock(conn, &mut state.mvcc_bootstrap_state)
+                        );
+                        // Done — drop the bootstrap connection.
+                        state.mvcc_bootstrap_conn = None;
                     }
 
                     state.phase = OpenDbAsyncPhase::Done;
