@@ -547,7 +547,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     /// sentinel; tables that have no real root yet (created and
     /// immediately dropped in this checkpoint) are filtered out.
     fn pending_sequence_compactions(&self) -> Vec<SeqCompaction> {
-        use crate::schema::SEQ_BACKING_TABLE_PREFIX;
         let resolve_root = |schema_root: i64| -> Option<i64> {
             if schema_root > 0 {
                 return Some(schema_root);
@@ -568,7 +567,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 .iter()
                 .filter(|(_, seq)| !seq.cycle)
                 .filter_map(|(_, seq)| {
-                    let backing_name = format!("{SEQ_BACKING_TABLE_PREFIX}{}", seq.name);
+                    let backing_name =
+                        crate::translate::sequence::sequence_backing_table_name(&seq.name);
                     let bt = schema.get_btree_table(&backing_name)?;
                     let backing_root = resolve_root(bt.root_page)?;
                     // Resolve the MVCC table_id once per sequence so the

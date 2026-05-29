@@ -1,5 +1,4 @@
 use super::*;
-use crate::schema::SEQ_BACKING_TABLE_PREFIX;
 use crate::translate::sequence::emit_sequence_descriptor_literals;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{to_u16, InsertFlags, RegisterOrLiteral};
@@ -240,7 +239,8 @@ pub(super) fn translate_sequence_function(
         (crate::MAIN_DB_ID, normalize_ident(&seq_name_raw))
     };
 
-    let backing_table_name = format!("{SEQ_BACKING_TABLE_PREFIX}{normalized_name}");
+    let backing_table_name =
+        crate::translate::sequence::sequence_backing_table_name(&normalized_name);
     let backing_table =
         resolver.with_schema(database_id, |s| s.get_btree_table(&backing_table_name));
     if backing_table.is_none() {

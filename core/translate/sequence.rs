@@ -28,7 +28,7 @@ use crate::Result;
 use turso_parser::ast;
 
 pub fn sequence_backing_table_name(seq_name: &str) -> String {
-    format!("{SEQ_BACKING_TABLE_PREFIX}{seq_name}")
+    String::from(SEQ_BACKING_TABLE_PREFIX) + seq_name
 }
 
 pub fn sequence_backing_table_sql(seq_name: &str) -> String {

@@ -2511,7 +2511,7 @@ impl Schema {
     pub fn remove_sequence(&mut self, name: &str) {
         let normalized = normalize_ident(name);
         self.sequences.remove(&normalized);
-        let backing_table = format!("{SEQ_BACKING_TABLE_PREFIX}{normalized}");
+        let backing_table = crate::translate::sequence::sequence_backing_table_name(&normalized);
         self.tables.remove(&backing_table);
     }
 
