@@ -593,11 +593,9 @@ pub fn op_checkpoint(
     // (e.g., when switching from WAL to MVCC mode via `PRAGMA journal_mode = "mvcc"`).
     let mv_store = program.connection.mv_store_for_db(*database);
     if let Some(mv_store) = mv_store.as_ref() {
-        if !matches!(checkpoint_mode, CheckpointMode::Truncate { .. }) {
-            return Err(LimboError::InvalidArgument(
-                "Only TRUNCATE checkpoint mode is supported for MVCC".to_string(),
-            ));
-        }
+        // All checkpoint modes route through the MVCC CheckpointStateMachine, which
+        // honors the mode (Passive runs off-lock; Full/Restart/Truncate block
+        // writers; Restart/Truncate also reset the WAL via `should_restart_log`).
         use crate::state_machine::{StateTransition, TransitionResult};
         let mut ckpt_sm = CheckpointStateMachine::new(
             pager.clone(),

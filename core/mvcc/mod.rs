@@ -338,6 +338,48 @@ mod tests {
         conn1.execute("COMMIT").unwrap();
         conn2.execute("COMMIT").unwrap();
     }
+
+    /// What this test checks: PRAGMA wal_checkpoint(<mode>) is accepted for ALL four
+    /// modes in MVCC (each routes through the CheckpointStateMachine), the committed
+    /// rows stay readable, and they survive a reopen.
+    /// Why this matters: the off-lock Passive checkpoint (and Full/Restart) were
+    /// previously rejected via PRAGMA in MVCC ("Only TRUNCATE supported"), hiding
+    /// them from SQL callers even though the state machine implements every mode.
+    #[test]
+    fn test_mvcc_wal_checkpoint_all_modes() {
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        {
+            let conn = db.connect();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+                .unwrap();
+        }
+        for (i, mode) in ["PASSIVE", "FULL", "RESTART", "TRUNCATE"].iter().enumerate() {
+            let conn = db.connect();
+            let id = i as i64 + 1;
+            conn.execute(format!("INSERT INTO t VALUES ({id}, {})", id * 10))
+                .unwrap();
+            conn.execute(format!("PRAGMA wal_checkpoint({mode})"))
+                .unwrap_or_else(|e| {
+                    panic!("PRAGMA wal_checkpoint({mode}) must be supported in MVCC: {e:?}")
+                });
+            let rows = get_rows(&conn, &format!("SELECT v FROM t WHERE id = {id}"));
+            assert_eq!(
+                rows[0][0].as_int().unwrap(),
+                id * 10,
+                "row {id} lost after {mode} checkpoint"
+            );
+        }
+        // Every committed row survives a reopen — the checkpoints made them durable.
+        db.restart();
+        let conn = db.connect();
+        let rows = get_rows(&conn, "SELECT count(*) FROM t");
+        assert_eq!(
+            rows[0][0].as_int().unwrap(),
+            4,
+            "rows lost across restart after checkpoints in all modes"
+        );
+    }
+
     fn get_rows(conn: &Arc<crate::Connection>, sql: &str) -> Vec<Vec<crate::Value>> {
         let mut stmt = conn.prepare(sql).unwrap();
         let mut rows = Vec::new();
