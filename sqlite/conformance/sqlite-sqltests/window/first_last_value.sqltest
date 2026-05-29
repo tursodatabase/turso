@@ -1,0 +1,182 @@
+@database :memory:
+
+setup fv_lv_base {
+    CREATE TABLE fv_lv(id INTEGER PRIMARY KEY, g TEXT, v INTEGER);
+    INSERT INTO fv_lv VALUES
+        (1, 'a', 10),
+        (2, 'a', 20),
+        (3, 'a', 30),
+        (4, 'b', 5),
+        (5, 'b', 15),
+        (6, 'b', 15);
+}
+
+# first_value reads the first row of the frame; under the default
+# RANGE UNBOUNDED PRECEDING TO CURRENT ROW frame that's the first row of
+# the partition. last_value reads the last row of the frame; under the
+# same frame that's the last row of the current peer group.
+@setup fv_lv_base
+test first-value-last-value-partition-order {
+    SELECT id, g, v,
+           first_value(v) OVER (PARTITION BY g ORDER BY v),
+           last_value(v) OVER (PARTITION BY g ORDER BY v)
+    FROM fv_lv ORDER BY id;
+}
+expect {
+    1|a|10|10|10
+    2|a|20|10|20
+    3|a|30|10|30
+    4|b|5|5|5
+    5|b|15|5|15
+    6|b|15|5|15
+}
+
+setup fv_lv_peers {
+    CREATE TABLE fv_p(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO fv_p VALUES (1, 1), (2, 2), (3, 2), (4, 3), (5, 3), (6, 3);
+}
+
+# Rows in the same peer group share last_value: they all see the same
+# "end of frame" because the frame ends at the last peer of the current
+# row under RANGE.
+@setup fv_lv_peers
+test first-last-value-shared-within-peer-group {
+    SELECT id, v,
+           first_value(v) OVER (ORDER BY v),
+           last_value(v) OVER (ORDER BY v)
+    FROM fv_p ORDER BY id;
+}
+expect {
+    1|1|1|1
+    2|2|1|2
+    3|2|1|2
+    4|3|1|3
+    5|3|1|3
+    6|3|1|3
+}
+
+setup fv_nulls {
+    CREATE TABLE fv_n(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO fv_n VALUES (1, NULL), (2, 5), (3, 10);
+}
+
+# A NULL first value is preserved (the capture flag distinguishes
+# "no row stepped yet" from "the captured value was NULL").
+@setup fv_nulls
+test first-value-null-is-preserved {
+    SELECT id, v, first_value(v) OVER (ORDER BY v) FROM fv_n ORDER BY id;
+}
+expect {
+    1||
+    2|5|
+    3|10|
+}
+
+setup fv_lv_empty {
+    CREATE TABLE fv_e(v INTEGER);
+}
+
+@setup fv_lv_empty
+test first-value-last-value-empty-input {
+    SELECT first_value(v) OVER (ORDER BY v), last_value(v) OVER (ORDER BY v) FROM fv_e;
+}
+expect {
+}
+
+setup fv_lv_text {
+    CREATE TABLE fv_t(v TEXT);
+    INSERT INTO fv_t VALUES ('apple'), ('banana'), ('cherry');
+}
+
+@setup fv_lv_text
+test first-last-value-text-args {
+    SELECT v, first_value(v) OVER (ORDER BY v), last_value(v) OVER (ORDER BY v) FROM fv_t ORDER BY v;
+}
+expect {
+    apple|apple|apple
+    banana|apple|banana
+    cherry|apple|cherry
+}
+
+@setup fv_lv_base
+test first-value-expression-argument {
+    SELECT id, v, first_value(v * 10) OVER (ORDER BY v) FROM fv_lv ORDER BY id;
+}
+expect {
+    1|10|50
+    2|20|50
+    3|30|50
+    4|5|50
+    5|15|50
+    6|15|50
+}
+
+@setup fv_lv_base
+test first-value-different-from-last-value-column {
+    SELECT id, g, v,
+           first_value(g) OVER (ORDER BY v),
+           last_value(v) OVER (ORDER BY v)
+    FROM fv_lv ORDER BY id;
+}
+expect {
+    1|a|10|b|10
+    2|a|20|b|20
+    3|a|30|b|30
+    4|b|5|b|5
+    5|b|15|b|15
+    6|b|15|b|15
+}
+
+@setup fv_lv_base
+test first-last-value-alongside-rank-and-row-number {
+    SELECT id, g, v,
+           rank() OVER (PARTITION BY g ORDER BY v),
+           first_value(v) OVER (PARTITION BY g ORDER BY v),
+           last_value(v) OVER (PARTITION BY g ORDER BY v),
+           row_number() OVER (PARTITION BY g ORDER BY v)
+    FROM fv_lv ORDER BY id;
+}
+expect {
+    1|a|10|1|10|10|1
+    2|a|20|2|10|20|2
+    3|a|30|3|10|30|3
+    4|b|5|1|5|5|1
+    5|b|15|2|5|15|2
+    6|b|15|2|5|15|3
+}
+
+setup fv_lv_no_order {
+    CREATE TABLE fv_no(g TEXT, v INTEGER);
+    INSERT INTO fv_no VALUES ('a', 1), ('a', 2), ('a', 3), ('b', 10), ('b', 20);
+}
+
+# With no ORDER BY, the frame covers the entire partition; first and
+# last_value both read across the whole partition.
+@setup fv_lv_no_order
+test first-last-value-no-order-by {
+    SELECT g, v,
+           first_value(v) OVER (PARTITION BY g),
+           last_value(v) OVER (PARTITION BY g)
+    FROM fv_no;
+}
+expect {
+    a|1|1|3
+    a|2|1|3
+    a|3|1|3
+    b|10|10|20
+    b|20|10|20
+}
+
+@setup fv_lv_base
+test first-last-value-named-window-shared {
+    SELECT id, first_value(v) OVER w, last_value(v) OVER w
+    FROM fv_lv WINDOW w AS (ORDER BY v) ORDER BY id;
+}
+expect {
+    1|5|10
+    2|5|20
+    3|5|30
+    4|5|5
+    5|5|15
+    6|5|15
+}
