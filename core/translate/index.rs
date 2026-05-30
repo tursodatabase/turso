@@ -123,7 +123,7 @@ pub fn translate_create_index(
     program.extend(&opts);
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
 
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
@@ -145,7 +145,7 @@ pub fn translate_create_index(
     if !tbl.has_rowid {
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
-    let columns = resolve_sorted_columns(&tbl, &columns)?;
+    let columns = resolve_sorted_columns_with_resolver(&tbl, &columns, Some(resolver))?;
 
     // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
     for col in &columns {
@@ -361,6 +361,7 @@ pub fn translate_create_index(
                 resolver,
                 &mut table_references,
                 table_cursor_id,
+                &tbl,
                 col,
                 start_reg + i,
             )?;
@@ -464,6 +465,7 @@ pub fn translate_create_index(
                 resolver,
                 &mut table_references,
                 table_cursor_id,
+                &tbl,
                 col,
                 start_reg + i,
             )?;
@@ -597,10 +599,18 @@ pub fn resolve_sorted_columns(
     table: &BTreeTable,
     cols: &[SortedColumn],
 ) -> crate::Result<Vec<IndexColumn>> {
+    resolve_sorted_columns_with_resolver(table, cols, None)
+}
+
+fn resolve_sorted_columns_with_resolver(
+    table: &BTreeTable,
+    cols: &[SortedColumn],
+    resolver: Option<&Resolver>,
+) -> crate::Result<Vec<IndexColumn>> {
     let mut resolved = Vec::with_capacity(cols.len());
     for sc in cols {
         let order = sc.order.unwrap_or(SortOrder::Asc);
-        let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref())?;
+        let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref(), resolver)?;
         // Unwrap parentheses for column resolution (SQLite treats (('col')) same as 'col')
         let unwrapped_expr = unwrap_parens(base_expr)?;
         if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
@@ -637,11 +647,21 @@ pub fn resolve_sorted_columns(
 /// Extracts collation sequence from an expression if it is a Collate expression.
 /// Given the example: `col1 COLLATE NOCASE` / Expr::Collation(Expr::Id(col1), CollationSeq)
 /// returns (Some(CollationSeq), Expr::Id(col1))
-fn extract_collation(expr: &Expr) -> crate::Result<(Option<CollationSeq>, &Expr)> {
+fn extract_collation<'a>(
+    expr: &'a Expr,
+    resolver: Option<&Resolver>,
+) -> crate::Result<(Option<CollationSeq>, &'a Expr)> {
     let mut current = expr;
     let mut coll = None;
     while let Expr::Collate(inner, seq) = current {
-        coll = Some(CollationSeq::new(seq.as_str())?);
+        let collation = match resolver {
+            Some(resolver) => resolver.resolve_collation(seq.as_str())?,
+            None => CollationSeq::new(seq.as_str())?,
+        };
+        if collation.is_custom() {
+            crate::bail_parse_error!("custom collations are not supported in indexes");
+        }
+        coll = Some(collation);
         current = inner.as_ref();
     }
     Ok((coll, current))
@@ -853,6 +873,7 @@ fn emit_index_column_value_from_cursor(
     resolver: &Resolver,
     table_references: &mut TableReferences,
     table_cursor_id: usize,
+    table: &BTreeTable,
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> crate::Result<()> {
@@ -873,10 +894,18 @@ fn emit_index_column_value_from_cursor(
                     table_ref_id: jt.internal_id,
                     referenced_tables: table_references.clone(),
                 });
-        program.with_self_table_context(self_table_context.as_ref(), |program, _| {
+        resolver.with_self_table_context(program, self_table_context.as_ref(), |program, _| {
             translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
             Ok(())
         })?;
+        // For virtual generated column references, apply the column's
+        // declared affinity to the computed expression result.
+        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
+            let column = &table.columns()[idx_col.pos_in_table];
+            if column.is_virtual_generated() {
+                program.emit_column_affinity(dest_reg, column.affinity());
+            }
+        }
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     }
@@ -928,7 +957,7 @@ pub fn translate_drop_index(
     program.extend(&opts);
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
 
     // Find the index in Schema
     let mut maybe_index = None;

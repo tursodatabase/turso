@@ -1,4 +1,4 @@
-import { DatabasePromise } from "@tursodatabase/database-common"
+import { DatabasePromise, TransactionFunction } from "@tursodatabase/database-common"
 import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner, RemoteWriter, RemoteWriteStatement } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion, Database as NativeDatabase } from "#index";
 import { promises } from "node:fs";
@@ -232,8 +232,8 @@ class Database extends DatabasePromise {
      * Prepares a SQL statement for execution.
      * When remoteWrites is enabled, returns a wrapper that routes writes to remote.
      */
-    override prepare(sql: string) {
-        const localStmt = super.prepare(sql);
+    override async prepare(sql: string) {
+        const localStmt = await super.prepare(sql);
 
         if (!this.#remoteWriter) {
             return localStmt;
@@ -254,7 +254,9 @@ class Database extends DatabasePromise {
      * Returns a function that executes the given function in a transaction.
      * When remoteWrites is enabled, the entire transaction goes to remote.
      */
-    override transaction(fn: (...any: any) => Promise<any>) {
+    override transaction<F extends (...args: any[]) => Promise<any>>(
+        fn: F,
+    ): TransactionFunction<F> {
         if (typeof fn !== "function")
             throw new TypeError("Expected first argument to be a function");
 
@@ -281,15 +283,17 @@ class Database extends DatabasePromise {
         const properties = {
             default: { value: wrapTxn("") },
             deferred: { value: wrapTxn("DEFERRED") },
+            concurrent: { value: wrapTxn("CONCURRENT") },
             immediate: { value: wrapTxn("IMMEDIATE") },
             exclusive: { value: wrapTxn("EXCLUSIVE") },
             database: { value: this, enumerable: true },
         };
         Object.defineProperties(properties.default.value, properties);
         Object.defineProperties(properties.deferred.value, properties);
+        Object.defineProperties(properties.concurrent.value, properties);
         Object.defineProperties(properties.immediate.value, properties);
         Object.defineProperties(properties.exclusive.value, properties);
-        return properties.default.value;
+        return properties.default.value as TransactionFunction<F>;
     }
 
     /**

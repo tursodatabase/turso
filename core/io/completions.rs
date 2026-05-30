@@ -143,6 +143,13 @@ impl CompletionGroup {
         self.completions.push(completion.clone());
     }
 
+    /// The children added so far. Used by error paths that need to
+    /// wait on the kernel side via `IO::drain_completions` after
+    /// cancelling the group.
+    pub fn completions(&self) -> &[Completion] {
+        &self.completions
+    }
+
     pub fn cancel(&self) {
         for c in &self.completions {
             c.abort();
@@ -352,6 +359,25 @@ impl Completion {
 
     pub fn wake(&self) {
         if let Some(inner) = &self.inner {
+            inner.context.wake();
+        }
+    }
+
+    /// Fire a "progress wake" without consuming the completion's result —
+    /// wakes the waker on this completion *and* on its parent group, if any.
+    /// Used by IO backends to nudge the future when an operation made progress
+    /// but isn't fully done (e.g. an io_uring writev that completed only the
+    /// first chunk and was resubmitted internally). Without this, a poll
+    /// whose drained CQEs are all intermediate-chunk completions returns
+    /// without waking anything, and since `step()` is the only thing that
+    /// drains the CQ, the resubmitted chunks pile up and the task deadlocks.
+    pub fn wake_progress(&self) {
+        if let Some(inner) = &self.inner {
+            if let Some(group) = inner.parent.get() {
+                if let Some(group_completion) = group.self_completion.get() {
+                    group_completion.wake();
+                }
+            }
             inner.context.wake();
         }
     }

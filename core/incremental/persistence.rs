@@ -113,7 +113,7 @@ impl WriteRow {
                     // First, seek in the index to find if the row exists
                     let index_values = index_key.clone();
                     let index_record =
-                        ImmutableRecord::from_values(&index_values, index_values.len());
+                        ImmutableRecord::from_values(&index_values, index_values.len())?;
 
                     let res = return_if_io!(cursors.index_cursor.seek(
                         SeekKey::IndexKey(&index_record),
@@ -241,7 +241,7 @@ impl WriteRow {
 
                     // Create an ImmutableRecord from the values
                     let immutable_record =
-                        ImmutableRecord::from_values(&complete_record, complete_record.len());
+                        ImmutableRecord::from_values(&complete_record, complete_record.len())?;
                     let btree_key = BTreeKey::new_table_rowid(rowid_val, Some(&immutable_record));
 
                     // Transition to InsertIndex state after table insertion
@@ -256,7 +256,7 @@ impl WriteRow {
 
                     // Create the index record with the rowid appended
                     let index_record =
-                        ImmutableRecord::from_values(&index_values, index_values.len());
+                        ImmutableRecord::from_values(&index_values, index_values.len())?;
                     let index_btree_key = BTreeKey::new_index_key(&index_record);
 
                     // Mark as Done before index insert to avoid retry on I/O
@@ -273,7 +273,7 @@ impl WriteRow {
 
                     // Create an ImmutableRecord from the values
                     let immutable_record =
-                        ImmutableRecord::from_values(&complete_record, complete_record.len());
+                        ImmutableRecord::from_values(&complete_record, complete_record.len())?;
                     let btree_key = BTreeKey::new_table_rowid(*rowid, Some(&immutable_record));
 
                     // Mark as Done before insert to avoid retry on I/O

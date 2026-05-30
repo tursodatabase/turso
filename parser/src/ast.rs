@@ -1766,6 +1766,8 @@ pub enum PragmaName {
     FreelistCount,
     /// Enable or disable foreign key constraint enforcement
     ForeignKeys,
+    /// Returns information about foreign keys declared by a table
+    ForeignKeyList,
     /// Deprecated: control whether column names include table name prefix
     FullColumnNames,
     /// List all SQL functions known to the database connection
@@ -1843,6 +1845,8 @@ pub enum PragmaName {
     ListTypes,
     /// Deprecated no-op: control whether callback is invoked for empty result sets
     EmptyResultCallbacks,
+    /// VDBE opcode trace output
+    VdbeTrace,
 }
 
 /// `CREATE TRIGGER` time

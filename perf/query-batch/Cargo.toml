@@ -1,0 +1,17 @@
+[package]
+name = "query-batch-benchmark"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+turso = { workspace = true }
+rusqlite = { workspace = true }
+tokio = { workspace = true, default-features = true, features = ["full"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "query_batch"
+harness = false

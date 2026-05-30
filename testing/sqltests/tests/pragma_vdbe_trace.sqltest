@@ -1,0 +1,14 @@
+@database :memory:
+
+test pragma-vdbe-trace {
+    PRAGMA vdbe_trace = ON;
+    PRAGMA vdbe_trace = OFF;
+    PRAGMA vdbe_trace = TRUE;
+    PRAGMA vdbe_trace = FALSE;
+    PRAGMA vdbe_trace = 0;
+    PRAGMA vdbe_trace = 1;
+    PRAGMA vdbe_trace = 2;
+    PRAGMA vdbe_trace;
+}
+expect {
+}

@@ -6,10 +6,10 @@ use crate::sync::RwLock;
 use crate::sync::{atomic, Arc};
 use bumpalo::Bump;
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
-use std::collections::BinaryHeap;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
+use crate::alloc::*;
 use crate::io::TempFile;
 use crate::types::{IOCompletions, ValueIterator};
 use crate::{
@@ -25,7 +25,7 @@ use crate::{io_yield_one, return_if_io, CompletionError};
 /// A custom comparison function for sorting custom type columns.
 /// Takes two value references and returns an Ordering.
 /// Used when a custom type defines a `<` operator for correct sort behavior.
-pub type SortComparator = Arc<dyn Fn(&ValueRef, &ValueRef) -> Ordering + Send + Sync>;
+pub type SortComparator = Arc<dyn Fn(&ValueRef, &ValueRef) -> Result<Ordering> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy)]
 enum SortState {
@@ -106,28 +106,27 @@ impl Sorter {
         min_chunk_read_buffer_size_bytes: usize,
         io: Arc<dyn IO>,
         temp_store: crate::TempStore,
-    ) -> Self {
+    ) -> Result<Self> {
         turso_assert_eq!(order.len(), collations.len());
-        Self {
+        let index_key_info = order
+            .iter()
+            .zip(collations)
+            .zip(nulls_orders)
+            .map(|((order, collation), nulls)| KeyInfo {
+                sort_order: *order,
+                collation,
+                nulls_order: nulls,
+            })
+            .try_collect()?;
+        let this = Self {
             arena: Bump::new(),
             records: Vec::new(),
             current: None,
             key_len: order.len(),
-            index_key_info: Rc::new(
-                order
-                    .iter()
-                    .zip(collations)
-                    .zip(nulls_orders)
-                    .map(|((order, collation), nulls)| KeyInfo {
-                        sort_order: *order,
-                        collation,
-                        nulls_order: nulls,
-                    })
-                    .collect(),
-            ),
+            index_key_info: Rc::new(index_key_info),
             comparators: Rc::new(comparators),
             chunks: Vec::new(),
-            chunk_heap: BinaryHeap::new(),
+            chunk_heap: TursoAllocExt::new(),
             max_buffer_size: max_buffer_size_bytes,
             current_buffer_size: 0,
             min_chunk_read_buffer_size: min_chunk_read_buffer_size_bytes,
@@ -140,7 +139,8 @@ impl Sorter {
             init_chunk_heap_state: InitChunkHeapState::Start,
             pending_completion: None,
             temp_store,
-        }
+        };
+        Ok(this)
     }
 
     pub const fn is_empty(&self) -> bool {
@@ -216,10 +216,10 @@ impl Sorter {
                     match &mut self.current {
                         Some(record) => {
                             record.invalidate();
-                            record.start_serialization(payload);
+                            record.start_serialization(payload)?;
                         }
                         None => {
-                            self.current = Some(arena_record.to_immutable_record());
+                            self.current = Some(arena_record.to_immutable_record()?);
                         }
                     }
 
@@ -240,7 +240,7 @@ impl Sorter {
                     match &mut self.current {
                         Some(record) => {
                             record.invalidate();
-                            record.start_serialization(payload);
+                            record.start_serialization(payload)?;
                         }
                         None => {
                             self.current = Some(boxed_record.record);
@@ -289,9 +289,9 @@ impl Sorter {
                         &self.index_key_info,
                         &self.comparators,
                     )?;
-                    let record_ref = self.arena.alloc(sortable_record);
-                    // SAFETY: arena.alloc returns a valid, aligned, non-null pointer
-                    self.records.push(NonNull::from(record_ref));
+                    let record_ref = self.arena.try_alloc(sortable_record)?;
+                    // SAFETY: try_alloc returns a valid, aligned, non-null pointer.
+                    self.records.try_push(NonNull::from(record_ref))?;
                     self.current_buffer_size += payload_size;
                     self.max_payload_size_in_buffer =
                         self.max_payload_size_in_buffer.max(payload_size);
@@ -311,7 +311,7 @@ impl Sorter {
                         Err(e) => {
                             tracing::error!("Failed to read chunk: {e}");
                             group.cancel();
-                            self.io.drain()?;
+                            self.io.drain_completions(group.completions())?;
                             return Err(e);
                         }
                         Ok(Some(c)) => group.add(&c),
@@ -331,7 +331,7 @@ impl Sorter {
                     )),
                     "chunks should have been read"
                 );
-                self.chunk_heap.reserve(self.chunks.len());
+                self.chunk_heap.try_reserve(self.chunks.len())?;
                 // TODO: blocking will be unnecessary here with IO completions
                 let mut group = CompletionGroup::new(|_| {});
                 for chunk_idx in 0..self.chunks.len() {
@@ -388,7 +388,7 @@ impl Sorter {
 
         match chunk.next()? {
             ChunkNextResult::Done(Some(record)) => {
-                self.chunk_heap.push((
+                self.chunk_heap.try_push((
                     Reverse(Box::new(BoxedSortableRecord::new(
                         record,
                         self.key_len,
@@ -396,7 +396,7 @@ impl Sorter {
                         self.comparators.clone(),
                     )?)),
                     chunk_idx,
-                ));
+                ))?;
                 Ok(None)
             }
             ChunkNextResult::Done(None) => Ok(None),
@@ -433,17 +433,18 @@ impl Sorter {
         // Pre-compute varint lengths for record sizes to determine the total buffer size.
         // SAFETY: All pointers are valid because they are allocated in the arena,
         // and the arena hasn't been reset.
-        let mut record_size_lengths = Vec::with_capacity(self.records.len());
+        let mut record_size_lengths = Vec::try_with_capacity_ext(self.records.len())?;
         for ptr in self.records.iter() {
             let record_size = unsafe { ptr.as_ref().payload().len() };
             let size_len = varint_len(record_size as u64);
+            // Enough space was preallocated to `push` instead of `try_push`
             record_size_lengths.push(size_len);
             chunk_size += size_len + record_size;
         }
 
-        let mut chunk = SortedChunk::new(chunk_file, self.next_chunk_offset, chunk_buffer_size);
+        let mut chunk = SortedChunk::new(chunk_file, self.next_chunk_offset, chunk_buffer_size)?;
         let c = chunk.write(&self.records, record_size_lengths, chunk_size)?;
-        self.chunks.push(chunk);
+        self.chunks.try_push(chunk)?;
 
         self.records.clear();
         self.arena.reset();
@@ -526,18 +527,18 @@ enum ChunkNextResult {
 }
 
 impl SortedChunk {
-    fn new(file: Arc<dyn File>, start_offset: usize, buffer_size: usize) -> Self {
-        Self {
+    fn new(file: Arc<dyn File>, start_offset: usize, buffer_size: usize) -> Result<Self> {
+        Ok(Self {
             file,
             start_offset: start_offset as u64,
             chunk_size: 0,
-            buffer: Arc::new(RwLock::new(vec![0; buffer_size])),
+            buffer: Arc::new(RwLock::new(try_vec![0; buffer_size]?)),
             buffer_len: Arc::new(atomic::AtomicUsize::new(0)),
             records: Vec::new(),
             io_state: Arc::new(RwLock::new(SortedChunkIOState::None)),
             total_bytes_read: Arc::new(atomic::AtomicUsize::new(0)),
             next_state: NextState::Start,
-        }
+        })
     }
 
     fn buffer_len(&self) -> usize {
@@ -594,13 +595,13 @@ impl SortedChunk {
                             }
                             buffer_offset += bytes_read;
 
-                            let mut record = ImmutableRecord::new(record_size);
+                            let mut record = ImmutableRecord::new(record_size)?;
                             record.start_serialization(
                                 &buffer[buffer_offset..buffer_offset + record_size],
-                            );
+                            )?;
                             buffer_offset += record_size;
 
-                            self.records.push(record);
+                            self.records.try_push(record)?;
                         }
                         if buffer_offset < buffer_len {
                             buffer.copy_within(buffer_offset..buffer_len, 0);
@@ -768,12 +769,12 @@ impl ArenaSortableRecord {
         index_key_info: &[KeyInfo],
         comparators: &[Option<SortComparator>],
     ) -> Result<Self> {
-        let payload = arena.alloc_slice_copy(record.get_payload());
+        let payload = arena.try_alloc_slice_copy(record.get_payload())?;
 
         let mut payload_iter = ValueIterator::new(payload)?;
 
-        let mut key_values =
-            bumpalo::collections::Vec::with_capacity_in(payload_iter.clone().count(), arena);
+        let mut key_values = bumpalo::collections::Vec::new_in(arena);
+        key_values.try_reserve(payload_iter.clone().count())?;
         for _ in 0..key_len {
             let value = match payload_iter.next() {
                 Some(Ok(v)) => v,
@@ -806,11 +807,11 @@ impl ArenaSortableRecord {
     }
 
     /// Create an ImmutableRecord by copying payload bytes out of the arena.
-    fn to_immutable_record(&self) -> ImmutableRecord {
+    fn to_immutable_record(&self) -> Result<ImmutableRecord> {
         let payload = self.payload();
-        let mut record = ImmutableRecord::new(payload.len());
-        record.start_serialization(payload);
-        record
+        let mut record = ImmutableRecord::new(payload.len())?;
+        record.start_serialization(payload)?;
+        Ok(record)
     }
 }
 
@@ -830,7 +831,7 @@ impl Ord for ArenaSortableRecord {
             .enumerate()
         {
             let cmp = if let Some(Some(comparator)) = comparators.get(i) {
-                comparator(&self_val, &other_val)
+                comparator(&self_val, &other_val).expect("Memory allocation failed here")
             } else {
                 match (self_val, other_val) {
                     (ValueRef::Text(left), ValueRef::Text(right)) => {
@@ -895,7 +896,7 @@ impl BoxedSortableRecord {
         comparators: Rc<Vec<Option<SortComparator>>>,
     ) -> Result<Self> {
         let mut value_iterator = record.iter()?;
-        let mut key_values = Vec::with_capacity(key_len);
+        let mut key_values = Vec::try_with_capacity_ext(key_len)?;
         let mut deserialization_error = None;
 
         for _ in 0..key_len {
@@ -903,6 +904,7 @@ impl BoxedSortableRecord {
                 Some(Ok(value)) => {
                     // SAFETY: value points into record which lives as long as this struct
                     let value: ValueRef<'static> = unsafe { std::mem::transmute(value) };
+                    // Preallocated enough space
                     key_values.push(value);
                 }
                 Some(Err(err)) => {
@@ -945,7 +947,7 @@ impl Ord for BoxedSortableRecord {
             .enumerate()
         {
             let cmp = if let Some(Some(comparator)) = self.comparators.get(i) {
-                comparator(&self_val, &other_val)
+                comparator(&self_val, &other_val).expect("Memory allocation failed here")
             } else {
                 match (self_val, other_val) {
                     (ValueRef::Text(left), ValueRef::Text(right)) => {
@@ -1036,14 +1038,15 @@ mod tests {
         for _ in 0..attempts {
             let mut sorter = Sorter::new(
                 &[SortOrder::Asc],
-                vec![CollationSeq::Binary],
-                vec![None],
-                vec![None],
+                try_vec![CollationSeq::Binary].unwrap(),
+                try_vec![None].unwrap(),
+                try_vec![None].unwrap(),
                 256,
                 64,
                 io.clone(),
                 crate::TempStore::Default,
-            );
+            )
+            .unwrap();
 
             let num_records = 1000 + rng.next_u64() % 2000;
             let num_records = num_records as i64;
@@ -1053,9 +1056,9 @@ mod tests {
 
             let mut initial_records = Vec::with_capacity(num_records as usize);
             for i in (0..num_records).rev() {
-                let mut values = vec![Value::from_i64(i)];
+                let mut values = try_vec![Value::from_i64(i)].unwrap();
                 values.append(&mut generate_values(&mut rng, &value_types));
-                let record = ImmutableRecord::from_values(&values, values.len());
+                let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
 
                 io.block(|| sorter.insert(&record))
                     .expect("Failed to insert the record");

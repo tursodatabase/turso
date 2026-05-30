@@ -53,7 +53,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@main
+        uses: cargo-bins/cargo-binstall@bbd0a7de0e936c8c626fa0e93584169d58ff1307
 
       - name: Install report dependencies
         shell: bash

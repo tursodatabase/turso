@@ -51,12 +51,13 @@ use crate::{
             OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState, OpIdxInsertState,
             OpInitCdcVersionState, OpInsertState, OpInsertSubState, OpJournalModeState,
             OpNewRowidState, OpNoConflictState, OpParseSchemaState, OpProgramState, OpRowIdState,
-            OpSeekState, OpTransactionState, OpVacuumIntoState,
+            OpSeekState, OpTransactionState, VacuumIntoOpContext,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
+        vacuum::VacuumInPlaceOpContext,
     },
-    ValueRef,
+    ValueRef, WalAutoActions,
 };
 use smallvec::SmallVec;
 
@@ -191,7 +192,45 @@ enum CommitState {
     },
 }
 
-#[derive(Debug, Clone)]
+impl CommitState {
+    fn cleanup_mvcc_checkpoint_state(&mut self) {
+        match self {
+            CommitState::CommittingMvcc { state_machine } => {
+                state_machine.inner_mut().cleanup_mvcc_checkpoint_state()
+            }
+            CommitState::CommittingAttachedMvcc { state_machine, .. } => {
+                state_machine.inner_mut().cleanup_mvcc_checkpoint_state()
+            }
+            CommitState::Ready | CommitState::Committing | CommitState::CommittingAttached => {}
+        }
+    }
+
+    fn cleanup_abandoned_mvcc_commit(&mut self, connection: &Connection) {
+        match self {
+            CommitState::CommittingAttachedMvcc {
+                state_machine,
+                db_id: attached_db_id,
+                ..
+            } if !state_machine.is_finalized() => {
+                if connection
+                    .database_schemas()
+                    .write()
+                    .remove(attached_db_id)
+                    .is_some()
+                {
+                    connection.bump_prepare_context_generation();
+                }
+            }
+            CommitState::CommittingMvcc { state_machine } if !state_machine.is_finalized() => {}
+            _ => return, // no-op for already-finalized state machines and non-MVCC commit states
+        };
+
+        connection.rollback_attached_mvcc_txs(true);
+        connection.rollback_attached_wal_txns();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Register {
     Value(Value),
     Aggregate(AggContext),
@@ -247,10 +286,10 @@ impl Register {
     /// Set the value of the register to a Text,
     /// reusing Register::Value(Value::Text(_)) buffer if possible.
     #[inline]
-    pub fn set_text(&mut self, val: Text) {
+    pub fn set_text(&mut self, val: Text) -> Result<()> {
         match self {
             Register::Value(Value::Text(existing)) => {
-                existing.do_extend(&val);
+                existing.do_extend(&val)?;
             }
             Register::Value(other_value_kind) => {
                 *other_value_kind = Value::Text(val);
@@ -259,15 +298,16 @@ impl Register {
                 *self = Register::Value(Value::Text(val));
             }
         }
+        Ok(())
     }
 
     /// Set the value of the register to a blob,
     /// reusing Register::Value(Value::Blob(_)) buffer if possible.
     #[inline]
-    pub fn set_blob(&mut self, val: Vec<u8>) {
+    pub fn set_blob(&mut self, val: Vec<u8>) -> Result<()> {
         match self {
             Register::Value(Value::Blob(existing)) => {
-                existing.do_extend(&val);
+                existing.do_extend(&val)?;
             }
             Register::Value(other_value_kind) => {
                 *other_value_kind = Value::Blob(val);
@@ -276,6 +316,7 @@ impl Register {
                 *self = Register::Value(Value::Blob(val));
             }
         }
+        Ok(())
     }
 
     // Set the value of the register to NULL,
@@ -317,6 +358,10 @@ pub struct Row {
 pub enum TxnCleanup {
     None,
     RollbackTxn,
+    /// begin_statement was called and statement is participating in an interactive transaction.
+    /// If statement is abandoned and/or dropped without an apparent error, we should rollback statement
+    /// to previous savepoint.
+    RollbackSavepoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -385,7 +430,7 @@ enum ActiveOpState {
     None,
     Delete(OpDeleteState),
     Destroy(OpDestroyState),
-    IdxDelete(Option<OpIdxDeleteState>),
+    IdxDelete(OpIdxDeleteState),
     IntegrityCheck(OpIntegrityCheckState),
     OpenEphemeral(OpOpenEphemeralState),
     Program(OpProgramState),
@@ -397,7 +442,6 @@ enum ActiveOpState {
     RowId(OpRowIdState),
     Transaction(OpTransactionState),
     JournalMode(OpJournalModeState),
-    VacuumInto(Option<OpVacuumIntoState>),
     ParseSchema(OpParseSchemaState),
     HashBuild(Option<OpHashBuildState>),
     HashProbe(Option<OpHashProbeState>),
@@ -422,7 +466,6 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::RowId(_) => "RowId",
             ActiveOpState::Transaction(_) => "Transaction",
             ActiveOpState::JournalMode(_) => "JournalMode",
-            ActiveOpState::VacuumInto(_) => "VacuumInto",
             ActiveOpState::ParseSchema(_) => "ParseSchema",
             ActiveOpState::HashBuild(_) => "HashBuild",
             ActiveOpState::HashProbe(_) => "HashProbe",
@@ -481,7 +524,12 @@ impl ActiveOpStateSlot {
         OpDestroyState,
         OpDestroyState::CreateCursor
     );
-    active_state_accessor!(idx_delete, IdxDelete, Option<OpIdxDeleteState>, None);
+    active_state_accessor!(
+        idx_delete,
+        IdxDelete,
+        OpIdxDeleteState,
+        OpIdxDeleteState::Seeking
+    );
     active_state_accessor!(
         integrity_check,
         IntegrityCheck,
@@ -532,7 +580,6 @@ impl ActiveOpStateSlot {
         OpJournalModeState,
         OpJournalModeState::default()
     );
-    active_state_accessor!(vacuum_into, VacuumInto, Option<OpVacuumIntoState>, None);
     active_state_accessor!(parse_schema, ParseSchema, OpParseSchemaState, None);
     active_state_accessor!(hash_build, HashBuild, Option<OpHashBuildState>, None);
     active_state_accessor!(hash_probe, HashProbe, Option<OpHashProbeState>, None);
@@ -556,18 +603,24 @@ impl ActiveOpStateSlot {
             _ => None,
         }
     }
-
-    fn reset_vacuum_into(&mut self) {
-        if matches!(self.state, ActiveOpState::VacuumInto(_)) {
-            self.clear();
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct DeferredSeekState {
     pub index_cursor_id: CursorID,
     pub table_cursor_id: CursorID,
+}
+
+pub(crate) enum VacuumOpState {
+    None,
+    IntoFile(Box<VacuumIntoOpContext>),
+    InPlace(Box<VacuumInPlaceOpContext>),
+}
+
+impl Default for VacuumOpState {
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 /// The program state describes the environment in which the program executes.
@@ -577,6 +630,8 @@ pub struct ProgramState {
     pub(crate) cursors: Vec<Option<Cursor>>,
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
+    /// Trace state: register snapshot for diffing.
+    pre_op_registers: Option<Box<[Register]>>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seeks: Vec<Option<DeferredSeekState>>,
@@ -599,6 +654,7 @@ pub struct ProgramState {
     pub metrics: StatementMetrics,
     /// Current collation sequence set by OP_CollSeq instruction
     current_collation: Option<CollationSeq>,
+    op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
@@ -673,6 +729,7 @@ impl ProgramState {
             cursors,
             cursor_seqs,
             registers,
+            pre_op_registers: None,
             result_row: None,
             last_compare: None,
             deferred_seeks: vec![None; max_cursors],
@@ -689,6 +746,7 @@ impl ProgramState {
             metrics: StatementMetrics::new(),
             distinct_key_values: Vec::new(),
             current_collation: None,
+            op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
@@ -733,7 +791,7 @@ impl ProgramState {
         matches!(self.execution_state, ProgramExecutionState::Interrupting)
     }
 
-    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
+    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) -> Result<()> {
         let i = index.get() - 1;
         if i >= self.parameters.len() {
             self.parameters.resize(i + 1, Value::Null);
@@ -747,10 +805,11 @@ impl ProgramState {
             (Value::Numeric(Numeric::Float(existing)), Value::Numeric(Numeric::Float(new))) => {
                 *existing = new
             }
-            (Value::Text(existing), Value::Text(new)) => existing.do_extend(&new),
-            (Value::Blob(existing), Value::Blob(new)) => existing.do_extend(&new),
+            (Value::Text(existing), Value::Text(new)) => existing.do_extend(&new)?,
+            (Value::Blob(existing), Value::Blob(new)) => existing.do_extend(&new)?,
             (slot, value) => *slot = value,
         }
+        Ok(())
     }
 
     pub fn clear_bindings(&mut self) {
@@ -799,11 +858,16 @@ impl ProgramState {
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
-        // Reset state machines
+        // A caller can reset or drop a statement after an MVCC auto-checkpoint
+        // has yielded I/O. Waiting for that I/O does not step the nested
+        // CheckpointStateMachine again, so release its checkpoint lock before
+        // replacing commit_state with Ready.
+        self.commit_state.cleanup_mvcc_checkpoint_state();
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
         self.current_collation = None;
         self.commit_state = CommitState::Ready;
+        self.op_vacuum_state = VacuumOpState::None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
         self.fk_immediate_violations_during_stmt
@@ -824,6 +888,14 @@ impl ProgramState {
         self.pending_fail_error = None;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
+    }
+
+    /// Whether this statement owns the implicit autocommit transaction it is
+    /// about to finish, including re-entry while its commit is in progress.
+    #[inline]
+    pub(crate) fn owns_auto_txn(&self) -> bool {
+        self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+            || !matches!(self.commit_state, CommitState::Ready)
     }
 
     #[inline]
@@ -1161,8 +1233,24 @@ macro_rules! get_cursor {
 pub struct ExplainState {
     /// Subprograms queued for explain output, processed after the parent program finishes.
     pending: std::collections::VecDeque<Arc<PreparedProgram>>,
+    /// Prepared subprograms that have already been queued for explain output.
+    ///
+    /// Recursive foreign-key action programs can contain a `Program` instruction
+    /// that calls the same prepared program again. Without this set, EXPLAIN
+    /// keeps printing the same subprogram forever.
+    queued_subprograms: std::collections::HashSet<usize>,
     /// The subprogram currently being explained, if any.
     current: Option<Arc<PreparedProgram>>,
+}
+
+impl ExplainState {
+    /// Queue a subprogram for EXPLAIN output if this statement has not queued it before.
+    fn queue_subprogram_once(&mut self, subprogram: Arc<PreparedProgram>) {
+        let subprogram_id = Arc::as_ptr(&subprogram) as usize;
+        if self.queued_subprograms.insert(subprogram_id) {
+            self.pending.push_back(subprogram);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1303,6 +1391,7 @@ impl Program {
         state.is_interrupted()
     }
 
+    #[turso_macros::trace_stack]
     pub fn step(
         &self,
         state: &mut ProgramState,
@@ -1375,10 +1464,11 @@ impl Program {
         let (row, subprogram) = if let Some(ref current) = explain_state.current {
             let (insn, _) = &current.insns[pc];
             let sub = if let Insn::Program {
-                program: prepared, ..
+                program: subprogram,
+                ..
             } = insn
             {
-                Some(prepared.clone())
+                Some(subprogram.prepared_program()?)
             } else {
                 None
             };
@@ -1391,10 +1481,11 @@ impl Program {
         } else {
             let (insn, _) = &self.insns[pc];
             let sub = if let Insn::Program {
-                program: prepared, ..
+                program: subprogram,
+                ..
             } = insn
             {
-                Some(prepared.clone())
+                Some(subprogram.prepared_program()?)
             } else {
                 None
             };
@@ -1406,7 +1497,7 @@ impl Program {
             (insn_to_row_with_comment(self, insn, comment), sub)
         };
         if let Some(sub) = subprogram {
-            explain_state.pending.push_back(sub);
+            explain_state.queue_subprogram_once(sub);
         }
         let (opcode, p1, p2, p3, p4, p5, comment) = row;
 
@@ -1529,6 +1620,47 @@ impl Program {
             let insn_function = insn.to_function();
             if enable_tracing {
                 trace_insn(self, state.pc as InsnReference, insn);
+                crate::stack::trace_remaining("program_step:opcode");
+            }
+            if self.connection.get_vdbe_trace() {
+                // Diff registers from PREVIOUS opcode
+                // The last opcode (Halt) won't have its diff printed, but Halt
+                // doesn't write to any registers
+                if let Some(ref old) = state.pre_op_registers {
+                    for (i, (old_reg, new_reg)) in
+                        old.iter().zip(state.registers.iter()).enumerate()
+                    {
+                        if old_reg != new_reg {
+                            match new_reg {
+                                Register::Value(v) => eprintln!("R[{i}] = {v}"),
+                                Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
+                                Register::Record(_) => eprintln!("R[{i}] = <record>"),
+                            }
+                        }
+                    }
+                    state.pre_op_registers = None;
+                }
+
+                // Print CURRENT opcode
+                if matches!(insn, Insn::Init { .. }) {
+                    eprintln!("VDBE Trace:");
+                }
+                eprintln!(
+                    "{}",
+                    explain::insn_to_str(
+                        self,
+                        state.pc as InsnReference,
+                        insn,
+                        String::new(),
+                        self.comments
+                            .iter()
+                            .find(|(offset, _)| *offset == state.pc as InsnReference)
+                            .map(|(_, comment)| comment)
+                            .copied()
+                    )
+                );
+                // Snapshot for next iteration
+                state.pre_op_registers = Some(state.registers.clone());
             }
             // Always increment VM steps for every loop iteration
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
@@ -1863,7 +1995,7 @@ impl Program {
         // Phase 1: Commit main DB MVCC transaction
         if matches!(program_state.commit_state, CommitState::Ready) {
             if let Some(tx_id) = conn.get_mv_tx_id() {
-                let state_machine = mv_store.commit_tx(tx_id, &conn)?;
+                let state_machine = mv_store.commit_tx(tx_id, &conn, crate::MAIN_DB_ID)?;
                 program_state.commit_state = CommitState::CommittingMvcc { state_machine };
             }
             // If no main MVCC tx, commit_state stays Ready and we fall
@@ -1932,7 +2064,7 @@ impl Program {
                 conn.set_mv_tx_for_db(db_id, None);
                 continue;
             };
-            let mut state_machine = match attached_mv_store.commit_tx(tx_id, &conn) {
+            let mut state_machine = match attached_mv_store.commit_tx(tx_id, &conn, db_id) {
                 Ok(sm) => sm,
                 Err(e) => {
                     tracing::error!(
@@ -2075,7 +2207,11 @@ impl Program {
                     // Commit dirty pages to WAL, then end write+read transactions.
                     // We disable auto-checkpoint and avoid pager.commit_tx() since
                     // the checkpoint logic can leave read locks held.
-                    match attached_pager.commit_dirty_pages(true, SyncMode::Normal, false) {
+                    match attached_pager.commit_dirty_pages(
+                        WalAutoActions::empty(),
+                        SyncMode::Normal,
+                        false,
+                    ) {
                         Ok(IOResult::Done(_)) => {}
                         Ok(IOResult::IO(io)) => {
                             // IO pending — return so the caller can yield and re-enter.
@@ -2150,11 +2286,35 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        // MVCC auto-checkpoint is owned by commit_state, not by normal_step().
+        // If its yielded I/O fails, normal_step sees the error before
+        // CommitStateMachine::Checkpoint gets another step, so the checkpoint
+        // state machine cannot run its own error cleanup. abort() is the first
+        // statement cleanup path that still owns that commit_state.
+        state.commit_state.cleanup_mvcc_checkpoint_state();
+        // If a CommitStateMachine was non-terminal when the program was
+        // aborted — Statement dropped mid-IO yield, or `?` propagated a Busy
+        // out of BeginCommitLogicalLog / SyncLogicalLog — release the locks
+        // it acquired (`pager_commit_lock`, `exclusive_tx`) and roll back the
+        // orphan tx. Without this the tx stays in `Preparing`, the next op on
+        // this connection trips a `turso_assert_eq!(Active)`, and any other
+        // writer parks forever on the leaked `pager_commit_lock`. The
+        // following err-match's no-rollback arms (Busy / TxError / etc.)
+        // would otherwise skip this cleanup.
+        state
+            .commit_state
+            .cleanup_abandoned_mvcc_commit(&self.connection);
 
-        // VACUUM INTO state can own internal helper statements whose drop path
-        // releases nested guards. Drop them before checking whether this program
+        // VACUUM (and VACUUM INTO) state can own internal helper statements whose drop path
+        // releases nested guards. Clean it before checking whether this program
         // is itself nested; otherwise abort could skip top-level cleanup.
-        state.active_op_state.reset_vacuum_into();
+        if let Err(err) = execute::cleanup_vacuum_state(&self.connection, state) {
+            capture_abort_error(
+                &mut abort_error,
+                err,
+                "Failed to clean up VACUUM state during abort",
+            );
+        }
 
         // Only end trigger execution if the subprogram was actually running.
         // Cached (pooled) statements may be dropped after their trigger execution
@@ -2165,6 +2325,7 @@ impl Program {
         }
         // Errors from nested statements are handled by the parent statement.
         if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
+            let owns_auto_txn = state.owns_auto_txn();
             if err.is_some() && !pager.is_checkpointing() {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
@@ -2201,11 +2362,18 @@ impl Program {
                 // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
                 // and the caller is expected to handle transaction cleanup explicitly if needed.
                 Some(LimboError::SchemaUpdated) => {}
+                Some(LimboError::WriteWriteConflict | LimboError::SchemaConflict) => {
+                    // These MVCC errors mean the current transaction cannot
+                    // commit. Roll it back even if this statement opened a
+                    // statement savepoint, as DDL does.
+                    self.rollback_current_txn(pager);
+                    self.connection.set_changes_without_total(0);
+                }
                 // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
                 // FK errors always behave like ABORT: rollback statement,
                 // rollback transaction in autocommit mode.
                 Some(LimboError::ForeignKeyConstraint(_)) => {
-                    if self.connection.get_auto_commit() {
+                    if owns_auto_txn {
                         self.rollback_current_txn(pager);
                     }
                     self.connection.set_changes_without_total(0);
@@ -2241,7 +2409,7 @@ impl Program {
                                     "Failed to release statement savepoint during abort",
                                 );
                             }
-                            if self.connection.get_auto_commit() {
+                            if owns_auto_txn {
                                 // Autocommit FAIL: commit partial changes.
                                 // This matches halt()'s FAIL+autocommit path.
                                 let mv_store = self.connection.mv_store();
@@ -2290,7 +2458,7 @@ impl Program {
                             }
                         }
                         _ => {
-                            if self.connection.get_auto_commit() {
+                            if owns_auto_txn {
                                 self.rollback_current_txn(pager);
                             }
                         }
@@ -2310,11 +2478,33 @@ impl Program {
                         "RaiseIgnore should be caught by op_program, not reach abort"
                     );
                 }
-                _ => {
-                    if state.auto_txn_cleanup != TxnCleanup::None || err.is_some() {
+                _ => match state.auto_txn_cleanup {
+                    TxnCleanup::RollbackTxn => {
                         self.rollback_current_txn(pager);
                     }
-                }
+                    TxnCleanup::RollbackSavepoint => {
+                        if owns_auto_txn {
+                            self.rollback_current_txn(pager);
+                        } else if err.is_none() && !pager.is_checkpointing() {
+                            if let Err(end_stmt_err) = state.end_statement(
+                                &self.connection,
+                                pager,
+                                EndStatement::RollbackSavepoint,
+                            ) {
+                                capture_abort_error(
+                                    &mut abort_error,
+                                    end_stmt_err,
+                                    "Failed to rollback statement savepoint during abort",
+                                );
+                            }
+                        }
+                    }
+                    TxnCleanup::None => {
+                        if owns_auto_txn || (!self.connection.get_auto_commit() && err.is_some()) {
+                            self.rollback_current_txn(pager);
+                        }
+                    }
+                },
             }
         }
         if state.uses_subjournal {
@@ -2349,7 +2539,7 @@ pub(crate) fn make_record(
     registers: &[Register],
     start_reg: &usize,
     count: &usize,
-) -> ImmutableRecord {
+) -> Result<ImmutableRecord> {
     let regs = &registers[*start_reg..*start_reg + *count];
     ImmutableRecord::from_registers(regs, regs.len())
 }
@@ -2656,10 +2846,14 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 let blob_data = &data[..content_size];
                 match dest {
                     Register::Value(Value::Blob(existing_blob)) => {
-                        existing_blob.do_extend(&blob_data);
+                        if let Err(err) = existing_blob.do_extend(&blob_data) {
+                            return Some(Err(err));
+                        }
                     }
                     _ => {
-                        dest.set_blob(blob_data.to_vec());
+                        if let Err(err) = dest.set_blob(blob_data.to_vec()) {
+                            return Some(Err(err));
+                        }
                     }
                 }
             }
@@ -2686,10 +2880,14 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 };
                 match dest {
                     Register::Value(Value::Text(existing_text)) => {
-                        existing_text.do_extend(&text_str);
+                        if let Err(err) = existing_text.do_extend(&text_str) {
+                            return Some(Err(err));
+                        }
                     }
                     _ => {
-                        dest.set_text(Text::new(text_str.to_string()));
+                        if let Err(err) = dest.set_text(Text::new(text_str.to_string())) {
+                            return Some(Err(err));
+                        }
                     }
                 }
             }
@@ -2720,8 +2918,6 @@ mod tests {
             OpColumnState::Start
         ));
         state.active_op_state.clear();
-        assert!(state.active_op_state.vacuum_into().is_none());
-        state.active_op_state.clear();
         assert!(state.active_op_state.parse_schema().is_none());
     }
 
@@ -2731,7 +2927,7 @@ mod tests {
         *state.active_op_state.column() = OpColumnState::GetColumn;
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
-            let _ = state.active_op_state.vacuum_into();
+            let _ = state.active_op_state.parse_schema();
         }));
         assert!(panic.is_err(), "mismatched opcode resume should panic");
     }
@@ -2764,6 +2960,7 @@ mod tests {
 ///
 /// These tests verify that the implementation correctly upholds these invariants
 /// under concurrent access patterns.
+
 #[cfg(all(shuttle, test))]
 mod shuttle_tests {
     use super::*;

@@ -150,3 +150,42 @@ expect {
     1|10
     1|20
 }
+
+test indexed-by-attached-qualified-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t15(a, b);
+    CREATE INDEX aux.i15 ON t15(a);
+    INSERT INTO aux.t15 VALUES(2, 'two');
+    INSERT INTO aux.t15 VALUES(1, 'one');
+    SELECT b FROM aux.t15 INDEXED BY i15 WHERE a >= 1 ORDER BY a;
+}
+expect {
+    one
+    two
+}
+
+test indexed-by-temp-qualified-table {
+    CREATE TEMP TABLE t16(a, b);
+    CREATE INDEX i16 ON t16(a);
+    INSERT INTO temp.t16 VALUES(2, 'two');
+    INSERT INTO temp.t16 VALUES(1, 'one');
+    SELECT b FROM temp.t16 INDEXED BY i16 WHERE a >= 1 ORDER BY a;
+}
+expect {
+    one
+    two
+}
+
+test indexed-by-attached-update-delete {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t17(a, b);
+    CREATE INDEX aux.i17 ON t17(a);
+    INSERT INTO aux.t17 VALUES(1, 'one');
+    INSERT INTO aux.t17 VALUES(2, 'two');
+    UPDATE aux.t17 INDEXED BY i17 SET b = 'updated' WHERE a = 1;
+    DELETE FROM aux.t17 INDEXED BY i17 WHERE a = 2;
+    SELECT a, b FROM aux.t17 ORDER BY a;
+}
+expect {
+    1|updated
+}

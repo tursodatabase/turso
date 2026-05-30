@@ -237,6 +237,37 @@ impl Affinity {
         }
     }
 
+    /// Like [`Self::convert`] but for the value-pre-conversion that comparison
+    /// opcodes apply via the affinity flag in `OP_Eq` and friends.
+    ///
+    /// Storage and default-value paths use [`Self::convert`], which forces
+    /// `Numeric::Integer` operands into `Numeric::Float` for `Affinity::Real`.
+    /// That's correct for *storing* into a REAL column, but would silently
+    /// lose precision when used to compare a REAL column against a 64-bit
+    /// integer literal: `i as f64` rounds the integer onto the nearest
+    /// representable double, which can collapse to the same double as the
+    /// column's value even when the underlying integer is distinct.
+    ///
+    /// SQLite avoids this by only applying numeric affinity to TEXT operands
+    /// in `OP_Eq` (see `applyNumericAffinity` in `vdbeaux.c`); int-vs-real
+    /// comparisons fall through to `sqlite3IntFloatCompare`, which keeps the
+    /// integer at full 64-bit precision.
+    pub fn convert_for_compare<'a>(
+        &self,
+        val: &'a impl AsValueRef,
+    ) -> Option<Either<ValueRef<'a>, Value>> {
+        let val_ref = val.as_value_ref();
+        let is_text = matches!(val_ref, ValueRef::Text(_));
+        match self {
+            Affinity::Numeric | Affinity::Integer | Affinity::Real => is_text
+                .then(|| apply_numeric_affinity(val_ref, false))
+                .flatten()
+                .map(Either::Left),
+            Affinity::Text => self.convert(val),
+            Affinity::Blob => None,
+        }
+    }
+
     /// Return TRUE if the given expression is a constant which would be
     /// unchanged by OP_Affinity with the affinity given in the second
     /// argument.

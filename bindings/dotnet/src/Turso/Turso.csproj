@@ -8,15 +8,29 @@
     <RootNamespace>Turso</RootNamespace>
     
     <PackageId>Turso</PackageId>
-    <Description>ADO.NET provider for turso bindings</Description>
-    <Version>0.0.1</Version>
+    <Title>Turso ADO.NET Provider</Title>
+    <Description>ADO.NET provider for Turso, exposing SQLite-compatible local database access through System.Data.Common.</Description>
+    <Version>0.0.2</Version>
+    <Authors>Turso authors</Authors>
+    <PackageTags>turso;sqlite;database;ado.net;system.data</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/tursodatabase/turso</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/tursodatabase/turso</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
   </PropertyGroup>
   
   <ItemGroup>
-    <PackageReference Include="Turso.Raw" Version="0.0.1" />
+    <PackageReference Include="Turso.Raw" Version="0.0.2" />
   </ItemGroup>
   
   <ItemGroup>
     <ProjectReference Include="..\Turso.Raw\Turso.Raw.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\Readme.md" Pack="true" PackagePath="README.md" />
   </ItemGroup>
 </Project>

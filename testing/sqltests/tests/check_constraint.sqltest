@@ -1652,6 +1652,39 @@ test check_constraint_alter_add_column_default_violates_check {
 expect error {
 }
 
+@cross-check-integrity
+test check_constraint_rename_then_drop_keeps_renamed_ref {
+    CREATE TABLE t(a INTEGER, b INTEGER, CHECK(a > 0));
+    ALTER TABLE t RENAME COLUMN a TO aa;
+    ALTER TABLE t DROP COLUMN b;
+    SELECT count(*) FROM sqlite_master WHERE name = 't' AND sql LIKE '%CHECK%aa > 0%';
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test check_constraint_rename_then_add_keeps_renamed_ref {
+    CREATE TABLE t(a INTEGER, CHECK(a > 0));
+    ALTER TABLE t RENAME COLUMN a TO aa;
+    ALTER TABLE t ADD COLUMN c TEXT;
+    SELECT count(*) FROM sqlite_master WHERE name = 't' AND sql LIKE '%CHECK%aa > 0%';
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test check_constraint_inline_rename_then_drop_keeps_renamed_ref {
+    CREATE TABLE t(a INTEGER CHECK(a > 0), b INTEGER);
+    ALTER TABLE t RENAME COLUMN a TO aa;
+    ALTER TABLE t DROP COLUMN b;
+    SELECT count(*) FROM sqlite_master WHERE name = 't' AND sql LIKE '%aa INTEGER CHECK%aa > 0%';
+}
+expect {
+    1
+}
+
 # Same scenario but with empty table should succeed (no existing rows to violate)
 @cross-check-integrity
 test check_constraint_alter_add_column_default_violates_check_empty_table {
@@ -1815,6 +1848,23 @@ expect {
     CHECK constraint failed in t
 }
 
+# Regression for SQLite xfer optimization bypassing CHECK(rowid=...)
+# validation during INSERT INTO ... SELECT.
+# https://sqlite.org/forum/forumpost/6dcc95e3ca750dbc
+@skip-if sqlite "SQLite xfer optimization bug; fixed on trunk for 3.54, not in released 3.53"
+test check_constraint_insert_select_validates_destination_rowid {
+    CREATE TABLE s(a CHECK(rowid=1));
+    CREATE TABLE d(a CHECK(rowid=1));
+
+    INSERT INTO s(rowid,a) VALUES(1,'src-ok');
+    INSERT INTO d(rowid,a) VALUES(1,'dst-ok');
+
+    PRAGMA integrity_check;
+    INSERT INTO d SELECT * FROM s;
+}
+expect error {
+    CHECK constraint failed.*rowid
+}
 
 @cross-check-integrity
 test check_constraint_text_affinity_coercion_pass {

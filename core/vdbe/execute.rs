@@ -5,7 +5,10 @@ use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
-use crate::schema::{Schema, Table, SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME};
+use crate::schema::{
+    render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
+    SQLITE_SEQUENCE_TABLE_NAME,
+};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
@@ -18,8 +21,8 @@ use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::types::{
-    compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions, IOResult,
-    ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
+    compare_immutable, compare_immutable_single, compare_records_generic, AsValueRef, Extendable,
+    IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers,
@@ -31,18 +34,19 @@ use crate::util::{
     trigger_still_references_renamed_column, trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
-    apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
+    apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
 };
 use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
 };
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::metrics::HashJoinMetrics;
+use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
     registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
-    StepResult, TxnCleanup,
+    StepResult, TxnCleanup, VacuumOpState,
 };
 use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
@@ -59,9 +63,9 @@ use crate::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
-    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, Connection, DatabaseStorage,
-    IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState, ValueRef,
-    MAIN_DB_ID, TEMP_DB_ID,
+    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, Connection, Database,
+    DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState,
+    ValueRef, WalAutoActions, MAIN_DB_ID, TEMP_DB_ID,
 };
 use crate::{
     error::{
@@ -69,7 +73,6 @@ use crate::{
         SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
         SQLITE_ERROR,
     },
-    ext::ExtValue,
     function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
         datetime::{
@@ -90,7 +93,7 @@ use std::{
     num::NonZero,
     sync::{atomic::Ordering, Arc},
 };
-use turso_macros::match_ignore_ascii_case;
+use turso_macros::{match_ignore_ascii_case, turso_debug_assert};
 
 use crate::pseudo::PseudoCursor;
 
@@ -112,6 +115,11 @@ use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType
 use turso_parser::parser::Parser;
 
 use super::sorter::Sorter;
+use crate::vdbe::vacuum::{
+    capture_custom_types, mirror_symbols, reject_unsupported_vacuum_auto_vacuum_mode,
+    vacuum_target_build_step, vacuum_target_opts_from_source, VacuumDbHeaderMeta,
+    VacuumTargetBuildConfig, VacuumTargetBuildContext,
+};
 
 #[cfg(feature = "json")]
 use crate::{
@@ -191,12 +199,14 @@ fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
 }
 
 /// Create a sort comparator closure from a SortComparatorType enum.
-fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::SortComparator {
+fn make_sort_comparator(
+    cmp_type: &SortComparatorType,
+) -> Result<crate::vdbe::sorter::SortComparator> {
     use std::cmp::Ordering;
-    match cmp_type {
+    let cmp: crate::vdbe::sorter::SortComparator = match cmp_type {
         SortComparatorType::NumericLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
-                match (a, b) {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
+                let res = match (a, b) {
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
                     (_, ValueRef::Null) => Ordering::Greater,
@@ -209,27 +219,29 @@ fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::S
                             _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
                         }
                     }
-                }
+                };
+                Ok(res)
             })
         }
         SortComparatorType::StringReverse => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
                 fn reverse_str(v: &ValueRef) -> String {
                     match v {
                         ValueRef::Text(t) => t.to_string().chars().rev().collect(),
                         _ => String::new(),
                     }
                 }
-                match (a, b) {
+                let res = match (a, b) {
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
                     (_, ValueRef::Null) => Ordering::Greater,
                     _ => reverse_str(a).cmp(&reverse_str(b)),
-                }
+                };
+                Ok(res)
             })
         }
         SortComparatorType::TestUintLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
                 fn to_u64(v: &ValueRef) -> Option<u64> {
                     match v {
                         ValueRef::Null => None,
@@ -244,7 +256,7 @@ fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::S
                         _ => None,
                     }
                 }
-                match (a, b) {
+                let res = match (a, b) {
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
                     (_, ValueRef::Null) => Ordering::Greater,
@@ -252,12 +264,13 @@ fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::S
                         (Some(a), Some(b)) => a.cmp(&b),
                         _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
                     },
-                }
+                };
+                Ok(res)
             })
         }
         SortComparatorType::ArrayLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
-                match (a, b) {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
+                let res = match (a, b) {
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
                     (_, ValueRef::Null) => Ordering::Greater,
@@ -270,8 +283,8 @@ fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::S
                         let b_vals = crate::vdbe::array::parse_text_array(b_text);
                         match (a_vals, b_vals) {
                             (Some(av), Some(bv)) => {
-                                let a_blob = crate::vdbe::array::values_to_record_blob(&av);
-                                let b_blob = crate::vdbe::array::values_to_record_blob(&bv);
+                                let a_blob = crate::vdbe::array::values_to_record_blob(&av)?;
+                                let b_blob = crate::vdbe::array::values_to_record_blob(&bv)?;
                                 if let (Value::Blob(ab), Value::Blob(bb)) = (&a_blob, &b_blob) {
                                     crate::vdbe::array::compare_arrays(ab, bb)
                                         .unwrap_or(Ordering::Equal)
@@ -283,10 +296,12 @@ fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::S
                         }
                     }
                     _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                }
+                };
+                Ok(res)
             })
         }
-    }
+    };
+    Ok(cmp)
 }
 
 /// Compare two values using the specified collation for text values.
@@ -295,16 +310,54 @@ fn compare_with_collation(
     lhs: &Value,
     rhs: &Value,
     collation: Option<CollationSeq>,
-) -> std::cmp::Ordering {
-    match (lhs, rhs) {
+    collation_comparator: &Option<crate::vdbe::sorter::SortComparator>,
+) -> Result<std::cmp::Ordering> {
+    Ok(match (lhs, rhs) {
         (Value::Text(lhs_text), Value::Text(rhs_text)) => {
-            if let Some(coll) = collation {
+            if let Some(comparator) = collation_comparator {
+                comparator(&lhs.as_ref(), &rhs.as_ref())?
+            } else if let Some(coll) = collation {
                 coll.compare_strings(lhs_text.as_str(), rhs_text.as_str())
             } else {
                 lhs.cmp(rhs)
             }
         }
         _ => lhs.cmp(rhs),
+    })
+}
+
+fn compare_with_program_collation<V1, V2>(
+    program: &Program,
+    lhs: V1,
+    rhs: V2,
+    collation: CollationSeq,
+) -> Result<std::cmp::Ordering>
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+{
+    let lhs = lhs.as_value_ref();
+    let rhs = rhs.as_value_ref();
+    if collation.is_custom() {
+        if let (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) = (lhs, rhs) {
+            return program.connection.compare_external_collation(
+                collation,
+                lhs_text.as_str(),
+                rhs_text.as_str(),
+            );
+        }
+    }
+    Ok(compare_immutable_single(lhs, rhs, collation))
+}
+
+fn comparison_matches_order(op: ComparisonOp, order: std::cmp::Ordering) -> bool {
+    match op {
+        ComparisonOp::Eq => order.is_eq(),
+        ComparisonOp::Ne => !order.is_eq(),
+        ComparisonOp::Lt => order.is_lt(),
+        ComparisonOp::Le => order.is_le(),
+        ComparisonOp::Gt => order.is_gt(),
+        ComparisonOp::Ge => order.is_ge(),
     }
 }
 
@@ -811,7 +864,7 @@ pub fn op_not_null(
 }
 
 pub fn op_comparison(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -967,17 +1020,24 @@ pub fn op_comparison(
         }
     }
 
-    let (new_lhs, new_rhs) = (affinity.convert(lhs_value), affinity.convert(rhs_value));
-
-    let should_jump = op.compare(
-        new_lhs
-            .as_ref()
-            .map_or(Either::Left(lhs_value), Either::Right),
-        new_rhs
-            .as_ref()
-            .map_or(Either::Left(rhs_value), Either::Right),
-        collation,
+    let (new_lhs, new_rhs) = (
+        affinity.convert_for_compare(lhs_value),
+        affinity.convert_for_compare(rhs_value),
     );
+
+    let lhs_for_compare = new_lhs
+        .as_ref()
+        .map_or(Either::Left(lhs_value), Either::Right);
+    let rhs_for_compare = new_rhs
+        .as_ref()
+        .map_or(Either::Left(rhs_value), Either::Right);
+    let should_jump = if collation.is_custom() {
+        let order =
+            compare_with_program_collation(program, lhs_for_compare, rhs_for_compare, collation)?;
+        comparison_matches_order(op, order)
+    } else {
+        op.compare(lhs_for_compare, rhs_for_compare, collation)
+    };
 
     match (new_lhs, new_rhs) {
         (Some(new_lhs), None) => {
@@ -1202,8 +1262,8 @@ pub fn op_open_read(
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 index.as_ref(),
                 num_columns,
-            ));
-            let index_info = Arc::new(IndexInfo::new_from_index(index));
+            )?);
+            let index_info = Arc::new(IndexInfo::new_from_index(index)?);
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
@@ -1824,13 +1884,13 @@ pub fn op_column(
                                 Value::Text(new_text),
                                 Register::Value(Value::Text(existing_text)),
                             ) => {
-                                existing_text.do_extend(new_text);
+                                existing_text.do_extend(new_text)?;
                             }
                             (
                                 Value::Blob(new_blob),
                                 Register::Value(Value::Blob(existing_blob)),
                             ) => {
-                                existing_blob.do_extend(new_blob);
+                                existing_blob.do_extend(new_blob)?;
                             }
                             _ => {
                                 state.registers[*dest].set_value(default.clone());
@@ -2122,8 +2182,8 @@ pub fn op_array_encode(
     }
 
     // Serialize coerced elements as a native record-format BLOB
-    let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len());
-    state.registers[*reg].set_blob(record.into_payload());
+    let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len())?;
+    state.registers[*reg].set_blob(record.into_payload())?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2153,7 +2213,7 @@ pub fn op_array_decode(
             return Ok(InsnFunctionStepResult::Step);
         }
     };
-    state.registers[*reg].set_text(Text::new(text));
+    state.registers[*reg].set_text(Text::new(text))?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2270,7 +2330,7 @@ pub fn op_make_array(
         &state.registers,
         *start_reg,
         *count,
-    ));
+    )?);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2313,7 +2373,7 @@ pub fn op_make_array_dynamic(
         &state.registers,
         *start_reg,
         count,
-    ));
+    )?);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2374,7 +2434,7 @@ pub fn op_union_pack(
     );
 
     let record =
-        ImmutableRecord::from_registers(std::slice::from_ref(&state.registers[*value_reg]), 1);
+        ImmutableRecord::from_registers(std::slice::from_ref(&state.registers[*value_reg]), 1)?;
     let record_bytes = record.into_payload();
 
     // Format: [tag_index: 1 byte][record bytes]
@@ -2552,17 +2612,17 @@ pub fn op_array_concat(
             let mut elems_a = array_values_from_blob(lb)?;
             let elems_b = array_values_from_blob(rb)?;
             elems_a.extend(elems_b);
-            values_to_record_blob(&elems_a)
+            values_to_record_blob(&elems_a)?
         }
         (Value::Blob(lb), _) => {
             let mut elems = array_values_from_blob(lb)?;
             elems.push(rhs_ref.clone());
-            values_to_record_blob(&elems)
+            values_to_record_blob(&elems)?
         }
         (_, Value::Blob(rb)) => {
             let mut elems = array_values_from_blob(rb)?;
             elems.insert(0, lhs_ref.clone());
-            values_to_record_blob(&elems)
+            values_to_record_blob(&elems)?
         }
         _ => {
             // Neither is an array blob — fall back to string concat
@@ -2619,10 +2679,10 @@ pub fn op_array_set_element(
     let mut elements = array_values_from_blob(blob)?;
     if idx >= elements.len() {
         // Out-of-bounds: preserve original array unchanged
-        state.registers[*dest].set_blob(blob.clone());
+        state.registers[*dest].set_blob(blob.clone())?;
     } else {
         elements[idx] = new_val;
-        state.registers[*dest].set_value(values_to_record_blob(&elements));
+        state.registers[*dest].set_value(values_to_record_blob(&elements)?);
     }
 
     state.pc += 1;
@@ -2650,7 +2710,7 @@ pub fn op_array_slice(
     let start_val = state.registers[*start_reg].get_value().clone();
     let end_val = state.registers[*end_reg].get_value().clone();
 
-    let result = exec_array_slice(&arr_val, &start_val, &end_val);
+    let result = exec_array_slice(&arr_val, &start_val, &end_val)?;
     state.registers[*dest].set_value(result);
 
     state.pc += 1;
@@ -2693,7 +2753,7 @@ pub fn op_make_record(
         }
     }
 
-    let record = make_record(&state.registers, &start_reg, &count);
+    let record = make_record(&state.registers, &start_reg, &count)?;
     state.registers[dest_reg] = Register::Record(record);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2858,6 +2918,7 @@ pub fn halt(
 ) -> Result<InsnFunctionStepResult> {
     let mv_store = program.connection.mv_store();
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
+    let owns_auto_txn = state.owns_auto_txn();
 
     // Check if we're resuming from a FAIL commit I/O wait.
     // If pending_fail_error is set, we were in the middle of committing partial changes
@@ -2933,7 +2994,7 @@ pub fn halt(
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
         // Note: ON CONFLICT FAIL does NOT apply to FK violations, so we check for those first.
-        if program.resolve_type == ResolveType::Fail && auto_commit {
+        if program.resolve_type == ResolveType::Fail && owns_auto_txn {
             // Check for immediate FK violations - FK errors don't respect ON CONFLICT
             if program.connection.foreign_keys_enabled()
                 && state.get_fk_immediate_violations_during_stmt() > 0
@@ -2964,7 +3025,11 @@ pub fn halt(
         return Err(error);
     }
 
-    tracing::trace!("halt(auto_commit={})", auto_commit);
+    tracing::trace!(
+        "halt(auto_commit={}, owns_auto_txn={})",
+        auto_commit,
+        owns_auto_txn
+    );
 
     // Check for immediate foreign key violations.
     // Any immediate violation causes the statement subtransaction to roll back.
@@ -2983,7 +3048,7 @@ pub fn halt(
     if auto_commit {
         // In autocommit mode, a statement that leaves deferred violations must fail here,
         // and it also ends the transaction.
-        if program.connection.foreign_keys_enabled() {
+        if owns_auto_txn && program.connection.foreign_keys_enabled() {
             let deferred_violations = program
                 .connection
                 .fk_deferred_violations
@@ -3005,19 +3070,34 @@ pub fn halt(
             }
         }
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
-        vtab_commit_all(&program.connection)?;
-        index_method_pre_commit_all(state, pager)?;
-        let result = program
-            .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
-            .map(Into::into);
-        // Apply deferred CDC state and reset CDC txn ID after successful commit
-        if matches!(result, Ok(InsnFunctionStepResult::Done)) {
+        if owns_auto_txn {
+            vtab_commit_all(&program.connection)?;
+            index_method_pre_commit_all(state, pager)?;
+            let result = program
+                .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
+                .map(Into::into);
+            // Apply deferred CDC state and reset CDC txn ID after successful commit
+            if matches!(result, Ok(InsnFunctionStepResult::Done)) {
+                if let Some(cdc_info) = state.pending_cdc_info.take() {
+                    program.connection.set_capture_data_changes_info(cdc_info);
+                }
+                program.connection.set_cdc_transaction_id(-1);
+            }
+            result
+        } else {
+            // Another root statement may own the implicit autocommit
+            // transaction. This statement can finish, but must not commit or
+            // roll back connection-level state it did not start.
             if let Some(cdc_info) = state.pending_cdc_info.take() {
                 program.connection.set_capture_data_changes_info(cdc_info);
             }
-            program.connection.set_cdc_transaction_id(-1);
+            if program.change_cnt_on {
+                program
+                    .connection
+                    .set_changes(state.n_change.load(Ordering::SeqCst));
+            }
+            Ok(InsnFunctionStepResult::Done)
         }
-        result
     } else {
         // Even if deferred violations are present, the statement subtransaction completes successfully when
         // it is part of an interactive transaction.
@@ -3147,6 +3227,23 @@ pub enum OpTransactionState {
     BeginNamedSavepoints,
     CheckSchemaCookie,
     BeginStatement,
+}
+
+#[cfg(any(test, injected_yields))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TransactionYieldPoint {
+    BeforeStart,
+}
+
+#[cfg(any(test, injected_yields))]
+impl crate::mvcc::yield_hooks::YieldPointMarker for TransactionYieldPoint {
+    const POINT_COUNT: u8 = 1;
+
+    fn ordinal(self) -> u8 {
+        match self {
+            TransactionYieldPoint::BeforeStart => 0,
+        }
+    }
 }
 
 pub fn op_transaction(
@@ -3358,6 +3455,31 @@ pub fn op_transaction_inner(
                     return Err(LimboError::ReadOnly);
                 }
 
+                // Fast path: if checkpoint root publication already replaced the
+                // shared schema, force reprepare before opening any transaction state.
+                if *db == crate::MAIN_DB_ID
+                    && mv_store.is_some()
+                    && conn.mvcc_schema_requires_reprepare_before_tx()
+                {
+                    tracing::debug!(
+                        "MVCC shared schema changed without a schema-cookie change; force reprepare"
+                    );
+                    return Err(LimboError::SchemaUpdated);
+                }
+                #[cfg(any(test, injected_yields))]
+                {
+                    if let Some(IOResult::IO(io)) =
+                        crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                            conn.yield_injector().as_ref(),
+                            0,
+                            *db as u64,
+                            TransactionYieldPoint::BeforeStart,
+                        )
+                    {
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                }
+
                 // 1. We try to upgrade current version
                 let current_state = conn.get_tx_state();
                 let is_secondary_db = *db != crate::MAIN_DB_ID;
@@ -3478,7 +3600,9 @@ pub fn op_transaction_inner(
                                 "nested stmt should not begin a new read transaction"
                             );
                             pager.begin_read_tx()?;
-                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                            if conn.get_auto_commit() {
+                                state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                            }
                         }
                         // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
                         pager.mvcc_refresh_if_db_changed();
@@ -3494,6 +3618,9 @@ pub fn op_transaction_inner(
                             && *tx_mode == TransactionMode::Concurrent
                         {
                             mark_unlikely();
+                            pager.end_read_tx();
+                            conn.set_tx_state(TransactionState::None);
+                            state.auto_txn_cleanup = TxnCleanup::None;
                             return Err(LimboError::TxError(
                                 "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
                                     .to_string(),
@@ -3503,6 +3630,19 @@ pub fn op_transaction_inner(
                         if !has_existing_mv_tx {
                             match begin_mvcc_tx(mv_store, &pager, tx_mode, None) {
                                 Ok(tx_id) => {
+                                    // Check again in case checkpoint published roots after the
+                                    // previous check and before this transaction was protected.
+                                    if conn.mvcc_schema_requires_reprepare_before_tx() {
+                                        tracing::debug!(
+                                            "MVCC shared schema changed while starting transaction; force reprepare"
+                                        );
+                                        mv_store.rollback_tx(tx_id, pager.clone(), &conn, *db);
+                                        if started_read_tx {
+                                            pager.end_read_tx();
+                                            state.auto_txn_cleanup = TxnCleanup::None;
+                                        }
+                                        return Err(LimboError::SchemaUpdated);
+                                    }
                                     program
                                         .connection
                                         .set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
@@ -3592,7 +3732,11 @@ pub fn op_transaction_inner(
                             "nested stmt should not begin a new read transaction"
                         );
                         pager.begin_read_tx()?;
-                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                        // https://github.com/tursodatabase/turso/issues/7106 : If auto-commit is turned off,
+                        // then we shouldn't be setting the auto_txn_cleanup, this will cause errors in case the client explicitly calls commit post a drop of the statement struct
+                        if conn.get_auto_commit() {
+                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                        }
                     }
 
                     if !is_secondary_db
@@ -3603,7 +3747,7 @@ pub fn op_transaction_inner(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new write transaction"
                         );
-                        let begin_w_tx_res = pager.begin_write_tx();
+                        let begin_w_tx_res = pager.begin_write_tx(conn.wal_auto_actions());
                         if matches!(
                             begin_w_tx_res,
                             Err(LimboError::Busy | LimboError::BusySnapshot)
@@ -3658,7 +3802,8 @@ pub fn op_transaction_inner(
             // 3b. For attached databases, begin the write transaction after
             // begin_read_tx has already completed in the Start state.
             OpTransactionState::AttachedBeginWriteTx => {
-                let res = pager.begin_write_tx()?;
+                let conn = program.connection.clone();
+                let res = pager.begin_write_tx(conn.wal_auto_actions())?;
                 if let IOResult::IO(io) = res {
                     return Ok(InsnFunctionStepResult::IO(io));
                 }
@@ -3768,6 +3913,9 @@ pub fn op_transaction_inner(
                         .n_active_writes
                         .fetch_add(1, Ordering::SeqCst);
                     state.is_active_write = true;
+                    if state.has_stmt_transaction {
+                        state.auto_txn_cleanup = TxnCleanup::RollbackSavepoint;
+                    }
                 }
                 state.pc += 1;
                 state.active_op_state.clear();
@@ -3832,87 +3980,94 @@ pub fn op_auto_commit(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    // The logic in this opcode can be a bit confusing, so to make things a bit clearer lets be
-    // very explicit about the currently existing and requested state.
-    let requested_autocommit = *auto_commit;
-    let requested_rollback = *rollback;
-    let changed = requested_autocommit != had_autocommit;
-    let is_txn_end_eq = changed && requested_autocommit;
-    // what the requested operation is
-    let is_begin_req = had_autocommit && !requested_autocommit && !requested_rollback;
-    let is_commit_req = !had_autocommit && requested_autocommit && !requested_rollback;
-    let is_rollback_req = !had_autocommit && requested_autocommit && requested_rollback;
-
-    if is_txn_end_eq && conn.n_active_writes.load(Ordering::SeqCst) > 0 {
-        return Err(LimboError::Busy);
+    #[derive(Debug)]
+    enum TxOp {
+        Begin,
+        Commit,
+        Rollback,
     }
+    let tx_op = match (*auto_commit, *rollback) {
+        (false, false) => TxOp::Begin,
+        (true, false) => TxOp::Commit,
+        (true, true) => TxOp::Rollback,
+        (false, true) => {
+            return Err(LimboError::InternalError(
+                "Insn::AutoCommit {{ auto_commit: false, rollback: true }} is not valid".into(),
+            ))
+        }
+    };
 
-    if changed {
-        if requested_rollback {
-            // ROLLBACK transition
-            if let Some(mv_store) = mv_store.as_ref() {
-                if let Some(tx_id) = conn.get_mv_tx_id() {
-                    mv_store.rollback_tx(tx_id, pager.clone(), &conn, MAIN_DB_ID);
+    // BEGIN disables autocommit; COMMIT/ROLLBACK enables it. Anything else (BEGIN within a txn,
+    // or COMMIT/ROLLBACK without one) is invalid.
+    let valid_transition = matches!(
+        (&tx_op, had_autocommit),
+        (TxOp::Begin, true) | (TxOp::Commit | TxOp::Rollback, false)
+    );
+
+    if valid_transition {
+        if matches!(tx_op, TxOp::Commit | TxOp::Rollback)
+            && conn.n_active_writes.load(Ordering::SeqCst) > 0
+        {
+            return Err(LimboError::Busy);
+        }
+
+        match tx_op {
+            TxOp::Rollback => {
+                if let Some(mv_store) = mv_store.as_ref() {
+                    if let Some(tx_id) = conn.get_mv_tx_id() {
+                        mv_store.rollback_tx(tx_id, pager.clone(), &conn, MAIN_DB_ID);
+                    }
+                    pager.end_read_tx();
+                    conn.rollback_attached_mvcc_txs(true);
+                } else {
+                    pager.rollback_tx(&conn);
                 }
-                pager.end_read_tx();
-                conn.rollback_attached_mvcc_txs(true);
-            } else {
-                pager.rollback_tx(&conn);
+                conn.rollback_attached_wal_txns();
+                conn.rollback_temp_schema();
+                conn.set_tx_state(TransactionState::None);
+                conn.auto_commit.store(true, Ordering::SeqCst);
+                conn.set_cdc_transaction_id(-1);
             }
-            conn.rollback_attached_wal_txns();
-            conn.rollback_temp_schema();
-            conn.set_tx_state(TransactionState::None);
-            conn.auto_commit.store(true, Ordering::SeqCst);
-            conn.set_cdc_transaction_id(-1);
-        } else {
-            // BEGIN (true->false) or COMMIT (false->true)
-            if is_commit_req {
+            TxOp::Commit => {
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
                 check_deferred_fk_on_commit(&conn)?;
+                conn.auto_commit.store(true, Ordering::SeqCst);
             }
-            conn.auto_commit
-                .store(requested_autocommit, Ordering::SeqCst);
+            TxOp::Begin => {
+                conn.auto_commit.store(false, Ordering::SeqCst);
+                return Ok(InsnFunctionStepResult::Done);
+            }
         }
     } else {
-        // No autocommit flip.
-        let mvcc_tx_active = conn.get_mv_tx().is_some();
-        if !mvcc_tx_active {
-            if !requested_autocommit {
-                return Err(LimboError::TxError(
-                    "cannot start a transaction within a transaction".to_string(),
-                ));
-            } else if requested_rollback {
-                return Err(LimboError::TxError(
-                    "cannot rollback - no transaction is active".to_string(),
-                ));
-            } else {
-                return Err(LimboError::TxError(
-                    "cannot commit - no transaction is active".to_string(),
-                ));
-            }
-        } else if is_begin_req {
-            return Err(LimboError::TxError(
-                "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
-            ));
-        }
+        return match &tx_op {
+            TxOp::Begin => Err(LimboError::TxError(
+                "cannot start a transaction within a transaction".to_string(),
+            )),
+            TxOp::Commit => Err(LimboError::TxError(
+                "cannot commit - no transaction is active".to_string(),
+            )),
+            TxOp::Rollback => Err(LimboError::TxError(
+                "cannot rollback - no transaction is active".to_string(),
+            )),
+        };
     }
 
+    turso_debug_assert!(matches!(tx_op, TxOp::Commit | TxOp::Rollback), "tx_op should be commit or rollback by now", {"tx_op": tx_op});
+
     // For explicit COMMIT, flush any pending index method writes first
-    if is_commit_req {
+    if matches!(tx_op, TxOp::Commit) {
         index_method_pre_commit_all(state, pager)?;
     }
 
-    let res = program
-        .commit_txn(pager.clone(), state, mv_store.as_ref(), requested_rollback)
-        .map(Into::into);
-
-    if mv_store.is_none()
-        && matches!(
-            res,
-            Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
-        )
-        && (is_rollback_req || is_commit_req)
+    let res = match program
+        .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
+        .map(Into::<InsnFunctionStepResult>::into)?
     {
+        res @ (InsnFunctionStepResult::Done | InsnFunctionStepResult::Step) => res,
+        res @ (InsnFunctionStepResult::IO(_) | InsnFunctionStepResult::Row) => return Ok(res),
+    };
+
+    if mv_store.is_none() {
         pager.clear_savepoints()?;
         // Non-main pagers (temp + attached) accumulate savepoints from the
         // mirror path; they're not cleared by the main pager's commit/
@@ -3929,27 +4084,15 @@ pub fn op_auto_commit(
     }
 
     // Clear deferred FK counters only after FINAL success of COMMIT/ROLLBACK.
-    if fk_on
-        && matches!(
-            res,
-            Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
-        )
-        && (is_rollback_req || is_commit_req)
-    {
+    if fk_on {
         conn.clear_deferred_foreign_key_violations();
     }
 
     // Reset CDC transaction ID after successful COMMIT or ROLLBACK.
-    if matches!(
-        res,
-        Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
-    ) && (is_rollback_req || is_commit_req)
-    {
-        conn.set_cdc_transaction_id(-1);
-        conn.clear_named_savepoints();
-    }
+    conn.set_cdc_transaction_id(-1);
+    conn.clear_named_savepoints();
 
-    res
+    Ok(res)
 }
 
 pub fn op_savepoint(
@@ -3986,6 +4129,12 @@ pub fn op_savepoint(
                         deferred_fk_violations,
                     );
                 } else {
+                    if !pager.holds_read_lock() {
+                        pager.begin_read_tx()?;
+                    }
+                    if matches!(conn.get_tx_state(), TransactionState::None) {
+                        conn.set_tx_state(TransactionState::Read);
+                    }
                     pager.open_subjournal()?;
                     let db_size =
                         return_if_io!(pager.with_header(|header| header.database_size.get()));
@@ -4351,6 +4500,7 @@ pub fn op_program(
         },
         insn
     );
+    let subprogram = subprogram.prepared_program()?;
     loop {
         match std::mem::take(state.active_op_state.program()) {
             OpProgramState::Start => {
@@ -4392,7 +4542,7 @@ pub fn op_program(
                     let value = state.registers[parent_reg].get_value().clone();
                     let param_index = NonZero::<usize>::new(param_idx + 1)
                         .expect("param_idx + 1 should be non-zero");
-                    statement.bind_at(param_index, value);
+                    statement.bind_at(param_index, value)?;
                 }
 
                 *state.active_op_state.program() = OpProgramState::Step {
@@ -4543,7 +4693,7 @@ pub fn op_string8(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(String8 { value, dest }, insn);
-    state.registers[*dest].set_text(Text::new(value.clone()));
+    state.registers[*dest].set_text(Text::new(value.clone()))?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -4555,7 +4705,7 @@ pub fn op_blob(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Blob { value, dest }, insn);
-    state.registers[*dest].set_blob(value.clone());
+    state.registers[*dest].set_blob(value.clone())?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -4769,6 +4919,7 @@ pub fn op_seek_rowid(
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
     }
+    invalidate_deferred_seeks_for_cursor(state, *cursor_id);
     let (pc, did_seek) = {
         let cursor = get_cursor!(state, *cursor_id);
 
@@ -5765,35 +5916,30 @@ fn update_agg_payload(
                     "Avg: payload[2] is not an integer".to_string(),
                 ));
             };
-            let val = match arg {
-                Value::Numeric(Numeric::Integer(i)) => i as f64,
-                Value::Numeric(Numeric::Float(f)) => f64::from(f),
+            let mut sum_state = SumAggState {
+                r_err,
+                ..Default::default()
+            };
+            match arg {
+                Value::Numeric(Numeric::Integer(i)) => {
+                    apply_kbn_step_int(sum_val, i, &mut sum_state);
+                }
+                Value::Numeric(Numeric::Float(f)) => {
+                    apply_kbn_step(sum_val, f64::from(f), &mut sum_state);
+                }
                 Value::Text(t) => match try_for_float(t.as_str().as_bytes()).1 {
-                    ParsedNumber::Integer(i) => i as f64,
-                    ParsedNumber::Float(f) => f,
-                    ParsedNumber::None => 0.0,
+                    ParsedNumber::Integer(i) => apply_kbn_step_int(sum_val, i, &mut sum_state),
+                    ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
+                    ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
                 },
                 Value::Blob(b) => match try_for_float(&b).1 {
-                    ParsedNumber::Integer(i) => i as f64,
-                    ParsedNumber::Float(f) => f,
-                    ParsedNumber::None => 0.0,
+                    ParsedNumber::Integer(i) => apply_kbn_step_int(sum_val, i, &mut sum_state),
+                    ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
+                    ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
                 },
                 _ => unreachable!(),
-            };
-            // Use Kahan-Babuška-Neumaier compensation for better floating-point precision
-            let s = sum_val.to_float_or_zero();
-            let t = s + val;
-            // When t is infinite, the KBN correction computes inf - inf = NaN,
-            // which is meaningless. Skip compensation in that case.
-            if t.is_finite() {
-                let correction = if s.abs() > val.abs() {
-                    (s - t) + val
-                } else {
-                    (val - t) + s
-                };
-                *r_err_val = Value::from_f64(r_err + correction);
             }
-            *sum_val = Value::from_f64(t);
+            *r_err_val = Value::from_f64(sum_state.r_err);
             *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
         }
         AggFunc::Sum | AggFunc::Total => {
@@ -5893,9 +6039,9 @@ fn update_agg_payload(
             let cmp = if let Some(ref cmp_fn) = comparator {
                 let arg_ref = arg.as_ref();
                 let payload_ref = payload[0].as_ref();
-                cmp_fn(&arg_ref, &payload_ref)
+                cmp_fn(&arg_ref, &payload_ref)?
             } else {
-                compare_with_collation(&arg, &payload[0], Some(collation))
+                compare_with_collation(&arg, &payload[0], Some(collation), comparator)?
             };
             let should_update = match func {
                 AggFunc::Max => cmp == Ordering::Greater,
@@ -6049,7 +6195,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                 )));
             } else {
                 let elements = &payload[1..1 + count];
-                Value::Blob(ImmutableRecord::from_values(elements, count).into_payload())
+                Value::Blob(ImmutableRecord::from_values(elements, count)?.into_payload())
             }
         }
         AggFunc::External(_) => {
@@ -6085,7 +6231,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
 }
 
 pub fn op_agg_step(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -6106,15 +6252,22 @@ pub fn op_agg_step(
         state.registers[*acc_reg] = match func {
             AggFunc::External(ext_func) => match ext_func.as_ref() {
                 ExtFunc::Aggregate {
+                    context,
                     init,
                     step,
                     finalize,
                     argc,
+                    aggregate_destructor,
+                    value_destructor,
+                    ..
                 } => Register::Aggregate(AggContext::External(ExternalAggState {
-                    state: unsafe { (init)() },
-                    argc: *argc,
+                    context: *context,
+                    state: unsafe { (init)(*context) },
+                    argc: (*argc).max(0) as usize,
                     step_fn: *step,
                     finalize_fn: *finalize,
+                    aggregate_destructor: *aggregate_destructor,
+                    value_destructor: *value_destructor,
                 })),
                 _ => unreachable!("scalar function called in aggregate context"),
             },
@@ -6127,35 +6280,65 @@ pub fn op_agg_step(
         };
     }
 
-    // Resolve custom type comparator for MIN/MAX if provided
-    let comparator = comparator.as_ref().map(make_sort_comparator);
+    let current_collation = state.current_collation.unwrap_or(CollationSeq::Binary);
+    let comparator = match comparator.as_ref() {
+        Some(comparator) => Some(make_sort_comparator(comparator)?),
+        None if current_collation.is_custom() => Some(
+            program
+                .connection
+                .make_collation_comparator(current_collation)?,
+        ),
+        None => None,
+    };
 
     // Step the aggregate
     match func {
         AggFunc::External(_) => {
             // External aggregates use FFI and need special handling
-            let (step_fn, state_ptr, argc) = {
+            let (context, step_fn, state_ptr, argc, aggregate_destructor, value_destructor) = {
                 let Register::Aggregate(agg) = &state.registers[*acc_reg] else {
                     unreachable!();
                 };
                 let AggContext::External(agg_state) = agg else {
                     unreachable!();
                 };
-                (agg_state.step_fn, agg_state.state, agg_state.argc)
+                (
+                    agg_state.context,
+                    agg_state.step_fn,
+                    agg_state.state,
+                    agg_state.argc,
+                    agg_state.aggregate_destructor,
+                    agg_state.value_destructor,
+                )
             };
-            if argc == 0 {
-                unsafe { step_fn(state_ptr, 0, std::ptr::null()) };
-            } else {
+            let mut ext_values = Vec::with_capacity(argc);
+            if argc != 0 {
                 let register_slice = &state.registers[*col..*col + argc];
-                let mut ext_values: Vec<ExtValue> = Vec::with_capacity(argc);
                 for ov in register_slice.iter() {
                     ext_values.push(ov.get_value().to_ffi());
                 }
-                let argv_ptr = ext_values.as_ptr();
-                unsafe { step_fn(state_ptr, argc as i32, argv_ptr) };
-                for ext_value in ext_values {
-                    unsafe { ext_value.__free_internal_type() };
+            }
+            let argv_ptr = if ext_values.is_empty() {
+                std::ptr::null()
+            } else {
+                ext_values.as_ptr()
+            };
+            let mut result = unsafe { step_fn(context, state_ptr, argc as i32, argv_ptr) };
+            let value = Value::from_ffi_ref(&result);
+            if let Some(value_destructor) = value_destructor {
+                unsafe { value_destructor(&mut result) };
+            } else {
+                unsafe { result.__free_internal_type() };
+            }
+            for ext_value in ext_values {
+                unsafe { ext_value.__free_internal_type() };
+            }
+            if let Err(err) = value {
+                if let Some(aggregate_destructor) = aggregate_destructor {
+                    unsafe { aggregate_destructor(state_ptr as usize) };
                 }
+                state.registers[*acc_reg].set_value(Value::Null);
+                return Err(err);
             }
         }
         _ => {
@@ -6188,8 +6371,6 @@ pub fn op_agg_step(
                     }
                     _ => None,
                 };
-                let collation = state.current_collation.unwrap_or(CollationSeq::Binary);
-
                 // Now get mutable borrow on payload
                 let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
                     panic!(
@@ -6198,7 +6379,14 @@ pub fn op_agg_step(
                     );
                 };
                 let payload = agg.payload_mut();
-                update_agg_payload(func, arg, maybe_arg2, payload, collation, &comparator)?;
+                update_agg_payload(
+                    func,
+                    arg,
+                    maybe_arg2,
+                    payload,
+                    current_collation,
+                    &comparator,
+                )?;
             }
         }
     };
@@ -6249,21 +6437,48 @@ pub fn op_agg_final(
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonGroupArray => {
-                    state.registers[dest_reg].set_text(Text::json("[]".to_string()));
+                    state.registers[dest_reg].set_text(Text::json("[]".to_string()))?;
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupArray => {
                     state.registers[dest_reg]
-                        .set_blob(json::jsonb::Jsonb::make_empty_array(1).data());
+                        .set_blob(json::jsonb::Jsonb::make_empty_array(1).data())?;
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonGroupObject => {
-                    state.registers[dest_reg].set_text(Text::json("{}".to_string()));
+                    state.registers[dest_reg].set_text(Text::json("{}".to_string()))?;
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupObject => {
                     state.registers[dest_reg]
-                        .set_blob(json::jsonb::Jsonb::make_empty_obj(1).data());
+                        .set_blob(json::jsonb::Jsonb::make_empty_obj(1).data())?;
+                }
+                AggFunc::External(ext_func) => {
+                    let value = match ext_func.as_ref() {
+                        ExtFunc::Aggregate {
+                            context,
+                            init,
+                            finalize,
+                            aggregate_destructor,
+                            value_destructor,
+                            ..
+                        } => {
+                            let aggregate_context = unsafe { init(*context) };
+                            let mut result = unsafe { finalize(*context, aggregate_context) };
+                            let value = Value::from_ffi_ref(&result);
+                            if let Some(value_destructor) = value_destructor {
+                                unsafe { value_destructor(&mut result) };
+                            } else {
+                                unsafe { result.__free_internal_type() };
+                            }
+                            if let Some(aggregate_destructor) = aggregate_destructor {
+                                unsafe { aggregate_destructor(aggregate_context as usize) };
+                            }
+                            value?
+                        }
+                        _ => unreachable!("scalar function called in aggregate context"),
+                    };
+                    state.registers[dest_reg].set_value(value);
                 }
                 _ => {}
             }
@@ -6316,21 +6531,30 @@ pub fn op_sorter_open(
         collations.push(coll.unwrap_or_default());
         nulls_orders.push(*nulls);
     }
-    let comparators = comparators
-        .iter()
-        .map(|c| c.as_ref().map(make_sort_comparator))
-        .collect();
+    let mut sort_comparators = Vec::with_capacity(order_collations_nulls.len());
+    for (idx, (_, coll, _)) in order_collations_nulls.iter().enumerate() {
+        let comparator = match comparators.get(idx).and_then(|c| c.as_ref()) {
+            Some(comparator) => Some(make_sort_comparator(comparator)?),
+            None => match coll {
+                Some(collation) if collation.is_custom() => {
+                    Some(program.connection.make_collation_comparator(*collation)?)
+                }
+                _ => None,
+            },
+        };
+        sort_comparators.push(comparator);
+    }
     let temp_store = program.connection.get_temp_store();
     let cursor = Sorter::new(
         &order,
         collations,
         nulls_orders,
-        comparators,
+        sort_comparators,
         max_buffer_size_bytes,
         page_size,
         pager.io.clone(),
         temp_store,
-    );
+    )?;
     let cursors = &mut state.cursors;
     cursors
         .get_mut(*cursor_id)
@@ -6556,7 +6780,7 @@ pub fn op_rowset_add(
 
     let rowset = state.rowsets.entry(*rowset_reg).or_default();
 
-    rowset.insert(rowid);
+    rowset.insert(rowid)?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -6658,7 +6882,7 @@ pub fn op_rowset_test(
         state.pc = pc_if_found.as_offset_int();
     } else {
         if *batch != -1 {
-            rowset.insert(rowid);
+            rowset.insert(rowid)?;
         }
         state.pc += 1;
     }
@@ -7303,18 +7527,18 @@ pub fn op_function(
             }
             ScalarFunc::TursoVersion => {
                 if !program.connection.is_db_initialized() {
-                    state.registers[*dest].set_text(Text::new(info::build::PKG_VERSION));
+                    state.registers[*dest].set_text(Text::new(info::build::PKG_VERSION))?;
                 } else {
                     let version_integer =
                         return_if_io!(pager.with_header(|header| header.version_number)).get()
                             as i64;
                     let version = execute_turso_version(version_integer);
-                    state.registers[*dest].set_text(Text::new(version));
+                    state.registers[*dest].set_text(Text::new(version))?;
                 }
             }
             ScalarFunc::SqliteVersion => {
                 let version = execute_sqlite_version();
-                state.registers[*dest].set_text(Text::new(version));
+                state.registers[*dest].set_text(Text::new(version))?;
             }
             ScalarFunc::SqliteSourceId => {
                 let src_id = format!(
@@ -7322,7 +7546,7 @@ pub fn op_function(
                     info::build::BUILT_TIME_SQLITE,
                     info::build::GIT_COMMIT_HASH.unwrap_or("unknown")
                 );
-                state.registers[*dest].set_text(Text::new(src_id));
+                state.registers[*dest].set_text(Text::new(src_id))?;
             }
             ScalarFunc::Replace => {
                 assert_eq!(arg_count, 3);
@@ -7338,7 +7562,7 @@ pub fn op_function(
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             ScalarFunc::LoadExtension => {
-                if !program.connection.db.can_load_extensions() {
+                if !program.connection.can_load_extensions() {
                     crate::bail_parse_error!("runtime extension loading is disabled");
                 }
                 let extension = &state.registers[*start_reg];
@@ -7540,7 +7764,7 @@ pub fn op_function(
                     _ => 0,
                 };
                 let accum = StatAccum::new(n_col);
-                state.registers[*dest].set_blob(accum.to_bytes());
+                state.registers[*dest].set_blob(accum.to_bytes())?;
             }
             ScalarFunc::StatPush => {
                 // stat_push(accum_blob, i_chng): Push a row into the accumulator
@@ -7911,25 +8135,25 @@ pub fn op_function(
                 check_arg_count!(arg_count, 2);
                 let arr_val = state.registers[*start_reg].get_value().clone();
                 let elem_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_append(&arr_val, &elem_val));
+                state.registers[*dest].set_value(exec_array_append(&arr_val, &elem_val)?);
             }
             ScalarFunc::ArrayPrepend => {
                 check_arg_count!(arg_count, 2);
                 let elem_val = state.registers[*start_reg].get_value().clone();
                 let arr_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_prepend(&arr_val, &elem_val));
+                state.registers[*dest].set_value(exec_array_prepend(&arr_val, &elem_val)?);
             }
             ScalarFunc::ArrayCat => {
                 check_arg_count!(arg_count, 2);
                 let a_val = state.registers[*start_reg].get_value().clone();
                 let b_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_cat(&a_val, &b_val));
+                state.registers[*dest].set_value(exec_array_cat(&a_val, &b_val)?);
             }
             ScalarFunc::ArrayRemove => {
                 check_arg_count!(arg_count, 2);
                 let arr_val = state.registers[*start_reg].get_value().clone();
                 let target = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_remove(&arr_val, &target));
+                state.registers[*dest].set_value(exec_array_remove(&arr_val, &target)?);
             }
             ScalarFunc::ArrayContains => {
                 check_arg_count!(arg_count, 2);
@@ -7956,7 +8180,7 @@ pub fn op_function(
                 let arr_val = state.registers[*start_reg].get_value().clone();
                 let start_idx = state.registers[*start_reg + 1].get_value().clone();
                 let end_idx = state.registers[*start_reg + 2].get_value().clone();
-                let result = exec_array_slice(&arr_val, &start_idx, &end_idx);
+                let result = exec_array_slice(&arr_val, &start_idx, &end_idx)?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::StringToArray => {
@@ -7971,7 +8195,7 @@ pub fn op_function(
                     &text,
                     &delimiter,
                     null_str.as_ref(),
-                ));
+                )?);
             }
             ScalarFunc::ArrayToString => {
                 let arr_val = state.registers[*start_reg].get_value().clone();
@@ -8067,35 +8291,44 @@ pub fn op_function(
             }
         }
         crate::function::Func::External(f) => match f.func {
-            ExtFunc::Scalar(f) => {
-                if arg_count == 0 {
-                    let result_c_value: ExtValue = unsafe { (f)(0, std::ptr::null()) };
-                    match Value::from_ffi(result_c_value) {
-                        Ok(result_ov) => {
-                            state.registers[*dest].set_value(result_ov);
-                        }
-                        Err(e) => {
-                            return Err(e);
-                        }
-                    }
-                } else {
+            ExtFunc::Scalar {
+                context,
+                callback,
+                context_destructor,
+                value_destructor,
+                ..
+            } => {
+                let mut ext_values = Vec::with_capacity(arg_count);
+                if arg_count != 0 {
                     let register_slice = &state.registers[*start_reg..*start_reg + arg_count];
-                    let mut ext_values: Vec<ExtValue> = Vec::with_capacity(arg_count);
                     for ov in register_slice.iter() {
-                        let val = ov.get_value().to_ffi();
-                        ext_values.push(val);
-                    }
-                    let argv_ptr = ext_values.as_ptr();
-                    let result_c_value: ExtValue = unsafe { (f)(arg_count as i32, argv_ptr) };
-                    match Value::from_ffi(result_c_value) {
-                        Ok(result_ov) => {
-                            state.registers[*dest].set_value(result_ov);
-                        }
-                        Err(e) => {
-                            return Err(e);
-                        }
+                        ext_values.push(ov.get_value().to_ffi());
                     }
                 }
+                let argv_ptr = if ext_values.is_empty() {
+                    std::ptr::null()
+                } else {
+                    ext_values.as_ptr()
+                };
+                let mut result = unsafe {
+                    callback(
+                        context,
+                        arg_count as i32,
+                        argv_ptr,
+                        context_destructor,
+                        value_destructor,
+                    )
+                };
+                let value = Value::from_ffi_ref(&result);
+                if let Some(value_destructor) = value_destructor {
+                    unsafe { value_destructor(&mut result) };
+                } else {
+                    unsafe { result.__free_internal_type() };
+                }
+                for ext_value in ext_values {
+                    unsafe { ext_value.__free_internal_type() };
+                }
+                state.registers[*dest].set_value(value?);
             }
             _ => unreachable!("aggregate called in scalar context"),
         },
@@ -8505,16 +8738,11 @@ pub fn op_function(
                                 }
 
                                 for column in &mut columns {
-                                    match column.expr.as_mut() {
-                                        ast::Expr::Id(id)
-                                            if normalize_ident(id.as_str()) == rename_from =>
-                                        {
-                                            *id = Name::exact(
-                                                column_def.col_name.as_str().to_owned(),
-                                            );
-                                        }
-                                        _ => {}
-                                    }
+                                    rename_identifiers(
+                                        column.expr.as_mut(),
+                                        &rename_from,
+                                        column_def.col_name.as_str(),
+                                    );
                                 }
 
                                 if let Some(ref mut wc) = where_clause {
@@ -8735,12 +8963,12 @@ pub fn op_function(
             };
 
             state.registers[*dest].set_value(r#type.clone());
-            state.registers[*dest + 1].set_text(Text::from(new_name));
-            state.registers[*dest + 2].set_text(Text::from(new_tbl_name));
+            state.registers[*dest + 1].set_text(Text::from(new_name))?;
+            state.registers[*dest + 2].set_text(Text::from(new_tbl_name))?;
             state.registers[*dest + 3].set_int(*root_page);
 
             if let Some(new_sql) = new_sql {
-                state.registers[*dest + 4].set_text(Text::from(new_sql));
+                state.registers[*dest + 4].set_text(Text::from(new_sql))?;
             } else {
                 state.registers[*dest + 4].set_value(sql.clone());
             }
@@ -8839,7 +9067,7 @@ pub fn op_function(
                             &before_str,
                             &after_str,
                         );
-                        state.registers[*dest].set_text(Text::new(highlighted));
+                        state.registers[*dest].set_text(Text::new(highlighted))?;
                     }
                 }
             }
@@ -9209,7 +9437,7 @@ pub fn op_insert(
                             Register::Record(r) => std::borrow::Cow::Borrowed(r),
                             Register::Value(value) => {
                                 let values = [value];
-                                let record = ImmutableRecord::from_values(values, values.len());
+                                let record = ImmutableRecord::from_values(values, values.len())?;
                                 std::borrow::Cow::Owned(record)
                             }
                             Register::Aggregate(..) => {
@@ -9231,7 +9459,7 @@ pub fn op_insert(
                         Register::Record(r) => std::borrow::Cow::Borrowed(r),
                         Register::Value(value) => {
                             let values = [value];
-                            let record = ImmutableRecord::from_values(values, values.len());
+                            let record = ImmutableRecord::from_values(values, values.len())?;
                             std::borrow::Cow::Owned(record)
                         }
                         Register::Aggregate(..) => {
@@ -9327,7 +9555,7 @@ pub fn op_insert(
                         Register::Record(r) => std::borrow::Cow::Borrowed(r),
                         Register::Value(value) => {
                             let values = [value];
-                            let record = ImmutableRecord::from_values(values, values.len());
+                            let record = ImmutableRecord::from_values(values, values.len())?;
                             std::borrow::Cow::Owned(record)
                         }
                         Register::Aggregate(..) => {
@@ -9556,7 +9784,7 @@ pub fn op_idx_delete(
             state.active_op_state.idx_delete()
         );
         match state.active_op_state.idx_delete() {
-            Some(OpIdxDeleteState::Seeking) => {
+            OpIdxDeleteState::Seeking => {
                 let found = match seek_internal(
                     program,
                     state,
@@ -9590,9 +9818,9 @@ pub fn op_idx_delete(
                     state.active_op_state.clear();
                     return Ok(InsnFunctionStepResult::Step);
                 }
-                *state.active_op_state.idx_delete() = Some(OpIdxDeleteState::Verifying);
+                *state.active_op_state.idx_delete() = OpIdxDeleteState::Verifying;
             }
-            Some(OpIdxDeleteState::Verifying) => {
+            OpIdxDeleteState::Verifying => {
                 let rowid = {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
@@ -9607,9 +9835,9 @@ pub fn op_idx_delete(
                         "IdxDelete: no matching index entry found for key while verifying: {reg_values:?}"
                     )));
                 }
-                *state.active_op_state.idx_delete() = Some(OpIdxDeleteState::Deleting);
+                *state.active_op_state.idx_delete() = OpIdxDeleteState::Deleting;
             }
-            Some(OpIdxDeleteState::Deleting) => {
+            OpIdxDeleteState::Deleting => {
                 {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
@@ -9620,9 +9848,6 @@ pub fn op_idx_delete(
                 state.pc += 1;
                 state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
-            }
-            None => {
-                *state.active_op_state.idx_delete() = Some(OpIdxDeleteState::Seeking);
             }
         }
     }
@@ -10067,31 +10292,40 @@ fn new_rowid_inner(
     }
 }
 
+fn coerce_register_to_integer(state: &mut ProgramState, reg: usize) -> Result<bool> {
+    let converted = match state.registers[reg].get_value() {
+        Value::Numeric(Numeric::Integer(_)) => return Ok(true),
+        Value::Numeric(Numeric::Float(f)) => cast_real_to_integer(f64::from(*f)).ok(),
+        Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
+            Ok(Value::Numeric(Numeric::Integer(i))) => Some(i),
+            Ok(Value::Numeric(Numeric::Float(f))) => cast_real_to_integer(f64::from(f)).ok(),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    if let Some(i) = converted {
+        state.registers[reg].set_int(i);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 pub fn op_must_be_int(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(MustBeInt { reg }, insn);
-    match &state.registers[*reg].get_value() {
-        Value::Numeric(Numeric::Integer(_)) => {}
-        Value::Numeric(Numeric::Float(f)) => match cast_real_to_integer(f64::from(*f)) {
-            Ok(i) => state.registers[*reg].set_int(i),
-            Err(_) => bail_constraint_error!("datatype mismatch"),
-        },
-        Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
-            Ok(Value::Numeric(Numeric::Integer(i))) => state.registers[*reg].set_int(i),
-            Ok(Value::Numeric(Numeric::Float(f))) => match cast_real_to_integer(f64::from(f)) {
-                Ok(i) => state.registers[*reg].set_int(i),
-                Err(_) => bail_constraint_error!("datatype mismatch"),
-            },
-            _ => bail_constraint_error!("datatype mismatch"),
-        },
-        _ => {
-            bail_constraint_error!("datatype mismatch");
+    load_insn!(MustBeInt { reg, target_pc }, insn);
+    if !coerce_register_to_integer(state, *reg)? {
+        if let Some(target_pc) = target_pc {
+            state.pc = target_pc.as_offset_int();
+            return Ok(InsnFunctionStepResult::Step);
         }
-    };
+        bail_constraint_error!("datatype mismatch");
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -10386,8 +10620,8 @@ pub fn op_open_write(
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 index.as_ref(),
                 num_columns,
-            ));
-            let index_info = Arc::new(IndexInfo::new_from_index(index));
+            )?);
+            let index_info = Arc::new(IndexInfo::new_from_index(index)?);
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
@@ -11059,7 +11293,7 @@ fn op_parse_schema_step(
                 let io = inner
                     .stmt
                     .take_io_completions()
-                    .expect("IO returned but no completions");
+                    .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                 return Ok(InsnFunctionStepResult::IO(io));
             }
             StepResult::Row => {
@@ -11318,7 +11552,7 @@ fn drive_init_cdc_version(
                 let io = inner
                     .stmt
                     .take_io_completions()
-                    .expect("IO returned but no completions");
+                    .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                 return Ok(InsnFunctionStepResult::IO(io));
             }
             StepResult::Row => match &inner.phase {
@@ -11347,12 +11581,12 @@ fn drive_init_cdc_version(
                             "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
                         ),
                     };
-                    inner.stmt = prepare_cdc_internal(&conn, create_sql)?;
+                    inner.stmt = prepare_cdc_internal(conn, create_sql)?;
                     inner.phase = OpInitCdcVersionPhase::CreateCdcTable;
                 }
                 OpInitCdcVersionPhase::CreateCdcTable => {
                     inner.stmt = prepare_cdc_internal(
-                        &conn,
+                        conn,
                         format!(
                             "CREATE TABLE IF NOT EXISTS {TURSO_CDC_VERSION_TABLE_NAME} (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
                         ),
@@ -11369,7 +11603,7 @@ fn drive_init_cdc_version(
                         *version
                     };
                     inner.stmt = prepare_cdc_internal(
-                        &conn,
+                        conn,
                         format!(
                             "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{escaped_cdc_table_name}', '{version_to_insert}')",
                         ),
@@ -11378,7 +11612,7 @@ fn drive_init_cdc_version(
                 }
                 OpInitCdcVersionPhase::InsertVersion => {
                     inner.stmt = prepare_cdc_internal(
-                        &conn,
+                        conn,
                         format!(
                             "SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{escaped_cdc_table_name}'",
                         ),
@@ -11672,13 +11906,17 @@ pub fn op_add_imm(
         Register::Record(_) => &Value::Null,
     };
 
-    let int_val = match current_value {
-        Value::Numeric(Numeric::Integer(i)) => i + value,
-        Value::Numeric(Numeric::Float(f)) => (f64::from(*f) as i64) + value,
-        Value::Text(s) => s.as_str().parse::<i64>().unwrap_or(0) + value,
-        Value::Blob(_) => *value, // BLOB becomes the added value
-        Value::Null => *value,    // NULL becomes the added value
+    // SQLite coerces the register to an integer before adding.
+    let lhs = match current_value {
+        Value::Numeric(Numeric::Integer(i)) => *i,
+        Value::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(*f)),
+        Value::Text(s) => crate::numeric::str_to_i64(s.as_str()).unwrap_or(0),
+        Value::Blob(b) => {
+            crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
+        }
+        Value::Null => 0,
     };
+    let int_val = lhs.wrapping_add(*value);
 
     state.registers[*register].set_int(int_val);
     state.pc += 1;
@@ -11947,7 +12185,7 @@ pub fn op_open_ephemeral(
             pager
                 .begin_read_tx() // we have to begin a read tx before beginning a write
                 .expect("Failed to start read transaction");
-            return_if_io!(pager.begin_write_tx());
+            return_if_io!(pager.begin_write_tx(WalAutoActions::all_enabled()));
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::CreateBtree {
                 pager: pager.clone(),
                 temp_file: temp_file.take(),
@@ -11977,8 +12215,12 @@ pub fn op_open_ephemeral(
             let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
                 BTreeCursor::new_index(pager.clone(), root_page, index, num_columns)
             } else {
-                BTreeCursor::new_table(pager.clone(), root_page, num_columns)
-            };
+                Ok(BTreeCursor::new_table(
+                    pager.clone(),
+                    root_page,
+                    num_columns,
+                ))
+            }?;
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::Rewind {
                 cursor: Box::new(cursor),
                 temp_file: temp_file.take(),
@@ -12411,7 +12653,7 @@ pub fn op_integrity_check(
                 errors.truncate(*max_errors);
                 let message = format_integrity_check_result(errors);
                 match message {
-                    Some(msg) => state.registers[*message_register].set_text(Text::new(msg)),
+                    Some(msg) => state.registers[*message_register].set_text(Text::new(msg))?,
                     None => state.registers[*message_register].set_null(),
                 };
                 state.active_op_state.clear();
@@ -12469,7 +12711,7 @@ pub fn op_integrity_check(
             errors.truncate(*max_errors);
             let message = format_integrity_check_result(errors);
             match message {
-                Some(msg) => state.registers[*message_register].set_text(Text::new(msg)),
+                Some(msg) => state.registers[*message_register].set_text(Text::new(msg))?,
                 None => state.registers[*message_register].set_null(),
             };
             state.active_op_state.clear();
@@ -12577,6 +12819,7 @@ fn rewrite_trigger_for_column_rename(
     new_col: &str,
 ) -> crate::Result<()> {
     let trigger_tbl = normalize_ident(&trigger.table_name);
+    let old_sql = trigger.sql.clone();
     if let Some(ref mut when) = trigger.when_clause {
         rename_identifiers_scoped_when_clause(when, table_name, &trigger_tbl, old_col, new_col);
     }
@@ -12597,6 +12840,13 @@ fn rewrite_trigger_for_column_rename(
             "error in trigger {} after rename: no such column: {}",
             trigger.name, old_col
         )));
+    }
+    // Keep trigger.sql in sync with the rewritten in-memory AST so a subsequent
+    // RENAME COLUMN sees the current column name (the translate step uses the
+    // in-memory trigger.sql as the source of the next rewrite).
+    let new_sql = regenerate_trigger_sql(trigger);
+    if new_sql != old_sql {
+        trigger.sql = new_sql;
     }
     Ok(())
 }
@@ -12800,20 +13050,37 @@ pub fn op_drop_column(
         Ok(())
     })?;
 
-    // Update index.pos_in_table for all indexes.
-    // For example, if the dropped column had index 2, then anything that was indexed on column 3 or higher should be decremented by 1.
-    conn.with_database_schema_mut(*db, |schema| {
+    // Shift left pos_in_table in all indexes, and self-table placeholders in generated column
+    // expressions, to account for the dropped column. For example, if the dropped column had index
+    // 2, then anything that was indexed on column 3 or higher should be decremented by 1.
+    conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
                 let index = Arc::get_mut(index).expect("this should be the only strong reference");
                 for index_column in index.columns.iter_mut() {
-                    if index_column.pos_in_table > *column_index {
+                    if index_column.pos_in_table != EXPR_INDEX_SENTINEL
+                        && index_column.pos_in_table > *column_index
+                    {
                         index_column.pos_in_table -= 1;
+                    }
+                    if let Some(ref mut expr) = index_column.expr {
+                        crate::translate::expr::walk_expr_mut(expr, &mut |e| {
+                            if let ast::Expr::Column {
+                                table, column: c, ..
+                            } = e
+                            {
+                                if table.is_self_table() && *c > *column_index {
+                                    *c -= 1;
+                                }
+                            }
+                            Ok(crate::translate::expr::WalkControl::Continue)
+                        })?;
                     }
                 }
             }
         }
-    });
+        Ok(())
+    })?;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
         for (view_name, view) in schema.views.iter() {
@@ -13003,8 +13270,29 @@ pub fn op_alter_column(
                 }
             }
         }
+        let clears_autoincrement_sequence = !*rename
+            && btree.has_autoincrement
+            && btree
+                .columns()
+                .get(*column_index)
+                .is_some_and(|column| column.is_rowid_alias())
+            && !new_column.is_rowid_alias();
+
         if *rename {
             btree.columns_mut()[*column_index].name = Some(new_name.clone());
+
+            // Refresh the cached sql in generated columns
+            let column_count = btree.columns().len();
+            for i in 0..column_count {
+                let cols_view = btree.columns();
+                if let Some(new_sql) = cols_view[i]
+                    .generated_expr()
+                    .map(|expr| render_gencol_expr_sql_with_new_names(expr, cols_view))
+                    .transpose()?
+                {
+                    btree.columns_mut()[i].set_generated_original_sql(new_sql)
+                }
+            }
         } else {
             btree.columns_mut()[*column_index] = new_column.clone();
         }
@@ -13042,6 +13330,9 @@ pub fn op_alter_column(
         if !*rename {
             // recompute alias from `new_column`
             btree.columns_mut()[*column_index].set_rowid_alias(new_column.is_rowid_alias());
+            if clears_autoincrement_sequence {
+                btree.has_autoincrement = false;
+            }
         }
 
         // Update this table's OWN foreign keys
@@ -13370,21 +13661,20 @@ pub fn op_hash_build(
     } else {
         data.mem_budget
     };
-    state
-        .hash_tables
-        .entry(data.hash_table_id)
-        .or_insert_with(|| {
-            let config = HashTableConfig {
-                initial_buckets: 1024,
-                mem_budget,
-                num_keys: data.num_keys,
-                collations: data.collations.clone(),
-                temp_store,
-                track_matched: data.track_matched,
-                partition_count: None,
-            };
-            HashTable::new(config, pager.io.clone())
-        });
+    if let std::collections::hash_map::Entry::Vacant(e) =
+        state.hash_tables.entry(data.hash_table_id)
+    {
+        let config = HashTableConfig {
+            initial_buckets: 1024,
+            mem_budget,
+            num_keys: data.num_keys,
+            collations: data.collations.clone(),
+            temp_store,
+            track_matched: data.track_matched,
+            partition_count: None,
+        };
+        e.insert(HashTable::new(config, pager.io.clone())?);
+    }
 
     // Read pre-computed key values directly from registers
     while op_state.key_idx < data.num_keys {
@@ -13475,21 +13765,24 @@ pub fn op_hash_distinct(
     } else {
         DEFAULT_MEM_BUDGET
     };
+    if let std::collections::hash_map::Entry::Vacant(e) =
+        state.hash_tables.entry(data.hash_table_id)
+    {
+        let config = HashTableConfig {
+            initial_buckets: 1024,
+            mem_budget,
+            num_keys: data.num_keys,
+            collations: data.collations.clone(),
+            temp_store,
+            track_matched: false,
+            partition_count: None,
+        };
+        e.insert(HashTable::new(config, pager.io.clone())?);
+    }
     let hash_table = state
         .hash_tables
-        .entry(data.hash_table_id)
-        .or_insert_with(|| {
-            let config = HashTableConfig {
-                initial_buckets: 1024,
-                mem_budget,
-                num_keys: data.num_keys,
-                collations: data.collations.clone(),
-                temp_store,
-                track_matched: false,
-                partition_count: None,
-            };
-            HashTable::new(config, pager.io.clone())
-        });
+        .get_mut(&data.hash_table_id)
+        .expect("hash table exists");
 
     let key_values = &mut state.distinct_key_values;
     key_values.clear();
@@ -13611,8 +13904,10 @@ pub fn op_hash_probe(
     // For spilled hash tables, either buffer main-loop probe rows for grace
     // processing or probe a partition that grace logic already loaded.
     if hash_table.has_spilled() {
-        let partition_idx =
-            partition_idx.unwrap_or_else(|| hash_table.partition_for_keys(&probe_keys));
+        let partition_idx = match partition_idx {
+            Some(partition_idx) => partition_idx,
+            None => hash_table.partition_for_keys(&probe_keys)?,
+        };
 
         // Main probe loop: buffer probe rows targeting spilled build partitions.
         if let Some(rowid_reg) = probe_rowid_reg {
@@ -13665,7 +13960,7 @@ pub fn op_hash_probe(
             partition_idx,
             &probe_keys,
             Some(&mut state.metrics.hash_join),
-        ) {
+        )? {
             Some(entry) => {
                 state.registers[dest_reg].set_int(entry.rowid);
                 write_hash_payload_to_registers(
@@ -13686,7 +13981,7 @@ pub fn op_hash_probe(
         }
     } else {
         // Non-spilled hash table, use normal probe
-        match hash_table.probe(probe_keys, Some(&mut state.metrics.hash_join)) {
+        match hash_table.probe(probe_keys, Some(&mut state.metrics.hash_join))? {
             Some(entry) => {
                 state.registers[dest_reg].set_int(entry.rowid);
                 write_hash_payload_to_registers(
@@ -13729,7 +14024,7 @@ pub fn op_hash_next(
         mark_unlikely();
         LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
     })?;
-    match hash_table.next_match() {
+    match hash_table.next_match()? {
         Some(entry) => {
             state.registers[*dest_reg].set_int(entry.rowid);
             write_hash_payload_to_registers(
@@ -13770,7 +14065,7 @@ pub fn op_hash_clear(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(HashClear { hash_table_id }, insn);
     if let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) {
-        hash_table.clear();
+        hash_table.clear()?;
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -13961,7 +14256,7 @@ pub fn op_hash_grace_init(
     }
 
     // Initialize grace processing
-    if !hash_table.grace_begin() {
+    if !hash_table.grace_begin()? {
         state.pc = target_pc.as_offset_int();
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -14247,32 +14542,16 @@ fn execute_turso_version(version_integer: i64) -> String {
     format!("{major}.{minor}.{release}")
 }
 
+/// Coerce a value to i64 using the same non-NULL conversion rules as
+/// SQLite's OP_AddImm.
 pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
     let value = value.as_value_ref();
     match value {
         ValueRef::Numeric(Numeric::Integer(i)) => i,
-        ValueRef::Numeric(Numeric::Float(f)) => {
-            let f = f64::from(f);
-            // Use sqlite3RealToI64 equivalent
-            if f < -9223372036854774784.0 {
-                i64::MIN
-            } else if f > 9223372036854774784.0 {
-                i64::MAX
-            } else {
-                f as i64
-            }
-        }
-        ValueRef::Text(t) => {
-            // Try to parse as integer, return 0 if failed
-            t.as_str().parse::<i64>().unwrap_or(0)
-        }
+        ValueRef::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(f)),
+        ValueRef::Text(t) => crate::numeric::str_to_i64(t.as_str()).unwrap_or(0),
         ValueRef::Blob(b) => {
-            // Try to parse blob as string then as integer
-            if let Ok(s) = std::str::from_utf8(b) {
-                s.parse::<i64>().unwrap_or(0)
-            } else {
-                0
-            }
+            crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
         }
         ValueRef::Null => 0,
     }
@@ -14385,7 +14664,7 @@ fn op_journal_mode_inner(
                 // If no new mode specified, just return current mode
                 let Some(mode_str) = new_mode else {
                     let ret: &'static str = prev_mode.into();
-                    state.registers[*dest].set_text(Text::new(ret));
+                    state.registers[*dest].set_text(Text::new(ret))?;
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
                 };
@@ -14396,7 +14675,7 @@ fn op_journal_mode_inner(
                     Ok(mode) if mode.supported() => mode,
                     _ => {
                         let ret: &'static str = prev_mode.into();
-                        state.registers[*dest].set_text(Text::new(ret));
+                        state.registers[*dest].set_text(Text::new(ret))?;
                         state.pc += 1;
                         return Ok(InsnFunctionStepResult::Step);
                     }
@@ -14405,14 +14684,14 @@ fn op_journal_mode_inner(
                 // If same mode, just return
                 if prev_mode == new_mode {
                     let ret: &'static str = new_mode.into();
-                    state.registers[*dest].set_text(Text::new(ret));
+                    state.registers[*dest].set_text(Text::new(ret))?;
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
                 }
 
                 if *db != crate::MAIN_DB_ID {
                     let ret: &'static str = prev_mode.into();
-                    state.registers[*dest].set_text(Text::new(ret));
+                    state.registers[*dest].set_text(Text::new(ret))?;
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
                 }
@@ -14548,7 +14827,7 @@ fn op_journal_mode_inner(
 
                 // Return result
                 let ret: &'static str = new_mode.into();
-                state.registers[*dest].set_text(Text::new(ret));
+                state.registers[*dest].set_text(Text::new(ret))?;
                 state.pc += 1;
 
                 return Ok(InsnFunctionStepResult::Step);
@@ -14655,42 +14934,50 @@ where
         })
 }
 
-/// Sub-states for the VACUUM INTO operation state machine.
+/// Phases for the VACUUM INTO opcode wrapper.
 #[derive(Default)]
-pub(crate) enum OpVacuumIntoSubState {
-    /// Initial state - validate preconditions and create destination database
+pub(crate) enum VacuumIntoOpPhase {
+    /// Initial state - validate preconditions and create output database.
     #[default]
     Init,
-    /// Build compacted destination database
-    Build(Box<crate::vdbe::vacuum::VacuumInto>),
-    /// Operation complete
+    /// Build compacted output database.
+    Build,
+    /// Force the committed output into a durable self-contained database file.
+    FinalizeOutput,
+    /// Operation complete.
     Done,
 }
 
-/// Holds the state for the VACUUM INTO operation.
+/// Holds the state for the VACUUM INTO opcode operation.
 #[derive(Default)]
-pub(crate) struct OpVacuumIntoState {
-    sub_state: OpVacuumIntoSubState,
-    /// Database index for the target schema
-    database_id: usize,
-    /// Escaped schema name for safe SQL interpolation
+pub(crate) struct VacuumIntoOpContext {
+    phase: VacuumIntoOpPhase,
+    /// Database index for the source schema.
+    source_db_id: usize,
+    /// Escaped schema name for safe SQL interpolation.
     escaped_schema_name: String,
+    /// Keep output database alive while vacuum is in progress.
+    _output_db: Option<Arc<Database>>,
+    /// Configuration for the shared vacuum target build state machine.
+    target_build_config: Option<VacuumTargetBuildConfig>,
+    /// Context for the shared vacuum target build state machine.
+    target_build_context: Option<VacuumTargetBuildContext>,
 }
 
 /// VACUUM INTO - create a compacted copy of the database at the specified path.
 ///
 /// This is an async state machine implementation that yields on I/O operations.
 /// It:
-/// 1. Creates a new database at the destination path with matching page_size and
+/// 1. Creates a new output database with matching page_size and
 ///    source feature flags and schema-replay symbols
 /// 2. Queries sqlite_schema for all schema objects including rootpage, ordered by rowid
-/// 3. Creates storage-backed tables (rootpage != 0) in destination, excluding
+/// 3. Creates storage-backed tables (rootpage != 0) in the output, excluding
 ///    sqlite_sequence (auto-created when AUTOINCREMENT tables are created)
 /// 4. Copies data for all storage-backed tables, including sqlite_stat1 and other
 ///    internal storage-backed tables
 /// 5. Creates user-defined secondary indexes after data copy for performance
 ///    (backing-btree indexes for custom index methods are excluded here)
-/// 6. Copies meta values (user_version, application_id) from source to destination
+/// 6. Finalizes output database header metadata
 /// 7. Creates triggers, views, and rootpage = 0 objects last (after data copy).
 ///    Custom index methods (FTS, vector) recreate and backfill their backing
 ///    indexes from the copied table data in this phase.
@@ -14703,7 +14990,7 @@ pub fn op_vacuum_into(
     match op_vacuum_into_inner(program, state, insn) {
         Ok(InsnFunctionStepResult::Step) => {
             // Instruction complete, reset state
-            state.active_op_state.clear();
+            state.op_vacuum_state = VacuumOpState::None;
             Ok(InsnFunctionStepResult::Step)
         }
         Ok(InsnFunctionStepResult::IO(io)) => {
@@ -14714,11 +15001,57 @@ pub fn op_vacuum_into(
             unreachable!("op_vacuum_into_inner only returns Step or IO")
         }
         Err(err) => {
-            // Reset state on error
-            state.active_op_state.clear();
+            if matches!(state.op_vacuum_state, VacuumOpState::IntoFile(_)) {
+                let VacuumOpState::IntoFile(vacuum_state) =
+                    std::mem::take(&mut state.op_vacuum_state)
+                else {
+                    unreachable!("invalid state, we are inside vacuum into op");
+                };
+                if let Err(cleanup_err) =
+                    cleanup_op_vacuum_into(&program.connection, state, vacuum_state)
+                {
+                    tracing::error!("VACUUM INTO cleanup failed after error: {cleanup_err}");
+                }
+            }
             Err(err)
         }
     }
+}
+
+/// Clean up any VACUUM or VACUUM INTO state on error or abort.
+pub(crate) fn cleanup_vacuum_state(
+    connection: &Arc<Connection>,
+    state: &mut ProgramState,
+) -> Result<()> {
+    match std::mem::take(&mut state.op_vacuum_state) {
+        VacuumOpState::None => Ok(()),
+        VacuumOpState::IntoFile(vacuum_state) => {
+            cleanup_op_vacuum_into(connection, state, vacuum_state)
+        }
+        VacuumOpState::InPlace(vacuum_state) => {
+            cleanup_op_vacuum_in_place(connection, vacuum_state)
+        }
+    }
+}
+
+fn cleanup_op_vacuum_into(
+    connection: &Arc<Connection>,
+    state: &mut ProgramState,
+    mut vacuum_state: Box<VacuumIntoOpContext>,
+) -> Result<()> {
+    if let Some(target_build_context) = vacuum_state.target_build_context.as_mut() {
+        target_build_context.cleanup_after_error()?;
+    }
+
+    vacuum_state.target_build_context = None;
+    vacuum_state._output_db = None;
+
+    if state.auto_txn_cleanup == TxnCleanup::RollbackTxn {
+        let pager = connection.pager.load();
+        connection.rollback_manual_txn_cleanup(&pager, true);
+        state.auto_txn_cleanup = TxnCleanup::None;
+    }
+    Ok(())
 }
 
 fn op_vacuum_into_inner(
@@ -14726,8 +15059,6 @@ fn op_vacuum_into_inner(
     state: &mut ProgramState,
     insn: &Insn,
 ) -> Result<InsnFunctionStepResult> {
-    use crate::vdbe::vacuum::{VacuumInto, VacuumIntoConfig};
-
     load_insn!(
         VacuumInto {
             schema_name,
@@ -14736,31 +15067,35 @@ fn op_vacuum_into_inner(
         insn
     );
 
-    if state.active_op_state.vacuum_into().is_none() {
-        let database_id = program.connection.get_database_id_by_name(schema_name)?;
+    if matches!(state.op_vacuum_state, VacuumOpState::None) {
+        let source_db_id = program.connection.get_database_id_by_name(schema_name)?;
 
         // Matches sqlite that treats VACUUM temp INTO as a no-op (no file created)
-        if database_id == TEMP_DB_ID {
+        if source_db_id == TEMP_DB_ID {
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
 
-        *state.active_op_state.vacuum_into() = Some(OpVacuumIntoState {
+        state.op_vacuum_state = VacuumOpState::IntoFile(Box::new(VacuumIntoOpContext {
             escaped_schema_name: schema_name.replace('"', "\"\""),
-            database_id,
+            source_db_id,
             ..Default::default()
-        });
+        }));
     }
 
-    let vacuum_state = state.active_op_state.vacuum_into().as_mut().unwrap();
+    let VacuumOpState::IntoFile(vacuum_state) = &mut state.op_vacuum_state else {
+        return Err(LimboError::InternalError(
+            "VACUUM INTO resumed with incompatible VACUUM state".to_string(),
+        ));
+    };
     let escaped_schema_name = &vacuum_state.escaped_schema_name;
-    let database_id = vacuum_state.database_id;
+    let source_db_id = vacuum_state.source_db_id;
 
     loop {
-        let current_sub_state = std::mem::take(&mut vacuum_state.sub_state);
+        let current_phase = std::mem::take(&mut vacuum_state.phase);
 
-        match current_sub_state {
-            OpVacuumIntoSubState::Init => {
+        match current_phase {
+            VacuumIntoOpPhase::Init => {
                 // Check if we're in a transaction
                 // as vacuum cannot be run inside a transaction
                 if !program.connection.auto_commit.load(Ordering::SeqCst) {
@@ -14789,32 +15124,35 @@ fn op_vacuum_into_inner(
                     )));
                 }
 
-                // Pin source metadata before building the destination. The
+                // Pin source metadata before building the output database. The
                 // BEGIN and pragma helpers here are blocking convenience wrappers;
-                // async work starts with the schema scan in vacuum_into_step.
-                let source_db = program.connection.get_source_database(database_id);
+                // async work starts with the schema scan in vacuum_target_build_step.
+                let source_db = program.connection.get_source_database(source_db_id);
                 program.connection.execute("BEGIN")?;
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
-                let user_version: i32 = extract_pragma_int(
-                    &program
-                        .connection
-                        .pragma_query(&format!("\"{escaped_schema_name}\".user_version"))?,
-                    "user_version",
-                )?;
-                let application_id: i32 = extract_pragma_int(
-                    &program
-                        .connection
-                        .pragma_query(&format!("\"{escaped_schema_name}\".application_id"))?,
-                    "application_id",
-                )?;
                 let page_size: u32 = extract_pragma_int(
                     &program
                         .connection
                         .pragma_query(&format!("\"{escaped_schema_name}\".page_size"))?,
                     "page_size",
                 )?;
+                let source_pager = program
+                    .connection
+                    .get_pager_from_database_index(&source_db_id)?;
+                let source_auto_vacuum_mode = source_pager.get_auto_vacuum_mode();
+                reject_unsupported_vacuum_auto_vacuum_mode(source_auto_vacuum_mode)?;
+                let header_meta = if let Some(mv_store) =
+                    program.connection.mv_store_for_db(source_db_id)
+                {
+                    let tx_id = program.connection.get_mv_tx_id_for_db(source_db_id);
+                    mv_store.with_header(VacuumDbHeaderMeta::from_source_header, tx_id.as_ref())?
+                } else {
+                    source_pager.io.block(|| {
+                        source_pager.with_header(VacuumDbHeaderMeta::from_source_header)
+                    })?
+                };
 
-                let reserved_space: u8 = if !is_attached_db(database_id) {
+                let reserved_space: u8 = if !is_attached_db(source_db_id) {
                     // For main or temp db prefer cached value to avoid blocking I/O
                     match program.connection.get_reserved_bytes() {
                         Some(val) => val,
@@ -14829,79 +15167,88 @@ fn op_vacuum_into_inner(
                     // For attached db read from its own pager
                     let pager = program
                         .connection
-                        .get_pager_from_database_index(&database_id)?;
+                        .get_pager_from_database_index(&source_db_id)?;
                     pager
                         .io
                         .block(|| pager.with_header(|header| header.reserved_space))?
                 };
 
-                // Mirror source feature flags to the destination so schema replay
+                // Mirror source feature flags to the output so schema replay
                 // can resolve custom types, generated columns, vtab modules, etc.
-                let dest_opts = crate::DatabaseOpts::new()
-                    .with_views(source_db.experimental_views_enabled())
-                    .with_index_method(source_db.experimental_index_method_enabled())
-                    .with_custom_types(source_db.experimental_custom_types_enabled())
-                    .with_generated_columns(source_db.experimental_generated_columns_enabled());
+                let output_opts = vacuum_target_opts_from_source(&source_db);
 
-                // Always use PlatformIO for the destination file, even if source
+                // Always use PlatformIO for the output file, even if source
                 // is in-memory. This ensures VACUUM INTO writes to disk.
                 let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
-                let dest_db = crate::Database::open_file_with_flags(
+                let output_db = crate::Database::open_file_with_flags(
                     io,
                     dest_path,
                     OpenFlags::Create,
-                    dest_opts,
+                    output_opts,
                     None,
                 )?;
-                let dest_conn = dest_db.connect()?;
-                dest_conn.reset_page_size(page_size)?;
-                // set reserved_space on destination to match source
+                let output_conn = output_db.connect()?;
+                output_conn.reset_page_size(page_size)?;
+                // set reserved_space on output to match source
                 // this is important for databases using encryption or checksums
                 // must be set before page 1 is allocated (before any schema operations)
-                dest_conn.set_reserved_bytes(reserved_space)?;
+                output_conn.set_reserved_bytes(reserved_space)?;
 
-                // Capture source custom type definitions so that STRICT tables with
-                // custom type columns can resolve those types during CREATE TABLE
-                // replay on the destination.
-                let source_custom_types: Vec<(String, Arc<crate::schema::TypeDef>)> = program
-                    .connection
-                    .with_schema(database_id, |source_schema| {
-                        source_schema
-                            .type_registry
-                            .iter()
-                            .filter(|(_, td)| !td.is_builtin)
-                            .map(|(name, td)| (name.clone(), td.clone()))
-                            .collect()
-                    });
+                mirror_symbols(&program.connection, &output_conn);
+                let source_custom_types = capture_custom_types(&program.connection, source_db_id);
 
-                let config = VacuumIntoConfig {
+                let config = VacuumTargetBuildConfig {
                     source_conn: program.connection.clone(),
                     escaped_schema_name: escaped_schema_name.clone(),
-                    database_id,
-                    source_user_version: user_version,
-                    source_application_id: application_id,
+                    source_db_id,
+                    header_meta,
                     source_custom_types,
-                    source_mvcc_enabled: source_db.mvcc_enabled(),
+                    target_mvcc_enabled: source_db.mvcc_enabled(),
+                    target_auto_vacuum_mode: source_auto_vacuum_mode,
+                    copy_mvcc_metadata_table: false,
                 };
 
-                vacuum_state.sub_state = OpVacuumIntoSubState::Build(Box::new(VacuumInto::new(
-                    config, dest_db, dest_conn,
-                )));
+                vacuum_state._output_db = Some(output_db);
+                vacuum_state.target_build_config = Some(config);
+                vacuum_state.target_build_context =
+                    Some(VacuumTargetBuildContext::new(output_conn));
+                vacuum_state.phase = VacuumIntoOpPhase::Build;
                 continue;
             }
 
-            OpVacuumIntoSubState::Build(mut vacuum_into) => match vacuum_into.step()? {
-                IOResult::Done(()) => {
-                    vacuum_state.sub_state = OpVacuumIntoSubState::Done;
-                    continue;
-                }
-                IOResult::IO(io) => {
-                    vacuum_state.sub_state = OpVacuumIntoSubState::Build(vacuum_into);
-                    return Ok(InsnFunctionStepResult::IO(io));
-                }
-            },
+            VacuumIntoOpPhase::Build => {
+                let config = vacuum_state
+                    .target_build_config
+                    .as_ref()
+                    .expect("VacuumTargetBuildConfig must be set in Build state");
+                let target_build_context = vacuum_state
+                    .target_build_context
+                    .as_mut()
+                    .expect("VacuumTargetBuildContext must be set in Build state");
 
-            OpVacuumIntoSubState::Done => {
+                match vacuum_target_build_step(config, target_build_context)? {
+                    crate::IOResult::Done(()) => {
+                        vacuum_state.phase = VacuumIntoOpPhase::FinalizeOutput;
+                        continue;
+                    }
+                    crate::IOResult::IO(io) => {
+                        vacuum_state.phase = VacuumIntoOpPhase::Build;
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                }
+            }
+
+            VacuumIntoOpPhase::FinalizeOutput => {
+                let target_build_context = vacuum_state
+                    .target_build_context
+                    .as_ref()
+                    .expect("VacuumTargetBuildContext must be set in FinalizeOutput state");
+                crate::vdbe::vacuum::finalize_vacuum_into_output(target_build_context)?;
+                vacuum_state.phase = VacuumIntoOpPhase::Done;
+                continue;
+            }
+
+            VacuumIntoOpPhase::Done => {
                 // Commit the source transaction started in Init.
                 program.connection.execute("COMMIT")?;
                 state.auto_txn_cleanup = TxnCleanup::None;
@@ -14911,6 +15258,57 @@ fn op_vacuum_into_inner(
             }
         }
     }
+}
+
+/// In-place VACUUM - compact the database via target build + direct-WAL
+/// copy-back. The opcode owns the source transaction lifecycle.
+pub fn op_vacuum(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(Vacuum { db }, insn);
+
+    if matches!(state.op_vacuum_state, VacuumOpState::None) {
+        state.op_vacuum_state = VacuumOpState::InPlace(Box::new(VacuumInPlaceOpContext::new(*db)));
+    }
+
+    let VacuumOpState::InPlace(vacuum_state) = &mut state.op_vacuum_state else {
+        return Err(LimboError::InternalError(
+            "VACUUM resumed with incompatible VACUUM state".to_string(),
+        ));
+    };
+
+    match vacuum_state.step(&program.connection) {
+        Ok(IOResult::Done(())) => {
+            state.op_vacuum_state = VacuumOpState::None;
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
+        Err(err) => {
+            let VacuumOpState::InPlace(vacuum_state) = std::mem::take(&mut state.op_vacuum_state)
+            else {
+                unreachable!("invalid state, we are inside vacuum op");
+            };
+            if let Err(cleanup_err) = cleanup_op_vacuum_in_place(&program.connection, vacuum_state)
+            {
+                tracing::error!("VACUUM cleanup failed after error: {cleanup_err}");
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Clean up in-place VACUUM state on error or abort. Rolls back the source
+/// transaction if it was acquired, restores connection state, and drops
+/// temp resources.
+fn cleanup_op_vacuum_in_place(
+    connection: &Arc<Connection>,
+    vacuum_state: Box<VacuumInPlaceOpContext>,
+) -> Result<()> {
+    vacuum_state.cleanup(connection)
 }
 
 fn with_header<T, F>(
@@ -15013,7 +15411,7 @@ mod tests {
             track_matched: false,
             ..Default::default()
         };
-        let mut ht = HashTable::new(config, io);
+        let mut ht = HashTable::new(config, io).unwrap();
 
         for i in 0..1024 {
             match ht
@@ -15034,13 +15432,237 @@ mod tests {
         let probe_key = (0..1024)
             .map(|i| vec![Value::from_i64(i)])
             .find(|key| {
-                let partition_idx = ht.partition_for_keys(key);
+                let partition_idx = ht.partition_for_keys(key).unwrap();
                 !ht.is_partition_loaded(partition_idx)
             })
             .expect("expected an unloaded spilled partition");
-        let partition_idx = ht.partition_for_keys(&probe_key);
+        let partition_idx = ht.partition_for_keys(&probe_key).unwrap();
 
         (ht, probe_key, partition_idx)
+    }
+
+    /// test to check that vacuum into connection state is reset if it is
+    /// interrupted mid way
+    #[test]
+    fn test_vacuum_into_busy_after_source_begin_rolls_back_source_txn() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+        let source_txn_progress_calls = Arc::new(AtomicUsize::new(0));
+        let did_interrupt = Arc::new(AtomicBool::new(false));
+        let conn_for_progress = conn.clone();
+        let source_txn_progress_calls_for_handler = source_txn_progress_calls.clone();
+        let did_interrupt_for_handler = did_interrupt.clone();
+        conn.set_progress_handler(
+            1,
+            Some(Box::new(move || {
+                if !conn_for_progress.get_auto_commit() {
+                    let calls =
+                        source_txn_progress_calls_for_handler.fetch_add(1, Ordering::SeqCst);
+                    calls >= 10 && !did_interrupt_for_handler.swap(true, Ordering::SeqCst)
+                } else {
+                    false
+                }
+            })),
+        );
+
+        let dest_dir = tempfile::TempDir::new().unwrap();
+        let dest_path = dest_dir.path().join("busy_vacuum.db");
+        let dest_path = dest_path.to_str().expect("temp path should be UTF-8");
+        let mut stmt = conn.prepare(format!("VACUUM INTO '{dest_path}'")).unwrap();
+        let step = stmt.step().unwrap();
+        conn.set_progress_handler(0, None);
+
+        assert!(
+            matches!(step, StepResult::Busy),
+            "progress interruption inside VACUUM INTO should surface as Busy, got {step:?}"
+        );
+        assert!(
+            source_txn_progress_calls.load(Ordering::SeqCst) > 10,
+            "test should interrupt after VACUUM INTO opens the source transaction"
+        );
+        assert!(
+            did_interrupt.load(Ordering::SeqCst),
+            "progress handler should have interrupted VACUUM INTO exactly once"
+        );
+        assert!(
+            conn.get_auto_commit(),
+            "Busy cleanup should roll back the source transaction before returning"
+        );
+    }
+
+    /// same like `test_vacuum_into_busy_after_source_begin_rolls_back_source_txn`
+    /// but for attached dbs
+    #[test]
+    fn test_cleanup_vacuum_into_rolls_back_attached_only_source_txn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let main_path = dir.path().join("vacuum-into-cleanup-main.db");
+        let attached_path = dir.path().join("vacuum-into-cleanup-attached.db");
+
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            main_path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new().with_attach(true),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute(format!(
+            "ATTACH DATABASE '{}' AS att",
+            attached_path.display()
+        ))
+        .unwrap();
+        conn.execute("CREATE TABLE att.t(x)").unwrap();
+        conn.execute("INSERT INTO att.t VALUES (1)").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        let attached_db_id = conn.get_database_id_by_name("att").unwrap();
+        let attached_pager = conn.get_pager_from_database_index(&attached_db_id).unwrap();
+        attached_pager.begin_read_tx().unwrap();
+
+        assert!(
+            !conn.pager.load().holds_read_lock(),
+            "attached-only cleanup regression requires the main pager to stay lock-free"
+        );
+        assert!(
+            attached_pager.holds_read_lock(),
+            "attached source pager should hold the pinned read snapshot"
+        );
+
+        let mut state = ProgramState::new(0, 0);
+        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+
+        cleanup_op_vacuum_into(&conn, &mut state, Box::default()).unwrap();
+
+        assert!(
+            conn.get_auto_commit(),
+            "cleanup should restore auto-commit without going through SQL ROLLBACK"
+        );
+        assert_eq!(state.auto_txn_cleanup, TxnCleanup::None);
+        assert!(
+            !attached_pager.holds_read_lock(),
+            "cleanup should release the attached source read snapshot"
+        );
+
+        conn.execute("INSERT INTO att.t VALUES (2)").unwrap();
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM att.t").unwrap();
+        let mut count = 0_i64;
+        stmt.run_with_row_callback(|row| {
+            count = row.get(0)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_in_place_vacuum_succeeds_and_releases_source_locks() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            "in-place-vacuum-design-b.db",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_vacuum(true),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        for i in 0..128 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'value-{i}')"))
+                .unwrap();
+        }
+        conn.execute("DELETE FROM t WHERE id % 2 = 0").unwrap();
+
+        conn.execute("VACUUM").unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT count(*), coalesce(sum(id), 0) FROM t")
+            .unwrap();
+        let mut count = 0_i64;
+        let mut sum = 0_i64;
+        stmt.run_with_row_callback(|row| {
+            count = row.get(0)?;
+            sum = row.get(1)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 64);
+        assert_eq!(sum, (1..128).step_by(2).sum::<i64>());
+        assert!(conn.get_auto_commit());
+
+        let pager = conn.pager.load();
+        assert!(!pager.holds_read_lock());
+        assert!(!pager.holds_write_lock());
+    }
+
+    #[test]
+    fn test_in_place_vacuum_busy_before_copyback_restores_source_txn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            "in-place-vacuum-busy-before-copyback.db",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_vacuum(true),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        for i in 0..32 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'value-{i}')"))
+                .unwrap();
+        }
+
+        let did_interrupt = Arc::new(AtomicBool::new(false));
+        let conn_for_progress = conn.clone();
+        let did_interrupt_for_handler = did_interrupt.clone();
+        conn.set_progress_handler(
+            1,
+            Some(Box::new(move || {
+                !conn_for_progress.get_auto_commit()
+                    && !did_interrupt_for_handler.swap(true, Ordering::SeqCst)
+            })),
+        );
+
+        let mut stmt = conn.prepare("VACUUM").unwrap();
+        let step = stmt.step().unwrap();
+        conn.set_progress_handler(0, None);
+
+        assert!(
+            matches!(step, StepResult::Busy),
+            "progress interruption inside in-place VACUUM should surface as Busy, got {step:?}"
+        );
+        assert!(
+            did_interrupt.load(Ordering::SeqCst),
+            "test should interrupt after in-place VACUUM opens the source snapshot"
+        );
+        assert!(
+            conn.get_auto_commit(),
+            "Busy cleanup should restore auto-commit before returning"
+        );
+        let pager = conn.pager.load();
+        assert!(!pager.holds_read_lock());
+        assert!(!pager.holds_write_lock());
     }
 
     #[test]
@@ -15076,7 +15698,7 @@ mod tests {
         );
         assert_eq!(state.pc, 0, "pc should not advance on invariant violation");
         assert!(
-            matches!(state.active_op_state.hash_probe(), None),
+            state.active_op_state.hash_probe().is_none(),
             "HashProbe should not stash resumable state for the removed fallback path"
         );
     }
@@ -15456,6 +16078,37 @@ mod tests {
         ];
         let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
         assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_finalize_avg_large_integers() {
+        let mut payload = vec![
+            Value::from_f64(0.0),
+            Value::from_f64(0.0),
+            Value::from_i64(0),
+        ];
+
+        update_agg_payload(
+            &AggFunc::Avg,
+            Value::from_i64(9007199254740994),
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+            &None,
+        )
+        .unwrap();
+        update_agg_payload(
+            &AggFunc::Avg,
+            Value::from_i64(-9007199254740993),
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+            &None,
+        )
+        .unwrap();
+
+        let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
+        assert_eq!(result, Value::from_f64(0.5));
     }
 
     #[test]

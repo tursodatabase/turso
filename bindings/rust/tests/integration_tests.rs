@@ -1829,3 +1829,42 @@ async fn test_autoincrement_blocked_in_mvcc() {
     let count = query_i64(&conn, "SELECT COUNT(*) FROM t").await;
     assert_eq!(count, 1);
 }
+
+#[tokio::test]
+async fn test_invalid_transaction_state_on_rows_drop() {
+    const SQL_CREATE: &str = "
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t(v) VALUES (1), (2), (3);";
+    const SQL_QUERY: &str = "SELECT v FROM t;";
+    let mut conn = turso::Builder::new_local(":memory:")
+        .build()
+        .await
+        .unwrap()
+        .connect()
+        .unwrap();
+    conn.execute_batch(SQL_CREATE).await.unwrap();
+    let tx = conn.transaction().await.unwrap();
+    let mut stmt = tx.prepare(SQL_QUERY).await.unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+    let _first = rows.next().await.unwrap();
+    drop(rows);
+    drop(stmt);
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_invalid_transaction_state_on_rows_drop_mvcc() {
+    const SQL_CREATE: &str = "
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t(v) VALUES (1), (2), (3);";
+    const SQL_QUERY: &str = "SELECT v FROM t;";
+    let (db, _dir) = setup_mvcc_db(SQL_CREATE).await;
+    let mut conn = db.connect().unwrap();
+    let tx = conn.transaction().await.unwrap();
+    let mut stmt = tx.prepare(SQL_QUERY).await.unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+    let _first = rows.next().await.unwrap();
+    drop(rows);
+    drop(stmt);
+    tx.commit().await.unwrap();
+}

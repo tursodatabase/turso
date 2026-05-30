@@ -59,9 +59,9 @@ jobs:
         with:
           name: native-${{ matrix.artifact-name }}
           path: |
-            ${{ env.working-directory }}/rs_compiled/**/turso_dotnet.dll
-            ${{ env.working-directory }}/rs_compiled/**/libturso_dotnet.so
-            ${{ env.working-directory }}/rs_compiled/**/libturso_dotnet.dylib
+            ${{ env.working-directory }}/rs_compiled/**/turso_sdk_kit.dll
+            ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.so
+            ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.dylib
 
           retention-days: 1
 

@@ -107,6 +107,7 @@ fn record<const N: usize>(values: [Value; N]) -> Vec<u8> {
         })
         .collect::<Vec<_>>();
     ImmutableRecord::from_values(&values, values.len())
+        .unwrap()
         .get_payload()
         .to_vec()
 }

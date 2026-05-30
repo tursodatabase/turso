@@ -1,12 +1,13 @@
-use crate::sync::Arc;
+use crate::{alloc::TursoVecExt, sync::Arc};
 
+use crate::alloc::*;
 use turso_parser::ast::{self, SortOrder};
 
 use crate::{
     emit_explain,
     schema::{Index, IndexColumn, PseudoCursorType, Schema},
     translate::{
-        collate::{get_collseq_from_expr, CollationSeq},
+        collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         group_by::is_orderby_agg_or_const,
         plan::Aggregate,
     },
@@ -197,13 +198,19 @@ impl EmitOrderBy {
         let has_sequence = (has_group_by && !only_aggs) || use_heap_sort;
 
         let remappings =
-            order_by_deduplicate_result_columns(order_by, result_columns, has_sequence);
+            order_by_deduplicate_result_columns(order_by, result_columns, has_sequence)?;
         let sort_cursor = if use_heap_sort {
             let index_name = format!("heap_sort_{}", program.offset().as_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
-            let mut index_columns = Vec::with_capacity(order_by.len() + result_columns.len());
+            let mut index_columns =
+                Vec::try_with_capacity_ext(order_by.len() + result_columns.len())?;
             for (column, order, _nulls) in order_by {
-                let collation = get_collseq_from_expr(column, referenced_tables)?;
+                let collation = get_collseq_from_expr_with_symbols(
+                    column,
+                    referenced_tables,
+                    Some(t_ctx.resolver.symbol_table),
+                )?;
                 let pos_in_table = index_columns.len();
+                // Have enough space pre-allocatoed to push without realloc
                 index_columns.push(IndexColumn {
                     name: pos_in_table.to_string(),
                     order: *order,
@@ -211,28 +218,28 @@ impl EmitOrderBy {
                     collation,
                     default: None,
                     expr: None,
-                })
+                });
             }
             let pos_in_table = index_columns.len();
             // add sequence number between ORDER BY columns and result column
-            index_columns.push(IndexColumn {
+            index_columns.try_push(IndexColumn {
                 name: pos_in_table.to_string(),
                 order: SortOrder::Asc,
                 pos_in_table,
                 collation: None,
                 default: None,
                 expr: None,
-            });
+            })?;
             for _ in remappings.iter().filter(|r| !r.deduplicated) {
                 let pos_in_table = index_columns.len();
-                index_columns.push(IndexColumn {
+                index_columns.try_push(IndexColumn {
                     name: pos_in_table.to_string(),
                     order: SortOrder::Asc,
                     pos_in_table,
                     collation: None,
                     default: None,
                     expr: None,
-                })
+                })?;
             }
             let index = Arc::new(Index {
                 name: index_name,
@@ -278,10 +285,14 @@ impl EmitOrderBy {
             )> = order_by
                 .iter()
                 .map(|(expr, dir, nulls)| {
-                    let collation = get_collseq_from_expr(expr, referenced_tables)?;
-                    Ok((*dir, collation, *nulls))
+                    let collation = get_collseq_from_expr_with_symbols(
+                        expr,
+                        referenced_tables,
+                        Some(t_ctx.resolver.symbol_table),
+                    )?;
+                    Ok::<_, crate::LimboError>((*dir, collation, *nulls))
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .try_collect::<Result<Vec<_>>>()??;
 
             // Resolve custom type comparators for ORDER BY columns.
             // For types with a `<` operator, the comparator is used for correct sort ordering.
@@ -290,12 +301,12 @@ impl EmitOrderBy {
                 .map(|(expr, _, _)| {
                     custom_type_comparator(expr, referenced_tables, t_ctx.resolver.schema())
                 })
-                .collect();
+                .try_collect()?;
 
             if has_sequence {
                 // sequence column: ascending with BINARY collation, no comparator, no nulls order
                 order_collations_nulls.push((SortOrder::Asc, Some(CollationSeq::default()), None));
-                comparators.push(None);
+                comparators.try_push(None)?;
             }
 
             let key_len = order_collations_nulls.len();
@@ -727,8 +738,9 @@ pub fn order_by_deduplicate_result_columns(
     )],
     result_columns: &[ResultSetColumn],
     has_sequence: bool,
-) -> Vec<OrderByRemapping> {
-    let mut result_column_remapping: Vec<OrderByRemapping> = Vec::new();
+) -> Result<Vec<OrderByRemapping>> {
+    let mut result_column_remapping: Vec<OrderByRemapping> =
+        Vec::try_with_capacity_ext(result_columns.len())?;
     let order_by_len = order_by.len();
     // `sequence_offset` shifts the base index where non-deduped SELECT columns begin,
     // because Sequence sits after ORDER BY keys but before result columns.
@@ -740,6 +752,7 @@ pub fn order_by_deduplicate_result_columns(
             .iter()
             .enumerate()
             .find(|(_, (expr, _, _))| exprs_are_equivalent(expr, &rc.expr));
+        // No need to use `try_push` as we preallocated enough capacity already
         if let Some((j, _)) = found {
             result_column_remapping.push(OrderByRemapping {
                 orderby_sorter_idx: j,
@@ -757,5 +770,5 @@ pub fn order_by_deduplicate_result_columns(
         }
     }
 
-    result_column_remapping
+    Ok(result_column_remapping)
 }

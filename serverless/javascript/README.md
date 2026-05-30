@@ -60,6 +60,14 @@ await conn.batch([
   "INSERT INTO users (email) VALUES ('user@example.com')",
   "INSERT INTO users (email) VALUES ('admin@example.com')",
 ]);
+
+// Parameterized batch statements also work
+await conn.transaction(async () => {
+  await conn.batch([
+    { sql: "INSERT INTO users (email) VALUES (?)", args: ["alice@example.com"] },
+    { sql: "INSERT INTO users (email) VALUES (?)", args: ["bob@example.com"] },
+  ]);
+}).concurrent();
 ```
 
 ### libSQL Compatibility Layer

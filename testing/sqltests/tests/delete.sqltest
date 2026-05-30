@@ -293,3 +293,21 @@ expect {
     2|b
     3|c
 }
+
+# under MVCC, a DELETE that drives its scan through a UNIQUE index must still visit
+# b-tree-resident rows after the un-checkpointed MVCC rows are exhausted.
+@skip-if sqlite "MVCC is not supported in SQLite"
+test mvcc-delete-via-index-removes-checkpointed-rows {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c INTEGER UNIQUE);
+    INSERT INTO t VALUES (1, 400), (2, 500), (3, 600);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    INSERT INTO t VALUES (4, 100), (5, 200);
+    DELETE FROM t WHERE c < 1000;
+    SELECT count(*) FROM t;
+}
+expect {
+    mvcc
+    0|0|0
+    0
+}

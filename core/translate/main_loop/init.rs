@@ -1,12 +1,21 @@
 use super::*;
+use crate::alloc::TursoIteratorExt;
 
-pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<DistinctCtx> {
+pub fn init_distinct(
+    program: &mut ProgramBuilder,
+    plan: &SelectPlan,
+    resolver: &Resolver,
+) -> Result<DistinctCtx> {
     let collations = plan
         .result_columns
         .iter()
         .map(|col| {
-            get_collseq_from_expr(&col.expr, &plan.table_references)
-                .map(|c| c.unwrap_or(CollationSeq::Binary))
+            get_collseq_from_expr_with_symbols(
+                &col.expr,
+                &plan.table_references,
+                Some(resolver.symbol_table),
+            )
+            .map(|c| c.unwrap_or(CollationSeq::Binary))
         })
         .collect::<Result<Vec<_>>>()?;
     let hash_table_id = program.alloc_hash_table_id();
@@ -65,9 +74,12 @@ impl InitLoop {
                 1,
                 "DISTINCT aggregate functions must have exactly one argument"
             );
-            let collations =
-                vec![get_collseq_from_expr(&agg.original_expr, tables)?
-                    .unwrap_or(CollationSeq::Binary)];
+            let collations = vec![get_collseq_from_expr_with_symbols(
+                &agg.original_expr,
+                tables,
+                Some(t_ctx.resolver.symbol_table),
+            )?
+            .unwrap_or(CollationSeq::Binary)];
             let hash_table_id = program.alloc_hash_table_id();
             agg.distinctness = Distinctness::Distinct {
                 ctx: Some(DistinctCtx {
@@ -90,10 +102,10 @@ impl InitLoop {
         let mut required_tables: TableMask = join_order
             .iter()
             .map(|member| member.original_idx)
-            .collect();
+            .try_collect()?;
         for table in tables.joined_tables().iter() {
             if let Operation::HashJoin(hash_join_op) = &table.op {
-                required_tables.set(hash_join_op.build_table_idx);
+                required_tables.set(hash_join_op.build_table_idx)?;
             }
         }
 
@@ -105,7 +117,7 @@ impl InitLoop {
             let schema_cookie = t_ctx
                 .resolver
                 .with_schema(table.database_id, |s| s.schema_version);
-            program.begin_read_on_database(table.database_id, schema_cookie);
+            program.begin_read_on_database(table.database_id, schema_cookie)?;
             // Initialize bookkeeping for OUTER JOIN
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.is_outer() {

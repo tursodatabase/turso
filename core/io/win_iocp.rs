@@ -396,13 +396,6 @@ impl IO for WindowsIOCP {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn drain(&self) -> Result<()> {
-        trace!("I/O drainning..");
-
-        self.instance.drain()
-    }
-
-    #[instrument(err, skip_all, level = Level::TRACE)]
     fn step(&self) -> Result<()> {
         trace!("I/O Step..");
 

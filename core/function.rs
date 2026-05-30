@@ -2,9 +2,20 @@ use crate::sync::Arc;
 use std::fmt;
 use std::fmt::{Debug, Display};
 use strum::IntoEnumIterator;
-use turso_ext::{FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction};
+use turso_ext::{
+    ContextDestructor, FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction,
+    ValueDestructor,
+};
 
 use crate::LimboError;
+
+pub type ContextCollationFunction = unsafe extern "C" fn(
+    context: usize,
+    left_ptr: *const u8,
+    left_len: usize,
+    right_ptr: *const u8,
+    right_len: usize,
+) -> i32;
 
 pub trait Deterministic: std::fmt::Display {
     fn is_deterministic(&self) -> bool;
@@ -15,54 +26,182 @@ pub struct ExternalFunc {
     pub func: ExtFunc,
 }
 
+pub struct ExternalCollation {
+    pub name: String,
+    pub context: usize,
+    pub callback: ContextCollationFunction,
+    pub context_destructor: Option<ContextDestructor>,
+}
+
+impl ExternalCollation {
+    pub fn new(
+        name: String,
+        context: usize,
+        callback: ContextCollationFunction,
+        context_destructor: Option<ContextDestructor>,
+    ) -> Self {
+        Self {
+            name,
+            context,
+            callback,
+            context_destructor,
+        }
+    }
+}
+
+impl Drop for ExternalCollation {
+    fn drop(&mut self) {
+        if let Some(destructor) = self.context_destructor {
+            unsafe { destructor(self.context) };
+        }
+    }
+}
+
+impl Debug for ExternalCollation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExternalCollation")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
 impl Deterministic for ExternalFunc {
     fn is_deterministic(&self) -> bool {
-        // external functions can be whatever so let's just default to false
-        false
+        match self.func {
+            ExtFunc::Scalar { deterministic, .. } => deterministic,
+            _ => false,
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum ExtFunc {
-    Scalar(ScalarFunction),
+    Scalar {
+        context: usize,
+        argc: i32,
+        deterministic: bool,
+        callback: ScalarFunction,
+        context_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    },
     Aggregate {
-        argc: usize,
+        context: usize,
+        argc: i32,
         init: InitAggFunction,
         step: StepFunction,
         finalize: FinalizeFunction,
+        context_destructor: Option<ContextDestructor>,
+        aggregate_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
     },
 }
 
 impl ExtFunc {
-    pub fn agg_args(&self) -> Result<usize, ()> {
+    pub fn agg_args(&self) -> Result<i32, ()> {
         if let ExtFunc::Aggregate { argc, .. } = self {
             return Ok(*argc);
         }
         Err(())
     }
+
+    pub fn matches_arg_count(&self, arg_count: usize) -> bool {
+        match self {
+            Self::Scalar { argc, .. } => *argc < 0 || *argc as usize == arg_count,
+            Self::Aggregate { argc, .. } => *argc < 0 || *argc as usize == arg_count,
+        }
+    }
+
+    pub fn is_aggregate(&self) -> bool {
+        matches!(self, Self::Aggregate { .. })
+    }
+
+    pub fn with_aggregate_arg_count(&self, arg_count: usize) -> Self {
+        match self {
+            Self::Aggregate {
+                context,
+                init,
+                step,
+                finalize,
+                aggregate_destructor,
+                value_destructor,
+                ..
+            } => Self::Aggregate {
+                context: *context,
+                argc: arg_count as i32,
+                init: *init,
+                step: *step,
+                finalize: *finalize,
+                context_destructor: None,
+                aggregate_destructor: *aggregate_destructor,
+                value_destructor: *value_destructor,
+            },
+            _ => self.clone(),
+        }
+    }
 }
 
 impl ExternalFunc {
-    pub fn new_scalar(name: String, func: ScalarFunction) -> Self {
+    pub fn new_scalar(
+        name: String,
+        argc: i32,
+        deterministic: bool,
+        context: usize,
+        callback: ScalarFunction,
+        context_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> Self {
         Self {
             name,
-            func: ExtFunc::Scalar(func),
+            func: ExtFunc::Scalar {
+                context,
+                argc,
+                deterministic,
+                callback,
+                context_destructor,
+                value_destructor,
+            },
         }
     }
 
     pub fn new_aggregate(
         name: String,
         argc: i32,
+        context: usize,
         func: (InitAggFunction, StepFunction, FinalizeFunction),
+        context_destructor: Option<ContextDestructor>,
+        aggregate_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
     ) -> Self {
         Self {
             name,
             func: ExtFunc::Aggregate {
-                argc: argc as usize,
+                context,
+                argc,
                 init: func.0,
                 step: func.1,
                 finalize: func.2,
+                context_destructor,
+                aggregate_destructor,
+                value_destructor,
             },
+        }
+    }
+}
+
+impl Drop for ExternalFunc {
+    fn drop(&mut self) {
+        match self.func {
+            ExtFunc::Scalar {
+                context,
+                context_destructor: Some(context_destructor),
+                ..
+            }
+            | ExtFunc::Aggregate {
+                context,
+                context_destructor: Some(context_destructor),
+                ..
+            } => unsafe { context_destructor(context) },
+            _ => {}
         }
     }
 }
@@ -382,7 +521,10 @@ impl AggFunc {
             Self::JsonGroupArray | Self::JsonbGroupArray => 1,
             #[cfg(feature = "json")]
             Self::JsonGroupObject | Self::JsonbGroupObject => 2,
-            Self::External(func) => func.agg_args().unwrap_or(0),
+            Self::External(func) => func
+                .agg_args()
+                .map(|argc| argc.max(0) as usize)
+                .unwrap_or(0),
         }
     }
 

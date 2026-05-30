@@ -1,10 +1,12 @@
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
-use crate::mvcc::yield_points::YieldInjector;
+use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
+    atomic::{
+        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8, Ordering,
+    },
     Arc, RwLock,
 };
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -19,19 +21,21 @@ use crate::{
     parse_schema_rows,
     progress::{ProgressHandler, ProgressHandlerCallback},
     refresh_analyze_stats, translate,
+    translate::collate::CollationSeq,
     util::IOExt,
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
     BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
     Parser, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
-    Trigger, Value, VirtualTable,
+    Trigger, Value, VirtualTable, WalAutoActions,
 };
 use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
+use std::cmp::Ordering as CmpOrdering;
 use std::fmt::Display;
 use std::ops::Deref;
 #[cfg(feature = "simulator")]
@@ -139,6 +143,18 @@ pub(crate) struct RollbackFrameInfo {
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
 }
 
+struct SchemaReparseGuard {
+    connection: Arc<Connection>,
+}
+
+impl Drop for SchemaReparseGuard {
+    fn drop(&mut self) {
+        self.connection
+            .schema_reparse_in_progress
+            .store(false, Ordering::SeqCst);
+    }
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -163,9 +179,14 @@ pub struct Connection {
     /// page size used for an uninitialized database or the next vacuum command.
     /// it's not always equal to the current page size of the database
     pub(super) page_size: AtomicU16,
-    /// Disable automatic checkpoint behaviour when DB is shutted down or WAL reach certain size
-    /// Client still can manually execute PRAGMA wal_checkpoint(...) commands
-    pub(super) wal_auto_checkpoint_disabled: AtomicBool,
+    /// Allowed automatic WAL maintenance actions for this connection.
+    /// Stored as the `bits()` of a `WalAutoActions`. Default is
+    /// `WalAutoActions::all_enabled()`. `wal_auto_actions_disable` clears
+    /// every bit, opting out of both auto-checkpoint and WAL header
+    /// restart — sync-engine consumers rely on the latter staying disabled
+    /// because rotating the WAL header invalidates their published
+    /// watermarks.
+    pub(super) wal_auto_actions: AtomicU8,
     pub(super) capture_data_changes: RwLock<Option<CaptureDataChangesInfo>>,
     /// CDC v2: transaction ID for grouping CDC records by transaction.
     /// -1 means unset (will be assigned on first CDC write in the transaction).
@@ -177,6 +198,7 @@ pub struct Connection {
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     pub(super) query_only: AtomicBool,
+    pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
     /// SQLite DQS misfeature: when ON (default), unresolved double-quoted identifiers
@@ -186,6 +208,8 @@ pub struct Connection {
     pub(super) full_column_names: AtomicBool,
     /// Deprecated pragma: when ON (default), column refs use just the column name
     pub(super) short_column_names: AtomicBool,
+    /// Per-connection runtime extension loading flag.
+    pub(super) enable_load_extension: AtomicBool,
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
     /// Per-attached-database MVCC transactions.
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
@@ -193,6 +217,8 @@ pub struct Connection {
         RwLock<HashMap<usize, (crate::mvcc::database::TxID, TransactionMode)>>,
     #[cfg(any(test, injected_yields))]
     pub(super) yield_injector: RwLock<Option<Arc<dyn YieldInjector>>>,
+    #[cfg(any(test, injected_yields))]
+    pub(super) failure_injector: RwLock<Option<Arc<dyn FailureInjector>>>,
     #[cfg(any(test, injected_yields))]
     pub(super) yield_instance_id_counter: AtomicU64,
 
@@ -247,6 +273,10 @@ pub struct Connection {
     /// Connection-level named savepoint stack used to mirror savepoint state
     /// onto temp/attached databases that start participating after SAVEPOINT.
     pub(crate) named_savepoints: RwLock<Vec<NamedSavepointFrame>>,
+    /// True while this connection is rebuilding its schema from sqlite_schema.
+    /// Internal helper statements used during reload must not recursively
+    /// trigger another schema reparse on the same connection.
+    pub(crate) schema_reparse_in_progress: AtomicBool,
     /// Generation counter bumped whenever any setting that affects PrepareContext
     /// changes. Allows prepared statements to cheaply detect when they need to be
     /// reprepared (single u64 comparison instead of rebuilding the full context).
@@ -316,6 +346,21 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    fn schema_reparse_guard(self: &Arc<Connection>) -> SchemaReparseGuard {
+        let was_reparsing = self.schema_reparse_in_progress.swap(true, Ordering::SeqCst);
+        turso_assert!(
+            !was_reparsing,
+            "schema reparse must not recurse on the same connection"
+        );
+        SchemaReparseGuard {
+            connection: self.clone(),
+        }
+    }
+
+    pub(crate) fn schema_reparse_in_progress(&self) -> bool {
+        self.schema_reparse_in_progress.load(Ordering::Acquire)
+    }
+
     pub(crate) fn empty_temp_schema(&self) -> Arc<Schema> {
         // with_options only fails if built-in type SQL is malformed (programmer bug).
         let mut schema = Schema::with_options(self.db.experimental_custom_types_enabled())
@@ -329,7 +374,9 @@ impl Connection {
             .with_views(self.db.experimental_views_enabled())
             .with_custom_types(self.db.experimental_custom_types_enabled())
             .with_index_method(self.db.experimental_index_method_enabled())
+            .with_vacuum(self.db.experimental_vacuum_enabled())
             .with_generated_columns(self.db.experimental_generated_columns_enabled())
+            .with_without_rowid(self.db.experimental_without_rowid_enabled())
     }
 
     fn effective_temp_store(&self) -> crate::TempStore {
@@ -372,7 +419,7 @@ impl Connection {
 
         #[cfg(not(target_family = "wasm"))]
         {
-            let temp_dir = tempfile::tempdir().map_err(|e| io_error(e, "tempdir"))?;
+            let temp_dir = self.create_tempdir()?;
             let temp_path = temp_dir.path().join("tursodb-temp.db");
             let temp_path_str = temp_path.to_str().ok_or_else(|| {
                 LimboError::InternalError("temp db path is not valid UTF-8".into())
@@ -624,12 +671,14 @@ impl Connection {
         Ok(true)
     }
 
+    #[turso_macros::trace_stack]
     fn compile_cmd(
         self: &Arc<Connection>,
         cmd: Cmd,
         input: &str,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
         self.maybe_update_schema();
+
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
@@ -650,9 +699,13 @@ impl Connection {
                 // than cloning the original AST, which can overflow the stack
                 // on deeply nested expression trees.
                 drop(syms);
-                let mut parser = Parser::new(input.as_bytes());
-                let Some(cmd) = parser.next_cmd()? else {
-                    return Err(err);
+                let cmd = {
+                    crate::stack::trace_stack!("schema_retry_parse");
+                    let mut parser = Parser::new(input.as_bytes());
+                    let Some(cmd) = parser.next_cmd()? else {
+                        return Err(err);
+                    };
+                    cmd
                 };
                 self.maybe_update_schema();
                 let syms = self.syms.read();
@@ -691,6 +744,7 @@ impl Connection {
         self.prepare_with_origin(sql, StatementOrigin::Root)
     }
 
+    #[turso_macros::trace_stack]
     fn prepare_with_origin(
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
@@ -712,20 +766,24 @@ impl Connection {
         let result = (|| {
             let sql = sql.as_ref();
             tracing::debug!("Preparing: {}", sql);
-            let mut parser = Parser::new(sql.as_bytes());
-            let cmd = match parser.next_cmd()? {
-                Some(cmd) => cmd,
-                None => {
-                    return Err(LimboError::InvalidArgument(
-                        "The supplied SQL string contains no statements".to_string(),
-                    ));
-                }
+            let (cmd, byte_offset_end) = {
+                crate::stack::trace_stack!("parse");
+                let mut parser = Parser::new(sql.as_bytes());
+                let cmd = match parser.next_cmd()? {
+                    Some(cmd) => cmd,
+                    None => {
+                        return Err(LimboError::InvalidArgument(
+                            "The supplied SQL string contains no statements".to_string(),
+                        ));
+                    }
+                };
+                (cmd, parser.offset())
             };
-            let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -747,6 +805,7 @@ impl Connection {
         self.prepare_stmt_with_origin(stmt, StatementOrigin::Root)
     }
 
+    #[turso_macros::trace_stack]
     fn prepare_stmt_with_origin(
         self: &Arc<Connection>,
         stmt: ast::Stmt,
@@ -903,6 +962,8 @@ impl Connection {
     }
 
     pub(crate) fn reparse_schema_with_cookie(self: &Arc<Connection>, cookie: u32) -> Result<()> {
+        let _reparse_guard = self.schema_reparse_guard();
+        self.pager.load().set_schema_cookie(Some(cookie));
         // create fresh schema as some objects can be deleted
         let mut fresh = Schema::with_options(self.experimental_custom_types_enabled())?;
         fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
@@ -1082,6 +1143,7 @@ impl Connection {
     /// Execute will run a query from start to finish taking ownership of I/O because it will run pending I/Os if it didn't finish.
     /// TODO: make this api async
     #[instrument(skip_all, level = Level::INFO)]
+    #[turso_macros::trace_stack]
     pub fn execute(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1094,7 +1156,10 @@ impl Connection {
                 .unwrap()
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input)?;
-            Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+            {
+                crate::stack::trace_stack!("run");
+                Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+            }
         }
         Ok(())
     }
@@ -1251,7 +1316,7 @@ impl Connection {
         if !has_types_table {
             return Ok(Vec::new());
         }
-        let mut type_stmt = self.prepare(format!(
+        let mut type_stmt = self.prepare_internal(format!(
             "SELECT name, sql FROM {}",
             crate::schema::TURSO_TYPES_TABLE_NAME
         ))?;
@@ -1264,14 +1329,60 @@ impl Connection {
     }
 
     pub fn maybe_update_schema(&self) {
-        let current_schema_version = self.schema.read().schema_version;
+        if self.schema_reparse_in_progress() {
+            return;
+        }
+        let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
-        if matches!(self.get_tx_state(), TransactionState::None)
-            && self.get_mv_tx().is_none()
-            && self.next_attached_mv_tx().is_none()
-            && current_schema_version != schema.schema_version
+        // MVCC checkpoint can publish physical btree roots into the shared
+        // schema without changing SQLite's schema cookie. If this connection
+        // still has the older schema snapshot, prepared statements must be
+        // invalidated and recompiled with the published roots.
+        if self.has_no_open_transaction_state()
+            && (current_schema.schema_version != schema.schema_version
+                || self
+                    .has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema))
         {
             *self.schema.write() = schema.clone();
+            self.bump_prepare_context_generation();
+        }
+    }
+
+    fn has_no_open_transaction_state(&self) -> bool {
+        matches!(self.get_tx_state(), TransactionState::None)
+            && self.get_mv_tx().is_none()
+            && self.next_attached_mv_tx().is_none()
+    }
+
+    fn has_mvcc_schema_snapshot_changed_with_same_version(
+        &self,
+        current_schema: &Arc<Schema>,
+        schema: &Arc<Schema>,
+    ) -> bool {
+        self.mvcc_enabled()
+            && current_schema.schema_version == schema.schema_version
+            && !Arc::ptr_eq(current_schema, schema)
+    }
+
+    pub(crate) fn mvcc_schema_requires_reprepare_before_tx(&self) -> bool {
+        if !self.has_no_open_transaction_state() {
+            return false;
+        }
+        let current_schema = self.schema.read().clone();
+        let schema = self.db.schema.lock();
+        self.has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema)
+    }
+
+    pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {
+        let current_schema = self.schema.read().clone();
+        let schema = self.db.schema.lock().clone();
+        if current_schema.schema_version < schema.schema_version
+            || (self.has_no_open_transaction_state()
+                && self
+                    .has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema))
+        {
+            *self.schema.write() = schema;
+            self.bump_prepare_context_generation();
         }
     }
 
@@ -1417,9 +1528,16 @@ impl Connection {
     pub fn wal_insert_begin(&self) -> Result<()> {
         let pager = self.pager.load();
         pager.begin_read_tx()?;
-        pager.io.block(|| pager.begin_write_tx()).inspect_err(|_| {
-            pager.end_read_tx();
-        })?;
+        // Sync-engine drives WAL maintenance explicitly: any auto-restart of
+        // the WAL header here would invalidate the watermarks the caller has
+        // already published (see `wal_changed_pages_after`), so opt out of
+        // every auto action for this write transaction.
+        pager
+            .io
+            .block(|| pager.begin_write_tx(WalAutoActions::empty()))
+            .inspect_err(|_| {
+                pager.end_read_tx();
+            })?;
 
         // start write transaction and disable auto-commit mode as SQL can be executed within WAL session (at caller own risk)
         self.set_tx_state(TransactionState::Write {
@@ -1450,7 +1568,7 @@ impl Connection {
                     .io
                     .block(|| {
                         return_if_io!(pager.commit_dirty_pages(
-                            true,
+                            WalAutoActions::empty(),
                             self.get_sync_mode(),
                             self.get_data_sync_retry(),
                         ));
@@ -1573,21 +1691,29 @@ impl Connection {
             && !is_memory_db
             && should_checkpoint_on_close
         {
-            self.pager.load().checkpoint_shutdown(
-                self.is_wal_auto_checkpoint_disabled(),
-                self.get_sync_mode(),
-            )?;
+            self.pager
+                .load()
+                .checkpoint_shutdown(self.wal_auto_actions(), self.get_sync_mode())?;
         };
         Ok(())
     }
 
-    pub fn wal_auto_checkpoint_disable(&self) {
-        self.wal_auto_checkpoint_disabled
-            .store(true, Ordering::SeqCst);
+    /// Disable every automatic WAL maintenance action for this connection
+    /// (auto-checkpoint AND WAL header restart). Sync-engine consumers call
+    /// this so they own all WAL bookkeeping themselves.
+    pub fn wal_auto_actions_disable(&self) {
+        self.wal_auto_actions
+            .store(WalAutoActions::empty().bits(), Ordering::SeqCst);
     }
 
-    pub fn is_wal_auto_checkpoint_disabled(&self) -> bool {
-        self.wal_auto_checkpoint_disabled.load(Ordering::SeqCst) || self.db.get_mv_store().is_some()
+    /// Returns the set of automatic WAL maintenance actions this connection
+    /// permits. MVCC connections always return an empty set because the
+    /// MVCC checkpoint state machine drives WAL maintenance explicitly.
+    pub fn wal_auto_actions(&self) -> WalAutoActions {
+        if self.db.get_mv_store().is_some() {
+            return WalAutoActions::empty();
+        }
+        WalAutoActions::from_bits_truncate(self.wal_auto_actions.load(Ordering::SeqCst))
     }
 
     #[cfg(feature = "simulator")]
@@ -1697,16 +1823,7 @@ impl Connection {
     }
 
     pub fn get_database_canonical_path(&self) -> String {
-        if self.db.is_in_memory_db() {
-            // For in-memory databases, SQLite shows empty string
-            String::new()
-        } else {
-            // For file databases, try show the full absolute path if that doesn't fail
-            match std::fs::canonicalize(&self.db.path) {
-                Ok(abs_path) => abs_path.to_string_lossy().to_string(),
-                Err(_) => self.db.path.to_string(),
-            }
-        }
+        self.db.get_database_canonical_path()
     }
 
     /// Check if a specific attached database is read only or not, by its index
@@ -1743,6 +1860,15 @@ impl Connection {
 
         self.page_size.store(size.get_raw(), Ordering::SeqCst);
         self.pager.load().set_initial_page_size(size)?;
+        // MvStore caches a copy of the database header in `global_header`, captured from the
+        // pager during bootstrap (before any PRAGMA page_size can run). Propagate the new
+        // page size so subsequent transactions and any header lookups see the same value the
+        // pager will write to disk; otherwise paths like op_open_ephemeral allocate buffers
+        // sized to the connection's page_size but compute usable_space from the stale 4 KiB
+        // global header, tripping the btree_init_page assertion.
+        if let Some(mv_store) = self.db.get_mv_store().as_ref() {
+            mv_store.set_global_page_size(size);
+        }
         self.bump_prepare_context_generation();
 
         Ok(())
@@ -1777,6 +1903,14 @@ impl Connection {
 
     pub fn get_auto_commit(&self) -> bool {
         self.auto_commit.load(Ordering::SeqCst)
+    }
+
+    pub fn set_load_extension_enabled(&self, enabled: bool) {
+        self.enable_load_extension.store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn can_load_extensions(&self) -> bool {
+        self.enable_load_extension.load(Ordering::Acquire)
     }
 
     pub fn reparse_schema_after_extension_load(self: &Arc<Connection>) -> Result<()> {
@@ -1908,8 +2042,20 @@ impl Connection {
         self.db.experimental_attach_enabled()
     }
 
+    pub fn experimental_vacuum_enabled(&self) -> bool {
+        self.db.experimental_vacuum_enabled()
+    }
+
+    pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
+        self.db.experimental_multiprocess_wal_enabled()
+    }
+
     pub fn experimental_generated_columns_enabled(&self) -> bool {
         self.db.experimental_generated_columns_enabled()
+    }
+
+    pub fn experimental_without_rowid_enabled(&self) -> bool {
+        self.db.experimental_without_rowid_enabled()
     }
 
     pub fn mvcc_enabled(&self) -> bool {
@@ -1959,6 +2105,32 @@ impl Connection {
     #[cfg(any(test, injected_yields))]
     pub(crate) fn yield_injector(&self) -> Option<Arc<dyn YieldInjector>> {
         self.yield_injector.read().clone()
+    }
+
+    #[cfg(any(test, injected_yields))]
+    pub fn set_failure_injector(&self, injector: Option<Arc<dyn FailureInjector>>) {
+        let mut slot = self.failure_injector.write();
+        match injector {
+            Some(injector) => {
+                turso_assert!(
+                    slot.is_none(),
+                    "failure injector should be empty before installing a new one"
+                );
+                *slot = Some(injector);
+            }
+            None => {
+                turso_assert!(
+                    slot.is_some(),
+                    "failure injector should be installed before it is cleared"
+                );
+                *slot = None;
+            }
+        }
+    }
+
+    #[cfg(any(test, injected_yields))]
+    pub(crate) fn failure_injector(&self) -> Option<Arc<dyn FailureInjector>> {
+        self.failure_injector.read().clone()
     }
 
     #[cfg(any(test, injected_yields))]
@@ -2337,7 +2509,9 @@ impl Connection {
             .with_views(self.db.experimental_views_enabled())
             .with_custom_types(self.db.experimental_custom_types_enabled())
             .with_index_method(self.db.experimental_index_method_enabled())
-            .with_generated_columns(self.db.experimental_generated_columns_enabled());
+            .with_vacuum(self.db.experimental_vacuum_enabled())
+            .with_generated_columns(self.db.experimental_generated_columns_enabled())
+            .with_without_rowid(self.db.experimental_without_rowid_enabled());
         // Select the IO layer for the attached database:
         // - :memory: databases always get a fresh MemoryIO
         // - File-based databases reuse the parent's IO when the parent is also
@@ -2630,6 +2804,14 @@ impl Connection {
         self.bump_prepare_context_generation();
     }
 
+    pub fn set_vdbe_trace(&self, value: bool) {
+        self.vdbe_trace.store(value, Ordering::SeqCst);
+    }
+
+    pub fn get_vdbe_trace(&self) -> bool {
+        self.vdbe_trace.load(Ordering::SeqCst)
+    }
+
     pub fn get_dml_require_where(&self) -> bool {
         self.dml_require_where.load(Ordering::SeqCst)
     }
@@ -2687,6 +2869,24 @@ impl Connection {
         self.bump_prepare_context_generation();
     }
 
+    /// Create a `TempDir` honoring `TURSO_TMPDIR` and `SQLITE_TMPDIR`,
+    /// falling back to the OS default (`env::temp_dir()`).
+    ///
+    /// `&self` is reserved for a future per-connection
+    /// `temp_store_directory` setting (e.g. `PRAGMA temp_store_directory`)
+    /// so call sites don't need to change when that lands.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn create_tempdir(&self) -> Result<TempDir> {
+        let res = if let Some(d) = std::env::var_os("TURSO_TMPDIR") {
+            tempfile::tempdir_in(d)
+        } else if let Some(d) = std::env::var_os("SQLITE_TMPDIR") {
+            tempfile::tempdir_in(d)
+        } else {
+            tempfile::tempdir()
+        };
+        res.map_err(|e| io_error(e, "tempdir"))
+    }
+
     pub fn get_data_sync_retry(&self) -> bool {
         self.data_sync_retry
             .load(crate::sync::atomic::Ordering::SeqCst)
@@ -2713,21 +2913,123 @@ impl Connection {
         self.syms.read().vtab_modules.keys().cloned().collect()
     }
 
-    /// Returns external (extension) functions: (name, is_aggregate, argc)
-    pub fn get_syms_functions(&self) -> Vec<(String, bool, i32)> {
+    /// Returns external (extension) functions: (name, is_aggregate, argc, deterministic)
+    pub fn get_syms_functions(&self) -> Vec<(String, bool, i32, bool)> {
         self.syms
             .read()
             .functions
             .values()
             .map(|f| {
-                let is_agg = matches!(f.func, function::ExtFunc::Aggregate { .. });
+                let is_agg = f.func.is_aggregate();
                 let argc = match &f.func {
-                    function::ExtFunc::Aggregate { argc, .. } => *argc as i32,
-                    function::ExtFunc::Scalar(_) => -1,
+                    function::ExtFunc::Aggregate { argc, .. } => *argc,
+                    function::ExtFunc::Scalar { argc, .. } => *argc,
                 };
-                (f.name.clone(), is_agg, argc)
+                (
+                    f.name.clone(),
+                    is_agg,
+                    argc,
+                    function::Deterministic::is_deterministic(f.as_ref()),
+                )
             })
             .collect()
+    }
+
+    pub fn register_external_collation(
+        &self,
+        name: String,
+        context: usize,
+        callback: crate::ContextCollationFunction,
+        context_destructor: Option<crate::ContextDestructor>,
+    ) {
+        let collation = CollationSeq::custom(&name);
+        let normalized_name = crate::util::normalize_ident(&name);
+        self.syms.write().collations.insert(
+            collation.id(),
+            Arc::new(function::ExternalCollation::new(
+                normalized_name,
+                context,
+                callback,
+                context_destructor,
+            )),
+        );
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn unregister_external_collation(&self, name: &str) {
+        if let Some(collation) = CollationSeq::known_custom(name) {
+            if self
+                .syms
+                .write()
+                .collations
+                .remove(&collation.id())
+                .is_some()
+            {
+                self.bump_prepare_context_generation();
+            }
+        }
+    }
+
+    pub(crate) fn get_external_collation(
+        &self,
+        collation: CollationSeq,
+    ) -> Result<Arc<function::ExternalCollation>> {
+        self.syms
+            .read()
+            .collations
+            .get(&collation.id())
+            .cloned()
+            .ok_or_else(|| {
+                LimboError::ParseError(format!("no such collation sequence: {}", collation.name()))
+            })
+    }
+
+    pub(crate) fn custom_collation_compare(
+        external: &function::ExternalCollation,
+        left: &str,
+        right: &str,
+    ) -> CmpOrdering {
+        let result = unsafe {
+            (external.callback)(
+                external.context,
+                left.as_ptr(),
+                left.len(),
+                right.as_ptr(),
+                right.len(),
+            )
+        };
+        result.cmp(&0)
+    }
+
+    pub(crate) fn external_collation_comparator(
+        external: Arc<function::ExternalCollation>,
+    ) -> crate::vdbe::sorter::SortComparator {
+        Arc::new(move |left, right| {
+            Ok(match (left, right) {
+                (crate::ValueRef::Text(left), crate::ValueRef::Text(right)) => {
+                    Self::custom_collation_compare(&external, left.as_str(), right.as_str())
+                }
+                _ => left.partial_cmp(right).unwrap_or(CmpOrdering::Equal),
+            })
+        })
+    }
+
+    pub(crate) fn make_collation_comparator(
+        &self,
+        collation: CollationSeq,
+    ) -> Result<crate::vdbe::sorter::SortComparator> {
+        let external = self.get_external_collation(collation)?;
+        Ok(Self::external_collation_comparator(external))
+    }
+
+    pub(crate) fn compare_external_collation(
+        &self,
+        collation: CollationSeq,
+        left: &str,
+        right: &str,
+    ) -> Result<CmpOrdering> {
+        let external = self.get_external_collation(collation)?;
+        Ok(Self::custom_collation_compare(&external, left, right))
     }
 
     pub(crate) fn database_ptr(&self) -> usize {
@@ -3097,6 +3399,39 @@ impl Connection {
         self.set_tx_state(TransactionState::None);
     }
 
+    /// Roll back transaction state for helpers that start a manual `BEGIN`
+    /// outside the normal Transaction opcode path.
+    ///
+    /// Unlike `rollback_current_txn_state`, this tolerates the attached-only
+    /// case where the connection flipped `auto_commit` off but never opened a
+    /// main-db read transaction.
+    pub(crate) fn rollback_manual_txn_cleanup(
+        &self,
+        pager: &Arc<Pager>,
+        clear_attached_schemas: bool,
+    ) {
+        let main_has_implicit_state = self.get_tx_state() != TransactionState::None
+            || self.get_mv_tx().is_some()
+            || pager.holds_read_lock()
+            || pager.holds_write_lock();
+
+        if main_has_implicit_state {
+            self.rollback_current_txn_state(pager, clear_attached_schemas);
+        } else {
+            if self.next_attached_mv_tx().is_some() {
+                self.rollback_attached_mvcc_txs(clear_attached_schemas);
+            }
+            self.rollback_attached_wal_txns();
+            self.set_tx_state(TransactionState::None);
+            self.auto_commit.store(true, Ordering::SeqCst);
+        }
+
+        self.rollback_temp_schema();
+        self.set_cdc_transaction_id(-1);
+        self.clear_named_savepoints();
+        self.clear_deferred_foreign_key_violations();
+    }
+
     /// Iterate over all attached MVCC transactions, calling `f(db_id, tx_id)` for each.
     pub(crate) fn for_each_attached_mv_tx(&self, mut f: impl FnMut(usize, u64)) {
         let txs = self.attached_mv_txs.read();
@@ -3160,6 +3495,7 @@ pub type StepResult = vdbe::StepResult;
 #[derive(Default)]
 pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
+    pub collations: HashMap<u32, Arc<function::ExternalCollation>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
     pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
     pub index_methods: HashMap<String, Arc<dyn IndexMethod>>,
@@ -3169,6 +3505,7 @@ impl std::fmt::Debug for SymbolTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SymbolTable")
             .field("functions", &self.functions)
+            .field("collations", &self.collations)
             .finish()
     }
 }
@@ -3199,6 +3536,7 @@ impl SymbolTable {
     pub fn new() -> Self {
         Self {
             functions: HashMap::default(),
+            collations: HashMap::default(),
             vtabs: HashMap::default(),
             vtab_modules: HashMap::default(),
             index_methods: HashMap::default(),
@@ -3207,14 +3545,32 @@ impl SymbolTable {
     pub fn resolve_function(
         &self,
         name: &str,
-        _arg_count: usize,
+        arg_count: usize,
     ) -> Option<Arc<function::ExternalFunc>> {
-        self.functions.get(name).cloned()
+        self.functions
+            .get(name)
+            .cloned()
+            .or_else(|| {
+                self.functions
+                    .get(&crate::util::normalize_ident(name))
+                    .cloned()
+            })
+            .filter(|func| func.func.matches_arg_count(arg_count))
+    }
+
+    pub fn resolve_collation(&self, name: &str) -> Option<CollationSeq> {
+        let collation = CollationSeq::known_custom(name)?;
+        self.collations
+            .contains_key(&collation.id())
+            .then_some(collation)
     }
 
     pub fn extend(&mut self, other: &SymbolTable) {
         for (name, func) in &other.functions {
             self.functions.insert(name.clone(), func.clone());
+        }
+        for (id, collation) in &other.collations {
+            self.collations.insert(*id, collation.clone());
         }
         for (name, vtab) in &other.vtabs {
             self.vtabs.insert(name.clone(), vtab.clone());

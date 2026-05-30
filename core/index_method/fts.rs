@@ -703,7 +703,8 @@ impl HybridBTreeDirectory {
                 Value::Blob(vec![]),
             ],
             Self::CHUNK_LEN,
-        );
+        )
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Blocking seek to first chunk
         loop {
@@ -1994,7 +1995,7 @@ impl FtsCursor {
                             Value::Blob(vec![]),
                         ],
                         3,
-                    );
+                    )?;
 
                     let seek_result =
                         return_if_io!(cursor
@@ -2179,7 +2180,7 @@ impl FtsCursor {
                             Value::Blob(chunk_data.to_vec()),
                         ],
                         3,
-                    );
+                    )?;
 
                     // Seek to find the correct position using GE (not eq_only)
                     // This positions the cursor at or after where the record should be inserted
@@ -2264,7 +2265,7 @@ impl FtsCursor {
                             Value::Blob(vec![]),
                         ],
                         3,
-                    );
+                    )?;
 
                     let _result =
                         return_if_io!(cursor
@@ -2711,7 +2712,7 @@ impl IndexMethodCursor for FtsCursor {
                         );
 
                         // Create HybridBTreeDirectory with catalog and pre-assembled hot files
-                        let pager = conn.pager.load().clone();
+                        let pager = conn.get_pager_from_database_index(&database_id)?;
                         let root_page = self.btree_root_page.ok_or_else(|| {
                             LimboError::InternalError("btree_root_page not set".into())
                         })?;

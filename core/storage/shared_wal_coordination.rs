@@ -2987,7 +2987,7 @@ mod tests {
             let waited = unsafe { libc::waitpid(child, &mut status, 0) };
             assert_eq!(waited, child, "waitpid failed");
             assert!(libc::WIFEXITED(status), "child did not exit cleanly");
-            return child as u32;
+            child as u32
         }
 
         #[cfg(windows)]
@@ -3349,6 +3349,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "lifetime-lock probe assumes shared lifetime lock; Windows uses process-scoped locks"
+    )]
     fn mapped_shared_wal_coordination_last_process_probe_reacquires_shared_lifetime_lock() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coordination.tshm");

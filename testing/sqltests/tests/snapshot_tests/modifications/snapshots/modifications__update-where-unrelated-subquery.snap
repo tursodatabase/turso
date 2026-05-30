@@ -1,0 +1,61 @@
+---
+source: modifications.sqltest
+expression: |-
+  UPDATE products
+      SET quantity = quantity + 1
+      WHERE EXISTS (
+          SELECT 1
+          FROM users
+          WHERE users.id = products.id
+      );
+info:
+  statement_type: UPDATE
+  tables:
+  - products
+  - users
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN products
+`--SEARCH users USING INTEGER PRIMARY KEY (rowid=?)
+
+BYTECODE
+addr  opcode           p1  p2  p3  p4                 p5  comment
+   0    Init            0  33   0                      0  Start at 33
+   1    OpenEphemeral   0   1   0                      0  cursor=0 is_table=true
+   2    OpenRead        1   2   0  k(5,B,B,B,B,B)      0  table=products, root=2, iDb=0
+   3    Rewind          1  16   0                      0  Rewind table products
+   4      BeginSubrtn   3   0   0                      0  r[3]=NULL
+   5      Integer       0   1   0                      0  r[1]=0
+   6      OpenRead      2   3   0  k(4,B,B,B,B)        0  table=users, root=3, iDb=0
+   7      RowId         1   5   0                      0  r[5]=products.rowid
+   8      SeekRowid     2   5  10                      0  if (r[5]!=cursor 2 for table users.rowid) goto 10
+   9      Integer       1   1   0                      0  r[1]=1
+  10    Return          3   0   1                      0
+  11    IfNot           1  15   1                      0  if !r[1] goto 15
+  12    RowId           1   2   0                      0  r[2]=products.rowid
+  13    MakeRecord      2   1   6                      0  r[6]=mkrec(r[2..2]); for ephemeral_scratch
+  14    Insert          0   6   2  ephemeral_scratch   6  intkey=r[2] data=r[6]
+  15  Next              1   4   0                      0
+  16  OpenWrite         1   2   0                      0  root=2; iDb=0
+  17  Rewind            0  32   0                      0  Rewind table ephemeral(ephemeral_scratch)
+  18    RowId           0   7   0                      0  r[7]=ephemeral(ephemeral_scratch).rowid
+  19    NotExists       1  31   7                      0
+  20    Null            0   8   0                      0  r[8]=NULL
+  21    Column          1   1   9                      0  r[9]=products.name
+  22    Column          1   2  10                      0  r[10]=products.price
+  23    Column          1   3  13  0                   0  r[13]=products.quantity
+  24    Add            13  14  11                      0  r[11]=r[13]+r[14]
+  25    Column          1   4  12                      0  r[12]=products.category
+  26    Affinity        8   5   0                      0  r[8..13] = D, B, E, D, B
+  27    MakeRecord      8   5  15                      0  r[15]=mkrec(r[8..12])
+  28    NotExists       1  31   7                      0
+  29    Delete          1   0   0  products            0
+  30    Insert          1  15   7  products           11  intkey=r[7] data=r[15]
+  31  Next              0  18   0                      0
+  32  Halt              0   0   0                      0
+  33  Transaction       0   2  10                      0  iDb=0 tx_mode=Write
+  34  Integer           1  14   0                      0  r[14]=1
+  35  Goto              0   1   0                      0

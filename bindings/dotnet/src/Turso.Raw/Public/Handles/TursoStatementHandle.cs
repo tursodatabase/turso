@@ -6,7 +6,12 @@ public class TursoStatementHandle() : SafeHandle(IntPtr.Zero, true)
 {
     protected override bool ReleaseHandle()
     {
-        TursoInterop.FreeStatement(handle);
+        _ = TursoInterop.StatementFinalize(handle, out var errorPtr);
+        if (errorPtr != IntPtr.Zero)
+            TursoInterop.FreeString(errorPtr);
+
+        TursoInterop.StatementDeinit(handle);
+        handle = IntPtr.Zero;
         return true;
     }
 

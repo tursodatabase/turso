@@ -90,6 +90,7 @@ cat > src/SUMMARY.md << 'EOF'
 - [ATTACH DATABASE](statements/attach-database.md)
 - [DETACH DATABASE](statements/detach-database.md)
 - [ANALYZE](statements/analyze.md)
+- [VACUUM](statements/vacuum.md)
 - [EXPLAIN](statements/explain.md)
 
 # Functions

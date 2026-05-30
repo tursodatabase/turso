@@ -30,7 +30,7 @@ test('remote write: exec insert and read back', async () => {
     const db = await connect(remoteWriteOpts());
     await db.exec("INSERT INTO rw_exec VALUES (1, 'hello')");
 
-    const rows = await db.prepare("SELECT * FROM rw_exec").all();
+    const rows = await (await db.prepare("SELECT * FROM rw_exec")).all();
     expect(rows).toEqual([{ id: 1, value: 'hello' }]);
     await db.close();
 })
@@ -44,10 +44,10 @@ test('remote write: prepared statement write', async () => {
 
     const db = await connect(remoteWriteOpts());
     for (let i = 1; i <= 5; i++) {
-        await db.prepare("INSERT INTO rw_prepared(x) VALUES (?)").run([i * 10]);
+        await (await db.prepare("INSERT INTO rw_prepared(x) VALUES (?)")).run([i * 10]);
     }
 
-    const rows = await db.prepare("SELECT x FROM rw_prepared ORDER BY x").all();
+    const rows = await (await db.prepare("SELECT x FROM rw_prepared ORDER BY x")).all();
     expect(rows).toEqual([{ x: 10 }, { x: 20 }, { x: 30 }, { x: 40 }, { x: 50 }]);
     await db.close();
 })
@@ -61,7 +61,7 @@ test('remote write: reads stay local', async () => {
     await seed.close();
 
     const db = await connect(remoteWriteOpts());
-    const rows = await db.prepare("SELECT * FROM rw_read").all();
+    const rows = await (await db.prepare("SELECT * FROM rw_read")).all();
     expect(rows).toEqual([{ id: 1, value: 'local' }]);
     await db.close();
 })
@@ -75,13 +75,13 @@ test('remote write: transaction commit', async () => {
 
     const db = await connect(remoteWriteOpts());
     const txn = db.transaction(async () => {
-        await db.prepare("INSERT INTO rw_txn(value) VALUES (?)").run([1]);
-        await db.prepare("INSERT INTO rw_txn(value) VALUES (?)").run([2]);
-        await db.prepare("INSERT INTO rw_txn(value) VALUES (?)").run([3]);
+        await (await db.prepare("INSERT INTO rw_txn(value) VALUES (?)")).run([1]);
+        await (await db.prepare("INSERT INTO rw_txn(value) VALUES (?)")).run([2]);
+        await (await db.prepare("INSERT INTO rw_txn(value) VALUES (?)")).run([3]);
     });
     await txn();
 
-    const rows = await db.prepare("SELECT value FROM rw_txn ORDER BY value").all();
+    const rows = await (await db.prepare("SELECT value FROM rw_txn ORDER BY value")).all();
     expect(rows).toEqual([{ value: 1 }, { value: 2 }, { value: 3 }]);
     await db.close();
 })
@@ -96,12 +96,12 @@ test('remote write: transaction rollback on error', async () => {
 
     const db = await connect(remoteWriteOpts());
     const txn = db.transaction(async () => {
-        await db.prepare("INSERT INTO rw_rollback(value) VALUES (?)").run([200]);
+        await (await db.prepare("INSERT INTO rw_rollback(value) VALUES (?)")).run([200]);
         throw new Error("deliberate rollback");
     });
     await expect(txn()).rejects.toThrow("deliberate rollback");
 
-    const rows = await db.prepare("SELECT value FROM rw_rollback ORDER BY value").all();
+    const rows = await (await db.prepare("SELECT value FROM rw_rollback ORDER BY value")).all();
     expect(rows).toEqual([{ value: 100 }]);
     await db.close();
 })
@@ -119,7 +119,7 @@ test('remote write: exec with BEGIN/COMMIT', async () => {
     await db.exec("INSERT INTO rw_exec_txn VALUES (2, 'b')");
     await db.exec("COMMIT");
 
-    const rows = await db.prepare("SELECT value FROM rw_exec_txn ORDER BY id").all();
+    const rows = await (await db.prepare("SELECT value FROM rw_exec_txn ORDER BY id")).all();
     expect(rows).toEqual([{ value: 'a' }, { value: 'b' }]);
     await db.close();
 })
@@ -137,7 +137,7 @@ test('remote write: second client sees writes after pull', async () => {
     // second client pulls and should see the remote write
     const db2 = await connect(localSyncedDbOpts());
 
-    const rows = await db2.prepare("SELECT * FROM rw_visible").all();
+    const rows = await (await db2.prepare("SELECT * FROM rw_visible")).all();
     expect(rows).toEqual([{ id: 1, value: 'from-remote-write' }]);
 
     await db1.close();
@@ -155,11 +155,11 @@ test('remote write: update and delete', async () => {
     const db = await connect(remoteWriteOpts());
     await db.exec("UPDATE rw_update SET value = 'updated' WHERE id = 1");
 
-    let rows = await db.prepare("SELECT value FROM rw_update WHERE id = 1").all();
+    let rows = await (await db.prepare("SELECT value FROM rw_update WHERE id = 1")).all();
     expect(rows).toEqual([{ value: 'updated' }]);
 
     await db.exec("DELETE FROM rw_update WHERE id = 1");
-    rows = await db.prepare("SELECT COUNT(*) as cnt FROM rw_update").all();
+    rows = await (await db.prepare("SELECT COUNT(*) as cnt FROM rw_update")).all();
     expect(rows).toEqual([{ cnt: 0 }]);
     await db.close();
 })
@@ -183,12 +183,12 @@ test('remote write: unique conflict rejected at write time', async () => {
     ).rejects.toThrow(/UNIQUE constraint failed/);
 
     // both clients see exactly the same single row
-    const rows1 = await db1.prepare("SELECT key, value FROM rw_conflict").all();
-    const rows2 = await db2.prepare("SELECT key, value FROM rw_conflict").all();
+    const rows1 = await (await db1.prepare("SELECT key, value FROM rw_conflict")).all();
+    const rows2 = await (await db2.prepare("SELECT key, value FROM rw_conflict")).all();
     expect(rows1).toEqual([{ key: 'a', value: 'taken' }]);
     expect(rows2).toEqual([]);
     await db2.pull();
-    const rows3 = await db2.prepare("SELECT key, value FROM rw_conflict").all();
+    const rows3 = await (await db2.prepare("SELECT key, value FROM rw_conflict")).all();
     expect(rows3).toEqual([{ key: 'a', value: 'taken' }]);
 
     await db1.close();
@@ -205,12 +205,12 @@ test('remote write: DDL create table and use it', async () => {
     await db.exec("CREATE TABLE rw_ddl(id INTEGER PRIMARY KEY, name TEXT)");
     await db.exec("INSERT INTO rw_ddl(name) VALUES ('after-create')");
 
-    const rows = await db.prepare("SELECT name FROM rw_ddl").all();
+    const rows = await (await db.prepare("SELECT name FROM rw_ddl")).all();
     expect(rows).toEqual([{ name: 'after-create' }]);
 
     // second client should see the new table
     const db2 = await connect(localSyncedDbOpts());
-    const rows2 = await db2.prepare("SELECT name FROM rw_ddl").all();
+    const rows2 = await (await db2.prepare("SELECT name FROM rw_ddl")).all();
     expect(rows2).toEqual([{ name: 'after-create' }]);
 
     await db.close();
@@ -229,7 +229,7 @@ test('remote write: DDL alter table adds column', async () => {
     await db.exec("ALTER TABLE rw_alter ADD COLUMN b TEXT DEFAULT 'default_b'");
     await db.exec("INSERT INTO rw_alter(a, b) VALUES ('after', 'new_b')");
 
-    const rows = await db.prepare("SELECT a, b FROM rw_alter ORDER BY a").all();
+    const rows = await (await db.prepare("SELECT a, b FROM rw_alter ORDER BY a")).all();
     expect(rows).toEqual([
         { a: 'after', b: 'new_b' },
         { a: 'before', b: 'default_b' },
@@ -246,7 +246,7 @@ test('remote write: DDL drop table', async () => {
     const db = await connect(remoteWriteOpts());
     await db.exec("DROP TABLE rw_drop");
 
-    await expect(() => db.prepare("SELECT * FROM rw_drop")).toThrow(/no such table/);
+    await expect(async () => await db.prepare("SELECT * FROM rw_drop")).rejects.toThrow(/no such table/);
     await db.close();
 })
 
@@ -261,7 +261,7 @@ test('remote write: DDL create index', async () => {
     await db.exec("CREATE INDEX IF NOT EXISTS idx_rw_value ON rw_idx(value)");
     await db.exec("INSERT INTO rw_idx(value) VALUES ('indexed')");
 
-    const rows = await db.prepare("SELECT value FROM rw_idx").all();
+    const rows = await (await db.prepare("SELECT value FROM rw_idx")).all();
     expect(rows).toEqual([{ value: 'indexed' }]);
     await db.close();
 })
@@ -276,7 +276,7 @@ test('remote write: read-only transaction goes remote, not local', async () => {
 
     // db1 connects with remote writes — local replica has 'original'
     const db1 = await connect(remoteWriteOpts());
-    const localRows = await db1.prepare("SELECT value FROM rw_read_txn").all();
+    const localRows = await (await db1.prepare("SELECT value FROM rw_read_txn")).all();
     expect(localRows).toEqual([{ value: 'original' }]);
 
     // another client updates the remote behind db1's back
@@ -286,12 +286,12 @@ test('remote write: read-only transaction goes remote, not local', async () => {
     await db2.close();
 
     // db1's local replica is stale — outside a txn, reads are local
-    const staleRows = await db1.prepare("SELECT value FROM rw_read_txn").all();
+    const staleRows = await (await db1.prepare("SELECT value FROM rw_read_txn")).all();
     expect(staleRows).toEqual([{ value: 'original' }]);
 
     // inside a transaction, reads should go remote and see 'updated'
     await db1.exec("BEGIN");
-    const txnRows = await db1.prepare("SELECT value FROM rw_read_txn").all();
+    const txnRows = await (await db1.prepare("SELECT value FROM rw_read_txn")).all();
     expect(txnRows[0]).toMatchObject({ value: 'updated' });
     await db1.exec("COMMIT");
 
@@ -306,15 +306,15 @@ test('remote write: insert returning', async () => {
     await seed.close();
 
     const db = await connect(remoteWriteOpts());
-    const rows = await db.prepare("INSERT INTO rw_returning(value) VALUES (?) RETURNING id, value").all(['hello']);
+    const rows = await (await db.prepare("INSERT INTO rw_returning(value) VALUES (?) RETURNING id, value")).all(['hello']);
     expect(rows).toMatchObject([{ id: 1, value: 'hello' }]);
 
-    expect(await db.prepare("SELECT * FROM rw_returning").all()).toMatchObject([{ id: 1, value: 'hello' }]);
+    expect(await (await db.prepare("SELECT * FROM rw_returning")).all()).toMatchObject([{ id: 1, value: 'hello' }]);
 
-    const rows2 = await db.prepare("INSERT INTO rw_returning(value) VALUES (?) RETURNING id, value").all(['world']);
+    const rows2 = await (await db.prepare("INSERT INTO rw_returning(value) VALUES (?) RETURNING id, value")).all(['world']);
     expect(rows2).toMatchObject([{ id: 2, value: 'world' }]);
 
-    expect(await db.prepare("SELECT * FROM rw_returning").all()).toMatchObject([
+    expect(await (await db.prepare("SELECT * FROM rw_returning")).all()).toMatchObject([
         { id: 1, value: 'hello' },
         { id: 2, value: 'world' },
     ]);
@@ -331,9 +331,9 @@ test('remote write: blob round-trip', async () => {
 
     const db = await connect(remoteWriteOpts());
     const blob = Buffer.from([0x00, 0x01, 0x02, 0xff, 0xfe, 0xfd]);
-    await db.prepare("INSERT INTO rw_blob(data) VALUES (?)").run([blob]);
+    await (await db.prepare("INSERT INTO rw_blob(data) VALUES (?)")).run([blob]);
 
-    const rows = await db.prepare("SELECT data FROM rw_blob").all();
+    const rows = await (await db.prepare("SELECT data FROM rw_blob")).all();
     expect(Buffer.from(rows[0].data)).toEqual(blob);
     await db.close();
 })

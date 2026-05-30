@@ -25,7 +25,10 @@ use crate::{
     emit_explain,
     schema::{Index, IndexColumn, Table},
     translate::{
-        collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
+        collate::{
+            get_collseq_from_expr_with_symbols, resolve_comparison_collseq_with_symbols,
+            CollationSeq,
+        },
         emitter::{prepare_cdc_if_necessary, HashCtx},
         expr::comparison_affinity,
         planner::{table_mask_from_expr, TableMask},

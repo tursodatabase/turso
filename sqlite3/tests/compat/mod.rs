@@ -271,6 +271,90 @@ mod tests {
         }
     }
 
+    // Per SQLite spec (https://www.sqlite.org/c3ref/prepare.html):
+    //   "If nByte is positive, it is the number of bytes read from zSql."
+    // Consumers like rusqlite/libsqlite3-sys pass non-NUL-terminated &str slices with
+    // explicit positive nByte. The three tests below cover the contract:
+    //   - positive nByte respects the bound (no over-read past the slice)
+    //   - negative nByte keeps the read-until-NUL behavior
+    //   - NUL within the bound truncates (per spec)
+    // Each test actively sets up the failure mode (garbage bytes after the bound, or
+    // a "should-not-be-seen" suffix after an embedded NUL) so an over-reading impl
+    // would produce a parser error rather than silently passing.
+
+    #[test]
+    fn test_prepare_v2_n_byte_positive_no_nul() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            // 8 bytes of valid SQL followed by 4 bytes of garbage. n_byte = 8.
+            // An over-reading impl would walk past the bound, hit \xff, and error.
+            let sql_and_garbage: &[u8] = b"SELECT 1\xff\xff\xff\xff";
+            let mut stmt = ptr::null_mut();
+            let rc = sqlite3_prepare_v2(
+                db,
+                sql_and_garbage.as_ptr() as *const libc::c_char,
+                8,
+                &mut stmt,
+                ptr::null_mut(),
+            );
+            assert_eq!(
+                rc, SQLITE_OK,
+                "prepare_v2 must respect positive n_byte (no over-read)"
+            );
+            assert!(!stmt.is_null());
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_prepare_v2_n_byte_negative_uses_nul() {
+        // Regression: n_byte = -1 path must still read until NUL terminator.
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            let rc = sqlite3_prepare_v2(db, c"SELECT 1".as_ptr(), -1, &mut stmt, ptr::null_mut());
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_prepare_v2_n_byte_truncates_at_embedded_nul() {
+        // Spec: "the SQL text is read up to the first zero terminator or the nByte-th
+        // byte, whichever comes first." Embedded NUL within the bound must truncate.
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            // NUL at offset 8; bound is 20 (claims more). Reader must stop at NUL.
+            // If under-truncating, parser sees "GARBAGE_AFTER_NUL" and errors out.
+            let sql: &[u8] = b"SELECT 1\x00GARBAGE_AFTER_NUL";
+            let mut stmt = ptr::null_mut();
+            let rc = sqlite3_prepare_v2(
+                db,
+                sql.as_ptr() as *const libc::c_char,
+                20,
+                &mut stmt,
+                ptr::null_mut(),
+            );
+            assert_eq!(
+                rc, SQLITE_OK,
+                "embedded NUL within bound must truncate, not over-read"
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
     #[test]
     fn test_sqlite3_bind_int() {
         unsafe {

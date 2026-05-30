@@ -342,7 +342,10 @@ pub fn emit_fk_child_decrement_on_delete(
                 dst_reg: tmpi,
                 extra_amount: 0,
             });
-            program.emit_insn(Insn::MustBeInt { reg: tmpi });
+            program.emit_insn(Insn::MustBeInt {
+                reg: tmpi,
+                target_pc: None,
+            });
 
             // NotExists jumps when the parent key is missing, so we decrement there
             let missing = program.allocate_label();

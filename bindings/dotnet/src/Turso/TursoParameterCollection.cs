@@ -8,7 +8,7 @@ public class TursoParameterCollection : DbParameterCollection
     private readonly List<TursoParameter> _parameters = new();
     public override int Count => _parameters.Count;
 
-    public override object SyncRoot => throw new NotImplementedException();
+    public override object SyncRoot => ((ICollection)_parameters).SyncRoot;
 
     public override int Add(object value)
     {
@@ -16,12 +16,13 @@ public class TursoParameterCollection : DbParameterCollection
         return _parameters.Count - 1;
     }
 
-    public int AddWithValue(string parameterName, object value)
+    public TursoParameter AddWithValue(string parameterName, object value)
     {
-        _parameters.Add(new TursoParameter(parameterName, value));
-        return _parameters.Count - 1;
+        var parameter = new TursoParameter(parameterName, value);
+        _parameters.Add(parameter);
+        return parameter;
     }
-    
+
     public override void AddRange(Array values)
     {
         for (var i = 0; i < values.Length; i++)
@@ -49,7 +50,9 @@ public class TursoParameterCollection : DbParameterCollection
 
     public override void CopyTo(Array array, int index)
     {
-        _parameters.CopyTo((TursoParameter[])array, index);
+        ArgumentNullException.ThrowIfNull(array);
+        for (var i = 0; i < _parameters.Count; i++)
+            array.SetValue(_parameters[i], index + i);
     }
 
     public override IEnumerator GetEnumerator()

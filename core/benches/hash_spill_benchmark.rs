@@ -30,7 +30,7 @@ fn create_hash_table(mem_budget: usize) -> HashTable {
         track_matched: false,
         partition_count: None,
     };
-    HashTable::new(config, io)
+    HashTable::new(config, io).unwrap()
 }
 
 /// Insert entries with integer keys and no payload
@@ -159,17 +159,21 @@ fn bench_build_and_probe(c: &mut Criterion) {
                     for i in 0..count {
                         let key = vec![Value::Numeric(Numeric::Integer(i as i64))];
                         if ht.has_spilled() {
-                            let partition_idx = ht.partition_for_keys(&key);
+                            let partition_idx = ht.partition_for_keys(&key).unwrap();
                             if !ht.is_partition_loaded(partition_idx) {
                                 while let Ok(IOResult::IO(_)) =
                                     ht.load_spilled_partition(partition_idx, None)
                                 {
                                 }
                             }
-                            if ht.probe_partition(partition_idx, &key, None).is_some() {
+                            if ht
+                                .probe_partition(partition_idx, &key, None)
+                                .unwrap()
+                                .is_some()
+                            {
                                 found += 1;
                             }
-                        } else if ht.probe(key, None).is_some() {
+                        } else if ht.probe(key, None).unwrap().is_some() {
                             found += 1;
                         }
                     }
@@ -193,17 +197,21 @@ fn bench_build_and_probe(c: &mut Criterion) {
                     for i in 0..count {
                         let key = vec![Value::from_i64(i as i64)];
                         if ht.has_spilled() {
-                            let partition_idx = ht.partition_for_keys(&key);
+                            let partition_idx = ht.partition_for_keys(&key).unwrap();
                             if !ht.is_partition_loaded(partition_idx) {
                                 while let Ok(IOResult::IO(_)) =
                                     ht.load_spilled_partition(partition_idx, None)
                                 {
                                 }
                             }
-                            if ht.probe_partition(partition_idx, &key, None).is_some() {
+                            if ht
+                                .probe_partition(partition_idx, &key, None)
+                                .unwrap()
+                                .is_some()
+                            {
                                 found += 1;
                             }
-                        } else if ht.probe(key, None).is_some() {
+                        } else if ht.probe(key, None).unwrap().is_some() {
                             found += 1;
                         }
                     }
@@ -239,7 +247,7 @@ fn bench_text_key_hashing(c: &mut Criterion) {
                         track_matched: false,
                         partition_count: None,
                     };
-                    let mut ht = HashTable::new(config, io);
+                    let mut ht = HashTable::new(config, io).unwrap();
                     insert_text_key_entries(&mut ht, count);
                     let _ = ht.finalize_build(None);
                     black_box(ht.has_spilled())
@@ -263,7 +271,7 @@ fn bench_text_key_hashing(c: &mut Criterion) {
                         track_matched: false,
                         partition_count: None,
                     };
-                    let mut ht = HashTable::new(config, io);
+                    let mut ht = HashTable::new(config, io).unwrap();
                     insert_text_key_entries(&mut ht, count);
                     let _ = ht.finalize_build(None);
                     black_box(ht.has_spilled())

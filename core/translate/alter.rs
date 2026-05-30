@@ -244,6 +244,51 @@ fn emit_rename_sqlite_sequence_entry(
     });
 }
 
+fn emit_delete_sqlite_sequence_entry(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    table_name_norm: &str,
+) {
+    let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
+    }) else {
+        return;
+    };
+
+    let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_sequence.clone()));
+    let sequence_name_reg = program.alloc_register();
+    let row_name_to_delete_reg = program.emit_string8_new_reg(table_name_norm.to_string());
+    program.mark_last_insn_constant();
+
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: seq_cursor_id,
+        root_page: RegisterOrLiteral::Literal(sqlite_sequence.root_page),
+        db: database_id,
+    });
+
+    program.cursor_loop(seq_cursor_id, |program, _rowid| {
+        program.emit_column_or_rowid(seq_cursor_id, 0, sequence_name_reg);
+
+        let continue_loop_label = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: sequence_name_reg,
+            rhs: row_name_to_delete_reg,
+            target_pc: continue_loop_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+
+        program.emit_insn(Insn::Delete {
+            cursor_id: seq_cursor_id,
+            table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+            is_part_of_update: false,
+        });
+
+        program.preassign_label_to_next_insn(continue_loop_label);
+    });
+}
+
 fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
     match literal {
         ast::Literal::Numeric(val) => parse_numeric_literal(val),
@@ -678,8 +723,8 @@ pub fn translate_alter_table(
     } = alter;
     let database_id = resolver.resolve_existing_table_database_id_qualified(&qualified_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
-    program.begin_write_operation();
+    program.begin_write_on_database(database_id, schema_cookie)?;
+    program.begin_write_operation()?;
     let table_name = qualified_name.name.as_str();
     // For attached databases, qualify sqlite_schema with the database name
     // so that the UPDATE targets the correct database's schema table.
@@ -995,29 +1040,31 @@ pub fn translate_alter_table(
                 connection,
                 input,
                 |program| {
-                    let table_name = btree.name.clone();
-                    let source_column_by_schema_idx = btree
-                        .columns()
-                        .iter()
-                        .enumerate()
-                        .map(|(new_idx, column)| {
-                            if column.is_virtual_generated() {
-                                None
-                            } else if new_idx < dropped_index {
-                                Some(new_idx)
-                            } else {
-                                Some(new_idx + 1)
-                            }
-                        })
-                        .collect();
-                    emit_rewrite_table_rows(
-                        program,
-                        original_btree.clone(),
-                        &btree,
-                        source_column_by_schema_idx,
-                        connection,
-                        database_id,
-                    );
+                    if !original_btree.columns()[dropped_index].is_virtual_generated() {
+                        let source_column_by_schema_idx = btree
+                            .columns()
+                            .iter()
+                            .enumerate()
+                            .map(|(new_idx, column)| {
+                                if column.is_virtual_generated() {
+                                    None
+                                } else if new_idx < dropped_index {
+                                    Some(new_idx)
+                                } else {
+                                    Some(new_idx + 1)
+                                }
+                            })
+                            .collect();
+
+                        emit_rewrite_table_rows(
+                            program,
+                            original_btree.clone(),
+                            &btree,
+                            source_column_by_schema_idx,
+                            connection,
+                            database_id,
+                        );
+                    }
 
                     program.emit_insn(Insn::SetCookie {
                         db: database_id,
@@ -1028,7 +1075,7 @@ pub fn translate_alter_table(
 
                     program.emit_insn(Insn::DropColumn {
                         db: database_id,
-                        table: table_name,
+                        table: btree.name.clone(),
                         column_index: dropped_index,
                     })
                 },
@@ -1162,6 +1209,12 @@ pub fn translate_alter_table(
                                 clause.tbl_name.as_str()
                             )));
                         }
+                        let decl_order = btree
+                            .foreign_keys
+                            .iter()
+                            .map(|fk| fk.decl_order)
+                            .max()
+                            .map_or(0, |order| order + 1);
                         let fk = ForeignKey {
                             parent_table: normalize_ident(clause.tbl_name.as_str()),
                             parent_columns: clause
@@ -1203,6 +1256,7 @@ pub fn translate_alter_table(
                                 }
                                 None => false,
                             },
+                            decl_order,
                         };
                         btree.foreign_keys.push(Arc::new(fk));
                     }
@@ -1410,7 +1464,7 @@ pub fn translate_alter_table(
 
             let temp_schema_version = if !temp_triggers_to_rewrite.is_empty() {
                 let schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
-                program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie);
+                program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie)?;
                 Some(schema_cookie)
             } else {
                 None
@@ -1621,6 +1675,14 @@ pub fn translate_alter_table(
                     let old_column = &btree.columns()[column_index];
                     let becomes_generated =
                         !old_column.is_generated() && replacement_column.is_generated();
+                    // Toggling the virtual-generated bit changes whether the column
+                    // occupies a stored slot, so the on-disk row layout shifts even
+                    // if neither side is "becomes_generated" (e.g. virtual -> regular).
+                    // Without rewriting, post-ALTER reads use the new schema's column
+                    // indexes against rows that still hold the pre-ALTER layout, and
+                    // values land in the wrong logical columns. See issue #6624.
+                    let virtuality_changed = old_column.is_virtual_generated()
+                        != replacement_column.is_virtual_generated();
                     // A change of declared type can change the column's affinity, in
                     // which case existing on-disk values must be coerced to match the
                     // new affinity. Without this, the row payload retains the old
@@ -1629,10 +1691,17 @@ pub fn translate_alter_table(
                     // changing NUMERIC -> TEXT). See issue #3706.
                     let affinity_changed = old_column.affinity_with_strict(btree.is_strict)
                         != replacement_column.affinity_with_strict(btree.is_strict);
-                    let rewrites_physical_layout = becomes_generated || affinity_changed;
+                    let rewrites_physical_layout =
+                        becomes_generated || virtuality_changed || affinity_changed;
                     (rewrites_physical_layout, Some(replacement_column))
                 }
             };
+            let clears_autoincrement_sequence = !rename
+                && btree.has_autoincrement
+                && btree.columns()[column_index].is_rowid_alias()
+                && replacement_column
+                    .as_ref()
+                    .is_some_and(|column| !column.is_rowid_alias());
 
             let is_making_column_generated = definition
                 .constraints
@@ -1810,7 +1879,7 @@ pub fn translate_alter_table(
                     .any(|(db, _, _)| *db == crate::TEMP_DB_ID);
             let temp_schema_version = if has_temp_rewrites {
                 let schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
-                program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie);
+                program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie)?;
                 Some(schema_cookie)
             } else {
                 None
@@ -1984,14 +2053,29 @@ pub fn translate_alter_table(
                     database_id,
                 )?;
 
+                let original_columns = original_btree.columns();
                 let source_column_by_schema_idx = rewritten_table
                     .columns()
                     .iter()
                     .enumerate()
                     .map(|(idx, column)| {
                         if column.is_virtual_generated() {
+                            // Virtual columns don't occupy a slot in the rewritten record.
+                            None
+                        } else if original_columns
+                            .get(idx)
+                            .is_some_and(|c| c.is_virtual_generated())
+                        {
+                            // Newly-stored slot (the original column was virtual): no
+                            // source value exists on the old row image — leave NULL.
                             None
                         } else {
+                            // The cursor is opened on the original btree, so the logical
+                            // index passed here is mapped to the original physical slot
+                            // by `emit_column_or_rowid` via the original's logical-to-
+                            // physical map. Schema order is preserved by ALTER COLUMN,
+                            // so the rewritten schema_idx also identifies the same
+                            // logical column in the original.
                             Some(idx)
                         }
                     })
@@ -2004,6 +2088,11 @@ pub fn translate_alter_table(
                     connection,
                     database_id,
                 );
+            }
+
+            if clears_autoincrement_sequence {
+                let table_name_norm = normalize_ident(table_name);
+                emit_delete_sqlite_sequence_entry(program, resolver, database_id, &table_name_norm);
             }
 
             program.emit_insn(Insn::SetCookie {
@@ -2057,7 +2146,10 @@ fn emit_rewrite_table_rows(
     });
 
     program.cursor_loop(cursor_id, |program, rowid| {
-        let base_dest_reg = program.alloc_registers(non_virtual_column_count);
+        // Initialize all destination slots to NULL so that columns without a
+        // source value (e.g. when a virtual generated column becomes stored,
+        // there is no pre-existing value on the old row image) default to NULL.
+        let base_dest_reg = program.alloc_registers_and_init_w_null(non_virtual_column_count);
         for (schema_idx, source_column_idx) in source_column_by_schema_idx.iter().enumerate() {
             let Some(source_column_idx) = source_column_idx else {
                 continue;
@@ -2116,7 +2208,7 @@ fn translate_rename_virtual_table(
     database_id: usize,
 ) -> Result<()> {
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_operation();
+    program.begin_write_operation()?;
     let vtab_cur = program.alloc_cursor_id(CursorType::VirtualTable(vtab));
     program.emit_insn(Insn::VOpen {
         cursor_id: vtab_cur,
@@ -3001,7 +3093,15 @@ fn apply_select_for_column_rename(
         _ => outer_target_qualifiers.to_vec(),
     };
 
+    // Per SQLite's ORDER BY resolution rules, a bare identifier that matches
+    // an output column alias refers to that alias, not to a column in the
+    // FROM clause. Such a reference must not be rewritten — its identity is
+    // the alias label, which is independent of the renamed table column.
+    let body = &select.body;
     for sorted_col in &mut select.order_by {
+        if crate::util::is_order_by_alias_ref(body, &sorted_col.expr, old_col_norm) {
+            continue;
+        }
         apply_expr_for_column_rename(
             mode,
             &mut sorted_col.expr,
@@ -5222,26 +5322,7 @@ fn collect_select_table_visible_columns_from_output(
 }
 
 fn collect_one_select_output_columns(one_select: &ast::OneSelect) -> Vec<String> {
-    match one_select {
-        ast::OneSelect::Select { columns, .. } => {
-            columns.iter().filter_map(result_column_name).collect()
-        }
-        ast::OneSelect::Values(_) => Vec::new(),
-    }
-}
-
-fn result_column_name(column: &ast::ResultColumn) -> Option<String> {
-    match column {
-        ast::ResultColumn::Expr(_, Some(alias)) => Some(normalize_ident(alias.name().as_str())),
-        ast::ResultColumn::Expr(expr, None) => match expr.as_ref() {
-            ast::Expr::Id(name) | ast::Expr::Name(name) => Some(normalize_ident(name.as_str())),
-            ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
-                Some(normalize_ident(col.as_str()))
-            }
-            _ => None,
-        },
-        _ => None,
-    }
+    crate::util::output_column_aliases(one_select)
 }
 
 /// Check a single expression node for invalid column references after a DROP COLUMN.

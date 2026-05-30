@@ -17,7 +17,7 @@ name = "turso_core"
 path = "lib.rs"
 
 [features]
-default = ["fs", "uuid", "time", "json", "series", "encryption"]
+default = ["fs", "uuid", "time", "json", "series", "encryption", "percentile"]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
 fs = ["turso_ext/vfs"]
@@ -41,6 +41,8 @@ nanosecond-bench = ["bench"]
 fts = ["dep:tantivy"]
 codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
+stacker = ["dep:stacker"]
+percentile = []
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = [
@@ -70,7 +72,10 @@ tantivy = { version = "0.26.0", optional = true }
 turso_ext = { workspace = true, features = ["core_only"] }
 cfg_block = "0.1.1"
 fallible-iterator = { workspace = true }
+allocator-api2 = { workspace = true }
 hex = { workspace = true }
+icu_collator = "2.2.0"
+icu_locale = "2.2.0"
 thiserror = { workspace = true }
 regex = { workspace = true }
 regex-syntax = { workspace = true, default-features = false, features = [
@@ -115,6 +120,7 @@ crc32c = "0.6.8"
 bigdecimal = "0.4"
 num-bigint = "0.4"
 num-traits = "0.2"
+stacker = { version = "0.1", optional = true }
 
 [target.'cfg(not(any(target_family = "wasm", all(target_os = "windows", target_arch = "aarch64"))))'.dependencies]
 simsimd = "6.5.3"
@@ -189,12 +195,20 @@ harness = false
 required-features = ["bench"]
 
 [[bench]]
+name = "alloc_collections"
+harness = false
+
+[[bench]]
 name = "hash_spill_benchmark"
 harness = false
 required-features = ["bench"]
 
 [[bench]]
 name = "write_perf_benchmark"
+harness = false
+
+[[bench]]
+name = "create_index_benchmark"
 harness = false
 
 [[bench]]
