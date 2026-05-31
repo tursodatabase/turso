@@ -21,6 +21,7 @@ use turso_core::{
 use turso_parser::ast::{ColumnConstraint, SortOrder};
 
 pub mod chaotic_elle;
+pub mod chaotic_reader_hold;
 pub mod elle;
 mod io;
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]

@@ -10,6 +10,7 @@ use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
 use turso_whopper::{
     StepResult, Whopper, WhopperOpts,
     chaotic_elle::{ChaoticElleProfile, ChaoticWorkloadProfile, ElleModelKind},
+    chaotic_reader_hold::ReaderHoldProfile,
     properties::*,
     workloads::*,
 };
@@ -374,7 +375,17 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             Box::new(SimpleKeysDoNotDisappear::new()),
         ];
 
-        (w, p, vec![], vec![])
+        // ReaderHoldsSnapshot — keep a BEGIN CONCURRENT + SELECT'd read_view
+        // alive across many checkpoint cycles. Fires per-fiber per-step with
+        // 5% probability, then runs to completion (≈hold_reads + 3 steps).
+        // Targets reader-vs-GC and reader-vs-page-free contracts.
+        let chaotic_profiles: ChaosProfiles = vec![(
+            0.05,
+            "reader-hold",
+            Box::new(ReaderHoldProfile::new(20, 200)),
+        )];
+
+        (w, p, vec![], chaotic_profiles)
     }
 }
 
