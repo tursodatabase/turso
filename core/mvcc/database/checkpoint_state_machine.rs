@@ -1058,16 +1058,28 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
     fn has_unpublished_schema_changes(&self) -> bool {
         let schema = self.connection.db.schema.lock();
+        // A negative root_page is only OUR pending publication if THIS checkpoint
+        // allocated it (it is present in `table_id_to_rootpage`). A CREATE that
+        // committed during the off-lock prepare window (begin_ts above our
+        // snapshot_ts) leaves a negative-root object this checkpoint did not cover;
+        // a later checkpoint that covers it publishes the root, so it is not
+        // pending for us and must not count here (otherwise Finalize's
+        // has_pending_root_publication assert trips on a legitimate concurrent
+        // CREATE). Mirrors the skip in `publish_checkpointed_schema_roots`.
+        let ours = |root_page: i64| {
+            root_page < 0
+                && self
+                    .mvstore
+                    .table_id_to_rootpage
+                    .get(&MVTableId::from(root_page))
+                    .is_some()
+        };
         !schema.dropped_root_pages.is_empty()
             || schema
                 .tables
                 .values()
-                .any(|table| table.btree().is_some_and(|btree| btree.root_page < 0))
-            || schema
-                .indexes
-                .values()
-                .flatten()
-                .any(|index| index.root_page < 0)
+                .any(|table| table.btree().is_some_and(|btree| ours(btree.root_page)))
+            || schema.indexes.values().flatten().any(|index| ours(index.root_page))
     }
 
     fn has_pending_root_publication(&self) -> bool {
@@ -1126,31 +1138,35 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             let btree_table = Arc::make_mut(btree_table);
             if btree_table.root_page < 0 {
                 let table_id = MVTableId::from(btree_table.root_page);
-                let entry = self
-                    .mvstore
-                    .table_id_to_rootpage
-                    .get(&table_id)
-                    .expect("we should have checkpointed table with table_id {table_id:?}");
-                let value = entry
-                    .value()
-                    .expect("table with id {table_id:?} should have a mapping");
-                btree_table.root_page = value as i64;
+                // A CREATE that committed during this checkpoint's off-lock prepare
+                // window (begin_ts above our snapshot_ts) is in the connection's
+                // schema but NOT in this pass's write_set, so it has no
+                // table_id_to_rootpage mapping yet. Leave its root_page negative —
+                // it stays MVCC-tracked and a later checkpoint that covers it
+                // publishes the real root. (Under the old blocking checkpoint no
+                // concurrent CREATE could slip in, so this was always Some.)
+                if let Some(entry) = self.mvstore.table_id_to_rootpage.get(&table_id) {
+                    let value = entry
+                        .value()
+                        .expect("a checkpointed table should have a root-page mapping");
+                    btree_table.root_page = value as i64;
+                }
             }
         }
         for table_index_list in schema.indexes.values_mut() {
             for index in table_index_list.iter_mut() {
                 if index.root_page < 0 {
                     let table_id = MVTableId::from(index.root_page);
-                    let entry = self
-                        .mvstore
-                        .table_id_to_rootpage
-                        .get(&table_id)
-                        .expect("we should have checkpointed index with table_id {table_id:?}");
-                    let value = entry
-                        .value()
-                        .expect("index with id {table_id:?} should have a mapping");
-                    let index = Arc::make_mut(index);
-                    index.root_page = value as i64;
+                    // Same off-lock case as the table loop above: an index whose
+                    // CREATE committed after our snapshot_ts isn't checkpointed by
+                    // this pass, so leave it negative for a later checkpoint.
+                    if let Some(entry) = self.mvstore.table_id_to_rootpage.get(&table_id) {
+                        let value = entry
+                            .value()
+                            .expect("a checkpointed index should have a root-page mapping");
+                        let index = Arc::make_mut(index);
+                        index.root_page = value as i64;
+                    }
                 }
             }
         }
