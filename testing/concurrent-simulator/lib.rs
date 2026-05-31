@@ -831,6 +831,16 @@ impl Whopper {
                             ctx.fiber.txn_id = None;
                         }
                     }
+                    // A chaotic workload (e.g. ReaderHoldsSnapshot) may queue
+                    // COMMIT after the engine auto-rolled-back its txn from
+                    // some prior error path (BusySnapshot etc. above). The
+                    // COMMIT then bails with this exact message; benign.
+                    turso_core::LimboError::TxError(ref msg)
+                        if msg == "cannot commit - no transaction is active" =>
+                    {
+                        debug!("commit on already-ended txn (auto-rollback race): {msg}");
+                        ctx.fiber.txn_id = None;
+                    }
                     _ => return Err(error.into()),
                 }
             }
