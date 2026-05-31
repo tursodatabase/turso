@@ -1730,30 +1730,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     return Ok(TransitionResult::Continue);
                 }
 
-                // A user-data row whose table_id has no entry in this
-                // checkpoint's `pending_root_page_allocations` (a fresh CREATE
-                // covered by us) and no published mapping in
-                // `table_id_to_rootpage` (a prior checkpoint's CREATE) is an
-                // ORPHAN from this pass's perspective: the schema row that
-                // would CREATE its table was filtered out of the snapshot
-                // (its `begin_ts > snapshot_ts`, or it was DROPped at a ts
-                // above snapshot_ts so the v1+v2 pair both got filtered).
-                //
-                // Without this skip, WriteRow panics on the missing root
-                // page. Skip it on the floor; a later checkpoint whose
-                // snapshot DOES include the schema row will collect the row
-                // properly. Symmetric to the "scope to ours" fix on the
-                // publish side (commit 5f4da476f).
-                if self.resolve_root_page(table_id).is_none() {
-                    self.state = CheckpointState::WriteRow {
-                        write_set_index: write_set_index + 1,
-                        requires_seek: true,
-                    };
-                    return Ok(TransitionResult::Continue);
-                }
-                let root_page = self
-                    .resolve_root_page(table_id)
-                    .expect("resolve_root_page None already returned above");
+                let root_page = self.resolve_root_page(table_id).unwrap_or_else(|| {
+                    panic!(
+                        "Table ID does not have a root page: {table_id}, row_version: {:?}",
+                        self.get_current_row_version(write_set_index)
+                            .expect("row version should exist")
+                    )
+                });
 
                 // If a table was created, it now has a real root page allocated for it, but the 'root_page' field in the sqlite_schema record is still the table id.
                 // So we need to rewrite the row version to use the real root page.
@@ -1944,31 +1927,17 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     return Ok(TransitionResult::Continue);
                 }
 
-                // Orphan index_id (same reason as the user-table-row skip in
-                // CheckpointState::WriteRow above): the schema row for this
-                // index was outside our snapshot, so no `BTreeCreateIndex` ran,
-                // so neither `pending_root_page_allocations` nor
-                // `table_id_to_rootpage` carries a mapping AND the engine's
-                // `index_id_to_index` was never populated for it. A later
-                // checkpoint whose snapshot covers the schema row picks it up.
-                if self.resolve_root_page(*index_id).is_none()
-                    || !self.index_id_to_index.contains_key(index_id)
-                {
-                    self.state = CheckpointState::WriteIndexRow {
-                        index_write_set_index: index_write_set_index + 1,
-                        requires_seek: true,
-                    };
-                    return Ok(TransitionResult::Continue);
-                }
+                // Get Index struct - it should exist for all indexes we're checkpointing
+                let index = self.index_id_to_index.get(index_id).unwrap_or_else(|| {
+                    panic!(
+                    "Index struct for index_id {index_id} must exist when checkpointing index rows",
+                )
+                });
 
-                let index = self
-                    .index_id_to_index
-                    .get(index_id)
-                    .expect("orphan-index skip above guarantees presence here");
-
+                // Get root page for this index — staged allocations first.
                 let root_page = self
                     .resolve_root_page(*index_id)
-                    .expect("orphan-index skip above guarantees presence here");
+                    .unwrap_or_else(|| panic!("Index ID {index_id} does not have a root page"));
 
                 // Get or create cursor for this index
                 let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
