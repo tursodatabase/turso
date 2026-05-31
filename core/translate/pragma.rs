@@ -1390,12 +1390,26 @@ fn query_pragma(
         PragmaName::IntegrityCheck => {
             let max_errors = parse_max_errors_from_value(&value);
             translate_integrity_check(schema, program, resolver, database_id, max_errors)?;
-            Ok(TransactionMode::Read)
+            // `Write` so MVCC routes through `begin_exclusive_tx`: integrity_check
+            // captures a fixed list of root_pages at prepare time from the
+            // schema (see translate_integrity_check_impl), then walks them.
+            // Without DDL exclusion, a concurrent `DROP INDEX` on another
+            // connection can destroy one of those btrees mid-walk and produce
+            // a false-positive "row N missing from index" report (because the
+            // index's pages were freed while integrity_check was iterating
+            // them, but the table itself is untouched). Acquiring the exclusive
+            // tx lock here mirrors SQLite's traditional shared-vs-exclusive
+            // exclusion between read txns and DDL — concurrent INSERT / UPDATE
+            // / DELETE / CHECKPOINT (all running as Concurrent or in pager-only
+            // mode) are unaffected, so the bug-finding interaction between data
+            // writes and a verifying reader is preserved.
+            Ok(TransactionMode::Write)
         }
         PragmaName::QuickCheck => {
             let max_errors = parse_max_errors_from_value(&value);
             translate_quick_check(schema, program, resolver, database_id, max_errors)?;
-            Ok(TransactionMode::Read)
+            // See `IntegrityCheck` above — same DDL race, same fix.
+            Ok(TransactionMode::Write)
         }
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
             let pragma = pragma_for(&pragma);
