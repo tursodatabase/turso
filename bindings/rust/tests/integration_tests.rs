@@ -458,6 +458,40 @@ async fn test_statement_query_resets_before_execution() {
 }
 
 #[tokio::test]
+async fn test_autocommit_write_persists_with_stepped_open_rows() {
+    async fn count_rows(conn: &turso::Connection) -> i64 {
+        let mut rows = conn.query("SELECT COUNT(*) FROM t", ()).await.unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_file = temp_dir.path().join("open-rows-write-loss.db");
+    let db_file = db_file.to_str().unwrap();
+    let db = Builder::new_local(db_file).build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute(
+        "CREATE TABLE t (k TEXT NOT NULL PRIMARY KEY, v INTEGER)",
+        (),
+    )
+    .await
+    .unwrap();
+
+    for key in ["a", "b", "c"] {
+        let mut rows = conn.query("SELECT COUNT(*) FROM t", ()).await.unwrap();
+        let _first: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+
+        conn.execute("INSERT INTO t (k, v) VALUES (?1, 1)", turso::params![key])
+            .await
+            .unwrap();
+
+        assert_eq!(rows.column_count(), 1);
+    }
+
+    assert_eq!(count_rows(&conn).await, 3);
+}
+
+#[tokio::test]
 async fn test_encryption() {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_file = temp_dir.path().join("test-encrypted.db");

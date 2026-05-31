@@ -3787,6 +3787,16 @@ pub fn op_transaction_inner(
 
                 // 3. Transaction state should be updated before checking for Schema cookie so that the tx is ended properly on error
                 if updated {
+                    if conn.get_auto_commit()
+                        && write
+                        && matches!(current_state, TransactionState::Read)
+                        && matches!(new_transaction_state, TransactionState::Write { .. })
+                    {
+                        // A stepped SELECT can own the implicit read transaction. If this
+                        // statement upgrades that read to a write, it is responsible for
+                        // finishing the autocommit write so successful DML cannot be dropped.
+                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                    }
                     conn.set_tx_state(new_transaction_state);
                 }
                 if is_secondary_db
