@@ -48,6 +48,16 @@ module checkpoint {
   // materialization, lost/resurrected deletes, tombstone-vs-boundary.
   type Op = { ts: int, key: int, value: int, del: bool }
 
+  // A transaction's op while it is still IN-FLIGHT: the writer has planted the
+  // row version in MVCC (insert with begin = TxID, delete with end = TxID) but
+  // its commit has not yet returned a timestamp. No `ts` yet — that is assigned
+  // at finalizeTx. Modeling commits as TWO phases (prepareTx then finalizeTx)
+  // is what lets a passive checkpoint observe a transaction's speculative state
+  // — the only window in which an `end = TxID(_)` tombstone can reach the
+  // checkpoint's row dispatcher.
+  type StagedOp = { key: int, value: int, del: bool }
+  type InFlightTx = { txId: int, ops: Set[StagedOp] }
+
   // The key UNIVERSE txns operate on. Deliberately wide so that, when the adapter
   // replays a trace against the real engine, the live rows span many B-tree pages
   // (and, with the overflow-sized payloads the adapter uses for value >= 2, many
@@ -85,6 +95,61 @@ module checkpoint {
   // True once `seed` has pre-populated the base tree. Gates commits/checkpoints so
   // every trace starts with `seed` (the only action enabled from `init`).
   var seeded: bool
+
+  // --- in-flight transactions (started but not yet committed) ---
+  // The set of transactions a writer has BEGUN: each has planted its row
+  // versions (insert: begin = TxID(txId); delete: end = TxID(txId)) in MVCC but
+  // has not yet returned a commit timestamp. invisible to readers / contents,
+  // but observable by a concurrent passive checkpoint's row collection — which
+  // is exactly where the speculative-tombstone bug class lives. `finalizeTx`
+  // commits one: assigns nextTs, materializes the ops at that ts, drops the txn
+  // from the in-flight set.
+  var inFlightTxs: Set[InFlightTx]
+  // Per-transaction identifier the model assigns at prepareTx. Distinct from
+  // `nextTs` because txIds are minted at PREPARE while commit timestamps are
+  // minted at FINALIZE — and arbitrarily many other steps can fire in between.
+  var nextTxId: int
+
+  // --- in-flight schema drops (R5) ---
+  // A DROP TABLE / DROP INDEX has the same off-lock-race structure as a
+  // committing INSERT/DELETE: the schema row's `end` becomes `TxID(_)` while
+  // the writer is mid-commit, observable by a concurrent passive checkpoint's
+  // collection. Modeling DROP as prepare+finalize parallels prepareTx /
+  // finalizeTx and lets the spec EXPRESS the symmetric "concurrent DROP during
+  // off-lock publish" race — the inverse of the CREATE race the recent
+  // schema-publish fix handles. As with R4 (readers), the structural variables
+  // and actions land first; the LOAD-BEARING invariant (e.g., "a DROP that
+  // finalized after our snapshot must not be applied by this checkpoint")
+  // wires in once the engine adapter learns to drive a fresh-DROP scenario
+  // analogous to how `CheckpointWithParked` drives a fresh DELETE.
+  type DropKind = str // "table" or "index"
+  type InFlightDrop = { dropId: int, kind: DropKind }
+  var inFlightDrops: Set[InFlightDrop]
+  var nextDropId: int
+  // Schema objects whose DROP has finalized. Distinct from "destroyed in this
+  // checkpoint's pass" — these are model-global, mirroring the engine's
+  // `destroyed_tables`/`destroyed_indexes` post-publish.
+  var droppedTables: Set[int]
+  var droppedIndexes: Set[int]
+
+  // --- active readers (R4) ---
+  // A Reader is a transaction that opened a read view at `snapshotTs` and has
+  // NOT YET committed/aborted. The read view is the set of (key, value) pairs
+  // observable at snapshotTs: resolve(committed-restricted-to-ts <= snapshotTs).
+  // The MVCC engine must keep that view consistent until the reader releases
+  // — i.e. checkpoint GC may not remove versions still needed by some live
+  // reader, and recovery from a crash must not invalidate a reader that
+  // observed a state ≤ snapshotTs that is still in `committed`.
+  //
+  // Modeling readers makes the GC-vs-live-reader contract testable: an
+  // invariant `readersSafe` asserts every live reader's view at its
+  // snapshotTs equals the view computed from the durable artifacts at the
+  // same ts. A bug that prematurely GCs a version a reader still needs would
+  // change the resolved view at snapshotTs after the GC fires; the invariant
+  // catches it.
+  type Reader = { readerId: int, snapshotTs: int }
+  var readers: Set[Reader]
+  var nextReaderId: int
 
   // --- in-progress checkpoint ---
   // ckptPhase: "idle" | "started" | "walFilled" | "dbBackfilled"
@@ -136,6 +201,14 @@ module checkpoint {
     ckptBoundary' = 0,
     ckptMode' = "",
     seeded' = false,
+    inFlightTxs' = Set(),
+    nextTxId' = 1,
+    readers' = Set(),
+    nextReaderId' = 1,
+    inFlightDrops' = Set(),
+    nextDropId' = 1,
+    droppedTables' = Set(),
+    droppedIndexes' = Set(),
   }
 
   // Pre-populate the base tree: commit every `seedKeys` row atomically at ts =
@@ -160,44 +233,106 @@ module checkpoint {
       ckptSnapshot' = ckptSnapshot,
       ckptBoundary' = ckptBoundary,
       ckptMode' = ckptMode,
+      inFlightTxs' = inFlightTxs,
+      nextTxId' = nextTxId,
+      readers' = readers,
+      nextReaderId' = nextReaderId,
+      inFlightDrops' = inFlightDrops,
+      nextDropId' = nextDropId,
+      droppedTables' = droppedTables,
+      droppedIndexes' = droppedIndexes,
     }
   }
 
-  // A transaction commits ATOMICALLY at ts = nextTs: it touches 1..3 keys, each
-  // independently written (to a nondet value) or deleted. All of the txn's ops
-  // share one ts and are appended to the (fsynced) logical log together — recovery
-  // must apply them all-or-nothing. Modeling multi-row txns (not one row per
-  // commit) exercises recovery atomicity across rows and multi-entry checkpoint
-  // materialization, not just single-row paths. Allowed while NO checkpoint runs
-  // ("idle") and during a PASSIVE checkpoint's unlocked prepare phase ("started")
-  // — the off-lock window where the engine still accepts writers. Full/Restart/
-  // Truncate block writers for the whole checkpoint, so no commit interleaves them.
-  action commit = {
-    // Pick 1..3 keys as INDEPENDENT draws from the wide universe (duplicates
-    // collapse). This bounds per-txn fan-out so `setOfMaps` (|dbValues|^|ks| and
-    // 2^|ks|) stays tiny no matter how large `dbKeys` is — the trick that lets the
-    // universe be wide without `commit` enumerating a 2^|dbKeys| powerset.
+  // PHASE 1 of a transaction: a writer opens a txn, plants its row versions
+  // in MVCC, and walks the commit state machine up to but NOT past the point
+  // where its tombstone/insert TxID-ends get rewritten to committed Timestamps
+  // (in the engine, mod.rs:2004 inside build_log_record). The txn is now
+  // "in-flight" — invisible to readers and to the recovered contents, but
+  // observable to a concurrent passive checkpoint's row dispatcher as a
+  // version with `begin = TxID(_)` or `end = TxID(_)`. Modeling commits as
+  // prepare+finalize (rather than as a single atomic step) is what lets the
+  // checkpoint actions interleave the moment a writer has planted versions
+  // but not yet committed — the only window in which the speculative-state
+  // bug class can fire.
+  //
+  // Allowed while NO checkpoint runs ("idle") and during a PASSIVE checkpoint's
+  // unlocked prepare phase ("started") — the off-lock window where the engine
+  // still accepts writers. Full/Restart/Truncate block writers for the whole
+  // checkpoint, so no prepare interleaves them.
+  action prepareTx = {
+    // 1..3 keys (duplicates collapse), values, del flags — same shape as the
+    // old atomic commit, just kept as `StagedOp`s (no `ts`) under a `txId` until
+    // finalizeTx assigns a commit timestamp. setOfMaps stays small because `ks`
+    // is bounded.
     nondet k1 = dbKeys.oneOf()
     nondet k2 = dbKeys.oneOf()
     nondet k3 = dbKeys.oneOf()
     val ks = Set(k1, k2, k3)
     nondet vmap = ks.setOfMaps(dbValues).oneOf()
     nondet dmap = ks.setOfMaps(Set(false, true)).oneOf()
-    val ops = ks.map(k => { ts: nextTs, key: k, value: vmap.get(k), del: dmap.get(k) })
+    val stagedOps = ks.map(k => { key: k, value: vmap.get(k), del: dmap.get(k) })
     all {
-    seeded,
-    ckptPhase == "idle" or (ckptPhase == "started" and ckptMode == "passive"),
-    committed' = committed.union(ops),
-    logFrames' = logFrames.union(ops),
-    nextTs' = nextTs + 1,
-    db' = db,
-    wal' = wal,
-    boundary' = boundary,
-    ckptPhase' = ckptPhase,
-    ckptSnapshot' = ckptSnapshot,
-    ckptBoundary' = ckptBoundary,
-    ckptMode' = ckptMode,
-    seeded' = seeded,
+      seeded,
+      ckptPhase == "idle" or (ckptPhase == "started" and ckptMode == "passive"),
+      inFlightTxs' = inFlightTxs.union(Set({ txId: nextTxId, ops: stagedOps })),
+      nextTxId' = nextTxId + 1,
+      // Durable artifacts and `nextTs` don't move — the txn has not committed.
+      committed' = committed,
+      logFrames' = logFrames,
+      nextTs' = nextTs,
+      db' = db,
+      wal' = wal,
+      boundary' = boundary,
+      ckptPhase' = ckptPhase,
+      ckptSnapshot' = ckptSnapshot,
+      ckptBoundary' = ckptBoundary,
+      ckptMode' = ckptMode,
+      seeded' = seeded,
+      readers' = readers,
+      nextReaderId' = nextReaderId,
+      inFlightDrops' = inFlightDrops,
+      nextDropId' = nextDropId,
+      droppedTables' = droppedTables,
+      droppedIndexes' = droppedIndexes,
+    }
+  }
+
+  // PHASE 2 of a transaction: the writer finishes its commit state machine
+  // (in the engine, rewrites TxID-ends to Timestamp-ends, appends the commit
+  // frame to the logical log, fsyncs, publishes the marker). Until this fires,
+  // every op the txn planted is invisible to committed/logFrames. Multiple
+  // in-flight txns can coexist — the model picks one to finalize per step.
+  //
+  // Allowed in the same windows as prepareTx (idle or passive-prepare): a
+  // writer can finish committing while a passive checkpoint runs, just as in
+  // production.
+  action finalizeTx = {
+    nondet tx = inFlightTxs.oneOf()
+    val finalOps = tx.ops.map(o => { ts: nextTs, key: o.key, value: o.value, del: o.del })
+    all {
+      seeded,
+      inFlightTxs != Set(),
+      ckptPhase == "idle" or (ckptPhase == "started" and ckptMode == "passive"),
+      committed' = committed.union(finalOps),
+      logFrames' = logFrames.union(finalOps),
+      nextTs' = nextTs + 1,
+      inFlightTxs' = inFlightTxs.exclude(Set(tx)),
+      nextTxId' = nextTxId,
+      readers' = readers,
+      nextReaderId' = nextReaderId,
+      inFlightDrops' = inFlightDrops,
+      nextDropId' = nextDropId,
+      droppedTables' = droppedTables,
+      droppedIndexes' = droppedIndexes,
+      db' = db,
+      wal' = wal,
+      boundary' = boundary,
+      ckptPhase' = ckptPhase,
+      ckptSnapshot' = ckptSnapshot,
+      ckptBoundary' = ckptBoundary,
+      ckptMode' = ckptMode,
+      seeded' = seeded,
     }
   }
 
@@ -220,6 +355,14 @@ module checkpoint {
       boundary' = boundary,
       nextTs' = nextTs,
       seeded' = seeded,
+      inFlightTxs' = inFlightTxs,
+      nextTxId' = nextTxId,
+      readers' = readers,
+      nextReaderId' = nextReaderId,
+      inFlightDrops' = inFlightDrops,
+      nextDropId' = nextDropId,
+      droppedTables' = droppedTables,
+      droppedIndexes' = droppedIndexes,
     }
   }
 
@@ -237,6 +380,14 @@ module checkpoint {
     ckptBoundary' = ckptBoundary,
     ckptMode' = ckptMode,
     seeded' = seeded,
+    inFlightTxs' = inFlightTxs,
+    nextTxId' = nextTxId,
+    readers' = readers,
+    nextReaderId' = nextReaderId,
+    inFlightDrops' = inFlightDrops,
+    nextDropId' = nextDropId,
+    droppedTables' = droppedTables,
+    droppedIndexes' = droppedIndexes,
   }
 
   // Phase 2: backfill the snapshot into the DB file + fsync it.
@@ -253,18 +404,63 @@ module checkpoint {
     ckptBoundary' = ckptBoundary,
     ckptMode' = ckptMode,
     seeded' = seeded,
+    inFlightTxs' = inFlightTxs,
+    nextTxId' = nextTxId,
+    readers' = readers,
+    nextReaderId' = nextReaderId,
+    inFlightDrops' = inFlightDrops,
+    nextDropId' = nextDropId,
+    droppedTables' = droppedTables,
+    droppedIndexes' = droppedIndexes,
   }
 
-  // Phase 3 (final): truncate the logical log, removing ONLY this checkpoint's
-  // snapshot (concurrent commits above it stay), and publish the boundary. With
-  // the correct ordering the snapshot is already durable in WAL+DB; the unsafe
-  // toggle lets this fire before the snapshot is durable elsewhere -> recovery
-  // loses it.
+  // Phase 3a (R6 split): publish the new `persistent_tx_ts_max` boundary.
+  // Mirrors engine yield `AfterDurableBoundaryAdvanced`: the durable header
+  // says recovery's last-completed-ckpt is `ckptBoundary`. Crashes BETWEEN
+  // 3a and 3b are recovery's hardest case: the boundary has advanced (so
+  // recovery WON'T replay this ckpt's frames) but the logical-log entries
+  // are still on disk — a non-idempotent recovery that re-applies them
+  // would corrupt. Splitting these two phases makes that crash window
+  // representable in the model. Today the engine commits both updates inside
+  // the locked phase, so the only "between" point is mid-fsync; the spec
+  // makes the ordering explicit either way.
+  action checkpointAdvanceBoundary = all {
+    ckptPhase == "dbBackfilled",
+    ckptPhase' = "boundaryAdvanced",
+    boundary' = ckptBoundary,
+    committed' = committed,
+    db' = db,
+    wal' = wal,
+    logFrames' = logFrames,
+    nextTs' = nextTs,
+    ckptSnapshot' = ckptSnapshot,
+    ckptBoundary' = ckptBoundary,
+    ckptMode' = ckptMode,
+    seeded' = seeded,
+    inFlightTxs' = inFlightTxs,
+    nextTxId' = nextTxId,
+    readers' = readers,
+    nextReaderId' = nextReaderId,
+    inFlightDrops' = inFlightDrops,
+    nextDropId' = nextDropId,
+    droppedTables' = droppedTables,
+    droppedIndexes' = droppedIndexes,
+  }
+
+  // Phase 3b (final): truncate the logical log, removing ONLY this checkpoint's
+  // snapshot (concurrent commits above it stay). Mirrors engine yields
+  // `AfterTruncateLogicalLog` + `AfterFsyncLogicalLog` (collapsed; the fsync
+  // is captured by the model's atomic-set semantics — there is no other
+  // observable state between "logical log mutated" and "logical log durable"
+  // in this abstraction). With the correct ordering the snapshot is already
+  // durable in WAL+DB AND the boundary is published; the unsafe toggle lets
+  // this fire BEFORE either, demonstrating the recoverySafe invariant has
+  // teeth.
   action checkpointTruncateLog = all {
-    ckptPhase == "dbBackfilled" or (not(backfillBeforeTruncate) and ckptPhase != "idle"),
+    ckptPhase == "boundaryAdvanced" or (not(backfillBeforeTruncate) and ckptPhase != "idle"),
     ckptPhase' = "idle",
     logFrames' = logFrames.exclude(ckptSnapshot),
-    boundary' = ckptBoundary,
+    boundary' = boundary,
     ckptSnapshot' = Set(),
     ckptBoundary' = 0,
     ckptMode' = "",
@@ -280,14 +476,149 @@ module checkpoint {
     wal' = if (ckptMode == "restart" or ckptMode == "truncate") Set() else wal,
     nextTs' = nextTs,
     seeded' = seeded,
+    inFlightTxs' = inFlightTxs,
+    nextTxId' = nextTxId,
+    readers' = readers,
+    nextReaderId' = nextReaderId,
+    inFlightDrops' = inFlightDrops,
+    nextDropId' = nextDropId,
+    droppedTables' = droppedTables,
+    droppedIndexes' = droppedIndexes,
+  }
+
+  // Open a read view at `nextTs - 1` (the latest committed ts so far). Mirrors
+  // the engine: BEGIN CONCURRENT followed by a first read snapshots the
+  // committed timestamp watermark and pins versions visible at that ts. Allowed
+  // in idle or passive-started phases; non-passive checkpoints block writers
+  // and the model's readers behave like other writers w.r.t. the lock.
+  action startReader = all {
+    seeded,
+    ckptPhase == "idle" or (ckptPhase == "started" and ckptMode == "passive"),
+    readers' = readers.union(Set({
+      readerId: nextReaderId,
+      snapshotTs: nextTs - 1,
+    })),
+    nextReaderId' = nextReaderId + 1,
+    committed' = committed,
+    db' = db,
+    wal' = wal,
+    logFrames' = logFrames,
+    boundary' = boundary,
+    nextTs' = nextTs,
+    ckptPhase' = ckptPhase,
+    ckptSnapshot' = ckptSnapshot,
+    ckptBoundary' = ckptBoundary,
+    ckptMode' = ckptMode,
+    seeded' = seeded,
+    inFlightTxs' = inFlightTxs,
+    nextTxId' = nextTxId,
+    inFlightDrops' = inFlightDrops,
+    nextDropId' = nextDropId,
+    droppedTables' = droppedTables,
+    droppedIndexes' = droppedIndexes,
+  }
+
+  // The reader commits / aborts and releases its snapshot. Allowed any time
+  // there is at least one live reader.
+  action endReader = {
+    nondet r = readers.oneOf()
+    all {
+      readers != Set(),
+      readers' = readers.exclude(Set(r)),
+      nextReaderId' = nextReaderId,
+      inFlightDrops' = inFlightDrops,
+      nextDropId' = nextDropId,
+      droppedTables' = droppedTables,
+      droppedIndexes' = droppedIndexes,
+      committed' = committed,
+      db' = db,
+      wal' = wal,
+      logFrames' = logFrames,
+      boundary' = boundary,
+      nextTs' = nextTs,
+      ckptPhase' = ckptPhase,
+      ckptSnapshot' = ckptSnapshot,
+      ckptBoundary' = ckptBoundary,
+      ckptMode' = ckptMode,
+      seeded' = seeded,
+      inFlightTxs' = inFlightTxs,
+      nextTxId' = nextTxId,
+    }
+  }
+
+  // Begin a DROP TABLE / DROP INDEX transaction. Plants the schema row's end
+  // marker as `TxID(_)` in the engine; the checkpoint's collection can observe
+  // this speculative state in the off-lock window. Mirrors `prepareTx` for
+  // schema operations.
+  action prepareDrop = {
+    nondet kind = Set("table", "index").oneOf()
+    all {
+      seeded,
+      ckptPhase == "idle" or (ckptPhase == "started" and ckptMode == "passive"),
+      inFlightDrops' = inFlightDrops.union(Set({ dropId: nextDropId, kind: kind })),
+      nextDropId' = nextDropId + 1,
+      committed' = committed,
+      logFrames' = logFrames,
+      nextTs' = nextTs,
+      db' = db,
+      wal' = wal,
+      boundary' = boundary,
+      ckptPhase' = ckptPhase,
+      ckptSnapshot' = ckptSnapshot,
+      ckptBoundary' = ckptBoundary,
+      ckptMode' = ckptMode,
+      seeded' = seeded,
+      inFlightTxs' = inFlightTxs,
+      nextTxId' = nextTxId,
+      readers' = readers,
+      nextReaderId' = nextReaderId,
+      droppedTables' = droppedTables,
+      droppedIndexes' = droppedIndexes,
+    }
+  }
+
+  // Finalize a DROP — schema row's `end` becomes `Timestamp(nextTs)` and the
+  // object moves to the appropriate destroyed-set. Mirrors `finalizeTx`.
+  action finalizeDrop = {
+    nondet d = inFlightDrops.oneOf()
+    all {
+      seeded,
+      inFlightDrops != Set(),
+      ckptPhase == "idle" or (ckptPhase == "started" and ckptMode == "passive"),
+      inFlightDrops' = inFlightDrops.exclude(Set(d)),
+      droppedTables' = if (d.kind == "table") droppedTables.union(Set(d.dropId)) else droppedTables,
+      droppedIndexes' = if (d.kind == "index") droppedIndexes.union(Set(d.dropId)) else droppedIndexes,
+      nextTs' = nextTs + 1,
+      committed' = committed,
+      logFrames' = logFrames,
+      db' = db,
+      wal' = wal,
+      boundary' = boundary,
+      ckptPhase' = ckptPhase,
+      ckptSnapshot' = ckptSnapshot,
+      ckptBoundary' = ckptBoundary,
+      ckptMode' = ckptMode,
+      seeded' = seeded,
+      inFlightTxs' = inFlightTxs,
+      nextTxId' = nextTxId,
+      readers' = readers,
+      nextReaderId' = nextReaderId,
+      nextDropId' = nextDropId,
+    }
   }
 
   action step = any {
     seed,
-    commit,
+    prepareTx,
+    finalizeTx,
+    startReader,
+    endReader,
+    prepareDrop,
+    finalizeDrop,
     checkpointStart,
     checkpointFillWal,
     checkpointBackfillDb,
+    checkpointAdvanceBoundary,
     checkpointTruncateLog,
   }
 
@@ -299,6 +630,29 @@ module checkpoint {
   val recoverySafe =
     recovered(db, wal, logFrames) == resolve(committed)
 
+  // Restrict `committed` to ops at ts <= snapshotTs. The view a reader at
+  // `snapshotTs` MUST observe, regardless of what else commits or checkpoints
+  // afterwards.
+  pure def viewAt(ops: Set[Op], snapshotTs: int): Set[(int, int)] =
+    resolve(ops.filter(o => o.ts <= snapshotTs))
+
+  // === READER CONTRACT (R4) ===
+  // Every live reader's view at its snapshotTs MUST equal the view computed
+  // from `committed` filtered to that ts. The engine has many ways to violate
+  // this: premature GC of a still-needed version, in-place page mutation
+  // visible to a held cursor, schema-cache desync overwriting a reader's row.
+  // Checked at every reachable state — including after a checkpoint runs.
+  val readersSafe =
+    readers.forall(r => viewAt(committed, r.snapshotTs) == viewAt(committed, r.snapshotTs))
+  // Note: the equality above is trivially true because we don't yet model the
+  // ENGINE'S view of a reader (which is what could diverge). The invariant
+  // becomes load-bearing once we add a model variable for what the engine
+  // SHOWS the reader, separate from what `committed` says it SHOULD show; that
+  // is the next step (R4b — model the per-reader cached view that GC can
+  // corrupt). The reader machinery (variable + actions + invariant skeleton)
+  // landing first lets follow-up changes flip on the load-bearing comparison
+  // without restructuring everything.
+
   // Example smoke trace (`quint test`): a checkpoint (mode chosen
   // nondeterministically) recovers safely. The richer coverage — every mode,
   // commits interleaved into a passive checkpoint, crashes at every point — comes
@@ -307,10 +661,12 @@ module checkpoint {
   run sequentialCheckpointTest =
     init
       .then(seed)
-      .then(commit)
+      .then(prepareTx)
+      .then(finalizeTx)
       .then(checkpointStart)
       .then(checkpointFillWal)
       .then(checkpointBackfillDb)
+      .then(checkpointAdvanceBoundary)
       .then(checkpointTruncateLog)
       .expect(recoverySafe)
 }

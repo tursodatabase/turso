@@ -3639,6 +3639,127 @@ fn test_checkpoint_stale_unique_index_delete_with_out_of_order_commit_yield() {
     assert_eq!(&rows[0][1].to_string(), "old_path_352");
 }
 
+/// What this test checks: a passive checkpoint MUST treat an in-flight DELETE
+/// (a `TxTimestampOrID::TxID(_)` end on a row whose commit has not yet bumped
+/// the end to a Timestamp) as "no committed end" — skip the version. The
+/// buggy `row_version.end.is_some()` classification routes the speculative
+/// tombstone through the delete path; `delete_row_from_pager` then fails on
+/// the not-yet-checkpointed b-tree because the rowid the writer DELETEd was
+/// only ever in the logical log.
+///
+/// Steps:
+/// 1. Create a table, insert a row, and leave it UNCHECKPOINTED (the row
+///    lives in the MVCC logical log; the b-tree is empty).
+/// 2. Open a second connection, BEGIN CONCURRENT, DELETE the row, prepare
+///    COMMIT. The DELETE plants `end = TxID(N)` on the row's tip version.
+/// 3. Park the COMMIT at `CommitYieldPoint::BuildLogRecordStart` — the yield
+///    fires BEFORE `step_build_log_record` rewrites `TxID`-ends to
+///    `Timestamp`-ends, so the tombstone is still in its speculative state.
+/// 4. While the COMMIT is parked, run a passive checkpoint on a third
+///    connection. Drive the checkpoint state machine directly to
+///    `BeforeAcquireLock` (the last off-lock yield) — the writer holds
+///    `blocking_checkpoint_lock.read()`, so `BeforeAcquireLock` is as far as
+///    the locked phase can advance until the COMMIT finalizes.
+/// 5. With the buggy classifier, `CheckpointState::Collect` puts the row in
+///    the write set with `is_delete = true`; `CheckpointState::WriteRow`
+///    tries to delete `rowid = 1` from a b-tree that has never seen it and
+///    returns an error. With the fix, the version is skipped (end is `TxID`,
+///    not `Timestamp`) and the checkpoint reaches `BeforeAcquireLock` cleanly.
+#[test]
+fn test_passive_checkpoint_skips_in_flight_delete_tombstone() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    {
+        let setup = db.connect();
+        // Disable auto-checkpoint so step (2) leaves the new row in MVCC only.
+        setup
+            .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        // Step 1a: create the table AND checkpoint it. This puts the table's
+        // b-tree on disk so the buggy WriteRow dispatcher cannot short-circuit
+        // through `created_btrees` (which would silently no-op the delete).
+        setup
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        // Step 1b: now insert the row, but leave it UNCHECKPOINTED in MVCC.
+        // The row has no presence in the b-tree, so a `delete_row_from_pager`
+        // seek on rowid=1 will return `NotFound` and bail.
+        setup.execute("INSERT INTO t VALUES (1, 'one')").unwrap();
+        drop(setup);
+    }
+
+    // Step 2-3: park a DELETE's COMMIT at BuildLogRecordStart.
+    let parked_conn = db.connect();
+    parked_conn.execute("BEGIN CONCURRENT").unwrap();
+    parked_conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    let injector = FixedYieldInjector::new([CommitYieldPoint::BuildLogRecordStart.point()]);
+    parked_conn.set_yield_injector(Some(injector.clone()));
+    let mut parked_commit = parked_conn.prepare("COMMIT").unwrap();
+    let pager_io = parked_conn.pager.load().io.clone();
+    loop {
+        match parked_commit.step().unwrap() {
+            StepResult::IO => {
+                if injector.is_empty() {
+                    break; // parked at BuildLogRecordStart (synthetic yield)
+                }
+                pager_io.step().unwrap();
+            }
+            StepResult::Done => panic!("COMMIT finished without yielding at BuildLogRecordStart"),
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+    parked_conn.set_yield_injector(None);
+
+    // Step 4: drive the checkpoint to BeforeAcquireLock with the writer parked.
+    let ckpt_conn = db.connect();
+    let mvstore = db.get_mvcc_store();
+    let ckpt_pager = ckpt_conn.pager.load().clone();
+    let mut sm = CheckpointStateMachine::new(
+        ckpt_pager.clone(),
+        mvstore,
+        ckpt_conn.clone(),
+        true,
+        ckpt_conn.get_sync_mode(),
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    match mbt_advance_ckpt(
+        &mut sm,
+        &ckpt_conn,
+        Some(CheckpointYieldPoint::BeforeAcquireLock),
+        ckpt_pager.io.as_ref(),
+    ) {
+        MbtAdvance::Parked => {}
+        MbtAdvance::Done => panic!("checkpoint finished entirely off-lock — unexpected"),
+        MbtAdvance::Faulted => panic!(
+            "checkpoint off-lock phase faulted on the speculative TxID-end tombstone — \
+             the row_version.end.is_some() classifier routed it through the delete path"
+        ),
+    }
+
+    // Step 5: resume the parked COMMIT, then finish the checkpoint.
+    loop {
+        match parked_commit.step().unwrap() {
+            StepResult::Done => break,
+            StepResult::IO => pager_io.step().unwrap(),
+            other => panic!("unexpected step result resuming parked COMMIT: {other:?}"),
+        }
+    }
+    drop(parked_commit);
+    drop(parked_conn);
+    match mbt_advance_ckpt(&mut sm, &ckpt_conn, None, ckpt_pager.io.as_ref()) {
+        MbtAdvance::Done => {}
+        MbtAdvance::Parked => panic!("checkpoint unexpectedly parked after writer finalized"),
+        MbtAdvance::Faulted => panic!("checkpoint did not complete after writer finalized"),
+    }
+    drop(sm);
+
+    // The row was DELETEd; the table should be empty after the checkpoint.
+    let rows = get_rows(&ckpt_conn, "SELECT id, v FROM t");
+    assert!(rows.is_empty(), "row should be deleted: got {rows:?}");
+}
+
 /// What this test checks: SQL-only recovery must not replay a CREATE TABLE frame already made durable by checkpoint.
 /// Why this matters: a regressed checkpoint boundary can make recovery replay the pre-checkpoint schema row with its negative root page after WAL recovery has already installed the positive root page.
 ///
@@ -14070,6 +14191,57 @@ enum MbtEpisode {
         after: Vec<(i64, i64)>,
         mode: String,
     },
+    /// A checkpoint whose collection runs while ONE transaction is pre-parked at
+    /// `BuildLogRecordStart` — its row versions are planted in MVCC but its end
+    /// timestamps are still `TxID(_)` (the speculative state). The trace's
+    /// `prepareTx@N@<ops>` lands BEFORE `checkpointStart` and the matching
+    /// `finalizeTx@N` lands AFTER `checkpointTruncateLog`, with no other
+    /// activity in between — the minimal pattern that surfaces the
+    /// speculative-tombstone misclassification (the buggy
+    /// `row_version.end.is_some()` routes a TxID-end through the delete path
+    /// even though the txn has not committed). `parked_ops` are the decoded
+    /// staged ops; `before`/`after` are the durable contents at ckpt start /
+    /// after the finalize.
+    CheckpointWithParked {
+        parked_ops: Vec<MbtOp>,
+        after: Vec<(i64, i64)>,
+        mode: String,
+    },
+}
+
+/// Parse the `<k>:<v>:<d>,...` payload of a `prepareTx@<txId>@<payload>` action
+/// token into the staged ops. A `<d>=1` is a delete (tombstone), `<d>=0` is a
+/// write (insert/update). The sentinel `"-"` means an empty op set.
+fn decode_staged_ops(s: &str) -> Vec<MbtOp> {
+    if s == "-" {
+        return Vec::new();
+    }
+    s.split(',')
+        .map(|t| {
+            let mut parts = t.split(':');
+            let k: i64 = parts.next().unwrap().parse().unwrap();
+            let v: i64 = parts.next().unwrap().parse().unwrap();
+            let d: i64 = parts.next().unwrap().parse().unwrap();
+            if d == 1 {
+                MbtOp::Delete { key: k }
+            } else {
+                MbtOp::Write { key: k, value: v }
+            }
+        })
+        .collect()
+}
+
+/// Extract `(tx_id, ops)` from a `prepareTx@<txId>@<payload>` action token,
+/// or `None` if the action is not a prepareTx.
+fn parse_prepare_tx(action: &str) -> Option<(u64, Vec<MbtOp>)> {
+    let rest = action.strip_prefix("prepareTx@")?;
+    let (id_s, ops_s) = rest.split_once('@')?;
+    Some((id_s.parse().ok()?, decode_staged_ops(ops_s)))
+}
+
+/// Extract the txId from a `finalizeTx@<txId>` action token, or `None`.
+fn parse_finalize_tx(action: &str) -> Option<u64> {
+    action.strip_prefix("finalizeTx@")?.parse().ok()
 }
 
 /// Map a trace's mode tag to the engine `CheckpointMode`.
@@ -14090,57 +14262,152 @@ fn mbt_checkpoint_mode(mode: &str) -> CheckpointMode {
 /// Group a raw trace into episodes. A commit's op is derived from the contents
 /// change; a no-op commit (delete of an absent key) is dropped. Commits between a
 /// `checkpointStart` and its `checkpointTruncateLog` are the interleaved ops.
+///
+/// The model represents a transaction as `prepareTx@<txId>@<ops>` (plants ops as
+/// IN-FLIGHT row versions: insert → begin = TxID, delete → end = TxID) followed
+/// by `finalizeTx@<txId>` (assigns a commit timestamp, materializes). The Python
+/// generator collapses adjacent prepare+finalize pairs into a single `commit`
+/// when nothing interleaves them; the EXPLICIT pairs remain when a checkpoint
+/// step lands between them — the case where speculative state (`TxID`-end
+/// tombstones in particular) becomes observable to a passive checkpoint. This
+/// pass keeps grouping observation: the txn's ops are applied AT finalize time
+/// (derived from the contents diff between the previous step and this one,
+/// since the model leaves `committed` untouched at prepareTx), and slotted into
+/// the surrounding episode (standalone Commit or interleaved into the active
+/// Checkpoint). Bug fidelity — actually parking a real connection at
+/// BuildLogRecordStart so the checkpoint observes the in-flight state — is the
+/// next layer; this layer only restores parseability of the new trace format.
 fn mbt_episodes(steps: &[MbtStep]) -> Vec<MbtEpisode> {
+    // Detect the minimal pre-parked-checkpoint pattern with a lookahead and
+    // skip its steps in the main loop:
+    //   prepareTx@N@<ops>  → checkpointStart:<mode> → checkpointFillWal →
+    //   checkpointBackfillDb → checkpointTruncateLog → finalizeTx@N
+    // (no other actions interleaved between prepareTx and finalizeTx). This
+    // produces a `CheckpointWithParked` episode for the exact pattern that
+    // surfaces the speculative-tombstone misclassification — every other shape
+    // (no pre-parked txn, multiple pre-parked, mid-window prepares) falls
+    // through to the existing Checkpoint episode with the old atomic-commit
+    // approximation.
+    let parked = detect_pre_parked_windows(steps);
+
     let mut eps = Vec::new();
     let mut prev: Vec<(i64, i64)> = Vec::new();
     let mut in_ckpt = false;
     let mut snapshot_before: Vec<(i64, i64)> = Vec::new();
     let mut interleaved: Vec<Vec<MbtOp>> = Vec::new();
     let mut ckpt_mode = String::new();
-    for step in steps {
+    let mut skip_until: Option<usize> = None;
+    for (i, step) in steps.iter().enumerate() {
+        if let Some(end) = skip_until {
+            if i < end {
+                prev = step.contents.clone();
+                continue;
+            }
+            skip_until = None;
+        }
+        if let Some(pw) = parked.get(&i) {
+            // Pattern starts here. Emit the episode using the contents after
+            // the trailing finalize step. Skip steps in [i, finalize_idx].
+            eps.push(MbtEpisode::CheckpointWithParked {
+                parked_ops: pw.ops.clone(),
+                after: steps[pw.finalize_idx].contents.clone(),
+                mode: pw.mode.clone(),
+            });
+            skip_until = Some(pw.finalize_idx + 1);
+            prev = steps[pw.finalize_idx].contents.clone();
+            continue;
+        }
         let action = step.action.as_str();
-        match action {
-            "init" => {}
-            "commit" => {
-                let txn = mbt_diff_txn(&prev, &step.contents);
-                if !txn.is_empty() {
-                    if in_ckpt {
-                        interleaved.push(txn);
-                    } else {
-                        eps.push(MbtEpisode::Commit {
-                            ops: txn,
-                            before: prev.clone(),
-                            after: step.contents.clone(),
-                        });
-                    }
+        if action == "init" || action.starts_with("prepareTx@") {
+            // prepareTx plants in-flight row versions but does NOT change the
+            // `committed` set — the txn becomes observable only at finalizeTx.
+            // Episode grouping happens at finalize; here it is a no-op. `init`
+            // is also a no-op.
+        } else if action == "commit" || action.starts_with("finalizeTx@") {
+            let txn = mbt_diff_txn(&prev, &step.contents);
+            if !txn.is_empty() {
+                if in_ckpt {
+                    interleaved.push(txn);
+                } else {
+                    eps.push(MbtEpisode::Commit {
+                        ops: txn,
+                        before: prev.clone(),
+                        after: step.contents.clone(),
+                    });
                 }
-                // else: no-op commit (only same-value rewrites / deletes of absent
-                // keys) — invisible in the contents, nothing to replay.
             }
-            a if a.starts_with("checkpointStart") => {
-                in_ckpt = true;
-                snapshot_before = prev.clone();
-                interleaved.clear();
-                ckpt_mode = a
-                    .strip_prefix("checkpointStart:")
-                    .unwrap_or("passive")
-                    .to_string();
-            }
-            "checkpointFillWal" | "checkpointBackfillDb" => {}
-            "checkpointTruncateLog" => {
-                in_ckpt = false;
-                eps.push(MbtEpisode::Checkpoint {
-                    interleaved: std::mem::take(&mut interleaved),
-                    before: snapshot_before.clone(),
-                    after: step.contents.clone(),
-                    mode: std::mem::take(&mut ckpt_mode),
-                });
-            }
-            other => panic!("unknown trace action {other}"),
+            // else: no-op commit (only same-value rewrites / deletes of absent
+            // keys) — invisible in the contents, nothing to replay.
+        } else if action.starts_with("checkpointStart") {
+            in_ckpt = true;
+            snapshot_before = prev.clone();
+            interleaved.clear();
+            ckpt_mode = action
+                .strip_prefix("checkpointStart:")
+                .unwrap_or("passive")
+                .to_string();
+        } else if action == "checkpointFillWal" || action == "checkpointBackfillDb" {
+        } else if action == "checkpointTruncateLog" {
+            in_ckpt = false;
+            eps.push(MbtEpisode::Checkpoint {
+                interleaved: std::mem::take(&mut interleaved),
+                before: snapshot_before.clone(),
+                after: step.contents.clone(),
+                mode: std::mem::take(&mut ckpt_mode),
+            });
+        } else {
+            panic!("unknown trace action {action}");
         }
         prev = step.contents.clone();
     }
     eps
+}
+
+/// A `prepareTx ... ckpt-cycle ... finalizeTx` window detected in a trace —
+/// the minimal pre-parked pattern that exercises the speculative-tombstone
+/// path. Indexed by the prepareTx step's position so the main loop can skip
+/// the whole window after emitting a `CheckpointWithParked` episode.
+struct PreParkedWindow {
+    ops: Vec<MbtOp>,
+    mode: String,
+    finalize_idx: usize,
+}
+
+fn detect_pre_parked_windows(steps: &[MbtStep]) -> std::collections::BTreeMap<usize, PreParkedWindow> {
+    let mut out = std::collections::BTreeMap::new();
+    for (i, step) in steps.iter().enumerate() {
+        let Some((tx_id, ops)) = parse_prepare_tx(&step.action) else {
+            continue;
+        };
+        // Require the EXACT 5-step trailing sequence with nothing else in
+        // between: checkpointStart:passive → checkpointFillWal →
+        // checkpointBackfillDb → checkpointTruncateLog → finalizeTx@<tx_id>.
+        // Only `passive` checkpoints are non-blocking; full/restart/truncate
+        // block writers for the entire checkpoint, so an in-flight txn would
+        // (correctly) make the engine return `Busy`. The bug we want to
+        // catch — speculative TxID-end versions being misclassified — fires
+        // only in the off-lock collection phase of a passive checkpoint.
+        if i + 5 >= steps.len() {
+            continue;
+        }
+        if steps[i + 1].action != "checkpointStart:passive"
+            || steps[i + 2].action != "checkpointFillWal"
+            || steps[i + 3].action != "checkpointBackfillDb"
+            || steps[i + 4].action != "checkpointTruncateLog"
+            || parse_finalize_tx(&steps[i + 5].action) != Some(tx_id)
+        {
+            continue;
+        }
+        out.insert(
+            i,
+            PreParkedWindow {
+                ops,
+                mode: "passive".to_string(),
+                finalize_idx: i + 5,
+            },
+        );
+    }
+    out
 }
 
 /// A trailing, never-completed checkpoint: a trace cut at MAX_STEPS may end while
@@ -14168,26 +14435,23 @@ fn mbt_trailing_checkpoint(steps: &[MbtStep]) -> Option<MbtTrailing> {
     let mut mode = String::new();
     for step in steps {
         let a = step.action.as_str();
-        match a {
-            "commit" => {
-                if in_ckpt {
-                    let txn = mbt_diff_txn(&prev, &step.contents);
-                    if !txn.is_empty() {
-                        interleaved.push(txn);
-                    }
+        if a == "commit" || a.starts_with("finalizeTx@") {
+            if in_ckpt {
+                let txn = mbt_diff_txn(&prev, &step.contents);
+                if !txn.is_empty() {
+                    interleaved.push(txn);
                 }
             }
-            x if x.starts_with("checkpointStart") => {
-                in_ckpt = true;
-                before = prev.clone();
-                interleaved.clear();
-                mode = x
-                    .strip_prefix("checkpointStart:")
-                    .unwrap_or("passive")
-                    .to_string();
-            }
-            "checkpointTruncateLog" => in_ckpt = false,
-            _ => {}
+        } else if a.starts_with("checkpointStart") {
+            in_ckpt = true;
+            before = prev.clone();
+            interleaved.clear();
+            mode = a
+                .strip_prefix("checkpointStart:")
+                .unwrap_or("passive")
+                .to_string();
+        } else if a == "checkpointTruncateLog" {
+            in_ckpt = false;
         }
         prev = step.contents.clone();
     }
@@ -14408,6 +14672,20 @@ fn mbt_build_prefix(
                             "[mbt prefix] interleaved txn failed: {txn:?}"
                         );
                     }
+                }
+                MbtEpisode::CheckpointWithParked {
+                    parked_ops, mode, ..
+                } => {
+                    // Reproduce the trace's effect on `committed`: apply the
+                    // parked txn atomically, then run the checkpoint. The bug
+                    // fidelity (actually parking the txn at BuildLogRecordStart
+                    // while the checkpoint runs) lives in the dedicated crash
+                    // helper; a prefix only needs the same final contents.
+                    assert!(
+                        mbt_apply_txn(&conn, parked_ops),
+                        "[mbt prefix] parked txn failed: {parked_ops:?}"
+                    );
+                    conn.checkpoint(mbt_checkpoint_mode(mode)).unwrap();
                 }
             }
         }
@@ -15050,6 +15328,188 @@ fn mbt_crash_test_checkpoint_concurrent(
     }
 }
 
+/// Crash-test a `CheckpointWithParked` episode: the trace had a `prepareTx@N`
+/// immediately before `checkpointStart` and the matching `finalizeTx@N`
+/// immediately after `checkpointTruncateLog`, so the txn's row versions are
+/// planted in MVCC with `end = TxID(_)` (the speculative state) for the entire
+/// duration of the checkpoint's collection. The checkpoint MUST treat such a
+/// TxID-end as "no committed end yet" (skip the version); the buggy classifier
+/// `row_version.end.is_some()` instead routes the speculative tombstone through
+/// `delete_row_from_pager` and fails on the not-yet-checkpointed btree.
+///
+/// The harness drives this on the real engine: a second connection BEGINs,
+/// stages the parked ops, prepares COMMIT, and parks the statement at
+/// `CommitYieldPoint::BuildLogRecordStart` (the engine yield BEFORE
+/// `step_build_log_record` rewrites `TxID`-ends to `Timestamp`-ends). With the
+/// statement parked, the checkpoint is run on a third connection; finally the
+/// statement is resumed to Done, the DB is reopened, and we assert that the
+/// recovered contents match the trace's `after`. No crash injection here: the
+/// bug fires inside `conn.checkpoint(_)` itself.
+fn mbt_crash_test_checkpoint_with_parked(
+    trace_idx: usize,
+    eps: &[MbtEpisode],
+    ep_i: usize,
+    parked_ops: &[MbtOp],
+    after: &[(i64, i64)],
+    mode: &str,
+    case_seed: &mut u64,
+) {
+    let expected_after = mbt_expected_rows(after);
+    for r in 0..MBT_RANDOM_RUNS {
+        let ci = *case_seed;
+        *case_seed += 1;
+        let ctx =
+            format!("trace {trace_idx} ep {ep_i} parked-ckpt({mode}) run={r} case={ci}");
+        let path = format!("/mbt_parked_{ci}.db");
+        let crash_io = Arc::new(super::crash_io::CrashIO::new());
+        let db = mbt_build_prefix(&path, &crash_io, eps, ep_i);
+
+        let parked_conn = db
+            .connect()
+            .unwrap_or_else(|e| panic!("[{ctx}] parked connect: {e:?}"));
+        let pager = parked_conn.pager.load().clone();
+        let pager_io = pager.io.clone();
+        if parked_conn.execute("BEGIN").is_err() {
+            drop(parked_conn);
+            drop(db);
+            continue;
+        }
+        let mut all_staged = true;
+        for &op in parked_ops {
+            if !mbt_apply_op(&parked_conn, op) {
+                all_staged = false;
+                break;
+            }
+        }
+        if !all_staged {
+            let _ = parked_conn.execute("ROLLBACK");
+            drop(parked_conn);
+            drop(db);
+            continue;
+        }
+        let mut stmt = match parked_conn.prepare("COMMIT") {
+            Ok(s) => s,
+            Err(_) => {
+                drop(parked_conn);
+                drop(db);
+                continue;
+            }
+        };
+        match mbt_advance_commit(
+            &parked_conn,
+            &mut stmt,
+            CommitYieldPoint::BuildLogRecordStart,
+            pager_io.as_ref(),
+        ) {
+            MbtAdvance::Parked => {}
+            // BuildLogRecordStart never fired (e.g. the txn had nothing to log)
+            // or the commit faulted: nothing for this run to test.
+            MbtAdvance::Done | MbtAdvance::Faulted => {
+                drop(stmt);
+                drop(parked_conn);
+                drop(db);
+                continue;
+            }
+        }
+
+        // Drive the checkpoint state machine directly to its LAST unlocked
+        // yield point (`BeforeAcquireLock`) — the bug we want to catch lives
+        // in the OFF-LOCK collection phase (`row_version.end.is_some()` in
+        // `Collect`), which happens before that gate. The parked commit
+        // holds a `blocking_checkpoint_lock.read()` until it finalizes, so
+        // advancing past `BeforeAcquireLock` here would Busy — and a
+        // `conn.checkpoint(_)` would Busy even earlier on the same gate. We
+        // mirror `run_checkpoint_with_scheduled_interleaving`: freeze the
+        // checkpoint off-lock with the writer still parked, then resume the
+        // writer, then resume the checkpoint to completion.
+        let ckpt_conn = db
+            .connect()
+            .unwrap_or_else(|e| panic!("[{ctx}] ckpt connect: {e:?}"));
+        let mvstore = db
+            .get_mv_store()
+            .clone()
+            .unwrap_or_else(|| panic!("[{ctx}] no mvstore"));
+        let ckpt_pager = ckpt_conn.pager.load().clone();
+        let mut sm = CheckpointStateMachine::new(
+            ckpt_pager.clone(),
+            mvstore,
+            ckpt_conn.clone(),
+            true,
+            ckpt_conn.get_sync_mode(),
+            mbt_checkpoint_mode(mode),
+        );
+        match mbt_advance_ckpt(
+            &mut sm,
+            &ckpt_conn,
+            Some(CheckpointYieldPoint::BeforeAcquireLock),
+            ckpt_pager.io.as_ref(),
+        ) {
+            MbtAdvance::Parked => {}
+            MbtAdvance::Done => {
+                // Checkpoint finished entirely in its unlocked phase (no rows
+                // to publish?) — nothing to test further.
+                drop(sm);
+                drop(stmt);
+                drop(parked_conn);
+                drop(ckpt_conn);
+                drop(db);
+                continue;
+            }
+            MbtAdvance::Faulted => {
+                panic!(
+                    "[{ctx}] checkpoint faulted off-lock with parked TxID-end versions \
+                     in MVCC (the speculative-tombstone path)"
+                );
+            }
+        }
+
+        // Resume the parked commit to Done — this releases its
+        // `blocking_checkpoint_lock.read()` so the checkpoint's locked phase
+        // can proceed.
+        for _ in 0..200_000 {
+            match stmt.step() {
+                Ok(StepResult::Done) => break,
+                Ok(StepResult::IO) => {
+                    if pager_io.step().is_err() {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        drop(stmt);
+        drop(parked_conn);
+
+        // Finish the checkpoint's locked phase + Finalize.
+        match mbt_advance_ckpt(&mut sm, &ckpt_conn, None, ckpt_pager.io.as_ref()) {
+            MbtAdvance::Done => {}
+            MbtAdvance::Parked => panic!(
+                "[{ctx}] checkpoint unexpectedly parked after BeforeAcquireLock with \
+                 no injector"
+            ),
+            MbtAdvance::Faulted => panic!(
+                "[{ctx}] checkpoint faulted in its locked phase after the parked \
+                 commit finalized"
+            ),
+        }
+        drop(sm);
+        drop(ckpt_conn);
+        drop(db);
+
+        let db2 = Database::open_file(crash_io.clone(), &path)
+            .unwrap_or_else(|e| panic!("[{ctx}] reopen: {e:?}"));
+        let conn2 = db2
+            .connect()
+            .unwrap_or_else(|e| panic!("[{ctx}] recovery/connect: {e:?}"));
+        let visible = mbt_visible_rows(&conn2);
+        assert_eq!(
+            visible, expected_after,
+            "[{ctx}] parked-ckpt did not converge to expected contents"
+        );
+        mbt_assert_consistent(&conn2, visible.len(), &ctx);
+    }
+}
+
 /// Crash-test recovery itself on the full sequence: replay the whole trace to a
 /// recovery-requiring state, reopen with a fault armed at every recovery IO so
 /// recovery aborts mid-flight, apply the durability crash, reopen cleanly, and
@@ -15155,9 +15615,11 @@ fn test_mbt_checkpoint_traces_match_spec() {
             continue;
         }
         let final_committed: Vec<(i64, i64)> = match eps.last() {
-            Some(MbtEpisode::Commit { after, .. } | MbtEpisode::Checkpoint { after, .. }) => {
-                after.clone()
-            }
+            Some(
+                MbtEpisode::Commit { after, .. }
+                | MbtEpisode::Checkpoint { after, .. }
+                | MbtEpisode::CheckpointWithParked { after, .. },
+            ) => after.clone(),
             None => Vec::new(),
         };
         // Targets: 0..n crash episode i; n = crash full-trace recovery; n+1 =
@@ -15221,6 +15683,23 @@ fn test_mbt_checkpoint_traces_match_spec() {
                                 &mut agg,
                             );
                         }
+                    }
+                    MbtEpisode::CheckpointWithParked {
+                        parked_ops,
+                        after,
+                        mode,
+                        ..
+                    } => {
+                        modes_seen.insert(mode.clone());
+                        mbt_crash_test_checkpoint_with_parked(
+                            ti,
+                            &eps,
+                            target,
+                            parked_ops,
+                            after,
+                            mode,
+                            &mut case_seed,
+                        );
                     }
                 }
             } else if target == n {
