@@ -86,6 +86,19 @@ pub enum Operation {
     },
     /// Drop an index
     DropIndex { sql: String, index_name: String },
+    /// Issue an `ALTER TABLE ... RENAME COLUMN ...`. Carries the structured
+    /// rename info so `apply_state_changes` can update `sim_state.tables`
+    /// to match the post-rename schema; otherwise subsequent random queries
+    /// generated against the OLD column name produce parse errors that the
+    /// init-op fallback at lib.rs:897 doesn't tolerate. The point is to
+    /// exercise the schema-row-rewrite path in the checkpoint state machine
+    /// (`is_schema_metadata_only_rewrite` at checkpoint_state_machine.rs:724
+    /// has zero coverage otherwise).
+    AlterRenameColumn {
+        table_name: String,
+        old_col: String,
+        new_col: String,
+    },
     /// Create Elle list table for consistency checking
     CreateElleTable { table_name: String },
     /// Append value to an Elle list key
@@ -146,6 +159,13 @@ impl Operation {
             Operation::Delete { sql } => sql.clone(),
             Operation::CreateIndex { sql, .. } => sql.clone(),
             Operation::DropIndex { sql, .. } => sql.clone(),
+            Operation::AlterRenameColumn {
+                table_name,
+                old_col,
+                new_col,
+            } => {
+                format!("ALTER TABLE {table_name} RENAME COLUMN {old_col} TO {new_col}")
+            }
             Operation::CreateElleTable { table_name } => {
                 // Store values as comma-separated integers (e.g., "1,2,3")
                 // This avoids JSON function complexity while still being parseable
@@ -253,6 +273,26 @@ impl Operation {
             }
             Operation::DropIndex { index_name, .. } => {
                 sim_state.indexes.remove(index_name);
+            }
+            Operation::AlterRenameColumn {
+                table_name,
+                old_col,
+                new_col,
+            } => {
+                // Mirror the rename in `sim_state.tables` so subsequent
+                // generators reference the NEW column name. Without this,
+                // every random Select/Update/Insert that picks the renamed
+                // column produces a parse-time "invalid expression" that
+                // the init-op fallback (lib.rs:897) doesn't tolerate.
+                if let Some(table) = sim_state.tables.get(table_name).cloned() {
+                    let mut table = table;
+                    for c in table.columns.iter_mut() {
+                        if c.name == *old_col {
+                            c.name = new_col.clone();
+                        }
+                    }
+                    sim_state.tables.insert(table_name.clone(), table);
+                }
             }
             Operation::CreateElleTable { table_name } => {
                 sim_state.elle_tables.insert(table_name.clone(), ());

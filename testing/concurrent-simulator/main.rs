@@ -348,14 +348,22 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
     } else {
         let w: Vec<(u32, Box<dyn Workload>)> = vec![
             (10, Box::new(IntegrityCheckWorkload)),
-            (5, Box::new(WalCheckpointWorkload)),
+            (12, Box::new(WalCheckpointWorkload)),
             (10, Box::new(CreateSimpleTableWorkload)),
             (20, Box::new(SimpleSelectWorkload)),
             (20, Box::new(SimpleInsertWorkload)),
+            // Random Insert::arbitrary covers richer schema shapes (more
+            // columns, types, conflict clauses) than SimpleInsertWorkload's
+            // fixed key/value table; exercises planner/codegen paths that
+            // interact with checkpoint timing.
+            (10, Box::new(InsertWorkload)),
             (15, Box::new(UpdateWorkload)),
             (15, Box::new(DeleteWorkload)),
-            (2, Box::new(CreateIndexWorkload)),
-            (2, Box::new(DropIndexWorkload)),
+            (5, Box::new(CreateIndexWorkload)),
+            (5, Box::new(DropIndexWorkload)),
+            // ALTER TABLE RENAME COLUMN — exercises the schema-row
+            // metadata-only-rewrite path in the checkpoint state machine.
+            (3, Box::new(AlterRenameColumnWorkload)),
             (30, Box::new(BeginWorkload)),
             (10, Box::new(CommitWorkload)),
             (10, Box::new(RollbackWorkload)),

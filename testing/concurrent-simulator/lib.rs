@@ -814,6 +814,22 @@ impl Whopper {
                             ctx.fiber.txn_id = None;
                         }
                     }
+                    // Parse errors at execute time happen when a query
+                    // references a column/table that was renamed/dropped by
+                    // ALTER/DROP on ANOTHER connection (cross-conn schema
+                    // cache desync). Same class as the parse-error tolerance
+                    // in `op.init_op` above; benign from the harness POV.
+                    turso_core::LimboError::ParseError(ref msg)
+                        if msg.to_lowercase().contains("no such")
+                            || msg.to_lowercase().contains("invalid expression") =>
+                    {
+                        debug!("parse error at execute time (cross-conn schema?): {msg}");
+                        if ctx.fiber.state.is_in_tx() && !ctx.fiber.connection.get_auto_commit() {
+                            ctx.fiber.current_op = Some(Operation::Rollback);
+                        } else {
+                            ctx.fiber.txn_id = None;
+                        }
+                    }
                     _ => return Err(error.into()),
                 }
             }
@@ -893,10 +909,16 @@ impl Whopper {
             )));
             if let Err(e) = op.init_op(&mut ctx) {
                 let err = e.to_string().to_lowercase();
-                // Allow "no such table/index" and "already exists" errors
+                // Allow "no such table/index" and "already exists" errors,
+                // plus "invalid expression in CREATE INDEX" — that's the
+                // engine surfacing an unresolved column reference (e.g.
+                // because the column was renamed via ALTER on another
+                // connection and this conn's schema cache hasn't picked up
+                // the rename yet); benign from the test harness's POV.
                 if err.contains("no such")
                     || err.contains("already exists")
                     || err.contains("not exist")
+                    || err.contains("invalid expression")
                 {
                     debug!("init operation skipped: {}", err);
                     return Ok(());

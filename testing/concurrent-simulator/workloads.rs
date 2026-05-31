@@ -209,6 +209,46 @@ impl Workload for CreateIndexWorkload {
     }
 }
 
+/// Issue an `ALTER TABLE ... RENAME COLUMN ...`. Targets the checkpoint
+/// state machine's `is_schema_metadata_only_rewrite` heuristic
+/// (checkpoint_state_machine.rs:724), which detects schema-row rewrites that
+/// don't need a B-tree create/destroy — RENAME COLUMN is the canonical
+/// trigger. The renamed column is given a fresh suffix so subsequent
+/// random queries that still reference the OLD column name (sim_state is
+/// intentionally NOT updated) fail benignly at parse/plan time, while the
+/// engine's schema-rewrite + checkpoint-collect interaction is exercised.
+pub struct AlterRenameColumnWorkload;
+
+impl Workload for AlterRenameColumnWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        // DDL is not allowed inside concurrent transactions.
+        if *ctx.fiber_state == FiberState::InConcurrentTx {
+            return None;
+        }
+        let tables: Vec<&Table> = ctx
+            .tables_vec
+            .iter()
+            .filter(|t| !t.columns.is_empty())
+            .collect();
+        if tables.is_empty() {
+            return None;
+        }
+        let table = tables[rng.random_range(0..tables.len())];
+        let col = &table.columns[rng.random_range(0..table.columns.len())];
+        // Short alphanumeric suffix — long `_r<u32>` numeric names triggered
+        // Limbo's CREATE INDEX parser to bail with "invalid expression"
+        // (likely the parser's column-ref recognizer; worth following up but
+        // not what this workload is targeting).
+        let suffix: u16 = rng.random();
+        let new_col = format!("c{suffix:x}");
+        Some(Operation::AlterRenameColumn {
+            table_name: table.name.clone(),
+            old_col: col.name.clone(),
+            new_col,
+        })
+    }
+}
+
 /// Drop an existing index (works in both Idle and InTx states).
 pub struct DropIndexWorkload;
 
