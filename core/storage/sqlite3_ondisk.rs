@@ -44,6 +44,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use crate::{
+    alloc::*,
     io_yield_one, turso_assert, turso_assert_eq, turso_assert_greater_than,
     types::{IOCompletions, IOResult},
     util::IOExt as _,
@@ -684,68 +685,87 @@ pub fn write_pages_vectored(
     let runs_left = Arc::new(AtomicUsize::new(run_count));
 
     const EST_BUFF_CAPACITY: usize = 32;
-    let mut run_bufs = Vec::with_capacity(EST_BUFF_CAPACITY);
-    let mut run_start_id: Option<usize> = None;
-    let mut completions = Vec::with_capacity(run_count);
+    let mut completions = Vec::try_with_capacity_ext(run_count).inspect_err(|_| {
+        let _ = err.set(CompletionError::Aborted);
+        done_flag.store(true, Ordering::Release);
+    })?;
 
-    let mut iter = batch.iter().peekable();
-    while let Some((id, buffer)) = iter.next() {
-        if run_start_id.is_none() {
-            run_start_id = Some(*id);
-        }
-        run_bufs.push(buffer.clone());
-
-        let is_end_of_run = iter.peek().is_none_or(|(next_id, _)| **next_id != id + 1);
-        if !is_end_of_run {
-            continue;
-        }
-
-        let start_id = run_start_id.take().expect("start id");
-        let runs_left_cl = runs_left.clone();
-        let done_cl = done_flag.clone();
-        let err_cl = err.clone();
-
-        let expected_bytes = (page_sz * run_bufs.len()) as i32;
-
-        let cmp = Completion::new_write(move |res| {
-            // Record error/mismatch, but always resolve the batch progress.
-            match res {
-                Ok(n) => {
-                    if n != expected_bytes {
-                        let _ = err_cl.set(CompletionError::ShortWrite);
-                        tracing::error!(
-                            "write_pages_vectored: short write: wrote({n}) != expected({expected_bytes})"
-                        );
-                    }
-                }
+    macro_rules! fail_run_if_err {
+        ($val:expr) => {
+            match $val {
+                Ok(val) => val,
                 Err(e) => {
-                    tracing::error!("write_pages_vectored: write error: {:?}", e);
-                    let _ = err_cl.set(e);
+                    // We failed to submit this run at all. Mark batch failed+done and cancel already-submitted.
+                    let _ = err.set(CompletionError::Aborted);
+                    done_flag.store(true, Ordering::Release);
+                    pager.io.cancel(&completions)?;
+                    pager.io.drain_completions(&completions)?;
+                    return Err(e.into());
                 }
             }
-            // we have to decrement runs_left on both paths
-            if runs_left_cl.fetch_sub(1, Ordering::AcqRel) == 1 {
-                tracing::debug!("write_pages_vectored: run complete");
-                done_cl.store(true, Ordering::Release);
-            }
-        });
-        let io_ctx = pager.io_ctx.read();
-        let bufs = std::mem::replace(&mut run_bufs, Vec::with_capacity(EST_BUFF_CAPACITY));
-        match pager
-            .db_file
-            .write_pages(start_id, page_sz, bufs, &io_ctx, cmp)
-        {
-            Ok(c) => completions.push(c),
-            Err(e) => {
-                // We failed to submit this run at all. Mark batch failed+done and cancel already-submitted.
-                let _ = err.set(CompletionError::Aborted);
-                done_flag.store(true, Ordering::Release);
-                pager.io.cancel(&completions)?;
-                pager.io.drain_completions(&completions)?;
-                return Err(e);
-            }
+
         }
     }
+
+    let mut run_bufs = fail_run_if_err!(Vec::try_with_capacity_ext(EST_BUFF_CAPACITY));
+    let mut run_start_id: Option<usize> = None;
+
+    let mut iter = batch.iter().peekable();
+    let mut func = || {
+        while let Some((id, buffer)) = iter.next() {
+            if run_start_id.is_none() {
+                run_start_id = Some(*id);
+            }
+            // Most likely Preallocated enough to not use `try_push.
+            run_bufs.push(buffer.clone());
+
+            let is_end_of_run = iter.peek().is_none_or(|(next_id, _)| **next_id != id + 1);
+            if !is_end_of_run {
+                continue;
+            }
+
+            let start_id = run_start_id.take().expect("start id");
+            let runs_left_cl = runs_left.clone();
+            let done_cl = done_flag.clone();
+            let err_cl = err.clone();
+
+            let expected_bytes = (page_sz * run_bufs.len()) as i32;
+
+            let cmp = Completion::new_write(move |res| {
+                // Record error/mismatch, but always resolve the batch progress.
+                match res {
+                    Ok(n) => {
+                        if n != expected_bytes {
+                            let _ = err_cl.set(CompletionError::ShortWrite);
+                            tracing::error!(
+                            "write_pages_vectored: short write: wrote({n}) != expected({expected_bytes})"
+                        );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("write_pages_vectored: write error: {:?}", e);
+                        let _ = err_cl.set(e);
+                    }
+                }
+                // we have to decrement runs_left on both paths
+                if runs_left_cl.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    tracing::debug!("write_pages_vectored: run complete");
+                    done_cl.store(true, Ordering::Release);
+                }
+            });
+            let io_ctx = pager.io_ctx.read();
+            let replace_bufs = Vec::try_with_capacity_ext(EST_BUFF_CAPACITY)?;
+
+            let bufs = std::mem::replace(&mut run_bufs, replace_bufs);
+            let c = pager
+                .db_file
+                .write_pages(start_id, page_sz, bufs, &io_ctx, cmp)?;
+            // Preallocated enough to not use `try_push`
+            completions.push(c);
+        }
+        Ok::<_, LimboError>(())
+    };
+    fail_run_if_err!(func());
     Ok(completions)
 }
 
@@ -2207,6 +2227,7 @@ mod tests {
     use crate::Value;
 
     use super::*;
+    use crate::alloc::vec;
     use rstest::rstest;
 
     #[rstest]
@@ -2221,8 +2242,8 @@ mod tests {
     #[case(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18], SerialType::f64(), Value::from_f64(std::f64::consts::PI))]
     #[case(&[1, 2], SerialType::const_int0(), Value::from_i64(0))]
     #[case(&[65, 66], SerialType::const_int1(), Value::from_i64(1))]
-    #[case(&[1, 2, 3], SerialType::blob(3), Value::Blob(vec![1, 2, 3]))]
-    #[case(&[], SerialType::blob(0), Value::Blob(vec![]))] // empty blob
+    #[case(&[1, 2, 3], SerialType::blob(3), Value::Blob(self::vec![1, 2, 3]))]
+    #[case(&[], SerialType::blob(0), Value::Blob(self::vec![]))] // empty blob
     #[case(&[65, 66, 67], SerialType::text(3), Value::build_text("ABC"))]
     #[case(&[0x80], SerialType::i8(), Value::from_i64(-128))]
     #[case(&[0x80, 0], SerialType::i16(), Value::from_i64(-32768))]
