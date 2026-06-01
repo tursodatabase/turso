@@ -23,13 +23,25 @@ turso = "0.4.3"
 tokio = { version = "1.0", features = ["full"] }
 ```
 
-For cloud sync capabilities, enable the `sync` feature:
+For cloud sync capabilities, enable the `sync` feature. This uses OpenSSL by default.
 
 ```toml
 [dependencies]
 turso = { version = "0.4.3", features = ["sync"] }
 tokio = { version = "1.0", features = ["full"] }
 ```
+
+To use Rustls instead, disable default features and enable `sync-rustls`
+directly:
+
+```toml
+[dependencies]
+turso = { version = "0.4.3", default-features = false, features = ["sync-rustls"] }
+tokio = { version = "1.0", features = ["full"] }
+```
+
+If both sync TLS backends are enabled, the compatibility OpenSSL-backed
+transport is used.
 
 ## Quick Start
 

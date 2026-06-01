@@ -18,10 +18,21 @@ mimalloc = ["dep:mimalloc"]
 pure-rust-crypto = ["turso_sdk_kit/pure-rust-crypto", "turso_sync_sdk_kit/pure-rust-crypto"]
 fts = ["turso_sdk_kit/fts"]
 stacker = ["turso_core/stacker"]
-sync = [
+# Keep `sync` as the compatibility alias for the OpenSSL-backed transport.
+sync = ["sync-openssl"]
+sync-openssl = [
     "dep:hyper",
     "dep:tokio",
     "dep:hyper-tls",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:bytes",
+]
+sync-rustls = [
+    "dep:hyper",
+    "dep:tokio",
+    "dep:hyper-rustls",
+    "dep:rustls",
     "dep:hyper-util",
     "dep:http-body-util",
     "dep:bytes",
@@ -39,6 +50,13 @@ mimalloc = { workspace = true, optional = true }
 hyper = { version = "1.8.1", features = ["http1"], optional = true }
 tokio = { workspace = true, features = ["full"], optional = true }
 hyper-tls = { version = "0.6.0", optional = true }
+hyper-rustls = { version = "0.27.7", features = [
+    "http1",
+    "aws-lc-rs",
+    "tls12",
+    "webpki-tokio",
+], optional = true, default-features = false }
+rustls = { version = "0.23.35", features = ["aws_lc_rs", "std"], optional = true, default-features = false }
 hyper-util = { version = "0.1.19", features = [
     "http1",
     "tokio",
