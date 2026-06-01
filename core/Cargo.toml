@@ -182,6 +182,10 @@ name = "mvcc_benchmark"
 harness = false
 
 [[bench]]
+name = "mvcc_recovery_benchmark"
+harness = false
+
+[[bench]]
 name = "json_benchmark"
 harness = false
 
