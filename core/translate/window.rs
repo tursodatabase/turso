@@ -293,8 +293,13 @@ fn append_order_by(
             .push((Box::new(expr.clone()), *sort_order, nulls_order));
     }
 
-    let contains_aggregates =
-        resolve_window_and_aggregate_functions(expr, ctx.resolver, &mut plan.aggregates, None)?;
+    let contains_aggregates = resolve_window_and_aggregate_functions(
+        expr,
+        ctx.resolver,
+        &mut plan.aggregates,
+        None,
+        &mut [],
+    )?;
     rewrite_expr_as_subquery_column(expr, ctx, contains_aggregates);
     Ok(())
 }
@@ -396,7 +401,7 @@ fn push_into_source_subquery(
     ctx: &mut WindowSubqueryContext,
 ) -> crate::Result<()> {
     let contains_aggregates =
-        resolve_window_and_aggregate_functions(expr, ctx.resolver, aggregates, None)?;
+        resolve_window_and_aggregate_functions(expr, ctx.resolver, aggregates, None, &mut [])?;
     if expr_contains_nondeterministic_scalar_function(expr, ctx.resolver)? {
         push_new_subquery_column(expr, ctx, contains_aggregates);
     } else {

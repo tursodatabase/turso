@@ -1,6 +1,7 @@
 use crate::sync::Arc;
 use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
+use super::plan::NamedWindowBound;
 use super::{
     expr::{walk_expr, walk_expr_mut},
     plan::{
@@ -204,6 +205,7 @@ pub fn resolve_window_and_aggregate_functions(
     resolver: &Resolver,
     aggs: &mut Vec<Aggregate>,
     mut windows: Option<&mut Vec<Window>>,
+    named_windows: &mut [crate::translate::plan::NamedWindowDef],
 ) -> Result<bool> {
     let mut contains_aggregates = false;
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
@@ -261,6 +263,7 @@ pub fn resolve_window_and_aggregate_functions(
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
+                                named_windows,
                                 resolver,
                                 expr,
                                 AccumulatorFunc::Agg(f),
@@ -285,6 +288,7 @@ pub fn resolve_window_and_aggregate_functions(
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
+                                named_windows,
                                 resolver,
                                 expr,
                                 AccumulatorFunc::Window(f),
@@ -307,6 +311,7 @@ pub fn resolve_window_and_aggregate_functions(
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
                                     link_with_window(
                                         windows.as_deref_mut(),
+                                        named_windows,
                                         resolver,
                                         expr,
                                         AccumulatorFunc::Agg(func),
@@ -345,6 +350,7 @@ pub fn resolve_window_and_aggregate_functions(
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
+                                named_windows,
                                 resolver,
                                 expr,
                                 AccumulatorFunc::Agg(f),
@@ -369,6 +375,7 @@ pub fn resolve_window_and_aggregate_functions(
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
+                                named_windows,
                                 resolver,
                                 expr,
                                 AccumulatorFunc::Window(f),
@@ -406,6 +413,7 @@ pub fn resolve_window_and_aggregate_functions(
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
                                     link_with_window(
                                         windows.as_deref_mut(),
+                                        named_windows,
                                         resolver,
                                         expr,
                                         AccumulatorFunc::Agg(func),
@@ -441,8 +449,10 @@ pub fn resolve_window_and_aggregate_functions(
     Ok(contains_aggregates)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn link_with_window(
     windows: Option<&mut Vec<Window>>,
+    named_windows: &mut [crate::translate::plan::NamedWindowDef],
     resolver: &Resolver,
     expr: &Expr,
     func: AccumulatorFunc,
@@ -461,7 +471,18 @@ fn link_with_window(
     }
     expr_vector_size(expr)?;
     if let Some(windows) = windows {
-        let window = resolve_window(windows, over_clause)?;
+        // Every function carries a coerced frame (`WindowFunc::coerced_frame`
+        // for built-in window funcs, the default `RANGE UNBOUNDED PRECEDING
+        // TO CURRENT ROW` for aggregate window funcs). Functions whose
+        // coerced frames disagree cannot share a single ephemeral-table
+        // pass — see SQLite's invariant at window.c:1679 — so the planner
+        // groups them into separate `Window` entries.
+        let coerced_frame = match &func {
+            AccumulatorFunc::Window(w) => w.coerced_frame(),
+            AccumulatorFunc::Agg(_) => None,
+        }
+        .unwrap_or_default();
+        let window = resolve_window(windows, named_windows, over_clause, coerced_frame)?;
         // Two equivalent window expressions can share one `WindowFunction`
         // entry unless they contain nondeterministic calls like `random()`,
         // which SQLite evaluates separately at each SQL occurrence.
@@ -474,19 +495,8 @@ fn link_with_window(
         {
             return Ok(());
         }
-        use crate::translate::plan::{Frame, FrameBoundary};
-        use turso_parser::ast::FrameMode;
-        // Built-ins whose `coerced_frame()` returns `None` (first_value
-        // / last_value / nth_value), and aggregates, share the standard
-        // default frame.
-        let frame = match &func {
-            AccumulatorFunc::Window(w) => w.coerced_frame(),
-            AccumulatorFunc::Agg(_) => None,
-        }
-        .unwrap_or_default();
         window.functions.push(WindowFunction {
             func,
-            frame,
             original_expr: expr.clone(),
             rewritten: None,
         });
@@ -500,26 +510,63 @@ fn link_with_window(
     Ok(())
 }
 
-fn resolve_window<'a>(windows: &'a mut Vec<Window>, over_clause: &Over) -> Result<&'a mut Window> {
+/// Resolve the `Window` a function call should be attached to, given the
+/// function's coerced frame. Two functions can share a `Window` only when
+/// their OVER clauses are equivalent AND their coerced frames match —
+/// functions with the same OVER but conflicting frames get separate
+/// `Window` entries so each compiles to its own ephemeral-table pass.
+fn resolve_window<'a>(
+    windows: &'a mut Vec<Window>,
+    named_windows: &mut [crate::translate::plan::NamedWindowDef],
+    over_clause: &Over,
+    frame: crate::translate::plan::Frame,
+) -> Result<&'a mut Window> {
     match over_clause {
         Over::Window(window) => {
-            if let Some(idx) = windows.iter().position(|w| w.is_equivalent(window)) {
+            if let Some(idx) = windows.iter().position(|w| w.is_equivalent(window, &frame)) {
                 return Ok(&mut windows[idx]);
             }
-
-            windows.push(Window::new(None, window)?);
+            windows.push(Window::new_unnamed(window, frame)?);
             Ok(windows.last_mut().expect("just pushed, so must exist"))
         }
         Over::Name(name) => {
             let window_name = normalize_ident(name.as_str());
-            // When multiple windows share the same name, SQLite uses the most recent
-            // definition. Iterate in reverse so we find the last definition first.
-            for window in windows.iter_mut().rev() {
-                if window.name.as_ref() == Some(&window_name) {
-                    return Ok(window);
-                }
+            // Reuse an existing resolved entry with the same name AND
+            // frame so functions sharing one coerced frame fold into one
+            // ephemeral-table pass. SQLite uses the most recent
+            // definition when names collide, so iterate in reverse.
+            if let Some(idx) = windows
+                .iter()
+                .rposition(|w| w.name.as_ref() == Some(&window_name) && w.frame == frame)
+            {
+                return Ok(&mut windows[idx]);
             }
-            crate::bail_parse_error!("no such window: {}", window_name);
+            // Need a new resolved entry. Verify the name exists.
+            let def = named_windows
+                .iter_mut()
+                .rfind(|d| d.name == window_name)
+                .ok_or_else(|| {
+                    crate::LimboError::ParseError(format!("no such window: {window_name}"))
+                })?;
+            // First attachment under this name takes ownership of the
+            // bound exprs. Subsequent distinct-frame
+            // attachments deep-clone from a sister resolved Window —
+            // the first attachment guarantees one exists.
+            let bound = match def.bound.take() {
+                Some(bound) => bound,
+                None => {
+                    let sister = windows
+                        .iter()
+                        .rfind(|w| w.name.as_ref() == Some(&window_name))
+                        .expect("sister Window must exist after the named def was taken");
+                    NamedWindowBound {
+                        partition_by: sister.partition_by.clone(),
+                        order_by: sister.order_by.clone(),
+                    }
+                }
+            };
+            windows.push(Window::from_named_bound(window_name, bound, frame));
+            Ok(windows.last_mut().expect("just pushed, so must exist"))
         }
     }
 }

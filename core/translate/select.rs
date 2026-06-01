@@ -1,7 +1,7 @@
 use super::emitter::{emit_program, TranslateCtx};
 use super::plan::{
-    select_star, Distinctness, InSeekSource, JoinOrderMember, Operation, OuterQueryReference,
-    QueryDestination, Search, TableReferences, Window,
+    select_star, Distinctness, InSeekSource, JoinOrderMember, NamedWindowBound, NamedWindowDef,
+    Operation, OuterQueryReference, QueryDestination, Search, TableReferences, Window,
 };
 use crate::schema::Table;
 use crate::stack::trace_stack;
@@ -26,6 +26,7 @@ use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
 use std::borrow::Cow;
 use turso_parser::ast::ResultColumn;
+use turso_parser::ast::SortOrder;
 use turso_parser::ast::{self, CompoundSelect, Expr};
 
 /// Maximum number of columns in a result set.
@@ -368,14 +369,36 @@ fn prepare_one_select_plan(
                 phantom_params: vec![],
             };
 
-            let mut windows = Vec::with_capacity(window_clause.len());
+            let mut windows: Vec<Window> = Vec::new();
+            let mut named_windows: Vec<NamedWindowDef> = Vec::with_capacity(window_clause.len());
             {
                 trace_stack!("bind_windows");
                 for window_def in window_clause.iter() {
+                    if !Window::is_default_frame_spec(&window_def.window.frame_clause) {
+                        crate::bail_parse_error!(
+                            "Custom frame specifications are not supported yet"
+                        );
+                    }
                     let name = normalize_ident(window_def.name.as_str());
-                    let mut window = Window::new(Some(name), &window_def.window)?;
-
-                    for expr in window.partition_by.iter_mut() {
+                    let mut partition_by: Vec<_> = window_def
+                        .window
+                        .partition_by
+                        .iter()
+                        .map(|arg| *arg.clone())
+                        .collect();
+                    let mut order_by: Vec<_> = window_def
+                        .window
+                        .order_by
+                        .iter()
+                        .map(|col| {
+                            (
+                                *col.expr.clone(),
+                                col.order.unwrap_or(SortOrder::Asc),
+                                col.nulls,
+                            )
+                        })
+                        .collect();
+                    for expr in partition_by.iter_mut() {
                         bind_and_rewrite_expr(
                             expr,
                             Some(&mut plan.table_references),
@@ -384,7 +407,7 @@ fn prepare_one_select_plan(
                             BindingBehavior::ResultColumnsNotAllowed,
                         )?;
                     }
-                    for (expr, _, _) in window.order_by.iter_mut() {
+                    for (expr, _, _) in order_by.iter_mut() {
                         bind_and_rewrite_expr(
                             expr,
                             Some(&mut plan.table_references),
@@ -393,8 +416,13 @@ fn prepare_one_select_plan(
                             BindingBehavior::ResultColumnsNotAllowed,
                         )?;
                     }
-
-                    windows.push(window);
+                    named_windows.push(NamedWindowDef {
+                        name,
+                        bound: Some(NamedWindowBound {
+                            partition_by,
+                            order_by,
+                        }),
+                    });
                 }
             }
 
@@ -502,6 +530,7 @@ fn prepare_one_select_plan(
                                 resolver,
                                 &mut aggregate_expressions,
                                 Some(&mut windows),
+                                &mut named_windows,
                             )?;
                             let (alias, implicit_column_name) = match &maybe_alias {
                                 Some(ast::As::As(name)) | Some(ast::As::Elided(name)) => {
@@ -639,6 +668,7 @@ fn prepare_one_select_plan(
                         resolver,
                         &mut plan.aggregates,
                         Some(&mut windows),
+                        &mut named_windows,
                     )?;
 
                     // SQLite rejects aggregate functions in ORDER BY when the query
@@ -1643,7 +1673,13 @@ fn process_having_clause(
             resolver,
             BindingBehavior::TryResultColumnsFirst,
         )?;
-        resolve_window_and_aggregate_functions(expr, resolver, aggregate_expressions, None)?;
+        resolve_window_and_aggregate_functions(
+            expr,
+            resolver,
+            aggregate_expressions,
+            None,
+            &mut [],
+        )?;
     }
 
     Ok(predicates)
