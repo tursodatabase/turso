@@ -941,21 +941,33 @@ fn recollect_aggregates(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()
 
     // Collect from result columns (same order as original collection)
     for rc in &plan.result_columns {
-        resolve_window_and_aggregate_functions(&rc.expr, resolver, &mut new_aggregates, None)?;
+        resolve_window_and_aggregate_functions(
+            &rc.expr,
+            resolver,
+            &mut new_aggregates,
+            None,
+            &mut [],
+        )?;
     }
 
     // Collect from HAVING
     if let Some(group_by) = &plan.group_by {
         if let Some(having) = &group_by.having {
             for expr in having {
-                resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None)?;
+                resolve_window_and_aggregate_functions(
+                    expr,
+                    resolver,
+                    &mut new_aggregates,
+                    None,
+                    &mut [],
+                )?;
             }
         }
     }
 
     // Collect from ORDER BY
     for (expr, _, _) in &plan.order_by {
-        resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None)?;
+        resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None, &mut [])?;
     }
 
     plan.aggregates = new_aggregates;
