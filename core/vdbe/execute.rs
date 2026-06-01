@@ -7008,6 +7008,49 @@ fn op_window_value(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Per-row inverse-step for pure window functions. Companion to
+/// `op_window_step`: fires when a row crosses the frame-start cursor on its
+/// way out of the function's frame.
+fn op_window_inverse(
+    _state: &mut ProgramState,
+    _acc_reg: usize,
+    _arg_reg: usize,
+    func: &WindowFunc,
+) -> Result<InsnFunctionStepResult> {
+    unreachable!("AggInverse fired for {func} but no inverse arm is wired");
+}
+
+pub fn op_agg_inverse(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        AggInverse {
+            acc_reg,
+            col,
+            delimiter: _,
+            func,
+            comparator: _,
+        },
+        insn
+    );
+
+    if let AccumulatorFunc::Window(win_func) = func {
+        return op_window_inverse(state, *acc_reg, *col, win_func);
+    }
+
+    // Aggregate window functions all carry RANGE UNBOUNDED PRECEDING TO
+    // CURRENT ROW as their coerced frame, so the frame start never moves
+    // and AggInverse is never emitted for them. Reaching this arm is a
+    // planner bug.
+    unreachable!(
+        "AggInverse fired for aggregate {} but no inverse arm is wired",
+        func.expect_agg()
+    );
+}
+
 pub fn op_agg_step(
     program: &Program,
     state: &mut ProgramState,

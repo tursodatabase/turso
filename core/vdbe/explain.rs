@@ -1274,6 +1274,21 @@ pub fn insn_to_row(
                 0,
                 format!("accum=r[{}] step(r[{}])", *acc_reg, *col),
             ),
+            Insn::AggInverse {
+                func,
+                acc_reg,
+                delimiter: _,
+                col,
+                comparator: _,
+            } => (
+                "AggInverse",
+                0,
+                *col as i64,
+                *acc_reg as i64,
+                Value::build_text(func.as_str()),
+                0,
+                format!("accum=r[{}] inverse(r[{}])", *acc_reg, *col),
+            ),
             Insn::AggFinal { register, func } => (
                 "AggFinal",
                 0,
