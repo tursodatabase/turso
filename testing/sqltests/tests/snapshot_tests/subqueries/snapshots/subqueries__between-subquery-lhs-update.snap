@@ -18,46 +18,55 @@ QUERY PLAN
 `--SCAN products
 
 BYTECODE
-addr  opcode          p1  p2  p3  p4              p5  comment
-   0    Init           0  37   0                   0  Start at 37
-   1    Once          18   0   0                   0  goto 18
-   2    BeginSubrtn    2   0   0                   0  r[2]=NULL
-   3    Null           0   1   0                   0  r[1]=NULL
-   4    Null           0   4   0                   0  r[4]=NULL
-   5    Integer        1   5   0                   0  r[5]=1; LIMIT counter
-   6    IfNot          5  14   0                   0  if !r[5] goto 14
-   7    OpenRead       0   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
-   8    Last           0  14   0                   0
-   9      RowId        0   6   0                   0  r[6]=products.rowid
-  10      CollSeq      0   0   0  Binary           0  collation=Binary
-  11      AggStep      0   6   4  max              0  accum=r[4] step(r[6])
-  12      Goto         0  14   0                   0
-  13    Prev           0   9   0                   0
-  14    AggFinal       0   4   0  max              0  accum=r[4]
-  15    Copy           4   3   0                   0  r[3]=r[4]
-  16    Copy           3   1   0                   0  r[1]=r[3]
-  17  Return           2   0   1                   0
-  18  OpenWrite        1   2   0                   0  root=2; iDb=0
-  19  Copy             1   9   0                   0  r[9]=r[1]
-  20  Gt               8   9  36                   0  if r[8]>r[9] goto 36
-  21  Copy             1  11   0                   0  r[11]=r[1]
-  22  Gt              11  12  36                   0  if r[11]>r[12] goto 36
-  23  Rewind           1  36   0                   0  Rewind table products
-  24    RowId          1  13   0                   0  r[13]=products.rowid
-  25    IsNull        13  36   0                   0  if (r[13]==NULL) goto 36
-  26    Null           0  14   0                   0  r[14]=NULL
-  27    Column         1   1  15                   0  r[15]=products.name
-  28    Column         1   2  16                   0  r[16]=products.category_id
-  29    Column         1   3  17                   0  r[17]=products.price
-  30    Column         1   4  19  0                0  r[19]=products.stock
-  31    Add           19  20  18                   0  r[18]=r[19]+r[20]
-  32    Affinity      14   5   0                   0  r[14..19] = D, B, D, E, D
-  33    MakeRecord    14   5  21                   0  r[21]=mkrec(r[14..18])
-  34    Insert         1  21  13  products         8  intkey=r[13] data=r[21]
-  35  Next             1  24   0                   0
-  36  Halt             0   0   0                   0
-  37  Transaction      0   2  11                   0  iDb=0 tx_mode=Write
-  38  Integer          1   8   0                   0  r[8]=1
-  39  Integer        100  12   0                   0  r[12]=100
-  40  Integer          1  20   0                   0  r[20]=1
-  41  Goto             0   1   0                   0
+addr  opcode            p1  p2  p3  p4                 p5  comment
+   0    Init             0  46   0                      0  Start at 46
+   1    OpenEphemeral    0   1   0                      0  cursor=0 is_table=true
+   2    Once            19   0   0                      0  goto 19
+   3    BeginSubrtn      2   0   0                      0  r[2]=NULL
+   4    Null             0   1   0                      0  r[1]=NULL
+   5    Null             0   4   0                      0  r[4]=NULL
+   6    Integer          1   5   0                      0  r[5]=1; LIMIT counter
+   7    IfNot            5  15   0                      0  if !r[5] goto 15
+   8    OpenRead         1   2   0  k(5,B,B,B,B,B)      0  table=products, root=2, iDb=0
+   9    Last             1  15   0                      0
+  10      RowId          1   6   0                      0  r[6]=products.rowid
+  11      CollSeq        0   0   0  Binary              0  collation=Binary
+  12      AggStep        0   6   4  max                 0  accum=r[4] step(r[6])
+  13      Goto           0  15   0                      0
+  14    Prev             1  10   0                      0
+  15    AggFinal         0   4   0  max                 0  accum=r[4]
+  16    Copy             4   3   0                      0  r[3]=r[4]
+  17    Copy             3   1   0                      0  r[1]=r[3]
+  18  Return             2   0   1                      0
+  19  OpenRead           2   2   0  k(5,B,B,B,B,B)      0  table=products, root=2, iDb=0
+  20  Copy               1  10   0                      0  r[10]=r[1]
+  21  Gt                 9  10  29                      0  if r[9]>r[10] goto 29
+  22  Copy               1  12   0                      0  r[12]=r[1]
+  23  Gt                12  13  29                      0  if r[12]>r[13] goto 29
+  24  Rewind             2  29   0                      0  Rewind table products
+  25    RowId            2   7   0                      0  r[7]=products.rowid
+  26    MakeRecord       7   1  14                      0  r[14]=mkrec(r[7..7]); for ephemeral_scratch
+  27    Insert           0  14   7  ephemeral_scratch   6  intkey=r[7] data=r[14]
+  28  Next               2  25   0                      0
+  29  OpenWrite          2   2   0                      0  root=2; iDb=0
+  30  Rewind             0  45   0                      0  Rewind table ephemeral(ephemeral_scratch)
+  31    RowId            0  15   0                      0  r[15]=ephemeral(ephemeral_scratch).rowid
+  32    NotExists        2  44  15                      0
+  33    Null             0  16   0                      0  r[16]=NULL
+  34    Column           2   1  17                      0  r[17]=products.name
+  35    Column           2   2  18                      0  r[18]=products.category_id
+  36    Column           2   3  19                      0  r[19]=products.price
+  37    Column           2   4  21  0                   0  r[21]=products.stock
+  38    Add             21  22  20                      0  r[20]=r[21]+r[22]
+  39    Affinity        16   5   0                      0  r[16..21] = D, B, D, E, D
+  40    MakeRecord      16   5  23                      0  r[23]=mkrec(r[16..20])
+  41    NotExists        2  44  15                      0
+  42    Delete           2   0   0  products            0
+  43    Insert           2  23  15  products           11  intkey=r[15] data=r[23]
+  44  Next               0  31   0                      0
+  45  Halt               0   0   0                      0
+  46  Transaction        0   2  11                      0  iDb=0 tx_mode=Write
+  47  Integer            1   9   0                      0  r[9]=1
+  48  Integer          100  13   0                      0  r[13]=100
+  49  Integer            1  22   0                      0  r[22]=1
+  50  Goto               0   1   0                      0
