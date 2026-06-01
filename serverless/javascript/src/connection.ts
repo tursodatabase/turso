@@ -66,7 +66,6 @@ export class Connection {
   private session: Session;
   private isOpen: boolean = true;
   private defaultSafeIntegerMode: boolean = false;
-  private _inTransaction: boolean = false;
   private execLock: AsyncLock = new AsyncLock();
 
   constructor(config: Config) {
@@ -75,19 +74,24 @@ export class Connection {
     }
     this.config = config;
     this.session = new Session(config);
-    
+
     // Define inTransaction property
     Object.defineProperty(this, 'inTransaction', {
-      get: () => this._inTransaction,
+      get: () => this.session.inTransaction,
       enumerable: true
     });
   }
 
   /**
    * Whether the database is currently in a transaction.
+   *
+   * Derived from the server's `get_autocommit` status (refreshed on every
+   * request), so it reflects the connection's real transaction state — the
+   * same as `sqlite3_get_autocommit()` on the native bindings — including
+   * transactions opened with a raw `BEGIN`, not just via `transaction()`.
    */
   get inTransaction(): boolean {
-    return this._inTransaction;
+    return this.session.inTransaction;
   }
 
   /**
@@ -308,7 +312,7 @@ export class Connection {
       // Inside an outer transaction(...) callback the surrounding BEGIN
       // already opened a transaction on this stream; emitting another
       // `BEGIN` step would fail, so ignore the user-supplied mode.
-      const effectiveMode = this._inTransaction ? undefined : mode;
+      const effectiveMode = this.session.inTransaction ? undefined : mode;
       return await this.session.batch(statements, effectiveMode, queryOptions);
     } finally {
       this.execLock.release();
@@ -370,15 +374,12 @@ export class Connection {
     const wrapTxn = (mode: string) => {
       return async (...bindParameters: any[]) => {
         await db.exec("BEGIN " + mode);
-        db._inTransaction = true;
         try {
           const result = await fn(...bindParameters);
           await db.exec("COMMIT");
-          db._inTransaction = false;
           return result;
         } catch (err) {
           await db.exec("ROLLBACK");
-          db._inTransaction = false;
           throw err;
         }
       };
