@@ -13748,6 +13748,9 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
             }
             self.inner.log_tx(m, c)
         }
+        fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
+            self.inner.upgrade_header_for_log_tx(m)
+        }
         fn sync(&self, t: FileSyncType) -> Result<Completion> {
             self.inner.sync(t)
         }

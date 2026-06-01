@@ -373,6 +373,10 @@ pub struct LogRecord {
     /// recovery ops' MVCC table ids and read transaction-level metadata.
     #[cfg(feature = "conn_raw_api")]
     pub portable_changes: Vec<u8>,
+    /// True when the committing connection requested portable logical-change
+    /// frames, even if this transaction has no client-visible metadata.
+    #[cfg(feature = "conn_raw_api")]
+    pub portable_changes_enabled: bool,
 }
 
 impl LogRecord {
@@ -390,6 +394,8 @@ impl LogRecord {
             has_header: false,
             #[cfg(feature = "conn_raw_api")]
             portable_changes: Vec::new(),
+            #[cfg(feature = "conn_raw_api")]
+            portable_changes_enabled: false,
         }
     }
 
@@ -1150,6 +1156,14 @@ pub enum CommitState<Clock: LogicalClock> {
     /// the executor.
     BuildLogRecord(BuildLogRecordCtx),
     BeginCommitLogicalLog {
+        end_ts: u64,
+        log_record: LogRecord,
+    },
+    UpgradeLogicalLogHeader {
+        end_ts: u64,
+        log_record: LogRecord,
+    },
+    WriteLogicalLog {
         end_ts: u64,
         log_record: LogRecord,
     },
@@ -2134,6 +2148,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             if !self.connection.portable_logical_changes_enabled() {
                 return Ok(());
             }
+            log_record.portable_changes_enabled = true;
 
             let mut builder = PortableLogicalBuilder::new();
             let mut metadata: Vec<_> = self
@@ -2793,9 +2808,44 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let end_ts = *end_ts;
                 let log_record = match std::mem::replace(
                     &mut self.state,
-                    CommitState::SyncLogicalLog { end_ts },
+                    CommitState::UpgradeLogicalLogHeader {
+                        end_ts,
+                        log_record: LogRecord::new(end_ts),
+                    },
                 ) {
                     CommitState::BeginCommitLogicalLog { log_record, .. } => log_record,
+                    _ => unreachable!(),
+                };
+                self.state = CommitState::UpgradeLogicalLogHeader { end_ts, log_record };
+                Ok(TransitionResult::Continue)
+            }
+            CommitState::UpgradeLogicalLogHeader { end_ts, log_record } => {
+                if let Some(c) = mvcc_store.storage.upgrade_header_for_log_tx(log_record)? {
+                    if !c.succeeded() {
+                        return Ok(TransitionResult::Io(IOCompletions::Single(c)));
+                    }
+                }
+                let end_ts = *end_ts;
+                let log_record = match std::mem::replace(
+                    &mut self.state,
+                    CommitState::WriteLogicalLog {
+                        end_ts,
+                        log_record: LogRecord::new(end_ts),
+                    },
+                ) {
+                    CommitState::UpgradeLogicalLogHeader { log_record, .. } => log_record,
+                    _ => unreachable!(),
+                };
+                self.state = CommitState::WriteLogicalLog { end_ts, log_record };
+                Ok(TransitionResult::Continue)
+            }
+            CommitState::WriteLogicalLog { end_ts, .. } => {
+                let end_ts = *end_ts;
+                let log_record = match std::mem::replace(
+                    &mut self.state,
+                    CommitState::SyncLogicalLog { end_ts },
+                ) {
+                    CommitState::WriteLogicalLog { log_record, .. } => log_record,
                     _ => unreachable!(),
                 };
                 let (c, append_bytes) = mvcc_store.storage.log_tx(log_record, None)?;
@@ -7038,6 +7088,16 @@ impl<Clock: LogicalClock> Debug for CommitState<Clock> {
             Self::BuildLogRecord(ctx) => f.debug_tuple("BuildLogRecord").field(ctx).finish(),
             Self::BeginCommitLogicalLog { end_ts, log_record } => f
                 .debug_struct("BeginCommitLogicalLog")
+                .field("end_ts", end_ts)
+                .field("log_record", log_record)
+                .finish(),
+            Self::UpgradeLogicalLogHeader { end_ts, log_record } => f
+                .debug_struct("UpgradeLogicalLogHeader")
+                .field("end_ts", end_ts)
+                .field("log_record", log_record)
+                .finish(),
+            Self::WriteLogicalLog { end_ts, log_record } => f
+                .debug_struct("WriteLogicalLog")
                 .field("end_ts", end_ts)
                 .field("log_record", log_record)
                 .finish(),

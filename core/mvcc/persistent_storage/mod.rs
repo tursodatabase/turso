@@ -44,6 +44,11 @@ pub trait DurableStorage: Send + Sync + Debug {
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)>;
 
+    /// If `m` needs a logical-log header upgrade before it can be appended,
+    /// start that write and return its completion. Callers must wait for this
+    /// completion and then call `log_tx`.
+    fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>>;
+
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
 
     /// Called after a logical-log write completed successfully, before the
@@ -177,6 +182,10 @@ impl DurableStorage for Storage {
         self.logical_log
             .write()
             .log_tx_deferred_offset(m, on_serialization_complete)
+    }
+
+    fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
+        self.logical_log.write().upgrade_header_for_log_tx(m)
     }
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {

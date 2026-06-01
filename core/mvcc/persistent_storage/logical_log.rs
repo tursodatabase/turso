@@ -414,8 +414,16 @@ pub struct LogHeader {
 
 impl LogHeader {
     pub(crate) fn new(io: &Arc<dyn crate::IO>) -> Self {
+        Self::new_with_version(io, LOG_VERSION_V2)
+    }
+
+    fn new_with_version(io: &Arc<dyn crate::IO>, version: u8) -> Self {
+        turso_assert!(
+            version == LOG_VERSION_V2 || version == LOG_VERSION,
+            "unsupported logical log header version: {version}"
+        );
         Self {
-            version: LOG_VERSION,
+            version,
             flags: 0,
             hdr_len: LOG_HDR_SIZE as u16,
             salt: io.generate_random_number() as u64,
@@ -617,18 +625,44 @@ impl LogicalLog {
         let payload_size = tx.buf.len() - LOG_RECORD_PREFIX_SIZE;
         let payload_size_u64 = payload_size as u64;
 
-        // 1. Ensure we have a log header object (created lazily on first write).
-        let is_first_write = self.offset == 0;
-        if is_first_write && self.header.is_none() {
-            let header = LogHeader::new(&self.io);
-            self.running_crc = derive_initial_crc(header.salt);
-            self.header = Some(header);
-        }
-
         #[cfg(feature = "conn_raw_api")]
         let has_portable_changes = !tx.portable_changes.is_empty();
         #[cfg(not(feature = "conn_raw_api"))]
         let has_portable_changes = false;
+        #[cfg(feature = "conn_raw_api")]
+        let portable_changes_enabled = tx.portable_changes_enabled || has_portable_changes;
+        #[cfg(not(feature = "conn_raw_api"))]
+        let portable_changes_enabled = false;
+
+        // 1. Ensure we have a log header object (created lazily on first write).
+        // Non-portable logs remain LML2 so a deployment that does not enable
+        // portable extensions can still roll back to readers that only know LML2.
+        let is_first_write = self.offset == 0;
+        if is_first_write && self.header.is_none() {
+            let version = if portable_changes_enabled {
+                LOG_VERSION
+            } else {
+                LOG_VERSION_V2
+            };
+            let header = LogHeader::new_with_version(&self.io, version);
+            self.running_crc = derive_initial_crc(header.salt);
+            self.header = Some(header);
+        }
+        if portable_changes_enabled {
+            let header = self
+                .header
+                .as_mut()
+                .expect("log header must be set before writing");
+            if header.version == LOG_VERSION_V2 {
+                if !is_first_write {
+                    return Err(LimboError::InternalError(
+                        "portable logical changes require logical log header upgrade before append"
+                            .to_string(),
+                    ));
+                }
+                header.version = LOG_VERSION;
+            }
+        }
         if has_portable_changes {
             tx.buf.splice(
                 LOG_RECORD_PREFIX_SIZE..LOG_RECORD_PREFIX_SIZE,
@@ -829,6 +863,36 @@ impl LogicalLog {
     pub fn log_tx(&mut self, tx: LogRecord) -> Result<Completion> {
         let (c, _) = self.frame_and_pwrite_tx(tx, true, None)?;
         Ok(c)
+    }
+
+    pub fn upgrade_header_for_log_tx(&mut self, tx: &LogRecord) -> Result<Option<Completion>> {
+        #[cfg(feature = "conn_raw_api")]
+        let portable_changes_enabled =
+            tx.portable_changes_enabled || !tx.portable_changes.is_empty();
+        #[cfg(not(feature = "conn_raw_api"))]
+        let portable_changes_enabled = {
+            let _ = tx;
+            false
+        };
+
+        if !portable_changes_enabled || self.offset == 0 {
+            return Ok(None);
+        }
+
+        let upgraded_header = {
+            let header = self.header.as_mut().ok_or_else(|| {
+                LimboError::InternalError(
+                    "Logical log header not initialized before portable upgrade".to_string(),
+                )
+            })?;
+            if header.version != LOG_VERSION_V2 {
+                return Ok(None);
+            }
+            header.version = LOG_VERSION;
+            header.clone()
+        };
+
+        Ok(Some(self.write_header(upgraded_header)?))
     }
 
     /// Writes a transaction to the log but does NOT advance the writer offset.
@@ -3471,11 +3535,12 @@ mod tests {
         encrypted_payload_blob_size, encrypted_payload_chunk_count, serialize_header_entry,
         serialize_op_entry, HeaderReadResult, LogHeader, LogicalLog, ParseResult, ParsedOp,
         StreamingLogicalLogReader, ENCRYPTED_CHUNK_AAD_SIZE, ENCRYPTED_PAYLOAD_CHUNK_SIZE,
-        END_MAGIC, EXTENSION_RECORD_HEADER_SIZE, EXTENSION_TYPE_PORTABLE_CHANGES, EXT_FRAME_MAGIC,
-        FRAME_MAGIC, LOG_HDR_CRC_START, LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION,
-        LOG_VERSION_V2, OP_UPSERT_TABLE, TX_EXT_HEADER_SIZE, TX_HEADER_SIZE, TX_HEADER_SIZE_V2,
-        TX_TRAILER_SIZE,
+        END_MAGIC, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_CRC_START, LOG_HDR_RESERVED_START,
+        LOG_HDR_SIZE, LOG_VERSION, LOG_VERSION_V2, TX_EXT_HEADER_SIZE, TX_HEADER_SIZE,
+        TX_HEADER_SIZE_V2, TX_TRAILER_SIZE,
     };
+    #[cfg(feature = "conn_raw_api")]
+    use super::{EXTENSION_RECORD_HEADER_SIZE, EXTENSION_TYPE_PORTABLE_CHANGES, OP_UPSERT_TABLE};
     use crate::OpenFlags;
     use crate::{turso_assert, turso_assert_less_than};
     use tracing_subscriber::EnvFilter;
@@ -5062,6 +5127,7 @@ mod tests {
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let header = reader.header().unwrap();
+        assert_eq!(header.version, LOG_VERSION_V2);
         // Verify the on-disk CRC matches a fresh computation over the header bytes
         let encoded = header.encode();
         let mut check_buf = [0u8; LOG_HDR_SIZE];
@@ -5078,6 +5144,7 @@ mod tests {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let header = LogHeader::new(&io);
+        assert_eq!(header.version, LOG_VERSION_V2);
         assert_ne!(header.salt, 0, "salt should be non-zero from IO RNG");
         let bytes = header.encode();
         // Verify CRC: zero out the CRC field and recompute
@@ -6212,6 +6279,144 @@ mod tests {
         assert_eq!(TX_TRAILER_SIZE, 8);
     }
 
+    #[test]
+    fn test_non_portable_first_write_uses_lml2_header_and_v2_frame() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file(
+                "non-portable-first-write-lml2.db-log",
+                OpenFlags::Create,
+                false,
+            )
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        let tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version((-2).into(), 1, "visible", 10)],
+            None,
+        );
+        let c = log.log_tx(tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let frame = read_file_bytes(file, &io);
+        let header = LogHeader::decode(&frame[..LOG_HDR_SIZE]).unwrap();
+        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(
+            u32::from_le_bytes(frame[LOG_HDR_SIZE..LOG_HDR_SIZE + 4].try_into().unwrap()),
+            FRAME_MAGIC
+        );
+    }
+
+    #[test]
+    fn test_non_portable_appends_keep_lml2_header_and_v2_frames() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("non-portable-appends-lml2.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        for (commit_ts, rowid) in [(10, 1), (20, 2)] {
+            let tx = crate::mvcc::database::LogRecord::for_test(
+                commit_ts,
+                &[make_test_row_version(
+                    (-2).into(),
+                    rowid,
+                    "visible",
+                    commit_ts,
+                )],
+                None,
+            );
+            let c = log.log_tx(tx).unwrap();
+            io.wait_for_completion(c).unwrap();
+        }
+
+        let frame = read_file_bytes(file, &io);
+        let header = LogHeader::decode(&frame[..LOG_HDR_SIZE]).unwrap();
+        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(
+            u32::from_le_bytes(frame[LOG_HDR_SIZE..LOG_HDR_SIZE + 4].try_into().unwrap()),
+            FRAME_MAGIC
+        );
+
+        let first_payload_size = u64::from_le_bytes(
+            frame[LOG_HDR_SIZE + 4..LOG_HDR_SIZE + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let second_frame_start =
+            LOG_HDR_SIZE + TX_HEADER_SIZE + first_payload_size + TX_TRAILER_SIZE;
+        assert_eq!(
+            u32::from_le_bytes(
+                frame[second_frame_start..second_frame_start + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            FRAME_MAGIC
+        );
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn test_portable_changes_upgrade_non_empty_lml2_log_to_lml3() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file(
+                "portable-after-lml2-upgrade.db-log",
+                OpenFlags::Create,
+                false,
+            )
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        let tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version((-2).into(), 1, "visible", 10)],
+            None,
+        );
+        let c = log.log_tx(tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let mut portable_tx = crate::mvcc::database::LogRecord::for_test(
+            20,
+            &[make_test_row_version((-2).into(), 2, "visible", 20)],
+            None,
+        );
+        portable_tx.portable_changes_enabled = true;
+        portable_tx.portable_changes = vec![0x1a, 0x00];
+
+        let c = log
+            .upgrade_header_for_log_tx(&portable_tx)
+            .unwrap()
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        let c = log.log_tx(portable_tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let frame = read_file_bytes(file, &io);
+        let header = LogHeader::decode(&frame[..LOG_HDR_SIZE]).unwrap();
+        assert_eq!(header.version, LOG_VERSION);
+
+        let first_payload_size = u64::from_le_bytes(
+            frame[LOG_HDR_SIZE + 4..LOG_HDR_SIZE + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let second_frame_start =
+            LOG_HDR_SIZE + TX_HEADER_SIZE + first_payload_size + TX_TRAILER_SIZE;
+        assert_eq!(
+            u32::from_le_bytes(
+                frame[second_frame_start..second_frame_start + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            EXT_FRAME_MAGIC
+        );
+    }
+
     #[cfg(feature = "conn_raw_api")]
     #[test]
     fn test_next_portable_change_frame_returns_empty_and_nonempty_lml3_frames() {
@@ -6226,11 +6431,12 @@ mod tests {
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
-        let empty_sync_tx = crate::mvcc::database::LogRecord::for_test(
+        let mut empty_sync_tx = crate::mvcc::database::LogRecord::for_test(
             10,
             &[make_test_row_version((-2).into(), 1, "internal", 10)],
             None,
         );
+        empty_sync_tx.portable_changes_enabled = true;
         let c = log.log_tx(empty_sync_tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -6246,6 +6452,7 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file, None);
         reader.read_header(&io).unwrap();
+        assert_eq!(reader.header().unwrap().version, LOG_VERSION);
         let first = reader.next_portable_change_frame(&io).unwrap().unwrap();
         assert_eq!(first.commit_ts, 10);
         assert_eq!(first.extension_record_count, 0);
