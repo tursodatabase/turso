@@ -546,12 +546,17 @@ pub struct WindowRegisters {
     pub prev_order_by_columns_start: Option<usize>,
 }
 
+/// Cursors on the ephemeral "buffer" B-tree that holds rows of the current
+/// partition. Naming mirrors SQLite's allocation in `sqlite3WindowCodeStep`
+/// (`window.c`).
 #[derive(Debug)]
 pub struct WindowCursors {
-    /// Cursor used to read from the ephemeral buffer table
-    pub buffer_read: CursorID,
-    /// Cursor used to write to the ephemeral buffer table
-    pub buffer_write: CursorID,
+    /// Used to `Insert` newly-buffered source rows. Position is implicit
+    /// (advances on each `NewRowid` + `Insert`).
+    pub csr_write: CursorID,
+    /// The row currently being returned to the outer query; result-column
+    /// propagation reads from here.
+    pub csr_current: CursorID,
 }
 
 pub struct EmitWindow;
@@ -604,17 +609,20 @@ impl EmitWindow {
             crate::alloc::vec![],
             None,
         ));
-        let cursor_buffer_read =
+        // The "current" cursor is the primary cursor on the ephemeral
+        // buffer; the write cursor is an OpenDup'd duplicate that shares
+        // the same underlying B-tree but tracks an independent position.
+        let cursor_csr_current =
             program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
-        let cursor_buffer_write =
+        let cursor_csr_write =
             program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
         program.emit_insn(Insn::OpenEphemeral {
-            cursor_id: cursor_buffer_read,
+            cursor_id: cursor_csr_current,
             is_table: true,
         });
         program.emit_insn(Insn::OpenDup {
-            original_cursor_id: cursor_buffer_read,
-            new_cursor_id: cursor_buffer_write,
+            original_cursor_id: cursor_csr_current,
+            new_cursor_id: cursor_csr_write,
         });
 
         // Window function processing is similar to aggregation processing in how results are mapped
@@ -675,8 +683,8 @@ impl EmitWindow {
                 new_order_by_columns_start: alloc_optional_registers(program, order_by_len),
             },
             cursors: WindowCursors {
-                buffer_read: cursor_buffer_read,
-                buffer_write: cursor_buffer_write,
+                csr_write: cursor_csr_write,
+                csr_current: cursor_csr_current,
             },
             src_column_count,
             expressions_referencing_subquery,
@@ -1007,12 +1015,12 @@ fn emit_insert_row_into_buffer(
         affinity_str: None,
     });
     program.emit_insn(Insn::NewRowid {
-        cursor: cursors.buffer_write,
+        cursor: cursors.csr_write,
         rowid_reg: registers.rowid,
         prev_largest_reg: 0,
     });
     program.emit_insn(Insn::Insert {
-        cursor: cursors.buffer_write,
+        cursor: cursors.csr_write,
         key_reg: registers.rowid,
         record_reg: reg_record,
         flag: InsertFlags::new(),
@@ -1109,7 +1117,7 @@ pub fn emit_window_results(
     let label_empty = program.allocate_label();
     let label_window_processing_end = labels.window_processing_end;
     let reg_flush_buffer_return_offset = registers.flush_buffer_return_offset;
-    let cursor_buffer_read = cursors.buffer_read;
+    let cursor_csr_current = cursors.csr_current;
 
     // All source rows have already been processed at this point.
     // In fallthrough mode, we are not returning to a caller — we just flush
@@ -1126,7 +1134,7 @@ pub fn emit_window_results(
     program.preassign_label_to_next_insn(labels.flush_buffer);
 
     program.emit_insn(Insn::Rewind {
-        cursor_id: cursor_buffer_read,
+        cursor_id: cursor_csr_current,
         pc_if_empty: label_empty,
     });
 
@@ -1135,7 +1143,7 @@ pub fn emit_window_results(
     program.preassign_label_to_next_insn(label_empty);
 
     program.emit_insn(Insn::ResetSorter {
-        cursor_id: cursor_buffer_read,
+        cursor_id: cursor_csr_current,
     });
     program.emit_insn(Insn::Return {
         return_reg: reg_flush_buffer_return_offset,
@@ -1183,7 +1191,7 @@ fn emit_return_buffered_rows(
     // into the dedicated registers.
     for (i, (_, col_idx)) in expressions_referencing_subquery.iter().enumerate() {
         let reg_result = registers.result_columns_start + i;
-        program.emit_column_or_rowid(cursors.buffer_read, *col_idx, reg_result);
+        program.emit_column_or_rowid(cursors.csr_current, *col_idx, reg_result);
     }
     // Pure window functions (e.g. row_number) advance their accumulator and
     // read it out once per buffered row as the buffer is replayed. Aggregate
@@ -1237,7 +1245,7 @@ fn emit_return_buffered_rows(
     }
 
     program.emit_insn(Insn::Next {
-        cursor_id: cursors.buffer_read,
+        cursor_id: cursors.csr_current,
         pc_if_next: label_loop_start,
     });
 
