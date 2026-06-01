@@ -789,11 +789,9 @@ impl Value {
         let precision = if precision < 1.0 { 0.0 } else { precision };
         let precision = precision.clamp(0.0, 30.0) as usize;
 
-        if precision == 0 {
-            return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
-        }
-
-        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
+        let multiplier = 10i64.pow(precision as u32) as f64;
+        let rounded = (f * multiplier + if f < 0.0 { -0.5 } else { 0.5 }).trunc() / multiplier;
+        let f: f64 = crate::numeric::str_to_f64(format!("{rounded:.precision$}"))
             .expect("formatted float should always parse successfully")
             .into();
 
@@ -2730,6 +2728,26 @@ mod tests {
         let input_val = Value::from_f64(100.123);
         let expected_val = Value::Null;
         assert_eq!(input_val.exec_round(Some(&Value::Null)), expected_val);
+
+        let input_val = Value::from_f64(2.25);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(2.3);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(-2.25);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(-2.3);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(2.35);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(2.4);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(-2.35);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(-2.4);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
     }
 
     #[test]
