@@ -2132,7 +2132,54 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         schema_conflict = true;
                     }
 
+                    // [bug3-commit] table_3 scope: trace every commit's cookie/schema state
+                    {
+                        let n_idx = self
+                            .connection
+                            .schema
+                            .read()
+                            .indexes
+                            .get("table_3")
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        let ws = tx.write_set.lock();
+                        let wrote_table_3 = ws.iter().any(|(rid, _)| {
+                            let id: i64 = rid.table_id.into();
+                            id == -47 || id == -79
+                        });
+                        drop(ws);
+                        if wrote_table_3 || n_idx > 0 {
+                            // List index names for table_3 in conn schema
+                            let idx_names: Vec<String> = self
+                                .connection
+                                .schema
+                                .read()
+                                .indexes
+                                .get("table_3")
+                                .map(|v| v.iter().map(|i| format!("{}:rp={}", i.name, i.root_page)).collect())
+                                .unwrap_or_default();
+                            eprintln!(
+                                "[bug3-commit] tx={} begin_ts={} end_ts={} our_cookie={our_cookie} global_cookie={global_cookie} schema_updated={schema_updated} schema_conflict={schema_conflict} n_table_3_idx_in_conn={n_idx} wrote_table_3={wrote_table_3} last_sc_ts={} idx_names={:?}",
+                                tx.tx_id,
+                                tx.begin_ts,
+                                ts,
+                                mvcc_store.last_committed_schema_change_ts.load(std::sync::atomic::Ordering::Acquire),
+                                idx_names,
+                            );
+                        }
+                    }
+
                     let can_commit_tx = !(exclusive_conflict || schema_conflict);
+                    // Debug exclusive conflict for tx=1318 and tx=1321
+                    if self.tx_id == 1318 || self.tx_id == 1321 {
+                        eprintln!(
+                            "[bug3-exclusive-check] tx={} exclusive_conflict={} schema_conflict={} is_exclusive_tx={} has_exclusive_tx={} can_commit={}",
+                            self.tx_id, exclusive_conflict, schema_conflict,
+                            mvcc_store.is_exclusive_tx(&self.tx_id),
+                            mvcc_store.has_exclusive_tx(),
+                            can_commit_tx
+                        );
+                    }
                     if can_commit_tx || read_only {
                         tx.state.store(TransactionState::Preparing(ts));
                     }
@@ -2535,6 +2582,13 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     let last_committed_ts = mvcc_store
                         .last_committed_tx_ts
                         .fetch_max(*end_ts, Ordering::AcqRel);
+                    // Debug last_committed_tx_ts updates for tx=1318 and 1321
+                    if self.tx_id == 1318 || self.tx_id == 1321 {
+                        eprintln!(
+                            "[bug3-last-commit-ts] tx={} updated last_committed_tx_ts: previous={} new={}",
+                            self.tx_id, last_committed_ts, end_ts
+                        );
+                    }
                     if last_committed_ts <= *end_ts {
                         global_header.replace(tx_header);
                     }
@@ -4087,8 +4141,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // Existing transactions already hold one blocking-checkpoint read guard
         // from begin_tx(). When upgrading read->write, do not acquire another one.
         let acquires_checkpoint_guard = maybe_existing_tx_id.is_none();
+        eprintln!(
+            "[bug3-test] begin_exclusive_tx: maybe_existing_tx_id={:?} acquires_checkpoint_guard={}",
+            maybe_existing_tx_id, acquires_checkpoint_guard
+        );
         if acquires_checkpoint_guard && !self.blocking_checkpoint_lock.read() {
             // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
+            eprintln!(
+                "[bug3-test] begin_exclusive_tx: Busy on blocking_checkpoint_lock"
+            );
             return Err(LimboError::Busy);
         }
         let unlock_checkpoint_guard = || {
@@ -4118,7 +4179,23 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // so a vanished tx cannot strand the lock (#6905).
         let already_holds_commit_lock = match maybe_existing_tx_id {
             Some(existing_tx_id) => {
+                eprintln!(
+                    "[bug3-test] begin_exclusive_tx: looking for existing_tx_id={} in txs",
+                    existing_tx_id
+                );
                 let tx = self.txs.get(&existing_tx_id).ok_or_else(|| {
+                    eprintln!(
+                        "[bug3-test] begin_exclusive_tx: existing_tx_id={} not found! Current txs:",
+                        existing_tx_id
+                    );
+                    for entry in self.txs.iter() {
+                        let other = entry.value();
+                        eprintln!(
+                            "[bug3-test]   tx_id={} state={:?}",
+                            other.tx_id,
+                            other.state.load()
+                        );
+                    }
                     if !already_exclusive {
                         self.release_exclusive_tx(&tx_id);
                     }
@@ -4130,9 +4207,27 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             None => false,
         };
 
+        eprintln!(
+            "[bug3-test] begin_exclusive_tx: already_holds_commit_lock={}",
+            already_holds_commit_lock
+        );
         if !already_holds_commit_lock {
             let locked = self.commit_coordinator.pager_commit_lock.write();
             if !locked {
+                eprintln!(
+                    "[bug3-test] begin_exclusive_tx: tx_id={} Busy on pager_commit_lock; tx count={}",
+                    tx_id,
+                    self.txs.iter().count()
+                );
+                for entry in self.txs.iter() {
+                    let other = entry.value();
+                    eprintln!(
+                        "[bug3-test]   tx_id={} state={:?} pager_commit_lock_held={}",
+                        other.tx_id,
+                        other.state.load(),
+                        other.pager_commit_lock_held.load(Ordering::Acquire)
+                    );
+                }
                 tracing::debug!(
                     "begin_exclusive_tx: tx_id={} failed with Busy on pager_commit_lock",
                     tx_id
@@ -4172,6 +4267,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 begin_ts
             );
             tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
+            eprintln!("[bug3-test] begin_exclusive_tx: tx_id={} succeeded (upgrade path)", tx_id);
             return Ok(tx_id);
         }
 
@@ -4183,6 +4279,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             begin_ts
         );
         tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
+        eprintln!("[bug3-test] begin_exclusive_tx: tx_id={} succeeded (new tx path)", tx_id);
         self.txs.insert(tx_id, tx);
         Ok(tx_id)
     }
@@ -4773,20 +4870,70 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     /// Acquires the exclusive transaction lock to the given transaction ID.
     fn acquire_exclusive_tx(&self, tx_id: &TxID) -> Result<()> {
+        // Focus on tx=1321 (the CREATE INDEX)
+        if *tx_id == 1321 {
+            eprintln!(
+                "[bug3-createindex] acquire_exclusive_tx: tx_id={} exclusive_tx.load()={} last_committed_tx_ts={}",
+                tx_id,
+                self.exclusive_tx.load(Ordering::Acquire),
+                self.last_committed_tx_ts.load(Ordering::Acquire)
+            );
+        }
+        eprintln!(
+            "[bug3-test] acquire_exclusive_tx: tx_id={} exclusive_tx.load()={}",
+            tx_id,
+            self.exclusive_tx.load(Ordering::Acquire)
+        );
         if self.exclusive_tx.load(Ordering::Acquire) == *tx_id {
             // Re-entrant upgrade attempt for the same transaction.
+            eprintln!("[bug3-test] acquire_exclusive_tx: re-entrant upgrade for same tx");
             return Ok(());
         }
-        if self.has_preparing_tx_other_than(*tx_id) {
+        let has_preparing_other = self.has_preparing_tx_other_than(*tx_id);
+        eprintln!(
+            "[bug3-test] acquire_exclusive_tx: has_preparing_tx_other_than({})={}",
+            tx_id, has_preparing_other
+        );
+        if has_preparing_other {
+            eprintln!("[bug3-test] acquire_exclusive_tx: Busy due to preparing tx");
+            for entry in self.txs.iter() {
+                let other = entry.value();
+                eprintln!(
+                    "[bug3-test]   tx_id={} state={:?}",
+                    other.tx_id,
+                    other.state.load()
+                );
+            }
             return Err(LimboError::Busy);
         }
         if let Some(tx) = self.txs.get(tx_id) {
             let tx = tx.value();
-            if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
+            let last_committed_tx_ts = self.last_committed_tx_ts.load(Ordering::Acquire);
+            if *tx_id == 1321 {
+                eprintln!(
+                    "[bug3-createindex] acquire_exclusive_tx: tx_id={} begin_ts={} last_committed_tx_ts={}",
+                    tx_id, tx.begin_ts, last_committed_tx_ts
+                );
+            }
+            eprintln!(
+                "[bug3-test] acquire_exclusive_tx: tx_id={} begin_ts={} last_committed_tx_ts={}",
+                tx_id, tx.begin_ts, last_committed_tx_ts
+            );
+            if tx.begin_ts < last_committed_tx_ts {
                 // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
                 // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
+                eprintln!(
+                    "[bug3-test] acquire_exclusive_tx: tx_id={} Busy due to begin_ts < last_committed_tx_ts",
+                    tx_id
+                );
                 return Err(LimboError::Busy);
             }
+        }
+        // Add yield point for Bug 3 reproducer: allow concurrent commits during exclusive acquisition
+        if *tx_id == 4 { // Only for our test's CREATE INDEX transaction
+            eprintln!("[bug3-exclusive-yield] tx={} yielding before compare_exchange", tx_id);
+            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(50)); // Longer window for concurrent commit
         }
         match self.exclusive_tx.compare_exchange(
             NO_EXCLUSIVE_TX,
@@ -4795,14 +4942,33 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                if self.has_preparing_tx_other_than(*tx_id) {
+                let has_preparing_other = self.has_preparing_tx_other_than(*tx_id);
+                eprintln!(
+                    "[bug3-test] acquire_exclusive_tx: post-exchange has_preparing_tx_other_than({})={}",
+                    tx_id, has_preparing_other
+                );
+                if has_preparing_other {
+                    eprintln!("[bug3-test] acquire_exclusive_tx: post-exchange Busy due to preparing tx");
+                    for entry in self.txs.iter() {
+                        let other = entry.value();
+                        eprintln!(
+                            "[bug3-test]   tx_id={} state={:?}",
+                            other.tx_id,
+                            other.state.load()
+                        );
+                    }
                     self.release_exclusive_tx(tx_id);
                     return Err(LimboError::Busy);
                 }
+                eprintln!("[bug3-test] acquire_exclusive_tx: tx_id={} succeeded", tx_id);
                 Ok(())
             }
-            Err(_) => {
+            Err(current_exclusive_tx) => {
                 // Another transaction already holds the exclusive lock
+                eprintln!(
+                    "[bug3-test] acquire_exclusive_tx: tx_id={} compare_exchange failed, current_exclusive_tx={}",
+                    tx_id, current_exclusive_tx
+                );
                 Err(LimboError::Busy)
             }
         }

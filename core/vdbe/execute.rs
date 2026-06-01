@@ -1667,6 +1667,12 @@ pub fn op_rewind(
         let cursor = state.get_cursor(*cursor_id);
         match cursor {
             Cursor::BTree(btree_cursor) => {
+                // Add yield point for Bug 3 reproducer: table scan during index creation
+                // This provides a window for concurrent transactions to commit
+                eprintln!("[bug3-yield] Rewind instruction - yielding for deterministic reproducer");
+                std::thread::yield_now(); // Let concurrent transactions proceed
+                std::thread::sleep(std::time::Duration::from_millis(10)); // Small delay for determinism
+
                 return_if_io!(btree_cursor.rewind());
                 btree_cursor.is_empty()
             }
@@ -9815,9 +9821,59 @@ pub fn op_idx_delete(
                     // If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry is found
                     // Also, do not raise this (self-correcting and non-critical) error if in writable_schema mode.
                     if *raise_error_if_no_matching_entry {
+                        let root_page = state.get_cursor(*cursor_id).as_btree_mut().root_page();
                         let reg_values = (*start_reg..*start_reg + *num_regs)
                             .map(|i| &state.registers[i])
                             .collect::<Vec<_>>();
+                        eprintln!(
+                            "[bug3-idxdel] root_page={root_page} key={reg_values:?}"
+                        );
+                        // Dump conn.schema's index list — find idx_v's root_page
+                        {
+                            let s = program.connection.schema.read();
+                            eprintln!("[bug3-idxdel] conn.schema v={} indexes:", s.schema_version);
+                            for (tbl, idxs) in s.indexes.iter() {
+                                for idx in idxs {
+                                    eprintln!(
+                                        "[bug3-idxdel]   table={tbl} index={} root_page={}",
+                                        idx.name, idx.root_page
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(mv_store) =
+                            program.connection.mv_store_for_db(crate::MAIN_DB_ID)
+                        {
+                            for probe_rp in [-79i64, -47i64] {
+                                let index_id =
+                                    crate::mvcc::database::MVTableId::from(probe_rp);
+                                if let Some(idx_map) = mv_store.index_rows.get(&index_id) {
+                                    let entries: Vec<_> = idx_map.value().iter().collect();
+                                    eprintln!(
+                                        "[bug3-idxdel] index_rows[{index_id:?}] has {} keys",
+                                        entries.len()
+                                    );
+                                    for (n, e) in entries.iter().take(5).enumerate() {
+                                        let versions = e.value().read();
+                                        eprintln!(
+                                            "[bug3-idxdel]   idx_key#{n}: {:?} -> {} versions",
+                                            e.key(),
+                                            versions.len()
+                                        );
+                                        for (vi, v) in versions.iter().enumerate() {
+                                            eprintln!(
+                                                "[bug3-idxdel]     v{vi}: begin={:?} end={:?} btree_resident={}",
+                                                v.begin, v.end, v.btree_resident
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    eprintln!(
+                                        "[bug3-idxdel] index_rows[{index_id:?}] EMPTY (no entry in map)"
+                                    );
+                                }
+                            }
+                        }
                         return Err(LimboError::Corrupt(format!(
                             "IdxDelete: no matching index entry found for key {reg_values:?} while seeking"
                         )));
@@ -10012,6 +10068,12 @@ pub fn op_idx_insert(
             {
                 let cursor = get_cursor!(state, cursor_id);
                 let cursor = cursor.as_btree_mut();
+                let rp = cursor.root_page();
+                let conn_v = program.connection.schema.read().schema_version;
+                eprintln!(
+                    "[bug3-idxins] root_page={rp} conn.schema.v={conn_v} record_dbg_first={:?}",
+                    record_to_insert.get_payload().get(..16).unwrap_or(&[])
+                );
                 return_if_io!(cursor.insert(&BTreeKey::new_index_key(record_to_insert)));
             }
             if flags.has(IdxInsertFlags::NCHANGE) {
@@ -10590,6 +10652,23 @@ pub fn op_open_write(
         CursorType::BTreeIndex(index) => Some(index),
         _ => None,
     };
+    if let Some(idx) = maybe_index {
+        if idx.table_name == "table_3" {
+            let conn_v = program.connection.schema.read().schema_version;
+            let n_idx_in_schema = program
+                .connection
+                .schema
+                .read()
+                .indexes
+                .get("table_3")
+                .map(|v| v.len())
+                .unwrap_or(0);
+            eprintln!(
+                "[bug3-ow] open_write idx name={} table={} root_page={} conn.schema.v={conn_v} n_table_3_idx_in_schema={n_idx_in_schema}",
+                idx.name, idx.table_name, root_page
+            );
+        }
+    }
 
     // Check if we can reuse the existing cursor
     let can_reuse_cursor = if let Some(Some(Cursor::BTree(btree_cursor))) = cursors.get(*cursor_id)
