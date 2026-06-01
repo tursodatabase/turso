@@ -22,6 +22,7 @@ pub trait DurableStorage: Send + Sync + Debug {
         &self,
         log_record: &mut LogRecord,
         row_version: &RowVersion,
+        portable_extension: Option<&[u8]>,
     ) -> Result<()>;
 
     /// Append a `DatabaseHeader` op to `log_record`'s payload buffer.
@@ -43,7 +44,18 @@ pub trait DurableStorage: Send + Sync + Debug {
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)>;
 
+    /// If `m` needs a logical-log header upgrade before it can be appended,
+    /// start that write and return its completion. Callers must wait for this
+    /// completion and then call `log_tx`.
+    fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>>;
+
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
+
+    /// Called after a logical-log write completed successfully, before the
+    /// transaction is made visible by advancing the logical-log offset.
+    fn on_log_write_complete(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// Persist the current logical-log header to durable storage.
     ///
@@ -52,13 +64,23 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn update_header(&self) -> Result<Completion>;
 
     fn truncate(&self) -> Result<Completion>;
+
+    /// Reset the logical log to a fresh header-only file.
+    ///
+    /// Used after an external database restore so future MVCC recovery starts
+    /// from the restored image instead of replaying stale local log frames.
+    fn reset_to_fresh_header(&self) -> Result<Completion>;
     fn get_logical_log_file(&self) -> Arc<dyn File>;
+    fn logical_log_offset(&self) -> u64;
     fn should_checkpoint(&self) -> bool;
     /// Set the checkpoint threshold in bytes of logical-log data written.
     /// A negative value disables automatic checkpointing.
     fn set_checkpoint_threshold(&self, threshold: i64);
     fn checkpoint_threshold(&self) -> i64;
-    fn advance_logical_log_offset_after_success(&self, bytes: u64);
+    fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()>;
+    fn discard_pending_log_write(&self) -> Result<()> {
+        Ok(())
+    }
     fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32);
 
     /// Set the in-memory log header from a previously-read on-disk header.
@@ -126,8 +148,9 @@ impl DurableStorage for Storage {
         &self,
         log_record: &mut LogRecord,
         row_version: &RowVersion,
+        portable_extension: Option<&[u8]>,
     ) -> Result<()> {
-        serialize_op_entry(&mut log_record.buf, row_version)?;
+        serialize_op_entry(&mut log_record.buf, row_version, portable_extension)?;
         log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
             LimboError::InternalError("logical log op_count exceeds u32".to_string())
         })?;
@@ -161,6 +184,10 @@ impl DurableStorage for Storage {
             .log_tx_deferred_offset(m, on_serialization_complete)
     }
 
+    fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
+        self.logical_log.write().upgrade_header_for_log_tx(m)
+    }
+
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
         self.logical_log.write().sync(sync_type)
     }
@@ -175,8 +202,18 @@ impl DurableStorage for Storage {
         Ok(c)
     }
 
+    fn reset_to_fresh_header(&self) -> Result<Completion> {
+        let c = self.logical_log.write().reset_to_fresh_header()?;
+        self.shadow_offset_store(0);
+        Ok(c)
+    }
+
     fn get_logical_log_file(&self) -> Arc<dyn File> {
         self.logical_log.read().file.clone()
+    }
+
+    fn logical_log_offset(&self) -> u64 {
+        self.log_offset.load(Ordering::Relaxed)
     }
 
     fn encryption_ctx(&self) -> Option<EncryptionContext> {
@@ -201,9 +238,10 @@ impl DurableStorage for Storage {
         self.checkpoint_threshold.load(Ordering::Relaxed)
     }
 
-    fn advance_logical_log_offset_after_success(&self, bytes: u64) {
+    fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()> {
         self.logical_log.write().advance_offset_after_success(bytes);
         self.shadow_offset_advance(bytes);
+        Ok(())
     }
 
     fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32) {
