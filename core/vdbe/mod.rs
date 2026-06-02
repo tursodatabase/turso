@@ -702,6 +702,7 @@ pub struct ProgramState {
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
     pub n_change: AtomicI64,
+    pub n_total_change: AtomicI64,
 }
 
 impl std::fmt::Debug for Program {
@@ -761,6 +762,7 @@ impl ProgramState {
             has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
+            n_total_change: AtomicI64::new(0),
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
             pending_cdc_info: None,
@@ -885,10 +887,20 @@ impl ProgramState {
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
         self.n_change.store(0, Ordering::SeqCst);
+        self.n_total_change.store(0, Ordering::SeqCst);
         *self.explain_state.write() = ExplainState::default();
         self.pending_fail_error = None;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
+    }
+
+    pub(crate) fn record_statement_change(&self) {
+        self.n_change.fetch_add(1, Ordering::SeqCst);
+        self.n_total_change.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn record_total_change(&self) {
+        self.n_total_change.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Whether this statement owns the implicit autocommit transaction it is
@@ -1874,6 +1886,8 @@ impl Program {
             if self.change_cnt_on {
                 self.connection
                     .set_changes(program_state.n_change.load(Ordering::SeqCst));
+                self.connection
+                    .add_total_changes(program_state.n_total_change.load(Ordering::SeqCst));
             }
             let transaction_finished = self.connection.auto_commit.load(Ordering::SeqCst)
                 && self.connection.get_tx_state() == TransactionState::None;
@@ -2368,7 +2382,7 @@ impl Program {
                     // commit. Roll it back even if this statement opened a
                     // statement savepoint, as DDL does.
                     self.rollback_current_txn(pager);
-                    self.connection.set_changes_without_total(0);
+                    self.connection.set_changes(0);
                 }
                 // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
                 // FK errors always behave like ABORT: rollback statement,
@@ -2377,7 +2391,7 @@ impl Program {
                     if owns_auto_txn {
                         self.rollback_current_txn(pager);
                     }
-                    self.connection.set_changes_without_total(0);
+                    self.connection.set_changes(0);
                 }
                 // Constraint and RAISE errors: behavior depends on the effective resolve type.
                 // For normal constraints, the resolve type comes from the statement (ON CONFLICT).
@@ -2468,7 +2482,7 @@ impl Program {
                         ResolveType::Fail => state.n_change.load(Ordering::SeqCst),
                         _ => 0,
                     };
-                    self.connection.set_changes_without_total(last_change);
+                    self.connection.set_changes(last_change);
                 }
                 Some(LimboError::RaiseIgnore) => {
                     tracing::error!(
