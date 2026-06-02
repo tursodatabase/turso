@@ -3482,6 +3482,86 @@ fn run_statement_io(
     }
 }
 
+/// Phases of the non-blocking interrupted-checkpoint reconciliation state machine
+/// ([`MvStore::maybe_complete_interrupted_checkpoint_io`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconcilePhase {
+    /// One-time setup: drop a stale read lock and snapshot the WAL frame count.
+    Start,
+    /// Read the logical-log header.
+    ReadHeader,
+    /// Branch on whether the WAL has committed frames left by an interrupted checkpoint.
+    Branch,
+    /// No committed WAL frames: truncate the WAL and adopt the header.
+    TruncateEmpty,
+    /// Backfill committed WAL frames into the DB file.
+    Checkpoint,
+    /// Fsync the DB file after backfill.
+    SyncDbFile,
+    /// (Re)write the logical-log header.
+    UpdateHeader,
+    /// Fsync the rewritten logical-log header.
+    SyncLog,
+    /// Verify the rewritten header's CRC, retrying once on a torn write.
+    VerifyCrc,
+    /// Truncate the WAL once the DB file and header are durable.
+    TruncateFinal,
+}
+
+/// State carried across IO yields by the interrupted-checkpoint reconciliation.
+pub(crate) struct ReconcileData {
+    phase: ReconcilePhase,
+    reader: StreamingLogicalLogReader,
+    header_result: Option<HeaderReadResult>,
+    wal_max_frame: u64,
+    checkpoint_result: Option<CheckpointResult>,
+    retried_crc: bool,
+    /// In-flight sync / header-write completion awaited by the current phase.
+    pending: Option<Completion>,
+    /// Reader used by the CRC re-verification; reset between attempts.
+    crc_reader: Option<StreamingLogicalLogReader>,
+}
+
+impl ReconcileData {
+    fn new(log_file: Arc<dyn crate::File>) -> Self {
+        Self {
+            phase: ReconcilePhase::Start,
+            // The header is never encrypted, so no EncryptionContext is needed here.
+            reader: StreamingLogicalLogReader::new(log_file, None),
+            header_result: None,
+            wal_max_frame: 0,
+            checkpoint_result: None,
+            retried_crc: false,
+            pending: None,
+            crc_reader: None,
+        }
+    }
+}
+
+/// Issue-once / await pattern for a single `Completion` inside a recovery phase.
+///
+/// On first entry `issue` produces the completion; on re-entry the stored
+/// completion is polled. Returns `Done` once it has finished (clearing `pending`),
+/// otherwise yields it. Re-entrant: `issue` runs exactly once per awaited op.
+fn await_completion(
+    pending: &mut Option<Completion>,
+    issue: impl FnOnce() -> Result<Completion>,
+) -> Result<IOResult<()>> {
+    if pending.is_none() {
+        *pending = Some(issue()?);
+    }
+    let completion = pending.as_ref().expect("pending set above");
+    if !completion.finished() {
+        return Ok(IOResult::IO(IOCompletions::Single(completion.clone())));
+    }
+    if let Some(err) = completion.get_error() {
+        *pending = None;
+        return Err(err.into());
+    }
+    *pending = None;
+    Ok(IOResult::Done(()))
+}
+
 impl<Clock: LogicalClock> MvStore<Clock> {
     fn uses_durable_mvcc_metadata(&self, connection: &Arc<Connection>) -> bool {
         !connection.db.is_in_memory_db()
@@ -5798,14 +5878,26 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(None)
     }
 
-    fn logical_log_header_crc_valid(&self, pager: &Arc<Pager>) -> Result<bool> {
-        let file = self.get_logical_log_file();
-        // Header is never encrypted; no need to pass EncryptionContext here.
-        let mut reader = StreamingLogicalLogReader::new(file, None);
-        match reader.try_read_header(&pager.io)? {
-            HeaderReadResult::Valid(_) => Ok(true),
-            HeaderReadResult::NoLog | HeaderReadResult::Invalid => Ok(false),
+    /// Re-reads the on-disk logical-log header and reports whether it is valid.
+    /// `reader` persists the in-flight read across yields and is reset to `None`
+    /// once a verdict is reached (so retries re-read).
+    fn logical_log_header_crc_valid_io(
+        &self,
+        reader: &mut Option<StreamingLogicalLogReader>,
+    ) -> Result<IOResult<bool>> {
+        if reader.is_none() {
+            // Header is never encrypted; no need to pass EncryptionContext here.
+            *reader = Some(StreamingLogicalLogReader::new(
+                self.get_logical_log_file(),
+                None,
+            ));
         }
+        let result = return_if_io!(reader
+            .as_mut()
+            .expect("reader set above")
+            .try_read_header_io());
+        *reader = None;
+        Ok(IOResult::Done(matches!(result, HeaderReadResult::Valid(_))))
     }
 
     /// Runs during bootstrap to reconcile WAL state left by a prior crash or incomplete
@@ -5813,113 +5905,167 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// validity, then either completes the interrupted checkpoint (backfill WAL → DB,
     /// sync, truncate) or fails closed on corrupt/inconsistent artifacts.
     /// See RECOVERY_SEMANTICS.md "Startup Case Classification" for the full case table.
+    ///
+    /// Blocking wrapper preserved for the synchronous bootstrap path; drives the
+    /// re-entrant state machine to completion.
     fn maybe_complete_interrupted_checkpoint(&self, connection: &Arc<Connection>) -> Result<()> {
         let pager = connection.pager.load().clone();
-        let Some(wal) = &pager.wal else {
-            return Ok(());
-        };
-        // The bootstrap connection may have acquired a WAL read lock during earlier
-        // bootstrap steps (e.g. schema parsing). Drop it so the TRUNCATE checkpoint
-        // below isn't blocked by our own read lock.
-        if wal.holds_read_lock() {
-            wal.end_read_tx();
-        }
-
-        let wal_max_frame = wal.get_max_frame_in_wal();
-        let file = self.get_logical_log_file();
-        // This method only reads the header (never encrypted); no need to pass EncryptionContext.
-        let mut reader = StreamingLogicalLogReader::new(file, None);
-        let header_result = reader.try_read_header(&pager.io)?;
-
-        let is_readonly = connection.db.is_readonly();
-        if wal_max_frame == 0 {
-            if !is_readonly {
-                let mut checkpoint_result = CheckpointResult::new(0, 0, 0);
-                pager
-                    .io
-                    .block(|| wal.truncate_wal(&mut checkpoint_result, pager.get_sync_type()))?;
-                if let HeaderReadResult::Valid(header) = &header_result {
-                    self.storage.set_header(header.clone());
-                }
-            }
-            return Ok(());
-        }
-
-        if is_readonly {
-            return Err(LimboError::Corrupt(
-                "Cannot reconcile interrupted MVCC checkpoint in read-only mode".to_string(),
-            ));
-        }
-
-        let header = match header_result {
-            HeaderReadResult::Valid(header) => header,
-            HeaderReadResult::NoLog => {
-                return Err(LimboError::Corrupt(
-                    "WAL has committed frames but logical log header is missing".to_string(),
-                ));
-            }
-            HeaderReadResult::Invalid => {
-                return Err(LimboError::Corrupt(
-                    "WAL has committed frames but logical log header is invalid".to_string(),
-                ));
-            }
-        };
-        self.storage.set_header(header);
-
-        // NOTE: this uses `CheckpointMode::Truncate` to drive WAL backfill only; we still
-        // truncate the WAL explicitly below to preserve WAL-last ordering in recovery.
-        let mut checkpoint_result = pager.io.block(|| {
-            wal.checkpoint(
-                &pager,
-                CheckpointMode::Truncate {
-                    upper_bound_inclusive: None,
-                },
-            )
-        })?;
-        if !checkpoint_result.everything_backfilled() {
-            return Err(LimboError::Corrupt(
-                "Unable to fully backfill committed WAL frames during MVCC recovery".to_string(),
-            ));
-        }
-
-        if connection.get_sync_mode() != SyncMode::Off
-            && checkpoint_result.wal_checkpoint_backfilled > 0
-        {
-            let c = pager
-                .db_file
-                .sync(Completion::new_sync(|_| {}), pager.get_sync_type())?;
-            pager.io.wait_for_completion(c)?;
-        }
-
-        // Write a fresh log header (distinct from the checkpoint state machine which no
-        // longer rewrites the header). This is bootstrap-only: we need a valid header on
-        // disk before truncating WAL. CRC verify + retry guards against torn header writes.
-        let mut retried_crc = false;
-        loop {
-            let c = self.storage.update_header()?;
-            pager.io.wait_for_completion(c)?;
-
-            if connection.get_sync_mode() != SyncMode::Off {
-                let c = self.storage.sync(pager.get_sync_type())?;
-                pager.io.wait_for_completion(c)?;
-            }
-
-            if self.logical_log_header_crc_valid(&pager)? {
-                break;
-            }
-
-            if retried_crc {
-                return Err(LimboError::Corrupt(
-                    "Logical log header CRC mismatch after retry".to_string(),
-                ));
-            }
-            retried_crc = true;
-        }
-
+        let mut data = ReconcileData::new(self.get_logical_log_file());
         pager
             .io
-            .block(|| wal.truncate_wal(&mut checkpoint_result, pager.get_sync_type()))?;
-        Ok(())
+            .block(|| self.maybe_complete_interrupted_checkpoint_io(connection, &mut data))
+    }
+
+    /// Non-blocking interrupted-checkpoint reconciliation. Each IO point yields
+    /// instead of busy-waiting: the header read, the WAL backfill checkpoint, the
+    /// DB-file and logical-log fsyncs, the header rewrite, and the WAL truncation.
+    pub(crate) fn maybe_complete_interrupted_checkpoint_io(
+        &self,
+        connection: &Arc<Connection>,
+        data: &mut ReconcileData,
+    ) -> Result<IOResult<()>> {
+        let pager = connection.pager.load().clone();
+        let Some(wal) = &pager.wal else {
+            return Ok(IOResult::Done(()));
+        };
+        let is_readonly = connection.db.is_readonly();
+        let sync_mode = connection.get_sync_mode();
+        loop {
+            match data.phase {
+                ReconcilePhase::Start => {
+                    // The bootstrap connection may have acquired a WAL read lock during
+                    // earlier bootstrap steps (e.g. schema parsing). Drop it so the
+                    // TRUNCATE checkpoint below isn't blocked by our own read lock.
+                    if wal.holds_read_lock() {
+                        wal.end_read_tx();
+                    }
+                    data.wal_max_frame = wal.get_max_frame_in_wal();
+                    data.phase = ReconcilePhase::ReadHeader;
+                }
+                ReconcilePhase::ReadHeader => {
+                    let header_result = return_if_io!(data.reader.try_read_header_io());
+                    data.header_result = Some(header_result);
+                    data.phase = ReconcilePhase::Branch;
+                }
+                ReconcilePhase::Branch => {
+                    if data.wal_max_frame == 0 {
+                        if is_readonly {
+                            return Ok(IOResult::Done(()));
+                        }
+                        data.phase = ReconcilePhase::TruncateEmpty;
+                    } else {
+                        if is_readonly {
+                            return Err(LimboError::Corrupt(
+                                "Cannot reconcile interrupted MVCC checkpoint in read-only mode"
+                                    .to_string(),
+                            ));
+                        }
+                        let header = match data.header_result.as_ref().expect("header read") {
+                            HeaderReadResult::Valid(header) => header.clone(),
+                            HeaderReadResult::NoLog => {
+                                return Err(LimboError::Corrupt(
+                                    "WAL has committed frames but logical log header is missing"
+                                        .to_string(),
+                                ));
+                            }
+                            HeaderReadResult::Invalid => {
+                                return Err(LimboError::Corrupt(
+                                    "WAL has committed frames but logical log header is invalid"
+                                        .to_string(),
+                                ));
+                            }
+                        };
+                        self.storage.set_header(header);
+                        data.phase = ReconcilePhase::Checkpoint;
+                    }
+                }
+                ReconcilePhase::TruncateEmpty => {
+                    if data.checkpoint_result.is_none() {
+                        data.checkpoint_result = Some(CheckpointResult::new(0, 0, 0));
+                    }
+                    return_if_io!(wal.truncate_wal(
+                        data.checkpoint_result
+                            .as_mut()
+                            .expect("checkpoint result set"),
+                        pager.get_sync_type(),
+                    ));
+                    if let Some(HeaderReadResult::Valid(header)) = &data.header_result {
+                        self.storage.set_header(header.clone());
+                    }
+                    return Ok(IOResult::Done(()));
+                }
+                ReconcilePhase::Checkpoint => {
+                    // NOTE: `CheckpointMode::Truncate` drives WAL backfill only; we still
+                    // truncate the WAL explicitly below to preserve WAL-last ordering.
+                    let checkpoint_result = return_if_io!(wal.checkpoint(
+                        &pager,
+                        CheckpointMode::Truncate {
+                            upper_bound_inclusive: None,
+                        },
+                    ));
+                    if !checkpoint_result.everything_backfilled() {
+                        return Err(LimboError::Corrupt(
+                            "Unable to fully backfill committed WAL frames during MVCC recovery"
+                                .to_string(),
+                        ));
+                    }
+                    data.checkpoint_result = Some(checkpoint_result);
+                    data.phase = ReconcilePhase::SyncDbFile;
+                }
+                ReconcilePhase::SyncDbFile => {
+                    let backfilled = data
+                        .checkpoint_result
+                        .as_ref()
+                        .map(|cr| cr.wal_checkpoint_backfilled)
+                        .unwrap_or(0);
+                    if sync_mode != SyncMode::Off && backfilled > 0 {
+                        return_if_io!(await_completion(&mut data.pending, || pager
+                            .db_file
+                            .sync(Completion::new_sync(|_| {}), pager.get_sync_type())));
+                    }
+                    data.phase = ReconcilePhase::UpdateHeader;
+                }
+                ReconcilePhase::UpdateHeader => {
+                    // Write a fresh log header before truncating WAL; the CRC verify +
+                    // single retry below guards against a torn header write.
+                    return_if_io!(await_completion(&mut data.pending, || self
+                        .storage
+                        .update_header()));
+                    data.phase = ReconcilePhase::SyncLog;
+                }
+                ReconcilePhase::SyncLog => {
+                    if sync_mode != SyncMode::Off {
+                        return_if_io!(await_completion(&mut data.pending, || self
+                            .storage
+                            .sync(pager.get_sync_type())));
+                    }
+                    data.phase = ReconcilePhase::VerifyCrc;
+                }
+                ReconcilePhase::VerifyCrc => {
+                    let valid =
+                        return_if_io!(self.logical_log_header_crc_valid_io(&mut data.crc_reader));
+                    if valid {
+                        data.phase = ReconcilePhase::TruncateFinal;
+                    } else if data.retried_crc {
+                        return Err(LimboError::Corrupt(
+                            "Logical log header CRC mismatch after retry".to_string(),
+                        ));
+                    } else {
+                        data.retried_crc = true;
+                        data.phase = ReconcilePhase::UpdateHeader;
+                    }
+                }
+                ReconcilePhase::TruncateFinal => {
+                    return_if_io!(wal.truncate_wal(
+                        data.checkpoint_result
+                            .as_mut()
+                            .expect("checkpoint result set"),
+                        pager.get_sync_type(),
+                    ));
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
     }
 
     /// Replays committed logical-log frames into the in-memory MVCC store.
