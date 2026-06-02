@@ -227,6 +227,7 @@ impl CommitState {
 
         connection.rollback_attached_mvcc_txs(true);
         connection.rollback_attached_wal_txns();
+        connection.rollback_temp_schema();
     }
 }
 
