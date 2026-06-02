@@ -1,5 +1,5 @@
 use crate::alloc::TursoSliceExt;
-use crate::function::AccumulatorFunc;
+use crate::function::{AccumulatorFunc, WindowFunc};
 use crate::schema::{BTreeCharacteristics, BTreeTable, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
@@ -512,15 +512,21 @@ pub struct WindowMetadata<'a> {
     pub buffer_table_name: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct WindowLabels {
     /// Address of the subroutine for flushing buffered rows
     pub flush_buffer: BranchOffset,
+    /// Address of the subroutine that sends the populated result registers
+    /// to the outer query (select-result / order-by sorter insert). Mirrors
+    /// SQLite's `addrGosub` (window.c:1988): every RETURN_ROW site Gosubs
+    /// here, so per-row bookkeeping with a single jump target — SELECT
+    /// DISTINCT's on-conflict label in particular — is emitted exactly once.
+    pub row_output: BranchOffset,
     /// Address of the end of window processing
     pub window_processing_end: BranchOffset,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct WindowRegisters {
     /// Stores the ROWID of the last row inserted into the buffer table.
     /// If NULL, we are before inserting the first row of a new partition.
@@ -546,22 +552,87 @@ pub struct WindowRegisters {
     /// These registers are used to detect whether the current row is a "peer"
     /// (i.e., has identical ORDER BY values to the previous row).
     pub new_order_by_columns_start: Option<usize>,
-    /// Start of the register array holding ORDER BY column values from the previous row.
-    /// These are used to compare against the current row to determine peer relationships.
-    pub prev_order_by_columns_start: Option<usize>,
+    /// Per-cursor "peer reference" registers — each holds the ORDER BY
+    /// values of the first row of the peer group that cursor is currently
+    /// processing. The peer-loop inside `emit_window_op` compares the
+    /// next-advanced row's values against the cursor's reg and either
+    /// loops (peer) or falls through (new group, also updates the reg).
+    ///
+    /// `peer_end_reg` doubles as the "previous source row" tracker —
+    /// it's also used by `emit_window_step`'s pre-check that skips
+    /// AggStep / RETURN_ROW when consecutive source rows are peers,
+    /// because under our supported frames AGGSTEP's peer-loop on
+    /// csr_end and the source-row peer check share the same reference.
+    ///
+    /// `peer_start_reg` is `Some` only when the window has a moving
+    /// frame start (ntile, percent_rank, cume_dist); other windows
+    /// don't allocate `csr_start` so the start peer-loop never runs.
+    ///
+    /// Mirrors SQLite's `s.start.reg` / `s.current.reg` / `s.end.reg`
+    /// (window.c:2897-2899).
+    pub peer_start_reg: Option<usize>,
+    pub peer_current_reg: Option<usize>,
+    pub peer_end_reg: Option<usize>,
+    /// Return-address register for the `labels.row_output` Gosub. Mirrors
+    /// SQLite's `regGosub` (window.c:2793).
+    pub row_output_return: usize,
 }
 
 /// Cursors on the ephemeral "buffer" B-tree that holds rows of the current
-/// partition. Naming mirrors SQLite's allocation in `sqlite3WindowCodeStep`
-/// (`window.c`).
-#[derive(Debug)]
+/// partition. The four cursor roles mirror SQLite's `sqlite3WindowCodeStep`
+/// allocation (`window.c:2834-2837`).
+#[derive(Debug, Clone, Copy)]
 pub struct WindowCursors {
     /// Used to `Insert` newly-buffered source rows. Position is implicit
     /// (advances on each `NewRowid` + `Insert`).
     pub csr_write: CursorID,
-    /// The row currently being returned to the outer query; result-column
-    /// propagation reads from here.
+    /// The row currently being returned to the outer query. `AggValue` fires
+    /// when this advances; result-column propagation reads from here.
     pub csr_current: CursorID,
+    /// Tracks the frame-end boundary. `AggStep` reads from this cursor's
+    /// current row, then advances it. Under RANGE/GROUPS frames the advance
+    /// loops through peer-equal rows in one go.
+    pub csr_end: CursorID,
+    /// Tracks the frame-start boundary for windows whose coerced frame
+    /// doesn't start at UNBOUNDED PRECEDING (ntile, percent_rank,
+    /// cume_dist). `AggInverse` reads from this cursor's current row,
+    /// then advances it (peer-loop under GROUPS/RANGE mode). `None` when
+    /// the frame start is UNBOUNDED PRECEDING — the cursor would never
+    /// move so allocation would be wasted. Mirrors SQLite's
+    /// `s.start.csr` (`window.c:2836`).
+    pub csr_start: Option<CursorID>,
+    /// Per-row lookup cursor used at output time by functions whose
+    /// value is computed via `SeekRowid` rather than running aggregator
+    /// state — first_value, nth_value, and (once they land) lag, lead.
+    /// `OpenDup`'d off `csr_current` and only moved by `SeekRowid` at
+    /// output time, so it's independent of the frame-cursor positions.
+    /// Allocated lazily — `None` when no function in the window needs
+    /// positional lookup. Mirrors SQLite's `pWin->csrApp` (`window.c`).
+    pub csr_app: Option<CursorID>,
+}
+
+/// Builds `KeyInfo` entries for the window's ORDER BY columns, populating
+/// each entry's collation from the expression. Used by every peer-equality
+/// `Insn::Compare` site (source-row pre-check + per-cursor peer-loop in
+/// `emit_window_op`); `sort_order` and `nulls_order` are left at their
+/// `Insn::Compare` defaults — the peer check only inspects equality, not
+/// ordering direction.
+fn build_order_by_key_info(
+    window: &Window,
+    table_references: &crate::translate::plan::TableReferences,
+) -> crate::Result<Vec<KeyInfo>> {
+    window
+        .order_by
+        .iter()
+        .map(|(expr, _, _)| {
+            let collation = get_collseq_from_expr(expr, table_references)?.unwrap_or_default();
+            Ok(KeyInfo {
+                sort_order: SortOrder::Asc,
+                collation,
+                nulls_order: None,
+            })
+        })
+        .collect()
 }
 
 pub struct EmitWindow;
@@ -614,13 +685,43 @@ impl EmitWindow {
             crate::alloc::vec![],
             None,
         ));
-        // The "current" cursor is the primary cursor on the ephemeral
-        // buffer; the write cursor is an OpenDup'd duplicate that shares
-        // the same underlying B-tree but tracks an independent position.
+        // `csr_current` is the primary cursor on the ephemeral buffer;
+        // the others are OpenDup'd duplicates that share the same B-tree
+        // with independent positions. `csr_start` is deliberately omitted
+        // until a moving-start frame needs it.
         let cursor_csr_current =
             program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
         let cursor_csr_write =
             program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
+        let cursor_csr_end = program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
+        // `csr_start` tracks the frame-start cursor for functions whose
+        // coerced frame doesn't start at UNBOUNDED PRECEDING (ntile,
+        // percent_rank, cume_dist). AggInverse fires on this cursor as
+        // the frame shrinks from the left.
+        let has_moving_start = !matches!(
+            window.frame.start,
+            crate::translate::plan::FrameBoundary::UnboundedPreceding
+        );
+        let cursor_csr_start = if has_moving_start {
+            Some(program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone())))
+        } else {
+            None
+        };
+        // `csr_app` is the per-row lookup cursor used at output time by
+        // first_value / nth_value (positional seek). Mirrors SQLite's
+        // `csrApp` allocation (`window.c:1422-1426`). Allocate only when
+        // needed so unaffected windows don't pay the extra `OpenDup`.
+        let needs_csr_app = window.functions.iter().any(|f| {
+            matches!(
+                &f.func,
+                AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue),
+            )
+        });
+        let cursor_csr_app = if needs_csr_app {
+            Some(program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone())))
+        } else {
+            None
+        };
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id: cursor_csr_current,
             is_table: true,
@@ -629,6 +730,22 @@ impl EmitWindow {
             original_cursor_id: cursor_csr_current,
             new_cursor_id: cursor_csr_write,
         });
+        program.emit_insn(Insn::OpenDup {
+            original_cursor_id: cursor_csr_current,
+            new_cursor_id: cursor_csr_end,
+        });
+        if let Some(csr_start) = cursor_csr_start {
+            program.emit_insn(Insn::OpenDup {
+                original_cursor_id: cursor_csr_current,
+                new_cursor_id: csr_start,
+            });
+        }
+        if let Some(csr_app) = cursor_csr_app {
+            program.emit_insn(Insn::OpenDup {
+                original_cursor_id: cursor_csr_current,
+                new_cursor_id: csr_app,
+            });
+        }
 
         // Window function processing is similar to aggregation processing in how results are mapped
         // to registers. Each function expression is stored in `expr_to_reg_cache` along with its
@@ -670,6 +787,7 @@ impl EmitWindow {
         t_ctx.meta_window = Some(WindowMetadata {
             labels: WindowLabels {
                 flush_buffer: program.allocate_label(),
+                row_output: program.allocate_label(),
                 window_processing_end: program.allocate_label(),
             },
             registers: WindowRegisters {
@@ -684,12 +802,34 @@ impl EmitWindow {
                 flush_buffer_return_offset: program.alloc_register(),
                 src_columns_start: reg_src_columns_start,
                 result_columns_start: reg_col_start,
-                prev_order_by_columns_start: alloc_optional_registers(program, order_by_len),
                 new_order_by_columns_start: alloc_optional_registers(program, order_by_len),
+                peer_start_reg: if has_moving_start {
+                    alloc_optional_registers(program, order_by_len)
+                } else {
+                    None
+                },
+                // `peer_current_reg` / `peer_end_reg` drive the AGGSTEP /
+                // RETURN_ROW peer-loops, which only run under RANGE / GROUPS
+                // (`b_peer` in `emit_window_op`). Under ROWS they're written
+                // by the seeding step but never read; skip the allocation.
+                peer_current_reg: if window.frame.mode != turso_parser::ast::FrameMode::Rows {
+                    alloc_optional_registers(program, order_by_len)
+                } else {
+                    None
+                },
+                peer_end_reg: if window.frame.mode != turso_parser::ast::FrameMode::Rows {
+                    alloc_optional_registers(program, order_by_len)
+                } else {
+                    None
+                },
+                row_output_return: program.alloc_register(),
             },
             cursors: WindowCursors {
                 csr_write: cursor_csr_write,
                 csr_current: cursor_csr_current,
+                csr_end: cursor_csr_end,
+                csr_start: cursor_csr_start,
+                csr_app: cursor_csr_app,
             },
             src_column_count,
             expressions_referencing_subquery,
@@ -698,49 +838,216 @@ impl EmitWindow {
 
         Ok(())
     }
-    /// Emits bytecode to process a single row of the window’s input (always a subquery).
+    /// Emits the per-source-row body for window processing.
     ///
-    /// Note:
-    /// The **buffer table** mentioned below is an ephemeral B-tree that temporarily
-    /// stores rows for the current window frame.
+    /// This is the Rust port of the main loop in SQLite's
+    /// `sqlite3WindowCodeStep` (`window.c:2786-3037`), restricted to the
+    /// frames our planner coerces to: ROWS / RANGE / GROUPS with
+    /// `UNBOUNDED PRECEDING` start and `CURRENT ROW` end (and the moving
+    /// variants for the as-yet-unimplemented ntile / percent_rank /
+    /// cume_dist).
     ///
-    /// High-level overview:
-    /// - Each row from the subquery is read, and its ORDER BY columns are loaded into
-    ///   dedicated registers for comparison and partitioning purposes.
-    /// - If the row starts a new partition (based on PARTITION BY columns), the buffer
-    ///   and accumulators are flushed or reset as needed.
-    /// - Rows are compared against the previous row to determine if they are "peers"
-    ///   (i.e., have the same ORDER BY values). Non-peer rows may trigger flushing
-    ///   of intermediate results.
-    /// - The row is then inserted into the window’s buffer table.
-    /// - Aggregate steps for any window functions are executed.
-    pub fn emit_window_loop_source(
+    /// Pseudocode for the most common shape (`UNBOUNDED PRECEDING TO
+    /// CURRENT ROW`):
+    ///
+    /// ```text
+    ///   load ORDER BY columns into newPeer regs
+    ///   if partition_by_cols changed:
+    ///       Gosub flush_partition
+    ///       Null rowid_reg                 ; marks "first row of new partition"
+    ///       Copy partition_by_cols → prev_partition_regs
+    ///
+    ///   if rowid_reg is null:                       ; FIRST ROW OF PARTITION
+    ///       Copy newPeer → prevPeer
+    ///       Null accumulators
+    ///       Insert row into ephemeral via csr_write
+    ///       Rewind csr_current, csr_end, csr_start  ; position at row 1
+    ///       Goto loop_end
+    ///   else:                                       ; SUBSEQUENT ROW
+    ///       Insert row into ephemeral via csr_write
+    ///       if RANGE/GROUPS and newPeer == prevPeer:
+    ///           Goto loop_end                       ; defer step until peer break
+    ///       emit_window_op AGGSTEP        ; advance csr_end through peer rows; AggStep per row
+    ///       emit_window_op RETURN_ROW     ; advance csr_current; emit each row
+    ///       (emit_window_op AGGINVERSE is a no-op for UNBOUNDED start)
+    ///       Copy newPeer → prevPeer                 ; RANGE/GROUPS only
+    ///   loop_end:
+    /// ```
+    ///
+    /// Example — `row_number() OVER (ORDER BY salary DESC)` over 3 rows:
+    /// the source coroutine yields each row, this body inserts it, advances
+    /// `csr_end` (AggStep increments row_number's counter) and `csr_current`
+    /// (RETURN_ROW emits the previous row with its accumulated counter).
+    /// The very first row's emission is deferred to the flush subroutine
+    /// because `csr_current` was just rewound and there's no preceding row
+    /// to emit yet.
+    pub fn emit_window_step(
         program: &mut ProgramBuilder,
         t_ctx: &mut TranslateCtx,
         plan: &SelectPlan,
     ) -> crate::Result<()> {
-        let WindowMetadata {
-            labels,
-            registers,
-            cursors,
-            src_column_count: input_column_count,
-            buffer_table_name,
-            ..
-        } = t_ctx.meta_window.as_ref().expect("missing window metadata");
+        let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
         let window = plan.window.as_ref().expect("missing window");
 
-        emit_load_order_by_columns(program, window, registers);
-        emit_flush_buffer_if_new_partition(program, labels, registers, window, plan)?;
-        emit_reset_state_if_new_partition(program, registers, window);
-        emit_flush_buffer_if_not_peer(program, labels, registers, window, plan)?;
+        let labels = meta.labels;
+        let registers = meta.registers;
+        let cursors = meta.cursors;
+        let src_column_count = meta.src_column_count;
+        let buffer_table_name = meta.buffer_table_name.clone();
+
+        emit_load_order_by_columns(program, window, &registers);
+        emit_flush_buffer_if_new_partition(program, &labels, &registers, window, plan)?;
+
+        // `rowid_reg` was NULL'd at partition entry; it stays NULL until the
+        // first Insert of this partition. We use that to dispatch between
+        // the first-row branch (cold-start setup) and the subsequent-row
+        // branch (the steady-state AGGSTEP + RETURN_ROW pair).
+        let label_subsequent = program.allocate_label();
+        let label_step_end = program.allocate_label();
+        program.emit_insn(Insn::NotNull {
+            reg: registers.rowid,
+            target_pc: label_subsequent,
+        });
+
+        // --- FIRST ROW OF PARTITION ---
+        if let Some(new_ob) = registers.new_order_by_columns_start {
+            // Seed every per-cursor peer reference with the first row's
+            // ORDER BY values. Mirrors SQLite's three-cursor init at
+            // `window.c:2973-2976` (regNewPeer → s.start.reg / current.reg
+            // / end.reg). Doubling as the source-row peer-pre-check
+            // reference (`regPeer` in SQLite), `peer_end_reg` is set
+            // here and updated by AGGSTEP's peer-loop fall-through —
+            // we don't need a separate `regPeer` because the values
+            // they would hold are always identical at any program point.
+            program.add_comment(
+                program.offset(),
+                "initialize per-cursor peer-reference registers for new partition",
+            );
+            let n = window.order_by.len() - 1;
+            for &peer_reg in [
+                registers.peer_start_reg,
+                registers.peer_current_reg,
+                registers.peer_end_reg,
+            ]
+            .iter()
+            .flatten()
+            {
+                program.emit_insn(Insn::Copy {
+                    src_reg: new_ob,
+                    dst_reg: peer_reg,
+                    extra_amount: n,
+                });
+            }
+        }
+        program.add_comment(program.offset(), "reset accumulator registers");
+        program.emit_insn(Insn::Null {
+            dest: registers.acc_start,
+            dest_end: Some(registers.acc_start + window.functions.len() - 1),
+        });
         emit_insert_row_into_buffer(
             program,
-            registers,
-            cursors,
-            input_column_count,
-            buffer_table_name,
+            &registers,
+            &cursors,
+            &src_column_count,
+            &buffer_table_name,
         );
-        emit_aggregation_step(program, window, &t_ctx.resolver, plan, registers)?;
+        // Position each frame cursor at the just-inserted first row.
+        // Mirrors `window.c:2967-2971` — `csr_start` is rewound only when
+        // the frame start isn't UNBOUNDED PRECEDING (otherwise the
+        // cursor wasn't allocated and AggInverse is a no-op).
+        let label_unreachable_empty = program.allocate_label();
+        if let Some(csr_start) = cursors.csr_start {
+            program.emit_insn(Insn::Rewind {
+                cursor_id: csr_start,
+                pc_if_empty: label_unreachable_empty,
+            });
+        }
+        program.emit_insn(Insn::Rewind {
+            cursor_id: cursors.csr_current,
+            pc_if_empty: label_unreachable_empty,
+        });
+        program.emit_insn(Insn::Rewind {
+            cursor_id: cursors.csr_end,
+            pc_if_empty: label_unreachable_empty,
+        });
+        program.preassign_label_to_next_insn(label_unreachable_empty);
+        // First row contributes nothing to xStep here — the drain AGGSTEP
+        // in the flush subroutine processes it once at end-of-partition,
+        // and RETURN_ROW there emits it.
+        program.emit_insn(Insn::Goto {
+            target_pc: label_step_end,
+        });
+
+        // --- SUBSEQUENT ROW ---
+        program.preassign_label_to_next_insn(label_subsequent);
+        emit_insert_row_into_buffer(
+            program,
+            &registers,
+            &cursors,
+            &src_column_count,
+            &buffer_table_name,
+        );
+
+        let frame_mode = window.frame.mode;
+        let order_by_len = window.order_by.len();
+        let is_range_or_groups = frame_mode != turso_parser::ast::FrameMode::Rows;
+        if is_range_or_groups && order_by_len == 0 {
+            // RANGE/GROUPS with no ORDER BY: the entire partition is one
+            // peer group. The main body emits nothing — every step gets
+            // deferred to the flush subroutine, which drains all rows
+            // under one peer-equal loop and emits each with the same
+            // accumulated value.
+            program.emit_insn(Insn::Goto {
+                target_pc: label_step_end,
+            });
+        } else if is_range_or_groups {
+            // RANGE/GROUPS: if the new row is peer-equal with prevPeer, the
+            // frame doesn't advance yet — buffer the row and skip the step.
+            // The next non-peer row will trigger AGGSTEP, which loops
+            // through all peer-equal buffered rows in `emit_window_op`.
+            let label_step_body = program.allocate_label();
+            program.add_comment(program.offset(), "compare ORDER BY columns to detect peer");
+            let compare_key_info = build_order_by_key_info(window, &plan.table_references)?;
+            // Source-row peer pre-check — skip AGGSTEP / RETURN_ROW when
+            // the new source row is in the same peer group as the
+            // previous one. Uses `peer_end_reg` as the reference (which
+            // tracks the last AGGSTEP'd group); AGGSTEP's own peer-loop
+            // updates `peer_end_reg` so subsequent source rows see the
+            // correct comparison value.
+            //
+            // `Insn::Compare` requires `start_reg_a < start_reg_b`, so
+            // we put the earlier-allocated `new_order_by_columns_start`
+            // first. The Jump targets are symmetric on lt/gt
+            // (both go to step_body) so the operand order doesn't
+            // change the semantics.
+            program.emit_insn(Insn::Compare {
+                start_reg_a: registers
+                    .new_order_by_columns_start
+                    .expect("new_order_by_columns_start must exist"),
+                start_reg_b: registers
+                    .peer_end_reg
+                    .expect("peer_end_reg must exist under RANGE/GROUPS with ORDER BY"),
+                count: window.order_by.len(),
+                key_info: compare_key_info,
+            });
+            program.emit_insn(Insn::Jump {
+                target_pc_lt: label_step_body,
+                target_pc_eq: label_step_end,
+                target_pc_gt: label_step_body,
+            });
+            program.preassign_label_to_next_insn(label_step_body);
+        }
+
+        emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None)?;
+        emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None)?;
+
+        // No explicit peer-tracker update needed here: AGGSTEP's
+        // peer-loop fall-through copies `new` into `peer_end_reg`, and
+        // the (non-cached) RETURN_ROW peer-loop fall-through copies
+        // `new` into `peer_current_reg`. Mirrors SQLite's
+        // `windowIfNewPeer` Copy-on-fall-through (window.c:2074).
+
+        program.preassign_label_to_next_insn(label_step_end);
 
         Ok(())
     }
@@ -879,106 +1186,6 @@ fn emit_flush_buffer_if_new_partition(
     Ok(())
 }
 
-fn emit_reset_state_if_new_partition(
-    program: &mut ProgramBuilder,
-    registers: &WindowRegisters,
-    window: &Window,
-) {
-    let label_skip_reset_state = program.allocate_label();
-
-    // If rowid is null, it means we are starting a new partition. It was either set by the code
-    // initializing window processing or by code detecting the start of a new partition.
-    program.emit_insn(Insn::NotNull {
-        reg: registers.rowid,
-        target_pc: label_skip_reset_state,
-    });
-    if let Some(dst_reg_start) = registers.new_order_by_columns_start {
-        // Initialize previous ORDER BY values for the new partition. The first row of the
-        // partition is compared to itself, not to the row from the previous partition.
-        program.add_comment(
-            program.offset(),
-            "initialize previous peer register for new partition",
-        );
-        program.emit_insn(Insn::Copy {
-            src_reg: dst_reg_start,
-            dst_reg: registers
-                .prev_order_by_columns_start
-                .expect("prev_order_by_columns_start must exist"),
-            extra_amount: window.order_by.len() - 1,
-        });
-    }
-    // Since this is a new partition, we must reset accumulator registers.
-    program.add_comment(program.offset(), "reset accumulator registers");
-    program.emit_insn(Insn::Null {
-        dest: registers.acc_start,
-        dest_end: Some(registers.acc_start + window.functions.len() - 1),
-    });
-
-    program.preassign_label_to_next_insn(label_skip_reset_state);
-}
-
-fn emit_flush_buffer_if_not_peer(
-    program: &mut ProgramBuilder,
-    labels: &WindowLabels,
-    registers: &WindowRegisters,
-    window: &Window,
-    plan: &SelectPlan,
-) -> Result<()> {
-    if let Some(reg_new_order_by_columns_start) = registers.new_order_by_columns_start {
-        let label_peer = program.allocate_label();
-        let label_not_peer = program.allocate_label();
-        let order_by_len = window.order_by.len();
-        let reg_prev_order_by_columns_start = registers
-            .prev_order_by_columns_start
-            .expect("prev_order_by_columns_start must exist");
-
-        program.add_comment(program.offset(), "compare ORDER BY columns to detect peer");
-        let mut compare_key_info = (0..window.order_by.len())
-            .map(|_| KeyInfo {
-                sort_order: SortOrder::Asc,
-                collation: CollationSeq::default(),
-                nulls_order: None,
-            })
-            .collect::<Vec<_>>();
-        for (i, c) in compare_key_info
-            .iter_mut()
-            .enumerate()
-            .take(window.order_by.len())
-        {
-            let maybe_collation =
-                get_collseq_from_expr(&window.order_by[i].0, &plan.table_references)?;
-            c.collation = maybe_collation.unwrap_or_default();
-        }
-        program.emit_insn(Insn::Compare {
-            start_reg_a: reg_prev_order_by_columns_start,
-            start_reg_b: reg_new_order_by_columns_start,
-            count: order_by_len,
-            key_info: compare_key_info,
-        });
-        program.emit_insn(Insn::Jump {
-            target_pc_lt: label_not_peer,
-            target_pc_eq: label_peer,
-            target_pc_gt: label_not_peer,
-        });
-
-        program.preassign_label_to_next_insn(label_not_peer);
-        program.add_comment(program.offset(), "detected non-peer row");
-        program.emit_insn(Insn::Gosub {
-            target_pc: labels.flush_buffer,
-            return_reg: registers.flush_buffer_return_offset,
-        });
-        program.emit_insn(Insn::Copy {
-            src_reg: reg_new_order_by_columns_start,
-            dst_reg: reg_prev_order_by_columns_start,
-            extra_amount: order_by_len - 1,
-        });
-
-        program.preassign_label_to_next_insn(label_peer);
-    }
-
-    Ok(())
-}
-
 fn emit_load_order_by_columns(
     program: &mut ProgramBuilder,
     window: &Window,
@@ -1033,62 +1240,288 @@ fn emit_insert_row_into_buffer(
     });
 }
 
-fn emit_aggregation_step(
+/// The three frame-cursor operations. Mirrors SQLite's `WINDOW_AGGSTEP`,
+/// `WINDOW_RETURN_ROW`, and `WINDOW_AGGINVERSE` constants in
+/// `window.c:1765-1773`. Each operation reads from one cursor, fires the
+/// per-function callback for it, then advances that cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowOp {
+    /// A row entered the frame at its right edge: read `csr_end`, fire
+    /// each function's xStep, advance `csr_end`.
+    AggStep,
+    /// Emit the row at `csr_current` to the outer query, then advance
+    /// `csr_current`. xValue is computed for each function before the
+    /// emit.
+    ReturnRow,
+    /// A row left the frame at its left edge: read `csr_start`, fire
+    /// each function's xInverse, advance `csr_start`. No-op (and never
+    /// emitted) for windows whose frame start is UNBOUNDED PRECEDING.
+    AggInverse,
+}
+
+/// Emit one of the three frame-cursor operations, mirroring SQLite's
+/// `windowCodeOp` helper (`window.c:2229-2376`).
+///
+/// `break_on_eof` is `Some(label)` only at flush time, when the caller wants
+/// the `RETURN_ROW` loop to exit cleanly on EOF instead of falling through.
+///
+/// Under RANGE/GROUPS frames (`bPeer == true`), the cursor advances loop
+/// through every peer-equal row before returning — one `AggStep` call
+/// xSteps the whole previous peer group, one `RETURN_ROW` call emits the
+/// whole previous peer group with the same accumulated state. Under ROWS
+/// frames (`bPeer == false`), each call advances by exactly one row.
+fn emit_window_op(
     program: &mut ProgramBuilder,
-    window: &Window,
-    resolver: &Resolver,
+    t_ctx: &mut TranslateCtx,
     plan: &SelectPlan,
-    registers: &WindowRegisters,
-) -> crate::Result<()> {
-    // Only iterate over functions whose accumulator is advanced once per
-    // input row read from the subquery. Aggregate window functions always
-    // qualify; window functions qualify when they produce one value per
-    // peer group (rank-family). row_number and the positional functions
-    // are handled entirely inside the per-row loop in
-    // `emit_peer_group_flush`.
-    let accumulates_per_input_row = |func: &WindowFunction| match &func.func {
-        AccumulatorFunc::Agg(_) => true,
-        AccumulatorFunc::Window(w) => w.one_value_per_peer_group(),
+    op: WindowOp,
+    break_on_eof: Option<BranchOffset>,
+) -> Result<()> {
+    let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+    let window = plan.window.as_ref().expect("missing window");
+    let registers = meta.registers;
+    let cursors = meta.cursors;
+    let order_by_len = window.order_by.len();
+    let frame_mode = window.frame.mode;
+    // bPeer mirrors SQLite's `WindowCodeArg.eFrmType != TK_ROWS` test
+    // (window.c:2247). Under RANGE / GROUPS frames, advances loop through
+    // peer-equal rows; with no ORDER BY every row is peer-equal so the
+    // loop runs to EOF.
+    let b_peer = frame_mode != turso_parser::ast::FrameMode::Rows;
+
+    let label_done = program.allocate_label();
+    // Cursor + per-cursor peer reference register for each op. Mirrors
+    // SQLite's switch at `window.c:2315-2344` plus the reg pickup at
+    // `window.c:2317-2336`.
+    let (cursor_for_op, peer_ref_reg) = match op {
+        WindowOp::AggStep => (cursors.csr_end, registers.peer_end_reg),
+        WindowOp::ReturnRow => (cursors.csr_current, registers.peer_current_reg),
+        WindowOp::AggInverse => (
+            cursors
+                .csr_start
+                .expect("AggInverse can only be emitted when the window has a moving frame start"),
+            registers.peer_start_reg,
+        ),
     };
 
-    for (i, func) in window
-        .functions
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| accumulates_per_input_row(f))
-    {
-        let reg_acc_start = registers.acc_start + i;
+    // RETURN_ROW finalizes accumulators before emitting (SQLite's
+    // windowAggFinal at window.c:2284). first_value / nth_value have
+    // no accumulator value to read — `emit_first_value_nth_value_lookup`
+    // writes their result registers directly inside `emit_return_one_row`.
+    if matches!(op, WindowOp::ReturnRow) {
+        for (i, func) in window.functions.iter().enumerate() {
+            if matches!(
+                &func.func,
+                AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue),
+            ) {
+                continue;
+            }
+            program.emit_insn(Insn::AggValue {
+                acc_reg: registers.acc_start + i,
+                dest_reg: registers.acc_result_start + i,
+                func: func.func.clone(),
+            });
+        }
+    }
+
+    let label_continue = program.allocate_label();
+    program.preassign_label_to_next_insn(label_continue);
+
+    match op {
+        WindowOp::AggStep => {
+            emit_function_step(program, t_ctx, plan, cursors.csr_end)?;
+        }
+        WindowOp::ReturnRow => {
+            emit_return_one_row(program, t_ctx, plan)?;
+        }
+        WindowOp::AggInverse => {
+            emit_function_inverse(program, t_ctx, plan)?;
+        }
+    }
+
+    // Advance the cursor. Three control-flow shapes mirroring SQLite's
+    // `windowCodeOp` tail at window.c:2351-2361:
+    //   - break_on_eof=Some: Next; on EOF fall through to a Goto that
+    //     jumps to the caller's break label.
+    //   - bPeer=true: Next; on EOF fall through to Goto label_done; else
+    //     fall through to the peer-loop check below.
+    //   - bPeer=false, no break_on_eof: Next; on EOF fall through;
+    //     no peer check; label_done is the next instruction.
+    let label_after_next = program.allocate_label();
+    program.emit_insn(Insn::Next {
+        cursor_id: cursor_for_op,
+        pc_if_next: label_after_next,
+    });
+    if let Some(break_target) = break_on_eof {
+        program.emit_insn(Insn::Goto {
+            target_pc: break_target,
+        });
+    } else if b_peer {
+        program.emit_insn(Insn::Goto {
+            target_pc: label_done,
+        });
+    }
+    program.preassign_label_to_next_insn(label_after_next);
+
+    if b_peer && order_by_len > 0 {
+        // Peer-loop check, mirroring SQLite's `windowIfNewPeer` (which
+        // bundles the Compare + Jump-if-equal + Copy-on-fall-through
+        // at `window.c:2057-2078`). The peer reference register is
+        // per-cursor (`peer_start_reg` / `peer_current_reg` /
+        // `peer_end_reg`) so the start / current / end cursors can be
+        // at different peer groups during flush — required for
+        // percent_rank / cume_dist.
+        let temp_start = program.alloc_registers(order_by_len);
+        for (i, (expr, _, _)) in window.order_by.iter().enumerate() {
+            if let Expr::Column { column, .. } = expr {
+                program.emit_insn(Insn::Column {
+                    cursor_id: cursor_for_op,
+                    column: *column,
+                    dest: temp_start + i,
+                    default: None,
+                });
+            } else {
+                unreachable!("expected Column in window.order_by, got {:?}", expr);
+            }
+        }
+        let key_info = build_order_by_key_info(window, &plan.table_references)?;
+        let peer_ref = peer_ref_reg.expect(
+            "per-cursor peer reference register must exist under RANGE/GROUPS with ORDER BY",
+        );
+        let label_update_peer = program.allocate_label();
+        program.emit_insn(Insn::Compare {
+            start_reg_a: peer_ref,
+            start_reg_b: temp_start,
+            count: order_by_len,
+            key_info,
+        });
+        program.emit_insn(Insn::Jump {
+            target_pc_lt: label_update_peer,
+            target_pc_eq: label_continue,
+            target_pc_gt: label_update_peer,
+        });
+        // Fall-through path (new peer group): copy the new row's ORDER
+        // BY values into the cursor's peer reference register so the
+        // next peer-loop iteration compares against this group.
+        program.preassign_label_to_next_insn(label_update_peer);
+        program.emit_insn(Insn::Copy {
+            src_reg: temp_start,
+            dst_reg: peer_ref,
+            extra_amount: order_by_len - 1,
+        });
+    } else if b_peer {
+        // RANGE/GROUPS with no ORDER BY: every row in the partition is
+        // peer-equal, so the loop always continues until EOF (handled by
+        // the Next/Goto pair above).
+        program.emit_insn(Insn::Goto {
+            target_pc: label_continue,
+        });
+    }
+
+    program.preassign_label_to_next_insn(label_done);
+
+    Ok(())
+}
+
+/// Emit per-function xStep / xInverse calls reading from `read_csr`.
+///
+/// Mirrors SQLite's `windowAggStep` (`window.c:1658-1762`): for each
+/// function, each argument is loaded from the cursor's current row into a
+/// fresh register block (SQLite's `p->regArg`), then `AggStep` /
+/// `AggInverse` is emitted referencing that block. Crucially, the load
+/// destinations are *separate* from `src_columns_start` so the source
+/// coroutine's register block (which holds the new-partition row being
+/// processed) isn't trampled while we drain the previous partition.
+///
+/// Argument expressions are pushed into the resolver's expression cache
+/// during the call so `translate_aggregation_step`'s recursive
+/// `translate_expr` resolves each `Expr::Column` to the arg-load register
+/// we just populated, instead of to `src_columns_start`. The cache is
+/// restored on the way out.
+fn emit_function_step(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    plan: &SelectPlan,
+    read_csr: CursorID,
+) -> Result<()> {
+    let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+    let window = plan.window.as_ref().expect("missing window");
+    let acc_start = meta.registers.acc_start;
+
+    // Save cache state so the per-arg overrides we push below don't leak
+    // out to other parts of the emit pipeline (e.g. emit_return_one_row).
+    let initial_cache_len = t_ctx.resolver.expr_to_reg_cache.len();
+    let cache_was_enabled = t_ctx.resolver.expr_to_reg_cache_enabled;
+
+    for (i, func) in window.functions.iter().enumerate() {
+        // first_value / nth_value are computed at output time via
+        // `SeekRowid` on `csr_app` (see
+        // `emit_first_value_nth_value_lookup`). They have no
+        // step-time accumulator update — mirrors SQLite's WINDOWFUNCNOOP
+        // pattern at `window.c:1727-1730`.
+        if matches!(
+            &func.func,
+            AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue)
+        ) {
+            continue;
+        }
+        let acc_reg = acc_start + i;
+        let args: Vec<Expr> = match func.current_expr() {
+            Expr::FunctionCall { args, .. } => args.iter().map(|a| (**a).clone()).collect(),
+            Expr::FunctionCallStar { .. } => vec![],
+            _ => unreachable!("window functions are FunctionCall or FunctionCallStar expressions"),
+        };
+
+        // Load each Expr::Column arg from the frame cursor into a fresh
+        // reg, then push a cache entry so translate_expr on that same Expr
+        // resolves to the freshly-loaded reg. Args that aren't simple
+        // column refs (rare after the planner rewrite) fall through to
+        // translate_expr's default path.
+        let arg_load_start = (!args.is_empty()).then(|| program.alloc_registers(args.len()));
+        if let Some(base) = arg_load_start {
+            for (j, arg) in args.iter().enumerate() {
+                if let Expr::Column { column, .. } = arg {
+                    program.emit_insn(Insn::Column {
+                        cursor_id: read_csr,
+                        column: *column,
+                        dest: base + j,
+                        default: None,
+                    });
+                    t_ctx.resolver.cache_expr_reg(
+                        std::borrow::Cow::Owned(arg.clone()),
+                        base + j,
+                        false,
+                        None,
+                    );
+                }
+            }
+        }
+        t_ctx.resolver.expr_to_reg_cache_enabled = true;
+
         match &func.func {
             AccumulatorFunc::Agg(agg_func) => {
-                // The aggregation step is performed incrementally as each row from the subquery is
-                // processed. Therefore, we don’t need to access the buffer table and can obtain
-                // argument values directly by evaluating the expressions that reference the
-                // subquery result columns. Use the rewritten form when available so the args
-                // reference the subquery rather than the (no-longer-visible) original tables.
-                let args = match func.current_expr() {
-                    Expr::FunctionCall { args, .. } => {
-                        args.iter().map(|a| (**a).clone()).collect()
-                    }
-                    Expr::FunctionCallStar { .. } => vec![],
-                    _ => unreachable!(
-                        "All window functions should be either FunctionCall or FunctionCallStar expressions"
-                    ),
-                };
-
-                // FILTER controls whether the current input row contributes to the
-                // running aggregate; it does not suppress the output row itself.
+                // FILTER predicate also loads from the frame cursor.
                 let filter_skip_label = if let Some(filter_expr) =
                     func.rewritten.as_ref().and_then(|r| r.filter_expr.as_ref())
                 {
                     let label = program.allocate_label();
                     let filter_reg = program.alloc_register();
-                    translate_expr(
-                        program,
-                        Some(&plan.table_references),
-                        filter_expr,
-                        filter_reg,
-                        resolver,
-                    )?;
+                    if let Expr::Column { column, .. } = filter_expr {
+                        program.emit_insn(Insn::Column {
+                            cursor_id: read_csr,
+                            column: *column,
+                            dest: filter_reg,
+                            default: None,
+                        });
+                    } else {
+                        translate_expr(
+                            program,
+                            Some(&plan.table_references),
+                            filter_expr,
+                            filter_reg,
+                            &t_ctx.resolver,
+                        )?;
+                    }
                     program.emit_insn(Insn::IfNot {
                         reg: filter_reg,
                         target_pc: label,
@@ -1107,43 +1540,21 @@ fn emit_aggregation_step(
                         &args,
                         &Distinctness::NonDistinct,
                     ),
-                    reg_acc_start,
-                    resolver,
+                    acc_reg,
+                    &t_ctx.resolver,
                     None,
                 )?;
+
                 if let Some(label) = filter_skip_label {
                     program.preassign_label_to_next_insn(label);
                 }
             }
             AccumulatorFunc::Window(win_func) => {
-                // Emit `AggStep` here, inside the input-scan loop, so the
-                // function's internal state advances once for every row read
-                // from the subquery. `AggValue` is NOT emitted here — the
-                // accumulator is read later, once per peer-group flush, in
-                // `emit_peer_group_flush`. Rank-family functions take no
-                // arguments; first_value/last_value/nth_value do, evaluated
-                // into a contiguous register block — the runtime reads
-                // arg_reg, arg_reg + 1, ... per the function's declared
-                // arity.
-                let arg_reg = match func.current_expr() {
-                    Expr::FunctionCall { args, .. } if !args.is_empty() => {
-                        let start = program.alloc_registers(args.len());
-                        for (i, arg) in args.iter().enumerate() {
-                            translate_expr(
-                                program,
-                                Some(&plan.table_references),
-                                arg,
-                                start + i,
-                                resolver,
-                            )?;
-                        }
-                        start
-                    }
-                    _ => 0,
-                };
+                // 0-ary window funcs (row_number) ignore `col`; the runtime
+                // only reads `state.registers[col + i]` for i in 0..arity.
                 program.emit_insn(Insn::AggStep {
-                    acc_reg: reg_acc_start,
-                    col: arg_reg,
+                    acc_reg,
+                    col: arg_load_start.unwrap_or(0),
                     delimiter: 0,
                     func: AccumulatorFunc::Window(win_func.clone()),
                     comparator: None,
@@ -1152,166 +1563,271 @@ fn emit_aggregation_step(
         }
     }
 
+    // Restore expr-cache state so the per-function arg overrides don't
+    // leak into later emit calls (e.g. emit_return_one_row's outer-query
+    // result emission, which expects its own result_columns_start mapping).
+    t_ctx.resolver.expr_to_reg_cache.truncate(initial_cache_len);
+    t_ctx.resolver.expr_to_reg_cache_enabled = cache_was_enabled;
+
     Ok(())
 }
 
-/// Emits bytecode to output all buffered rows produced by window processing.
+/// Emit per-function `AggInverse` calls — the counterpart of
+/// `emit_function_step` for the frame-start side. Mirrors the xInverse
+/// dispatch inside SQLite's `windowAggStep(... bInverse=1, ...)`
+/// (window.c:2329).
 ///
-/// The generated code has two possible entry points:
-/// * **Fallthrough mode** (normal flow): After all source rows have been processed,
-///   this code executes inline to flush any remaining buffered rows, then continues execution.
-/// * **Subroutine mode** (jump into `labels.flush_buffer`): In this case the code
-///   returns control to the address stored in `registers.flush_buffer_return_offset`
-///   once all buffered rows are processed.
-pub fn emit_window_results(
+/// For our supported moving-start frames (ntile, percent_rank,
+/// cume_dist) xInverse is purely state-mutating: it increments a
+/// counter the function's xValue reads. We pass `col = 0` because none
+/// of these read leaving-row columns. Aggregate inverses (sum / count
+/// / avg under a sliding frame) would need the leaving row's args loaded
+/// from `csr_start` first — that path lands when we accept user-specified
+/// custom frames.
+fn emit_function_inverse(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     plan: &SelectPlan,
-) -> crate::Result<()> {
-    let WindowMetadata {
-        labels,
-        registers,
-        cursors,
-        ..
-    } = t_ctx.meta_window.as_ref().expect("missing window metadata");
+) -> Result<()> {
+    let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
     let window = plan.window.as_ref().expect("missing window");
-
-    let label_empty = program.allocate_label();
-    let label_window_processing_end = labels.window_processing_end;
-    let reg_flush_buffer_return_offset = registers.flush_buffer_return_offset;
-    let cursor_csr_current = cursors.csr_current;
-
-    // All source rows have already been processed at this point.
-    // In fallthrough mode, we are not returning to a caller — we just flush
-    // the buffered rows and continue execution.
-    program.add_comment(program.offset(), "return remaining buffered rows");
-    program.emit_insn(Insn::Null {
-        dest: registers.flush_buffer_return_offset,
-        dest_end: None,
-    });
-
-    // If control jumps here (labels.flush_buffer), we are in subroutine mode.
-    // In that case, after flushing the buffer, execution will return to the
-    // address stored in `flush_buffer_return_offset`.
-    program.preassign_label_to_next_insn(labels.flush_buffer);
-
-    program.emit_insn(Insn::Rewind {
-        cursor_id: cursor_csr_current,
-        pc_if_empty: label_empty,
-    });
-
-    emit_peer_group_flush(program, window, t_ctx, plan)?;
-
-    program.preassign_label_to_next_insn(label_empty);
-
-    program.emit_insn(Insn::ResetSorter {
-        cursor_id: cursor_csr_current,
-    });
-    program.emit_insn(Insn::Return {
-        return_reg: reg_flush_buffer_return_offset,
-        can_fallthrough: true,
-    });
-
-    program.preassign_label_to_next_insn(label_window_processing_end);
-
+    let acc_start = meta.registers.acc_start;
+    for (i, func) in window.functions.iter().enumerate() {
+        program.emit_insn(Insn::AggInverse {
+            acc_reg: acc_start + i,
+            col: 0,
+            delimiter: 0,
+            func: func.func.clone(),
+            comparator: None,
+        });
+    }
     Ok(())
 }
 
-fn emit_peer_group_flush(
+/// Emit one output row's worth of work: populate `result_columns_start` from
+/// `csr_current`, then either send the row to the outer query (no ORDER BY)
+/// or insert it into the order-by sorter. Mirrors SQLite's
+/// `windowReturnOneRow` (`window.c:1816-1990`), restricted to the
+/// streaming code path.
+/// Emit per-output-row positional lookup for every `first_value` /
+/// `nth_value` in the current window. Mirrors SQLite's first_value /
+/// nth_value arms in `windowReturnOneRow` (`window.c:1940-1965`):
+///
+/// ```text
+///   reg_result := NULL
+///   tmp := 1                                 (first_value, N=1)
+///     -- or --
+///   tmp := arg[1] from csr_current           (nth_value, per-row N)
+///   MustBeInt tmp; if tmp <= 0: error
+///   tmp := tmp + frame_start_rowid - 1       (frame_start_rowid = 1 for UB-CR)
+///   if tmp > csr_current.rowid: goto lbl     (target past frame end → NULL)
+///   SeekRowid(csr_app, tmp)
+///   reg_result := Column(csr_app, arg[0])
+///   lbl:
+/// ```
+///
+/// The frames the planner currently lets first_value/nth_value through
+/// with all have `frame_start_rowid = 1` (RANGE UNBOUNDED PRECEDING TO
+/// CURRENT ROW). Sliding `ROWS BETWEEN N PRECEDING AND CURRENT ROW` for
+/// these functions is rejected at parse — it needs a stable
+/// per-partition N register (parallel to SQLite's `pWin->regApp`) to
+/// compute `frame_start_rowid` at emit time.
+fn emit_first_value_nth_value_lookup(
     program: &mut ProgramBuilder,
-    window: &Window,
     t_ctx: &mut TranslateCtx,
     plan: &SelectPlan,
-) -> crate::Result<()> {
-    let WindowMetadata {
-        labels,
-        registers,
-        cursors,
-        expressions_referencing_subquery,
-        ..
-    } = t_ctx.meta_window.as_ref().expect("missing window metadata");
+) -> Result<()> {
+    let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+    let window = plan.window.as_ref().expect("missing window");
+    let registers = meta.registers;
+    let cursors = meta.cursors;
+    let acc_result_start = registers.acc_result_start;
+    let csr_current = cursors.csr_current;
 
-    // For aggregate window functions and the rank-family, the accumulator
-    // has already been advanced once per source row during the input scan.
-    // Emit one `AggValue` per such function here, before entering the loop
-    // over buffered rows: this reads the accumulator into the result
-    // register exactly once per peer-group flush. The per-row loop below
-    // will copy that register's contents into the output for every buffered
-    // row in the group (RANGE UNBOUNDED PRECEDING TO CURRENT ROW semantics).
     for (i, func) in window.functions.iter().enumerate() {
-        let value_pre_loop = match &func.func {
-            AccumulatorFunc::Agg(_) => true,
-            AccumulatorFunc::Window(w) => w.one_value_per_peer_group(),
+        let is_nth = match &func.func {
+            AccumulatorFunc::Window(WindowFunc::FirstValue) => false,
+            AccumulatorFunc::Window(WindowFunc::NthValue) => true,
+            _ => continue,
         };
-        if value_pre_loop {
-            program.emit_insn(Insn::AggValue {
-                acc_reg: registers.acc_start + i,
-                dest_reg: registers.acc_result_start + i,
-                func: func.func.clone(),
+        let csr_app = cursors
+            .csr_app
+            .expect("csr_app must exist when a window contains first_value or nth_value");
+        let result_reg = acc_result_start + i;
+
+        let args: Vec<&Expr> = match func.current_expr() {
+            Expr::FunctionCall { args, .. } => args.iter().map(|a| a.as_ref()).collect(),
+            _ => unreachable!("first_value / nth_value are always Expr::FunctionCall"),
+        };
+        let arg_value_col = match args.first() {
+            Some(Expr::Column { column, .. }) => *column,
+            other => unreachable!(
+                "first_value/nth_value arg[0] must be a subquery column ref \
+                 after planner rewrite, got {other:?}"
+            ),
+        };
+
+        // Default result: NULL (stays NULL on seek miss or N past frame end).
+        program.emit_insn(Insn::Null {
+            dest: result_reg,
+            dest_end: None,
+        });
+
+        // Compute target rowid. For UB-CR frames, frame_start_rowid = 1,
+        // so target = N (read fresh per output row for nth_value, 1 for
+        // first_value).
+        let target_reg = program.alloc_register();
+        if is_nth {
+            let n_col = match args.get(1) {
+                Some(Expr::Column { column, .. }) => *column,
+                other => unreachable!(
+                    "nth_value arg[1] must be a subquery column ref \
+                     after planner rewrite, got {other:?}"
+                ),
+            };
+            program.emit_insn(Insn::Column {
+                cursor_id: csr_current,
+                column: n_col,
+                dest: target_reg,
+                default: None,
+            });
+            // Validate N: must be a positive integer. Matches SQLite's
+            // `windowCheckValue(eCond=2)` at `window.c:1490-1506` — the
+            // error message is the verbatim SQLite string.
+            let lbl_n_ok = program.allocate_label();
+            let lbl_n_err = program.allocate_label();
+            program.emit_insn(Insn::MustBeInt {
+                reg: target_reg,
+                target_pc: Some(lbl_n_err),
+            });
+            let reg_zero = program.alloc_register();
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: reg_zero,
+            });
+            program.emit_insn(Insn::Gt {
+                lhs: target_reg,
+                rhs: reg_zero,
+                target_pc: lbl_n_ok,
+                flags: crate::vdbe::insn::CmpInsFlags::default(),
+                collation: None,
+            });
+            program.preassign_label_to_next_insn(lbl_n_err);
+            program.emit_insn(Insn::Halt {
+                err_code: crate::error::SQLITE_ERROR,
+                description: "second argument to nth_value must be a positive integer".to_string(),
+                on_error: None,
+                description_reg: None,
+            });
+            program.preassign_label_to_next_insn(lbl_n_ok);
+        } else {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: target_reg,
             });
         }
+
+        // If target > csr_current.rowid (frame_end_rowid for UB-CR), the
+        // Nth row is past the frame end — result stays NULL.
+        let cur_rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::RowId {
+            cursor_id: csr_current,
+            dest: cur_rowid_reg,
+        });
+        let lbl_miss = program.allocate_label();
+        program.emit_insn(Insn::Gt {
+            lhs: target_reg,
+            rhs: cur_rowid_reg,
+            target_pc: lbl_miss,
+            flags: crate::vdbe::insn::CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: csr_app,
+            src_reg: target_reg,
+            target_pc: lbl_miss,
+        });
+        program.emit_insn(Insn::Column {
+            cursor_id: csr_app,
+            column: arg_value_col,
+            dest: result_reg,
+            default: None,
+        });
+        program.preassign_label_to_next_insn(lbl_miss);
     }
 
-    let label_skip_returning_row = program.allocate_label();
-    let label_loop_start = program.allocate_label();
-    program.preassign_label_to_next_insn(label_loop_start);
+    Ok(())
+}
 
-    // Propagate subquery result column values to the outer query (if any) or directly to
-    // the final output that will be returned to the user, by copying them from the buffer table
-    // into the dedicated registers.
+fn emit_return_one_row(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    plan: &SelectPlan,
+) -> Result<()> {
+    let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+    let labels = meta.labels;
+    let registers = meta.registers;
+    let cursors = meta.cursors;
+    let expressions_referencing_subquery = meta.expressions_referencing_subquery.clone();
+
     for (i, (_, col_idx)) in expressions_referencing_subquery.iter().enumerate() {
         let reg_result = registers.result_columns_start + i;
         program.emit_column_or_rowid(cursors.csr_current, *col_idx, reg_result);
     }
-    // For row_number, ntile, lag, lead and first/last/nth_value no
-    // `AggStep` ran during the input scan. Emit `AggStep` + `AggValue` here,
-    // inside the per-row loop over buffered rows: `AggStep` advances the
-    // function's state for the current row, then `AggValue` reads the
-    // resulting value into the result register that gets written to this
-    // row's output. This is the site that gives every buffered row in a
-    // peer group a distinct value. Functions where
-    // `one_value_per_peer_group()` is true were handled above the loop and
-    // are skipped here.
-    for (i, func) in window.functions.iter().enumerate() {
-        if let AccumulatorFunc::Window(win_func) = &func.func {
-            if win_func.one_value_per_peer_group() {
-                continue;
-            }
-            let acc_reg = registers.acc_start + i;
-            let dest_reg = registers.acc_result_start + i;
-            program.emit_insn(Insn::AggStep {
-                acc_reg,
-                col: 0,
-                delimiter: 0,
-                func: AccumulatorFunc::Window(win_func.clone()),
-                comparator: None,
-            });
-            program.emit_insn(Insn::AggValue {
-                acc_reg,
-                dest_reg,
-                func: AccumulatorFunc::Window(win_func.clone()),
-            });
-        }
-    }
+
+    // Per-row lookups for functions whose value is computed at output
+    // time (first_value / nth_value). Each writes the function's value
+    // register before the outer query reads it via `emit_select_result`'s
+    // expression-cache lookup.
+    emit_first_value_nth_value_lookup(program, t_ctx, plan)?;
+
+    // The select-result / sorter-insert code is a shared subroutine —
+    // RETURN_ROW is emitted at several sites (streaming step + flush
+    // loops), and jump targets inside the row-output code (SELECT
+    // DISTINCT's on-conflict label in particular) must resolve to exactly
+    // one address. Mirrors SQLite's `OP_Gosub regGosub, addrGosub` at the
+    // end of `windowReturnOneRow` (window.c:1988).
+    program.emit_insn(Insn::Gosub {
+        target_pc: labels.row_output,
+        return_reg: registers.row_output_return,
+    });
+
+    Ok(())
+}
+
+/// Emit the single row-output subroutine that every RETURN_ROW site Gosubs
+/// to: send the populated result registers to the outer query (or the
+/// order-by sorter), applying OFFSET, LIMIT and SELECT DISTINCT
+/// deduplication. This is the window-loop half of what SQLite emits once
+/// as the `addrGosub` target in `select.c`.
+fn emit_row_output_subroutine(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    plan: &SelectPlan,
+) -> Result<()> {
+    let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+    let labels = meta.labels;
+    let registers = meta.registers;
+
+    program.preassign_label_to_next_insn(labels.row_output);
+
+    let label_skip_returning_row = program.allocate_label();
     t_ctx.resolver.enable_expr_to_reg_cache();
 
-    match plan.order_by.is_empty() {
-        true => {
-            emit_select_result(
-                program,
-                &t_ctx.resolver,
-                plan,
-                Some(labels.window_processing_end),
-                Some(label_skip_returning_row),
-                t_ctx.reg_nonagg_emit_once_flag,
-                t_ctx.reg_offset,
-                t_ctx.reg_result_cols_start.unwrap(),
-                t_ctx.limit_ctx,
-            )?;
-        }
-        false => {
-            EmitOrderBy::sorter_insert(program, t_ctx, plan)?;
-        }
+    if plan.order_by.is_empty() {
+        emit_select_result(
+            program,
+            &t_ctx.resolver,
+            plan,
+            Some(labels.window_processing_end),
+            Some(label_skip_returning_row),
+            t_ctx.reg_nonagg_emit_once_flag,
+            t_ctx.reg_offset,
+            t_ctx.reg_result_cols_start.unwrap(),
+            t_ctx.limit_ctx,
+        )?;
+    } else {
+        EmitOrderBy::sorter_insert(program, t_ctx, plan)?;
     }
 
     program.preassign_label_to_next_insn(label_skip_returning_row);
@@ -1321,10 +1837,120 @@ fn emit_peer_group_flush(
         program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
     }
 
-    program.emit_insn(Insn::Next {
-        cursor_id: cursors.csr_current,
-        pc_if_next: label_loop_start,
+    program.emit_insn(Insn::Return {
+        return_reg: registers.row_output_return,
+        can_fallthrough: false,
     });
+
+    Ok(())
+}
+
+/// Emit the flush subroutine for window processing — the partition-end /
+/// end-of-source code that drains any remaining rows still ahead of the
+/// frame-end cursor and emits all rows still ahead of the current cursor.
+///
+/// This is the Rust port of SQLite's flush block at `window.c:3043-3105`,
+/// restricted to the `UNBOUNDED PRECEDING TO CURRENT ROW` path
+/// (`window.c:3085-3094`):
+///
+/// ```text
+///   Rewind csr_write → if empty, jump to label_empty
+///   emit_window_op AGGSTEP, break_on_eof=None
+///       ↑ drains the last buffered row whose AggStep was deferred
+///   addr_loop_start:
+///   emit_window_op RETURN_ROW, break_on_eof=label_break
+///   emit_window_op AGGINVERSE (no-op for UNBOUNDED start)
+///   Goto addr_loop_start
+///   label_break:
+///   label_empty:
+///   ResetSorter csr_current
+///   Return flush_buffer_return_offset
+/// ```
+///
+/// Entered two ways, just like SQLite's flush block:
+/// - **Fallthrough** (end of source): the inline code immediately preceding
+///   sets `flush_buffer_return_offset` to NULL so the `Return` falls through.
+/// - **Subroutine** (partition boundary): the main loop body Gosubs to
+///   `labels.flush_buffer`; `Return` jumps back to the address stored in
+///   `flush_buffer_return_offset`.
+pub fn emit_window_flush(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    plan: &SelectPlan,
+) -> crate::Result<()> {
+    let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+    let labels = meta.labels;
+    let registers = meta.registers;
+    let cursors = meta.cursors;
+
+    let label_empty = program.allocate_label();
+    let label_break = program.allocate_label();
+
+    // Fallthrough entry: the source loop just ended. Null the return
+    // register so the trailing Return falls through past this subroutine.
+    program.add_comment(program.offset(), "return remaining buffered rows");
+    program.emit_insn(Insn::Null {
+        dest: registers.flush_buffer_return_offset,
+        dest_end: None,
+    });
+
+    // Subroutine entry: partition boundary Gosub lands here.
+    program.preassign_label_to_next_insn(labels.flush_buffer);
+
+    // Detect empty partition. Rewind csr_write sets its position to the
+    // first row and jumps to label_empty when the table is empty; csr_write
+    // isn't used past flush so resetting its position is harmless.
+    program.emit_insn(Insn::Rewind {
+        cursor_id: cursors.csr_write,
+        pc_if_empty: label_empty,
+    });
+
+    // Drain step: the very last row inserted in the main loop hasn't had
+    // AggStep called against it (under ROWS) or its peer group might still
+    // be incomplete (under RANGE). One AGGSTEP advances csr_end through the
+    // remaining rows.
+    emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None)?;
+
+    let label_loop_start = program.allocate_label();
+    program.preassign_label_to_next_insn(label_loop_start);
+    emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, Some(label_break))?;
+    // Functions with a moving frame start (ntile, percent_rank,
+    // cume_dist) fire AggInverse between output rows so xValue's next
+    // read sees the advanced state. The window is split per-coerced-frame
+    // at plan time, so every function in this window has the same start
+    // boundary — one window-level gate. Mirrors SQLite's flush block at
+    // window.c:3091 (`windowCodeOp(..., WINDOW_AGGINVERSE, regStart, 0)`).
+    let window = plan.window.as_ref().expect("missing window");
+    if !matches!(
+        window.frame.start,
+        crate::translate::plan::FrameBoundary::UnboundedPreceding
+    ) {
+        emit_window_op(program, t_ctx, plan, WindowOp::AggInverse, None)?;
+    }
+    program.emit_insn(Insn::Goto {
+        target_pc: label_loop_start,
+    });
+
+    program.preassign_label_to_next_insn(label_break);
+    program.preassign_label_to_next_insn(label_empty);
+
+    program.emit_insn(Insn::ResetSorter {
+        cursor_id: cursors.csr_current,
+    });
+    program.emit_insn(Insn::Return {
+        return_reg: registers.flush_buffer_return_offset,
+        can_fallthrough: true,
+    });
+
+    // The fallthrough entry (end of source) continues past the Return;
+    // jump over the row-output subroutine body that follows.
+    program.emit_insn(Insn::Goto {
+        target_pc: labels.window_processing_end,
+    });
+
+    emit_row_output_subroutine(program, t_ctx, plan)?;
+
+    program.preassign_label_to_next_insn(labels.window_processing_end);
 
     Ok(())
 }
