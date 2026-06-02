@@ -68,6 +68,38 @@ fn v2_row(
 }
 
 #[turso_macros::test]
+fn test_cdc_internal_inserts_change_counters(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    let total_changes_before_insert = conn.total_changes();
+    conn.execute("INSERT INTO t VALUES (42, 'hello')").unwrap();
+
+    assert_eq!(
+        (
+            conn.changes(),
+            conn.total_changes() - total_changes_before_insert
+        ),
+        (1, 3)
+    );
+
+    let total_changes_before_insert = conn.total_changes();
+    conn.execute("INSERT INTO t VALUES (43, 'world'), (44, 'again')")
+        .unwrap();
+
+    assert_eq!(
+        (
+            conn.changes(),
+            conn.total_changes() - total_changes_before_insert
+        ),
+        (2, 5)
+    );
+}
+
+#[turso_macros::test]
 fn test_cdc_simple_id(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")

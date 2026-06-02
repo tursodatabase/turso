@@ -188,6 +188,12 @@ impl Statement {
             .load(crate::sync::atomic::Ordering::SeqCst)
     }
 
+    pub fn n_total_change(&self) -> i64 {
+        self.state
+            .n_total_change
+            .load(crate::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn set_mv_tx(&mut self, mv_tx: Option<(u64, TransactionMode)>) {
         self.program.connection.set_mv_tx(mv_tx);
     }
@@ -993,7 +999,6 @@ impl Statement {
             self.release_active_root_if_counted();
         }
         self.state.reset(max_registers, max_cursors);
-        self.state.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
         self.busy_handler_state = None;
         self.query_timeout_override = None;

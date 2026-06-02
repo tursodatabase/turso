@@ -3095,6 +3095,9 @@ pub fn halt(
                 program
                     .connection
                     .set_changes(state.n_change.load(Ordering::SeqCst));
+                program
+                    .connection
+                    .add_total_changes(state.n_total_change.load(Ordering::SeqCst));
             }
             Ok(InsnFunctionStepResult::Done)
         }
@@ -3110,6 +3113,9 @@ pub fn halt(
             program
                 .connection
                 .set_changes(state.n_change.load(Ordering::SeqCst));
+            program
+                .connection
+                .add_total_changes(state.n_total_change.load(Ordering::SeqCst));
         }
         Ok(InsnFunctionStepResult::Done)
     }
@@ -4445,7 +4451,7 @@ fn finish_subprogram(
     saved_last_insert_rowid: Option<i64>,
     saved_changes_value: Option<i64>,
 ) {
-    let pending_changes = statement.n_change();
+    let pending_changes = statement.n_total_change();
     if pending_changes != 0 {
         program.connection.add_total_changes(pending_changes);
     }
@@ -4464,7 +4470,7 @@ fn finish_subprogram(
 
     // Restore `changes()`, but not `total_changes()`
     if let Some(changes) = saved_changes_value {
-        program.connection.set_changes_without_total(changes);
+        program.connection.set_changes(changes);
     }
 }
 
@@ -4479,7 +4485,9 @@ pub fn op_reset_count(
     }
 
     let nchange = state.n_change.swap(0, Ordering::SeqCst);
+    let ntotal_change = state.n_total_change.swap(0, Ordering::SeqCst);
     program.connection.set_changes(nchange);
+    program.connection.add_total_changes(ntotal_change);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -9517,14 +9525,16 @@ pub fn op_insert(
                         if !flag.has(InsertFlags::SKIP_LAST_ROWID) {
                             program.connection.update_last_rowid(rowid);
                         }
-                        state
-                            .n_change
-                            .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
+                        if flag.has(InsertFlags::SKIP_STATEMENT_CHANGE_COUNT) {
+                            state.record_total_change();
+                        } else {
+                            state.record_statement_change();
+                        }
                     }
+                } else if flag.has(InsertFlags::SKIP_STATEMENT_CHANGE_COUNT) {
+                    state.record_total_change();
                 } else {
-                    state
-                        .n_change
-                        .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
+                    state.record_statement_change();
                 }
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
@@ -9736,9 +9746,7 @@ pub fn op_delete(
     if !is_part_of_update {
         // DELETEs do not count towards the total changes if they are part of an UPDATE statement,
         // i.e. the DELETE and subsequent INSERT of a row are the same "change".
-        state
-            .n_change
-            .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
+        state.record_statement_change();
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
