@@ -1,4 +1,48 @@
 use super::*;
+use crate::{translate::alter::literal_default_value, types::ValueType};
+use bitflags::bitflags;
+
+bitflags! {
+    /// Storage class flags that represent the possible storage classes an expression can yield.
+    /// Used to combine column affinities across UNION/INTERSECT/EXCEPT arms.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct StorageClassMask: u8 {
+        const NUMERIC = 0x01;
+        const TEXT = 0x02;
+        const BLOB = 0x04;
+    }
+}
+
+impl StorageClassMask {
+    pub const fn from_numeric() -> Self {
+        Self::NUMERIC
+    }
+
+    pub const fn from_text() -> Self {
+        Self::TEXT
+    }
+
+    pub const fn from_blob() -> Self {
+        Self::BLOB
+    }
+
+    pub const fn from_null() -> Self {
+        Self::empty()
+    }
+
+    pub fn has_numeric(&self) -> bool {
+        self.contains(Self::NUMERIC)
+    }
+
+    pub fn has_text(&self) -> bool {
+        self.contains(Self::TEXT)
+    }
+
+    #[allow(dead_code)]
+    pub fn has_blob(&self) -> bool {
+        self.contains(Self::BLOB)
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ExprAffinityInfo {
@@ -97,6 +141,66 @@ pub fn get_expr_affinity(
     resolver: Option<&Resolver>,
 ) -> Affinity {
     get_expr_affinity_info(expr, referenced_tables, resolver).affinity
+}
+
+/// Mirrors SQLite's `sqlite3ExprDataType()` (expr.c): a bitmask of the storage
+/// classes an expression could yield. Used to combine column affinities across
+/// the arms of a compound (UNION/INTERSECT/EXCEPT) subquery.
+pub(crate) fn expr_data_type(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+) -> StorageClassMask {
+    match expr {
+        ast::Expr::Collate(inner, _) | ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
+            expr_data_type(inner, referenced_tables)
+        }
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            expr_data_type(exprs.first().unwrap(), referenced_tables)
+        }
+        // A literal's storage class is its data type; reuse the literal->Value
+        // inference rather than re-deriving the class from the AST here.
+        ast::Expr::Literal(lit) => match literal_default_value(lit).map(|v| v.value_type()) {
+            Ok(ValueType::Null) => StorageClassMask::from_null(),
+            Ok(ValueType::Text) => StorageClassMask::from_text(),
+            Ok(ValueType::Blob) => StorageClassMask::from_blob(),
+            // Integer/Float (and the fallback for keyword literals) are numeric.
+            _ => StorageClassMask::from_numeric(),
+        },
+        ast::Expr::Binary(_, ast::Operator::Concat, _) => {
+            StorageClassMask::TEXT | StorageClassMask::BLOB
+        }
+        ast::Expr::FunctionCall { .. }
+        | ast::Expr::FunctionCallStar { .. }
+        | ast::Expr::Variable(_) => StorageClassMask::all(),
+        ast::Expr::Column { .. }
+        | ast::Expr::RowId { .. }
+        | ast::Expr::Cast { .. }
+        | ast::Expr::Subquery(_) => {
+            let aff = get_expr_affinity(expr, referenced_tables, None);
+            if aff.is_numeric() {
+                StorageClassMask::NUMERIC | StorageClassMask::BLOB
+            } else if matches!(aff, Affinity::Text) {
+                StorageClassMask::TEXT | StorageClassMask::BLOB
+            } else {
+                StorageClassMask::all()
+            }
+        }
+        ast::Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } => {
+            let mut res = StorageClassMask::from_null();
+            for (_, then) in when_then_pairs {
+                res |= expr_data_type(then, referenced_tables);
+            }
+            if let Some(else_expr) = else_expr {
+                res |= expr_data_type(else_expr, referenced_tables);
+            }
+            res
+        }
+        _ => StorageClassMask::from_numeric(),
+    }
 }
 
 pub fn comparison_affinity(

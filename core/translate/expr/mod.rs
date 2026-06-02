@@ -79,7 +79,9 @@ use vectors::*;
 #[allow(unused_imports)]
 use walk::*;
 
-pub(crate) use affinity::{compare_affinity, get_expr_affinity_info, ExprAffinityInfo};
+pub(crate) use affinity::{
+    compare_affinity, expr_data_type, get_expr_affinity_info, ExprAffinityInfo, StorageClassMask,
+};
 pub use affinity::{comparison_affinity, get_expr_affinity};
 pub(crate) use arrays::{
     emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,

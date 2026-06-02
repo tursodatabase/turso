@@ -125,6 +125,18 @@ impl Affinity {
         Self::from_char(code as char)
     }
 
+    /// Convert affinity to the corresponding Type enum
+    pub fn to_type(&self) -> crate::schema::Type {
+        use crate::schema::Type;
+        match self {
+            Affinity::Blob => Type::Blob,
+            Affinity::Text => Type::Text,
+            Affinity::Numeric => Type::Numeric,
+            Affinity::Integer => Type::Integer,
+            Affinity::Real => Type::Real,
+        }
+    }
+
     pub fn is_numeric(&self) -> bool {
         matches!(self, Affinity::Integer | Affinity::Real | Affinity::Numeric)
     }
