@@ -603,11 +603,11 @@ pub struct WindowCursors {
     pub csr_start: Option<CursorID>,
     /// Per-row lookup cursor used at output time by functions whose
     /// value is computed via `SeekRowid` rather than running aggregator
-    /// state — first_value, nth_value, and (once they land) lag, lead.
-    /// `OpenDup`'d off `csr_current` and only moved by `SeekRowid` at
-    /// output time, so it's independent of the frame-cursor positions.
-    /// Allocated lazily — `None` when no function in the window needs
-    /// positional lookup. Mirrors SQLite's `pWin->csrApp` (`window.c`).
+    /// state — first_value, nth_value, lag, lead. `OpenDup`'d off
+    /// `csr_current` and only moved by `SeekRowid` at output time, so
+    /// it's independent of the frame-cursor positions. Allocated
+    /// lazily — `None` when no function in the window needs positional
+    /// lookup. Mirrors SQLite's `pWin->csrApp` (`window.c`).
     pub csr_app: Option<CursorID>,
 }
 
@@ -687,8 +687,7 @@ impl EmitWindow {
         ));
         // `csr_current` is the primary cursor on the ephemeral buffer;
         // the others are OpenDup'd duplicates that share the same B-tree
-        // with independent positions. `csr_start` is deliberately omitted
-        // until a moving-start frame needs it.
+        // with independent positions.
         let cursor_csr_current =
             program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
         let cursor_csr_write =
@@ -708,13 +707,19 @@ impl EmitWindow {
             None
         };
         // `csr_app` is the per-row lookup cursor used at output time by
-        // first_value / nth_value (positional seek). Mirrors SQLite's
-        // `csrApp` allocation (`window.c:1422-1426`). Allocate only when
-        // needed so unaffected windows don't pay the extra `OpenDup`.
+        // first_value / nth_value / lag / lead (positional seek). Mirrors
+        // SQLite's `csrApp` allocation (`window.c:1422-1426`). Allocate
+        // only when needed so unaffected windows don't pay the extra
+        // `OpenDup`.
         let needs_csr_app = window.functions.iter().any(|f| {
             matches!(
                 &f.func,
-                AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue),
+                AccumulatorFunc::Window(
+                    WindowFunc::FirstValue
+                        | WindowFunc::NthValue
+                        | WindowFunc::Lag
+                        | WindowFunc::Lead
+                ),
             )
         });
         let cursor_csr_app = if needs_csr_app {
@@ -1039,7 +1044,19 @@ impl EmitWindow {
         }
 
         emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None)?;
-        emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None)?;
+        // Frames whose end is UNBOUNDED FOLLOWING (lead's and lag's
+        // coerced frames) cache the entire partition before any RETURN_ROW
+        // fires — every output row's frame depends on rows yet to be
+        // inserted, so we can only emit at flush time. SQLite's
+        // `windowCacheFrame` (`window.c:2031`) selects the same control
+        // flow when a lead/lag function is present.
+        let cache_frame = matches!(
+            window.frame.end,
+            crate::translate::plan::FrameBoundary::UnboundedFollowing
+        );
+        if !cache_frame {
+            emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None)?;
+        }
 
         // No explicit peer-tracker update needed here: AGGSTEP's
         // peer-loop fall-through copies `new` into `peer_end_reg`, and
@@ -1305,14 +1322,20 @@ fn emit_window_op(
     };
 
     // RETURN_ROW finalizes accumulators before emitting (SQLite's
-    // windowAggFinal at window.c:2284). first_value / nth_value have
-    // no accumulator value to read — `emit_first_value_nth_value_lookup`
-    // writes their result registers directly inside `emit_return_one_row`.
+    // windowAggFinal at window.c:2284). first_value / nth_value / lag /
+    // lead have no accumulator value to read — their result registers
+    // are written directly inside `emit_return_one_row` via positional
+    // lookup helpers.
     if matches!(op, WindowOp::ReturnRow) {
         for (i, func) in window.functions.iter().enumerate() {
             if matches!(
                 &func.func,
-                AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue),
+                AccumulatorFunc::Window(
+                    WindowFunc::FirstValue
+                        | WindowFunc::NthValue
+                        | WindowFunc::Lag
+                        | WindowFunc::Lead
+                ),
             ) {
                 continue;
             }
@@ -1454,14 +1477,15 @@ fn emit_function_step(
     let cache_was_enabled = t_ctx.resolver.expr_to_reg_cache_enabled;
 
     for (i, func) in window.functions.iter().enumerate() {
-        // first_value / nth_value are computed at output time via
-        // `SeekRowid` on `csr_app` (see
-        // `emit_first_value_nth_value_lookup`). They have no
-        // step-time accumulator update — mirrors SQLite's WINDOWFUNCNOOP
-        // pattern at `window.c:1727-1730`.
+        // first_value / nth_value / lag / lead are WINDOWFUNCNOOP in
+        // SQLite (window.c:591, 1727-1730): no step function — the value
+        // is computed at output time via `SeekRowid` on `csr_app`. See
+        // `emit_first_value_nth_value_lookup` and `emit_lag_lead_lookup`.
         if matches!(
             &func.func,
-            AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue)
+            AccumulatorFunc::Window(
+                WindowFunc::FirstValue | WindowFunc::NthValue | WindowFunc::Lag | WindowFunc::Lead
+            )
         ) {
             continue;
         }
@@ -1601,6 +1625,145 @@ fn emit_function_inverse(
             comparator: None,
         });
     }
+    Ok(())
+}
+
+/// Emit the per-output-row lookup for every `lag` / `lead` function in the
+/// current window. Mirrors SQLite's lag/lead arm in `windowReturnOneRow`
+/// (`window.c:1958`):
+///
+/// ```text
+///   reg_result := arg[2] from csr_current   (default; NULL if nArg < 3)
+///   tmp := rowid(csr_current)
+///   tmp := tmp ± offset                     (offset = 1 if nArg < 2,
+///                                             else arg[1] from csr_current)
+///   if SeekRowid(csr_app, tmp) succeeds:
+///       reg_result := Column(csr_app, arg_col[0])
+///   lbl_miss:
+/// ```
+///
+/// `csr_app` is OpenDup'd off `csr_current` and only seeks at output time, so
+/// it doesn't disturb the frame-cursor positions. The function's result is
+/// written to its cached `acc_result_start + i` register, which the
+/// expression-cache then resolves to when `emit_select_result` reads the
+/// function expression.
+fn emit_lag_lead_lookup(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    plan: &SelectPlan,
+) -> Result<()> {
+    let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+    let window = plan.window.as_ref().expect("missing window");
+    let registers = meta.registers;
+    let cursors = meta.cursors;
+    let acc_result_start = registers.acc_result_start;
+    let csr_current = cursors.csr_current;
+
+    for (i, func) in window.functions.iter().enumerate() {
+        let is_lead = match &func.func {
+            AccumulatorFunc::Window(WindowFunc::Lag) => false,
+            AccumulatorFunc::Window(WindowFunc::Lead) => true,
+            _ => continue,
+        };
+        let csr_app = cursors
+            .csr_app
+            .expect("csr_app must exist when a window contains lag / lead");
+        let result_reg = acc_result_start + i;
+
+        let args: Vec<&Expr> = match func.current_expr() {
+            Expr::FunctionCall { args, .. } => args.iter().map(|a| a.as_ref()).collect(),
+            _ => unreachable!("lag / lead are always Expr::FunctionCall"),
+        };
+
+        let arg0_col = match args.first() {
+            Some(Expr::Column { column, .. }) => *column,
+            other => unreachable!(
+                "lag/lead arg[0] must be a buffer column reference after planner rewrite, got {other:?}"
+            ),
+        };
+
+        // Default value first: NULL when nArg < 3, else read arg[2] from csr_current.
+        if args.len() < 3 {
+            program.emit_insn(Insn::Null {
+                dest: result_reg,
+                dest_end: None,
+            });
+        } else if let Expr::Column { column, .. } = args[2] {
+            program.emit_insn(Insn::Column {
+                cursor_id: csr_current,
+                column: *column,
+                dest: result_reg,
+                default: None,
+            });
+        } else {
+            unreachable!(
+                "lag/lead arg[2] must be a buffer column reference after planner rewrite, got {:?}",
+                args[2]
+            );
+        }
+
+        // tmp = rowid(csr_current) ± offset.
+        let tmp_reg = program.alloc_register();
+        program.emit_insn(Insn::RowId {
+            cursor_id: csr_current,
+            dest: tmp_reg,
+        });
+        if args.len() < 2 {
+            // Default offset = 1.
+            program.emit_insn(Insn::AddImm {
+                register: tmp_reg,
+                value: if is_lead { 1 } else { -1 },
+            });
+        } else {
+            let offset_col = match args[1] {
+                Expr::Column { column, .. } => *column,
+                other => unreachable!(
+                    "lag/lead arg[1] must be a buffer column reference after planner rewrite, got {other:?}"
+                ),
+            };
+            let offset_reg = program.alloc_register();
+            program.emit_insn(Insn::Column {
+                cursor_id: csr_current,
+                column: offset_col,
+                dest: offset_reg,
+                default: None,
+            });
+            // Insn::Subtract is `dest = lhs - rhs`; Insn::Add is
+            // `dest = lhs + rhs`. We want `tmp = tmp ± offset`, so tmp
+            // is the lhs in both cases.
+            if is_lead {
+                program.emit_insn(Insn::Add {
+                    lhs: tmp_reg,
+                    rhs: offset_reg,
+                    dest: tmp_reg,
+                });
+            } else {
+                program.emit_insn(Insn::Subtract {
+                    lhs: tmp_reg,
+                    rhs: offset_reg,
+                    dest: tmp_reg,
+                });
+            }
+        }
+
+        // SeekRowid on csr_app — on hit, overwrite result with the
+        // column from the target row; on miss, fall through to lbl_miss
+        // and the default register value (set above) stays put.
+        let lbl_miss = program.allocate_label();
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: csr_app,
+            src_reg: tmp_reg,
+            target_pc: lbl_miss,
+        });
+        program.emit_insn(Insn::Column {
+            cursor_id: csr_app,
+            column: arg0_col,
+            dest: result_reg,
+            default: None,
+        });
+        program.preassign_label_to_next_insn(lbl_miss);
+    }
+
     Ok(())
 }
 
@@ -1776,10 +1939,11 @@ fn emit_return_one_row(
     }
 
     // Per-row lookups for functions whose value is computed at output
-    // time (first_value / nth_value). Each writes the function's value
-    // register before the outer query reads it via `emit_select_result`'s
-    // expression-cache lookup.
+    // time (first_value / nth_value / lag / lead). Each writes the
+    // function's value register before the outer query reads it via
+    // `emit_select_result`'s expression-cache lookup.
     emit_first_value_nth_value_lookup(program, t_ctx, plan)?;
+    emit_lag_lead_lookup(program, t_ctx, plan)?;
 
     // The select-result / sorter-insert code is a shared subroutine —
     // RETURN_ROW is emitted at several sites (streaming step + flush
