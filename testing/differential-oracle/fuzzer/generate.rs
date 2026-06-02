@@ -53,6 +53,13 @@ pub struct SqlGenBackend {
 
 impl SqlGenBackend {
     pub fn new(seed: u64) -> Self {
+        Self::new_with_window_weight(seed, 0.0)
+    }
+
+    /// Construct with a non-zero probability that each expression-list
+    /// result column is a window function. Used by the window-function-
+    /// focused fuzzing path.
+    pub fn new_with_window_weight(seed: u64, window_function_probability: f64) -> Self {
         let ctx = sql_gen::Context::new_with_seed(seed);
         let mut policy = Policy::default()
             .with_stmt_weights(sql_gen::StmtWeights {
@@ -63,6 +70,7 @@ impl SqlGenBackend {
                 sql_gen::FunctionConfig::deterministic().disable(&["LIKELY", "UNLIKELY"]),
             );
         policy.select_config.require_order_by_with_limit = true;
+        policy.select_config.window_function_probability = window_function_probability;
         // Disable expression values for inserts, enable conflict clauses for updates
         policy.insert_config.expression_value_probability = 0.0;
         policy.insert_config.or_replace_probability = 0.0;

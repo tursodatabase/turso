@@ -642,17 +642,25 @@ fn generate_select_columns<C: Capabilities>(
             let num_cols = ctx.gen_range_inclusive((*range.start()).max(1), *range.end());
             let mut columns = Vec::with_capacity(num_cols);
             let restrict = select_config.restrict_mixed_aggregates;
+            let window_prob = select_config.window_function_probability.clamp(0.0, 1.0);
 
             for i in 0..num_cols {
-                let expr = generate_expr(generator, ctx, 0)?;
-                // When restricting mixed aggregates and there is no GROUP BY,
-                // an expression that mixes aggregate calls with bare column
-                // refs (e.g. `COUNT(a) + b`) is invalid SQL.  Replace it with
-                // a plain column reference.
-                let expr = if restrict && expr.contains_aggregate() && expr.contains_column_ref() {
-                    pick_scoped_column_ref(ctx)?
+                // Window functions are only valid as a result-column expression
+                // (or in ORDER BY of the same SELECT). We don't recurse: the
+                // window function call itself is the projection.
+                let expr = if window_prob > 0.0 && ctx.gen_bool_with_prob(window_prob) {
+                    generate_window_function(ctx)?
                 } else {
-                    expr
+                    let e = generate_expr(generator, ctx, 0)?;
+                    // When restricting mixed aggregates and there is no GROUP BY,
+                    // an expression that mixes aggregate calls with bare column
+                    // refs (e.g. `COUNT(a) + b`) is invalid SQL. Replace it with
+                    // a plain column reference.
+                    if restrict && e.contains_aggregate() && e.contains_column_ref() {
+                        pick_scoped_column_ref(ctx)?
+                    } else {
+                        e
+                    }
                 };
                 columns.push(SelectColumn {
                     expr,
@@ -665,6 +673,113 @@ fn generate_select_columns<C: Capabilities>(
             }
             Ok(columns)
         }
+    }
+}
+
+/// The set of built-in window functions Turso supports. Mirrors
+/// SQLite's built-in list at `window.c:610-625`.
+const BUILTIN_WINDOW_FUNCS: &[(&str, WindowFnArity)] = &[
+    ("row_number", WindowFnArity::ZeroArg),
+    ("rank", WindowFnArity::ZeroArg),
+    ("dense_rank", WindowFnArity::ZeroArg),
+    ("percent_rank", WindowFnArity::ZeroArg),
+    ("cume_dist", WindowFnArity::ZeroArg),
+    ("ntile", WindowFnArity::Ntile),
+    ("lag", WindowFnArity::LagLead),
+    ("lead", WindowFnArity::LagLead),
+    ("first_value", WindowFnArity::OneArg),
+    ("last_value", WindowFnArity::OneArg),
+    ("nth_value", WindowFnArity::NthValue),
+];
+
+#[derive(Clone, Copy)]
+enum WindowFnArity {
+    ZeroArg,
+    OneArg,
+    Ntile,
+    NthValue,
+    LagLead,
+}
+
+/// Generate a `func(...) OVER (...)` projection. Mirrors the grammar at
+/// `window.c:600-708` — only built-in functions and the
+/// planner-coerced frames (no user `ROWS`/`RANGE`/`GROUPS` clauses,
+/// since the engine rejects those).
+fn generate_window_function(ctx: &mut Context) -> Result<Expr, GenError> {
+    // Pick a function.
+    let (name, arity) = *ctx
+        .choose(BUILTIN_WINDOW_FUNCS)
+        .expect("BUILTIN_WINDOW_FUNCS is non-empty");
+
+    // Pick a typed column for value args (lag/lead/first_value/etc).
+    // We restrict to columns the current scope sees; window functions
+    // are projection-only so the scope is the SELECT's FROM clause.
+    let arg_col = pick_scoped_column_ref(ctx)?;
+
+    let args: Vec<Expr> = match arity {
+        WindowFnArity::ZeroArg => Vec::new(),
+        WindowFnArity::OneArg => vec![arg_col],
+        WindowFnArity::Ntile => {
+            // ntile(N) — N must be a positive integer literal.
+            let n = ctx.gen_range_inclusive(1, 6) as i64;
+            vec![Expr::literal(ctx, Literal::Integer(n))]
+        }
+        WindowFnArity::NthValue => {
+            // nth_value(expr, N) — N must be a positive integer.
+            let n = ctx.gen_range_inclusive(1, 4) as i64;
+            vec![arg_col, Expr::literal(ctx, Literal::Integer(n))]
+        }
+        WindowFnArity::LagLead => {
+            // lag/lead take 1-3 args: expr[, offset[, default]].
+            let nargs = ctx.gen_range_inclusive(1, 3);
+            let mut a = vec![arg_col];
+            if nargs >= 2 {
+                // Negative offsets are legal and look in the opposite
+                // direction; for lag they exercise the streaming-frame
+                // miss behavior (forward lookups past the one buffered
+                // row return the default).
+                let offset = ctx.gen_range_inclusive(0, 8) as i64 - 4;
+                a.push(Expr::literal(ctx, Literal::Integer(offset)));
+            }
+            if nargs >= 3 {
+                let default = ctx.gen_range_inclusive(0, 200) as i64 - 100;
+                a.push(Expr::literal(ctx, Literal::Integer(default)));
+            }
+            a
+        }
+    };
+
+    // Build the OVER clause: 0-2 PARTITION BY exprs, 0-2 ORDER BY
+    // exprs with the same direction. Columns picked from the SELECT
+    // scope so they're always valid.
+    let n_part = ctx.gen_range_inclusive(0, 2);
+    let n_ord = ctx.gen_range_inclusive(0, 2);
+    let partition_by: Vec<Expr> = (0..n_part)
+        .map(|_| pick_scoped_column_ref(ctx))
+        .collect::<Result<_, _>>()?;
+    let dir = if ctx.gen_bool() {
+        OrderDirection::Asc
+    } else {
+        OrderDirection::Desc
+    };
+    let order_by: Vec<(Expr, OrderDirection)> = (0..n_ord)
+        .map(|_| pick_scoped_column_ref(ctx).map(|e| (e, dir)))
+        .collect::<Result<_, _>>()?;
+
+    // Some functions return floats whose default formatting differs
+    // between SQLite and Turso (e.g. percent_rank = 1/3). Wrap them in
+    // `printf('%.4f', ...)` so the textual comparison agrees while
+    // still exercising the same semantics.
+    let win = Expr::window_function(ctx, name.to_string(), args, partition_by, order_by);
+    if matches!(name, "percent_rank" | "cume_dist") {
+        let fmt_str = Expr::literal(ctx, Literal::Text("%.4f".to_string()));
+        Ok(Expr::function_call(
+            ctx,
+            "printf".to_string(),
+            vec![fmt_str, win],
+        ))
+    } else {
+        Ok(win)
     }
 }
 

@@ -52,6 +52,11 @@ pub struct SimConfig {
     pub tree_mode: TreeMode,
     /// Whether to enable MVCC mode.
     pub mvcc: bool,
+    /// Probability that each expression-list SELECT column is generated
+    /// as a window function. 0.0 disables window-function generation
+    /// entirely; values up to 1.0 weight the SELECT list heavily toward
+    /// `func(...) OVER (...)` projections.
+    pub window_function_probability: f64,
 }
 
 impl Default for SimConfig {
@@ -67,6 +72,7 @@ impl Default for SimConfig {
             coverage: false,
             tree_mode: TreeMode::default(),
             mvcc: false,
+            window_function_probability: 0.0,
         }
     }
 }
@@ -335,7 +341,10 @@ impl Fuzzer {
         let mut generator: Box<dyn SqlGenerator> = match self.config.generator {
             GeneratorKind::SqlGen => {
                 let seed: u64 = self.rng.borrow_mut().next_u64();
-                Box::new(SqlGenBackend::new(seed))
+                Box::new(SqlGenBackend::new_with_window_weight(
+                    seed,
+                    self.config.window_function_probability,
+                ))
             }
             GeneratorKind::SqlGenProp => {
                 let seed_bytes: [u8; 32] = {
@@ -648,6 +657,7 @@ mod tests {
             coverage: false,
             tree_mode: TreeMode::default(),
             mvcc: false,
+            window_function_probability: 0.0,
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());
