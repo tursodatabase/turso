@@ -7,7 +7,7 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
-        expr::{as_binary_components, expr_data_type, get_expr_affinity},
+        expr::{as_binary_components, expr_data_type, get_expr_affinity, StorageClassMask},
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
@@ -34,18 +34,7 @@ use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
 
-/// Maps an affinity to the Type and type name used for a subquery result column.
-fn type_from_affinity(affinity: Affinity) -> (Type, &'static str) {
-    match affinity {
-        Affinity::Integer => (Type::Integer, "INTEGER"),
-        Affinity::Real => (Type::Real, "REAL"),
-        Affinity::Text => (Type::Text, "TEXT"),
-        Affinity::Numeric => (Type::Numeric, "NUMERIC"),
-        Affinity::Blob => (Type::Blob, "BLOB"),
-    }
-}
-
-/// Infer the Type and type name from an expression's affinity.
+/// Infer the Type from an expression's affinity.
 ///
 /// Used for subquery result columns. SQLite derives column affinity from:
 /// - Column references: the declared column type
@@ -54,11 +43,9 @@ fn type_from_affinity(affinity: Affinity) -> (Type, &'static str) {
 /// - Literals: BLOB affinity (no affinity)
 ///
 /// The affinity determines comparison behavior in IN expressions, etc.
-fn infer_type_from_expr(
-    expr: &ast::Expr,
-    tables: Option<&TableReferences>,
-) -> (Type, &'static str) {
-    type_from_affinity(get_expr_affinity(expr, tables, None))
+fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> Type {
+    let affinity = get_expr_affinity(expr, tables, None);
+    affinity.to_type()
 }
 
 /// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
@@ -85,11 +72,11 @@ fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
         arm.result_columns
             .get(i)
             .map(|rc| expr_data_type(&rc.expr, Some(&arm.table_references)))
-            .unwrap_or(0)
+            .unwrap_or(StorageClassMask::from_null())
     };
 
     let mut affinity = col_affinity(arms[0]);
-    let mut data_types = 0u8;
+    let mut data_types = StorageClassMask::from_null();
     let mut idx = 0;
     // Skip leading arms with no affinity, adopting the next arm's affinity.
     while matches!(affinity, Affinity::Blob) && idx + 1 < arms.len() {
@@ -105,8 +92,8 @@ fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
         data_types |= col_data_type(arm);
     }
     match affinity {
-        Affinity::Text if data_types & 0x01 != 0 => Affinity::Blob,
-        a if a.is_numeric() && data_types & 0x02 != 0 => Affinity::Blob,
+        Affinity::Text if data_types.has_numeric() => Affinity::Blob,
+        a if a.is_numeric() && data_types.has_text() => Affinity::Blob,
         a => a,
     }
 }
@@ -2289,11 +2276,11 @@ impl JoinedTable {
             .result_columns
             .iter()
             .map(|rc| {
-                let (col_type, type_name) =
-                    infer_type_from_expr(&rc.expr, Some(&plan.table_references));
+                let col_type = infer_type_from_expr(&rc.expr, Some(&plan.table_references));
+                let type_name = col_type.to_string();
                 Column::new(
                     rc.name(&plan.table_references).map(String::from),
-                    type_name.to_string(),
+                    type_name,
                     None,
                     None,
                     col_type,
@@ -2399,13 +2386,14 @@ impl JoinedTable {
                 let col_name = explicit_columns
                     .and_then(|cols| cols.get(i).cloned())
                     .or_else(|| rc.name(table_references).map(String::from));
-                let (col_type, type_name) = match &compound_arms {
-                    Some(arms) => type_from_affinity(compound_column_affinity(arms, i)),
+                let col_type = match &compound_arms {
+                    Some(arms) => compound_column_affinity(arms, i).to_type(),
                     None => infer_type_from_expr(&rc.expr, Some(table_references)),
                 };
+                let type_name = col_type.to_string();
                 Column::new(
                     col_name,
-                    type_name.to_string(),
+                    type_name,
                     None,
                     None,
                     col_type,
