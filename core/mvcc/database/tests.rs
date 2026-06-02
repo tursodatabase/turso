@@ -5,7 +5,7 @@ use crate::io::PlatformIO;
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
-use crate::mvcc::database::CommitYieldPoint;
+use crate::mvcc::database::{CommitYieldPoint, ExclusiveTxYieldPoint};
 #[cfg(feature = "conn_raw_api")]
 use crate::mvcc::persistent_storage::logical_log::{ParsedOp, StreamingLogicalLogReader};
 use crate::mvcc::persistent_storage::logical_log::{
@@ -71,6 +71,51 @@ impl FixedYieldInjector {
 impl YieldInjector for FixedYieldInjector {
     fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
         self.remaining.lock().remove(&point)
+    }
+}
+
+struct CommitWriterOnExclusiveAcquireInjector {
+    point: YieldPoint,
+    selection_key: u64,
+    writer: Arc<Connection>,
+    fired: AtomicBool,
+}
+
+impl CommitWriterOnExclusiveAcquireInjector {
+    fn new(point: YieldPoint, selection_key: u64, writer: Arc<Connection>) -> Arc<Self> {
+        Arc::new(Self {
+            point,
+            selection_key,
+            writer,
+            fired: AtomicBool::new(false),
+        })
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for CommitWriterOnExclusiveAcquireInjector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommitWriterOnExclusiveAcquireInjector")
+            .field("point", &self.point)
+            .field("selection_key", &self.selection_key)
+            .field("fired", &self.fired())
+            .finish_non_exhaustive()
+    }
+}
+
+impl YieldInjector for CommitWriterOnExclusiveAcquireInjector {
+    fn should_yield(&self, _instance_id: u64, selection_key: u64, point: YieldPoint) -> bool {
+        if point != self.point
+            || selection_key != self.selection_key
+            || self.fired.swap(true, Ordering::AcqRel)
+        {
+            return false;
+        }
+        self.writer.execute("COMMIT").unwrap();
+        true
     }
 }
 
@@ -147,7 +192,7 @@ fn mvcc_active_write_tx_blocks_vacuum_gate() {
     let pager = db.conn.pager.load().clone();
     let tx_id = db
         .mvcc_store
-        .begin_exclusive_tx(pager.clone(), None)
+        .begin_exclusive_tx(pager.clone(), None, &db.conn)
         .unwrap();
 
     assert!(matches!(
@@ -173,7 +218,7 @@ fn mvcc_vacuum_gate_blocks_new_read_and_write_tx() {
         Err(LimboError::Busy)
     ));
     assert!(matches!(
-        db.mvcc_store.begin_exclusive_tx(pager, None),
+        db.mvcc_store.begin_exclusive_tx(pager, None, &db.conn),
         Err(LimboError::Busy)
     ));
 
@@ -5384,7 +5429,7 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
     // Now try to acquire exclusive lock for the tx that started before the
     // read-only dependent committed. Should succeed because the read-only tx
     // did not advance last_committed_tx_ts.
-    let acquire_result = mvcc_store.acquire_exclusive_tx(&exclusive_tx_id);
+    let acquire_result = mvcc_store.acquire_exclusive_tx(&exclusive_tx_id, None);
     assert!(
         acquire_result.is_ok(),
         "acquire_exclusive_tx should not return Busy after a read-only dependent committed: {acquire_result:?}",
@@ -14338,4 +14383,74 @@ fn test_global_header_regression_would_lose_committed_user_version() {
         42,
         "older out-of-order FinalizeCommit regressed committed PRAGMA user_version"
     );
+}
+
+#[test]
+fn test_create_index_exclusive_acquire_rechecks_timestamp_after_cas() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN DEFERRED").unwrap();
+    let mut read = ddl.prepare("SELECT COUNT(*) FROM t").unwrap();
+    read.run_ignore_rows().unwrap();
+    drop(read);
+
+    let mvcc_store = db.get_mvcc_store();
+    let ddl_tx_id = ddl
+        .get_mv_tx_id()
+        .expect("DDL connection should have an active MVCC transaction");
+    let ddl_begin_ts = mvcc_store
+        .txs
+        .get(&ddl_tx_id)
+        .expect("DDL transaction should be tracked")
+        .value()
+        .begin_ts;
+    assert!(
+        ddl_begin_ts >= mvcc_store.last_committed_tx_ts.load(Ordering::Acquire),
+        "pre-CAS timestamp check should pass before the injected writer commit"
+    );
+
+    let injector = CommitWriterOnExclusiveAcquireInjector::new(
+        ExclusiveTxYieldPoint::AfterTimestampCheckBeforeCas.point(),
+        ddl_tx_id,
+        writer,
+    );
+    ddl.set_yield_injector(Some(injector.clone()));
+
+    let result = ddl.execute("CREATE INDEX idx_v ON t(v)");
+    assert!(
+        injector.fired(),
+        "writer should commit in the exclusive-acquire CAS window"
+    );
+    assert!(
+        matches!(result, Err(crate::LimboError::Busy)),
+        "stale DDL transaction should release exclusive and return Busy after post-CAS recheck: {result:?}"
+    );
+    assert!(
+        !mvcc_store.is_exclusive_tx(&ddl_tx_id),
+        "failed stale DDL should not keep the exclusive slot"
+    );
+    ddl.set_yield_injector(None);
+    if ddl.get_mv_tx_id().is_some() {
+        ddl.execute("ROLLBACK").unwrap();
+    }
+
+    let observer = db.connect();
+    observer.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    observer.execute("DELETE FROM t WHERE id = 2").unwrap();
+
+    let integrity = get_rows(&observer, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(integrity[0][0].to_string(), "ok");
 }
