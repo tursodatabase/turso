@@ -72,6 +72,10 @@ export interface DescribeRequest {
   sql: string;
 }
 
+export interface GetAutocommitRequest {
+  type: 'get_autocommit';
+}
+
 export interface DescribeResult {
   params: Array<{ name?: string }>;
   cols: Column[];
@@ -81,7 +85,7 @@ export interface DescribeResult {
 
 export interface PipelineRequest {
   baton: string | null;
-  requests: (ExecuteRequest | BatchRequest | SequenceRequest | CloseRequest | DescribeRequest)[];
+  requests: (ExecuteRequest | BatchRequest | SequenceRequest | CloseRequest | DescribeRequest | GetAutocommitRequest)[];
 }
 
 export interface PipelineResponse {
@@ -90,8 +94,9 @@ export interface PipelineResponse {
   results: Array<{
     type: 'ok' | 'error';
     response?: {
-      type: 'execute' | 'batch' | 'sequence' | 'close' | 'describe';
+      type: 'execute' | 'batch' | 'sequence' | 'close' | 'describe' | 'get_autocommit';
       result?: ExecuteResult | DescribeResult;
+      is_autocommit?: boolean;
     };
     error?: {
       message: string;

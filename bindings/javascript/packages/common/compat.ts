@@ -63,7 +63,6 @@ class Database {
   inTransaction: boolean;
 
   private db: NativeDatabase;
-  private _inTransaction: boolean = false;
 
   /**
    * Creates a new database connection. If the database file pointed to by `path` does not exists, it will be created.
@@ -85,7 +84,7 @@ class Database {
       readonly: { get: () => this.db.readonly },
       open: { get: () => this.db.open },
       memory: { get: () => this.db.memory },
-      inTransaction: { get: () => this._inTransaction },
+      inTransaction: { get: () => this.db.inTransaction() },
     });
   }
 
@@ -122,15 +121,12 @@ class Database {
     const wrapTxn = (mode) => {
       return (...bindParameters) => {
         db.exec("BEGIN " + mode);
-        db._inTransaction = true;
         try {
           const result = fn(...bindParameters);
           db.exec("COMMIT");
-          db._inTransaction = false;
           return result;
         } catch (err) {
           db.exec("ROLLBACK");
-          db._inTransaction = false;
           throw err;
         }
       };

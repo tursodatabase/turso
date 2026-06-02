@@ -231,7 +231,7 @@ The purpose of these tests is to verify behavior matches with SQLite and Turso.
 
 1. [Cargo-c](https://github.com/lu-zero/cargo-c) is needed for building C-ABI compatible library. You can get it via:
 ```console
-cargo install cargo-c
+cargo install cargo-c --version 0.10.16 --locked
 ```
 2. [SQLite](https://www.sqlite.org/index.html) is needed for compatibility checking. You can install it using `brew` on macOS/Linux:
 ```console

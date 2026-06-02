@@ -1955,6 +1955,10 @@ impl Database {
             cache_size: AtomicI32::new(default_cache_size),
             page_size: AtomicU16::new(page_size.get_raw()),
             wal_auto_actions: AtomicU8::new(WalAutoActions::all_enabled().bits()),
+            #[cfg(feature = "conn_raw_api")]
+            portable_logical_changes_enabled: AtomicBool::new(false),
+            #[cfg(feature = "conn_raw_api")]
+            mvcc_log_metadata: RwLock::new(HashMap::default()),
             capture_data_changes: RwLock::new(None),
             cdc_transaction_id: AtomicI64::new(-1),
             closed: AtomicBool::new(false),

@@ -571,6 +571,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                     // No BTreeDestroyIndex needed since there's no physical B-tree.
                                     let index_id = MVTableId(root_page);
                                     self.destroyed_indexes.insert(index_id);
+                                    self.mvstore.remove_table_id_to_rootpage(&index_id);
                                     skip_write = true;
                                 } else {
                                     // DROP INDEX - index was checkpointed
@@ -620,13 +621,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         }
                         SqliteSchemaBtreeKind::Table => {
                             // This is a table schema change (existing logic)
-                            tracing::trace!("table schema change with root page {root_page}, is_delete={is_delete}");
+                            tracing::trace!(
+                                "table schema change with root page {root_page}, is_delete={is_delete}"
+                            );
                             if is_delete {
                                 if root_page < 0 {
                                     // Table was never checkpointed - derive table_id directly from root_page.
                                     // No BTreeDestroy needed since there's no physical B-tree.
                                     let table_id = MVTableId::from(root_page);
                                     self.destroyed_tables.insert(table_id);
+                                    self.mvstore.remove_table_id_to_rootpage(&table_id);
                                     skip_write = true;
                                 } else {
                                     // Table was checkpointed - look up by physical root page
@@ -788,6 +792,33 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     /// Check if we have more rows to write
     fn has_more_rows(&self, write_set_index: usize) -> bool {
         write_set_index < self.write_set.len()
+    }
+
+    fn next_requires_seek_after_insert(&self, current_idx: usize) -> bool {
+        let Some(curr) = self.write_set.get(current_idx) else {
+            return true;
+        };
+        let Some(next) = self.write_set.get(current_idx + 1) else {
+            return true;
+        };
+        // Table not the same, then seek
+        if curr.0.row.id.table_id != next.0.row.id.table_id {
+            return true;
+        }
+        // If we have special write then seek
+        if curr.1.is_some() || next.1.is_some() {
+            return true;
+        }
+        let (RowKey::Int(prev_id), RowKey::Int(next_id)) =
+            (&curr.0.row.id.row_id, &next.0.row.id.row_id)
+        else {
+            return true;
+        };
+        // if next id is strictly prev_id + 1 then we don't need to seek
+        if next_id.checked_sub(*prev_id) != Some(1) {
+            return true;
+        }
+        false
     }
 
     /// Fsync the logical log file
@@ -1225,6 +1256,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             // Evict stale cursor.
                             self.cursors.remove(&root_page);
                             self.destroyed_tables.insert(table_id);
+                            self.mvstore.remove_table_id_to_rootpage(&table_id);
                         }
                         SpecialWrite::BTreeCreateIndex { index_id, .. } => {
                             let created_root_page: u32 = self.pager.io.block(|| {
@@ -1286,6 +1318,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             // Evict stale cursor.
                             self.cursors.remove(&root_page);
                             self.destroyed_indexes.insert(index_id);
+                            self.mvstore.remove_table_id_to_rootpage(&index_id);
                         }
                     }
                 }
@@ -1455,9 +1488,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 match write_row_state_machine.step(&())? {
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
                     IOResult::Done(_) => {
+                        let requires_seek = self.next_requires_seek_after_insert(write_set_index);
                         self.state = CheckpointState::WriteRow {
                             write_set_index: write_set_index + 1,
-                            requires_seek: true,
+                            requires_seek,
                         };
                         Ok(TransitionResult::Continue)
                     }

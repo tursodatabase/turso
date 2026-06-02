@@ -45,6 +45,7 @@ export interface NativeDatabase {
     executor(sql: string, queryOptions?: QueryOptions): NativeExecutor;
 
     defaultSafeIntegers(toggle: boolean);
+    inTransaction(): boolean;
     totalChanges(): number;
     changes(): number;
     lastInsertRowid(): number;

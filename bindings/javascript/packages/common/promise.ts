@@ -92,7 +92,6 @@ class Database {
   private db: NativeDatabase;
   private ioStep: () => Promise<void>;
   private execLock: AsyncLock;
-  private _inTransaction: boolean = false;
   protected connected: boolean = false;
 
   constructor(db: NativeDatabase, ioStep?: () => Promise<void>) {
@@ -104,7 +103,7 @@ class Database {
       readonly: { get: () => this.db.readonly },
       open: { get: () => this.db.open },
       memory: { get: () => this.db.memory },
-      inTransaction: { get: () => this._inTransaction },
+      inTransaction: { get: () => this.db.inTransaction() },
     });
   }
 
@@ -158,15 +157,12 @@ class Database {
     const wrapTxn = (mode) => {
       return async (...bindParameters) => {
         await db.exec("BEGIN " + mode);
-        db._inTransaction = true;
         try {
           const result = await fn(...bindParameters);
           await db.exec("COMMIT");
-          db._inTransaction = false;
           return result;
         } catch (err) {
           await db.exec("ROLLBACK");
-          db._inTransaction = false;
           throw err;
         }
       };
@@ -279,10 +275,9 @@ class Database {
         }
       };
 
-      const wrap = mode !== undefined && !this._inTransaction;
+      const wrap = mode !== undefined && !this.db.inTransaction();
       if (wrap) {
         await runRawSql(`BEGIN ${mode!.toUpperCase()}`);
-        this._inTransaction = true;
       }
 
       let rowsAffected = 0;
@@ -339,12 +334,10 @@ class Database {
 
         if (wrap) {
           await runRawSql("COMMIT");
-          this._inTransaction = false;
         }
       } catch (err) {
         if (wrap) {
           try { await runRawSql("ROLLBACK"); } catch { /* ignore */ }
-          this._inTransaction = false;
         }
         throw err;
       }

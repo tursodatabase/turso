@@ -49,8 +49,10 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         &self,
         log_record: &mut turso_core::mvcc::database::LogRecord,
         row_version: &turso_core::mvcc::database::RowVersion,
+        portable_extension: Option<&[u8]>,
     ) -> turso_core::Result<()> {
-        self.inner.serialize_row_version(log_record, row_version)
+        self.inner
+            .serialize_row_version(log_record, row_version, portable_extension)
     }
 
     fn serialize_database_header(
@@ -86,8 +88,16 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         self.inner.truncate()
     }
 
+    fn reset_to_fresh_header(&self) -> turso_core::Result<turso_core::Completion> {
+        self.inner.reset_to_fresh_header()
+    }
+
     fn get_logical_log_file(&self) -> Arc<dyn turso_core::File> {
         self.inner.get_logical_log_file()
+    }
+
+    fn logical_log_offset(&self) -> u64 {
+        self.inner.logical_log_offset()
     }
 
     fn should_checkpoint(&self) -> bool {
@@ -102,8 +112,19 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         self.inner.checkpoint_threshold()
     }
 
-    fn advance_logical_log_offset_after_success(&self, bytes: u64) {
+    fn upgrade_header_for_log_tx(
+        &self,
+        m: &turso_core::mvcc::database::LogRecord,
+    ) -> turso_core::Result<Option<turso_core::Completion>> {
+        self.inner.upgrade_header_for_log_tx(m)
+    }
+
+    fn advance_logical_log_offset_after_success(&self, bytes: u64) -> turso_core::Result<()> {
         self.inner.advance_logical_log_offset_after_success(bytes)
+    }
+
+    fn discard_pending_log_write(&self) -> turso_core::Result<()> {
+        self.inner.discard_pending_log_write()
     }
 
     fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32) {

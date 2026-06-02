@@ -416,6 +416,39 @@ test.serial("Database.pragma() after close()", async (t) => {
 // Database.transaction()
 // ==========================================================================
 
+test.serial("Database.inTransaction property", async (t) => {
+  const db = t.context.db;
+
+  // 1. A fresh connection is in autocommit, not a transaction.
+  t.false(db.inTransaction, "fresh connection is not in a transaction");
+
+  // 2. A one-shot query runs in autocommit: the moment it returns, the
+  //    connection is no longer in a transaction.
+  const stmt = await db.prepare("SELECT 1 AS n");
+  await stmt.get();
+  t.false(db.inTransaction, "autocommit after a one-shot query");
+
+  // 3. The transaction() helper reports in-transaction inside its callback and
+  //    autocommit once it completes.
+  let insideTxn;
+  const txn = db.transaction(async () => { insideTxn = db.inTransaction; });
+  await txn();
+  t.true(insideTxn, "in a transaction inside the transaction() callback");
+  t.false(db.inTransaction, "autocommit after transaction() completes");
+
+  // 4. inTransaction must reflect the real transaction state, so it also tracks
+  //    transactions opened with raw BEGIN/COMMIT/ROLLBACK.
+  await db.exec("BEGIN");
+  t.true(db.inTransaction, "in a transaction after raw BEGIN");
+  await db.exec("COMMIT");
+  t.false(db.inTransaction, "autocommit after raw COMMIT");
+
+  await db.exec("BEGIN");
+  t.true(db.inTransaction, "in a transaction after raw BEGIN");
+  await db.exec("ROLLBACK");
+  t.false(db.inTransaction, "autocommit after raw ROLLBACK");
+});
+
 test.serial("Database.transaction()", async (t) => {
   const db = t.context.db;
 
