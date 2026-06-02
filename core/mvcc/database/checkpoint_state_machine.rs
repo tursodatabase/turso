@@ -30,10 +30,7 @@ use strum::EnumCount;
 
 const COLLECT_PREEMPTION_THRESHOLD: usize = 1024;
 
-/// Key identifying an index row pending checkpoint-time GC: (index_id, row key).
-type GcIndexKey = (MVTableId, RowKey);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointState {
     AcquireLock,
     CollectTableRows,
@@ -70,13 +67,11 @@ pub enum CheckpointState {
     /// Truncate the WAL file after DB file and logical-log cleanup are safely durable.
     TruncateWal,
     GcTableRows {
-        rows: std::collections::BTreeSet<RowID>,
-        cursor: Option<RowID>,
+        next_index: usize,
         lwm: u64,
     },
     GcIndexRows {
-        rows: std::collections::BTreeSet<GcIndexKey>,
-        cursor: Option<GcIndexKey>,
+        next_index: usize,
         lwm: u64,
     },
     Finalize,
@@ -389,7 +384,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
     #[cfg(test)]
     pub(crate) fn state_for_test(&self) -> CheckpointState {
-        self.state.clone()
+        self.state
     }
 
     #[cfg(test)]
@@ -974,17 +969,20 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             "gc_checkpointed_versions requires the blocking checkpoint lock"
         );
         let ckpt_max = self.durable_txid_max_new;
-        let CheckpointState::GcTableRows { rows, cursor, lwm } = &mut self.state else {
+        let CheckpointState::GcTableRows { next_index, lwm } = self.state else {
             unreachable!("gc_checkpointed_table_versions runs only in GcTableRows");
         };
-        let lwm = *lwm;
-        let bounds: (Bound<RowID>, Bound<RowID>) = match cursor.clone() {
-            None => (Bound::Unbounded, Bound::Unbounded),
-            Some(last) => (Bound::Excluded(last), Bound::Unbounded),
-        };
+        let mut index = next_index;
         let mut processed = 0;
-        for row_id in rows.range(bounds) {
-            *cursor = Some(row_id.clone());
+        while index < self.write_set.len() {
+            let current = index;
+            index += 1;
+            if current > 0
+                && self.write_set[current - 1].0.row.id == self.write_set[current].0.row.id
+            {
+                continue;
+            }
+            let row_id = &self.write_set[current].0.row.id;
             if let Some(entry) = self.mvstore.rows.get(row_id) {
                 let is_now_empty = {
                     let mut versions = entry.value().write();
@@ -1006,10 +1004,19 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
             processed += 1;
             if processed >= COLLECT_PREEMPTION_THRESHOLD {
-                return Some(IOCompletions::Single(Completion::new_yield()));
+                break;
             }
         }
-        None
+        if index < self.write_set.len() {
+            let CheckpointState::GcTableRows { next_index, .. } = &mut self.state else {
+                unreachable!("gc_checkpointed_table_versions runs only in GcTableRows");
+            };
+            *next_index = index;
+
+            Some(IOCompletions::Single(Completion::new_yield()))
+        } else {
+            None
+        }
     }
 
     fn gc_checkpointed_index_versions(&mut self) -> Option<IOCompletions> {
@@ -1018,43 +1025,52 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             "gc_checkpointed_versions requires the blocking checkpoint lock"
         );
         let ckpt_max = self.durable_txid_max_new;
-        let CheckpointState::GcIndexRows { rows, cursor, lwm } = &mut self.state else {
+        let CheckpointState::GcIndexRows { next_index, lwm } = self.state else {
             unreachable!("gc_checkpointed_index_versions runs only in GcIndexRows");
         };
-        let lwm = *lwm;
-        let bounds: (Bound<GcIndexKey>, Bound<GcIndexKey>) = match cursor.clone() {
-            None => (Bound::Unbounded, Bound::Unbounded),
-            Some(last) => (Bound::Excluded(last), Bound::Unbounded),
-        };
+        let mut index = next_index;
         let mut processed = 0;
-        for (index_id, row_key) in rows.range(bounds) {
-            *cursor = Some((*index_id, row_key.clone()));
-            let RowKey::Record(sortable_key) = row_key else {
-                unreachable!("index row versions always have Record keys");
-            };
-            let outer_entry = self
-                .mvstore
-                .index_rows
-                .get(index_id)
-                .expect("index_id from write set must exist in index_rows");
-            let inner_map = outer_entry.value();
-            let is_now_empty = {
-                let inner_entry = inner_map
-                    .get(sortable_key)
-                    .expect("index row from write set must exist in inner map");
-                let mut versions = inner_entry.value().write();
-                MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
-                versions.is_empty()
-            };
-            if is_now_empty {
-                inner_map.remove(sortable_key);
+        while index < self.index_write_set.len() {
+            let current = index;
+            index += 1;
+            {
+                let (index_id, row_version, _is_delete) = &self.index_write_set[current];
+                let index_id = *index_id;
+                let RowKey::Record(sortable_key) = &row_version.row.id.row_id else {
+                    unreachable!("index row versions always have Record keys");
+                };
+                let outer_entry = self
+                    .mvstore
+                    .index_rows
+                    .get(&index_id)
+                    .expect("index_id from write set must exist in index_rows");
+                let inner_map = outer_entry.value();
+                let is_now_empty = {
+                    let inner_entry = inner_map
+                        .get(sortable_key)
+                        .expect("index row from write set must exist in inner map");
+                    let mut versions = inner_entry.value().write();
+                    MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
+                    versions.is_empty()
+                };
+                if is_now_empty {
+                    inner_map.remove(sortable_key);
+                }
             }
             processed += 1;
             if processed >= COLLECT_PREEMPTION_THRESHOLD {
-                return Some(IOCompletions::Single(Completion::new_yield()));
+                break;
             }
         }
-        None
+        if index < self.index_write_set.len() {
+            let CheckpointState::GcIndexRows { next_index, .. } = &mut self.state else {
+                unreachable!("gc_checkpointed_index_versions runs only in GcIndexRows");
+            };
+            *next_index = index;
+            Some(IOCompletions::Single(Completion::new_yield()))
+        } else {
+            None
+        }
     }
 
     /// Stages synthetic `persistent_tx_ts_max` row into the checkpoint write set
@@ -1848,17 +1864,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         self.mvstore
                             .durable_txid_max
                             .store(self.durable_txid_max_new, Ordering::SeqCst);
-                        let rows = self
-                            .write_set
-                            .iter()
-                            .map(|(row_version, _special_write)| row_version.row.id.clone())
-                            .collect();
                         let lwm = self.mvstore.compute_lwm();
-                        self.state = CheckpointState::GcTableRows {
-                            rows,
-                            cursor: None,
-                            lwm,
-                        };
+                        self.state = CheckpointState::GcTableRows { next_index: 0, lwm };
                         Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
@@ -1869,26 +1876,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 if let Some(io) = self.gc_checkpointed_table_versions() {
                     return Ok(TransitionResult::Io(io));
                 }
-                let CheckpointState::GcTableRows { lwm, .. } = &self.state else {
+                let CheckpointState::GcTableRows { lwm, .. } = self.state else {
                     unreachable!("state is GcTableRows here");
                 };
-                let lwm = *lwm;
-                let rows = self
-                    .index_write_set
-                    .iter()
-                    .map(|(index_id, row_version, _is_delete)| {
-                        debug_assert!(
-                            matches!(row_version.row.id.row_id, RowKey::Record(_)),
-                            "index row versions always have Record keys"
-                        );
-                        (*index_id, row_version.row.id.row_id.clone())
-                    })
-                    .collect();
-                self.state = CheckpointState::GcIndexRows {
-                    rows,
-                    cursor: None,
-                    lwm,
-                };
+                self.state = CheckpointState::GcIndexRows { next_index: 0, lwm };
                 Ok(TransitionResult::Continue)
             }
 
@@ -2254,41 +2245,37 @@ mod tests {
             true,
             conn.get_sync_mode(),
         );
-        // GC asserts it runs under the blocking checkpoint lock.
         checkpoint.lock_states.blocking_checkpoint_lock_held = true;
+        checkpoint.durable_txid_max_new = 5;
 
-        // More than one chunk worth of checkpointed rows so GC must preempt.
         let table_id = MVTableId::from(-2);
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
-        let mut rows = std::collections::BTreeSet::new();
         for i in 0..row_count as i64 {
             let version = committed_table_row_version(table_id, i);
             let row_id = RowID::new(table_id, RowKey::Int(i));
             mvstore
                 .rows
-                .insert(row_id.clone(), Arc::new(RwLock::new(vec![version])));
-            rows.insert(row_id);
+                .insert(row_id, Arc::new(RwLock::new(vec![version.clone()])));
+            checkpoint.write_set.push((version, None));
         }
         checkpoint.state = CheckpointState::GcTableRows {
-            rows,
-            cursor: None,
+            next_index: 0,
             lwm: u64::MAX,
         };
 
-        // The first chunk fills up before the scan finishes, so it must yield.
         let first = checkpoint.gc_checkpointed_table_versions();
         assert!(
             first.is_some_and(|io| io.is_explicit_yield()),
             "GCing more than COLLECT_PREEMPTION_THRESHOLD rows must preempt with an explicit yield"
         );
 
-        // Resume until GC finishes; the cursor must reach the last key in the set,
-        // i.e. every row was visited exactly once across the chunks.
         while checkpoint.gc_checkpointed_table_versions().is_some() {}
-        let CheckpointState::GcTableRows { rows, cursor, .. } = &checkpoint.state else {
-            panic!("state should still be GcTableRows");
-        };
-        assert_eq!(cursor.as_ref(), rows.last());
+        let remaining = mvstore
+            .rows
+            .iter()
+            .filter(|entry| entry.key().table_id == table_id)
+            .count();
+        assert_eq!(remaining, 0);
     }
 
     #[test]
@@ -2305,18 +2292,17 @@ mod tests {
             conn.get_sync_mode(),
         );
         checkpoint.lock_states.blocking_checkpoint_lock_held = true;
+        checkpoint.durable_txid_max_new = 5;
 
         let index_id = MVTableId::from(-7);
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
-        let mut rows = std::collections::BTreeSet::new();
         for i in 0..row_count as i64 {
             let (key, version) = index_row_version(index_id, "k", i, 1, Some(5), None, false);
-            rows.insert((index_id, version.row.id.row_id.clone()));
-            mvstore.insert_index_version(index_id, key, version);
+            mvstore.insert_index_version(index_id, key, version.clone());
+            checkpoint.index_write_set.push((index_id, version, false));
         }
         checkpoint.state = CheckpointState::GcIndexRows {
-            rows,
-            cursor: None,
+            next_index: 0,
             lwm: u64::MAX,
         };
 
@@ -2327,9 +2313,10 @@ mod tests {
         );
 
         while checkpoint.gc_checkpointed_index_versions().is_some() {}
-        let CheckpointState::GcIndexRows { rows, cursor, .. } = &checkpoint.state else {
-            panic!("state should still be GcIndexRows");
-        };
-        assert_eq!(cursor.as_ref(), rows.last());
+        let remaining = mvstore
+            .index_rows
+            .get(&index_id)
+            .map_or(0, |entry| entry.value().len());
+        assert_eq!(remaining, 0);
     }
 }
