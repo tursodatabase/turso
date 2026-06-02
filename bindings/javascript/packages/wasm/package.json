@@ -32,6 +32,7 @@
   "devDependencies": {
     "@napi-rs/cli": "^3.1.5",
     "@vitest/browser": "^4.1.0",
+    "@vitest/browser-playwright": "^4.1.0",
     "playwright": "^1.55.0",
     "typescript": "^5.9.2",
     "vite": "^7.3.2",
