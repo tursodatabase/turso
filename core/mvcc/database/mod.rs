@@ -6166,21 +6166,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             //   decode against the schema that exists AFTER the frame.
             // - DROP INDEX logs DELETE_INDEX entries for rows that existed before the
             //   frame; they decode against the schema that existed BEFORE the frame.
-            // - ALTER TABLE deletes and reinserts a table's sqlite_schema row while
+            // - ALTER TABLE deletes and reinserts the sqlite_schema row while
             //   logging table/index DML; the post-frame schema must be applied whole,
             //   never half-updated.
-            //
-            // The writer serializes every sqlite_schema op before any data/index op
-            // within a frame (see `step_build_log_record`), so one forward pass
-            // suffices: apply the schema ops first, build the post-frame schema once
-            // at the schema->data boundary, then decode the frame's index ops with
-            // the right before/after view. `current_schema` (the previous frame's
-            // post-frame schema) stays installed as the pre-frame view until the
-            // whole frame has been applied.
             let mut frame_changes_schema = false;
             let mut schema_after: Option<Arc<Schema>> = None;
-            // Debug-only guard for the writer's schema-first invariant.
-            #[cfg(debug_assertions)]
             let mut seen_data_op = false;
 
             for parsed_op in frame {
@@ -6190,57 +6180,41 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
                 );
                 if touches_schema {
-                    // The writer emits all schema ops before any data/index op,
-                    // so a schema op after a data op means a malformed frame.
-                    #[cfg(debug_assertions)]
-                    assert!(
-                        !seen_data_op,
-                        "logical-log frame has a sqlite_schema op after a data/index op"
-                    );
+                    if seen_data_op {
+                        return Err(LimboError::Corrupt(
+                            "log frame has a schema op after a data op".into(),
+                        ));
+                    }
                     if !frame_changes_schema {
-                        // First schema op of a schema-changing frame: drop
-                        // IndexInfo cached from earlier frames so this frame
-                        // chooses from its own before/after schema pair.
+                        // First schema-changing op in a frame: drop index cache from earlier
+                        // frames so this frame chooses from its own before/after schema pair.
                         frame_changes_schema = true;
                         index_infos.clear();
                     }
                 } else {
                     if frame_changes_schema && schema_after.is_none() {
-                        // Schema prefix complete: every sqlite_schema row for
-                        // this frame is now applied to `schema_rows`. Build the
-                        // post-frame schema once, before decoding any index op.
+                        // Now that all schema ops have been seen, build this frame's AFTER schema.
                         schema_after = Some(build_schema(&schema_rows)?);
                     }
-                    #[cfg(debug_assertions)]
-                    {
-                        seen_data_op = true;
-                    }
+                    seen_data_op = true;
                 }
 
-                // Some index writes are real while the transaction is running
-                // but have no meaning at either durable boundary, so skip them
-                // before decoding:
+                // Skip index ops that cannot affect the final state of this frame.
                 //
-                // - UPSERT_INDEX for an index gone after the frame (e.g. UPDATE
-                //   writes into idx_old, then DROP INDEX idx_old before COMMIT):
-                //   the post-frame schema has no CREATE INDEX text for it and it
-                //   cannot survive the transaction.
-                // - DELETE_INDEX for an index created earlier in the same frame:
-                //   there was no pre-frame entry in the db file, so it is a no-op.
-                let skip_index_op = match &parsed_op {
-                    ParsedOp::UpsertIndex { table_id, .. } => {
-                        schema_after.as_ref().is_some_and(|after| {
-                            !schema_has_index_root(after, root_page_for_index(*table_id))
-                        })
+                // - UPSERT_INDEX writes an entry that survives after the transaction. In a
+                //   schema-changing frame, the index must exist in the post-frame schema.
+                // - DELETE_INDEX removes an entry that existed before the transaction. In a
+                //   schema-changing frame, the index must exist in the pre-frame schema.
+                let should_skip_index_op = match (&parsed_op, schema_after.as_ref()) {
+                    (ParsedOp::UpsertIndex { table_id, .. }, Some(after)) => {
+                        !schema_has_index_root(after, root_page_for_index(*table_id))
                     }
-                    ParsedOp::DeleteIndex { table_id, .. } => {
-                        schema_after.as_ref().is_some_and(|_| {
-                            !schema_has_index_root(&current_schema, root_page_for_index(*table_id))
-                        })
+                    (ParsedOp::DeleteIndex { table_id, .. }, Some(_)) => {
+                        !schema_has_index_root(&current_schema, root_page_for_index(*table_id))
                     }
                     _ => false,
                 };
-                if skip_index_op {
+                if should_skip_index_op {
                     continue;
                 }
 
@@ -6264,12 +6238,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         .transpose()?
                         .flatten();
 
-                    let chosen = match op_kind {
+                    let chosen_schema = match op_kind {
                         IndexOpKind::Upsert if schema_after.is_some() => after,
                         IndexOpKind::Delete if schema_after.is_some() => before,
                         IndexOpKind::Upsert | IndexOpKind::Delete => before,
                     };
-                    let index_info = chosen.ok_or_else(|| {
+                    let index_info = chosen_schema.ok_or_else(|| {
                         let expected_schema = match op_kind {
                             IndexOpKind::Upsert if schema_after.is_some() => "post-frame",
                             IndexOpKind::Delete if schema_after.is_some() => "pre-frame",
@@ -6576,19 +6550,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 }
             }
 
-            // A pure-DDL frame (schema ops only, with no following data/index op to
-            // trigger the boundary build above) still needs its post-frame schema.
-            if frame_changes_schema && schema_after.is_none() {
-                schema_after = Some(build_schema(&schema_rows)?);
-            }
             if frame_changes_schema {
+                let after = match schema_after {
+                    Some(after) => after,
+                    None => {
+                        // Earlier, we build the schema when encountering the first non-schema op,
+                        // so the AFTER schema can still be None if the frame only contained schema
+                        // ops.
+                        build_schema(&schema_rows)?
+                    }
+                };
+
                 // Now that all table and index ops from this transaction have
                 // been replayed, publish the frame's final schema. No later index
                 // op from this frame can observe a half-applied sqlite_schema.
-                let schema_after =
-                    schema_after.expect("schema_after must exist when frame changes schema");
-                install_schema(schema_after.clone());
-                current_schema = schema_after;
+                install_schema(after.clone());
+                current_schema = after;
                 // The frame may have decoded DROP INDEX entries using the
                 // pre-frame schema. Do not carry those IndexInfo values into
                 // later frames after current_schema has changed.
