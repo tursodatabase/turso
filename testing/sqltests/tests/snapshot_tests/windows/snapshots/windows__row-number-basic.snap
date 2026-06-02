@@ -28,7 +28,7 @@ addr  opcode            p1  p2  p3  p4                     p5  comment
    3    OpenRead         1   5   0  k(2,B)                  0  index=idx_employees_salary, root=5, iDb=0
    4    Last             1  12   0                          0
    5      DeferredSeek   1   0   0                          0
-   6      Column         0   3   2                          0  r[2]=employees.salary
+   6      Column         1   0   2                          0  r[2]=idx_employees_salary.salary
    7      IdxRowId       1   3   0                          0  r[3]=cursor 1 for index idx_employees_salary.rowid
    8      Column         0   1   4                          0  r[4]=employees.name
    9      Column         0   2   5                          0  r[5]=employees.department

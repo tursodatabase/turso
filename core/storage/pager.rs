@@ -1383,7 +1383,50 @@ pub struct Pager {
     /// Only stored on Apple platforms; on others, always returns Fsync.
     #[cfg(target_vendor = "apple")]
     sync_type: AtomicFileSyncType,
+    /// Live BTreeCursors on this pager, bucketed by btree root page.
+    /// Counterpart of SQLite's BtShared.pCursor list; bucketing per root
+    /// supplies the BTCF_Multiple fast path (btree.c:9348).
+    pub(crate) cursor_registry: Mutex<rustc_hash::FxHashMap<i64, Vec<RegisteredCursor>>>,
 }
+
+/// Raw fat pointer to a registered cursor.
+///
+/// # Safety
+/// Dereferencing requires that no other reference to the referent cursor
+/// is live at the same time. The registry Mutex serializes registry
+/// mutation but not access to the cursors themselves; that exclusion comes
+/// from the execution model — a Connection runs one statement at a time,
+/// and a statement's cursors are touched only by its executor thread.
+///
+/// Identity compares the data half of the pointer only: codegen may emit
+/// multiple vtable pointers for the same trait/type pair across
+/// translation units, so vtable comparison can spuriously fail.
+#[derive(Clone, Copy)]
+pub(crate) struct RegisteredCursor(std::ptr::NonNull<dyn crate::storage::btree::CursorTrait>);
+
+impl RegisteredCursor {
+    pub(crate) fn for_cursor(cursor: &dyn crate::storage::btree::CursorTrait) -> Self {
+        Self(std::ptr::NonNull::from(cursor))
+    }
+
+    /// # Safety
+    /// See the type-level doc.
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) unsafe fn as_mut(&self) -> &mut dyn crate::storage::btree::CursorTrait {
+        unsafe { self.0.as_ptr().as_mut().unwrap() }
+    }
+}
+
+impl PartialEq for RegisteredCursor {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_ptr() as *const () == other.0.as_ptr() as *const ()
+    }
+}
+
+impl Eq for RegisteredCursor {}
+
+unsafe impl Send for RegisteredCursor {}
+unsafe impl Sync for RegisteredCursor {}
 
 assert_send_sync!(Pager);
 
@@ -1623,7 +1666,93 @@ impl Pager {
             init_page_1,
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
+            cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
         })
+    }
+
+    /// Add a cursor to the registry. Called from Cursor::new_btree once the
+    /// cursor lives in its final heap location; BTreeCursor::drop unregisters.
+    pub(crate) fn register_cursor(&self, cursor: &dyn crate::storage::btree::CursorTrait) {
+        let root = cursor.root_page();
+        let mut registry = self.cursor_registry.lock();
+        let bucket = registry.entry(root).or_default();
+        bucket.push(RegisteredCursor::for_cursor(cursor));
+        // Set BTCF_Multiple on every cursor in the bucket. Idempotent for
+        // existing peers; we don't bother branching on the 1→2 transition.
+        if bucket.len() >= 2 {
+            for &peer in bucket.iter() {
+                // SAFETY: see RegisteredCursor's invariant.
+                unsafe { peer.as_mut().set_has_peers_for_external_writes(true) };
+            }
+        }
+    }
+
+    pub(crate) fn unregister_cursor(&self, cursor: &dyn crate::storage::btree::CursorTrait) {
+        let target = RegisteredCursor::for_cursor(cursor);
+        let root = cursor.root_page();
+        let mut registry = self.cursor_registry.lock();
+        if let Some(bucket) = registry.get_mut(&root) {
+            if let Some(idx) = bucket.iter().position(|c| *c == target) {
+                bucket.swap_remove(idx);
+            }
+            // 2→1: clear BTCF_Multiple on the survivor.
+            if bucket.len() == 1 {
+                let surviving = bucket[0];
+                // SAFETY: see RegisteredCursor's invariant.
+                unsafe { surviving.as_mut().set_has_peers_for_external_writes(false) };
+            }
+            if bucket.is_empty() {
+                registry.remove(&root);
+            }
+        }
+    }
+
+    /// Snapshot all peers of `except` on the same btree root. Snapshotting
+    /// under the lock lets the caller iterate (and yield IO) without
+    /// blocking concurrent cursor open/close on the registry.
+    pub(crate) fn snapshot_peers_for_root(
+        &self,
+        except: &dyn crate::storage::btree::CursorTrait,
+    ) -> smallvec::SmallVec<[RegisteredCursor; 4]> {
+        let except_handle = RegisteredCursor::for_cursor(except);
+        let except_root = except.root_page();
+        let registry = self.cursor_registry.lock();
+        let Some(bucket) = registry.get(&except_root) else {
+            return smallvec::SmallVec::new();
+        };
+        if bucket.len() <= 1 {
+            return smallvec::SmallVec::new();
+        }
+        bucket
+            .iter()
+            .copied()
+            .filter(|c| *c != except_handle)
+            .collect()
+    }
+
+    /// Invalidate every cursor's page stack. Called from rollback — pinned
+    /// pages may now hold pre-rollback bytes (cf. saveAllCursors in
+    /// sqlite3BtreeRollback, btree.c:4485).
+    pub(crate) fn invalidate_all_cursors(&self) {
+        let snapshot: smallvec::SmallVec<[RegisteredCursor; 8]> = {
+            let registry = self.cursor_registry.lock();
+            registry.values().flat_map(|b| b.iter().copied()).collect()
+        };
+        for peer in snapshot {
+            // SAFETY: see RegisteredCursor's invariant.
+            unsafe { peer.as_mut().invalidate_btree_cache() };
+        }
+    }
+
+    /// Invalidate the page stacks of every peer on `except`'s btree. Used
+    /// by clear_btree / btree_destroy where every page is freed; saving
+    /// positions would just stash keys that no longer exist.
+    pub(crate) fn invalidate_peer_cursors(&self, except: &dyn crate::storage::btree::CursorTrait) {
+        let peers = self.snapshot_peers_for_root(except);
+        for peer in peers {
+            // SAFETY: see RegisteredCursor's invariant.
+            unsafe { peer.as_mut().invalidate_btree_cache() };
+        }
     }
 
     /// Get the sync type setting.
@@ -2130,6 +2259,9 @@ impl Pager {
                     ))
                 })?;
         }
+
+        // saveAllCursors at sqlite3BtreeSavepoint (btree.c:4580).
+        self.invalidate_all_cursors();
 
         Ok(())
     }
@@ -2977,6 +3109,8 @@ impl Pager {
             // Clear dirty pages and page cache before releasing the write lock
             self.clear_page_cache(true);
             self.dirty_pages.write().clear();
+            // saveAllCursors at sqlite3BtreeRollback (btree.c:4485).
+            self.invalidate_all_cursors();
             self.reset_internal_states();
             self.set_schema_cookie(None);
             wal.rollback(None);
@@ -5273,6 +5407,8 @@ impl Pager {
             // since we only need to clear the dirty pages that were modified by the write transaction.
             self.clear_page_cache(clear_dirty);
             self.dirty_pages.write().clear();
+            // saveAllCursors at sqlite3BtreeRollback (btree.c:4485).
+            self.invalidate_all_cursors();
         } else {
             turso_assert!(
                 self.dirty_pages.read().is_empty(),

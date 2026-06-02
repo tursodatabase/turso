@@ -50,7 +50,7 @@ addr  opcode                                       p1   p2   p3  p4            p
   10                              OpenRead          1    9    0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
   11                              Rewind            1   27    0                 0  Rewind index idx_orders_customer
   12                                DeferredSeek    1    0    0                 0
-  13                                Column          0    1   14                 0  r[14]=orders.customer_id
+  13                                Column          1    0   14                 0  r[14]=idx_orders_customer.customer_id
   14                                Column          0    3   15                 0  r[15]=orders.total_amount
   15                                RealAffinity   15    0    0                 0
   16                                Compare        10   14    1  k(1, Binary)   0  r[10..10]==r[14..14]
@@ -61,7 +61,7 @@ addr  opcode                                       p1   p2   p3  p4            p
   21                                Gosub          16   38    0                 0  ; goto clear accumulator subroutine
   22                                AggStep         0   15   12  sum            0  accum=r[12] step(r[15])
   23                                If              8   25    0                 0  if r[8] goto 25; don't emit group columns if continuing existing group
-  24                                Column          0    1   11                 0  r[11]=orders.customer_id
+  24                                Column          1    0   11                 0  r[11]=idx_orders_customer.customer_id
   25                                Integer         1    8    0                 0  r[8]=1; indicate data in accumulator
   26                              Next              1   12    0                 0
   27                              Gosub             7   31    0                 0  ; emit row for final group
@@ -103,7 +103,7 @@ addr  opcode                                       p1   p2   p3  p4            p
   63                    OpenRead                    3    9    0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
   64                    Rewind                      3   80    0                 0  Rewind index idx_orders_customer
   65                      DeferredSeek              3    2    0                 0
-  66                      Column                    2    1   32                 0  r[32]=orders.customer_id
+  66                      Column                    3    0   32                 0  r[32]=idx_orders_customer.customer_id
   67                      Column                    2    3   33                 0  r[33]=orders.total_amount
   68                      RealAffinity             33    0    0                 0
   69                      Compare                  28   32    1  k(1, Binary)   0  r[28..28]==r[32..32]
@@ -114,7 +114,7 @@ addr  opcode                                       p1   p2   p3  p4            p
   74                      Gosub                    34   91    0                 0  ; goto clear accumulator subroutine
   75                      AggStep                   0   33   30  sum            0  accum=r[30] step(r[33])
   76                      If                       26   78    0                 0  if r[26] goto 78; don't emit group columns if continuing existing group
-  77                      Column                    2    1   29                 0  r[29]=orders.customer_id
+  77                      Column                    3    0   29                 0  r[29]=idx_orders_customer.customer_id
   78                      Integer                   1   26    0                 0  r[26]=1; indicate data in accumulator
   79                    Next                        3   65    0                 0
   80                    Gosub                      25   84    0                 0  ; emit row for final group
@@ -153,7 +153,7 @@ addr  opcode                                       p1   p2   p3  p4            p
  113          OpenRead                              6    9    0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
  114          Rewind                                6  130    0                 0  Rewind index idx_orders_customer
  115            DeferredSeek                        6    5    0                 0
- 116            Column                              5    1   50                 0  r[50]=orders.customer_id
+ 116            Column                              6    0   50                 0  r[50]=idx_orders_customer.customer_id
  117            Column                              5    3   51                 0  r[51]=orders.total_amount
  118            RealAffinity                       51    0    0                 0
  119            Compare                            46   50    1  k(1, Binary)   0  r[46..46]==r[50..50]
@@ -164,7 +164,7 @@ addr  opcode                                       p1   p2   p3  p4            p
  124            Gosub                              52  143    0                 0  ; goto clear accumulator subroutine
  125            AggStep                             0   51   48  sum            0  accum=r[48] step(r[51])
  126            If                                 44  128    0                 0  if r[44] goto 128; don't emit group columns if continuing existing group
- 127            Column                              5    1   47                 0  r[47]=orders.customer_id
+ 127            Column                              6    0   47                 0  r[47]=idx_orders_customer.customer_id
  128            Integer                             1   44    0                 0  r[44]=1; indicate data in accumulator
  129          Next                                  6  115    0                 0
  130          Gosub                                43  134    0                 0  ; emit row for final group

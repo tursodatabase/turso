@@ -34,7 +34,7 @@ addr  opcode                    p1  p2  p3  p4                     p5  comment
    8            OpenRead         2   4   0  k(2,B)                  0  index=idx_employees_department, root=4, iDb=0
    9            Rewind           2  25   0                          0  Rewind index idx_employees_department
   10              DeferredSeek   2   1   0                          0
-  11              Column         1   2  14                          0  r[14]=employees.department
+  11              Column         2   0  14                          0  r[14]=idx_employees_department.department
   12              Column         1   3  15                          0  r[15]=employees.salary
   13              Compare        9  14   1  k(1, Binary)            0  r[9..9]==r[14..14]
   14              Jump          15  19  15                          0  ; start new group if comparison is not equal
@@ -45,7 +45,7 @@ addr  opcode                    p1  p2  p3  p4                     p5  comment
   19              AggStep        0  15  11  sum                     0  accum=r[11] step(r[15])
   20              AggStep        0  17  12  count                   0  accum=r[12] step(r[17])
   21              If             7  23   0                          0  if r[7] goto 23; don't emit group columns if continuing existing group
-  22              Column         1   2  10                          0  r[10]=employees.department
+  22              Column         2   0  10                          0  r[10]=idx_employees_department.department
   23              Integer        1   7   0                          0  r[7]=1; indicate data in accumulator
   24            Next             2  10   0                          0
   25            Gosub            6  29   0                          0  ; emit row for final group

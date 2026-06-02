@@ -39,7 +39,7 @@ addr  opcode                          p1  p2  p3  p4                  p5  commen
    9          OpenRead                 2   4   0  k(2,B)               0  index=idx_sales_category, root=4, iDb=0
   10          Rewind                   2  29   0                       0  Rewind index idx_sales_category
   11            DeferredSeek           2   1   0                       0
-  12            Column                 1   1  13                       0  r[13]=sales.category
+  12            Column                 2   0  13                       0  r[13]=idx_sales_category.category
   13            Column                 1   6  14                       0  r[14]=sales.salesperson_id
   14            Column                 1   2  15                       0  r[15]=sales.region
   15            Compare                8  13   1  k(1, Binary)         0  r[8..8]==r[13..13]
@@ -53,7 +53,7 @@ addr  opcode                          p1  p2  p3  p4                  p5  commen
   23            HashDistinct  1073741825  15   1  jmp=25               0
   24            AggStep                0  15  11  count                0  accum=r[11] step(r[15])
   25            If                     6  27   0                       0  if r[6] goto 27; don't emit group columns if continuing existing group
-  26            Column                 1   1   9                       0  r[9]=sales.category
+  26            Column                 2   0   9                       0  r[9]=idx_sales_category.category
   27            Integer                1   6   0                       0  r[6]=1; indicate data in accumulator
   28          Next                     2  11   0                       0
   29          Gosub                    5  33   0                       0  ; emit row for final group
