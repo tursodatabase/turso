@@ -1274,6 +1274,7 @@ pub(crate) enum CommitYieldPoint {
     /// is cleared by the caller at vdbe/mod.rs. Used for failure injection
     /// to reproduce divergence between `mv_store.txs` and `connection.mv_tx_id`.
     AfterRemoveTx,
+    AfterCommitConflictChecksBeforePreparing,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -2568,6 +2569,23 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         tracing::debug!("schema ts is older than our ts");
                         // Schema changes made after the transaction began always cause a [SchemaConflict] error and the tx must abort.
                         schema_conflict = true;
+                    }
+
+                    #[cfg(any(test, injected_yields))]
+                    {
+                        let yield_context = self.yield_context();
+                        if yield_context.injector.as_ref().is_some_and(|injector| {
+                            injector.should_yield(
+                                yield_context.instance_id,
+                                yield_context.selection_key,
+                                CommitYieldPoint::AfterCommitConflictChecksBeforePreparing.point(),
+                            )
+                        }) {
+                            tracing::debug!(
+                                tx_id = self.tx_id,
+                                "injected commit interleaving before Preparing"
+                            );
+                        }
                     }
 
                     let can_commit_tx = !(exclusive_conflict || schema_conflict);
