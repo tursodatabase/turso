@@ -644,7 +644,7 @@ pub fn translate_expr(
             // First translate inner expr, then set the curr collation. If we set curr collation before,
             // it may be overwritten later by inner translate.
             translate_expr(program, referenced_tables, expr, target_register, resolver)?;
-            let collation = CollationSeq::new(collation.as_str())?;
+            let collation = resolver.resolve_collation(collation.as_str())?;
             program.set_collation(Some((collation, true)));
             Ok(target_register)
         }
@@ -660,6 +660,7 @@ pub fn translate_expr(
             args,
             filter_over,
             order_by: _,
+            within_group: _,
         } => {
             let args_count = args.len();
             let func_type = resolver.resolve_function(name.as_str(), args_count)?;
@@ -2118,6 +2119,7 @@ pub fn translate_expr(
                         args,
                         filter_over: filter_over.clone(),
                         order_by: vec![],
+                        within_group: vec![],
                     };
 
                     // Recursively call translate_expr with the synthetic function call
@@ -2138,6 +2140,7 @@ pub fn translate_expr(
                         args: vec![], // Empty args for func(*)
                         filter_over: filter_over.clone(),
                         order_by: vec![], // Empty order_by for func(*)
+                        within_group: vec![],
                     };
 
                     // Recursively call translate_expr with the synthetic function call

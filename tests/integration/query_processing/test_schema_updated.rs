@@ -1,6 +1,7 @@
+use tempfile::TempDir;
 use turso_core::{Result, StatementStatusCounter, Value};
 
-use crate::common::TempDatabase;
+use crate::common::{ExecRows, TempDatabase};
 
 /// Test that SchemaUpdated error reprepares the statement.
 ///
@@ -207,4 +208,108 @@ fn test_deferred_seeks_resize_on_reprepare(tmp_db: TempDatabase) -> Result<()> {
     assert_eq!(results.len(), 3);
 
     Ok(())
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/6769.
+///
+/// ALTER TABLE ... ALTER COLUMN that turns an AUTOINCREMENT rowid alias into a
+/// non-rowid column must persist a consistent state on disk: the table's row in
+/// `sqlite_sequence` is removed and the rewritten `sqlite_schema.sql` no longer
+/// carries the AUTOINCREMENT keyword. After reopening the database, those
+/// invariants must still hold and subsequent inserts must not revive the
+/// sequence row.
+#[test]
+fn test_alter_table_alter_column_clears_autoincrement_reopen() {
+    let path = TempDir::new()
+        .unwrap()
+        .keep()
+        .join("alter_col_autoincrement_clear_reopen.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t(b) VALUES ('x'), ('y')")
+            .unwrap();
+
+        let seq_before: Vec<(String, i64)> =
+            conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name='t'");
+        assert_eq!(
+            seq_before,
+            vec![("t".into(), 2)],
+            "sqlite_sequence should be populated before ALTER"
+        );
+
+        conn.execute("ALTER TABLE t ALTER COLUMN a TO a2 TEXT")
+            .unwrap();
+
+        let schema_has_autoinc: Vec<(i64,)> =
+            conn.exec_rows("SELECT sql LIKE '%AUTOINCREMENT%' FROM sqlite_schema WHERE name='t'");
+        assert_eq!(
+            schema_has_autoinc,
+            vec![(0,)],
+            "AUTOINCREMENT must be gone from sqlite_schema.sql after ALTER COLUMN"
+        );
+
+        let seq_after_alter: Vec<(i64,)> =
+            conn.exec_rows("SELECT COUNT(*) FROM sqlite_sequence WHERE name='t'");
+        assert_eq!(
+            seq_after_alter,
+            vec![(0,)],
+            "sqlite_sequence row must be cleared by ALTER COLUMN"
+        );
+
+        conn.close().unwrap();
+    }
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        let schema_has_autoinc: Vec<(i64,)> =
+            conn.exec_rows("SELECT sql LIKE '%AUTOINCREMENT%' FROM sqlite_schema WHERE name='t'");
+        assert_eq!(
+            schema_has_autoinc,
+            vec![(0,)],
+            "persisted sqlite_schema.sql must not contain AUTOINCREMENT after reopen"
+        );
+
+        let seq_after_reopen: Vec<(i64,)> =
+            conn.exec_rows("SELECT COUNT(*) FROM sqlite_sequence WHERE name='t'");
+        assert_eq!(
+            seq_after_reopen,
+            vec![(0,)],
+            "sqlite_sequence row must remain absent after reopen"
+        );
+
+        conn.execute("INSERT INTO t(b) VALUES ('z')").unwrap();
+
+        let seq_after_insert: Vec<(i64,)> =
+            conn.exec_rows("SELECT COUNT(*) FROM sqlite_sequence WHERE name='t'");
+        assert_eq!(
+            seq_after_insert,
+            vec![(0,)],
+            "INSERT after reopen must not recreate the sequence row \
+             (in-memory has_autoincrement must have been cleared)"
+        );
+
+        let rewritten: Vec<(String, String)> =
+            conn.exec_rows("SELECT a2, b FROM t WHERE a2 IS NOT NULL ORDER BY rowid");
+        assert_eq!(
+            rewritten,
+            vec![("1".into(), "x".into()), ("2".into(), "y".into())],
+            "pre-ALTER rows must carry the old rowid as TEXT after the column rewrite"
+        );
+
+        let post_insert: Vec<(i64, String)> =
+            conn.exec_rows("SELECT a2 IS NULL, b FROM t WHERE b='z'");
+        assert_eq!(
+            post_insert,
+            vec![(1, "z".into())],
+            "INSERT after reopen must leave a2 NULL — column is no longer a rowid alias"
+        );
+
+        conn.close().unwrap();
+    }
 }

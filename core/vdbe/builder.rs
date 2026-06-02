@@ -1,4 +1,5 @@
-use crate::{turso_assert, turso_assert_eq, turso_debug_assert};
+use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result};
+
 use rustc_hash::FxHashMap as HashMap;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
@@ -1405,6 +1406,12 @@ impl ProgramBuilder {
                 } => {
                     resolve(target_pc, "NotExists")?;
                 }
+                Insn::MustBeInt {
+                    target_pc: Some(target_pc),
+                    ..
+                } => {
+                    resolve(target_pc, "MustBeInt")?;
+                }
                 Insn::Yield {
                     yield_reg: _,
                     end_offset,
@@ -1625,37 +1632,47 @@ impl ProgramBuilder {
     }
 
     /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
-    pub fn begin_write_operation(&mut self) {
+    pub fn begin_write_operation(&mut self) -> Result<(), alloc::TryReserveError> {
         self.txn_mode = TransactionMode::Write;
-        self.write_databases.set(crate::MAIN_DB_ID);
+        self.write_databases.set(crate::MAIN_DB_ID)
     }
 
     /// Begin a write operation on a specific database (for attached databases).
-    pub fn begin_write_on_database(&mut self, database_id: usize, schema_cookie: u32) {
+    pub fn begin_write_on_database(
+        &mut self,
+        database_id: usize,
+        schema_cookie: u32,
+    ) -> Result<(), alloc::TryReserveError> {
         self.txn_mode = TransactionMode::Write;
-        self.write_databases.set(database_id);
+        self.write_databases.set(database_id)?;
         self.write_database_cookies
             .insert(database_id, schema_cookie);
+        Ok(())
     }
 
-    pub fn begin_read_operation(&mut self) {
+    pub fn begin_read_operation(&mut self) -> Result<(), alloc::TryReserveError> {
         // Just override the transaction mode when it is None
         if matches!(self.txn_mode, TransactionMode::None) {
             self.txn_mode = TransactionMode::Read;
         }
-        self.read_databases.set(crate::MAIN_DB_ID);
+        self.read_databases.set(crate::MAIN_DB_ID)
     }
 
     /// Begin a read operation on a specific attached database.
     /// This ensures a Transaction instruction is emitted for the attached pager
     /// so that a WAL read lock is acquired.
-    pub fn begin_read_on_database(&mut self, database_id: usize, schema_cookie: u32) {
+    pub fn begin_read_on_database(
+        &mut self,
+        database_id: usize,
+        schema_cookie: u32,
+    ) -> Result<(), alloc::TryReserveError> {
         if matches!(self.txn_mode, TransactionMode::None) {
             self.txn_mode = TransactionMode::Read;
         }
-        self.read_databases.set(database_id);
+        self.read_databases.set(database_id)?;
         self.read_database_cookies
             .insert(database_id, schema_cookie);
+        Ok(())
     }
 
     pub const fn begin_concurrent_operation(&mut self) {

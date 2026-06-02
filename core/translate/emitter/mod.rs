@@ -1,7 +1,7 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 use super::{
-    collate::{get_expr_collation_ctx, CollationSeq},
+    collate::{get_expr_collation_ctx_with_symbols, CollationSeq},
     compound_select::emit_program_for_compound_select,
     emitter::{
         delete::emit_program_for_delete, select::emit_program_for_select,
@@ -22,11 +22,13 @@ use super::{
     trigger_exec::{get_triggers_including_temp, has_triggers_including_temp},
     window::WindowMetadata,
 };
+use crate::alloc::TursoIteratorExt;
 use crate::instrument;
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
     EXPR_INDEX_SENTINEL,
 };
+use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::ColumnMask;
 use crate::vdbe::{
     affinity::Affinity,
@@ -179,6 +181,13 @@ pub struct Resolver<'a> {
     /// (e.g. via a nested sub-program), update this field on that
     /// path or switch to a live read.
     has_temp_schema: bool,
+    /// Foreign-key action programs currently being compiled by this resolver.
+    ///
+    /// This is shared with forked resolvers because `translate_inner` can fork
+    /// the resolver while compiling generated foreign-key action SQL. Without
+    /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
+    /// that its own action program is already being built.
+    pub(super) fk_action_compile_stack: FkActionCompileStack,
 }
 
 #[derive(Clone)]
@@ -285,6 +294,7 @@ impl<'a> Resolver<'a> {
             dqs_dml,
             trigger_context: None,
             has_temp_schema,
+            fk_action_compile_stack: FkActionCompileStack::default(),
         }
     }
 
@@ -313,6 +323,7 @@ impl<'a> Resolver<'a> {
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
+            fk_action_compile_stack: self.fk_action_compile_stack.clone(),
         }
     }
 
@@ -333,6 +344,7 @@ impl<'a> Resolver<'a> {
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
+            fk_action_compile_stack: self.fk_action_compile_stack.clone(),
         }
     }
 
@@ -490,9 +502,20 @@ impl<'a> Resolver<'a> {
         needs_decode: bool,
         referenced_tables: &TableReferences,
     ) -> Result<()> {
-        let collation = get_expr_collation_ctx(expr.as_ref(), referenced_tables)?;
+        let collation = get_expr_collation_ctx_with_symbols(
+            expr.as_ref(),
+            referenced_tables,
+            Some(self.symbol_table),
+        )?;
         self.cache_expr_reg(expr, reg, needs_decode, collation);
         Ok(())
+    }
+
+    pub fn resolve_collation(&self, name: &str) -> Result<CollationSeq> {
+        if let Some(collation) = self.symbol_table.resolve_collation(name) {
+            return Ok(collation);
+        }
+        CollationSeq::new(name)
     }
 
     /// Returns the register, decode flag, and collation metadata for a previously translated expression.
@@ -523,20 +546,21 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    pub(crate) fn attached_database_ids_in_search_order(&self) -> BitSet {
-        self.attached_databases
+    pub(crate) fn attached_database_ids_in_search_order(&self) -> Result<BitSet> {
+        Ok(self
+            .attached_databases
             .read()
             .index_to_data
             .keys()
             .copied()
-            .collect()
+            .try_collect()?)
     }
 
     fn resolve_unqualified_existing_database_id<F>(
         &self,
         object_name: &str,
         schema_contains_object: F,
-    ) -> usize
+    ) -> Result<usize>
     where
         F: Fn(&Schema, &str) -> bool,
     {
@@ -548,24 +572,24 @@ impl<'a> Resolver<'a> {
                 schema_contains_object(schema, object_name)
             })
         {
-            return crate::TEMP_DB_ID;
+            return Ok(crate::TEMP_DB_ID);
         }
 
         if self.with_schema(crate::MAIN_DB_ID, |schema| {
             schema_contains_object(schema, object_name)
         }) {
-            return crate::MAIN_DB_ID;
+            return Ok(crate::MAIN_DB_ID);
         }
 
-        for database_id in self.attached_database_ids_in_search_order() {
+        for database_id in self.attached_database_ids_in_search_order()? {
             if self.with_schema(database_id, |schema| {
                 schema_contains_object(schema, object_name)
             }) {
-                return database_id;
+                return Ok(database_id);
             }
         }
 
-        crate::MAIN_DB_ID
+        Ok(crate::MAIN_DB_ID)
     }
 
     fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
@@ -618,20 +642,20 @@ impl<'a> Resolver<'a> {
                 return Ok(ctx.database_id);
             }
 
-            return Ok(self.resolve_unqualified_existing_database_id(
+            return self.resolve_unqualified_existing_database_id(
                 table_name,
                 Self::schema_has_table_like_object,
-            ));
+            );
         }
 
         if let Some(database_id) = Self::resolve_schema_table_database_id(table_name) {
             return Ok(database_id);
         }
 
-        Ok(self.resolve_unqualified_existing_database_id(
+        self.resolve_unqualified_existing_database_id(
             table_name,
             Self::schema_has_table_like_object,
-        ))
+        )
     }
 
     pub(crate) fn resolve_existing_index_database_id(
@@ -643,7 +667,7 @@ impl<'a> Resolver<'a> {
         }
 
         let index_name = normalize_ident(qualified_name.name.as_str());
-        Ok(self.resolve_unqualified_existing_database_id(&index_name, Self::schema_has_index))
+        self.resolve_unqualified_existing_database_id(&index_name, Self::schema_has_index)
     }
 
     pub(crate) fn resolve_existing_trigger_database_id(
@@ -655,7 +679,7 @@ impl<'a> Resolver<'a> {
         }
 
         let trigger_name = qualified_name.name.as_str();
-        Ok(self.resolve_unqualified_existing_database_id(trigger_name, Self::schema_has_trigger))
+        self.resolve_unqualified_existing_database_id(trigger_name, Self::schema_has_trigger)
     }
 
     /// Resolve database ID from a qualified name
@@ -1321,7 +1345,9 @@ fn emit_cdc_insns_v1(
         cursor: cdc_cursor_id,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: InsertFlags::new()
+            .skip_last_rowid()
+            .skip_statement_change_count(),
         table_name: "".to_string(),
     });
     Ok(())
@@ -1460,7 +1486,9 @@ fn emit_cdc_insns_v2(
         cursor: cdc_cursor_id,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: InsertFlags::new()
+            .skip_last_rowid()
+            .skip_statement_change_count(),
         table_name: "".to_string(),
     });
     Ok(())
@@ -1546,7 +1574,9 @@ pub fn emit_cdc_commit_insns(
         cursor: cdc_cursor_id,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: InsertFlags::new()
+            .skip_last_rowid()
+            .skip_statement_change_count(),
         table_name: "".to_string(),
     });
     Ok(())
@@ -1627,6 +1657,7 @@ pub(crate) fn init_limit(
                         program.add_comment(program.offset(), "LIMIT counter");
                         program.emit_insn(Insn::MustBeInt {
                             reg: limit_ctx.reg_limit,
+                            target_pc: None,
                         });
                     }
                     _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
@@ -1635,7 +1666,10 @@ pub(crate) fn init_limit(
                     let r = limit_ctx.reg_limit;
 
                     _ = translate_expr(program, None, expr, r, &t_ctx.resolver)?;
-                    program.emit_insn(Insn::MustBeInt { reg: r });
+                    program.emit_insn(Insn::MustBeInt {
+                        reg: r,
+                        target_pc: None,
+                    });
                 }
             }
         }
@@ -1658,7 +1692,10 @@ pub(crate) fn init_limit(
                             value: value.into(),
                             dest: offset_reg,
                         });
-                        program.emit_insn(Insn::MustBeInt { reg: offset_reg });
+                        program.emit_insn(Insn::MustBeInt {
+                            reg: offset_reg,
+                            target_pc: None,
+                        });
                     }
                     _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
                 },
@@ -1667,7 +1704,10 @@ pub(crate) fn init_limit(
                 }
             }
             program.add_comment(program.offset(), "OFFSET counter");
-            program.emit_insn(Insn::MustBeInt { reg: offset_reg });
+            program.emit_insn(Insn::MustBeInt {
+                reg: offset_reg,
+                target_pc: None,
+            });
 
             let combined_reg = program.alloc_register();
             t_ctx.reg_limit_offset_sum = Some(combined_reg);
@@ -1719,8 +1759,8 @@ pub(crate) fn emit_columns_and_dependencies(
     let target_base = program.alloc_registers(targets.len());
     let extra_base = {
         let mut dependencies_not_in_targets: ColumnMask = dependencies.clone();
-        let target_mask = targets.iter().copied().collect();
-        dependencies_not_in_targets -= &target_mask;
+        let target_mask = targets.iter().copied().try_collect()?;
+        dependencies_not_in_targets.union_with(&target_mask)?;
 
         let extra_count = dependencies_not_in_targets.count();
 

@@ -1,13 +1,20 @@
 import { AsyncLock } from './async-lock.js';
-import { Session, type SessionConfig } from './session.js';
+import { Session, type SessionConfig, type BatchMode } from './session.js';
 import { Statement } from './statement.js';
 import { type QueryOptions } from './protocol.js';
 import { normalizeArgs, splitBindParameters } from './args.js';
+
+export type { BatchMode } from './session.js';
 
 /**
  * Configuration options for connecting to a Turso database.
  */
 export interface Config extends SessionConfig {}
+
+export type BatchStatement = string | {
+  sql: string;
+  args?: any[] | Record<string, any>;
+};
 
 
 /**
@@ -59,7 +66,6 @@ export class Connection {
   private session: Session;
   private isOpen: boolean = true;
   private defaultSafeIntegerMode: boolean = false;
-  private _inTransaction: boolean = false;
   private execLock: AsyncLock = new AsyncLock();
 
   constructor(config: Config) {
@@ -68,19 +74,24 @@ export class Connection {
     }
     this.config = config;
     this.session = new Session(config);
-    
+
     // Define inTransaction property
     Object.defineProperty(this, 'inTransaction', {
-      get: () => this._inTransaction,
+      get: () => this.session.inTransaction,
       enumerable: true
     });
   }
 
   /**
    * Whether the database is currently in a transaction.
+   *
+   * Derived from the server's `get_autocommit` status (refreshed on every
+   * request), so it reflects the connection's real transaction state — the
+   * same as `sqlite3_get_autocommit()` on the native bindings — including
+   * transactions opened with a raw `BEGIN`, not just via `transaction()`.
    */
   get inTransaction(): boolean {
-    return this._inTransaction;
+    return this.session.inTransaction;
   }
 
   /**
@@ -236,28 +247,73 @@ export class Connection {
 
 
   /**
-   * Execute multiple SQL statements in a batch.
-   * 
-   * @param statements - Array of SQL statements to execute
-   * @param mode - Optional transaction mode (currently unused)
-   * @returns Promise resolving to batch execution results
-   * 
+   * Executes a batch of SQL statements over this connection.
+   *
+   * By default, batch() is not transactional: each statement runs in its
+   * own autocommit step, so a failure mid-batch leaves earlier successful
+   * statements committed. Pass a `mode` to make the batch atomic — the
+   * statements are wrapped in `BEGIN <mode>` / `COMMIT` (with `ROLLBACK`
+   * on failure) and dispatched as a single Hrana request, so the whole
+   * batch completes in one round-trip. When called from inside a
+   * `connection.transaction(...)` callback the `mode` argument is ignored
+   * and the surrounding transaction is reused.
+   *
+   * When `mode` is set, `batch()` owns the surrounding
+   * `BEGIN`/`COMMIT`/`ROLLBACK`, so the `statements` array must not
+   * contain its own transaction-control SQL (`BEGIN`, `COMMIT`,
+   * `ROLLBACK`, `SAVEPOINT`, `RELEASE`). The input is not validated
+   * for that — a user-supplied `COMMIT` will close the wrapper
+   * transaction mid-batch and leave earlier statements committed,
+   * defeating the all-or-nothing contract.
+   *
+   * @param statements - An array of SQL strings or `{ sql, args }` objects.
+   * @param mode - When set, makes the batch atomic. Accepts the same
+   *   values as `connection.transaction(...)` variants: `"deferred"`,
+   *   `"immediate"`, `"exclusive"`, `"concurrent"`. Ignored when already
+   *   inside a transaction.
+   * @returns An object with `rowsAffected` (sum of affected rows) and
+   *   `lastInsertRowid` (rowid of the last successful insert).
+   *
    * @example
-   * ```typescript
-   * await client.batch([
-   *   "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
-   *   "INSERT INTO users (name) VALUES ('Alice')",
-   *   "INSERT INTO users (name) VALUES ('Bob')"
+   * // Plain SQL strings (non-atomic).
+   * await db.batch([
+   *   "INSERT INTO users(name) VALUES ('Alice')",
+   *   "INSERT INTO users(name) VALUES ('Bob')",
    * ]);
-   * ```
+   *
+   * @example
+   * // Positional and named bind parameters.
+   * await db.batch([
+   *   { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Carol", "carol@example.net"] },
+   *   { sql: "INSERT INTO users(name, email) VALUES (:name, :email)", args: { name: "Dave", email: "dave@example.net" } },
+   * ]);
+   *
+   * @example
+   * // Atomic via the mode parameter.
+   * await db.batch([
+   *   { sql: "INSERT INTO users(name) VALUES (?)", args: ["Eve"] },
+   *   { sql: "INSERT INTO users(name) VALUES (?)", args: ["Frank"] },
+   * ], "immediate");
+   *
+   * @example
+   * // Atomic via the transaction() API for mixed workloads.
+   * const txn = db.transaction(async () => {
+   *   await db.batch([{ sql: "INSERT INTO users(name) VALUES (?)", args: ["Eve"] }]);
+   *   await db.execute("UPDATE counters SET n = n + 1");
+   * });
+   * await txn.immediate();
    */
-  async batch(statements: string[], mode?: string, queryOptions?: QueryOptions): Promise<any> {
+  async batch(statements: BatchStatement[], mode?: BatchMode, queryOptions?: QueryOptions): Promise<any> {
     if (!this.isOpen) {
       throw new TypeError("The database connection is not open");
     }
     await this.execLock.acquire();
     try {
-      return await this.session.batch(statements, queryOptions);
+      // Inside an outer transaction(...) callback the surrounding BEGIN
+      // already opened a transaction on this stream; emitting another
+      // `BEGIN` step would fail, so ignore the user-supplied mode.
+      const effectiveMode = this.session.inTransaction ? undefined : mode;
+      return await this.session.batch(statements, effectiveMode, queryOptions);
     } finally {
       this.execLock.release();
     }
@@ -318,15 +374,12 @@ export class Connection {
     const wrapTxn = (mode: string) => {
       return async (...bindParameters: any[]) => {
         await db.exec("BEGIN " + mode);
-        db._inTransaction = true;
         try {
           const result = await fn(...bindParameters);
           await db.exec("COMMIT");
-          db._inTransaction = false;
           return result;
         } catch (err) {
           await db.exec("ROLLBACK");
-          db._inTransaction = false;
           throw err;
         }
       };
@@ -335,6 +388,7 @@ export class Connection {
     const properties = {
       default: { value: wrapTxn("") },
       deferred: { value: wrapTxn("DEFERRED") },
+      concurrent: { value: wrapTxn("CONCURRENT") },
       immediate: { value: wrapTxn("IMMEDIATE") },
       exclusive: { value: wrapTxn("EXCLUSIVE") },
       database: { value: this, enumerable: true },
@@ -342,6 +396,7 @@ export class Connection {
 
     Object.defineProperties(properties.default.value, properties);
     Object.defineProperties(properties.deferred.value, properties);
+    Object.defineProperties(properties.concurrent.value, properties);
     Object.defineProperties(properties.immediate.value, properties);
     Object.defineProperties(properties.exclusive.value, properties);
     

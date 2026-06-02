@@ -258,7 +258,13 @@ unsafe fn dispatch_func_bridge(slot_id: usize, argc: i32, argv: *const ExtValue)
 // Each bridges turso_core's ScalarFunction ABI to the C sqlite3_create_function_v2 callback.
 macro_rules! func_bridge {
     ($id:literal, $name:ident) => {
-        unsafe extern "C" fn $name(argc: i32, argv: *const ExtValue) -> ExtValue {
+        unsafe extern "C" fn $name(
+            _context: usize,
+            argc: i32,
+            argv: *const ExtValue,
+            _context_destructor: Option<turso_ext::ContextDestructor>,
+            _value_destructor: Option<turso_ext::ValueDestructor>,
+        ) -> ExtValue {
             dispatch_func_bridge($id, argc, argv)
         }
     };
@@ -802,7 +808,7 @@ pub unsafe extern "C" fn sqlite3_context_db_handle(context: *mut ffi::c_void) ->
 pub unsafe extern "C" fn sqlite3_prepare_v2(
     raw_db: *mut sqlite3,
     sql: *const ffi::c_char,
-    _len: ffi::c_int,
+    n_byte: ffi::c_int,
     out_stmt: *mut *mut sqlite3_stmt,
     tail: *mut *const ffi::c_char,
 ) -> ffi::c_int {
@@ -811,8 +817,22 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     }
     let db: &mut sqlite3 = &mut *raw_db;
     let mut db = db.inner.lock().unwrap();
-    let sql_cstr = CStr::from_ptr(sql);
-    let sql_str = match sql_cstr.to_str() {
+    // SQLite C-API contract (https://www.sqlite.org/c3ref/prepare.html):
+    //   If nByte is negative, zSql is read up to the first zero terminator.
+    //   If nByte is positive, it is the number of bytes read from zSql.
+    // Without this branch, the function unconditionally walks until NUL — over-reads
+    // any non-NUL-terminated Rust `&str` passed by rusqlite/libsqlite3-sys, producing
+    // misleading parse errors from neighbouring memory.
+    let sql_bytes: &[u8] = if n_byte < 0 {
+        CStr::from_ptr(sql).to_bytes()
+    } else {
+        let bounded = std::slice::from_raw_parts(sql as *const u8, n_byte as usize);
+        bounded
+            .iter()
+            .position(|&b| b == 0)
+            .map_or(bounded, |i| &bounded[..i])
+    };
+    let sql_str = match std::str::from_utf8(sql_bytes) {
         Ok(s) => s,
         Err(_) => {
             db.err_code = SQLITE_MISUSE;
@@ -1519,6 +1539,20 @@ fn sqlite3_bind_index_in_range(stmt: &sqlite3_stmt, idx: ffi::c_int) -> Option<N
     }
 }
 
+unsafe fn sqlite3_bind_result(
+    stmt: &mut sqlite3_stmt,
+    result: Result<(), LimboError>,
+) -> ffi::c_int {
+    match result {
+        Ok(()) => SQLITE_OK,
+        Err(err) => {
+            let db = &mut *stmt.db;
+            let mut inner = db.inner.lock().unwrap();
+            set_db_err(&mut inner, err)
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_parameter_name(
     stmt: *mut sqlite3_stmt,
@@ -1570,8 +1604,8 @@ pub unsafe extern "C" fn sqlite3_bind_null(stmt: *mut sqlite3_stmt, idx: ffi::c_
         return SQLITE_RANGE;
     };
 
-    stmt.stmt.bind_at(index, Value::Null);
-    SQLITE_OK
+    let result = stmt.stmt.bind_at(index, Value::Null);
+    sqlite3_bind_result(stmt, result)
 }
 
 #[no_mangle]
@@ -1597,9 +1631,8 @@ pub unsafe extern "C" fn sqlite3_bind_int64(
         return SQLITE_RANGE;
     };
 
-    stmt.stmt.bind_at(index, Value::from_i64(val));
-
-    SQLITE_OK
+    let result = stmt.stmt.bind_at(index, Value::from_i64(val));
+    sqlite3_bind_result(stmt, result)
 }
 
 #[no_mangle]
@@ -1616,9 +1649,8 @@ pub unsafe extern "C" fn sqlite3_bind_double(
         return SQLITE_RANGE;
     };
 
-    stmt.stmt.bind_at(index, Value::from_f64(val));
-
-    SQLITE_OK
+    let result = stmt.stmt.bind_at(index, Value::from_f64(val));
+    sqlite3_bind_result(stmt, result)
 }
 
 #[no_mangle]
@@ -1637,8 +1669,8 @@ pub unsafe extern "C" fn sqlite3_bind_text(
         return SQLITE_RANGE;
     };
     if text.is_null() {
-        stmt_ref.stmt.bind_at(index, Value::Null);
-        return SQLITE_OK;
+        let result = stmt_ref.stmt.bind_at(index, Value::Null);
+        return sqlite3_bind_result(stmt_ref, result);
     }
 
     let static_ptr = std::ptr::null();
@@ -1662,15 +1694,27 @@ pub unsafe extern "C" fn sqlite3_bind_text(
 
     if ptr_val == transient_ptr {
         let val = Value::from_text(str_value);
-        stmt_ref.stmt.bind_at(index, val);
+        let result = stmt_ref.stmt.bind_at(index, val);
+        let rc = sqlite3_bind_result(stmt_ref, result);
+        if rc != SQLITE_OK {
+            return rc;
+        }
     } else if ptr_val == static_ptr {
         let slice = std::slice::from_raw_parts(text as *const u8, str_value.len());
         let val = Value::from_text(std::str::from_utf8(slice).unwrap());
-        stmt_ref.stmt.bind_at(index, val);
+        let result = stmt_ref.stmt.bind_at(index, val);
+        let rc = sqlite3_bind_result(stmt_ref, result);
+        if rc != SQLITE_OK {
+            return rc;
+        }
     } else {
         let slice = std::slice::from_raw_parts(text as *const u8, str_value.len());
         let val = Value::from_text(std::str::from_utf8(slice).unwrap());
-        stmt_ref.stmt.bind_at(index, val);
+        let result = stmt_ref.stmt.bind_at(index, val);
+        let rc = sqlite3_bind_result(stmt_ref, result);
+        if rc != SQLITE_OK {
+            return rc;
+        }
 
         stmt_ref
             .destructors
@@ -1696,15 +1740,19 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
         return SQLITE_RANGE;
     };
     if blob.is_null() {
-        stmt_ref.stmt.bind_at(index, Value::Null);
-        return SQLITE_OK;
+        let result = stmt_ref.stmt.bind_at(index, Value::Null);
+        return sqlite3_bind_result(stmt_ref, result);
     }
 
     let slice_blob = std::slice::from_raw_parts(blob as *const u8, len as usize).to_vec();
 
     let val_blob = Value::from_blob(slice_blob);
 
-    stmt_ref.stmt.bind_at(index, val_blob);
+    let result = stmt_ref.stmt.bind_at(index, val_blob);
+    let rc = sqlite3_bind_result(stmt_ref, result);
+    if rc != SQLITE_OK {
+        return rc;
+    }
 
     if let Some(destructor_fn) = destructor {
         let ptr_val = destructor_fn as *const ffi::c_void;
@@ -2489,7 +2537,16 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
     let db_ref = &*db;
     let inner = db_ref.inner.lock().unwrap();
     let api = inner.conn._build_turso_ext();
-    let rc = (api.register_scalar_function)(api.ctx, func_name_c.as_ptr(), bridge);
+    let rc = (api.register_scalar_function)(
+        api.ctx,
+        func_name_c.as_ptr(),
+        _n_args,
+        false,
+        0,
+        bridge,
+        None,
+        None,
+    );
     inner.conn._free_extension_ctx(api);
 
     if rc != turso_ext::ResultCode::OK {

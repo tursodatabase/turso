@@ -211,7 +211,40 @@ pub fn resolve_window_and_aggregate_functions(
                 distinctness,
                 filter_over,
                 order_by,
+                within_group,
             } => {
+                let ordered_set_func = ordered_set_agg_func(&normalize_ident(name.as_str()));
+
+                if !within_group.is_empty() {
+                    let new_agg = build_ordered_set_aggregate(
+                        name,
+                        args,
+                        distinctness.as_ref(),
+                        order_by,
+                        within_group,
+                        filter_over,
+                        ordered_set_func,
+                    )?;
+                    add_aggregate_if_not_exists(
+                        aggs,
+                        expr,
+                        &new_agg.args,
+                        Distinctness::NonDistinct,
+                        new_agg.func,
+                        filter_over.filter_clause.as_deref().cloned(),
+                    )?;
+                    contains_aggregates = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+
+                // Ordered-set aggregates are only meaningful with WITHIN GROUP. mode() in
+                // particular has no plain-aggregate form, so reject it early with a clear error.
+                if matches!(ordered_set_func, Some(AggFunc::Mode)) {
+                    crate::bail_parse_error!(
+                        "mode() requires a WITHIN GROUP (ORDER BY ...) clause"
+                    );
+                }
+
                 if !order_by.is_empty() {
                     crate::bail_parse_error!(
                         "ORDER BY clause is not supported yet in aggregate functions"
@@ -476,6 +509,89 @@ fn add_aggregate_if_not_exists(
     Ok(())
 }
 
+/// Maps a normalized function name to the ordered-set [`AggFunc`] it implements, if any.
+/// Ordered-set aggregates are written `f(direct_args) WITHIN GROUP (ORDER BY x)`.
+fn ordered_set_agg_func(normalized_name: &str) -> Option<AggFunc> {
+    match normalized_name {
+        "mode" => Some(AggFunc::Mode),
+        "percentile_cont" => Some(AggFunc::PercentileCont),
+        "percentile_disc" => Some(AggFunc::PercentileDisc),
+        _ => None,
+    }
+}
+
+struct OrderedSetAggregate {
+    func: AggFunc,
+    // Matches `add_aggregate_if_not_exists`, which consumes `&[Box<Expr>]`.
+    #[allow(clippy::vec_box)]
+    args: Vec<Box<Expr>>,
+}
+
+/// Validates a `WITHIN GROUP (ORDER BY ...)` ordered-set aggregate and rewrites it into a
+/// uniform argument list for the rest of the pipeline: `[value]` for `mode`, or
+/// `[value, fraction]` for the percentile functions. `value` is the single ORDER BY
+/// expression; `fraction` is the direct argument.
+fn build_ordered_set_aggregate(
+    name: &ast::Name,
+    args: &[Box<Expr>],
+    distinctness: Option<&ast::Distinctness>,
+    order_by: &[ast::SortedColumn],
+    within_group: &[ast::SortedColumn],
+    filter_over: &ast::FunctionTail,
+    ordered_set_func: Option<AggFunc>,
+) -> Result<OrderedSetAggregate> {
+    let Some(func) = ordered_set_func else {
+        crate::bail_parse_error!(
+            "WITHIN GROUP is not supported for function {}()",
+            name.as_str()
+        );
+    };
+    if filter_over.over_clause.is_some() {
+        crate::bail_parse_error!(
+            "ordered-set aggregate {}() may not be used as a window function",
+            name.as_str()
+        );
+    }
+    if distinctness.is_some() {
+        crate::bail_parse_error!(
+            "DISTINCT is not supported for ordered-set aggregate {}()",
+            name.as_str()
+        );
+    }
+    if !order_by.is_empty() {
+        crate::bail_parse_error!(
+            "{}() does not accept an argument ORDER BY together with WITHIN GROUP",
+            name.as_str()
+        );
+    }
+    if within_group.len() != 1 {
+        crate::bail_parse_error!(
+            "WITHIN GROUP for {}() must specify exactly one ORDER BY expression",
+            name.as_str()
+        );
+    }
+    let sort_col = &within_group[0];
+    if matches!(sort_col.order, Some(ast::SortOrder::Desc)) || sort_col.nulls.is_some() {
+        crate::bail_parse_error!(
+            "DESC and NULLS ordering inside WITHIN GROUP are not supported yet"
+        );
+    }
+    let expected_direct_args = match func {
+        AggFunc::Mode => 0,
+        _ => 1, // percentile_cont / percentile_disc take the fraction
+    };
+    if args.len() != expected_direct_args {
+        crate::bail_parse_error!("wrong number of arguments to function {}()", name.as_str());
+    }
+    let mut new_args: Vec<Box<Expr>> = Vec::with_capacity(args.len() + 1);
+    new_args.push(sort_col.expr.clone());
+    new_args.extend(args.iter().cloned());
+    Ok(OrderedSetAggregate {
+        func,
+        args: new_args,
+    })
+}
+
 /// Plan a CTE when it's referenced in a query.
 /// Each call produces a fresh plan with unique internal_ids, ensuring that
 /// multiple references to the same CTE get independent cursor IDs,
@@ -524,7 +640,7 @@ fn plan_cte(
             identifier: referenced_table.identifier.clone(),
             internal_id: referenced_table.internal_id,
             table: referenced_table.table.clone(),
-            using_dedup_hidden_cols: referenced_table.using_dedup_hidden_cols(),
+            using_dedup_hidden_cols: referenced_table.using_dedup_hidden_cols()?,
             col_used_mask: ColumnUsedMask::default(),
             cte_select: None,
             cte_explicit_columns: vec![],
@@ -1497,7 +1613,7 @@ pub fn table_mask_from_expr(
                     .iter()
                     .position(|t| t.internal_id == *table)
                 {
-                    mask.set(table_idx);
+                    mask.set(table_idx)?;
                 } else if table_references
                     .find_outer_query_ref_by_internal_id(*table)
                     .is_none()
@@ -1525,7 +1641,7 @@ pub fn table_mask_from_expr(
                                 .iter()
                                 .position(|t| t.internal_id == *outer_ref_id)
                             {
-                                mask.set(table_idx);
+                                mask.set(table_idx)?;
                             }
                         }
                     }
@@ -1543,7 +1659,7 @@ pub fn table_mask_from_expr(
                                 .iter()
                                 .position(|t| t.internal_id == *outer_ref_id)
                             {
-                                mask.set(table_idx);
+                                mask.set(table_idx)?;
                             }
                         }
                     }

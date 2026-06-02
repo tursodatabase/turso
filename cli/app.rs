@@ -563,7 +563,9 @@ impl Limbo {
         let mut last_stmt_metrics = None;
         for mut output in runner {
             if let Ok(Some(ref mut stmt)) = output {
-                self.apply_parameter_bindings(stmt);
+                if let Err(err) = self.apply_parameter_bindings(stmt) {
+                    output = Err(err);
+                }
             }
             if self
                 .print_query_result(input, &mut output, stats.as_mut())
@@ -589,19 +591,20 @@ impl Limbo {
         }
     }
 
-    fn apply_parameter_bindings(&self, stmt: &mut Statement) {
+    fn apply_parameter_bindings(&self, stmt: &mut Statement) -> Result<(), LimboError> {
         for binding in &self.parameter_bindings {
             if let Some(index) = binding.index {
                 if stmt.parameters().has_slot(index) {
-                    stmt.bind_at(index, binding.value.clone());
+                    stmt.bind_at(index, binding.value.clone())?;
                 }
                 continue;
             }
 
             if let Some(index) = stmt.parameter_index(&binding.name) {
-                stmt.bind_at(index, binding.value.clone());
+                stmt.bind_at(index, binding.value.clone())?;
             }
         }
+        Ok(())
     }
 
     fn handle_parameter_command(&mut self, args: ParameterArgs) -> Result<(), String> {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::alloc::TursoIteratorExt;
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
 use crate::translate::plan::ColumnUsedMask;
@@ -135,15 +136,20 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                         join_key.get_build_expr(self.predicates),
                     ),
                 };
-                resolve_comparison_collseq(original_lhs, original_rhs, self.table_references)
-                    .unwrap_or(CollationSeq::Binary)
+                resolve_comparison_collseq_with_symbols(
+                    original_lhs,
+                    original_rhs,
+                    self.table_references,
+                    Some(self.t_ctx.resolver.symbol_table),
+                )
+                .unwrap_or(CollationSeq::Binary)
             })
             .collect();
 
         let use_bloom_filter = self.hash_join_op.use_bloom_filter
             && collations
                 .iter()
-                .all(|c| matches!(c, CollationSeq::Binary | CollationSeq::Unset));
+                .all(|c| matches!(*c, CollationSeq::Binary | CollationSeq::Unset));
 
         let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
         let (payload_columns, payload_signature_columns, use_materialized_keys, allow_seek) =
@@ -158,7 +164,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                     );
                     let payload_signature_columns: ColumnUsedMask = (0..payload_columns.len())
                         .map(|i| *payload_num_keys + i)
-                        .collect();
+                        .try_collect()?;
                     (
                         payload_columns.clone(),
                         payload_signature_columns,
@@ -340,8 +346,9 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         }
 
         if !config.use_materialized_keys {
-            let build_only_mask: TableMask =
-                [planner.hash_join_op.build_table_idx].into_iter().collect();
+            let build_only_mask: TableMask = [planner.hash_join_op.build_table_idx]
+                .into_iter()
+                .try_collect()?;
             for cond in planner.predicates.iter() {
                 if cond.from_outer_join.is_some() {
                     // OUTER JOIN predicates must stay on the right-table loop

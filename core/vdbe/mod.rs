@@ -227,10 +227,11 @@ impl CommitState {
 
         connection.rollback_attached_mvcc_txs(true);
         connection.rollback_attached_wal_txns();
+        connection.rollback_temp_schema();
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Register {
     Value(Value),
     Aggregate(AggContext),
@@ -286,10 +287,10 @@ impl Register {
     /// Set the value of the register to a Text,
     /// reusing Register::Value(Value::Text(_)) buffer if possible.
     #[inline]
-    pub fn set_text(&mut self, val: Text) {
+    pub fn set_text(&mut self, val: Text) -> Result<()> {
         match self {
             Register::Value(Value::Text(existing)) => {
-                existing.do_extend(&val);
+                existing.do_extend(&val)?;
             }
             Register::Value(other_value_kind) => {
                 *other_value_kind = Value::Text(val);
@@ -298,15 +299,16 @@ impl Register {
                 *self = Register::Value(Value::Text(val));
             }
         }
+        Ok(())
     }
 
     /// Set the value of the register to a blob,
     /// reusing Register::Value(Value::Blob(_)) buffer if possible.
     #[inline]
-    pub fn set_blob(&mut self, val: Vec<u8>) {
+    pub fn set_blob(&mut self, val: Vec<u8>) -> Result<()> {
         match self {
             Register::Value(Value::Blob(existing)) => {
-                existing.do_extend(&val);
+                existing.do_extend(&val)?;
             }
             Register::Value(other_value_kind) => {
                 *other_value_kind = Value::Blob(val);
@@ -315,6 +317,7 @@ impl Register {
                 *self = Register::Value(Value::Blob(val));
             }
         }
+        Ok(())
     }
 
     // Set the value of the register to NULL,
@@ -356,6 +359,10 @@ pub struct Row {
 pub enum TxnCleanup {
     None,
     RollbackTxn,
+    /// begin_statement was called and statement is participating in an interactive transaction.
+    /// If statement is abandoned and/or dropped without an apparent error, we should rollback statement
+    /// to previous savepoint.
+    RollbackSavepoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -624,6 +631,8 @@ pub struct ProgramState {
     pub(crate) cursors: Vec<Option<Cursor>>,
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
+    /// Trace state: register snapshot for diffing.
+    pre_op_registers: Option<Box<[Register]>>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seeks: Vec<Option<DeferredSeekState>>,
@@ -693,6 +702,7 @@ pub struct ProgramState {
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
     pub n_change: AtomicI64,
+    pub n_total_change: AtomicI64,
 }
 
 impl std::fmt::Debug for Program {
@@ -721,6 +731,7 @@ impl ProgramState {
             cursors,
             cursor_seqs,
             registers,
+            pre_op_registers: None,
             result_row: None,
             last_compare: None,
             deferred_seeks: vec![None; max_cursors],
@@ -751,6 +762,7 @@ impl ProgramState {
             has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
+            n_total_change: AtomicI64::new(0),
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
             pending_cdc_info: None,
@@ -782,7 +794,7 @@ impl ProgramState {
         matches!(self.execution_state, ProgramExecutionState::Interrupting)
     }
 
-    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
+    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) -> Result<()> {
         let i = index.get() - 1;
         if i >= self.parameters.len() {
             self.parameters.resize(i + 1, Value::Null);
@@ -796,10 +808,11 @@ impl ProgramState {
             (Value::Numeric(Numeric::Float(existing)), Value::Numeric(Numeric::Float(new))) => {
                 *existing = new
             }
-            (Value::Text(existing), Value::Text(new)) => existing.do_extend(&new),
-            (Value::Blob(existing), Value::Blob(new)) => existing.do_extend(&new),
+            (Value::Text(existing), Value::Text(new)) => existing.do_extend(&new)?,
+            (Value::Blob(existing), Value::Blob(new)) => existing.do_extend(&new)?,
             (slot, value) => *slot = value,
         }
+        Ok(())
     }
 
     pub fn clear_bindings(&mut self) {
@@ -874,10 +887,28 @@ impl ProgramState {
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
         self.n_change.store(0, Ordering::SeqCst);
+        self.n_total_change.store(0, Ordering::SeqCst);
         *self.explain_state.write() = ExplainState::default();
         self.pending_fail_error = None;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
+    }
+
+    pub(crate) fn record_statement_change(&self) {
+        self.n_change.fetch_add(1, Ordering::SeqCst);
+        self.n_total_change.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn record_total_change(&self) {
+        self.n_total_change.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Whether this statement owns the implicit autocommit transaction it is
+    /// about to finish, including re-entry while its commit is in progress.
+    #[inline]
+    pub(crate) fn owns_auto_txn(&self) -> bool {
+        self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+            || !matches!(self.commit_state, CommitState::Ready)
     }
 
     #[inline]
@@ -1215,8 +1246,24 @@ macro_rules! get_cursor {
 pub struct ExplainState {
     /// Subprograms queued for explain output, processed after the parent program finishes.
     pending: std::collections::VecDeque<Arc<PreparedProgram>>,
+    /// Prepared subprograms that have already been queued for explain output.
+    ///
+    /// Recursive foreign-key action programs can contain a `Program` instruction
+    /// that calls the same prepared program again. Without this set, EXPLAIN
+    /// keeps printing the same subprogram forever.
+    queued_subprograms: std::collections::HashSet<usize>,
     /// The subprogram currently being explained, if any.
     current: Option<Arc<PreparedProgram>>,
+}
+
+impl ExplainState {
+    /// Queue a subprogram for EXPLAIN output if this statement has not queued it before.
+    fn queue_subprogram_once(&mut self, subprogram: Arc<PreparedProgram>) {
+        let subprogram_id = Arc::as_ptr(&subprogram) as usize;
+        if self.queued_subprograms.insert(subprogram_id) {
+            self.pending.push_back(subprogram);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1430,10 +1477,11 @@ impl Program {
         let (row, subprogram) = if let Some(ref current) = explain_state.current {
             let (insn, _) = &current.insns[pc];
             let sub = if let Insn::Program {
-                program: prepared, ..
+                program: subprogram,
+                ..
             } = insn
             {
-                Some(prepared.clone())
+                Some(subprogram.prepared_program()?)
             } else {
                 None
             };
@@ -1446,10 +1494,11 @@ impl Program {
         } else {
             let (insn, _) = &self.insns[pc];
             let sub = if let Insn::Program {
-                program: prepared, ..
+                program: subprogram,
+                ..
             } = insn
             {
-                Some(prepared.clone())
+                Some(subprogram.prepared_program()?)
             } else {
                 None
             };
@@ -1461,7 +1510,7 @@ impl Program {
             (insn_to_row_with_comment(self, insn, comment), sub)
         };
         if let Some(sub) = subprogram {
-            explain_state.pending.push_back(sub);
+            explain_state.queue_subprogram_once(sub);
         }
         let (opcode, p1, p2, p3, p4, p5, comment) = row;
 
@@ -1585,6 +1634,46 @@ impl Program {
             if enable_tracing {
                 trace_insn(self, state.pc as InsnReference, insn);
                 crate::stack::trace_remaining("program_step:opcode");
+            }
+            if self.connection.get_vdbe_trace() {
+                // Diff registers from PREVIOUS opcode
+                // The last opcode (Halt) won't have its diff printed, but Halt
+                // doesn't write to any registers
+                if let Some(ref old) = state.pre_op_registers {
+                    for (i, (old_reg, new_reg)) in
+                        old.iter().zip(state.registers.iter()).enumerate()
+                    {
+                        if old_reg != new_reg {
+                            match new_reg {
+                                Register::Value(v) => eprintln!("R[{i}] = {v}"),
+                                Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
+                                Register::Record(_) => eprintln!("R[{i}] = <record>"),
+                            }
+                        }
+                    }
+                    state.pre_op_registers = None;
+                }
+
+                // Print CURRENT opcode
+                if matches!(insn, Insn::Init { .. }) {
+                    eprintln!("VDBE Trace:");
+                }
+                eprintln!(
+                    "{}",
+                    explain::insn_to_str(
+                        self,
+                        state.pc as InsnReference,
+                        insn,
+                        String::new(),
+                        self.comments
+                            .iter()
+                            .find(|(offset, _)| *offset == state.pc as InsnReference)
+                            .map(|(_, comment)| comment)
+                            .copied()
+                    )
+                );
+                // Snapshot for next iteration
+                state.pre_op_registers = Some(state.registers.clone());
             }
             // Always increment VM steps for every loop iteration
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
@@ -1797,6 +1886,8 @@ impl Program {
             if self.change_cnt_on {
                 self.connection
                     .set_changes(program_state.n_change.load(Ordering::SeqCst));
+                self.connection
+                    .add_total_changes(program_state.n_total_change.load(Ordering::SeqCst));
             }
             let transaction_finished = self.connection.auto_commit.load(Ordering::SeqCst)
                 && self.connection.get_tx_state() == TransactionState::None;
@@ -2249,6 +2340,7 @@ impl Program {
         }
         // Errors from nested statements are handled by the parent statement.
         if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
+            let owns_auto_txn = state.owns_auto_txn();
             if err.is_some() && !pager.is_checkpointing() {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
@@ -2285,14 +2377,21 @@ impl Program {
                 // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
                 // and the caller is expected to handle transaction cleanup explicitly if needed.
                 Some(LimboError::SchemaUpdated) => {}
+                Some(LimboError::WriteWriteConflict | LimboError::SchemaConflict) => {
+                    // These MVCC errors mean the current transaction cannot
+                    // commit. Roll it back even if this statement opened a
+                    // statement savepoint, as DDL does.
+                    self.rollback_current_txn(pager);
+                    self.connection.set_changes(0);
+                }
                 // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
                 // FK errors always behave like ABORT: rollback statement,
                 // rollback transaction in autocommit mode.
                 Some(LimboError::ForeignKeyConstraint(_)) => {
-                    if self.connection.get_auto_commit() {
+                    if owns_auto_txn {
                         self.rollback_current_txn(pager);
                     }
-                    self.connection.set_changes_without_total(0);
+                    self.connection.set_changes(0);
                 }
                 // Constraint and RAISE errors: behavior depends on the effective resolve type.
                 // For normal constraints, the resolve type comes from the statement (ON CONFLICT).
@@ -2325,7 +2424,7 @@ impl Program {
                                     "Failed to release statement savepoint during abort",
                                 );
                             }
-                            if self.connection.get_auto_commit() {
+                            if owns_auto_txn {
                                 // Autocommit FAIL: commit partial changes.
                                 // This matches halt()'s FAIL+autocommit path.
                                 let mv_store = self.connection.mv_store();
@@ -2374,7 +2473,7 @@ impl Program {
                             }
                         }
                         _ => {
-                            if self.connection.get_auto_commit() {
+                            if owns_auto_txn {
                                 self.rollback_current_txn(pager);
                             }
                         }
@@ -2383,7 +2482,7 @@ impl Program {
                         ResolveType::Fail => state.n_change.load(Ordering::SeqCst),
                         _ => 0,
                     };
-                    self.connection.set_changes_without_total(last_change);
+                    self.connection.set_changes(last_change);
                 }
                 Some(LimboError::RaiseIgnore) => {
                     tracing::error!(
@@ -2394,11 +2493,33 @@ impl Program {
                         "RaiseIgnore should be caught by op_program, not reach abort"
                     );
                 }
-                _ => {
-                    if state.auto_txn_cleanup != TxnCleanup::None || err.is_some() {
+                _ => match state.auto_txn_cleanup {
+                    TxnCleanup::RollbackTxn => {
                         self.rollback_current_txn(pager);
                     }
-                }
+                    TxnCleanup::RollbackSavepoint => {
+                        if owns_auto_txn {
+                            self.rollback_current_txn(pager);
+                        } else if err.is_none() && !pager.is_checkpointing() {
+                            if let Err(end_stmt_err) = state.end_statement(
+                                &self.connection,
+                                pager,
+                                EndStatement::RollbackSavepoint,
+                            ) {
+                                capture_abort_error(
+                                    &mut abort_error,
+                                    end_stmt_err,
+                                    "Failed to rollback statement savepoint during abort",
+                                );
+                            }
+                        }
+                    }
+                    TxnCleanup::None => {
+                        if owns_auto_txn || (!self.connection.get_auto_commit() && err.is_some()) {
+                            self.rollback_current_txn(pager);
+                        }
+                    }
+                },
             }
         }
         if state.uses_subjournal {
@@ -2433,7 +2554,7 @@ pub(crate) fn make_record(
     registers: &[Register],
     start_reg: &usize,
     count: &usize,
-) -> ImmutableRecord {
+) -> Result<ImmutableRecord> {
     let regs = &registers[*start_reg..*start_reg + *count];
     ImmutableRecord::from_registers(regs, regs.len())
 }
@@ -2740,10 +2861,14 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 let blob_data = &data[..content_size];
                 match dest {
                     Register::Value(Value::Blob(existing_blob)) => {
-                        existing_blob.do_extend(&blob_data);
+                        if let Err(err) = existing_blob.do_extend(&blob_data) {
+                            return Some(Err(err));
+                        }
                     }
                     _ => {
-                        dest.set_blob(blob_data.to_vec());
+                        if let Err(err) = dest.set_blob(blob_data.to_vec()) {
+                            return Some(Err(err));
+                        }
                     }
                 }
             }
@@ -2770,10 +2895,14 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 };
                 match dest {
                     Register::Value(Value::Text(existing_text)) => {
-                        existing_text.do_extend(&text_str);
+                        if let Err(err) = existing_text.do_extend(&text_str) {
+                            return Some(Err(err));
+                        }
                     }
                     _ => {
-                        dest.set_text(Text::new(text_str.to_string()));
+                        if let Err(err) = dest.set_text(Text::new(text_str.to_string())) {
+                            return Some(Err(err));
+                        }
                     }
                 }
             }

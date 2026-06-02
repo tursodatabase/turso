@@ -617,7 +617,7 @@ pub(crate) fn vacuum_target_build_step(
                     crate::StepResult::IO => {
                         let io = schema_stmt
                             .take_io_completions()
-                            .expect("StepResult::IO returned but no completions available");
+                            .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                         state.phase = VacuumTargetBuildPhase::CollectSchemaRows { schema_stmt };
                         return Ok(crate::IOResult::IO(io));
                     }
@@ -678,7 +678,7 @@ pub(crate) fn vacuum_target_build_step(
                 crate::StepResult::IO => {
                     let io = target_schema_stmt
                         .take_io_completions()
-                        .expect("StepResult::IO returned but no completions available");
+                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::StepCreateTable {
                         target_schema_stmt,
                         idx,
@@ -789,7 +789,7 @@ pub(crate) fn vacuum_target_build_step(
                     for (i, value) in row.get_values().cloned().enumerate() {
                         let index =
                             std::num::NonZero::new(i + 1).expect("i + 1 is always non-zero");
-                        target_insert_stmt.bind_at(index, value);
+                        target_insert_stmt.bind_at(index, value)?;
                     }
 
                     state.phase = VacuumTargetBuildPhase::StepTargetInsert {
@@ -809,7 +809,7 @@ pub(crate) fn vacuum_target_build_step(
                 crate::StepResult::IO => {
                     let io = select_stmt
                         .take_io_completions()
-                        .expect("StepResult::IO returned but no completions available");
+                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::CopyRows {
                         select_stmt,
                         target_insert_stmt,
@@ -842,7 +842,7 @@ pub(crate) fn vacuum_target_build_step(
                 crate::StepResult::IO => {
                     let io = target_insert_stmt
                         .take_io_completions()
-                        .expect("StepResult::IO returned but no completions available");
+                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::StepTargetInsert {
                         select_stmt,
                         target_insert_stmt,
@@ -891,7 +891,7 @@ pub(crate) fn vacuum_target_build_step(
                 crate::StepResult::IO => {
                     let io = target_schema_stmt
                         .take_io_completions()
-                        .expect("StepResult::IO returned but no completions available");
+                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::StepCreateIndex {
                         target_schema_stmt,
                         idx,
@@ -935,7 +935,7 @@ pub(crate) fn vacuum_target_build_step(
                 crate::StepResult::IO => {
                     let io = target_schema_stmt
                         .take_io_completions()
-                        .expect("StepResult::IO returned but no completions available");
+                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::StepPostData {
                         target_schema_stmt,
                         idx,
@@ -2321,10 +2321,13 @@ fn vacuum_in_place_cleanup(
 mod tests {
     use super::*;
     use crate::io::{FileId, FileSyncType};
+    use crate::mvcc::yield_hooks::YieldPointMarker;
+    use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
     use crate::schema::Schema;
     use crate::storage::encryption::{CipherMode, EncryptionKey};
     use crate::storage::pager::Page;
     use crate::util::IOExt;
+    use crate::vdbe::execute::TransactionYieldPoint;
     use crate::{
         Buffer, Clock, Completion, DatabaseOpts, File, MemoryIO, MonotonicInstant, OpenFlags,
         WallClockInstant, IO,
@@ -2417,6 +2420,33 @@ mod tests {
         count_as_wal_sync: bool,
         db_syncs: Arc<AtomicUsize>,
         wal_syncs: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct OneShotTransactionYieldInjector {
+        yielded: AtomicUsize,
+    }
+
+    impl OneShotTransactionYieldInjector {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                yielded: AtomicUsize::new(0),
+            })
+        }
+
+        fn yielded(&self) -> bool {
+            self.yielded.load(StdOrdering::SeqCst) != 0
+        }
+    }
+
+    impl YieldInjector for OneShotTransactionYieldInjector {
+        fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+            point == TransactionYieldPoint::BeforeStart.point()
+                && self
+                    .yielded
+                    .compare_exchange(0, 1, StdOrdering::SeqCst, StdOrdering::SeqCst)
+                    .is_ok()
+        }
     }
 
     impl File for SyncCountingFile {
@@ -2827,6 +2857,89 @@ mod tests {
             1,
             "VACUUM INTO finalization must do exactly one WAL fsync after truncation"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn vacuum_target_build_preserves_nested_statement_explicit_yield() -> Result<()> {
+        let io = Arc::new(MemoryIO::new());
+        let source_io: Arc<dyn IO> = io.clone();
+        let source_db = Database::open_file_with_flags(
+            source_io,
+            "vacuum-yield-source.db",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_vacuum(true),
+            None,
+        )?;
+        let source_conn = source_db.connect()?;
+        source_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+        source_conn.execute("CREATE INDEX idx_t_payload ON t(payload)")?;
+        for id in 1..=8 {
+            source_conn.execute(format!("INSERT INTO t VALUES({id}, 'payload-{id}')"))?;
+        }
+        source_conn.execute("BEGIN")?;
+
+        let source_pager = source_conn.get_pager();
+        let header_meta = source_pager
+            .io
+            .block(|| source_pager.with_header(VacuumDbHeaderMeta::from_source_header))?;
+
+        let target_io: Arc<dyn IO> = io.clone();
+        let target_db = Database::open_file_with_flags(
+            target_io,
+            "vacuum-yield-target.db",
+            OpenFlags::Create,
+            vacuum_target_opts_from_source(&source_db),
+            None,
+        )?;
+        let target_conn = target_db.connect()?;
+        mirror_symbols(&source_conn, &target_conn);
+
+        let config = VacuumTargetBuildConfig {
+            source_conn: source_conn.clone(),
+            escaped_schema_name: "main".to_string(),
+            source_db_id: crate::MAIN_DB_ID,
+            header_meta,
+            source_custom_types: capture_custom_types(&source_conn, crate::MAIN_DB_ID),
+            target_mvcc_enabled: source_db.mvcc_enabled(),
+            target_auto_vacuum_mode: source_pager.get_auto_vacuum_mode(),
+            copy_mvcc_metadata_table: false,
+        };
+
+        let injector = OneShotTransactionYieldInjector::new();
+        source_conn.set_yield_injector(Some(injector.clone()));
+
+        let mut context = VacuumTargetBuildContext::new(target_conn.clone());
+        let mut saw_explicit_yield = false;
+        loop {
+            match vacuum_target_build_step(&config, &mut context)? {
+                crate::IOResult::Done(()) => break,
+                crate::IOResult::IO(completions) => {
+                    saw_explicit_yield |= completions.is_explicit_yield();
+                    if !completions.is_explicit_yield() {
+                        completions.wait(io.as_ref())?;
+                    }
+                }
+            }
+        }
+
+        source_conn.set_yield_injector(None);
+        source_conn.execute("COMMIT")?;
+
+        assert!(injector.yielded(), "test must trigger the injected yield");
+        assert!(
+            saw_explicit_yield,
+            "vacuum target build must return the nested explicit yield instead of panicking"
+        );
+
+        let mut copied_rows = None;
+        let mut stmt = target_conn.prepare("SELECT COUNT(*) FROM t")?;
+        stmt.run_with_row_callback(|row| {
+            copied_rows = Some(row.get::<i64>(0)?);
+            Ok(())
+        })?;
+        assert_eq!(copied_rows, Some(8));
 
         Ok(())
     }

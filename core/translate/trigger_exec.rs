@@ -13,7 +13,7 @@ use crate::translate::{
 };
 use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::insn::Insn;
+use crate::vdbe::insn::{Insn, Subprogram};
 use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, QueryMode, Result};
 use std::cell::RefCell;
@@ -633,10 +633,10 @@ fn execute_trigger_commands(
     // before OP_Program enters the subprogram.
     for db_id in &subprogram_prepared.write_databases {
         if db_id == crate::MAIN_DB_ID {
-            program.begin_write_operation();
+            program.begin_write_operation()?;
         } else {
             let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
-            program.begin_write_on_database(db_id, schema_cookie);
+            program.begin_write_on_database(db_id, schema_cookie)?;
         }
     }
     for db_id in &subprogram_prepared.read_databases {
@@ -644,10 +644,10 @@ fn execute_trigger_commands(
             continue;
         }
         if db_id == crate::MAIN_DB_ID {
-            program.begin_read_operation();
+            program.begin_read_operation()?;
         } else {
             let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
-            program.begin_read_on_database(db_id, schema_cookie);
+            program.begin_read_on_database(db_id, schema_cookie)?;
         }
     }
 
@@ -681,7 +681,7 @@ fn execute_trigger_commands(
 
     program.emit_insn(Insn::Program {
         param_registers,
-        program: built_subprogram.prepared().clone(),
+        program: Subprogram::PreparedProgram(built_subprogram.prepared().clone()),
         ignore_jump_target,
     });
 

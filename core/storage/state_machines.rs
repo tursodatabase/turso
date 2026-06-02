@@ -34,6 +34,14 @@ pub enum AdvanceState {
 pub enum CountState {
     Start,
     Loop,
+    /// Resume state used after `CountState::Loop` yielded for spill IO
+    /// mid-descent. The loop-top `stack.advance()` and `self.count +=
+    /// cell_count()` mutations have already been applied for this step,
+    /// so on re-entry we retry only the read + (second-)advance + push,
+    /// then transition back to `Loop`.
+    Descend {
+        target: i64,
+    },
     Finish,
 }
 

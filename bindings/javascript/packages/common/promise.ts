@@ -53,6 +53,32 @@ function toBindArgs(params) {
   return [params];
 }
 
+
+/**
+ * Locking mode for `Database.batch(stmts, mode)` and the variants of
+ * `Database.transaction(...)`. When passed to `batch()`, the statements are
+ * wrapped in `BEGIN <mode>` / `COMMIT` (with `ROLLBACK` on failure).
+ */
+export type BatchMode = "deferred" | "immediate" | "exclusive" | "concurrent";
+
+/**
+ * A wrapped transaction function. Calling it runs the wrapped function inside a
+ * `BEGIN`/`COMMIT` block; the mode properties (`deferred`, `concurrent`, etc.)
+ * return equivalent wrappers that begin the transaction with the corresponding
+ * locking mode.
+ */
+export interface TransactionFunction<
+  F extends (...args: any[]) => Promise<any> = (...args: any[]) => Promise<any>,
+> {
+  (...args: Parameters<F>): ReturnType<F>;
+  default: TransactionFunction<F>;
+  deferred: TransactionFunction<F>;
+  concurrent: TransactionFunction<F>;
+  immediate: TransactionFunction<F>;
+  exclusive: TransactionFunction<F>;
+  database: Database;
+}
+
 /**
  * Database represents a connection that can prepare and execute SQL statements.
  */
@@ -66,7 +92,6 @@ class Database {
   private db: NativeDatabase;
   private ioStep: () => Promise<void>;
   private execLock: AsyncLock;
-  private _inTransaction: boolean = false;
   protected connected: boolean = false;
 
   constructor(db: NativeDatabase, ioStep?: () => Promise<void>) {
@@ -78,7 +103,7 @@ class Database {
       readonly: { get: () => this.db.readonly },
       open: { get: () => this.db.open },
       memory: { get: () => this.db.memory },
-      inTransaction: { get: () => this._inTransaction },
+      inTransaction: { get: () => this.db.inTransaction() },
     });
   }
 
@@ -122,7 +147,9 @@ class Database {
    *
    * @param {function} fn - The function to wrap in a transaction.
    */
-  transaction(fn: (...any) => Promise<any>) {
+  transaction<F extends (...args: any[]) => Promise<any>>(
+    fn: F,
+  ): TransactionFunction<F> {
     if (typeof fn !== "function")
       throw new TypeError("Expected first argument to be a function");
 
@@ -130,15 +157,12 @@ class Database {
     const wrapTxn = (mode) => {
       return async (...bindParameters) => {
         await db.exec("BEGIN " + mode);
-        db._inTransaction = true;
         try {
           const result = await fn(...bindParameters);
           await db.exec("COMMIT");
-          db._inTransaction = false;
           return result;
         } catch (err) {
           await db.exec("ROLLBACK");
-          db._inTransaction = false;
           throw err;
         }
       };
@@ -146,15 +170,181 @@ class Database {
     const properties = {
       default: { value: wrapTxn("") },
       deferred: { value: wrapTxn("DEFERRED") },
+      concurrent: { value: wrapTxn("CONCURRENT") },
       immediate: { value: wrapTxn("IMMEDIATE") },
       exclusive: { value: wrapTxn("EXCLUSIVE") },
       database: { value: this, enumerable: true },
     };
     Object.defineProperties(properties.default.value, properties);
     Object.defineProperties(properties.deferred.value, properties);
+    Object.defineProperties(properties.concurrent.value, properties);
     Object.defineProperties(properties.immediate.value, properties);
     Object.defineProperties(properties.exclusive.value, properties);
-    return properties.default.value;
+    return properties.default.value as TransactionFunction<F>;
+  }
+
+  /**
+   * Executes a batch of SQL statements sequentially over this connection.
+   *
+   * By default, batch() is not transactional: each statement runs in its
+   * own autocommit step, so a failure mid-batch leaves earlier successful
+   * statements committed. Pass a `mode` to make the batch atomic — the
+   * statements are wrapped in `BEGIN <mode>` / `COMMIT`, and `ROLLBACK`
+   * runs if any statement fails. When called from inside a
+   * `db.transaction(...)` callback the `mode` argument is ignored and the
+   * surrounding transaction is reused.
+   *
+   * When `mode` is set, `batch()` owns the surrounding
+   * `BEGIN`/`COMMIT`/`ROLLBACK`, so the `statements` array must not
+   * contain its own transaction-control SQL (`BEGIN`, `COMMIT`,
+   * `ROLLBACK`, `SAVEPOINT`, `RELEASE`). The input is not validated
+   * for that — a user-supplied `COMMIT` will close the wrapper
+   * transaction mid-batch and leave earlier statements committed,
+   * defeating the all-or-nothing contract.
+   *
+   * @param statements - An array of SQL strings or `{ sql, args }` objects.
+   * @param mode - When set, wraps the batch in `BEGIN <mode>` / `COMMIT`
+   *   (with `ROLLBACK` on failure). Ignored when already inside a
+   *   transaction.
+   * @returns An object with `rowsAffected` (sum of affected rows) and
+   *   `lastInsertRowid` (rowid of the last successful insert).
+   *
+   * @example
+   * // Plain SQL strings (non-atomic).
+   * await db.batch([
+   *   "INSERT INTO users(name) VALUES ('Alice')",
+   *   "INSERT INTO users(name) VALUES ('Bob')",
+   * ]);
+   *
+   * @example
+   * // Positional and named bind parameters.
+   * await db.batch([
+   *   { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Carol", "carol@example.net"] },
+   *   { sql: "INSERT INTO users(name, email) VALUES (:name, :email)", args: { name: "Dave", email: "dave@example.net" } },
+   * ]);
+   *
+   * @example
+   * // Atomic via the mode parameter.
+   * await db.batch([
+   *   { sql: "INSERT INTO users(name) VALUES (?)", args: ["Eve"] },
+   *   { sql: "INSERT INTO users(name) VALUES (?)", args: ["Frank"] },
+   * ], "immediate");
+   *
+   * @example
+   * // Atomic via the transaction() API for mixed workloads.
+   * const txn = db.transaction(async () => {
+   *   await db.batch([{ sql: "INSERT INTO users(name) VALUES (?)", args: ["Eve"] }]);
+   *   await db.exec("UPDATE counters SET n = n + 1");
+   * });
+   * await txn.immediate();
+   */
+  async batch(
+    statements: Array<string | { sql: string; args?: any[] | Record<string, any> }>,
+    mode?: BatchMode,
+  ): Promise<{ rowsAffected: number; lastInsertRowid: number | bigint | undefined }> {
+    if (!Array.isArray(statements)) {
+      throw new TypeError("Expected first argument to be an array of statements");
+    }
+    if (!this.connected) {
+      await this.connect();
+    }
+    if (!this.open) {
+      throw new TypeError("The database connection is not open");
+    }
+
+    // Hold execLock across the entire batch so it is observed as a
+    // single unit by other callers on this connection. The helpers
+    // below run their own step loops without re-acquiring the lock.
+    await this.execLock.acquire();
+    try {
+      const runRawSql = async (sql: string) => {
+        const exec = this.db.executor(sql);
+        try {
+          while (true) {
+            const stepResult = exec.stepSync();
+            if (stepResult === STEP_IO) {
+              await this.io();
+              continue;
+            }
+            if (stepResult === STEP_DONE) {
+              break;
+            }
+          }
+        } finally {
+          exec.reset();
+        }
+      };
+
+      const wrap = mode !== undefined && !this.db.inTransaction();
+      if (wrap) {
+        await runRawSql(`BEGIN ${mode!.toUpperCase()}`);
+      }
+
+      let rowsAffected = 0;
+      let lastInsertRowid: number | bigint | undefined;
+      try {
+        for (const statement of statements) {
+          const sql = typeof statement === "string" ? statement : statement.sql;
+          const args = typeof statement === "string" ? undefined : statement.args;
+
+          let nativeStmt: NativeStatement;
+          try {
+            nativeStmt = this.db.prepare(sql);
+          } catch (err) {
+            throw convertError(err);
+          }
+          try {
+            if (args !== undefined) {
+              bindParams(nativeStmt, [args]);
+            }
+            const totalChangesBefore = this.db.totalChanges();
+            const lastInsertRowidBefore = this.db.lastInsertRowid();
+            try {
+              while (true) {
+                const stepResult = await nativeStmt.stepSync();
+                if (stepResult === STEP_IO) {
+                  await this.io();
+                  continue;
+                }
+                if (stepResult === STEP_DONE) {
+                  break;
+                }
+                // STEP_ROW results are discarded; batch() does not
+                // surface rows.
+              }
+              if (this.db.totalChanges() !== totalChangesBefore) {
+                rowsAffected += this.db.changes();
+              }
+              // SQLite keeps last_insert_rowid() sticky across
+              // non-INSERT statements, so just checking the value is
+              // not enough — UPDATE/DELETE would inherit a stale
+              // rowid. Use the delta as the per-statement INSERT
+              // signal.
+              const lastInsertRowidAfter = this.db.lastInsertRowid();
+              if (lastInsertRowidAfter !== lastInsertRowidBefore) {
+                lastInsertRowid = lastInsertRowidAfter;
+              }
+            } finally {
+              nativeStmt.reset();
+            }
+          } finally {
+            nativeStmt.finalize();
+          }
+        }
+
+        if (wrap) {
+          await runRawSql("COMMIT");
+        }
+      } catch (err) {
+        if (wrap) {
+          try { await runRawSql("ROLLBACK"); } catch { /* ignore */ }
+        }
+        throw err;
+      }
+      return { rowsAffected, lastInsertRowid };
+    } finally {
+      this.execLock.release();
+    }
   }
 
   /**

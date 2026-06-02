@@ -1,6 +1,7 @@
 //! VDBE bytecode generation for pragma statements.
 //! More info: https://www.sqlite.org/pragma.html.
 
+use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
 use crate::turso_soft_unreachable;
 use chrono::Datelike;
@@ -47,19 +48,20 @@ fn parse_max_errors_from_value(value: &Option<Expr>) -> usize {
     }
 }
 
-fn visible_database_ids_for_table_list(connection: &crate::Connection) -> BitSet {
+fn visible_database_ids_for_table_list(connection: &crate::Connection) -> crate::Result<BitSet> {
+    use crate::alloc::*;
     let mut ids = BitSet::default();
-    ids.set(crate::MAIN_DB_ID);
-    ids.set(crate::TEMP_DB_ID);
-    ids.extend(
+    ids.set(crate::MAIN_DB_ID)?;
+    ids.set(crate::TEMP_DB_ID)?;
+    ids.try_extend(
         connection
             .attached_databases()
             .read()
             .index_to_data
             .keys()
             .copied(),
-    );
-    ids
+    )?;
+    Ok(ids)
 }
 
 fn display_table_list_name(database_id: usize, name: &str) -> String {
@@ -279,13 +281,13 @@ pub fn translate_pragma(
         TransactionMode::None => {}
         TransactionMode::Read => {
             let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-            program.begin_read_on_database(database_id, schema_cookie);
-            program.begin_read_operation();
+            program.begin_read_on_database(database_id, schema_cookie)?;
+            program.begin_read_operation()?;
         }
         TransactionMode::Write => {
             let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-            program.begin_write_on_database(database_id, schema_cookie);
-            program.begin_write_operation();
+            program.begin_write_on_database(database_id, schema_cookie)?;
+            program.begin_write_operation()?;
         }
         TransactionMode::Concurrent => {
             program.begin_concurrent_operation();
@@ -752,6 +754,12 @@ fn update_pragma(
             connection.set_temp_store(temp_store);
             Ok(TransactionMode::None)
         }
+        PragmaName::VdbeTrace => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_vdbe_trace(enabled);
+            Ok(TransactionMode::None)
+        }
+
         PragmaName::FunctionList => query_pragma(
             PragmaName::FunctionList,
             resolver,
@@ -943,14 +951,18 @@ fn query_pragma(
             }
 
             // External (extension) functions
-            for (name, is_agg, argc) in connection.get_syms_functions() {
+            for (name, is_agg, argc, deterministic) in connection.get_syms_functions() {
                 let func_type = if is_agg { "a" } else { "s" };
+                let mut flags = 0;
+                if deterministic {
+                    flags |= SQLITE_DETERMINISTIC;
+                }
                 program.emit_string8(name, base_reg);
                 program.emit_int(0, base_reg + 1); // builtin = 0
                 program.emit_string8(func_type.to_string(), base_reg + 2);
                 program.emit_string8("utf8".to_string(), base_reg + 3);
                 program.emit_int(argc as i64, base_reg + 4);
-                program.emit_int(0, base_reg + 5); // flags = 0 for extensions
+                program.emit_int(flags, base_reg + 5);
                 program.emit_result_row(base_reg, 6);
             }
 
@@ -1222,9 +1234,9 @@ fn query_pragma(
             program.alloc_registers(5);
 
             let database_ids = if schema_was_explicit {
-                [database_id].into_iter().collect::<BitSet>()
+                [database_id].into_iter().try_collect::<BitSet>()?
             } else {
-                visible_database_ids_for_table_list(connection.as_ref())
+                visible_database_ids_for_table_list(connection.as_ref())?
             };
             for current_database_id in &database_ids {
                 let database_name = connection
@@ -1452,6 +1464,7 @@ fn query_pragma(
 
             Ok(TransactionMode::None)
         }
+        PragmaName::VdbeTrace => Ok(TransactionMode::None),
         PragmaName::FreelistCount => {
             let value = pager.freepage_list();
             let register = program.alloc_register();

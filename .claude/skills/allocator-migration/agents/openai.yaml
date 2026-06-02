@@ -1,0 +1,4 @@
+interface:
+  display_name: "Allocator Migration"
+  short_description: "Migrate Turso code to crate::alloc and fallible allocation APIs."
+  default_prompt: "Help migrate this Turso module to the crate::alloc namespace using allocator-aware aliases and fallible allocation APIs."

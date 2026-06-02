@@ -10,7 +10,7 @@ use std::{
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{header::AUTHORIZATION, Request};
-use hyper_tls::HttpsConnector;
+use hyper_rustls::HttpsConnector;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
@@ -559,7 +559,12 @@ impl IoWorker {
         // Create HTTPS-capable Hyper client.
         let mut http_connector = HttpConnector::new();
         http_connector.enforce_http(false);
-        let https: HttpsConnector<HttpConnector> = HttpsConnector::new();
+        let https: HttpsConnector<HttpConnector> = HttpsConnector::<HttpConnector>::builder()
+            .with_native_roots()
+            .expect("failed to load native root CA certificates")
+            .https_or_http()
+            .enable_http1()
+            .build();
         let client: Client<HttpsConnector<HttpConnector>, Full<Bytes>> =
             Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https);
 

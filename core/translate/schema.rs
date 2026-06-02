@@ -752,6 +752,14 @@ fn validate(
                             translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone());
                         validate_default_expr(&expr, col_i)?
                     }
+                    ast::ColumnConstraint::Collate { collation_name } => {
+                        let collation = resolver.resolve_collation(collation_name.as_str())?;
+                        if collation.is_custom() {
+                            bail_parse_error!(
+                                "custom collations are not supported in schema definitions"
+                            );
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1121,7 +1129,7 @@ pub fn translate_create_table(
         resolver.resolve_database_id(&tbl_name)?
     };
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
     validate(&body, &normalized_tbl_name, resolver, connection)?;
 
@@ -1790,7 +1798,7 @@ pub fn translate_drop_table(
     program.extend(&opts);
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
 
     let Some(table) = resolver.with_schema(database_id, |s| s.get_table(name)) else {
         if if_exists {
@@ -1942,7 +1950,7 @@ pub fn translate_drop_table(
 
         if !trigger_names_to_drop.is_empty() {
             let temp_schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
-            program.begin_write_on_database(crate::TEMP_DB_ID, temp_schema_cookie);
+            program.begin_write_on_database(crate::TEMP_DB_ID, temp_schema_cookie)?;
             let temp_schema_table =
                 resolver.with_schema(crate::TEMP_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID));
             if let Some(temp_schema_table) = temp_schema_table {

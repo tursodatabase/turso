@@ -249,7 +249,15 @@ impl TursoSyncServer {
 
         for (i, arg) in req.stmt.args.iter().enumerate() {
             let core_value = convert_value_to_core(arg);
-            stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), core_value);
+            if let Err(err) = stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), core_value) {
+                error!("Failed to bind statement argument: {}", err);
+                return StreamResult::Error {
+                    error: Error {
+                        message: err.to_string(),
+                        code: "BIND_ERROR".to_string(),
+                    },
+                };
+            }
         }
 
         let want_rows = req.stmt.want_rows.unwrap_or(true);
@@ -413,7 +421,7 @@ impl TursoSyncServer {
 
         for (i, arg) in step.stmt.args.iter().enumerate() {
             let core_value = convert_value_to_core(arg);
-            stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), core_value);
+            stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), core_value)?;
         }
 
         let want_rows = step.stmt.want_rows.unwrap_or(true);

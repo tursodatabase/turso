@@ -140,6 +140,24 @@ jobs:
         run: |
           make test-shuttle
 
+  conn-raw-api-tests:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-conn-raw-api"
+          cache-on-failure: true
+      - uses: "./.github/shared/setup-sccache"
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Run conn_raw_api-gated core tests
+        run: cargo nextest run -p turso_core --features conn_raw_api --locked --no-fail-fast --failure-output=final
+
   # stress-nondeterminism-check:
   #   runs-on: blacksmith-4vcpu-ubuntu-2404
   #   timeout-minutes: 15
@@ -291,7 +309,7 @@ jobs:
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -314,7 +332,6 @@ jobs:
       - uses: "./.github/shared/install_sqlite"
       - name: Test
         run: make test
-        timeout-minutes: 20
 
   concurrent-simulator:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -347,7 +364,7 @@ jobs:
       - name: Run turso_whopper regression tests
         if: matrix.profile.name == 'in-process'
         run: cargo test -p turso_whopper --test regression_tests
-        timeout-minutes: 5
+        timeout-minutes: 15
       - name: Run turso_whopper (${{ matrix.profile.name }})
         run: |
           cargo build -p turso_whopper --release

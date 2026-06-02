@@ -4956,3 +4956,24 @@ expect @js {
     -2929861166669336|-5586410532100113|X'0303'|-8516271698769449|11446132865438784
     ok
 }
+
+# UPDATE with an OR-decomposed WHERE that mixes a virtual gencol
+# predicate and a unique-column range predicate
+test update-or-virtual-deferred-seek-no-panic-implicit-index {
+    CREATE TABLE t (a TEXT UNIQUE, b INTEGER AS (395) VIRTUAL);
+    INSERT INTO t (a) VALUES ('u1'), ('u2');
+    UPDATE t SET a = 'q' WHERE (b = 395 AND a = 'u1') OR (a < 'z');
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+test update-or-virtual-deferred-seek-no-panic-explicit-index {
+    CREATE TABLE t (a TEXT UNIQUE, b INTEGER AS (395) VIRTUAL);
+    CREATE INDEX t_idx ON t (a DESC, b DESC);
+    INSERT INTO t (a) VALUES ('u1'), ('u2');
+    UPDATE t SET a = 'q' WHERE (b = 395 AND a = 'u1') OR (a < 'z');
+}
+expect error {
+    UNIQUE constraint failed
+}

@@ -19,6 +19,23 @@ use turso_core::{Database, LimboError, PlatformIO, StepResult};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(not(feature = "codspeed"))]
+macro_rules! iter_custom_or_iter {
+    ($b:expr, |$iters:ident| $body:block) => {
+        $b.iter_custom(|$iters| $body)
+    };
+}
+
+#[cfg(feature = "codspeed")]
+macro_rules! iter_custom_or_iter {
+    ($b:expr, |$iters:ident| $body:block) => {
+        $b.iter(|| {
+            let $iters = 1;
+            $body
+        })
+    };
+}
+
 fn rusqlite_open() -> rusqlite::Connection {
     let sqlite_conn = rusqlite::Connection::open("../testing/system/testing.db").unwrap();
     sqlite_conn
@@ -124,7 +141,7 @@ fn bench_alter(criterion: &mut Criterion) {
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
-        b.iter_custom(|iters| {
+        iter_custom_or_iter!(b, |iters| {
             (0..iters)
                 .map(|_| {
                     conn.execute("CREATE TABLE x(a)").unwrap();
@@ -143,7 +160,7 @@ fn bench_alter(criterion: &mut Criterion) {
     if enable_rusqlite {
         group.bench_function(BenchmarkId::new("sqlite_rename_table", ""), |b| {
             let conn = rusqlite::Connection::open("../testing/system/schema_5k.db").unwrap();
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 (0..iters)
                     .map(|_| {
                         conn.execute("CREATE TABLE x(a)", ()).unwrap();
@@ -169,7 +186,7 @@ fn bench_alter(criterion: &mut Criterion) {
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
-        b.iter_custom(|iters| {
+        iter_custom_or_iter!(b, |iters| {
             (0..iters)
                 .map(|_| {
                     conn.execute("CREATE TABLE x(a)").unwrap();
@@ -188,7 +205,7 @@ fn bench_alter(criterion: &mut Criterion) {
     if enable_rusqlite {
         group.bench_function(BenchmarkId::new("sqlite_rename_column", ""), |b| {
             let conn = rusqlite::Connection::open("../testing/system/schema_5k.db").unwrap();
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 (0..iters)
                     .map(|_| {
                         conn.execute("CREATE TABLE x(a)", ()).unwrap();
@@ -215,7 +232,7 @@ fn bench_alter(criterion: &mut Criterion) {
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
-        b.iter_custom(|iters| {
+        iter_custom_or_iter!(b, |iters| {
             (0..iters)
                 .map(|_| {
                     conn.execute("CREATE TABLE x(a)").unwrap();
@@ -234,7 +251,7 @@ fn bench_alter(criterion: &mut Criterion) {
     if enable_rusqlite {
         group.bench_function(BenchmarkId::new("sqlite_add_column", ""), |b| {
             let conn = rusqlite::Connection::open("../testing/system/schema_5k.db").unwrap();
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 (0..iters)
                     .map(|_| {
                         conn.execute("CREATE TABLE x(a)", ()).unwrap();
@@ -260,7 +277,7 @@ fn bench_alter(criterion: &mut Criterion) {
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
-        b.iter_custom(|iters| {
+        iter_custom_or_iter!(b, |iters| {
             (0..iters)
                 .map(|_| {
                     conn.execute("CREATE TABLE x(a, b)").unwrap();
@@ -279,7 +296,7 @@ fn bench_alter(criterion: &mut Criterion) {
     if enable_rusqlite {
         group.bench_function(BenchmarkId::new("sqlite_drop_column", ""), |b| {
             let conn = rusqlite::Connection::open("../testing/system/schema_5k.db").unwrap();
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 (0..iters)
                     .map(|_| {
                         conn.execute("CREATE TABLE x(a, b)", ()).unwrap();

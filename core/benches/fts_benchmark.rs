@@ -23,6 +23,23 @@ use turso_core::{Database, DatabaseOpts, OpenFlags, PlatformIO, StepResult};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(not(feature = "codspeed"))]
+macro_rules! iter_custom_or_iter {
+    ($b:expr, |$iters:ident| $body:block) => {
+        $b.iter_custom(|$iters| $body)
+    };
+}
+
+#[cfg(feature = "codspeed")]
+macro_rules! iter_custom_or_iter {
+    ($b:expr, |$iters:ident| $body:block) => {
+        $b.iter(|| {
+            let $iters = 1;
+            $body
+        })
+    };
+}
+
 /// Helper to execute a statement to completion, stepping through IO.
 fn run_to_completion(
     stmt: &mut turso_core::Statement,
@@ -141,7 +158,7 @@ fn bench_fts_cold_query(criterion: &mut Criterion) {
         group.bench_function(
             BenchmarkId::new("cold_query", format!("{row_count}_rows")),
             |b| {
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         // Fresh connection = no cached directory
@@ -189,7 +206,7 @@ fn bench_fts_warm_query(criterion: &mut Criterion) {
         group.bench_function(
             BenchmarkId::new("warm_query", format!("{row_count}_rows")),
             |b| {
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
@@ -242,7 +259,7 @@ fn bench_fts_query_selectivity(criterion: &mut Criterion) {
         let sql = format!("SELECT id, title FROM docs WHERE (title, body) MATCH '{query_term}'");
 
         group.bench_function(BenchmarkId::new("selectivity", name), |b| {
-            b.iter_custom(|iters| {
+            iter_custom_or_iter!(b, |iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
@@ -278,7 +295,7 @@ fn bench_fts_insert_then_query(criterion: &mut Criterion) {
         group.bench_function(
             BenchmarkId::new("insert_query", format!("{row_count}_rows")),
             |b| {
-                b.iter_custom(|iters| {
+                iter_custom_or_iter!(b, |iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();

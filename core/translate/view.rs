@@ -61,7 +61,7 @@ pub fn translate_create_materialized_view(
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(view_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
     // Validate the view can be created and extract its columns
@@ -297,7 +297,7 @@ pub fn translate_create_view(
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(view_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
     validate_create_view(resolver, database_id, &normalized_view_name)?;
@@ -385,7 +385,7 @@ pub fn translate_drop_view(
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(view_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
     // Check if view exists (either regular or materialized)

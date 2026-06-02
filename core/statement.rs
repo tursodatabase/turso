@@ -13,6 +13,7 @@ use turso_parser::{
     parser::Parser,
 };
 
+use crate::alloc::TursoIteratorExt;
 use crate::{
     busy::BusyHandlerState,
     parameters,
@@ -184,6 +185,12 @@ impl Statement {
     pub fn n_change(&self) -> i64 {
         self.state
             .n_change
+            .load(crate::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn n_total_change(&self) -> i64 {
+        self.state
+            .n_total_change
             .load(crate::sync::atomic::Ordering::SeqCst)
     }
 
@@ -547,7 +554,7 @@ impl Statement {
             .iter()
             .chain(self.program.prepared.read_databases.iter())
             .filter(|&id| id != crate::MAIN_DB_ID)
-            .collect();
+            .try_collect()?;
         for db_id in &attached_db_ids {
             // Discard any connection-local schema changes for this non-main DB
             // (temp or attached) so the re-translate reads the committed schema.
@@ -561,14 +568,11 @@ impl Statement {
             }
         }
 
-        // if current connection is within a transaction which changed schema - we must use its schema version instead of DB schema version
-        // see test_prepared_stmt_reprepare_ddl_change_txn (plus test_sync_pull_after_local_ddl_and_remote_writes)
-        {
-            let mut conn_schema = conn.schema.write();
-            if conn_schema.schema_version < conn.db.schema.lock().schema_version {
-                *conn_schema = conn.db.clone_schema();
-            }
-        }
+        // Refresh from shared schema only when shared is newer; this preserves a
+        // connection-local schema that is ahead of shared. An MVCC checkpoint can
+        // publish new btree roots without bumping the schema cookie, so
+        // same-version reprepare still refreshes it.
+        conn.refresh_schema_from_shared_for_reprepare();
         let new_program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;
@@ -824,8 +828,9 @@ impl Statement {
         self.program.parameters.index(name)
     }
 
-    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
-        self.state.bind_at(index, value);
+    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) -> Result<()> {
+        self.state.bind_at(index, value)?;
+        Ok(())
     }
 
     pub fn clear_bindings(&mut self) {
@@ -994,7 +999,6 @@ impl Statement {
             self.release_active_root_if_counted();
         }
         self.state.reset(max_registers, max_cursors);
-        self.state.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
         self.busy_handler_state = None;
         self.query_timeout_override = None;

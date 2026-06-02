@@ -455,8 +455,10 @@ pub enum Expr {
         distinctness: Option<Distinctness>,
         /// arguments
         args: Vec<Box<Expr>>,
-        /// `ORDER BY`
+        /// `ORDER BY` (aggregate argument ordering inside the parentheses)
         order_by: Vec<SortedColumn>,
+        /// `WITHIN GROUP (ORDER BY ...)` for ordered-set aggregates
+        within_group: Vec<SortedColumn>,
         /// `FILTER`
         filter_over: FunctionTail,
     },
@@ -1845,6 +1847,8 @@ pub enum PragmaName {
     ListTypes,
     /// Deprecated no-op: control whether callback is invoked for empty result sets
     EmptyResultCallbacks,
+    /// VDBE opcode trace output
+    VdbeTrace,
 }
 
 /// `CREATE TRIGGER` time

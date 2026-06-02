@@ -48,7 +48,9 @@ impl ArbitraryFrom<&ColumnType> for SimValue {
         column_type: &ColumnType,
     ) -> Self {
         let value = match column_type {
-            ColumnType::Integer => Value::from_i64(rng.random_range(i64::MIN..i64::MAX)),
+            //TODO: widen back to the full i64 range once
+            // https://github.com/tursodatabase/turso/issues/6715 is fixed
+            ColumnType::Integer => Value::from_i64(rng.random_range(-(1i64 << 53)..(1i64 << 53))),
             ColumnType::Float => Value::from_f64(rng.random_range(-1e10..1e10)),
             ColumnType::Text => Value::build_text(gen_random_text(rng)),
             ColumnType::Blob => Value::Blob(gen_random_text(rng).into_bytes()),

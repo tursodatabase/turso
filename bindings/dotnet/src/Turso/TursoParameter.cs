@@ -1,11 +1,14 @@
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using Turso.Raw.Public.Value;
 
 namespace Turso;
 
 public class TursoParameter : DbParameter
 {
+    private int _size;
     private static readonly Dictionary<Type, TursoValueType> TursoTypeMapping =
         new()
         {
@@ -32,11 +35,11 @@ public class TursoParameter : DbParameter
             { typeof(ulong), TursoValueType.Integer },
             { typeof(ushort), TursoValueType.Integer }
         };
-    
+
     public TursoParameter()
     {
     }
-    
+
     public TursoParameter(object value)
     {
         Value = value;
@@ -54,7 +57,7 @@ public class TursoParameter : DbParameter
         DbType = dbType;
         Value = value;
     }
-    
+
     public override void ResetDbType()
     {
         DbType = DbType.String;
@@ -64,7 +67,7 @@ public class TursoParameter : DbParameter
 
     public override ParameterDirection Direction
     {
-        get => ParameterDirection.Input; 
+        get => ParameterDirection.Input;
         set
         {
             if (value != ParameterDirection.Input)
@@ -74,8 +77,11 @@ public class TursoParameter : DbParameter
         }
     }
     public override bool IsNullable { get; set; }
-    public override string? ParameterName { get; set; }
-    public override string? SourceColumn { get; set; }
+    [AllowNull]
+    public override string ParameterName { get; set; } = "";
+
+    [AllowNull]
+    public override string SourceColumn { get; set; } = "";
     public override object? Value { get; set; }
     public override bool SourceColumnNullMapping { get; set; }
 
@@ -83,37 +89,51 @@ public class TursoParameter : DbParameter
     {
         if (Value is null)
             return new TursoValue { ValueType = TursoValueType.Null };
-        
+
         var valueType = Value.GetType();
         if (!TursoTypeMapping.TryGetValue(valueType, out var tursoValueType))
         {
             throw new ArgumentException($"Parameter type {valueType} is not supported");
         }
-        
+
         return GetTursoValue(Value, tursoValueType);
     }
 
     public override int Size
     {
-        get => Value is string s 
-            ? s.Length 
-            : Value is byte[] bytes 
-                ? bytes.Length 
-                : 0;
-        set => throw new NotImplementedException();
+        get => _size;
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(value, -1);
+            _size = value;
+        }
     }
 
-    private TursoValue GetTursoValue(object value, TursoValueType tursoValueType)
+    private static TursoValue GetTursoValue(object value, TursoValueType tursoValueType)
     {
         return tursoValueType switch
         {
             TursoValueType.Empty => new TursoValue() { ValueType = TursoValueType.Empty },
             TursoValueType.Null => new TursoValue() { ValueType = TursoValueType.Null },
             TursoValueType.Integer => new TursoValue() { ValueType = TursoValueType.Integer, IntValue = Convert.ToInt64(value) },
-            TursoValueType.Real => new TursoValue() { ValueType = TursoValueType.Real, RealValue = Convert.ToDouble(value) },
-            TursoValueType.Text => new TursoValue() { ValueType = TursoValueType.Text, StringValue = value.ToString()! },
+            TursoValueType.Real => new TursoValue() { ValueType = TursoValueType.Real, RealValue = Convert.ToDouble(value, CultureInfo.InvariantCulture) },
+            TursoValueType.Text => new TursoValue() { ValueType = TursoValueType.Text, StringValue = ToInvariantString(value) },
             TursoValueType.Blob => new TursoValue() { ValueType = TursoValueType.Blob, BlobValue = (byte[])value },
             _ => throw new ArgumentOutOfRangeException(nameof(tursoValueType), tursoValueType, null)
+        };
+    }
+
+    private static string ToInvariantString(object value)
+    {
+        return value switch
+        {
+            DateTime dateTime => dateTime.ToString("yyyy-MM-dd HH:mm:ss.FFFFFFF", CultureInfo.InvariantCulture),
+            DateTimeOffset dateTimeOffset => dateTimeOffset.ToString("yyyy-MM-dd HH:mm:ss.FFFFFFFzzz", CultureInfo.InvariantCulture),
+            DateOnly dateOnly => dateOnly.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+            TimeOnly timeOnly => timeOnly.ToString("HH:mm:ss.FFFFFFF", CultureInfo.InvariantCulture),
+            TimeSpan timeSpan => timeSpan.ToString("c", CultureInfo.InvariantCulture),
+            IFormattable formattable => formattable.ToString(null, CultureInfo.InvariantCulture),
+            _ => value.ToString()!
         };
     }
 }

@@ -21,8 +21,8 @@ use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::types::{
-    compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions, IOResult,
-    ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
+    compare_immutable, compare_immutable_single, compare_records_generic, AsValueRef, Extendable,
+    IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers,
@@ -34,7 +34,7 @@ use crate::util::{
     trigger_still_references_renamed_column, trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
-    apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
+    apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
 };
 use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
@@ -73,7 +73,6 @@ use crate::{
         SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
         SQLITE_ERROR,
     },
-    ext::ExtValue,
     function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
         datetime::{
@@ -200,12 +199,14 @@ fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
 }
 
 /// Create a sort comparator closure from a SortComparatorType enum.
-fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::SortComparator {
+fn make_sort_comparator(
+    cmp_type: &SortComparatorType,
+) -> Result<crate::vdbe::sorter::SortComparator> {
     use std::cmp::Ordering;
-    match cmp_type {
+    let cmp: crate::vdbe::sorter::SortComparator = match cmp_type {
         SortComparatorType::NumericLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
-                match (a, b) {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
+                let res = match (a, b) {
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
                     (_, ValueRef::Null) => Ordering::Greater,
@@ -218,27 +219,29 @@ fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::S
                             _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
                         }
                     }
-                }
+                };
+                Ok(res)
             })
         }
         SortComparatorType::StringReverse => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
                 fn reverse_str(v: &ValueRef) -> String {
                     match v {
                         ValueRef::Text(t) => t.to_string().chars().rev().collect(),
                         _ => String::new(),
                     }
                 }
-                match (a, b) {
+                let res = match (a, b) {
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
                     (_, ValueRef::Null) => Ordering::Greater,
                     _ => reverse_str(a).cmp(&reverse_str(b)),
-                }
+                };
+                Ok(res)
             })
         }
         SortComparatorType::TestUintLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
                 fn to_u64(v: &ValueRef) -> Option<u64> {
                     match v {
                         ValueRef::Null => None,
@@ -253,7 +256,7 @@ fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::S
                         _ => None,
                     }
                 }
-                match (a, b) {
+                let res = match (a, b) {
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
                     (_, ValueRef::Null) => Ordering::Greater,
@@ -261,12 +264,13 @@ fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::S
                         (Some(a), Some(b)) => a.cmp(&b),
                         _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
                     },
-                }
+                };
+                Ok(res)
             })
         }
         SortComparatorType::ArrayLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
-                match (a, b) {
+            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
+                let res = match (a, b) {
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
                     (_, ValueRef::Null) => Ordering::Greater,
@@ -279,8 +283,8 @@ fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::S
                         let b_vals = crate::vdbe::array::parse_text_array(b_text);
                         match (a_vals, b_vals) {
                             (Some(av), Some(bv)) => {
-                                let a_blob = crate::vdbe::array::values_to_record_blob(&av);
-                                let b_blob = crate::vdbe::array::values_to_record_blob(&bv);
+                                let a_blob = crate::vdbe::array::values_to_record_blob(&av)?;
+                                let b_blob = crate::vdbe::array::values_to_record_blob(&bv)?;
                                 if let (Value::Blob(ab), Value::Blob(bb)) = (&a_blob, &b_blob) {
                                     crate::vdbe::array::compare_arrays(ab, bb)
                                         .unwrap_or(Ordering::Equal)
@@ -292,10 +296,12 @@ fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::S
                         }
                     }
                     _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                }
+                };
+                Ok(res)
             })
         }
-    }
+    };
+    Ok(cmp)
 }
 
 /// Compare two values using the specified collation for text values.
@@ -304,16 +310,54 @@ fn compare_with_collation(
     lhs: &Value,
     rhs: &Value,
     collation: Option<CollationSeq>,
-) -> std::cmp::Ordering {
-    match (lhs, rhs) {
+    collation_comparator: &Option<crate::vdbe::sorter::SortComparator>,
+) -> Result<std::cmp::Ordering> {
+    Ok(match (lhs, rhs) {
         (Value::Text(lhs_text), Value::Text(rhs_text)) => {
-            if let Some(coll) = collation {
+            if let Some(comparator) = collation_comparator {
+                comparator(&lhs.as_ref(), &rhs.as_ref())?
+            } else if let Some(coll) = collation {
                 coll.compare_strings(lhs_text.as_str(), rhs_text.as_str())
             } else {
                 lhs.cmp(rhs)
             }
         }
         _ => lhs.cmp(rhs),
+    })
+}
+
+fn compare_with_program_collation<V1, V2>(
+    program: &Program,
+    lhs: V1,
+    rhs: V2,
+    collation: CollationSeq,
+) -> Result<std::cmp::Ordering>
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+{
+    let lhs = lhs.as_value_ref();
+    let rhs = rhs.as_value_ref();
+    if collation.is_custom() {
+        if let (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) = (lhs, rhs) {
+            return program.connection.compare_external_collation(
+                collation,
+                lhs_text.as_str(),
+                rhs_text.as_str(),
+            );
+        }
+    }
+    Ok(compare_immutable_single(lhs, rhs, collation))
+}
+
+fn comparison_matches_order(op: ComparisonOp, order: std::cmp::Ordering) -> bool {
+    match op {
+        ComparisonOp::Eq => order.is_eq(),
+        ComparisonOp::Ne => !order.is_eq(),
+        ComparisonOp::Lt => order.is_lt(),
+        ComparisonOp::Le => order.is_le(),
+        ComparisonOp::Gt => order.is_gt(),
+        ComparisonOp::Ge => order.is_ge(),
     }
 }
 
@@ -820,7 +864,7 @@ pub fn op_not_null(
 }
 
 pub fn op_comparison(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -981,15 +1025,19 @@ pub fn op_comparison(
         affinity.convert_for_compare(rhs_value),
     );
 
-    let should_jump = op.compare(
-        new_lhs
-            .as_ref()
-            .map_or(Either::Left(lhs_value), Either::Right),
-        new_rhs
-            .as_ref()
-            .map_or(Either::Left(rhs_value), Either::Right),
-        collation,
-    );
+    let lhs_for_compare = new_lhs
+        .as_ref()
+        .map_or(Either::Left(lhs_value), Either::Right);
+    let rhs_for_compare = new_rhs
+        .as_ref()
+        .map_or(Either::Left(rhs_value), Either::Right);
+    let should_jump = if collation.is_custom() {
+        let order =
+            compare_with_program_collation(program, lhs_for_compare, rhs_for_compare, collation)?;
+        comparison_matches_order(op, order)
+    } else {
+        op.compare(lhs_for_compare, rhs_for_compare, collation)
+    };
 
     match (new_lhs, new_rhs) {
         (Some(new_lhs), None) => {
@@ -1214,8 +1262,8 @@ pub fn op_open_read(
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 index.as_ref(),
                 num_columns,
-            ));
-            let index_info = Arc::new(IndexInfo::new_from_index(index));
+            )?);
+            let index_info = Arc::new(IndexInfo::new_from_index(index)?);
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
@@ -1836,13 +1884,13 @@ pub fn op_column(
                                 Value::Text(new_text),
                                 Register::Value(Value::Text(existing_text)),
                             ) => {
-                                existing_text.do_extend(new_text);
+                                existing_text.do_extend(new_text)?;
                             }
                             (
                                 Value::Blob(new_blob),
                                 Register::Value(Value::Blob(existing_blob)),
                             ) => {
-                                existing_blob.do_extend(new_blob);
+                                existing_blob.do_extend(new_blob)?;
                             }
                             _ => {
                                 state.registers[*dest].set_value(default.clone());
@@ -2134,8 +2182,8 @@ pub fn op_array_encode(
     }
 
     // Serialize coerced elements as a native record-format BLOB
-    let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len());
-    state.registers[*reg].set_blob(record.into_payload());
+    let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len())?;
+    state.registers[*reg].set_blob(record.into_payload())?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2165,7 +2213,7 @@ pub fn op_array_decode(
             return Ok(InsnFunctionStepResult::Step);
         }
     };
-    state.registers[*reg].set_text(Text::new(text));
+    state.registers[*reg].set_text(Text::new(text))?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2282,7 +2330,7 @@ pub fn op_make_array(
         &state.registers,
         *start_reg,
         *count,
-    ));
+    )?);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2325,7 +2373,7 @@ pub fn op_make_array_dynamic(
         &state.registers,
         *start_reg,
         count,
-    ));
+    )?);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2386,7 +2434,7 @@ pub fn op_union_pack(
     );
 
     let record =
-        ImmutableRecord::from_registers(std::slice::from_ref(&state.registers[*value_reg]), 1);
+        ImmutableRecord::from_registers(std::slice::from_ref(&state.registers[*value_reg]), 1)?;
     let record_bytes = record.into_payload();
 
     // Format: [tag_index: 1 byte][record bytes]
@@ -2564,17 +2612,17 @@ pub fn op_array_concat(
             let mut elems_a = array_values_from_blob(lb)?;
             let elems_b = array_values_from_blob(rb)?;
             elems_a.extend(elems_b);
-            values_to_record_blob(&elems_a)
+            values_to_record_blob(&elems_a)?
         }
         (Value::Blob(lb), _) => {
             let mut elems = array_values_from_blob(lb)?;
             elems.push(rhs_ref.clone());
-            values_to_record_blob(&elems)
+            values_to_record_blob(&elems)?
         }
         (_, Value::Blob(rb)) => {
             let mut elems = array_values_from_blob(rb)?;
             elems.insert(0, lhs_ref.clone());
-            values_to_record_blob(&elems)
+            values_to_record_blob(&elems)?
         }
         _ => {
             // Neither is an array blob — fall back to string concat
@@ -2631,10 +2679,10 @@ pub fn op_array_set_element(
     let mut elements = array_values_from_blob(blob)?;
     if idx >= elements.len() {
         // Out-of-bounds: preserve original array unchanged
-        state.registers[*dest].set_blob(blob.clone());
+        state.registers[*dest].set_blob(blob.clone())?;
     } else {
         elements[idx] = new_val;
-        state.registers[*dest].set_value(values_to_record_blob(&elements));
+        state.registers[*dest].set_value(values_to_record_blob(&elements)?);
     }
 
     state.pc += 1;
@@ -2662,7 +2710,7 @@ pub fn op_array_slice(
     let start_val = state.registers[*start_reg].get_value().clone();
     let end_val = state.registers[*end_reg].get_value().clone();
 
-    let result = exec_array_slice(&arr_val, &start_val, &end_val);
+    let result = exec_array_slice(&arr_val, &start_val, &end_val)?;
     state.registers[*dest].set_value(result);
 
     state.pc += 1;
@@ -2705,7 +2753,7 @@ pub fn op_make_record(
         }
     }
 
-    let record = make_record(&state.registers, &start_reg, &count);
+    let record = make_record(&state.registers, &start_reg, &count)?;
     state.registers[dest_reg] = Register::Record(record);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2870,6 +2918,7 @@ pub fn halt(
 ) -> Result<InsnFunctionStepResult> {
     let mv_store = program.connection.mv_store();
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
+    let owns_auto_txn = state.owns_auto_txn();
 
     // Check if we're resuming from a FAIL commit I/O wait.
     // If pending_fail_error is set, we were in the middle of committing partial changes
@@ -2945,7 +2994,7 @@ pub fn halt(
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
         // Note: ON CONFLICT FAIL does NOT apply to FK violations, so we check for those first.
-        if program.resolve_type == ResolveType::Fail && auto_commit {
+        if program.resolve_type == ResolveType::Fail && owns_auto_txn {
             // Check for immediate FK violations - FK errors don't respect ON CONFLICT
             if program.connection.foreign_keys_enabled()
                 && state.get_fk_immediate_violations_during_stmt() > 0
@@ -2976,7 +3025,11 @@ pub fn halt(
         return Err(error);
     }
 
-    tracing::trace!("halt(auto_commit={})", auto_commit);
+    tracing::trace!(
+        "halt(auto_commit={}, owns_auto_txn={})",
+        auto_commit,
+        owns_auto_txn
+    );
 
     // Check for immediate foreign key violations.
     // Any immediate violation causes the statement subtransaction to roll back.
@@ -2995,7 +3048,7 @@ pub fn halt(
     if auto_commit {
         // In autocommit mode, a statement that leaves deferred violations must fail here,
         // and it also ends the transaction.
-        if program.connection.foreign_keys_enabled() {
+        if owns_auto_txn && program.connection.foreign_keys_enabled() {
             let deferred_violations = program
                 .connection
                 .fk_deferred_violations
@@ -3017,19 +3070,37 @@ pub fn halt(
             }
         }
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
-        vtab_commit_all(&program.connection)?;
-        index_method_pre_commit_all(state, pager)?;
-        let result = program
-            .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
-            .map(Into::into);
-        // Apply deferred CDC state and reset CDC txn ID after successful commit
-        if matches!(result, Ok(InsnFunctionStepResult::Done)) {
+        if owns_auto_txn {
+            vtab_commit_all(&program.connection)?;
+            index_method_pre_commit_all(state, pager)?;
+            let result = program
+                .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
+                .map(Into::into);
+            // Apply deferred CDC state and reset CDC txn ID after successful commit
+            if matches!(result, Ok(InsnFunctionStepResult::Done)) {
+                if let Some(cdc_info) = state.pending_cdc_info.take() {
+                    program.connection.set_capture_data_changes_info(cdc_info);
+                }
+                program.connection.set_cdc_transaction_id(-1);
+            }
+            result
+        } else {
+            // Another root statement may own the implicit autocommit
+            // transaction. This statement can finish, but must not commit or
+            // roll back connection-level state it did not start.
             if let Some(cdc_info) = state.pending_cdc_info.take() {
                 program.connection.set_capture_data_changes_info(cdc_info);
             }
-            program.connection.set_cdc_transaction_id(-1);
+            if program.change_cnt_on {
+                program
+                    .connection
+                    .set_changes(state.n_change.load(Ordering::SeqCst));
+                program
+                    .connection
+                    .add_total_changes(state.n_total_change.load(Ordering::SeqCst));
+            }
+            Ok(InsnFunctionStepResult::Done)
         }
-        result
     } else {
         // Even if deferred violations are present, the statement subtransaction completes successfully when
         // it is part of an interactive transaction.
@@ -3042,6 +3113,9 @@ pub fn halt(
             program
                 .connection
                 .set_changes(state.n_change.load(Ordering::SeqCst));
+            program
+                .connection
+                .add_total_changes(state.n_total_change.load(Ordering::SeqCst));
         }
         Ok(InsnFunctionStepResult::Done)
     }
@@ -3161,6 +3235,23 @@ pub enum OpTransactionState {
     BeginStatement,
 }
 
+#[cfg(any(test, injected_yields))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TransactionYieldPoint {
+    BeforeStart,
+}
+
+#[cfg(any(test, injected_yields))]
+impl crate::mvcc::yield_hooks::YieldPointMarker for TransactionYieldPoint {
+    const POINT_COUNT: u8 = 1;
+
+    fn ordinal(self) -> u8 {
+        match self {
+            TransactionYieldPoint::BeforeStart => 0,
+        }
+    }
+}
+
 pub fn op_transaction(
     program: &Program,
     state: &mut ProgramState,
@@ -3189,12 +3280,15 @@ fn begin_mvcc_tx(
     pager: &Arc<Pager>,
     mode: &TransactionMode,
     existing_tx_id: Option<u64>,
+    connection: &Connection,
 ) -> Result<u64> {
     match mode {
         TransactionMode::None | TransactionMode::Read | TransactionMode::Concurrent => {
             mv_store.begin_tx(pager.clone())
         }
-        TransactionMode::Write => mv_store.begin_exclusive_tx(pager.clone(), existing_tx_id),
+        TransactionMode::Write => {
+            mv_store.begin_exclusive_tx(pager.clone(), existing_tx_id, connection)
+        }
     }
 }
 
@@ -3370,6 +3464,31 @@ pub fn op_transaction_inner(
                     return Err(LimboError::ReadOnly);
                 }
 
+                // Fast path: if checkpoint root publication already replaced the
+                // shared schema, force reprepare before opening any transaction state.
+                if *db == crate::MAIN_DB_ID
+                    && mv_store.is_some()
+                    && conn.mvcc_schema_requires_reprepare_before_tx()
+                {
+                    tracing::debug!(
+                        "MVCC shared schema changed without a schema-cookie change; force reprepare"
+                    );
+                    return Err(LimboError::SchemaUpdated);
+                }
+                #[cfg(any(test, injected_yields))]
+                {
+                    if let Some(IOResult::IO(io)) =
+                        crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                            conn.yield_injector().as_ref(),
+                            0,
+                            *db as u64,
+                            TransactionYieldPoint::BeforeStart,
+                        )
+                    {
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                }
+
                 // 1. We try to upgrade current version
                 let current_state = conn.get_tx_state();
                 let is_secondary_db = *db != crate::MAIN_DB_ID;
@@ -3453,7 +3572,7 @@ pub fn op_transaction_inner(
                             // applies to all databases uniformly.
                             let effective_mode =
                                 conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or(*tx_mode);
-                            match begin_mvcc_tx(mv_store, &pager, &effective_mode, None) {
+                            match begin_mvcc_tx(mv_store, &pager, &effective_mode, None, &conn) {
                                 Ok(tx_id) => {
                                     conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
                                     started_secondary_tx = true;
@@ -3472,7 +3591,7 @@ pub fn op_transaction_inner(
                                 && matches!(tx_mode, TransactionMode::Write)
                             {
                                 if let Err(err) =
-                                    begin_mvcc_tx(mv_store, &pager, tx_mode, Some(tx_id))
+                                    begin_mvcc_tx(mv_store, &pager, tx_mode, Some(tx_id), &conn)
                                 {
                                     pager.end_read_tx();
                                     return Err(err);
@@ -3490,7 +3609,9 @@ pub fn op_transaction_inner(
                                 "nested stmt should not begin a new read transaction"
                             );
                             pager.begin_read_tx()?;
-                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                            if conn.get_auto_commit() {
+                                state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                            }
                         }
                         // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
                         pager.mvcc_refresh_if_db_changed();
@@ -3516,8 +3637,21 @@ pub fn op_transaction_inner(
                         }
 
                         if !has_existing_mv_tx {
-                            match begin_mvcc_tx(mv_store, &pager, tx_mode, None) {
+                            match begin_mvcc_tx(mv_store, &pager, tx_mode, None, &conn) {
                                 Ok(tx_id) => {
+                                    // Check again in case checkpoint published roots after the
+                                    // previous check and before this transaction was protected.
+                                    if conn.mvcc_schema_requires_reprepare_before_tx() {
+                                        tracing::debug!(
+                                            "MVCC shared schema changed while starting transaction; force reprepare"
+                                        );
+                                        mv_store.rollback_tx(tx_id, pager.clone(), &conn, *db);
+                                        if started_read_tx {
+                                            pager.end_read_tx();
+                                            state.auto_txn_cleanup = TxnCleanup::None;
+                                        }
+                                        return Err(LimboError::SchemaUpdated);
+                                    }
                                     program
                                         .connection
                                         .set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
@@ -3546,9 +3680,13 @@ pub fn op_transaction_inner(
                             if matches!(new_transaction_state, TransactionState::Write { .. })
                                 && matches!(actual_tx_mode, TransactionMode::Write)
                             {
-                                if let Err(err) =
-                                    begin_mvcc_tx(mv_store, &pager, &actual_tx_mode, Some(tx_id))
-                                {
+                                if let Err(err) = begin_mvcc_tx(
+                                    mv_store,
+                                    &pager,
+                                    &actual_tx_mode,
+                                    Some(tx_id),
+                                    &conn,
+                                ) {
                                     if started_read_tx {
                                         pager.end_read_tx();
                                         conn.set_tx_state(TransactionState::None);
@@ -3607,7 +3745,11 @@ pub fn op_transaction_inner(
                             "nested stmt should not begin a new read transaction"
                         );
                         pager.begin_read_tx()?;
-                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                        // https://github.com/tursodatabase/turso/issues/7106 : If auto-commit is turned off,
+                        // then we shouldn't be setting the auto_txn_cleanup, this will cause errors in case the client explicitly calls commit post a drop of the statement struct
+                        if conn.get_auto_commit() {
+                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                        }
                     }
 
                     if !is_secondary_db
@@ -3784,6 +3926,9 @@ pub fn op_transaction_inner(
                         .n_active_writes
                         .fetch_add(1, Ordering::SeqCst);
                     state.is_active_write = true;
+                    if state.has_stmt_transaction {
+                        state.auto_txn_cleanup = TxnCleanup::RollbackSavepoint;
+                    }
                 }
                 state.pc += 1;
                 state.active_op_state.clear();
@@ -4313,7 +4458,7 @@ fn finish_subprogram(
     saved_last_insert_rowid: Option<i64>,
     saved_changes_value: Option<i64>,
 ) {
-    let pending_changes = statement.n_change();
+    let pending_changes = statement.n_total_change();
     if pending_changes != 0 {
         program.connection.add_total_changes(pending_changes);
     }
@@ -4332,7 +4477,7 @@ fn finish_subprogram(
 
     // Restore `changes()`, but not `total_changes()`
     if let Some(changes) = saved_changes_value {
-        program.connection.set_changes_without_total(changes);
+        program.connection.set_changes(changes);
     }
 }
 
@@ -4347,7 +4492,9 @@ pub fn op_reset_count(
     }
 
     let nchange = state.n_change.swap(0, Ordering::SeqCst);
+    let ntotal_change = state.n_total_change.swap(0, Ordering::SeqCst);
     program.connection.set_changes(nchange);
+    program.connection.add_total_changes(ntotal_change);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -4368,6 +4515,7 @@ pub fn op_program(
         },
         insn
     );
+    let subprogram = subprogram.prepared_program()?;
     loop {
         match std::mem::take(state.active_op_state.program()) {
             OpProgramState::Start => {
@@ -4409,7 +4557,7 @@ pub fn op_program(
                     let value = state.registers[parent_reg].get_value().clone();
                     let param_index = NonZero::<usize>::new(param_idx + 1)
                         .expect("param_idx + 1 should be non-zero");
-                    statement.bind_at(param_index, value);
+                    statement.bind_at(param_index, value)?;
                 }
 
                 *state.active_op_state.program() = OpProgramState::Step {
@@ -4560,7 +4708,7 @@ pub fn op_string8(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(String8 { value, dest }, insn);
-    state.registers[*dest].set_text(Text::new(value.clone()));
+    state.registers[*dest].set_text(Text::new(value.clone()))?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -4572,7 +4720,7 @@ pub fn op_blob(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Blob { value, dest }, insn);
-    state.registers[*dest].set_blob(value.clone());
+    state.registers[*dest].set_blob(value.clone())?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -4786,6 +4934,7 @@ pub fn op_seek_rowid(
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
     }
+    invalidate_deferred_seeks_for_cursor(state, *cursor_id);
     let (pc, did_seek) = {
         let cursor = get_cursor!(state, *cursor_id);
 
@@ -5693,6 +5842,17 @@ fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
             // We serialize to a record blob only in finalize, avoiding O(n²) re-serialization.
             payload.push(Value::from_i64(0));
         }
+        AggFunc::Mode => {
+            // [0] = collation bits, [1] = count, [2..] = buffered values.
+            payload.push(Value::from_i64(0)); // collation (recorded at step time)
+            payload.push(Value::from_i64(0)); // count
+        }
+        AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+            // [0] = collation bits, [1] = count, [2] = fraction, [3..] = buffered values.
+            payload.push(Value::from_i64(0)); // collation (recorded at step time)
+            payload.push(Value::from_i64(0)); // count
+            payload.push(Value::Null); // fraction (set on first step)
+        }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
             payload.push(Value::Blob(vec![]));
@@ -5905,9 +6065,9 @@ fn update_agg_payload(
             let cmp = if let Some(ref cmp_fn) = comparator {
                 let arg_ref = arg.as_ref();
                 let payload_ref = payload[0].as_ref();
-                cmp_fn(&arg_ref, &payload_ref)
+                cmp_fn(&arg_ref, &payload_ref)?
             } else {
-                compare_with_collation(&arg, &payload[0], Some(collation))
+                compare_with_collation(&arg, &payload[0], Some(collation), comparator)?
             };
             let should_update = match func {
                 AggFunc::Max => cmp == Ordering::Greater,
@@ -5967,6 +6127,13 @@ fn update_agg_payload(
             // via payload_vec_mut() to grow the Vec (O(1) per row).
             return Err(LimboError::InternalError(
                 "ArrayAgg should be handled directly in op_agg_step, not update_agg_payload".into(),
+            ));
+        }
+        AggFunc::Mode | AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+            // Ordered-set aggregates buffer values into a growable Vec, handled directly
+            // in op_agg_step (the slice here cannot grow).
+            return Err(LimboError::InternalError(
+                "ordered-set aggregate should be handled directly in op_agg_step".into(),
             ));
         }
         #[cfg(feature = "json")]
@@ -6061,7 +6228,45 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                 )));
             } else {
                 let elements = &payload[1..1 + count];
-                Value::Blob(ImmutableRecord::from_values(elements, count).into_payload())
+                Value::Blob(ImmutableRecord::from_values(elements, count)?.into_payload())
+            }
+        }
+        AggFunc::Mode => {
+            // payload: [0]=collation bits, [1]=count, [2..]=buffered values.
+            let collation =
+                CollationSeq::from_storage_bits(payload[0].as_int().unwrap_or(0) as u16);
+            let count = payload[1].as_int().unwrap_or(0) as usize;
+            if count == 0 || 2 + count > payload.len() {
+                Value::Null
+            } else {
+                ordered_set_mode(&payload[2..2 + count], collation)
+            }
+        }
+        AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+            // payload: [0]=collation bits, [1]=count, [2]=fraction, [3..]=buffered values.
+            // The fraction was range-checked in translate (pre-loop), so it is
+            // here either NULL (→ NULL output, matching PG) or a valid number.
+            if matches!(payload[2], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let collation =
+                CollationSeq::from_storage_bits(payload[0].as_int().unwrap_or(0) as u16);
+            let count = payload[1].as_int().unwrap_or(0) as usize;
+            let fraction = payload[2].as_float();
+            if count == 0 {
+                Value::Null
+            } else if 3 + count > payload.len() {
+                return Err(LimboError::InternalError(format!(
+                    "percentile: count ({count}) exceeds payload length ({})",
+                    payload.len()
+                )));
+            } else {
+                let values = &payload[3..3 + count];
+                if matches!(func, AggFunc::PercentileDisc) {
+                    ordered_set_percentile_disc(values, fraction, collation)
+                } else {
+                    ordered_set_percentile_cont(values, fraction)
+                }
             }
         }
         AggFunc::External(_) => {
@@ -6096,8 +6301,92 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
     Ok(val)
 }
 
+/// Most frequent value of an ordered set (`mode() WITHIN GROUP (ORDER BY x)`).
+/// Ties are broken by the smallest value, matching PostgreSQL (the first value the
+/// ascending ordering would return).
+/// Compares two ordered-set values, honoring `collation` for text (built-in and locale
+/// collations are resolved without a connection; extension `Custom` collations fall back
+/// to BINARY, matching other connection-less comparison paths).
+fn ordered_set_compare(a: &Value, b: &Value, collation: CollationSeq) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Text(lhs), Value::Text(rhs)) => {
+            collation.compare_strings(lhs.as_str(), rhs.as_str())
+        }
+        _ => a.cmp(b),
+    }
+}
+
+fn ordered_set_mode(values: &[Value], collation: CollationSeq) -> Value {
+    // NULLs were already dropped at step time.
+    let mut sorted: Vec<Value> = values.to_vec();
+    sorted.sort_by(|a, b| ordered_set_compare(a, b, collation));
+    let mut best_idx = 0usize;
+    let mut best_count = 0usize;
+    let mut i = 0;
+    while i < sorted.len() {
+        let mut j = i + 1;
+        while j < sorted.len()
+            && ordered_set_compare(&sorted[j], &sorted[i], collation) == std::cmp::Ordering::Equal
+        {
+            j += 1;
+        }
+        // Strict `>` keeps the earliest (smallest, since sorted ascending) run on ties.
+        if j - i > best_count {
+            best_count = j - i;
+            best_idx = i;
+        }
+        i = j;
+    }
+    sorted[best_idx].clone()
+}
+
+/// Continuous (interpolated) percentile of an ordered set.
+///
+/// Non-numeric values are ignored (PostgreSQL instead requires a numeric/interval input
+/// type and errors otherwise, but columns are dynamically typed here). `percentile_disc`
+/// differs: it returns the actual element of any type, so it does not filter.
+fn ordered_set_percentile_cont(values: &[Value], fraction: f64) -> Value {
+    let mut floats: Vec<f64> = values
+        .iter()
+        .filter_map(|v| match v {
+            Value::Numeric(Numeric::Integer(i)) => Some(*i as f64),
+            Value::Numeric(Numeric::Float(f)) => Some(f64::from(*f)),
+            _ => None,
+        })
+        .collect();
+    if floats.is_empty() {
+        return Value::Null;
+    }
+    floats.sort_by(|a, b| a.total_cmp(b));
+    let n = floats.len() as f64;
+    let index = fraction * (n - 1.0);
+    let lower = index.floor() as usize;
+    let upper = index.ceil() as usize;
+    if lower == upper {
+        Value::from_f64(floats[lower])
+    } else {
+        let weight = index - lower as f64;
+        Value::from_f64(floats[lower] * (1.0 - weight) + floats[upper] * weight)
+    }
+}
+
+/// Discrete percentile of an ordered set: returns the actual element (in its original
+/// type) at the position PostgreSQL would select — the smallest value whose cumulative
+/// distribution (`row / n`) is at least `fraction`.
+fn ordered_set_percentile_disc(values: &[Value], fraction: f64, collation: CollationSeq) -> Value {
+    let mut sorted: Vec<Value> = values.to_vec();
+    sorted.sort_by(|a, b| ordered_set_compare(a, b, collation));
+    let n = sorted.len();
+    let index = if fraction <= 0.0 {
+        0
+    } else {
+        ((fraction * n as f64).ceil() as usize).saturating_sub(1)
+    };
+    sorted[index.min(n - 1)].clone()
+}
+
 pub fn op_agg_step(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -6118,15 +6407,22 @@ pub fn op_agg_step(
         state.registers[*acc_reg] = match func {
             AggFunc::External(ext_func) => match ext_func.as_ref() {
                 ExtFunc::Aggregate {
+                    context,
                     init,
                     step,
                     finalize,
                     argc,
+                    aggregate_destructor,
+                    value_destructor,
+                    ..
                 } => Register::Aggregate(AggContext::External(ExternalAggState {
-                    state: unsafe { (init)() },
-                    argc: *argc,
+                    context: *context,
+                    state: unsafe { (init)(*context) },
+                    argc: (*argc).max(0) as usize,
                     step_fn: *step,
                     finalize_fn: *finalize,
+                    aggregate_destructor: *aggregate_destructor,
+                    value_destructor: *value_destructor,
                 })),
                 _ => unreachable!("scalar function called in aggregate context"),
             },
@@ -6139,78 +6435,140 @@ pub fn op_agg_step(
         };
     }
 
-    // Resolve custom type comparator for MIN/MAX if provided
-    let comparator = comparator.as_ref().map(make_sort_comparator);
+    let current_collation = state.current_collation.unwrap_or(CollationSeq::Binary);
+    let comparator = match comparator.as_ref() {
+        Some(comparator) => Some(make_sort_comparator(comparator)?),
+        None if current_collation.is_custom() => Some(
+            program
+                .connection
+                .make_collation_comparator(current_collation)?,
+        ),
+        None => None,
+    };
 
     // Step the aggregate
     match func {
         AggFunc::External(_) => {
             // External aggregates use FFI and need special handling
-            let (step_fn, state_ptr, argc) = {
+            let (context, step_fn, state_ptr, argc, aggregate_destructor, value_destructor) = {
                 let Register::Aggregate(agg) = &state.registers[*acc_reg] else {
                     unreachable!();
                 };
                 let AggContext::External(agg_state) = agg else {
                     unreachable!();
                 };
-                (agg_state.step_fn, agg_state.state, agg_state.argc)
+                (
+                    agg_state.context,
+                    agg_state.step_fn,
+                    agg_state.state,
+                    agg_state.argc,
+                    agg_state.aggregate_destructor,
+                    agg_state.value_destructor,
+                )
             };
-            if argc == 0 {
-                unsafe { step_fn(state_ptr, 0, std::ptr::null()) };
-            } else {
+            let mut ext_values = Vec::with_capacity(argc);
+            if argc != 0 {
                 let register_slice = &state.registers[*col..*col + argc];
-                let mut ext_values: Vec<ExtValue> = Vec::with_capacity(argc);
                 for ov in register_slice.iter() {
                     ext_values.push(ov.get_value().to_ffi());
                 }
-                let argv_ptr = ext_values.as_ptr();
-                unsafe { step_fn(state_ptr, argc as i32, argv_ptr) };
-                for ext_value in ext_values {
-                    unsafe { ext_value.__free_internal_type() };
+            }
+            let argv_ptr = if ext_values.is_empty() {
+                std::ptr::null()
+            } else {
+                ext_values.as_ptr()
+            };
+            let mut result = unsafe { step_fn(context, state_ptr, argc as i32, argv_ptr) };
+            let value = Value::from_ffi_ref(&result);
+            if let Some(value_destructor) = value_destructor {
+                unsafe { value_destructor(&mut result) };
+            } else {
+                unsafe { result.__free_internal_type() };
+            }
+            for ext_value in ext_values {
+                unsafe { ext_value.__free_internal_type() };
+            }
+            if let Err(err) = value {
+                if let Some(aggregate_destructor) = aggregate_destructor {
+                    unsafe { aggregate_destructor(state_ptr as usize) };
                 }
+                state.registers[*acc_reg].set_value(Value::Null);
+                return Err(err);
             }
         }
         _ => {
             let arg = state.registers[*col].get_value().clone();
 
-            if matches!(func, AggFunc::ArrayAgg) {
-                // ArrayAgg grows the payload Vec directly (O(1) per row).
-                let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
-                    panic!(
-                        "Unexpected value {:?} in AggStep at register {}",
-                        state.registers[*acc_reg], *acc_reg
-                    );
-                };
-                let payload = agg.payload_vec_mut();
-                let count = payload[0]
-                    .as_int()
-                    .expect("array_agg count must be an integer")
-                    as usize;
-                payload[0] = Value::from_i64((count + 1) as i64);
-                payload.push(arg);
-            } else {
-                // Only a subset of aggregate functions take two arguments
-                let maybe_arg2 = match func {
-                    AggFunc::GroupConcat | AggFunc::StringAgg => {
-                        Some(state.registers[*delimiter].get_value().clone())
-                    }
-                    #[cfg(feature = "json")]
-                    AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-                        Some(state.registers[*delimiter].get_value().clone())
-                    }
-                    _ => None,
-                };
-                let collation = state.current_collation.unwrap_or(CollationSeq::Binary);
+            // Read the optional second-argument register before borrowing the
+            // accumulator mutably (delimiter for group_concat/json, fraction for percentiles).
+            let maybe_arg2 = match func {
+                AggFunc::GroupConcat | AggFunc::StringAgg => {
+                    Some(state.registers[*delimiter].get_value().clone())
+                }
+                #[cfg(feature = "json")]
+                AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
+                    Some(state.registers[*delimiter].get_value().clone())
+                }
+                AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+                    Some(state.registers[*delimiter].get_value().clone())
+                }
+                _ => None,
+            };
 
-                // Now get mutable borrow on payload
-                let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
-                    panic!(
-                        "Unexpected value {:?} in AggStep at register {}",
-                        state.registers[*acc_reg], *acc_reg
-                    );
-                };
-                let payload = agg.payload_mut();
-                update_agg_payload(func, arg, maybe_arg2, payload, collation, &comparator)?;
+            let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+                panic!(
+                    "Unexpected value {:?} in AggStep at register {}",
+                    state.registers[*acc_reg], *acc_reg
+                );
+            };
+
+            match func {
+                // ArrayAgg and the ordered-set aggregates buffer values by growing the
+                // payload Vec directly (O(1) per row); they cannot use the fixed-size slice.
+                AggFunc::ArrayAgg => {
+                    let payload = agg.payload_vec_mut();
+                    let count = payload[0]
+                        .as_int()
+                        .expect("array_agg count must be an integer")
+                        as usize;
+                    payload[0] = Value::from_i64((count + 1) as i64);
+                    payload.push(arg);
+                }
+                AggFunc::Mode => {
+                    let payload = agg.payload_vec_mut();
+                    // Record the value's collation (constant per group) for finalize-time sorting.
+                    payload[0] = Value::from_i64(current_collation.to_bits() as i64);
+                    // Ordered-set aggregates ignore NULL inputs.
+                    if !matches!(arg, Value::Null) {
+                        let count = payload[1].as_int().unwrap_or(0) as usize;
+                        payload[1] = Value::from_i64((count + 1) as i64);
+                        payload.push(arg);
+                    }
+                }
+                AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+                    let payload = agg.payload_vec_mut();
+                    payload[0] = Value::from_i64(current_collation.to_bits() as i64);
+                    // The fraction is a per-group constant; record it on every step.
+                    if let Some(fraction) = maybe_arg2 {
+                        payload[2] = fraction;
+                    }
+                    if !matches!(arg, Value::Null) {
+                        let count = payload[1].as_int().unwrap_or(0) as usize;
+                        payload[1] = Value::from_i64((count + 1) as i64);
+                        payload.push(arg);
+                    }
+                }
+                _ => {
+                    let payload = agg.payload_mut();
+                    update_agg_payload(
+                        func,
+                        arg,
+                        maybe_arg2,
+                        payload,
+                        current_collation,
+                        &comparator,
+                    )?;
+                }
             }
         }
     };
@@ -6261,21 +6619,48 @@ pub fn op_agg_final(
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonGroupArray => {
-                    state.registers[dest_reg].set_text(Text::json("[]".to_string()));
+                    state.registers[dest_reg].set_text(Text::json("[]".to_string()))?;
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupArray => {
                     state.registers[dest_reg]
-                        .set_blob(json::jsonb::Jsonb::make_empty_array(1).data());
+                        .set_blob(json::jsonb::Jsonb::make_empty_array(1).data())?;
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonGroupObject => {
-                    state.registers[dest_reg].set_text(Text::json("{}".to_string()));
+                    state.registers[dest_reg].set_text(Text::json("{}".to_string()))?;
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupObject => {
                     state.registers[dest_reg]
-                        .set_blob(json::jsonb::Jsonb::make_empty_obj(1).data());
+                        .set_blob(json::jsonb::Jsonb::make_empty_obj(1).data())?;
+                }
+                AggFunc::External(ext_func) => {
+                    let value = match ext_func.as_ref() {
+                        ExtFunc::Aggregate {
+                            context,
+                            init,
+                            finalize,
+                            aggregate_destructor,
+                            value_destructor,
+                            ..
+                        } => {
+                            let aggregate_context = unsafe { init(*context) };
+                            let mut result = unsafe { finalize(*context, aggregate_context) };
+                            let value = Value::from_ffi_ref(&result);
+                            if let Some(value_destructor) = value_destructor {
+                                unsafe { value_destructor(&mut result) };
+                            } else {
+                                unsafe { result.__free_internal_type() };
+                            }
+                            if let Some(aggregate_destructor) = aggregate_destructor {
+                                unsafe { aggregate_destructor(aggregate_context as usize) };
+                            }
+                            value?
+                        }
+                        _ => unreachable!("scalar function called in aggregate context"),
+                    };
+                    state.registers[dest_reg].set_value(value);
                 }
                 _ => {}
             }
@@ -6328,21 +6713,30 @@ pub fn op_sorter_open(
         collations.push(coll.unwrap_or_default());
         nulls_orders.push(*nulls);
     }
-    let comparators = comparators
-        .iter()
-        .map(|c| c.as_ref().map(make_sort_comparator))
-        .collect();
+    let mut sort_comparators = Vec::with_capacity(order_collations_nulls.len());
+    for (idx, (_, coll, _)) in order_collations_nulls.iter().enumerate() {
+        let comparator = match comparators.get(idx).and_then(|c| c.as_ref()) {
+            Some(comparator) => Some(make_sort_comparator(comparator)?),
+            None => match coll {
+                Some(collation) if collation.is_custom() => {
+                    Some(program.connection.make_collation_comparator(*collation)?)
+                }
+                _ => None,
+            },
+        };
+        sort_comparators.push(comparator);
+    }
     let temp_store = program.connection.get_temp_store();
     let cursor = Sorter::new(
         &order,
         collations,
         nulls_orders,
-        comparators,
+        sort_comparators,
         max_buffer_size_bytes,
         page_size,
         pager.io.clone(),
         temp_store,
-    );
+    )?;
     let cursors = &mut state.cursors;
     cursors
         .get_mut(*cursor_id)
@@ -6568,7 +6962,7 @@ pub fn op_rowset_add(
 
     let rowset = state.rowsets.entry(*rowset_reg).or_default();
 
-    rowset.insert(rowid);
+    rowset.insert(rowid)?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -6670,7 +7064,7 @@ pub fn op_rowset_test(
         state.pc = pc_if_found.as_offset_int();
     } else {
         if *batch != -1 {
-            rowset.insert(rowid);
+            rowset.insert(rowid)?;
         }
         state.pc += 1;
     }
@@ -7315,18 +7709,18 @@ pub fn op_function(
             }
             ScalarFunc::TursoVersion => {
                 if !program.connection.is_db_initialized() {
-                    state.registers[*dest].set_text(Text::new(info::build::PKG_VERSION));
+                    state.registers[*dest].set_text(Text::new(info::build::PKG_VERSION))?;
                 } else {
                     let version_integer =
                         return_if_io!(pager.with_header(|header| header.version_number)).get()
                             as i64;
                     let version = execute_turso_version(version_integer);
-                    state.registers[*dest].set_text(Text::new(version));
+                    state.registers[*dest].set_text(Text::new(version))?;
                 }
             }
             ScalarFunc::SqliteVersion => {
                 let version = execute_sqlite_version();
-                state.registers[*dest].set_text(Text::new(version));
+                state.registers[*dest].set_text(Text::new(version))?;
             }
             ScalarFunc::SqliteSourceId => {
                 let src_id = format!(
@@ -7334,7 +7728,7 @@ pub fn op_function(
                     info::build::BUILT_TIME_SQLITE,
                     info::build::GIT_COMMIT_HASH.unwrap_or("unknown")
                 );
-                state.registers[*dest].set_text(Text::new(src_id));
+                state.registers[*dest].set_text(Text::new(src_id))?;
             }
             ScalarFunc::Replace => {
                 assert_eq!(arg_count, 3);
@@ -7350,7 +7744,7 @@ pub fn op_function(
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             ScalarFunc::LoadExtension => {
-                if !program.connection.db.can_load_extensions() {
+                if !program.connection.can_load_extensions() {
                     crate::bail_parse_error!("runtime extension loading is disabled");
                 }
                 let extension = &state.registers[*start_reg];
@@ -7552,7 +7946,7 @@ pub fn op_function(
                     _ => 0,
                 };
                 let accum = StatAccum::new(n_col);
-                state.registers[*dest].set_blob(accum.to_bytes());
+                state.registers[*dest].set_blob(accum.to_bytes())?;
             }
             ScalarFunc::StatPush => {
                 // stat_push(accum_blob, i_chng): Push a row into the accumulator
@@ -7923,25 +8317,25 @@ pub fn op_function(
                 check_arg_count!(arg_count, 2);
                 let arr_val = state.registers[*start_reg].get_value().clone();
                 let elem_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_append(&arr_val, &elem_val));
+                state.registers[*dest].set_value(exec_array_append(&arr_val, &elem_val)?);
             }
             ScalarFunc::ArrayPrepend => {
                 check_arg_count!(arg_count, 2);
                 let elem_val = state.registers[*start_reg].get_value().clone();
                 let arr_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_prepend(&arr_val, &elem_val));
+                state.registers[*dest].set_value(exec_array_prepend(&arr_val, &elem_val)?);
             }
             ScalarFunc::ArrayCat => {
                 check_arg_count!(arg_count, 2);
                 let a_val = state.registers[*start_reg].get_value().clone();
                 let b_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_cat(&a_val, &b_val));
+                state.registers[*dest].set_value(exec_array_cat(&a_val, &b_val)?);
             }
             ScalarFunc::ArrayRemove => {
                 check_arg_count!(arg_count, 2);
                 let arr_val = state.registers[*start_reg].get_value().clone();
                 let target = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_remove(&arr_val, &target));
+                state.registers[*dest].set_value(exec_array_remove(&arr_val, &target)?);
             }
             ScalarFunc::ArrayContains => {
                 check_arg_count!(arg_count, 2);
@@ -7968,7 +8362,7 @@ pub fn op_function(
                 let arr_val = state.registers[*start_reg].get_value().clone();
                 let start_idx = state.registers[*start_reg + 1].get_value().clone();
                 let end_idx = state.registers[*start_reg + 2].get_value().clone();
-                let result = exec_array_slice(&arr_val, &start_idx, &end_idx);
+                let result = exec_array_slice(&arr_val, &start_idx, &end_idx)?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::StringToArray => {
@@ -7983,7 +8377,7 @@ pub fn op_function(
                     &text,
                     &delimiter,
                     null_str.as_ref(),
-                ));
+                )?);
             }
             ScalarFunc::ArrayToString => {
                 let arr_val = state.registers[*start_reg].get_value().clone();
@@ -8079,35 +8473,44 @@ pub fn op_function(
             }
         }
         crate::function::Func::External(f) => match f.func {
-            ExtFunc::Scalar(f) => {
-                if arg_count == 0 {
-                    let result_c_value: ExtValue = unsafe { (f)(0, std::ptr::null()) };
-                    match Value::from_ffi(result_c_value) {
-                        Ok(result_ov) => {
-                            state.registers[*dest].set_value(result_ov);
-                        }
-                        Err(e) => {
-                            return Err(e);
-                        }
-                    }
-                } else {
+            ExtFunc::Scalar {
+                context,
+                callback,
+                context_destructor,
+                value_destructor,
+                ..
+            } => {
+                let mut ext_values = Vec::with_capacity(arg_count);
+                if arg_count != 0 {
                     let register_slice = &state.registers[*start_reg..*start_reg + arg_count];
-                    let mut ext_values: Vec<ExtValue> = Vec::with_capacity(arg_count);
                     for ov in register_slice.iter() {
-                        let val = ov.get_value().to_ffi();
-                        ext_values.push(val);
-                    }
-                    let argv_ptr = ext_values.as_ptr();
-                    let result_c_value: ExtValue = unsafe { (f)(arg_count as i32, argv_ptr) };
-                    match Value::from_ffi(result_c_value) {
-                        Ok(result_ov) => {
-                            state.registers[*dest].set_value(result_ov);
-                        }
-                        Err(e) => {
-                            return Err(e);
-                        }
+                        ext_values.push(ov.get_value().to_ffi());
                     }
                 }
+                let argv_ptr = if ext_values.is_empty() {
+                    std::ptr::null()
+                } else {
+                    ext_values.as_ptr()
+                };
+                let mut result = unsafe {
+                    callback(
+                        context,
+                        arg_count as i32,
+                        argv_ptr,
+                        context_destructor,
+                        value_destructor,
+                    )
+                };
+                let value = Value::from_ffi_ref(&result);
+                if let Some(value_destructor) = value_destructor {
+                    unsafe { value_destructor(&mut result) };
+                } else {
+                    unsafe { result.__free_internal_type() };
+                }
+                for ext_value in ext_values {
+                    unsafe { ext_value.__free_internal_type() };
+                }
+                state.registers[*dest].set_value(value?);
             }
             _ => unreachable!("aggregate called in scalar context"),
         },
@@ -8742,12 +9145,12 @@ pub fn op_function(
             };
 
             state.registers[*dest].set_value(r#type.clone());
-            state.registers[*dest + 1].set_text(Text::from(new_name));
-            state.registers[*dest + 2].set_text(Text::from(new_tbl_name));
+            state.registers[*dest + 1].set_text(Text::from(new_name))?;
+            state.registers[*dest + 2].set_text(Text::from(new_tbl_name))?;
             state.registers[*dest + 3].set_int(*root_page);
 
             if let Some(new_sql) = new_sql {
-                state.registers[*dest + 4].set_text(Text::from(new_sql));
+                state.registers[*dest + 4].set_text(Text::from(new_sql))?;
             } else {
                 state.registers[*dest + 4].set_value(sql.clone());
             }
@@ -8846,7 +9249,7 @@ pub fn op_function(
                             &before_str,
                             &after_str,
                         );
-                        state.registers[*dest].set_text(Text::new(highlighted));
+                        state.registers[*dest].set_text(Text::new(highlighted))?;
                     }
                 }
             }
@@ -9216,7 +9619,7 @@ pub fn op_insert(
                             Register::Record(r) => std::borrow::Cow::Borrowed(r),
                             Register::Value(value) => {
                                 let values = [value];
-                                let record = ImmutableRecord::from_values(values, values.len());
+                                let record = ImmutableRecord::from_values(values, values.len())?;
                                 std::borrow::Cow::Owned(record)
                             }
                             Register::Aggregate(..) => {
@@ -9238,7 +9641,7 @@ pub fn op_insert(
                         Register::Record(r) => std::borrow::Cow::Borrowed(r),
                         Register::Value(value) => {
                             let values = [value];
-                            let record = ImmutableRecord::from_values(values, values.len());
+                            let record = ImmutableRecord::from_values(values, values.len())?;
                             std::borrow::Cow::Owned(record)
                         }
                         Register::Aggregate(..) => {
@@ -9296,14 +9699,16 @@ pub fn op_insert(
                         if !flag.has(InsertFlags::SKIP_LAST_ROWID) {
                             program.connection.update_last_rowid(rowid);
                         }
-                        state
-                            .n_change
-                            .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
+                        if flag.has(InsertFlags::SKIP_STATEMENT_CHANGE_COUNT) {
+                            state.record_total_change();
+                        } else {
+                            state.record_statement_change();
+                        }
                     }
+                } else if flag.has(InsertFlags::SKIP_STATEMENT_CHANGE_COUNT) {
+                    state.record_total_change();
                 } else {
-                    state
-                        .n_change
-                        .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
+                    state.record_statement_change();
                 }
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
@@ -9334,7 +9739,7 @@ pub fn op_insert(
                         Register::Record(r) => std::borrow::Cow::Borrowed(r),
                         Register::Value(value) => {
                             let values = [value];
-                            let record = ImmutableRecord::from_values(values, values.len());
+                            let record = ImmutableRecord::from_values(values, values.len())?;
                             std::borrow::Cow::Owned(record)
                         }
                         Register::Aggregate(..) => {
@@ -9515,9 +9920,7 @@ pub fn op_delete(
     if !is_part_of_update {
         // DELETEs do not count towards the total changes if they are part of an UPDATE statement,
         // i.e. the DELETE and subsequent INSERT of a row are the same "change".
-        state
-            .n_change
-            .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
+        state.record_statement_change();
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -10071,31 +10474,40 @@ fn new_rowid_inner(
     }
 }
 
+fn coerce_register_to_integer(state: &mut ProgramState, reg: usize) -> Result<bool> {
+    let converted = match state.registers[reg].get_value() {
+        Value::Numeric(Numeric::Integer(_)) => return Ok(true),
+        Value::Numeric(Numeric::Float(f)) => cast_real_to_integer(f64::from(*f)).ok(),
+        Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
+            Ok(Value::Numeric(Numeric::Integer(i))) => Some(i),
+            Ok(Value::Numeric(Numeric::Float(f))) => cast_real_to_integer(f64::from(f)).ok(),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    if let Some(i) = converted {
+        state.registers[reg].set_int(i);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 pub fn op_must_be_int(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(MustBeInt { reg }, insn);
-    match &state.registers[*reg].get_value() {
-        Value::Numeric(Numeric::Integer(_)) => {}
-        Value::Numeric(Numeric::Float(f)) => match cast_real_to_integer(f64::from(*f)) {
-            Ok(i) => state.registers[*reg].set_int(i),
-            Err(_) => bail_constraint_error!("datatype mismatch"),
-        },
-        Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
-            Ok(Value::Numeric(Numeric::Integer(i))) => state.registers[*reg].set_int(i),
-            Ok(Value::Numeric(Numeric::Float(f))) => match cast_real_to_integer(f64::from(f)) {
-                Ok(i) => state.registers[*reg].set_int(i),
-                Err(_) => bail_constraint_error!("datatype mismatch"),
-            },
-            _ => bail_constraint_error!("datatype mismatch"),
-        },
-        _ => {
-            bail_constraint_error!("datatype mismatch");
+    load_insn!(MustBeInt { reg, target_pc }, insn);
+    if !coerce_register_to_integer(state, *reg)? {
+        if let Some(target_pc) = target_pc {
+            state.pc = target_pc.as_offset_int();
+            return Ok(InsnFunctionStepResult::Step);
         }
-    };
+        bail_constraint_error!("datatype mismatch");
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -10390,8 +10802,8 @@ pub fn op_open_write(
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 index.as_ref(),
                 num_columns,
-            ));
-            let index_info = Arc::new(IndexInfo::new_from_index(index));
+            )?);
+            let index_info = Arc::new(IndexInfo::new_from_index(index)?);
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
@@ -11343,12 +11755,17 @@ fn drive_init_cdc_version(
             },
             StepResult::Done => match inner.phase {
                 OpInitCdcVersionPhase::CheckTable => {
+                    let change_id_column = if conn.mvcc_enabled() {
+                        "change_id INTEGER PRIMARY KEY"
+                    } else {
+                        "change_id INTEGER PRIMARY KEY AUTOINCREMENT"
+                    };
                     let create_sql = match version {
                         CdcVersion::V1 => format!(
-                            "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+                            "CREATE TABLE IF NOT EXISTS {cdc_table_name} ({change_id_column}, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
                         ),
                         CdcVersion::V2 => format!(
-                            "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+                            "CREATE TABLE IF NOT EXISTS {cdc_table_name} ({change_id_column}, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
                         ),
                     };
                     inner.stmt = prepare_cdc_internal(conn, create_sql)?;
@@ -11676,13 +12093,17 @@ pub fn op_add_imm(
         Register::Record(_) => &Value::Null,
     };
 
-    let int_val = match current_value {
-        Value::Numeric(Numeric::Integer(i)) => i + value,
-        Value::Numeric(Numeric::Float(f)) => (f64::from(*f) as i64) + value,
-        Value::Text(s) => s.as_str().parse::<i64>().unwrap_or(0) + value,
-        Value::Blob(_) => *value, // BLOB becomes the added value
-        Value::Null => *value,    // NULL becomes the added value
+    // SQLite coerces the register to an integer before adding.
+    let lhs = match current_value {
+        Value::Numeric(Numeric::Integer(i)) => *i,
+        Value::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(*f)),
+        Value::Text(s) => crate::numeric::str_to_i64(s.as_str()).unwrap_or(0),
+        Value::Blob(b) => {
+            crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
+        }
+        Value::Null => 0,
     };
+    let int_val = lhs.wrapping_add(*value);
 
     state.registers[*register].set_int(int_val);
     state.pc += 1;
@@ -11981,8 +12402,12 @@ pub fn op_open_ephemeral(
             let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
                 BTreeCursor::new_index(pager.clone(), root_page, index, num_columns)
             } else {
-                BTreeCursor::new_table(pager.clone(), root_page, num_columns)
-            };
+                Ok(BTreeCursor::new_table(
+                    pager.clone(),
+                    root_page,
+                    num_columns,
+                ))
+            }?;
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::Rewind {
                 cursor: Box::new(cursor),
                 temp_file: temp_file.take(),
@@ -12415,7 +12840,7 @@ pub fn op_integrity_check(
                 errors.truncate(*max_errors);
                 let message = format_integrity_check_result(errors);
                 match message {
-                    Some(msg) => state.registers[*message_register].set_text(Text::new(msg)),
+                    Some(msg) => state.registers[*message_register].set_text(Text::new(msg))?,
                     None => state.registers[*message_register].set_null(),
                 };
                 state.active_op_state.clear();
@@ -12473,7 +12898,7 @@ pub fn op_integrity_check(
             errors.truncate(*max_errors);
             let message = format_integrity_check_result(errors);
             match message {
-                Some(msg) => state.registers[*message_register].set_text(Text::new(msg)),
+                Some(msg) => state.registers[*message_register].set_text(Text::new(msg))?,
                 None => state.registers[*message_register].set_null(),
             };
             state.active_op_state.clear();
@@ -12645,6 +13070,8 @@ pub fn op_rename_table(
             .tables
             .remove(&normalized_from)
             .expect("table being renamed should be in schema");
+        #[cfg(feature = "conn_raw_api")]
+        schema.unregister_table_root_page(table.as_ref());
         match Arc::make_mut(&mut table) {
             Table::BTree(btree) => {
                 let btree = Arc::make_mut(btree);
@@ -12673,6 +13100,8 @@ pub fn op_rename_table(
             _ => panic!("only btree and virtual tables can be renamed"),
         }
 
+        #[cfg(feature = "conn_raw_api")]
+        schema.register_table_root_page(&normalized_to, table.as_ref());
         schema.tables.insert(normalized_to.to_owned(), table);
 
         for (tname, t_arc) in schema.tables.iter_mut() {
@@ -13032,6 +13461,14 @@ pub fn op_alter_column(
                 }
             }
         }
+        let clears_autoincrement_sequence = !*rename
+            && btree.has_autoincrement
+            && btree
+                .columns()
+                .get(*column_index)
+                .is_some_and(|column| column.is_rowid_alias())
+            && !new_column.is_rowid_alias();
+
         if *rename {
             btree.columns_mut()[*column_index].name = Some(new_name.clone());
 
@@ -13084,6 +13521,9 @@ pub fn op_alter_column(
         if !*rename {
             // recompute alias from `new_column`
             btree.columns_mut()[*column_index].set_rowid_alias(new_column.is_rowid_alias());
+            if clears_autoincrement_sequence {
+                btree.has_autoincrement = false;
+            }
         }
 
         // Update this table's OWN foreign keys
@@ -13412,21 +13852,20 @@ pub fn op_hash_build(
     } else {
         data.mem_budget
     };
-    state
-        .hash_tables
-        .entry(data.hash_table_id)
-        .or_insert_with(|| {
-            let config = HashTableConfig {
-                initial_buckets: 1024,
-                mem_budget,
-                num_keys: data.num_keys,
-                collations: data.collations.clone(),
-                temp_store,
-                track_matched: data.track_matched,
-                partition_count: None,
-            };
-            HashTable::new(config, pager.io.clone())
-        });
+    if let std::collections::hash_map::Entry::Vacant(e) =
+        state.hash_tables.entry(data.hash_table_id)
+    {
+        let config = HashTableConfig {
+            initial_buckets: 1024,
+            mem_budget,
+            num_keys: data.num_keys,
+            collations: data.collations.clone(),
+            temp_store,
+            track_matched: data.track_matched,
+            partition_count: None,
+        };
+        e.insert(HashTable::new(config, pager.io.clone())?);
+    }
 
     // Read pre-computed key values directly from registers
     while op_state.key_idx < data.num_keys {
@@ -13517,21 +13956,24 @@ pub fn op_hash_distinct(
     } else {
         DEFAULT_MEM_BUDGET
     };
+    if let std::collections::hash_map::Entry::Vacant(e) =
+        state.hash_tables.entry(data.hash_table_id)
+    {
+        let config = HashTableConfig {
+            initial_buckets: 1024,
+            mem_budget,
+            num_keys: data.num_keys,
+            collations: data.collations.clone(),
+            temp_store,
+            track_matched: false,
+            partition_count: None,
+        };
+        e.insert(HashTable::new(config, pager.io.clone())?);
+    }
     let hash_table = state
         .hash_tables
-        .entry(data.hash_table_id)
-        .or_insert_with(|| {
-            let config = HashTableConfig {
-                initial_buckets: 1024,
-                mem_budget,
-                num_keys: data.num_keys,
-                collations: data.collations.clone(),
-                temp_store,
-                track_matched: false,
-                partition_count: None,
-            };
-            HashTable::new(config, pager.io.clone())
-        });
+        .get_mut(&data.hash_table_id)
+        .expect("hash table exists");
 
     let key_values = &mut state.distinct_key_values;
     key_values.clear();
@@ -13653,8 +14095,10 @@ pub fn op_hash_probe(
     // For spilled hash tables, either buffer main-loop probe rows for grace
     // processing or probe a partition that grace logic already loaded.
     if hash_table.has_spilled() {
-        let partition_idx =
-            partition_idx.unwrap_or_else(|| hash_table.partition_for_keys(&probe_keys));
+        let partition_idx = match partition_idx {
+            Some(partition_idx) => partition_idx,
+            None => hash_table.partition_for_keys(&probe_keys)?,
+        };
 
         // Main probe loop: buffer probe rows targeting spilled build partitions.
         if let Some(rowid_reg) = probe_rowid_reg {
@@ -13707,7 +14151,7 @@ pub fn op_hash_probe(
             partition_idx,
             &probe_keys,
             Some(&mut state.metrics.hash_join),
-        ) {
+        )? {
             Some(entry) => {
                 state.registers[dest_reg].set_int(entry.rowid);
                 write_hash_payload_to_registers(
@@ -13728,7 +14172,7 @@ pub fn op_hash_probe(
         }
     } else {
         // Non-spilled hash table, use normal probe
-        match hash_table.probe(probe_keys, Some(&mut state.metrics.hash_join)) {
+        match hash_table.probe(probe_keys, Some(&mut state.metrics.hash_join))? {
             Some(entry) => {
                 state.registers[dest_reg].set_int(entry.rowid);
                 write_hash_payload_to_registers(
@@ -13771,7 +14215,7 @@ pub fn op_hash_next(
         mark_unlikely();
         LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
     })?;
-    match hash_table.next_match() {
+    match hash_table.next_match()? {
         Some(entry) => {
             state.registers[*dest_reg].set_int(entry.rowid);
             write_hash_payload_to_registers(
@@ -13812,7 +14256,7 @@ pub fn op_hash_clear(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(HashClear { hash_table_id }, insn);
     if let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) {
-        hash_table.clear();
+        hash_table.clear()?;
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -14003,7 +14447,7 @@ pub fn op_hash_grace_init(
     }
 
     // Initialize grace processing
-    if !hash_table.grace_begin() {
+    if !hash_table.grace_begin()? {
         state.pc = target_pc.as_offset_int();
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -14289,32 +14733,16 @@ fn execute_turso_version(version_integer: i64) -> String {
     format!("{major}.{minor}.{release}")
 }
 
+/// Coerce a value to i64 using the same non-NULL conversion rules as
+/// SQLite's OP_AddImm.
 pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
     let value = value.as_value_ref();
     match value {
         ValueRef::Numeric(Numeric::Integer(i)) => i,
-        ValueRef::Numeric(Numeric::Float(f)) => {
-            let f = f64::from(f);
-            // Use sqlite3RealToI64 equivalent
-            if f < -9223372036854774784.0 {
-                i64::MIN
-            } else if f > 9223372036854774784.0 {
-                i64::MAX
-            } else {
-                f as i64
-            }
-        }
-        ValueRef::Text(t) => {
-            // Try to parse as integer, return 0 if failed
-            t.as_str().parse::<i64>().unwrap_or(0)
-        }
+        ValueRef::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(f)),
+        ValueRef::Text(t) => crate::numeric::str_to_i64(t.as_str()).unwrap_or(0),
         ValueRef::Blob(b) => {
-            // Try to parse blob as string then as integer
-            if let Ok(s) = std::str::from_utf8(b) {
-                s.parse::<i64>().unwrap_or(0)
-            } else {
-                0
-            }
+            crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
         }
         ValueRef::Null => 0,
     }
@@ -14427,7 +14855,7 @@ fn op_journal_mode_inner(
                 // If no new mode specified, just return current mode
                 let Some(mode_str) = new_mode else {
                     let ret: &'static str = prev_mode.into();
-                    state.registers[*dest].set_text(Text::new(ret));
+                    state.registers[*dest].set_text(Text::new(ret))?;
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
                 };
@@ -14438,7 +14866,7 @@ fn op_journal_mode_inner(
                     Ok(mode) if mode.supported() => mode,
                     _ => {
                         let ret: &'static str = prev_mode.into();
-                        state.registers[*dest].set_text(Text::new(ret));
+                        state.registers[*dest].set_text(Text::new(ret))?;
                         state.pc += 1;
                         return Ok(InsnFunctionStepResult::Step);
                     }
@@ -14447,14 +14875,14 @@ fn op_journal_mode_inner(
                 // If same mode, just return
                 if prev_mode == new_mode {
                     let ret: &'static str = new_mode.into();
-                    state.registers[*dest].set_text(Text::new(ret));
+                    state.registers[*dest].set_text(Text::new(ret))?;
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
                 }
 
                 if *db != crate::MAIN_DB_ID {
                     let ret: &'static str = prev_mode.into();
-                    state.registers[*dest].set_text(Text::new(ret));
+                    state.registers[*dest].set_text(Text::new(ret))?;
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
                 }
@@ -14565,11 +14993,6 @@ fn op_journal_mode_inner(
 
                 // Setup new mode
                 if matches!(new_mode, journal_mode::JournalMode::Mvcc) {
-                    if program.connection.get_capture_data_changes_info().is_some() {
-                        return Err(LimboError::InternalError(
-                            "cannot enable MVCC while CDC is active".to_string(),
-                        ));
-                    }
                     let db_path = program.connection.get_database_canonical_path();
                     let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
                     let mv_store = journal_mode::open_mv_store(
@@ -14590,7 +15013,7 @@ fn op_journal_mode_inner(
 
                 // Return result
                 let ret: &'static str = new_mode.into();
-                state.registers[*dest].set_text(Text::new(ret));
+                state.registers[*dest].set_text(Text::new(ret))?;
                 state.pc += 1;
 
                 return Ok(InsnFunctionStepResult::Step);
@@ -15174,7 +15597,7 @@ mod tests {
             track_matched: false,
             ..Default::default()
         };
-        let mut ht = HashTable::new(config, io);
+        let mut ht = HashTable::new(config, io).unwrap();
 
         for i in 0..1024 {
             match ht
@@ -15195,11 +15618,11 @@ mod tests {
         let probe_key = (0..1024)
             .map(|i| vec![Value::from_i64(i)])
             .find(|key| {
-                let partition_idx = ht.partition_for_keys(key);
+                let partition_idx = ht.partition_for_keys(key).unwrap();
                 !ht.is_partition_loaded(partition_idx)
             })
             .expect("expected an unloaded spilled partition");
-        let partition_idx = ht.partition_for_keys(&probe_key);
+        let partition_idx = ht.partition_for_keys(&probe_key).unwrap();
 
         (ht, probe_key, partition_idx)
     }

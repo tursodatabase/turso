@@ -1,7 +1,25 @@
-*target
+# Build caches and local-only artifacts.
+**/target
+**/node_modules
+**/build
+**/dist
+bindings/javascript/packages/*/bundle
+bindings/javascript/packages/*/*.wasm
+bindings/javascript/packages/*/*.node
+bindings/java/libs
+
+# Local fuzzer / test artifacts that share dirs with tracked fixtures.
+/whopper-*
+testing/testing_clone.db
+testing/system/test_copy.db
+testing/sqltests/database/integrity_*.db
+
+# VCS
 .git
+
+# Project-specific excludes
 turso-test-runner
 assets
 perf/clickbench
 perf/tpc-h
-testing/sqlright/build
+fuzz/corpus
