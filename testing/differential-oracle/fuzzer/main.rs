@@ -58,6 +58,12 @@ struct Args {
     /// Enable experimental MVCC mode.
     #[arg(long)]
     mvcc: bool,
+
+    /// Probability (0.0..=1.0) that each expression-list SELECT column
+    /// is generated as a window function. Set high (e.g. `0.6`) to
+    /// stress-test the window function emit pipeline.
+    #[arg(long, default_value_t = 0.0)]
+    window_function_probability: f64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -240,6 +246,7 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
             TreeMode::Simplified
         },
         mvcc: args.mvcc,
+        window_function_probability: args.window_function_probability.clamp(0.0, 1.0),
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);

@@ -1483,8 +1483,7 @@ pub enum Expr {
     ArrayLiteral(ArrayLiteralExpr),
     /// expr[n] — array subscript
     ArraySubscript(Box<ArraySubscriptExpr>),
-    // Stubs: not yet generated (weight 0), shown in coverage report
-    /// expr OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)
+    /// `func(args) OVER (PARTITION BY ... ORDER BY ...)`.
     WindowFunction(Box<WindowFunctionExpr>),
     /// expr COLLATE collation_name
     Collate(Box<CollateExpr>),
@@ -1511,8 +1510,8 @@ impl fmt::Display for Expr {
             Expr::Parenthesized(e) => write!(f, "({e})"),
             Expr::ArrayLiteral(a) => write!(f, "{a}"),
             Expr::ArraySubscript(a) => write!(f, "{a}"),
+            Expr::WindowFunction(w) => write!(f, "{w}"),
             // Stubs
-            Expr::WindowFunction(_) => todo!("window function generation"),
             Expr::Collate(_) => todo!("COLLATE expression generation"),
             Expr::Raise(_) => todo!("RAISE expression generation"),
         }
@@ -1645,10 +1644,21 @@ impl Expr {
         Expr::Parenthesized(Box::new(expr))
     }
 
-    /// Create a window function expression (stub — records to context).
-    pub fn window_function(ctx: &mut Context) -> Self {
+    /// Create a window function expression (records to context).
+    pub fn window_function(
+        ctx: &mut Context,
+        name: String,
+        args: Vec<Expr>,
+        partition_by: Vec<Expr>,
+        order_by: Vec<(Expr, OrderDirection)>,
+    ) -> Self {
         ctx.record(ExprKind::WindowFunction);
-        todo!("window function generation")
+        Expr::WindowFunction(Box::new(WindowFunctionExpr {
+            name,
+            args,
+            partition_by,
+            order_by,
+        }))
     }
 
     /// Create a COLLATE expression (stub — records to context).
@@ -2058,9 +2068,57 @@ pub struct InSubqueryExpr {
 // Stub expression types (not yet generated)
 // =============================================================================
 
-/// A window function expression (stub).
+/// A window function expression: `func(args) OVER (PARTITION BY ... ORDER BY ...)`.
+///
+/// Restricted to the planner-coerced frame set — no user-specified
+/// `ROWS`/`RANGE`/`GROUPS` clauses or `EXCLUDE` clauses, matching what
+/// the engine currently accepts.
 #[derive(Debug, Clone)]
-pub struct WindowFunctionExpr;
+pub struct WindowFunctionExpr {
+    pub name: String,
+    pub args: Vec<Expr>,
+    /// Optional list of partition expressions.
+    pub partition_by: Vec<Expr>,
+    /// Optional list of order-by expressions with direction.
+    pub order_by: Vec<(Expr, OrderDirection)>,
+}
+
+impl fmt::Display for WindowFunctionExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}(", self.name)?;
+        for (i, arg) in self.args.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{arg}")?;
+        }
+        write!(f, ") OVER (")?;
+        let mut first_clause = true;
+        if !self.partition_by.is_empty() {
+            write!(f, "PARTITION BY ")?;
+            for (i, e) in self.partition_by.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{e}")?;
+            }
+            first_clause = false;
+        }
+        if !self.order_by.is_empty() {
+            if !first_clause {
+                write!(f, " ")?;
+            }
+            write!(f, "ORDER BY ")?;
+            for (i, (e, dir)) in self.order_by.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{e} {dir}")?;
+            }
+        }
+        write!(f, ")")
+    }
+}
 
 /// A COLLATE expression (stub).
 #[derive(Debug, Clone)]
