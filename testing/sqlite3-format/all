@@ -1,0 +1,26 @@
+#!/bin/sh
+
+fail=0
+run_test() {
+  test="$1"
+  db="$test.db"
+  rm -f "$db"
+  if ! sqlite3 "$db" < "$test-create.sql"; then
+    echo "$test: SETUP FAILED"; fail=1; return
+  fi
+  if ./database-cmp "$db" "$(cat $test-check.sql)"; then
+    echo "$test: ok"
+  else
+    echo "$test: FAIL"; fail=1
+  fi
+}
+
+run_test "test-btree-depth"
+run_test "test-freelist"
+run_test "test-large-db"
+run_test "test-overflow-page"
+run_test "test-pagesize-512"
+run_test "test-pagesize-65536"
+run_test "test-types"
+
+exit "$fail"
