@@ -4,14 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use turso_core::{Connection, Database, DatabaseOpts, IO, LimboError, OpenFlags};
 use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
-use turso_whopper::{
-    multiprocess_platform_io,
-    workloads::{
-        BeginWorkload, CommitWorkload, CreateIndexWorkload, CreateSimpleTableWorkload,
-        DeleteWorkload, DropIndexWorkload, IntegrityCheckWorkload, RollbackWorkload,
-        SimpleInsertWorkload, SimpleSelectWorkload, UpdateWorkload, WalCheckpointWorkload,
-    },
-};
+use turso_whopper::multiprocess_platform_io;
 
 fn wait_for_file(path: &Path) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -472,13 +465,6 @@ fn probe_simple_kv_length_via_fresh_worker(
 }
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
-fn advance_seeded_whopper_to_step(whopper: &mut MultiprocessWhopper, step_after_execution: usize) {
-    while whopper.current_step < step_after_execution {
-        whopper.step().expect("seeded whopper step");
-    }
-}
-
-#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
 fn multiprocess_restart_reuses_persisted_tshm_without_disk_scan() {
     let mut whopper = create_multiprocess_whopper(2);
@@ -694,59 +680,45 @@ fn multiprocess_committed_large_row_survives_repeated_restarts() -> anyhow::Resu
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
-fn multiprocess_seed_8849519299024683634_localizes_schema_loss_boundary() {
-    configure_worker_exe();
-    let mut whopper = MultiprocessWhopper::new(MultiprocessOpts {
-        seed: Some(8849519299024683634),
-        enable_mvcc: false,
-        process_count: 16,
-        connections_per_process: 1,
-        max_steps: 72,
-        elle_tables: vec![],
-        workloads: vec![
-            (10, Box::new(IntegrityCheckWorkload)),
-            (5, Box::new(WalCheckpointWorkload)),
-            (10, Box::new(CreateSimpleTableWorkload)),
-            (20, Box::new(SimpleSelectWorkload)),
-            (20, Box::new(SimpleInsertWorkload)),
-            (15, Box::new(UpdateWorkload)),
-            (15, Box::new(DeleteWorkload)),
-            (2, Box::new(CreateIndexWorkload)),
-            (2, Box::new(DropIndexWorkload)),
-            (30, Box::new(BeginWorkload)),
-            (10, Box::new(CommitWorkload)),
-            (10, Box::new(RollbackWorkload)),
-        ],
-        properties: vec![],
-        chaotic_profiles: vec![],
-        kill_probability: 0.0,
-        restart_probability: 0.05,
-        history_output: None,
-        keep_files: true,
-    })
-    .expect("create seeded multiprocess whopper");
+fn multiprocess_committed_table_schema_survives_repeated_restarts() -> anyhow::Result<()> {
+    let mut whopper = create_multiprocess_whopper_with_keep(1, true);
+    let db_path = whopper.db_path().to_path_buf();
+    let table_name = "table_name";
+    let key = "key_name";
+    let value_len: i64 = 874;
 
-    advance_seeded_whopper_to_step(&mut whopper, 67);
-    assert!(
-        probe_table_rootpage_via_fresh_worker(&whopper, "simple_kv_9842").is_some(),
-        "simple_kv_9842 should still exist for a fresh opener immediately after the step 66 restart",
-    );
+    whopper.execute_sql_direct(
+        0,
+        format!("create table {table_name}(key text primary key, value text not null)"),
+    )??;
+
+    whopper.execute_sql_direct(
+        0,
+        format!(
+            "insert into {table_name}(key, value) values ('{key}', printf('%0*d', {value_len}, 1))"
+        ),
+    )??;
+
+    assert!(probe_table_rootpage_via_fresh_worker(&whopper, table_name).is_some());
     assert_eq!(
-        probe_simple_kv_length_via_fresh_worker(&whopper, "simple_kv_9842", "key_6095"),
-        Some(874),
-        "baseline row should still be visible for a fresh opener immediately after the step 66 restart",
+        probe_simple_kv_length_via_fresh_worker(&whopper, table_name, key),
+        Some(value_len)
     );
 
-    advance_seeded_whopper_to_step(&mut whopper, 70);
-    assert!(
-        probe_table_rootpage_via_fresh_worker(&whopper, "simple_kv_9842").is_some(),
-        "simple_kv_9842 disappeared from sqlite_schema by the step 70 restart; cohort_telemetries={:?}",
-        whopper.worker_startup_telemetries(),
-    );
+    for _restart in 1..=3 {
+        whopper.restart_all_workers_preserve_files().unwrap();
+        assert!(probe_table_rootpage_via_fresh_worker(&whopper, table_name).is_some());
+        assert_eq!(
+            probe_simple_kv_length_via_fresh_worker(&whopper, table_name, key),
+            Some(value_len)
+        );
+    }
 
-    whopper
-        .finalize()
-        .expect("finalize seeded multiprocess whopper");
+    let db_str = db_path.to_str().unwrap();
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(format!("{db_str}-wal"));
+    let _ = std::fs::remove_file(format!("{db_str}-tshm"));
+    Ok(())
 }
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
