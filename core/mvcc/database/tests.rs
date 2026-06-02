@@ -37,6 +37,211 @@ const TX_BASE_HEADER_SIZE: usize = 24;
 const TX_EXT_HEADER_SIZE: usize = 40;
 const TX_TRAILER_SIZE: usize = 8;
 
+/// A read deferred by [`DeferredReadIo`]: the target file, the read position, and
+/// the completion to fulfil when [`crate::IO::step`] drains it.
+type DeferredRead = (Arc<dyn crate::File>, u64, Completion);
+
+/// A test IO that wraps [`MemoryIO`] but defers every read completion until
+/// [`crate::IO::step`] is called, completing one read at a time. Writes, syncs and
+/// truncates complete synchronously. This forces any code that reads through it to
+/// yield to IO and then re-enter, exercising re-entrancy (e.g. MVCC recovery).
+pub(crate) struct DeferredReadIo {
+    inner: Arc<crate::io::MemoryIO>,
+    pending: Arc<Mutex<std::collections::VecDeque<DeferredRead>>>,
+    reads: Arc<AtomicU64>,
+    /// While false, reads complete synchronously (used to build fixtures without
+    /// driving the whole engine async). Once armed, reads are deferred.
+    armed: Arc<AtomicBool>,
+}
+
+impl DeferredReadIo {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(crate::io::MemoryIO::new()),
+            pending: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            reads: Arc::new(AtomicU64::new(0)),
+            armed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Start deferring read completions.
+    pub(crate) fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Total reads issued through this IO so far.
+    pub(crate) fn total_reads(&self) -> u64 {
+        self.reads.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn pending_reads(&self) -> usize {
+        self.pending.lock().len()
+    }
+}
+
+impl crate::io::Clock for DeferredReadIo {
+    fn current_time_monotonic(&self) -> crate::io::clock::MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+    fn current_time_wall_clock(&self) -> crate::io::clock::WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl crate::IO for DeferredReadIo {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> crate::Result<Arc<dyn crate::File>> {
+        let inner = self.inner.open_file(path, flags, direct)?;
+        Ok(Arc::new(DeferredReadFile {
+            inner,
+            pending: self.pending.clone(),
+            reads: self.reads.clone(),
+            armed: self.armed.clone(),
+        }))
+    }
+
+    fn remove_file(&self, path: &str) -> crate::Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn step(&self) -> crate::Result<()> {
+        let next = self.pending.lock().pop_front();
+        if let Some((file, pos, c)) = next {
+            // `pread` fulfils `c` synchronously here (inner is MemoryIO); the
+            // returned handle is the same completion and is not needed.
+            let _c = file.pread(pos, c)?;
+        }
+        Ok(())
+    }
+}
+
+struct DeferredReadFile {
+    inner: Arc<dyn crate::File>,
+    pending: Arc<Mutex<std::collections::VecDeque<DeferredRead>>>,
+    reads: Arc<AtomicU64>,
+    armed: Arc<AtomicBool>,
+}
+
+impl crate::File for DeferredReadFile {
+    fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
+        self.inner.lock_file(exclusive)
+    }
+    fn unlock_file(&self) -> crate::Result<()> {
+        self.inner.unlock_file()
+    }
+    fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        if !self.armed.load(Ordering::SeqCst) {
+            return self.inner.pread(pos, c);
+        }
+        self.pending
+            .lock()
+            .push_back((self.inner.clone(), pos, c.clone()));
+        Ok(c)
+    }
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> crate::Result<Completion> {
+        self.inner.pwrite(pos, buffer, c)
+    }
+    fn pwritev(
+        &self,
+        pos: u64,
+        buffers: Vec<Arc<Buffer>>,
+        c: Completion,
+    ) -> crate::Result<Completion> {
+        self.inner.pwritev(pos, buffers, c)
+    }
+    fn sync(&self, c: Completion, sync_type: crate::io::FileSyncType) -> crate::Result<Completion> {
+        self.inner.sync(c, sync_type)
+    }
+    fn truncate(&self, len: u64, c: Completion) -> crate::Result<Completion> {
+        self.inner.truncate(len, c)
+    }
+    fn size(&self) -> crate::Result<u64> {
+        self.inner.size()
+    }
+}
+
+/// What this test checks: full logical-log recovery — header read, the embedded
+/// metadata and `sqlite_schema` queries, the page-1 cookie read, and frame replay —
+/// is re-entrant. Driving recovery through an IO that completes one read at a time
+/// reconstructs the exact committed state, with no duplicated or dropped operations.
+/// Why this matters: recovery must be able to yield to IO at any read without
+/// corrupting its in-memory reconstruction of the MVCC store.
+#[test]
+fn test_recovery_reentrant_with_deferred_reads() {
+    let io_impl = Arc::new(DeferredReadIo::new());
+    let io: Arc<dyn crate::IO> = io_impl.clone();
+    let path = format!("mvcc-deferred-recovery-{}", rand::random::<u64>());
+
+    // Build a fixture with several committed frames: a table + index, a batch of
+    // inserts, a delete, a schema change (ALTER), and a post-ALTER insert. Reads
+    // are synchronous here so only recovery is exercised under deferred IO.
+    {
+        DATABASE_MANAGER.lock().clear();
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            &path,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+        for i in 1..=12 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+                .unwrap();
+        }
+        conn.execute("DELETE FROM t WHERE id = 5").unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN w INTEGER").unwrap();
+        conn.execute("INSERT INTO t VALUES (20, 'v20', 99)")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    // Reopen with deferred reads armed so recovery yields at every read and
+    // re-enters the recovery state machine repeatedly.
+    DATABASE_MANAGER.lock().clear();
+    io_impl.arm();
+    let reads_before = io_impl.total_reads();
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        &path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    assert!(
+        io_impl.total_reads() > reads_before,
+        "recovery must read the logical log through the deferred IO"
+    );
+    assert_eq!(
+        io_impl.pending_reads(),
+        0,
+        "every deferred read issued during recovery must be drained"
+    );
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    let ids: Vec<i64> = rows.iter().map(|r| r[0].as_int().unwrap()).collect();
+    assert_eq!(ids, vec![1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 20]);
+    assert_eq!(rows.first().unwrap()[1].to_string(), "v1");
+    assert_eq!(rows.last().unwrap()[1].to_string(), "v20");
+
+    // The index must round-trip too: a lookup that uses idx_v returns the row.
+    let by_v = get_rows(&conn, "SELECT id FROM t WHERE v = 'v11'");
+    assert_eq!(by_v.len(), 1);
+    assert_eq!(by_v[0][0].as_int().unwrap(), 11);
+}
+
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
     path: Option<String>,

@@ -7601,117 +7601,6 @@ mod tests {
         assert!(last_chunk.end > last_chunk.start);
     }
 
-    /// A test IO that wraps [`MemoryIO`] but defers every read completion until
-    /// [`crate::IO::step`] is called, so a reader that yields to IO can be exercised
-    /// one completion at a time. Writes, syncs and truncates complete synchronously,
-    /// so building/copying log bytes stays straightforward.
-    struct DeferredReadIo {
-        inner: Arc<MemoryIO>,
-        pending: Arc<
-            crate::sync::Mutex<std::collections::VecDeque<(Arc<dyn crate::File>, u64, Completion)>>,
-        >,
-    }
-
-    impl DeferredReadIo {
-        fn new() -> Self {
-            Self {
-                inner: Arc::new(MemoryIO::new()),
-                pending: Arc::new(crate::sync::Mutex::new(std::collections::VecDeque::new())),
-            }
-        }
-
-        fn pending_reads(&self) -> usize {
-            self.pending.lock().len()
-        }
-    }
-
-    impl crate::io::Clock for DeferredReadIo {
-        fn current_time_monotonic(&self) -> crate::io::clock::MonotonicInstant {
-            self.inner.current_time_monotonic()
-        }
-        fn current_time_wall_clock(&self) -> crate::io::clock::WallClockInstant {
-            self.inner.current_time_wall_clock()
-        }
-    }
-
-    impl crate::IO for DeferredReadIo {
-        fn open_file(
-            &self,
-            path: &str,
-            flags: OpenFlags,
-            direct: bool,
-        ) -> crate::Result<Arc<dyn crate::File>> {
-            let inner = self.inner.open_file(path, flags, direct)?;
-            Ok(Arc::new(DeferredReadFile {
-                inner,
-                pending: self.pending.clone(),
-            }))
-        }
-
-        fn remove_file(&self, path: &str) -> crate::Result<()> {
-            self.inner.remove_file(path)
-        }
-
-        fn step(&self) -> crate::Result<()> {
-            let next = self.pending.lock().pop_front();
-            if let Some((file, pos, c)) = next {
-                file.pread(pos, c)?;
-            }
-            Ok(())
-        }
-    }
-
-    struct DeferredReadFile {
-        inner: Arc<dyn crate::File>,
-        pending: Arc<
-            crate::sync::Mutex<std::collections::VecDeque<(Arc<dyn crate::File>, u64, Completion)>>,
-        >,
-    }
-
-    impl crate::File for DeferredReadFile {
-        fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
-            self.inner.lock_file(exclusive)
-        }
-        fn unlock_file(&self) -> crate::Result<()> {
-            self.inner.unlock_file()
-        }
-        fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
-            self.pending
-                .lock()
-                .push_back((self.inner.clone(), pos, c.clone()));
-            Ok(c)
-        }
-        fn pwrite(
-            &self,
-            pos: u64,
-            buffer: Arc<Buffer>,
-            c: Completion,
-        ) -> crate::Result<Completion> {
-            self.inner.pwrite(pos, buffer, c)
-        }
-        fn pwritev(
-            &self,
-            pos: u64,
-            buffers: Vec<Arc<Buffer>>,
-            c: Completion,
-        ) -> crate::Result<Completion> {
-            self.inner.pwritev(pos, buffers, c)
-        }
-        fn sync(
-            &self,
-            c: Completion,
-            sync_type: crate::io::FileSyncType,
-        ) -> crate::Result<Completion> {
-            self.inner.sync(c, sync_type)
-        }
-        fn truncate(&self, len: u64, c: Completion) -> crate::Result<Completion> {
-            self.inner.truncate(len, c)
-        }
-        fn size(&self) -> crate::Result<u64> {
-            self.inner.size()
-        }
-    }
-
     /// Read every transaction frame from `file` non-blockingly, stepping the
     /// deferred IO whenever the reader yields. Returns the collected ops and the
     /// number of IO yields observed.
@@ -7790,7 +7679,7 @@ mod tests {
 
         // Under test: copy the identical bytes into a deferred-read IO and drive the
         // non-blocking reader, completing one read per yield.
-        let deferred = Arc::new(DeferredReadIo::new());
+        let deferred = Arc::new(crate::mvcc::database::tests::DeferredReadIo::new());
         let io: Arc<dyn crate::IO> = deferred.clone();
         let file_b = io
             .open_file("reentrant-deferred.db-log", OpenFlags::Create, false)
