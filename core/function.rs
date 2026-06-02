@@ -526,6 +526,8 @@ impl WindowFunc {
                 | Self::FirstValue
                 | Self::LastValue
                 | Self::NthValue
+                | Self::Lag
+                | Self::Lead
         )
     }
 
@@ -539,6 +541,11 @@ impl WindowFunc {
         use crate::translate::plan::{Frame, FrameBoundary};
         use turso_parser::ast::{Expr, FrameMode, Literal};
         match self {
+            // Lag shares row_number's streaming frame even though its lookup
+            // can point forward (negative offset): SQLite emits a row as soon
+            // as the row after it is buffered, so a forward lookup past that
+            // one row misses and yields the default — behavior we match by
+            // using the same frame rather than caching the whole partition.
             Self::RowNumber | Self::Lag => Some(Frame {
                 mode: FrameMode::Rows,
                 start: FrameBoundary::UnboundedPreceding,

@@ -319,12 +319,30 @@ expect {
     nth_value|w|2
 }
 
+# lag and lead each appear three times (one row per accepted arity).
+test pragma-function-list-window-lag {
+    SELECT name, type, narg FROM pragma_function_list WHERE name = 'lag' ORDER BY narg;
+}
+expect {
+    lag|w|1
+    lag|w|2
+    lag|w|3
+}
+
+test pragma-function-list-window-lead {
+    SELECT name, type, narg FROM pragma_function_list WHERE name = 'lead' ORDER BY narg;
+}
+expect {
+    lead|w|1
+    lead|w|2
+    lead|w|3
+}
+
 @skip-if sqlite "Turso should not list window functions that it cannot run"
 test pragma-function-list-omits-unimplemented-window-functions {
     SELECT COUNT(*) FROM pragma_function_list
     WHERE name IN (
-        'percent_rank','cume_dist','ntile',
-        'lag','lead'
+        'percent_rank','cume_dist','ntile'
     );
 }
 expect {
