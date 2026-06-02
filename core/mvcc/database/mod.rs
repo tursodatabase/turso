@@ -80,6 +80,9 @@ pub mod tests;
 /// Sentinel value for `MvStore::exclusive_tx` indicating no exclusive transaction is active.
 const NO_EXCLUSIVE_TX: u64 = 0;
 
+#[cfg(not(any(test, injected_yields)))]
+struct YieldContext;
+
 /// A table ID for MVCC.
 /// MVCC table IDs are always negative. Their corresponding rootpage entry in sqlite_schema
 /// is the same negative value if the table has not been checkpointed yet. Otherwise, the root page
@@ -1271,6 +1274,22 @@ pub(crate) enum CommitYieldPoint {
     /// is cleared by the caller at vdbe/mod.rs. Used for failure injection
     /// to reproduce divergence between `mv_store.txs` and `connection.mv_tx_id`.
     AfterRemoveTx,
+}
+
+#[cfg(any(test, injected_yields))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
+#[repr(u8)]
+pub(crate) enum ExclusiveTxYieldPoint {
+    AfterTimestampCheckBeforeCas,
+}
+
+#[cfg(any(test, injected_yields))]
+impl YieldPointMarker for ExclusiveTxYieldPoint {
+    const POINT_COUNT: u8 = Self::COUNT as u8;
+
+    fn ordinal(self) -> u8 {
+        self as u8
+    }
 }
 
 #[cfg(any(test, injected_yields))]
@@ -4525,7 +4544,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         &self,
         pager: Arc<Pager>,
         maybe_existing_tx_id: Option<TxID>,
+        connection: &Connection,
     ) -> Result<TxID> {
+        #[cfg(not(any(test, injected_yields)))]
+        let _ = connection;
         // Existing transactions already hold one blocking-checkpoint read guard
         // from begin_tx(). When upgrading read->write, do not acquire another one.
         let acquires_checkpoint_guard = maybe_existing_tx_id.is_none();
@@ -4548,10 +4570,21 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         } else {
             self.get_begin_timestamp()
         };
+        #[cfg(any(test, injected_yields))]
+        let exclusive_yield_context = YieldContext::new(
+            connection.yield_injector(),
+            None,
+            connection.next_yield_instance_id(),
+            tx_id,
+        );
+        #[cfg(any(test, injected_yields))]
+        let exclusive_yield_context = Some(&exclusive_yield_context);
+        #[cfg(not(any(test, injected_yields)))]
+        let exclusive_yield_context: Option<&YieldContext> = None;
 
         let already_exclusive = self.is_exclusive_tx(&tx_id);
         if !already_exclusive {
-            self.acquire_exclusive_tx(&tx_id)
+            self.acquire_exclusive_tx(&tx_id, exclusive_yield_context)
                 .inspect_err(|_| unlock_checkpoint_guard())?;
         }
 
@@ -5214,7 +5247,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     /// Acquires the exclusive transaction lock to the given transaction ID.
-    fn acquire_exclusive_tx(&self, tx_id: &TxID) -> Result<()> {
+    fn acquire_exclusive_tx(
+        &self,
+        tx_id: &TxID,
+        yield_context: Option<&YieldContext>,
+    ) -> Result<()> {
+        #[cfg(not(any(test, injected_yields)))]
+        let _ = yield_context;
         if self.exclusive_tx.load(Ordering::Acquire) == *tx_id {
             // Re-entrant upgrade attempt for the same transaction.
             return Ok(());
@@ -5228,6 +5267,21 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
                 // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
                 return Err(LimboError::Busy);
+            }
+        }
+        #[cfg(any(test, injected_yields))]
+        if let Some(yield_context) = yield_context {
+            if yield_context.injector.as_ref().is_some_and(|injector| {
+                injector.should_yield(
+                    yield_context.instance_id,
+                    yield_context.selection_key,
+                    ExclusiveTxYieldPoint::AfterTimestampCheckBeforeCas.point(),
+                )
+            }) {
+                tracing::debug!(
+                    tx_id,
+                    "injected exclusive acquisition interleaving before CAS"
+                );
             }
         }
         match self.exclusive_tx.compare_exchange(
