@@ -528,6 +528,7 @@ impl WindowFunc {
                 | Self::NthValue
                 | Self::Lag
                 | Self::Lead
+                | Self::Ntile
         )
     }
 
