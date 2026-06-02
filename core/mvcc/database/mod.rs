@@ -1135,8 +1135,16 @@ impl AtomicTransactionState {
         self.state.store(state.encode(), Ordering::Release);
     }
 
+    fn store_seqcst(&self, state: TransactionState) {
+        self.state.store(state.encode(), Ordering::SeqCst);
+    }
+
     fn load(&self) -> TransactionState {
         TransactionState::decode(self.state.load(Ordering::Acquire))
+    }
+
+    fn load_seqcst(&self) -> TransactionState {
+        TransactionState::decode(self.state.load(Ordering::SeqCst))
     }
 }
 
@@ -2522,6 +2530,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         ts > tx.begin_ts,
                         "end_ts must be strictly greater than begin_ts"
                     );
+                    // Publish Preparing before checking exclusive_tx so an exclusive
+                    // transaction cannot acquire from an invisible commit window.
+                    tx.state.store_seqcst(TransactionState::Preparing(ts));
 
                     // First we check if there is exclusive conflict, if there is then we won't
                     // commit txn.
@@ -2583,14 +2594,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         }) {
                             tracing::debug!(
                                 tx_id = self.tx_id,
-                                "injected commit interleaving before Preparing"
+                                "injected commit interleaving after conflict checks"
                             );
                         }
-                    }
-
-                    let can_commit_tx = !(exclusive_conflict || schema_conflict);
-                    if can_commit_tx || read_only {
-                        tx.state.store(TransactionState::Preparing(ts));
                     }
                 });
                 // We allow reads from happening. Exlusive means there is a single writer.
@@ -5254,13 +5260,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Returns true if there is an exclusive transaction ongoing.
     #[inline]
     fn has_exclusive_tx(&self) -> bool {
-        self.exclusive_tx.load(Ordering::Acquire) != NO_EXCLUSIVE_TX
+        self.exclusive_tx.load(Ordering::SeqCst) != NO_EXCLUSIVE_TX
     }
 
     fn has_preparing_tx_other_than(&self, tx_id: TxID) -> bool {
         self.txs.iter().any(|entry| {
             *entry.key() != tx_id
-                && matches!(entry.value().state.load(), TransactionState::Preparing(_))
+                && matches!(
+                    entry.value().state.load_seqcst(),
+                    TransactionState::Preparing(_)
+                )
         })
     }
 
@@ -5312,8 +5321,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         match self.exclusive_tx.compare_exchange(
             NO_EXCLUSIVE_TX,
             *tx_id,
-            Ordering::AcqRel,
-            Ordering::Acquire,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
         ) {
             Ok(_) => {
                 if self.has_preparing_tx_other_than(*tx_id) {
