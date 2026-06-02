@@ -6753,8 +6753,13 @@ fn ordered_set_percentile_disc(values: &[Value], fraction: f64, collation: Colla
     sorted[index.min(n - 1)].clone()
 }
 
-/// Records what a window function needs from one row so its answer can be read
-/// later. Functions without arguments do not read `arg_reg`.
+/// Per-row step for pure window functions (those carried in
+/// `AccumulatorFunc::Window`). Mirrors `op_agg_step` but with no FILTER and
+/// per-function state semantics. State lives in the same
+/// `Register::Aggregate(AggContext::Builtin(_))` slot used by built-in
+/// aggregates so AggValue can read it back via the standard path. The `col`
+/// argument is the register holding the function's single argument (when it
+/// has one — 0-ary functions like row_number ignore it).
 fn op_window_step(
     state: &mut ProgramState,
     acc_reg: usize,
@@ -6848,49 +6853,6 @@ fn op_window_step(
             *pending = 1;
         }
         // first_value(expr) — captures the argument value of the first row
-        // of the partition once, then never updates. Under our default
-        // RANGE UNBOUNDED PRECEDING TO CURRENT ROW frame this corresponds
-        // to "value at frame start = partition start" (matches SQLite's
-        // first_valueStepFunc behavior on the same frame).
-        //
-        // State: payload[0] = captured value, payload[1] = captured flag
-        // (Integer 0 = not yet captured, 1 = captured). The flag lets us
-        // distinguish "no captures yet" from "captured a NULL".
-        WindowFunc::FirstValue => {
-            if let Register::Value(Value::Null) = state.registers[acc_reg] {
-                state.registers[acc_reg] =
-                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
-                        Value::Null,
-                        Value::from_i64(0),
-                    ]?));
-            }
-            // Most steps past the first per partition are no-ops; check the
-            // capture flag with an immutable borrow first so we don't clone
-            // the arg (potentially a Text/Blob allocation) on every row.
-            let already_captured = {
-                let Register::Aggregate(AggContext::Builtin(payload)) = &state.registers[acc_reg]
-                else {
-                    unreachable!("first_value accumulator must be a Builtin payload");
-                };
-                let Value::Numeric(Numeric::Integer(captured)) = &payload[1] else {
-                    unreachable!("first_value capture flag must be Integer");
-                };
-                *captured != 0
-            };
-            if !already_captured {
-                let arg_value = state.registers[arg_reg].get_value().clone();
-                let Register::Aggregate(AggContext::Builtin(payload)) =
-                    &mut state.registers[acc_reg]
-                else {
-                    unreachable!("first_value accumulator must be a Builtin payload");
-                };
-                payload[0] = arg_value;
-                let Value::Numeric(Numeric::Integer(captured)) = &mut payload[1] else {
-                    unreachable!("first_value capture flag must be Integer");
-                };
-                *captured = 1;
-            }
-        }
         // last_value(expr) — captures the argument value of every source row,
         // so payload[0] always holds the value of the most recently stepped
         // row. With our default RANGE frame, AggValue is called once per
