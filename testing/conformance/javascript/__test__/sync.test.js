@@ -164,6 +164,33 @@ test.serial("Database.transaction()", async (t) => {
   t.is(stmt.get(5).name, "Junior");
 });
 
+test.serial("Database.inTransaction property", async (t) => {
+  const db = t.context.db;
+
+  // A fresh connection is in autocommit, not a transaction.
+  t.false(db.inTransaction, "fresh connection is not in a transaction");
+
+  // The transaction() helper reports in-transaction inside its callback and
+  // autocommit once it completes.
+  let insideTxn;
+  const txn = db.transaction(() => { insideTxn = db.inTransaction; });
+  txn();
+  t.true(insideTxn, "in a transaction inside the transaction() callback");
+  t.false(db.inTransaction, "autocommit after transaction() completes");
+
+  // inTransaction must reflect the real transaction state, so it also tracks
+  // transactions opened with raw BEGIN/COMMIT/ROLLBACK.
+  db.exec("BEGIN");
+  t.true(db.inTransaction, "in a transaction after raw BEGIN");
+  db.exec("COMMIT");
+  t.false(db.inTransaction, "autocommit after raw COMMIT");
+
+  db.exec("BEGIN");
+  t.true(db.inTransaction, "in a transaction after raw BEGIN");
+  db.exec("ROLLBACK");
+  t.false(db.inTransaction, "autocommit after raw ROLLBACK");
+});
+
 test.serial("Database.transaction().immediate()", async (t) => {
   const db = t.context.db;
   const insert = db.prepare(

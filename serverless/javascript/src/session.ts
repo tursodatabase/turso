@@ -7,10 +7,12 @@ import {
   type CursorResponse,
   type CursorEntry,
   type PipelineRequest,
+  type PipelineResponse,
   type SequenceRequest,
   type CloseRequest,
   type DescribeRequest,
   type DescribeResult,
+  type GetAutocommitRequest,
   type QueryOptions,
 } from './protocol.js';
 import { DatabaseError } from './error.js';
@@ -57,10 +59,46 @@ export class Session {
   private config: SessionConfig;
   private baton: string | null = null;
   private baseUrl: string;
+  // Cached autocommit status from the server's last `get_autocommit` answer.
+  // A fresh connection is in autocommit (not in a transaction).
+  private autocommit: boolean = true;
 
   constructor(config: SessionConfig) {
     this.config = config;
     this.baseUrl = normalizeUrl(config.url);
+  }
+
+  /**
+   * Whether the connection is currently inside a transaction.
+   *
+   * Derived from the server's authoritative `get_autocommit` answer (the same
+   * value as `sqlite3_get_autocommit()`), which we refresh on every pipeline
+   * request. This is the only reliable signal: a non-null baton does NOT imply
+   * a transaction — the server also keeps the stream open for stored SQL or
+   * pragma side effects.
+   */
+  get inTransaction(): boolean {
+    return !this.autocommit;
+  }
+
+  /**
+   * Refresh the cached autocommit status from a pipeline response, reading the
+   * answer to the `get_autocommit` request we append to every pipeline call.
+   */
+  private updateAutocommit(response: PipelineResponse): void {
+    if (!response.results) {
+      return;
+    }
+    for (const result of response.results) {
+      if (
+        result.type === 'ok' &&
+        result.response?.type === 'get_autocommit' &&
+        typeof result.response.is_autocommit === 'boolean'
+      ) {
+        this.autocommit = result.response.is_autocommit;
+        return;
+      }
+    }
   }
 
   private createAbortSignal(queryOptions?: QueryOptions): AbortSignal | undefined {
@@ -80,10 +118,10 @@ export class Session {
   async describe(sql: string, queryOptions?: QueryOptions): Promise<DescribeResult> {
     const request: PipelineRequest = {
       baton: this.baton,
-      requests: [{
-        type: "describe",
-        sql: sql
-      } as DescribeRequest]
+      requests: [
+        { type: "describe", sql: sql } as DescribeRequest,
+        { type: "get_autocommit" } as GetAutocommitRequest,
+      ]
     };
 
     let response;
@@ -91,6 +129,7 @@ export class Session {
       response = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
+      this.autocommit = true;
       throw e;
     }
 
@@ -98,6 +137,7 @@ export class Session {
     if (response.base_url) {
       this.baseUrl = response.base_url;
     }
+    this.updateAutocommit(response);
 
     // Check for errors in the response
     if (response.results && response.results[0]) {
@@ -422,10 +462,10 @@ export class Session {
   async sequence(sql: string, queryOptions?: QueryOptions): Promise<void> {
     const request: PipelineRequest = {
       baton: this.baton,
-      requests: [{
-        type: "sequence",
-        sql: sql
-      } as SequenceRequest]
+      requests: [
+        { type: "sequence", sql: sql } as SequenceRequest,
+        { type: "get_autocommit" } as GetAutocommitRequest,
+      ]
     };
 
     let seqResponse;
@@ -433,6 +473,7 @@ export class Session {
       seqResponse = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
+      this.autocommit = true;
       throw e;
     }
 
@@ -440,6 +481,7 @@ export class Session {
     if (seqResponse.base_url) {
       this.baseUrl = seqResponse.base_url;
     }
+    this.updateAutocommit(seqResponse);
 
     // Check for errors in the response
     if (seqResponse.results && seqResponse.results[0]) {
@@ -477,5 +519,6 @@ export class Session {
     // Reset local state
     this.baton = null;
     this.baseUrl = '';
+    this.autocommit = true;
   }
 }
