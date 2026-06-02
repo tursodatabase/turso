@@ -17,10 +17,15 @@ public partial class SqliteConnection
         if (step is null)
         {
             _aggregateFunctions.Remove(name);
+            if (_database is not null)
+                TursoBindings.UnregisterFunction(DatabaseHandle, name);
             return;
         }
 
-        throw new NotSupportedException(AdvancedExtensionApisNotSupportedMessage);
+        var registration = new AggregateFunctionRegistration(name, argc, isDeterministic, seed, step, resultSelector);
+        _aggregateFunctions[name] = registration;
+        if (_database is not null)
+            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
     }
 
     private void RegisterAggregateFunctions()
@@ -60,40 +65,40 @@ public partial class SqliteConnection
         return registration.CreateInvocationHandle();
     }
 
-    private static void StepAggregate(IntPtr context, IntPtr aggregateContext, int argc, IntPtr argv, IntPtr result)
+    private static TursoExtensionValue StepAggregate(IntPtr context, IntPtr aggregateContext, int argc, IntPtr argv)
     {
         try
         {
             var invocation = (AggregateInvocation?)GCHandle.FromIntPtr(aggregateContext).Target
                 ?? throw new ObjectDisposedException(nameof(AggregateInvocation));
             invocation.Step(ReadArguments(argc, argv));
-            WriteResult(result, null);
+            return CreateResult(null);
         }
         catch (SqliteException ex)
         {
-            WriteError(result, "__turso_sqlite_error__:" + ex.SqliteErrorCode.ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + ex.Message);
+            return CreateError("__turso_sqlite_error__:" + ex.SqliteErrorCode.ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + ex.Message);
         }
         catch (Exception ex)
         {
-            WriteError(result, ex.Message);
+            return CreateError(ex.Message);
         }
     }
 
-    private static void FinalizeAggregate(IntPtr context, IntPtr aggregateContext, IntPtr result)
+    private static TursoExtensionValue FinalizeAggregate(IntPtr context, IntPtr aggregateContext)
     {
         try
         {
             var invocation = (AggregateInvocation?)GCHandle.FromIntPtr(aggregateContext).Target
                 ?? throw new ObjectDisposedException(nameof(AggregateInvocation));
-            WriteResult(result, invocation.FinalizeResult());
+            return CreateResult(invocation.FinalizeResult());
         }
         catch (SqliteException ex)
         {
-            WriteError(result, "__turso_sqlite_error__:" + ex.SqliteErrorCode.ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + ex.Message);
+            return CreateError("__turso_sqlite_error__:" + ex.SqliteErrorCode.ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + ex.Message);
         }
         catch (Exception ex)
         {
-            WriteError(result, ex.Message);
+            return CreateError(ex.Message);
         }
     }
 

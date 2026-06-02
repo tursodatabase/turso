@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    ffi::CString,
     fmt::Display,
     ops::Deref,
     sync::{
@@ -33,6 +34,10 @@ assert_send!(TursoDatabase, TursoConnection, TursoStatement);
 assert_sync!(TursoDatabase);
 
 pub use turso_core::types::FromValue;
+pub use turso_ext::{
+    AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarFunction,
+    StepFunction, Value as ExtensionValue, ValueDestructor,
+};
 pub type EncryptionOpts = turso_core::EncryptionOpts;
 pub type Value = turso_core::Value;
 pub type ValueRef<'a> = turso_core::types::ValueRef<'a>;
@@ -360,6 +365,14 @@ impl TursoStatusCode {
             TursoStatusCode::Row => capi::c::turso_status_code_t::TURSO_ROW,
             TursoStatusCode::Io => capi::c::turso_status_code_t::TURSO_IO,
         }
+    }
+}
+
+fn result_code_to_result(result: ResultCode, operation: &str) -> Result<(), TursoError> {
+    if result.is_ok() {
+        Ok(())
+    } else {
+        Err(TursoError::Error(format!("{operation} failed: {result}")))
     }
 }
 
@@ -827,6 +840,113 @@ impl TursoConnection {
     }
     pub fn last_insert_rowid(&self) -> i64 {
         self.connection.last_insert_rowid()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_scalar_function(
+        &self,
+        name: String,
+        argc: i32,
+        deterministic: bool,
+        context: usize,
+        callback: ScalarFunction,
+        context_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> Result<(), TursoError> {
+        let name = CString::new(name).map_err(|err| {
+            TursoError::Misuse(format!(
+                "external scalar function name contains interior NUL: {err}"
+            ))
+        })?;
+        let api = unsafe { self.connection._build_turso_ext() };
+        let result = unsafe {
+            (api.register_scalar_function)(
+                api.ctx,
+                name.as_ptr(),
+                argc,
+                deterministic,
+                context,
+                callback,
+                context_destructor,
+                value_destructor,
+            )
+        };
+        unsafe { self.connection._free_extension_ctx(api) };
+        result_code_to_result(result, "register external scalar function")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_aggregate_function(
+        &self,
+        name: String,
+        argc: i32,
+        context: usize,
+        init: InitAggFunction,
+        step: StepFunction,
+        finalize: FinalizeFunction,
+        context_destructor: Option<ContextDestructor>,
+        aggregate_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> Result<(), TursoError> {
+        let name = CString::new(name).map_err(|err| {
+            TursoError::Misuse(format!(
+                "external aggregate function name contains interior NUL: {err}"
+            ))
+        })?;
+        let api = unsafe { self.connection._build_turso_ext() };
+        let result = unsafe {
+            (api.register_aggregate_function)(
+                api.ctx,
+                name.as_ptr(),
+                argc,
+                context,
+                init,
+                step,
+                finalize,
+                context_destructor,
+                aggregate_destructor,
+                value_destructor,
+            )
+        };
+        unsafe { self.connection._free_extension_ctx(api) };
+        result_code_to_result(result, "register external aggregate function")
+    }
+
+    pub fn unregister_external_function(&self, name: &str) -> Result<(), TursoError> {
+        let name = CString::new(name).map_err(|err| {
+            TursoError::Misuse(format!(
+                "external function name contains interior NUL: {err}"
+            ))
+        })?;
+        let api = unsafe { self.connection._build_turso_ext() };
+        let result = unsafe { (api.unregister_function)(api.ctx, name.as_ptr()) };
+        unsafe { self.connection._free_extension_ctx(api) };
+        result_code_to_result(result, "unregister external function")
+    }
+
+    pub fn register_external_collation(
+        &self,
+        name: String,
+        context: usize,
+        callback: turso_core::ContextCollationFunction,
+        context_destructor: Option<ContextDestructor>,
+    ) {
+        self.connection
+            .register_external_collation(name, context, callback, context_destructor);
+    }
+
+    pub fn unregister_external_collation(&self, name: &str) {
+        self.connection.unregister_external_collation(name);
+    }
+
+    pub fn set_load_extension_enabled(&self, enabled: bool) {
+        self.connection.set_load_extension_enabled(enabled);
+    }
+
+    pub fn load_extension(&self, path: &str) -> Result<(), TursoError> {
+        turso_core::resolve_ext_path(path)
+            .and_then(|path| self.connection.load_extension(path))
+            .map_err(TursoError::from)
     }
 
     /// prepares single SQL statement
