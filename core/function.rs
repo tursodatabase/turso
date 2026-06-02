@@ -444,6 +444,18 @@ pub enum AggFunc {
     #[cfg(feature = "json")]
     JsonGroupObject,
     ArrayAgg,
+    /// `mode() WITHIN GROUP (ORDER BY x)` — most frequent value of `x`.
+    /// Stored args (post-planning): `[value]`.
+    #[strum(disabled)]
+    Mode,
+    /// `percentile_cont(fraction) WITHIN GROUP (ORDER BY x)` — interpolated percentile.
+    /// Stored args (post-planning): `[value, fraction]`.
+    #[strum(disabled)]
+    PercentileCont,
+    /// `percentile_disc(fraction) WITHIN GROUP (ORDER BY x)` — discrete percentile.
+    /// Stored args (post-planning): `[value, fraction]`.
+    #[strum(disabled)]
+    PercentileDisc,
     #[strum(disabled)]
     External(Arc<ExtFunc>),
 }
@@ -486,7 +498,10 @@ impl PartialEq for AggFunc {
             | (Self::StringAgg, Self::StringAgg)
             | (Self::Sum, Self::Sum)
             | (Self::Total, Self::Total)
-            | (Self::ArrayAgg, Self::ArrayAgg) => true,
+            | (Self::ArrayAgg, Self::ArrayAgg)
+            | (Self::Mode, Self::Mode)
+            | (Self::PercentileCont, Self::PercentileCont)
+            | (Self::PercentileDisc, Self::PercentileDisc) => true,
             (Self::External(a), Self::External(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
@@ -517,6 +532,10 @@ impl AggFunc {
             Self::Sum => 1,
             Self::Total => 1,
             Self::ArrayAgg => 1,
+            // Ordered-set aggregates: args are rewritten by the planner to
+            // `[value]` (mode) or `[value, fraction]` (percentiles).
+            Self::Mode => 1,
+            Self::PercentileCont | Self::PercentileDisc => 2,
             #[cfg(feature = "json")]
             Self::JsonGroupArray | Self::JsonbGroupArray => 1,
             #[cfg(feature = "json")]
@@ -542,6 +561,8 @@ impl AggFunc {
             Self::Sum => &[1],
             Self::Total => &[1],
             Self::ArrayAgg => &[1],
+            Self::Mode => &[1],
+            Self::PercentileCont | Self::PercentileDisc => &[2],
             #[cfg(feature = "json")]
             Self::JsonGroupArray | Self::JsonbGroupArray => &[1],
             #[cfg(feature = "json")]
@@ -562,6 +583,9 @@ impl AggFunc {
             Self::Sum => "sum",
             Self::Total => "total",
             Self::ArrayAgg => "array_agg",
+            Self::Mode => "mode",
+            Self::PercentileCont => "percentile_cont",
+            Self::PercentileDisc => "percentile_disc",
             #[cfg(feature = "json")]
             Self::JsonbGroupArray => "jsonb_group_array",
             #[cfg(feature = "json")]

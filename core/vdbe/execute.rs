@@ -5827,6 +5827,17 @@ fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
             // We serialize to a record blob only in finalize, avoiding O(n²) re-serialization.
             payload.push(Value::from_i64(0));
         }
+        AggFunc::Mode => {
+            // [0] = collation bits, [1] = count, [2..] = buffered values.
+            payload.push(Value::from_i64(0)); // collation (recorded at step time)
+            payload.push(Value::from_i64(0)); // count
+        }
+        AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+            // [0] = collation bits, [1] = count, [2] = fraction, [3..] = buffered values.
+            payload.push(Value::from_i64(0)); // collation (recorded at step time)
+            payload.push(Value::from_i64(0)); // count
+            payload.push(Value::Null); // fraction (set on first step)
+        }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
             payload.push(Value::Blob(vec![]));
@@ -6103,6 +6114,13 @@ fn update_agg_payload(
                 "ArrayAgg should be handled directly in op_agg_step, not update_agg_payload".into(),
             ));
         }
+        AggFunc::Mode | AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+            // Ordered-set aggregates buffer values into a growable Vec, handled directly
+            // in op_agg_step (the slice here cannot grow).
+            return Err(LimboError::InternalError(
+                "ordered-set aggregate should be handled directly in op_agg_step".into(),
+            ));
+        }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
             // arg = value
@@ -6198,6 +6216,44 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                 Value::Blob(ImmutableRecord::from_values(elements, count)?.into_payload())
             }
         }
+        AggFunc::Mode => {
+            // payload: [0]=collation bits, [1]=count, [2..]=buffered values.
+            let collation =
+                CollationSeq::from_storage_bits(payload[0].as_int().unwrap_or(0) as u16);
+            let count = payload[1].as_int().unwrap_or(0) as usize;
+            if count == 0 || 2 + count > payload.len() {
+                Value::Null
+            } else {
+                ordered_set_mode(&payload[2..2 + count], collation)
+            }
+        }
+        AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+            // payload: [0]=collation bits, [1]=count, [2]=fraction, [3..]=buffered values.
+            // The fraction was range-checked in translate (pre-loop), so it is
+            // here either NULL (→ NULL output, matching PG) or a valid number.
+            if matches!(payload[2], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let collation =
+                CollationSeq::from_storage_bits(payload[0].as_int().unwrap_or(0) as u16);
+            let count = payload[1].as_int().unwrap_or(0) as usize;
+            let fraction = payload[2].as_float();
+            if count == 0 {
+                Value::Null
+            } else if 3 + count > payload.len() {
+                return Err(LimboError::InternalError(format!(
+                    "percentile: count ({count}) exceeds payload length ({})",
+                    payload.len()
+                )));
+            } else {
+                let values = &payload[3..3 + count];
+                if matches!(func, AggFunc::PercentileDisc) {
+                    ordered_set_percentile_disc(values, fraction, collation)
+                } else {
+                    ordered_set_percentile_cont(values, fraction)
+                }
+            }
+        }
         AggFunc::External(_) => {
             mark_unlikely();
             // External aggregates are finalized via AggContext::compute_external()
@@ -6228,6 +6284,90 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
     };
 
     Ok(val)
+}
+
+/// Most frequent value of an ordered set (`mode() WITHIN GROUP (ORDER BY x)`).
+/// Ties are broken by the smallest value, matching PostgreSQL (the first value the
+/// ascending ordering would return).
+/// Compares two ordered-set values, honoring `collation` for text (built-in and locale
+/// collations are resolved without a connection; extension `Custom` collations fall back
+/// to BINARY, matching other connection-less comparison paths).
+fn ordered_set_compare(a: &Value, b: &Value, collation: CollationSeq) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Text(lhs), Value::Text(rhs)) => {
+            collation.compare_strings(lhs.as_str(), rhs.as_str())
+        }
+        _ => a.cmp(b),
+    }
+}
+
+fn ordered_set_mode(values: &[Value], collation: CollationSeq) -> Value {
+    // NULLs were already dropped at step time.
+    let mut sorted: Vec<Value> = values.to_vec();
+    sorted.sort_by(|a, b| ordered_set_compare(a, b, collation));
+    let mut best_idx = 0usize;
+    let mut best_count = 0usize;
+    let mut i = 0;
+    while i < sorted.len() {
+        let mut j = i + 1;
+        while j < sorted.len()
+            && ordered_set_compare(&sorted[j], &sorted[i], collation) == std::cmp::Ordering::Equal
+        {
+            j += 1;
+        }
+        // Strict `>` keeps the earliest (smallest, since sorted ascending) run on ties.
+        if j - i > best_count {
+            best_count = j - i;
+            best_idx = i;
+        }
+        i = j;
+    }
+    sorted[best_idx].clone()
+}
+
+/// Continuous (interpolated) percentile of an ordered set.
+///
+/// Non-numeric values are ignored (PostgreSQL instead requires a numeric/interval input
+/// type and errors otherwise, but columns are dynamically typed here). `percentile_disc`
+/// differs: it returns the actual element of any type, so it does not filter.
+fn ordered_set_percentile_cont(values: &[Value], fraction: f64) -> Value {
+    let mut floats: Vec<f64> = values
+        .iter()
+        .filter_map(|v| match v {
+            Value::Numeric(Numeric::Integer(i)) => Some(*i as f64),
+            Value::Numeric(Numeric::Float(f)) => Some(f64::from(*f)),
+            _ => None,
+        })
+        .collect();
+    if floats.is_empty() {
+        return Value::Null;
+    }
+    floats.sort_by(|a, b| a.total_cmp(b));
+    let n = floats.len() as f64;
+    let index = fraction * (n - 1.0);
+    let lower = index.floor() as usize;
+    let upper = index.ceil() as usize;
+    if lower == upper {
+        Value::from_f64(floats[lower])
+    } else {
+        let weight = index - lower as f64;
+        Value::from_f64(floats[lower] * (1.0 - weight) + floats[upper] * weight)
+    }
+}
+
+/// Discrete percentile of an ordered set: returns the actual element (in its original
+/// type) at the position PostgreSQL would select — the smallest value whose cumulative
+/// distribution (`row / n`) is at least `fraction`.
+fn ordered_set_percentile_disc(values: &[Value], fraction: f64, collation: CollationSeq) -> Value {
+    let mut sorted: Vec<Value> = values.to_vec();
+    sorted.sort_by(|a, b| ordered_set_compare(a, b, collation));
+    let n = sorted.len();
+    let index = if fraction <= 0.0 {
+        0
+    } else {
+        ((fraction * n as f64).ceil() as usize).saturating_sub(1)
+    };
+    sorted[index.min(n - 1)].clone()
 }
 
 pub fn op_agg_step(
@@ -6344,49 +6484,76 @@ pub fn op_agg_step(
         _ => {
             let arg = state.registers[*col].get_value().clone();
 
-            if matches!(func, AggFunc::ArrayAgg) {
-                // ArrayAgg grows the payload Vec directly (O(1) per row).
-                let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
-                    panic!(
-                        "Unexpected value {:?} in AggStep at register {}",
-                        state.registers[*acc_reg], *acc_reg
-                    );
-                };
-                let payload = agg.payload_vec_mut();
-                let count = payload[0]
-                    .as_int()
-                    .expect("array_agg count must be an integer")
-                    as usize;
-                payload[0] = Value::from_i64((count + 1) as i64);
-                payload.push(arg);
-            } else {
-                // Only a subset of aggregate functions take two arguments
-                let maybe_arg2 = match func {
-                    AggFunc::GroupConcat | AggFunc::StringAgg => {
-                        Some(state.registers[*delimiter].get_value().clone())
+            // Read the optional second-argument register before borrowing the
+            // accumulator mutably (delimiter for group_concat/json, fraction for percentiles).
+            let maybe_arg2 = match func {
+                AggFunc::GroupConcat | AggFunc::StringAgg => {
+                    Some(state.registers[*delimiter].get_value().clone())
+                }
+                #[cfg(feature = "json")]
+                AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
+                    Some(state.registers[*delimiter].get_value().clone())
+                }
+                AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+                    Some(state.registers[*delimiter].get_value().clone())
+                }
+                _ => None,
+            };
+
+            let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+                panic!(
+                    "Unexpected value {:?} in AggStep at register {}",
+                    state.registers[*acc_reg], *acc_reg
+                );
+            };
+
+            match func {
+                // ArrayAgg and the ordered-set aggregates buffer values by growing the
+                // payload Vec directly (O(1) per row); they cannot use the fixed-size slice.
+                AggFunc::ArrayAgg => {
+                    let payload = agg.payload_vec_mut();
+                    let count = payload[0]
+                        .as_int()
+                        .expect("array_agg count must be an integer")
+                        as usize;
+                    payload[0] = Value::from_i64((count + 1) as i64);
+                    payload.push(arg);
+                }
+                AggFunc::Mode => {
+                    let payload = agg.payload_vec_mut();
+                    // Record the value's collation (constant per group) for finalize-time sorting.
+                    payload[0] = Value::from_i64(current_collation.to_bits() as i64);
+                    // Ordered-set aggregates ignore NULL inputs.
+                    if !matches!(arg, Value::Null) {
+                        let count = payload[1].as_int().unwrap_or(0) as usize;
+                        payload[1] = Value::from_i64((count + 1) as i64);
+                        payload.push(arg);
                     }
-                    #[cfg(feature = "json")]
-                    AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-                        Some(state.registers[*delimiter].get_value().clone())
+                }
+                AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+                    let payload = agg.payload_vec_mut();
+                    payload[0] = Value::from_i64(current_collation.to_bits() as i64);
+                    // The fraction is a per-group constant; record it on every step.
+                    if let Some(fraction) = maybe_arg2 {
+                        payload[2] = fraction;
                     }
-                    _ => None,
-                };
-                // Now get mutable borrow on payload
-                let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
-                    panic!(
-                        "Unexpected value {:?} in AggStep at register {}",
-                        state.registers[*acc_reg], *acc_reg
-                    );
-                };
-                let payload = agg.payload_mut();
-                update_agg_payload(
-                    func,
-                    arg,
-                    maybe_arg2,
-                    payload,
-                    current_collation,
-                    &comparator,
-                )?;
+                    if !matches!(arg, Value::Null) {
+                        let count = payload[1].as_int().unwrap_or(0) as usize;
+                        payload[1] = Value::from_i64((count + 1) as i64);
+                        payload.push(arg);
+                    }
+                }
+                _ => {
+                    let payload = agg.payload_mut();
+                    update_agg_payload(
+                        func,
+                        arg,
+                        maybe_arg2,
+                        payload,
+                        current_collation,
+                        &comparator,
+                    )?;
+                }
             }
         }
     };

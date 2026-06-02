@@ -160,6 +160,7 @@ fn keyword_or_id_token(input: &[u8]) -> TokenType {
         b"WHERE" => TokenType::TK_WHERE,
         b"WINDOW" => TokenType::TK_WINDOW,
         b"WITH" => TokenType::TK_WITH,
+        b"WITHIN" => TokenType::TK_WITHIN,
         b"WITHOUT" => TokenType::TK_WITHOUT,
         _ => TokenType::TK_ID,
     })
@@ -1254,6 +1255,7 @@ mod tests {
             ("WHERE", TokenType::TK_WHERE),
             ("WINDOW", TokenType::TK_WINDOW),
             ("WITH", TokenType::TK_WITH),
+            ("WITHIN", TokenType::TK_WITHIN),
             ("WITHOUT", TokenType::TK_WITHOUT),
         ]);
 

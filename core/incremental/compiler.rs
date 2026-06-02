@@ -1717,6 +1717,7 @@ impl DbspCompiler {
                     distinctness: None,
                     args: ast_args,
                     order_by: Vec::new(),
+                    within_group: vec![],
                     filter_over: ast::FunctionTail {
                         filter_clause: None,
                         over_clause: None,
@@ -1762,6 +1763,7 @@ impl DbspCompiler {
                     },
                     args: ast_args,
                     order_by: Vec::new(),
+                    within_group: vec![],
                     filter_over: ast::FunctionTail {
                         filter_clause: None,
                         over_clause: None,
