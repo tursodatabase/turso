@@ -3,6 +3,8 @@
 
 use std::hint::black_box;
 use std::sync::Arc;
+#[cfg(not(feature = "codspeed"))]
+use std::time::Duration;
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -162,7 +164,9 @@ fn bench_recovery(c: &mut Criterion) {
 #[cfg(not(feature = "codspeed"))]
 criterion_group! {
     name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    config = Criterion::default()
+        .measurement_time(Duration::from_secs(60))
+        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_recovery
 }
 
