@@ -1730,36 +1730,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     return Ok(TransitionResult::Continue);
                 }
 
-                let root_page = if let Some(rp) = self.resolve_root_page(table_id) {
-                    rp
-                } else {
-                    // Orphan user-table row: the row was committed inside our
-                    // snapshot but its schema row's two versions (a CREATE
-                    // followed by a later DROP, or a DROP followed by a
-                    // recreate) BOTH fall outside this checkpoint's snapshot
-                    // — `maybe_get_checkpointable_versions` filters
-                    // `begin > snapshot_ts` and `end > snapshot_ts` cases,
-                    // and when both fire neither version of the schema row
-                    // makes it into `write_set`. Without a schema row in
-                    // scope, no `BTreeCreate` fires and `table_id_to_rootpage`
-                    // is empty for this `table_id`.
-                    //
-                    // Allocate a real page inline here (same call the
-                    // schema-row's `BTreeCreate` would have made). The row is
-                    // then written into a real btree; a subsequent checkpoint
-                    // whose snapshot includes the later DROP destroys the
-                    // btree via the normal `BTreeDestroy` path. Net: orphan
-                    // rows are not dropped on the floor (which earlier "skip
-                    // the row" attempts did), and the engine's invariant
-                    // "every reachable table_id has a real rootpage" is
-                    // restored at this earlier point in the pipeline.
-                    let created_root_page: u32 = self.pager.io.block(|| {
-                        self.pager.btree_create(&CreateBTreeFlags::new_table())
-                    })?;
-                    self.pending_root_page_allocations
-                        .insert(table_id, created_root_page as u64);
-                    created_root_page as u64
-                };
+                let root_page = self.resolve_root_page(table_id).unwrap_or_else(|| {
+                    panic!(
+                        "Table ID does not have a root page: {table_id}, row_version: {:?}",
+                        self.get_current_row_version(write_set_index)
+                            .expect("row version should exist")
+                    )
+                });
 
                 // If a table was created, it now has a real root page allocated for it, but the 'root_page' field in the sqlite_schema record is still the table id.
                 // So we need to rewrite the row version to use the real root page.
@@ -1950,38 +1927,17 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     return Ok(TransitionResult::Continue);
                 }
 
-                // Orphan index_id (same scenario as the table-row case above
-                // in `WriteRow`: the schema row's two versions both fall
-                // outside the snapshot, so no `BTreeCreateIndex` fired AND
-                // `connection.db.schema` no longer has this index, so the
-                // constructor's `index_id_to_index` build did not pick it up
-                // either). The `Index` struct (column types, ordering, etc.)
-                // lives in the schema row we did not see — we cannot
-                // synthesize it from the in-mvstore row payload alone, so
-                // there is no way to allocate a meaningful index btree here.
-                // Skip the row; a later checkpoint whose snapshot includes
-                // the schema event picks it up (CREATE then materializes;
-                // DROP then never has any work). Net: no data loss, because
-                // the index's contents are derivable from the table's data
-                // and existence — neither of which we are touching.
-                if self.resolve_root_page(*index_id).is_none()
-                    || !self.index_id_to_index.contains_key(index_id)
-                {
-                    self.state = CheckpointState::WriteIndexRow {
-                        index_write_set_index: index_write_set_index + 1,
-                        requires_seek: true,
-                    };
-                    return Ok(TransitionResult::Continue);
-                }
+                // Get Index struct - it should exist for all indexes we're checkpointing
+                let index = self.index_id_to_index.get(index_id).unwrap_or_else(|| {
+                    panic!(
+                    "Index struct for index_id {index_id} must exist when checkpointing index rows",
+                )
+                });
 
-                let index = self
-                    .index_id_to_index
-                    .get(index_id)
-                    .expect("orphan-index skip above guarantees presence here");
-
+                // Get root page for this index — staged allocations first.
                 let root_page = self
                     .resolve_root_page(*index_id)
-                    .expect("orphan-index skip above guarantees presence here");
+                    .unwrap_or_else(|| panic!("Index ID {index_id} does not have a root page"));
 
                 // Get or create cursor for this index
                 let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
