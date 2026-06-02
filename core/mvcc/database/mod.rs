@@ -6065,90 +6065,98 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 continue;
             }
 
-            // Work out what sqlite_schema will look like after this transaction,
-            // before applying any row/index changes from the transaction.
+            // A single transaction frame can mix sqlite_schema changes with
+            // table/index DML. Index log records carry only encoded key bytes plus
+            // an index root page (not CREATE INDEX SQL), so decoding them needs an
+            // IndexInfo from a schema valid for this frame. Two schema views matter:
             //
-            // Why this is necessary:
-            // - CREATE INDEX can log index-entry inserts in the same frame as the
-            //   sqlite_schema insert for the new index. Those index-entry inserts
-            //   need the post-frame schema.
-            // - DROP INDEX can log DELETE_INDEX entries for b-tree index entries
-            //   that existed before the transaction. Those deletes still need the
-            //   pre-frame schema, because the final schema no longer has idx.
-            // - ALTER TABLE can delete and reinsert the same table's sqlite_schema
-            //   row while also logging table/index DML. Installing the schema after
-            //   only the delete would create an impossible in-between schema:
-            //   sqlite_schema may still contain idx while the table row for t is
-            //   temporarily absent.
+            // - CREATE INDEX logs index-entry inserts that survive the frame; they
+            //   decode against the schema that exists AFTER the frame.
+            // - DROP INDEX logs DELETE_INDEX entries for rows that existed before the
+            //   frame; they decode against the schema that existed BEFORE the frame.
+            // - ALTER TABLE deletes and reinserts a table's sqlite_schema row while
+            //   logging table/index DML; the post-frame schema must be applied whole,
+            //   never half-updated.
             //
-            // So recovery stages sqlite_schema into `schema_rows_after`, builds a
-            // post-frame Schema from that staged map, and keeps the installed
-            // `current_schema` unchanged until every op in the frame has replayed.
-            // Most transaction frames do not change sqlite_schema, so clone the
-            // schema row map only if this frame actually writes sqlite_schema.
-            let mut schema_rows_after: Option<HashMap<i64, ImmutableRecord>> = None;
-            for parsed_op in &frame {
-                match parsed_op {
-                    ParsedOp::UpsertTable {
-                        rowid,
-                        record_bytes,
-                        ..
-                    } if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID => {
-                        let schema_rows_after =
-                            schema_rows_after.get_or_insert_with(|| schema_rows.clone());
-                        let record = ImmutableRecord::from_bin_record(record_bytes.clone());
-                        if record.column_count() < 5 {
-                            return Err(LimboError::Corrupt(format!(
-                                "sqlite_schema row must have at least 5 columns, got {}",
-                                record.column_count()
-                            )));
-                        }
-                        schema_rows_after.insert(rowid.row_id.to_int_or_panic(), record);
+            // The writer serializes every sqlite_schema op before any data/index op
+            // within a frame (see `step_build_log_record`), so one forward pass
+            // suffices: apply the schema ops first, build the post-frame schema once
+            // at the schema->data boundary, then decode the frame's index ops with
+            // the right before/after view. `current_schema` (the previous frame's
+            // post-frame schema) stays installed as the pre-frame view until the
+            // whole frame has been applied.
+            let mut frame_changes_schema = false;
+            let mut schema_after: Option<Arc<Schema>> = None;
+            // Debug-only guard for the writer's schema-first invariant.
+            #[cfg(debug_assertions)]
+            let mut seen_data_op = false;
+
+            for parsed_op in frame {
+                let touches_schema = matches!(
+                    &parsed_op,
+                    ParsedOp::UpsertTable { rowid, .. } | ParsedOp::DeleteTable { rowid, .. }
+                        if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
+                );
+                if touches_schema {
+                    // The writer emits all schema ops before any data/index op,
+                    // so a schema op after a data op means a malformed frame.
+                    #[cfg(debug_assertions)]
+                    assert!(
+                        !seen_data_op,
+                        "logical-log frame has a sqlite_schema op after a data/index op"
+                    );
+                    if !frame_changes_schema {
+                        // First schema op of a schema-changing frame: drop
+                        // IndexInfo cached from earlier frames so this frame
+                        // chooses from its own before/after schema pair.
+                        frame_changes_schema = true;
+                        index_infos.clear();
                     }
-                    ParsedOp::DeleteTable { rowid, .. }
-                        if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID =>
+                } else {
+                    if frame_changes_schema && schema_after.is_none() {
+                        // Schema prefix complete: every sqlite_schema row for
+                        // this frame is now applied to `schema_rows`. Build the
+                        // post-frame schema once, before decoding any index op.
+                        schema_after = Some(build_schema(&schema_rows)?);
+                    }
+                    #[cfg(debug_assertions)]
                     {
-                        let schema_rows_after =
-                            schema_rows_after.get_or_insert_with(|| schema_rows.clone());
-                        schema_rows_after.remove(&rowid.row_id.to_int_or_panic());
+                        seen_data_op = true;
                     }
-                    _ => {}
                 }
-            }
-            // schema_rows_after is Some if the frame changes the schema
-            let schema_rows_after = schema_rows_after;
 
-            let schema_after = match schema_rows_after.as_ref() {
-                Some(schema_rows_after) => Some(build_schema(schema_rows_after)?),
-                None => None,
-            };
-
-            if schema_rows_after.is_some() {
-                // Cached IndexInfo values are tied to a specific schema. Clear
-                // before decoding a schema-changing frame so this frame chooses
-                // from its own before/after schema pair.
-                index_infos.clear();
-            }
-
-            {
-                let should_skip_index_op = |parsed_op: &ParsedOp| -> bool {
-                    let Some(schema_after) = schema_after.as_ref() else {
-                        return false;
-                    };
-
-                    match parsed_op {
-                        ParsedOp::UpsertIndex { table_id, .. } => {
-                            let root_page = root_page_for_index(*table_id);
-                            !schema_has_index_root(schema_after, root_page)
-                        }
-                        ParsedOp::DeleteIndex { table_id, .. } => {
-                            let root_page = root_page_for_index(*table_id);
-                            !schema_has_index_root(&current_schema, root_page)
-                        }
-                        _ => false,
+                // Some index writes are real while the transaction is running
+                // but have no meaning at either durable boundary, so skip them
+                // before decoding:
+                //
+                // - UPSERT_INDEX for an index gone after the frame (e.g. UPDATE
+                //   writes into idx_old, then DROP INDEX idx_old before COMMIT):
+                //   the post-frame schema has no CREATE INDEX text for it and it
+                //   cannot survive the transaction.
+                // - DELETE_INDEX for an index created earlier in the same frame:
+                //   there was no pre-frame entry in the db file, so it is a no-op.
+                let skip_index_op = match &parsed_op {
+                    ParsedOp::UpsertIndex { table_id, .. } => {
+                        schema_after.as_ref().is_some_and(|after| {
+                            !schema_has_index_root(after, root_page_for_index(*table_id))
+                        })
                     }
+                    ParsedOp::DeleteIndex { table_id, .. } => {
+                        schema_after.as_ref().is_some_and(|_| {
+                            !schema_has_index_root(&current_schema, root_page_for_index(*table_id))
+                        })
+                    }
+                    _ => false,
                 };
+                if skip_index_op {
+                    continue;
+                }
 
+                // Index log records store only encoded key bytes plus an index
+                // root page. Pick the schema view that owns the entry at the
+                // frame boundary: surviving UPSERT_INDEX entries against the
+                // post-frame schema, DELETE_INDEX entries against the pre-frame
+                // schema. Without a schema change `current_schema` is both views.
                 let mut get_index_info = |index_id: MVTableId,
                                           op_kind: IndexOpKind|
                  -> Result<Arc<IndexInfo>> {
@@ -6164,28 +6172,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         .transpose()?
                         .flatten();
 
-                    // The logical log tells us whether an index entry is being
-                    // inserted or deleted, but it stores only encoded key bytes
-                    // plus the index root page. The recovery loop below skips
-                    // index ops that cannot affect the final state of this
-                    // frame before those bytes are decoded. For the remaining
-                    // ops, pick the schema view that owns the entry at the
-                    // frame boundary:
-                    //
-                    // - UPSERT_INDEX writes an entry that survives after the
-                    //   transaction. In a schema-changing frame, the index must
-                    //   exist in the post-frame schema.
-                    // - DELETE_INDEX removes an entry that existed before the
-                    //   transaction. In a schema-changing frame, the index must
-                    //   exist in the pre-frame schema.
-                    // - If the frame does not change schema, `current_schema` is
-                    //   both the before and after schema.
-                    let index_info = match op_kind {
+                    let chosen = match op_kind {
                         IndexOpKind::Upsert if schema_after.is_some() => after,
                         IndexOpKind::Delete if schema_after.is_some() => before,
                         IndexOpKind::Upsert | IndexOpKind::Delete => before,
-                    }
-                    .ok_or_else(|| {
+                    };
+                    let index_info = chosen.ok_or_else(|| {
                         let expected_schema = match op_kind {
                             IndexOpKind::Upsert if schema_after.is_some() => "post-frame",
                             IndexOpKind::Delete if schema_after.is_some() => "pre-frame",
@@ -6198,339 +6190,311 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     index_infos.insert((index_id, op_kind), index_info.clone());
                     Ok(index_info)
                 };
+                let next_rec = reader.parsed_op_to_streaming(parsed_op, &mut get_index_info)?;
 
-                for parsed_op in frame {
-                    // Some index writes are real while the transaction is
-                    // running, but have no meaning at either durable boundary.
-                    //
-                    // Example: UPDATE a row so it writes a new entry into
-                    // idx_old, then DROP INDEX idx_old before COMMIT. The
-                    // UPSERT_INDEX for idx_old is not part of the database
-                    // after the transaction, and the post-frame schema no
-                    // longer has CREATE INDEX text for idx_old. Decoding it
-                    // against the pre-frame schema would preserve an index
-                    // entry for an index that was dropped. Decoding it against
-                    // the post-frame schema is impossible. The correct action
-                    // is to skip it.
-                    //
-                    // The opposite case is a DELETE_INDEX for an index created
-                    // earlier in the same frame. There was no pre-frame index
-                    // entry in the database file, so that delete also has no
-                    // durable work to do.
-                    if should_skip_index_op(&parsed_op) {
-                        continue;
-                    }
+                tracing::trace!("next_rec {next_rec:?}");
 
-                    let next_rec = reader.parsed_op_to_streaming(parsed_op, &mut get_index_info)?;
-
-                    tracing::trace!("next_rec {next_rec:?}");
-
-                    match next_rec {
-                        StreamingResult::UpsertTableRow {
-                            row,
-                            rowid,
-                            commit_ts,
-                            btree_resident,
-                        } => {
-                            max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
-                            if commit_ts <= replay_cutoff_ts {
-                                continue;
+                match next_rec {
+                    StreamingResult::UpsertTableRow {
+                        row,
+                        rowid,
+                        commit_ts,
+                        btree_resident,
+                    } => {
+                        max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
+                        if commit_ts <= replay_cutoff_ts {
+                            continue;
+                        }
+                        let is_schema_row = rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
+                        if is_schema_row {
+                            let row_data = row.payload().to_vec();
+                            let record = ImmutableRecord::from_bin_record(row_data);
+                            if record.column_count() < 5 {
+                                return Err(LimboError::Corrupt(format!(
+                                    "sqlite_schema row must have at least 5 columns, got {}",
+                                    record.column_count()
+                                )));
                             }
-                            let is_schema_row = rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
-                            if is_schema_row {
-                                let row_data = row.payload().to_vec();
-                                let record = ImmutableRecord::from_bin_record(row_data);
-                                if record.column_count() < 5 {
+                            let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
+                                return Err(LimboError::Corrupt(
+                                    "sqlite_schema type must be text".to_string(),
+                                ));
+                            };
+                            let row_type = row_type.as_str();
+                            let val = match record.get_value_opt(3) {
+                                Some(v) => v,
+                                None => {
+                                    return Err(LimboError::InternalError(
+                                        "Expected at least 5 columns in sqlite_schema".to_string(),
+                                    ));
+                                }
+                            };
+                            let ValueRef::Numeric(crate::numeric::Numeric::Integer(root_page)) =
+                                val
+                            else {
+                                panic!("Expected integer value for root page, got {val:?}");
+                            };
+                            let sql = match record.get_value_opt(4) {
+                                Some(ValueRef::Text(v)) => Some(v.as_str()),
+                                _ => None,
+                            };
+                            let is_virtual_table = row_type == "table"
+                                && sql.is_some_and(|sql| {
+                                    contains_ignore_ascii_case!(sql.as_bytes(), b"create virtual")
+                                });
+                            let has_btree = match row_type {
+                                "index" => true,
+                                "table" => !is_virtual_table,
+                                _ => false,
+                            };
+                            if has_btree {
+                                if root_page == 0 {
                                     return Err(LimboError::Corrupt(format!(
-                                        "sqlite_schema row must have at least 5 columns, got {}",
-                                        record.column_count()
+                                        "sqlite_schema root_page=0 for btree {row_type}"
                                     )));
                                 }
-                                let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
-                                    return Err(LimboError::Corrupt(
-                                        "sqlite_schema type must be text".to_string(),
-                                    ));
-                                };
-                                let row_type = row_type.as_str();
-                                let val = match record.get_value_opt(3) {
-                                    Some(v) => v,
-                                    None => {
-                                        return Err(LimboError::InternalError(
-                                            "Expected at least 5 columns in sqlite_schema"
-                                                .to_string(),
-                                        ));
-                                    }
-                                };
-                                let ValueRef::Numeric(crate::numeric::Numeric::Integer(root_page)) =
-                                    val
-                                else {
-                                    panic!("Expected integer value for root page, got {val:?}");
-                                };
-                                let sql = match record.get_value_opt(4) {
-                                    Some(ValueRef::Text(v)) => Some(v.as_str()),
-                                    _ => None,
-                                };
-                                let is_virtual_table = row_type == "table"
-                                    && sql.is_some_and(|sql| {
-                                        contains_ignore_ascii_case!(
-                                            sql.as_bytes(),
-                                            b"create virtual"
-                                        )
-                                    });
-                                let has_btree = match row_type {
-                                    "index" => true,
-                                    "table" => !is_virtual_table,
-                                    _ => false,
-                                };
-                                if has_btree {
-                                    if root_page == 0 {
-                                        return Err(LimboError::Corrupt(format!(
-                                            "sqlite_schema root_page=0 for btree {row_type}"
-                                        )));
-                                    }
-                                    if root_page < 0 {
-                                        let table_id = self.get_table_id_from_root_page(root_page);
-                                        if let Some(entry) =
-                                            self.table_id_to_rootpage.get(&table_id)
-                                        {
-                                            if let Some(value) = *entry.value() {
-                                                panic!("Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}");
-                                            }
+                                if root_page < 0 {
+                                    let table_id = self.get_table_id_from_root_page(root_page);
+                                    if let Some(entry) = self.table_id_to_rootpage.get(&table_id) {
+                                        if let Some(value) = *entry.value() {
+                                            panic!("Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}");
                                         }
-                                        self.insert_table_id_to_rootpage(table_id, None);
-                                    } else {
-                                        dropped_root_pages.remove(&root_page);
-                                        let table_id = self.get_table_id_from_root_page(root_page);
-                                        let Some(entry) = self.table_id_to_rootpage.get(&table_id)
-                                        else {
-                                            panic!("Logical log contains root page reference {root_page} that does not exist in the table_id_to_rootpage map");
-                                        };
-                                        let Some(value) = *entry.value() else {
-                                            panic!("Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map");
-                                        };
-                                        turso_assert_eq!(value, root_page as u64, "logical log root page does not match table_id_to_rootpage map", { "root_page": root_page, "map_value": value });
                                     }
-                                } else if root_page != 0 {
-                                    return Err(LimboError::Corrupt(format!(
-                                "sqlite_schema root_page must be 0 for {row_type}, got {root_page}"
-                            )));
-                                }
-                                let rowid_int = rowid.row_id.to_int_or_panic();
-                                schema_rows.insert(rowid_int, record);
-                            } else if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
-                                // Data row references a table_id not yet in the map. This can happen
-                                // with logs written before the schema-first serialization fix: in a
-                                // same-transaction CREATE TABLE + INSERT + DROP TABLE, data rows were
-                                // serialized before the schema INSERT that registers the table_id.
-                                // The schema INSERT (or DELETE) for this table will follow later in
-                                // this transaction frame, so we register the table_id now.
-                                self.insert_table_id_to_rootpage(rowid.table_id, None);
-                            }
-
-                            let version_id = self.get_version_id();
-                            let row_version = RowVersion {
-                                id: version_id,
-                                begin: Some(TxTimestampOrID::Timestamp(commit_ts)),
-                                end: None,
-                                row: row.clone(),
-                                btree_resident,
-                            };
-                            {
-                                let versions = self.rows.get_or_insert_with(rowid.clone(), || {
-                                    Arc::new(RwLock::new(Vec::new()))
-                                });
-                                let mut versions = versions.value().write();
-                                self.insert_version_raw(&mut versions, row_version);
-                            }
-                            let allocator = self.get_rowid_allocator(&rowid.table_id);
-                            allocator.insert_row_id_maybe_update(rowid.row_id.to_int_or_panic());
-                        }
-                        StreamingResult::DeleteTableRow {
-                            rowid,
-                            commit_ts,
-                            btree_resident,
-                        } => {
-                            max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
-                            if commit_ts <= replay_cutoff_ts {
-                                continue;
-                            }
-                            if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
-                                // See comment in UpsertTableRow: old logs may have data rows
-                                // serialized before the schema INSERT that registers the table_id.
-                                self.insert_table_id_to_rootpage(rowid.table_id, None);
-                            }
-                            let tombstone_row = if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                let rowid_int = rowid.row_id.to_int_or_panic();
-                                if let Some(record) = schema_rows.get(&rowid_int) {
-                                    // Preserve the pre-delete sqlite_schema record in recovered
-                                    // tombstones so checkpoint can still recover B-tree identity.
-                                    Row::new_table_row(
-                                        rowid.clone(),
-                                        record.as_blob().clone(),
-                                        record.column_count(),
-                                    )
+                                    self.insert_table_id_to_rootpage(table_id, None);
                                 } else {
-                                    Row::new_table_row(rowid.clone(), Vec::new(), 0)
+                                    dropped_root_pages.remove(&root_page);
+                                    let table_id = self.get_table_id_from_root_page(root_page);
+                                    let Some(entry) = self.table_id_to_rootpage.get(&table_id)
+                                    else {
+                                        panic!("Logical log contains root page reference {root_page} that does not exist in the table_id_to_rootpage map");
+                                    };
+                                    let Some(value) = *entry.value() else {
+                                        panic!("Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map");
+                                    };
+                                    turso_assert_eq!(value, root_page as u64, "logical log root page does not match table_id_to_rootpage map", { "root_page": root_page, "map_value": value });
                                 }
+                            } else if root_page != 0 {
+                                return Err(LimboError::Corrupt(format!(
+                            "sqlite_schema root_page must be 0 for {row_type}, got {root_page}"
+                        )));
+                            }
+                            let rowid_int = rowid.row_id.to_int_or_panic();
+                            schema_rows.insert(rowid_int, record);
+                        } else if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
+                            // Data row references a table_id not yet in the map. This can happen
+                            // with logs written before the schema-first serialization fix: in a
+                            // same-transaction CREATE TABLE + INSERT + DROP TABLE, data rows were
+                            // serialized before the schema INSERT that registers the table_id.
+                            // The schema INSERT (or DELETE) for this table will follow later in
+                            // this transaction frame, so we register the table_id now.
+                            self.insert_table_id_to_rootpage(rowid.table_id, None);
+                        }
+
+                        let version_id = self.get_version_id();
+                        let row_version = RowVersion {
+                            id: version_id,
+                            begin: Some(TxTimestampOrID::Timestamp(commit_ts)),
+                            end: None,
+                            row: row.clone(),
+                            btree_resident,
+                        };
+                        {
+                            let versions = self.rows.get_or_insert_with(rowid.clone(), || {
+                                Arc::new(RwLock::new(Vec::new()))
+                            });
+                            let mut versions = versions.value().write();
+                            self.insert_version_raw(&mut versions, row_version);
+                        }
+                        let allocator = self.get_rowid_allocator(&rowid.table_id);
+                        allocator.insert_row_id_maybe_update(rowid.row_id.to_int_or_panic());
+                    }
+                    StreamingResult::DeleteTableRow {
+                        rowid,
+                        commit_ts,
+                        btree_resident,
+                    } => {
+                        max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
+                        if commit_ts <= replay_cutoff_ts {
+                            continue;
+                        }
+                        if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
+                            // See comment in UpsertTableRow: old logs may have data rows
+                            // serialized before the schema INSERT that registers the table_id.
+                            self.insert_table_id_to_rootpage(rowid.table_id, None);
+                        }
+                        let tombstone_row = if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                            let rowid_int = rowid.row_id.to_int_or_panic();
+                            if let Some(record) = schema_rows.get(&rowid_int) {
+                                // Preserve the pre-delete sqlite_schema record in recovered
+                                // tombstones so checkpoint can still recover B-tree identity.
+                                Row::new_table_row(
+                                    rowid.clone(),
+                                    record.as_blob().clone(),
+                                    record.column_count(),
+                                )
                             } else {
                                 Row::new_table_row(rowid.clone(), Vec::new(), 0)
-                            };
-                            if let Some(versions) = self.rows.get(&rowid) {
-                                // Row exists in memory — try to find the current (non-ended) version
-                                // that was committed before this delete, and mark it as ended. If no
-                                // such version exists (e.g. it was already GC'd or this is a B-tree
-                                // resident row not yet in memory), insert a tombstone instead.
-                                let mut versions = versions.value().write();
-                                if let Some(existing) = versions.iter_mut().rev().find(|rv| {
-                            rv.end.is_none()
-                                && matches!(rv.begin, Some(TxTimestampOrID::Timestamp(b)) if b < commit_ts)
-                        }) {
-                            existing.end = Some(TxTimestampOrID::Timestamp(commit_ts));
+                            }
+                        } else {
+                            Row::new_table_row(rowid.clone(), Vec::new(), 0)
+                        };
+                        if let Some(versions) = self.rows.get(&rowid) {
+                            // Row exists in memory — try to find the current (non-ended) version
+                            // that was committed before this delete, and mark it as ended. If no
+                            // such version exists (e.g. it was already GC'd or this is a B-tree
+                            // resident row not yet in memory), insert a tombstone instead.
+                            let mut versions = versions.value().write();
+                            if let Some(existing) = versions.iter_mut().rev().find(|rv| {
+                        rv.end.is_none()
+                            && matches!(rv.begin, Some(TxTimestampOrID::Timestamp(b)) if b < commit_ts)
+                    }) {
+                        existing.end = Some(TxTimestampOrID::Timestamp(commit_ts));
+                    } else {
+                        let version_id = self.get_version_id();
+                        let row_version = RowVersion {
+                            id: version_id,
+                            begin: None,
+                            end: Some(TxTimestampOrID::Timestamp(commit_ts)),
+                            row: tombstone_row.clone(),
+                            btree_resident,
+                        };
+                        self.insert_version_raw(&mut versions, row_version);
+                    }
                         } else {
                             let version_id = self.get_version_id();
                             let row_version = RowVersion {
                                 id: version_id,
                                 begin: None,
                                 end: Some(TxTimestampOrID::Timestamp(commit_ts)),
-                                row: tombstone_row.clone(),
+                                row: tombstone_row,
                                 btree_resident,
                             };
+                            let versions = self.rows.get_or_insert_with(rowid.clone(), || {
+                                Arc::new(RwLock::new(Vec::new()))
+                            });
+                            let mut versions = versions.value().write();
                             self.insert_version_raw(&mut versions, row_version);
                         }
-                            } else {
-                                let version_id = self.get_version_id();
-                                let row_version = RowVersion {
-                                    id: version_id,
-                                    begin: None,
-                                    end: Some(TxTimestampOrID::Timestamp(commit_ts)),
-                                    row: tombstone_row,
-                                    btree_resident,
-                                };
-                                let versions = self.rows.get_or_insert_with(rowid.clone(), || {
-                                    Arc::new(RwLock::new(Vec::new()))
-                                });
+                        if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                            let rowid_int = rowid.row_id.to_int_or_panic();
+                            let Some(record) = schema_rows.get(&rowid_int) else {
+                                // this can happen if a row in sqlite_schema was inserted and then
+                                // deleted in the same transaction (ex: a CREATE TABLE followed by a DROP TABLE)
+                                continue;
+                            };
+                            if record.column_count() < 5 {
+                                return Err(LimboError::Corrupt(format!(
+                                    "sqlite_schema row must have at least 5 columns, got {}",
+                                    record.column_count()
+                                )));
+                            }
+                            let (
+                                ValueRef::Text(row_type),
+                                ValueRef::Numeric(Numeric::Integer(root_page)),
+                            ) = record.get_two_values(0, 3)?
+                            else {
+                                return Err(LimboError::Corrupt(
+                                    "sqlite_schema type and root_page must be text and integer"
+                                        .to_string(),
+                                ));
+                            };
+                            let row_type = row_type.as_str();
+                            if (row_type == "table" || row_type == "index") && root_page > 0 {
+                                dropped_root_pages.insert(root_page);
+                            }
+                            schema_rows.remove(&rowid_int);
+                        }
+                    }
+                    StreamingResult::UpsertIndexRow {
+                        row,
+                        rowid,
+                        commit_ts,
+                        btree_resident,
+                    } => {
+                        max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
+                        if commit_ts <= replay_cutoff_ts {
+                            continue;
+                        }
+                        let version_id = self.get_version_id();
+                        let row_version = RowVersion {
+                            id: version_id,
+                            begin: Some(TxTimestampOrID::Timestamp(commit_ts)),
+                            end: None,
+                            row: row.clone(),
+                            btree_resident,
+                        };
+                        let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
+                            panic!("Index writes must be to a record");
+                        };
+                        self.insert_index_version(
+                            rowid.table_id,
+                            Arc::new(sortable_key),
+                            row_version,
+                        );
+                    }
+                    StreamingResult::DeleteIndexRow {
+                        row,
+                        rowid,
+                        commit_ts,
+                        btree_resident,
+                    } => {
+                        max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
+                        if commit_ts <= replay_cutoff_ts {
+                            continue;
+                        }
+                        let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
+                            panic!("Index writes must be to a record");
+                        };
+                        let sortable_key =
+                            self.get_or_create_index_key_arc(rowid.table_id, sortable_key);
+                        if let Some(index_map) = self.index_rows.get(&rowid.table_id) {
+                            if let Some(versions) = index_map.value().get(&sortable_key) {
                                 let mut versions = versions.value().write();
-                                self.insert_version_raw(&mut versions, row_version);
-                            }
-                            if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                let rowid_int = rowid.row_id.to_int_or_panic();
-                                let Some(record) = schema_rows.get(&rowid_int) else {
-                                    // this can happen if a row in sqlite_schema was inserted and then
-                                    // deleted in the same transaction (ex: a CREATE TABLE followed by a DROP TABLE)
-                                    continue;
-                                };
-                                if record.column_count() < 5 {
-                                    return Err(LimboError::Corrupt(format!(
-                                        "sqlite_schema row must have at least 5 columns, got {}",
-                                        record.column_count()
-                                    )));
-                                }
-                                let (
-                                    ValueRef::Text(row_type),
-                                    ValueRef::Numeric(Numeric::Integer(root_page)),
-                                ) = record.get_two_values(0, 3)?
-                                else {
-                                    return Err(LimboError::Corrupt(
-                                        "sqlite_schema type and root_page must be text and integer"
-                                            .to_string(),
-                                    ));
-                                };
-                                let row_type = row_type.as_str();
-                                if (row_type == "table" || row_type == "index") && root_page > 0 {
-                                    dropped_root_pages.insert(root_page);
-                                }
-                                schema_rows.remove(&rowid_int);
+                                if let Some(existing) = versions.iter_mut().rev().find(|rv| {
+                            rv.end.is_none()
+                                && matches!(rv.begin, Some(TxTimestampOrID::Timestamp(b)) if b < commit_ts)
+                        }) {
+                            existing.end = Some(TxTimestampOrID::Timestamp(commit_ts));
+                            continue;
+                        }
                             }
                         }
-                        StreamingResult::UpsertIndexRow {
-                            row,
-                            rowid,
-                            commit_ts,
+                        let version_id = self.get_version_id();
+                        let row_version = RowVersion {
+                            id: version_id,
+                            begin: None,
+                            end: Some(TxTimestampOrID::Timestamp(commit_ts)),
+                            row: row.clone(),
                             btree_resident,
-                        } => {
-                            max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
-                            if commit_ts <= replay_cutoff_ts {
-                                continue;
-                            }
-                            let version_id = self.get_version_id();
-                            let row_version = RowVersion {
-                                id: version_id,
-                                begin: Some(TxTimestampOrID::Timestamp(commit_ts)),
-                                end: None,
-                                row: row.clone(),
-                                btree_resident,
-                            };
-                            let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
-                                panic!("Index writes must be to a record");
-                            };
-                            self.insert_index_version(
-                                rowid.table_id,
-                                Arc::new(sortable_key),
-                                row_version,
-                            );
+                        };
+                        self.insert_index_version(rowid.table_id, sortable_key, row_version);
+                    }
+                    StreamingResult::UpdateHeader { header, commit_ts } => {
+                        max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
+                        if commit_ts <= replay_cutoff_ts {
+                            continue;
                         }
-                        StreamingResult::DeleteIndexRow {
-                            row,
-                            rowid,
-                            commit_ts,
-                            btree_resident,
-                        } => {
-                            max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
-                            if commit_ts <= replay_cutoff_ts {
-                                continue;
-                            }
-                            let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
-                                panic!("Index writes must be to a record");
-                            };
-                            let sortable_key =
-                                self.get_or_create_index_key_arc(rowid.table_id, sortable_key);
-                            if let Some(index_map) = self.index_rows.get(&rowid.table_id) {
-                                if let Some(versions) = index_map.value().get(&sortable_key) {
-                                    let mut versions = versions.value().write();
-                                    if let Some(existing) = versions.iter_mut().rev().find(|rv| {
-                                rv.end.is_none()
-                                    && matches!(rv.begin, Some(TxTimestampOrID::Timestamp(b)) if b < commit_ts)
-                            }) {
-                                existing.end = Some(TxTimestampOrID::Timestamp(commit_ts));
-                                continue;
-                            }
-                                }
-                            }
-                            let version_id = self.get_version_id();
-                            let row_version = RowVersion {
-                                id: version_id,
-                                begin: None,
-                                end: Some(TxTimestampOrID::Timestamp(commit_ts)),
-                                row: row.clone(),
-                                btree_resident,
-                            };
-                            self.insert_index_version(rowid.table_id, sortable_key, row_version);
-                        }
-                        StreamingResult::UpdateHeader { header, commit_ts } => {
-                            max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
-                            if commit_ts <= replay_cutoff_ts {
-                                continue;
-                            }
-                            // Recovery applies only post-boundary header ops; the same value is later
-                            // staged to pager page-1 during checkpoint.
-                            self.global_header.write().replace(header);
-                        }
-                        StreamingResult::Eof => {
-                            unreachable!("next_frame does not return EOF records");
-                        }
+                        // Recovery applies only post-boundary header ops; the same value is later
+                        // staged to pager page-1 during checkpoint.
+                        self.global_header.write().replace(header);
+                    }
+                    StreamingResult::Eof => {
+                        unreachable!("next_frame does not return EOF records");
                     }
                 }
             }
 
-            if schema_rows_after.is_some() {
+            // A pure-DDL frame (schema ops only, with no following data/index op to
+            // trigger the boundary build above) still needs its post-frame schema.
+            if frame_changes_schema && schema_after.is_none() {
+                schema_after = Some(build_schema(&schema_rows)?);
+            }
+            if frame_changes_schema {
                 // Now that all table and index ops from this transaction have
                 // been replayed, publish the frame's final schema. No later index
                 // op from this frame can observe a half-applied sqlite_schema.
-                let schema_rows_after =
-                    schema_rows_after.expect("schema_rows_after must exist when schema changed");
-                let schema_after = schema_after
-                    .expect("schema_after must exist when frame_changes_schema is true");
-                schema_rows = schema_rows_after;
+                let schema_after =
+                    schema_after.expect("schema_after must exist when frame changes schema");
                 install_schema(schema_after.clone());
                 current_schema = schema_after;
                 // The frame may have decoded DROP INDEX entries using the
