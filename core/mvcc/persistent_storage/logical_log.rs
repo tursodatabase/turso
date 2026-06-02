@@ -1711,10 +1711,7 @@ pub(in crate::mvcc) mod reader {
 
     #[derive(Debug)]
     enum StreamingState {
-        /// We are positioned at the start of a transaction frame. This state parses frame metadata.
         ParsingFrameHeader,
-        /// We are parsing a record in a transaction frame. The reader then transitions to
-        /// [Self::ParsingFrameHeader] if there are more frames to parse, and [Self::Finished] otherwise.
         ParsingRecord {
             record_idx: usize,
             payload_bytes_read: usize,
@@ -1733,7 +1730,6 @@ pub(in crate::mvcc) mod reader {
             /// ops begin. The extension block is encrypted together with the recovery payload, so it
             /// is consumed from the front of the decrypted plaintext during recovery and discarded.
             extension_skipped: usize,
-            /// Bytes belonging to the start of a ParsedOp leftover from the last decrypted chunk.
             carry: Vec<u8>,
             /// One chunk may contain multiple ops, but [FrameIterator] only yield one at a time, so we
             /// push ops to the back of this queue when parsing, and pop from the front when yielding.
@@ -1744,13 +1740,10 @@ pub(in crate::mvcc) mod reader {
             payload_bytes_read: usize,
             header_bytes: [u8; TX_HEADER_SIZE],
         },
-        /// We have finished parsing a frame, and a new FrameIterator
-        /// needs to be retrieved from [StreamingLogicalLogReader].
         FinishedFrame {
             frame_info: FrameInfo,
             header_bytes: [u8; TX_HEADER_SIZE],
         },
-        /// The complete logical log has been parsed
         Finished,
     }
 
@@ -1794,11 +1787,9 @@ pub(in crate::mvcc) mod reader {
 
     pub struct StreamingLogicalLogReader {
         cursor: cursor::LogCursor,
-        /// Log Header
         header: Option<LogHeader>,
         state: StreamingState,
-        /// Byte offset of the end of the last fully validated transaction frame. Used during
-        /// recovery to set the writer offset so that torn-tail bytes are overwritten on next append.
+        /// Offset of the end of the last fully validated frame.
         last_valid_offset: usize,
         encryption_ctx: Option<EncryptionContext>,
         /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
@@ -1807,7 +1798,6 @@ pub(in crate::mvcc) mod reader {
         // Reused scratch buffer for decrypted chunk plaintext. Kept on the reader so encrypted
         // recovery can reuse the allocation across chunks and transaction frames.
         scratch_buffer: Vec<u8>,
-        /// Running CRC state for chained checksum validation. Seeded from the header salt.
         running_crc: crc::RunningCrc,
     }
 
@@ -1835,12 +1825,6 @@ pub(in crate::mvcc) mod reader {
             }
         }
 
-        /// Parse a single ParsedOp.
-        ///
-        /// Streams the op field-by-field into a contiguous buffer and decodes it with the shared
-        /// [try_parse_one_op_from_buf], so the unencrypted recovery path produces ops identical to
-        /// the encrypted path. A short read at any field means a torn tail: stop scanning and keep
-        /// the frames parsed so far.
         pub(crate) fn parse_op(
             &mut self,
             io: &Arc<dyn crate::IO>,
@@ -2018,15 +2002,10 @@ pub(in crate::mvcc) mod reader {
             self.header.as_ref()
         }
 
-        /// Returns the byte offset just past the last fully validated transaction frame.
-        /// After recovery, the log writer should resume from this offset so any torn-tail
-        /// bytes beyond it are overwritten by the next append.
         pub fn last_valid_offset(&self) -> usize {
             self.last_valid_offset
         }
 
-        /// Returns the running CRC state after all validated frames. Used during recovery
-        /// to hand off the chain state to the writer so it can continue appending.
         pub fn running_crc(&self) -> u32 {
             self.running_crc.pos_at_last_valid_frame()
         }
@@ -2170,9 +2149,6 @@ pub(in crate::mvcc) mod reader {
                 }
             };
 
-            // Stop scanning at the first structurally invalid frame, preserving everything parsed
-            // so far. This mirrors WAL prefix semantics: a torn or corrupt tail is treated as the
-            // end of the valid log rather than a hard error.
             macro_rules! stop_scanning {
                 () => {{
                     self.last_valid_offset = frame_start;
@@ -2182,9 +2158,10 @@ pub(in crate::mvcc) mod reader {
             }
 
             // TX HEADER v2 layout (24 bytes):
-            //   FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
-            // LML3 extension frames use EXT_FRAME_MAGIC and append a 16-byte tail:
-            //   extension_size(8) | extension_record_count(4) | frame_flags(4)
+            // FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
+            //
+            // TX HEADER v3 extension frames append:
+            // extension_size(8) | extension_record_count(4) | frame_flags(4)
             let frame_magic = u32::from_le_bytes([
                 header_bytes[0],
                 header_bytes[1],

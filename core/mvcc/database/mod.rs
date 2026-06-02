@@ -6080,6 +6080,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let frame_commit_ts = frame_iter.commit_ts();
             max_commit_ts_seen = max_commit_ts_seen.max(frame_commit_ts);
             if frame_commit_ts <= replay_cutoff_ts {
+                //FIXME instead, we need to skip the frame!
                 // This frame is at or below the durable metadata boundary, so its effects are
                 // already persisted; do not replay it. The streaming reader only advances past a
                 // frame once its records are consumed, so drive the iterator to the end (validating
