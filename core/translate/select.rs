@@ -423,12 +423,47 @@ fn prepare_one_select_plan(
                             BindingBehavior::ResultColumnsNotAllowed,
                         )?;
                     }
+                    if let Some(base_name) = window_def.window.base.as_ref() {
+                        let base_name = normalize_ident(base_name.as_str());
+                        // SQLite chains WINDOW-clause definitions only to an
+                        // earlier definition. An unresolved base here is left
+                        // alone and may still be used as an ordinary name.
+                        if let Some(base) = named_windows
+                            .iter()
+                            .rfind(|window| window.name == base_name)
+                        {
+                            if !partition_by.is_empty() {
+                                crate::bail_parse_error!(
+                                    "cannot override PARTITION clause of window: {base_name}"
+                                );
+                            }
+                            if base.has_frame_clause {
+                                crate::bail_parse_error!(
+                                    "cannot override frame specification of window: {base_name}"
+                                );
+                            }
+                            let base_bound = base
+                                .bound
+                                .as_ref()
+                                .expect("named windows are bound before functions are resolved");
+                            if !base_bound.order_by.is_empty() && !order_by.is_empty() {
+                                crate::bail_parse_error!(
+                                    "cannot override ORDER BY clause of window: {base_name}"
+                                );
+                            }
+                            partition_by.clone_from(&base_bound.partition_by);
+                            if order_by.is_empty() {
+                                order_by.clone_from(&base_bound.order_by);
+                            }
+                        }
+                    }
                     named_windows.push(NamedWindowDef {
                         name,
                         bound: Some(NamedWindowBound {
                             partition_by,
                             order_by,
                         }),
+                        has_frame_clause: window_def.window.frame_clause.is_some(),
                     });
                 }
             }
