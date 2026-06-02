@@ -693,3 +693,68 @@ test percentile-constant-expr-fraction-out-of-range-empty {
 }
 expect error {
 }
+
+# A NULL fraction propagates to a NULL result, matching PostgreSQL. This holds
+# for populated, empty, and correlated-empty input alike.
+@setup nums
+test percentile-cont-null-fraction-is-null {
+    SELECT typeof(percentile_cont(NULL) WITHIN GROUP (ORDER BY x)) FROM t;
+}
+expect {
+    null
+}
+
+@setup nums
+test percentile-disc-null-fraction-is-null {
+    SELECT typeof(percentile_disc(NULL) WITHIN GROUP (ORDER BY x)) FROM t;
+}
+expect {
+    null
+}
+
+@setup nums
+test percentile-null-fraction-empty-input-is-null {
+    SELECT typeof(percentile_cont(NULL) WITHIN GROUP (ORDER BY x)) FROM t WHERE x > 1000;
+}
+expect {
+    null
+}
+
+# A NULL fraction supplied via an outer (correlated) reference is also NULL.
+test percentile-correlated-null-fraction-is-null {
+    CREATE TABLE inner_t(g, x);
+    INSERT INTO inner_t VALUES (1, 10), (1, 20), (1, 30);
+    CREATE TABLE outer_t(id, frac);
+    INSERT INTO outer_t VALUES (1, NULL);
+    SELECT typeof((SELECT percentile_cont(outer_t.frac) WITHIN GROUP (ORDER BY x)
+                   FROM inner_t WHERE g = outer_t.id)) FROM outer_t;
+}
+expect {
+    null
+}
+
+# An out-of-range fraction supplied via a (correlated) outer reference errors
+# even when the inner aggregate sees zero rows. PG validates the direct
+# argument once per invocation, not per row.
+test percentile-correlated-bad-fraction-empty-inner-errors {
+    CREATE TABLE inner_t(g, x);
+    INSERT INTO inner_t VALUES (1, 10), (1, 20);
+    CREATE TABLE outer_t(id, bad);
+    INSERT INTO outer_t VALUES (1, 2.5);
+    SELECT (SELECT percentile_cont(outer_t.bad) WITHIN GROUP (ORDER BY x)
+            FROM inner_t WHERE g = 999) FROM outer_t;
+}
+expect error {
+}
+
+# Same with all-NULL inner values: the fraction is still validated.
+test percentile-correlated-bad-fraction-all-null-inner-errors {
+    CREATE TABLE inner_t(x);
+    INSERT INTO inner_t VALUES (NULL), (NULL);
+    CREATE TABLE outer_t(id, bad);
+    INSERT INTO outer_t VALUES (1, 2.5);
+    SELECT (SELECT percentile_cont(outer_t.bad) WITHIN GROUP (ORDER BY x) FROM inner_t)
+    FROM outer_t;
+}
+expect error {
+}

@@ -1021,6 +1021,7 @@ fn emit_aggregation_step(
             AggArgumentSource::new_from_expression(agg_func, &args, &Distinctness::NonDistinct),
             reg_acc_start,
             resolver,
+            None,
         )?;
     }
 

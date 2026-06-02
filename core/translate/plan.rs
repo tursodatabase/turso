@@ -2901,6 +2901,10 @@ pub struct Aggregate {
     pub original_expr: ast::Expr,
     pub distinctness: Distinctness,
     pub filter_expr: Option<ast::Expr>,
+    /// For `percentile_cont`/`percentile_disc`: register holding the fraction
+    /// after it has been evaluated and range-checked once per invocation,
+    /// before the aggregate row loop. Populated by `InitLoop::emit`.
+    pub fraction_reg: Option<usize>,
 }
 
 impl Aggregate {
@@ -2917,6 +2921,7 @@ impl Aggregate {
             original_expr: expr.clone(),
             distinctness,
             filter_expr,
+            fraction_reg: None,
         }
     }
 

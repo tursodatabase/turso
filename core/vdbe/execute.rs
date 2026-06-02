@@ -6229,13 +6229,15 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
         }
         AggFunc::PercentileCont | AggFunc::PercentileDisc => {
             // payload: [0]=collation bits, [1]=count, [2]=fraction, [3..]=buffered values.
+            // The fraction was range-checked in translate (pre-loop), so it is
+            // here either NULL (→ NULL output, matching PG) or a valid number.
+            if matches!(payload[2], Value::Null) {
+                return Ok(Value::Null);
+            }
             let collation =
                 CollationSeq::from_storage_bits(payload[0].as_int().unwrap_or(0) as u16);
             let count = payload[1].as_int().unwrap_or(0) as usize;
-            // Validate the fraction even when no values were accumulated (e.g. all inputs
-            // were NULL); PostgreSQL reports a bad fraction regardless of row count.
-            // payload[2] is always present (init pushes collation/count/fraction slots).
-            let fraction = ordered_set_fraction(&payload[2])?;
+            let fraction = payload[2].as_float();
             if count == 0 {
                 Value::Null
             } else if 3 + count > payload.len() {
@@ -6321,25 +6323,6 @@ fn ordered_set_mode(values: &[Value], collation: CollationSeq) -> Value {
         i = j;
     }
     sorted[best_idx].clone()
-}
-
-/// Validates and extracts a percentile fraction, which must lie in `[0, 1]`.
-fn ordered_set_fraction(value: &Value) -> Result<f64> {
-    let fraction = match value {
-        Value::Numeric(Numeric::Integer(i)) => *i as f64,
-        Value::Numeric(Numeric::Float(f)) => f64::from(*f),
-        _ => {
-            return Err(LimboError::InvalidArgument(
-                "percentile fraction must be a number".to_string(),
-            ))
-        }
-    };
-    if !(0.0..=1.0).contains(&fraction) {
-        return Err(LimboError::InvalidArgument(format!(
-            "percentile value {fraction} is not between 0 and 1"
-        )));
-    }
-    Ok(fraction)
 }
 
 /// Continuous (interpolated) percentile of an ordered set.
