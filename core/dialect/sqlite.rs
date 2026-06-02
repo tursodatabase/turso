@@ -300,6 +300,18 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
             }
             Ok(Some(Func::Window(WindowFunc::Ntile)))
         }
+        "percent_rank" => {
+            if arg_count != 0 {
+                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+            }
+            Ok(Some(Func::Window(WindowFunc::PercentRank)))
+        }
+        "cume_dist" => {
+            if arg_count != 0 {
+                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+            }
+            Ok(Some(Func::Window(WindowFunc::CumeDist)))
+        }
         "timediff" => {
             if arg_count != 2 {
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)

@@ -1,0 +1,224 @@
+@database :memory:
+
+# cume_dist() computes (rows in groups ≤ current) / nTotal. Frame is
+# GROUPS 1 FOLLOWING TO UNBOUNDED FOLLOWING — the `1 FOLLOWING` means
+# AggInverse must fire for the current group BEFORE its xValue is read.
+# In the emitter this is the OP_IfPos countdown that skips the first
+# RETURN_ROW, plus the post-AGGINVERSE-EOF second loop that drains the
+# last group.
+
+setup vals5 {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1),(2),(3),(4),(5);
+}
+
+# 5 distinct rows → cume_dist = 1/5, 2/5, 3/5, 4/5, 5/5. Picked 5
+# because the denominator's nice and every value has a clean f64.
+@setup vals5
+test cume-dist-no-peers {
+    SELECT x, cume_dist() OVER (ORDER BY x) FROM t;
+}
+expect {
+    1|0.2
+    2|0.4
+    3|0.6
+    4|0.8
+    5|1.0
+}
+
+# Peer groups share the same cume_dist value, with the group size
+# contributing to nStep all at once.
+setup peers4 {
+    CREATE TABLE p(x INTEGER);
+    INSERT INTO p VALUES (1),(1),(2),(2);
+}
+
+@setup peers4
+test cume-dist-with-peers {
+    SELECT x, cume_dist() OVER (ORDER BY x) FROM p;
+}
+expect {
+    1|0.5
+    1|0.5
+    2|1.0
+    2|1.0
+}
+
+# Single row → cume_dist = 1.0 (the only row covers the whole partition).
+setup one_row {
+    CREATE TABLE r(x INTEGER);
+    INSERT INTO r VALUES (1);
+}
+
+@setup one_row
+test cume-dist-single-row {
+    SELECT cume_dist() OVER (ORDER BY x) FROM r;
+}
+expect {
+    1.0
+}
+
+# Empty table → no rows out.
+setup empty {
+    CREATE TABLE e(x INTEGER);
+}
+
+@setup empty
+test cume-dist-empty {
+    SELECT x, cume_dist() OVER (ORDER BY x) FROM e;
+}
+expect {
+}
+
+# All rows peers → all 1.0 (the entire partition is one group, and
+# every row's "groups ≤ current" includes everything).
+setup all_peers {
+    CREATE TABLE ap(x INTEGER);
+    INSERT INTO ap VALUES (1),(1),(1),(1);
+}
+
+@setup all_peers
+test cume-dist-all-peers {
+    SELECT cume_dist() OVER (ORDER BY x) FROM ap;
+}
+expect {
+    1.0
+    1.0
+    1.0
+    1.0
+}
+
+# PARTITION BY resets cume_dist within each partition — exercises the
+# countdown register reinit at the partition boundary.
+setup partitioned {
+    CREATE TABLE pa(g INTEGER, x INTEGER);
+    INSERT INTO pa VALUES (1,1),(1,2),(1,3),(1,4),(2,10),(2,20);
+}
+
+@setup partitioned
+test cume-dist-with-partition {
+    SELECT g, x, cume_dist() OVER (PARTITION BY g ORDER BY x) FROM pa;
+}
+expect {
+    1|1|0.25
+    1|2|0.5
+    1|3|0.75
+    1|4|1.0
+    2|10|0.5
+    2|20|1.0
+}
+
+# Combine partition resets with peer groups inside each partition —
+# exercises the countdown-reset + two-loop flush path against
+# nontrivial GROUPS frames in every partition.
+setup partitioned_peers {
+    CREATE TABLE pap(g INTEGER, x INTEGER);
+    INSERT INTO pap VALUES (1,1),(1,1),(1,2),(1,2),(2,5),(2,5),(2,9);
+}
+
+@setup partitioned_peers
+test cume-dist-with-partition-and-peers {
+    SELECT g, x, printf('%.4f', cume_dist() OVER (PARTITION BY g ORDER BY x)) FROM pap;
+}
+expect {
+    1|1|0.5000
+    1|1|0.5000
+    1|2|1.0000
+    1|2|1.0000
+    2|5|0.6667
+    2|5|0.6667
+    2|9|1.0000
+}
+
+# DESC ordering — same values, in reverse traversal order.
+@setup vals5
+test cume-dist-order-desc {
+    SELECT x, cume_dist() OVER (ORDER BY x DESC) FROM t;
+}
+expect {
+    5|0.2
+    4|0.4
+    3|0.6
+    2|0.8
+    1|1.0
+}
+
+# Mixed with ntile() — different coerced frames (ntile's is ROWS
+# CURRENT→UF; cume_dist's is GROUPS 1F→UF), so the planner splits the
+# window into two passes.
+@setup vals5
+test cume-dist-mixed-with-ntile {
+    SELECT x, ntile(2) OVER (ORDER BY x), cume_dist() OVER (ORDER BY x) FROM t;
+}
+expect {
+    1|1|0.2
+    2|1|0.4
+    3|1|0.6
+    4|2|0.8
+    5|2|1.0
+}
+
+# OVER () — no PARTITION, no ORDER BY. With no ORDER BY every row is a
+# peer of every other row, so the whole partition is one group:
+# cume_dist = 1.0 for every row.
+@setup vals5
+test cume-dist-over-empty {
+    SELECT cume_dist() OVER () FROM t;
+}
+expect {
+    1.0
+    1.0
+    1.0
+    1.0
+    1.0
+}
+
+# Both percent_rank and cume_dist in the same SELECT. Their coerced
+# frames differ (CURRENT→UF vs 1F→UF), so each gets its own pass.
+@setup vals5
+test percent-rank-and-cume-dist-together {
+    SELECT x,
+           percent_rank() OVER (ORDER BY x),
+           cume_dist() OVER (ORDER BY x)
+    FROM t;
+}
+expect {
+    1|0.0|0.2
+    2|0.25|0.4
+    3|0.5|0.6
+    4|0.75|0.8
+    5|1.0|1.0
+}
+
+# printf to lock formatting for the awkward denominators.
+setup vals3 {
+    CREATE TABLE t3(x INTEGER);
+    INSERT INTO t3 VALUES (1),(2),(3);
+}
+
+@setup vals3
+test cume-dist-printf-format {
+    SELECT printf('%.4f', cume_dist() OVER (ORDER BY x)) FROM t3;
+}
+expect {
+    0.3333
+    0.6667
+    1.0000
+}
+
+# NULLs form their own peer group at the start of an ASC ordering.
+setup vals_nulls {
+    CREATE TABLE tn(v);
+    INSERT INTO tn VALUES (NULL),(1),(NULL),(2);
+}
+
+@setup vals_nulls
+test cume-dist-null-peers {
+    SELECT v, printf('%.4f', cume_dist() OVER (ORDER BY v)) FROM tn ORDER BY v;
+}
+expect {
+    |0.5000
+    |0.5000
+    1|0.7500
+    2|1.0000
+}

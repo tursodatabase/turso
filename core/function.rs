@@ -529,6 +529,8 @@ impl WindowFunc {
                 | Self::Lag
                 | Self::Lead
                 | Self::Ntile
+                | Self::PercentRank
+                | Self::CumeDist
         )
     }
 
