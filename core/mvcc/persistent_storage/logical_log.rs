@@ -232,16 +232,18 @@
 #![allow(dead_code)]
 
 use crate::io::FileSyncType;
+use crate::return_if_io;
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::turso_assert;
+use crate::util::IOExt;
 use crate::{
     io::{CompletionGroup, ReadComplete},
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
     storage::sqlite3_ondisk::{
         read_varint, read_varint_partial, varint_len, write_varint_to_vec, DatabaseHeader,
     },
-    types::IndexInfo,
+    types::{IOCompletions, IOResult, IndexInfo},
     Buffer, Completion, CompletionError, LimboError, Result,
 };
 
@@ -1665,6 +1667,48 @@ enum StreamingState {
     NeedTransactionStart,
 }
 
+/// Drives the non-blocking [`StreamingLogicalLogReader::next_frame_io`] prefetch.
+///
+/// The reader yields to IO only while filling its in-memory buffer. Once a whole
+/// transaction frame is buffered, the existing (synchronous) parser runs without
+/// touching disk, so the gnarly byte-level parsing code stays untouched and the
+/// only re-entrant surface is the buffer fill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FramePhase {
+    /// Between frames: decide whether any bytes remain, then fill the header.
+    Start,
+    /// Ensure the fixed-size frame header is buffered so its size can be computed.
+    FillHeader,
+    /// Header is buffered; ensure the whole frame body is buffered.
+    FillBody,
+    /// The frame is fully buffered; run the synchronous parser without IO.
+    Parse,
+}
+
+/// Tracks a streaming buffer-fill read issued by [`StreamingLogicalLogReader::ensure_buffered`].
+///
+/// `buffer_len_at_issue` lets re-entry compute how many bytes the completion
+/// appended to the shared buffer so `offset` can be advanced exactly once.
+struct PendingFill {
+    completion: Completion,
+    buffer_len_at_issue: usize,
+}
+
+/// Tracks an in-flight positioned read issued while reading the log header.
+struct PendingPositioned {
+    completion: Completion,
+    out: Arc<RwLock<Vec<u8>>>,
+    expected_len: usize,
+}
+
+/// On-disk size breakdown of a transaction frame, derived purely from its header
+/// bytes. Used by the prefetch path to buffer an entire frame before parsing.
+#[derive(Clone, Copy, Debug)]
+struct FrameDims {
+    /// Total on-disk frame size: header + body + trailer.
+    on_disk_size: usize,
+}
+
 /// Result of attempting to read and validate the logical log file header.
 #[derive(Debug, Clone)]
 pub(crate) enum HeaderReadResult {
@@ -1703,6 +1747,12 @@ pub struct StreamingLogicalLogReader {
     // Reused scratch buffer for decrypted chunk plaintext. Kept on the reader so encrypted
     // recovery can reuse the allocation across chunks and transaction frames.
     decrypt_scratch: Vec<u8>,
+    /// Re-entrant prefetch state for `next_frame_io`.
+    frame_phase: FramePhase,
+    /// In-flight streaming buffer-fill read, if any (`ensure_buffered`).
+    pending_fill: Option<PendingFill>,
+    /// In-flight positioned header read, if any (`try_read_header_io`).
+    pending_positioned: Option<PendingPositioned>,
 }
 
 impl StreamingLogicalLogReader {
@@ -1731,6 +1781,9 @@ impl StreamingLogicalLogReader {
             #[cfg(test)]
             pending_ops: std::collections::VecDeque::new(),
             decrypt_scratch,
+            frame_phase: FramePhase::Start,
+            pending_fill: None,
+            pending_positioned: None,
         }
     }
 
@@ -1789,16 +1842,22 @@ impl StreamingLogicalLogReader {
     }
 
     pub(crate) fn try_read_header(&mut self, io: &Arc<dyn crate::IO>) -> Result<HeaderReadResult> {
+        io.block(|| self.try_read_header_io())
+    }
+
+    /// Non-blocking variant of [`Self::try_read_header`]. Yields to IO while the
+    /// fixed-size header is read; re-entrant via `pending_positioned`.
+    pub(crate) fn try_read_header_io(&mut self) -> Result<IOResult<HeaderReadResult>> {
         self.file_size = self.file.size()? as usize;
         if self.file_size < LOG_HDR_SIZE {
-            return Ok(HeaderReadResult::NoLog);
+            return Ok(IOResult::Done(HeaderReadResult::NoLog));
         }
 
-        let header_bytes = self.read_exact_at(io, 0, LOG_HDR_SIZE)?;
+        let header_bytes = return_if_io!(self.poll_positioned_read(0, LOG_HDR_SIZE));
         let hdr_len = u16::from_le_bytes([header_bytes[6], header_bytes[7]]) as usize;
         if hdr_len != LOG_HDR_SIZE {
             self.set_invalid_header_state();
-            return Ok(HeaderReadResult::Invalid);
+            return Ok(IOResult::Done(HeaderReadResult::Invalid));
         }
 
         match LogHeader::decode(&header_bytes) {
@@ -1809,14 +1868,73 @@ impl StreamingLogicalLogReader {
                 self.buffer.write().clear();
                 self.buffer_offset = 0;
                 self.last_valid_offset = hdr_len;
-                Ok(HeaderReadResult::Valid(header))
+                Ok(IOResult::Done(HeaderReadResult::Valid(header)))
             }
             Err(LimboError::Corrupt(_)) => {
                 self.set_invalid_header_state();
-                Ok(HeaderReadResult::Invalid)
+                Ok(IOResult::Done(HeaderReadResult::Invalid))
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Issue a positioned read of `len` bytes at `pos`, returning the in-flight
+    /// completion and the buffer the completion will fill. Shared by the blocking
+    /// [`Self::read_exact_at`] and the re-entrant [`Self::poll_positioned_read`].
+    fn issue_positioned_read(
+        &self,
+        pos: u64,
+        len: usize,
+    ) -> Result<(Completion, Arc<RwLock<Vec<u8>>>)> {
+        let header_buf = Arc::new(Buffer::new_temporary(len));
+        let out = Arc::new(RwLock::new(Vec::with_capacity(len)));
+        let out_clone = out.clone();
+        let completion: Box<ReadComplete> = Box::new(move |res| {
+            let Ok((buf, bytes_read)) = res else {
+                tracing::error!("couldn't read logical log err={:?}", res);
+                return None;
+            };
+            if bytes_read > 0 {
+                out_clone
+                    .write()
+                    .extend_from_slice(&buf.as_slice()[..bytes_read as usize]);
+            }
+            None
+        });
+        let c = Completion::new_read(header_buf, completion);
+        let c = self.file.pread(pos, c)?;
+        Ok((c, out))
+    }
+
+    /// Re-entrant positioned read used while reading the log header without
+    /// blocking. Returns `IOResult::Done(bytes)` once the read completes.
+    fn poll_positioned_read(&mut self, pos: u64, len: usize) -> Result<IOResult<Vec<u8>>> {
+        if let Some(pending) = self.pending_positioned.take() {
+            if !pending.completion.finished() {
+                let c = pending.completion.clone();
+                self.pending_positioned = Some(pending);
+                return Ok(IOResult::IO(IOCompletions::Single(c)));
+            }
+            if let Some(err) = pending.completion.get_error() {
+                return Err(err.into());
+            }
+            let out = pending.out.read().clone();
+            if out.len() != pending.expected_len {
+                return Err(LimboError::Corrupt(format!(
+                    "Logical log short read: expected {}, got {}",
+                    pending.expected_len,
+                    out.len()
+                )));
+            }
+            return Ok(IOResult::Done(out));
+        }
+        let (c, out) = self.issue_positioned_read(pos, len)?;
+        self.pending_positioned = Some(PendingPositioned {
+            completion: c.clone(),
+            out,
+            expected_len: len,
+        });
+        Ok(IOResult::IO(IOCompletions::Single(c)))
     }
 
     fn set_invalid_header_state(&mut self) {
@@ -1833,25 +1951,147 @@ impl StreamingLogicalLogReader {
     /// index op. Empty parsed frames are skipped, so callers that receive Some(frame) can
     /// rely on `frame` being non-empty.
     pub(crate) fn next_frame(&mut self, io: &Arc<dyn crate::IO>) -> Result<Option<Vec<ParsedOp>>> {
-        loop {
-            match self.state {
-                StreamingState::NeedTransactionStart => {
-                    if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
-                        return Ok(None);
-                    }
+        io.block(|| self.next_frame_io(io))
+    }
 
+    /// Non-blocking variant of [`Self::next_frame`].
+    ///
+    /// Yields to IO only while filling the in-memory buffer: it buffers the whole
+    /// transaction frame first (header, then body), then runs the synchronous
+    /// parser, which never touches disk because every byte it needs is already
+    /// buffered. The only re-entrant surface is therefore the buffer fill, driven
+    /// by `frame_phase`.
+    pub(crate) fn next_frame_io(
+        &mut self,
+        io: &Arc<dyn crate::IO>,
+    ) -> Result<IOResult<Option<Vec<ParsedOp>>>> {
+        loop {
+            match self.frame_phase {
+                FramePhase::Start => {
+                    self.file_size = self.file.size()? as usize;
+                    // Reclaim the previous frame's bytes before buffering the next one.
+                    self.compact_consumed_prefix();
+                    if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
+                        return Ok(IOResult::Done(None));
+                    }
+                    self.frame_phase = FramePhase::FillHeader;
+                }
+                FramePhase::FillHeader => {
+                    // Buffer up to the largest possible frame header so its on-disk
+                    // size can be computed. A torn tail simply buffers fewer bytes;
+                    // the parser then reaches Eof on its own.
+                    let want = TX_EXT_HEADER_SIZE.min(self.remaining_bytes());
+                    return_if_io!(self.ensure_buffered(want));
+                    self.frame_phase = FramePhase::FillBody;
+                }
+                FramePhase::FillBody => {
+                    let want = match self.peek_frame_dims()? {
+                        Some(dims) => dims.on_disk_size.min(self.remaining_bytes()),
+                        // Header unreadable/invalid: don't prefetch a body. The
+                        // synchronous parser reaches the same Eof/InvalidFrame
+                        // verdict using only the buffered header bytes.
+                        None => self.bytes_can_read(),
+                    };
+                    return_if_io!(self.ensure_buffered(want));
+                    self.frame_phase = FramePhase::Parse;
+                }
+                FramePhase::Parse => {
+                    self.frame_phase = FramePhase::Start;
+                    // The whole frame is buffered, so this never yields to IO.
                     let ops = match self.parse_next_transaction(io)? {
                         ParseResult::Frame(frame) => frame.ops,
-                        ParseResult::Eof | ParseResult::InvalidFrame => return Ok(None),
+                        ParseResult::Eof | ParseResult::InvalidFrame => {
+                            return Ok(IOResult::Done(None));
+                        }
                     };
 
                     if ops.is_empty() {
                         continue;
                     }
-                    return Ok(Some(ops));
+                    return Ok(IOResult::Done(Some(ops)));
                 }
             }
         }
+    }
+
+    /// Compute a frame's total on-disk size from its buffered header bytes,
+    /// without consuming them. Returns `None` when the header is not fully
+    /// buffered (torn tail) or is structurally invalid (bad magic / overflow);
+    /// in those cases the caller skips body prefetch and lets the parser decide.
+    fn peek_frame_dims(&self) -> Result<Option<FrameDims>> {
+        let (payload_size, extension_size, header_len) = {
+            let buffer = self.buffer.read();
+            let base = self.buffer_offset;
+            let avail = buffer.len().saturating_sub(base);
+            if avail < TX_HEADER_SIZE {
+                return Ok(None);
+            }
+            let hdr = &buffer[base..base + TX_HEADER_SIZE];
+            let frame_magic = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+            let is_v2 = self
+                .header
+                .as_ref()
+                .is_some_and(|header| header.version == LOG_VERSION_V2);
+            let has_extension_header = !is_v2 && frame_magic == EXT_FRAME_MAGIC;
+            if frame_magic != FRAME_MAGIC && !has_extension_header {
+                return Ok(None);
+            }
+            let header_len = if has_extension_header {
+                TX_EXT_HEADER_SIZE
+            } else {
+                TX_HEADER_SIZE
+            };
+            if avail < header_len {
+                return Ok(None);
+            }
+            let payload_size_u64 = u64::from_le_bytes([
+                hdr[4], hdr[5], hdr[6], hdr[7], hdr[8], hdr[9], hdr[10], hdr[11],
+            ]);
+            let Ok(payload_size) = usize::try_from(payload_size_u64) else {
+                return Ok(None);
+            };
+            let extension_size = if has_extension_header {
+                let ext = &buffer[base + 24..base + 32];
+                let extension_size_u64 = u64::from_le_bytes([
+                    ext[0], ext[1], ext[2], ext[3], ext[4], ext[5], ext[6], ext[7],
+                ]);
+                match usize::try_from(extension_size_u64) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                0
+            };
+            (payload_size, extension_size, header_len)
+        };
+
+        // Mirror the byte accounting of `parse_next_transaction`: when encryption
+        // is on, payload and extension are encrypted together into chunked blobs;
+        // otherwise both are stored raw.
+        let body = if self.encryption_ctx.is_some() {
+            let plaintext = match payload_size.checked_add(extension_size) {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            match self.encrypted_payload_on_disk_size(plaintext) {
+                Ok(v) => v,
+                Err(LimboError::Corrupt(_)) => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        } else {
+            match extension_size.checked_add(payload_size) {
+                Some(v) => v,
+                None => return Ok(None),
+            }
+        };
+        let on_disk_size = match header_len
+            .checked_add(body)
+            .and_then(|s| s.checked_add(TX_TRAILER_SIZE))
+        {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        Ok(Some(FrameDims { on_disk_size }))
     }
 
     /// Reads next record in log.
@@ -3291,23 +3531,7 @@ impl StreamingLogicalLogReader {
     }
 
     fn read_exact_at(&self, io: &Arc<dyn crate::IO>, pos: u64, len: usize) -> Result<Vec<u8>> {
-        let header_buf = Arc::new(Buffer::new_temporary(len));
-        let out = Arc::new(RwLock::new(Vec::with_capacity(len)));
-        let out_clone = out.clone();
-        let completion: Box<ReadComplete> = Box::new(move |res| {
-            let out = out_clone.clone();
-            let mut out = out.write();
-            let Ok((buf, bytes_read)) = res else {
-                tracing::error!("couldn't read logical log header err={:?}", res);
-                return None;
-            };
-            if bytes_read > 0 {
-                out.extend_from_slice(&buf.as_slice()[..bytes_read as usize]);
-            }
-            None
-        });
-        let c = Completion::new_read(header_buf, completion);
-        let c = self.file.pread(pos, c)?;
+        let (c, out) = self.issue_positioned_read(pos, len)?;
         io.wait_for_completion(c)?;
         let out = out.read().clone();
         if out.len() != len {
@@ -3325,82 +3549,113 @@ impl StreamingLogicalLogReader {
 
     /// Read at least `need` bytes from the logical log, issuing multiple reads if necessary.
     /// If at any point 0 bytes are read, that indicates corruption.
+    ///
+    /// Blocking wrapper around the re-entrant [`Self::ensure_buffered`]. Used by the
+    /// synchronous parser and the non-recovery consumers; the parser only calls it
+    /// after a `remaining_bytes()` guard, so the short-read error path is a safety net.
     pub fn read_more_data(&mut self, io: &Arc<dyn crate::IO>, need: usize) -> Result<()> {
-        let bytes_can_read = self.bytes_can_read();
-        if bytes_can_read >= need {
-            return Ok(());
+        io.block(|| self.ensure_buffered(need))?;
+        if self.bytes_can_read() < need {
+            return Err(LimboError::Corrupt(format!(
+                "Expected to read {need} bytes more but reached end of file at offset {}",
+                self.offset
+            )));
         }
+        Ok(())
+    }
 
-        let initial_buffer_offset = self.buffer_offset;
-
-        loop {
-            let buffer_size_before_read = self.buffer.read().len();
-            turso_assert!(
-                buffer_size_before_read >= self.buffer_offset,
-                "buffer_size_before_read < buffer_offset",
-                { "buffer_size_before_read": buffer_size_before_read, "buffer_offset": self.buffer_offset }
-            );
-            let bytes_available_in_buffer = buffer_size_before_read - self.buffer_offset;
-            let still_need = need.saturating_sub(bytes_available_in_buffer);
-
-            if still_need == 0 {
-                break;
+    /// Re-entrant buffer fill: ensure at least `need` unconsumed bytes are buffered
+    /// (counting from `buffer_offset`), reading from the file as needed.
+    ///
+    /// This is the only place the streaming reader yields to IO. It returns
+    /// `IOResult::Done(())` once `need` bytes are buffered OR the file is exhausted
+    /// (a torn tail); callers detect the short tail via `remaining_bytes()`. The
+    /// in-flight read is tracked in `pending_fill` so re-entry advances `offset`
+    /// exactly once per completed read.
+    ///
+    /// Each call issues at most one read: re-entry (driven by the caller after the
+    /// yielded completion finishes) accounts for the prior read and either settles
+    /// or issues the next one.
+    fn ensure_buffered(&mut self, need: usize) -> Result<IOResult<()>> {
+        if let Some(pending) = self.pending_fill.take() {
+            // Account for a read issued on a previous call.
+            if !pending.completion.finished() {
+                let c = pending.completion.clone();
+                self.pending_fill = Some(pending);
+                return Ok(IOResult::IO(IOCompletions::Single(c)));
             }
-
-            turso_assert!(
-                self.file_size >= self.offset,
-                "file_size < offset",
-                { "file_size": self.file_size, "offset": self.offset }
-            );
-            let to_read = 4096.max(still_need).min(self.file_size - self.offset);
-
-            if to_read == 0 {
-                // No more data available in file even though we need more -> corrupt
-                return Err(LimboError::Corrupt(format!(
-                    "Expected to read {still_need} bytes more but reached end of file at offset {}",
-                    self.offset
-                )));
+            if let Some(err) = pending.completion.get_error() {
+                return Err(err.into());
             }
-
-            let header_buf = Arc::new(Buffer::new_temporary(to_read));
-            let buffer = self.buffer.clone();
-            let completion: Box<ReadComplete> = Box::new(move |res| match res {
-                Ok((buf, bytes_read)) => {
-                    let mut buffer = buffer.write();
-                    let buf = buf.as_slice();
-                    if bytes_read > 0 {
-                        buffer.extend_from_slice(&buf[..bytes_read as usize]);
-                    }
-                    None
-                }
-                Err(err) => Some(err),
-            });
-            let c = Completion::new_read(header_buf, completion);
-            let c = self.file.pread(self.offset as u64, c)?;
-            io.wait_for_completion(c)?;
-
-            let buffer_size_after_read = self.buffer.read().len();
-            let bytes_read = buffer_size_after_read - buffer_size_before_read;
-
+            let buffer_len = self.buffer.read().len();
+            let bytes_read = buffer_len.saturating_sub(pending.buffer_len_at_issue);
             if bytes_read == 0 {
                 return Err(LimboError::Corrupt(format!(
-                    "Expected to read {still_need} bytes more but read 0 bytes at offset {}",
+                    "Expected to read more bytes but read 0 bytes at offset {}",
                     self.offset
                 )));
             }
-
             self.offset += bytes_read;
+            // A real read just settled, so reclaim the consumed prefix here. The
+            // fast path below deliberately does NOT compact, keeping the
+            // synchronous parser's many already-buffered reads O(1).
+            if self.bytes_can_read() >= need {
+                self.compact_consumed_prefix();
+                return Ok(IOResult::Done(()));
+            }
+        } else if self.bytes_can_read() >= need {
+            // Fast path: already buffered, nothing in flight.
+            return Ok(IOResult::Done(()));
         }
 
-        // Cleanup consumed bytes. If everything was consumed, clear avoids memmove.
+        turso_assert!(
+            self.file_size >= self.offset,
+            "file_size < offset",
+            { "file_size": self.file_size, "offset": self.offset }
+        );
+        let available_in_file = self.file_size - self.offset;
+        if available_in_file == 0 {
+            // File exhausted before reaching `need`: leave the partial tail
+            // buffered so the caller can detect it as a torn tail.
+            self.compact_consumed_prefix();
+            return Ok(IOResult::Done(()));
+        }
+
+        let still_need = need - self.bytes_can_read();
+        let to_read = 4096.max(still_need).min(available_in_file);
+        let read_buf = Arc::new(Buffer::new_temporary(to_read));
+        let buffer = self.buffer.clone();
+        let completion: Box<ReadComplete> = Box::new(move |res| match res {
+            Ok((buf, bytes_read)) => {
+                if bytes_read > 0 {
+                    buffer
+                        .write()
+                        .extend_from_slice(&buf.as_slice()[..bytes_read as usize]);
+                }
+                None
+            }
+            Err(err) => Some(err),
+        });
+        let completion = Completion::new_read(read_buf, completion);
+        let buffer_len_at_issue = self.buffer.read().len();
+        let c = self.file.pread(self.offset as u64, completion)?;
+        self.pending_fill = Some(PendingFill {
+            completion: c.clone(),
+            buffer_len_at_issue,
+        });
+        Ok(IOResult::IO(IOCompletions::Single(c)))
+    }
+
+    /// Drop already-consumed bytes from the front of the buffer and reset
+    /// `buffer_offset` to 0. Called once a fill settles, never mid-read.
+    fn compact_consumed_prefix(&mut self) {
         let mut buffer = self.buffer.write();
-        if initial_buffer_offset >= buffer.len() {
+        if self.buffer_offset >= buffer.len() {
             buffer.clear();
-        } else if initial_buffer_offset > 0 {
-            let _ = buffer.drain(0..initial_buffer_offset);
+        } else if self.buffer_offset > 0 {
+            let _ = buffer.drain(0..self.buffer_offset);
         }
         self.buffer_offset = 0;
-        Ok(())
     }
 
     fn bytes_can_read(&self) -> usize {
@@ -7344,5 +7599,226 @@ mod tests {
 
         // Keep the last chunk variable used so the compiler notices if the range math changes.
         assert!(last_chunk.end > last_chunk.start);
+    }
+
+    /// A test IO that wraps [`MemoryIO`] but defers every read completion until
+    /// [`crate::IO::step`] is called, so a reader that yields to IO can be exercised
+    /// one completion at a time. Writes, syncs and truncates complete synchronously,
+    /// so building/copying log bytes stays straightforward.
+    struct DeferredReadIo {
+        inner: Arc<MemoryIO>,
+        pending: Arc<
+            crate::sync::Mutex<std::collections::VecDeque<(Arc<dyn crate::File>, u64, Completion)>>,
+        >,
+    }
+
+    impl DeferredReadIo {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(MemoryIO::new()),
+                pending: Arc::new(crate::sync::Mutex::new(std::collections::VecDeque::new())),
+            }
+        }
+
+        fn pending_reads(&self) -> usize {
+            self.pending.lock().len()
+        }
+    }
+
+    impl crate::io::Clock for DeferredReadIo {
+        fn current_time_monotonic(&self) -> crate::io::clock::MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+        fn current_time_wall_clock(&self) -> crate::io::clock::WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl crate::IO for DeferredReadIo {
+        fn open_file(
+            &self,
+            path: &str,
+            flags: OpenFlags,
+            direct: bool,
+        ) -> crate::Result<Arc<dyn crate::File>> {
+            let inner = self.inner.open_file(path, flags, direct)?;
+            Ok(Arc::new(DeferredReadFile {
+                inner,
+                pending: self.pending.clone(),
+            }))
+        }
+
+        fn remove_file(&self, path: &str) -> crate::Result<()> {
+            self.inner.remove_file(path)
+        }
+
+        fn step(&self) -> crate::Result<()> {
+            let next = self.pending.lock().pop_front();
+            if let Some((file, pos, c)) = next {
+                file.pread(pos, c)?;
+            }
+            Ok(())
+        }
+    }
+
+    struct DeferredReadFile {
+        inner: Arc<dyn crate::File>,
+        pending: Arc<
+            crate::sync::Mutex<std::collections::VecDeque<(Arc<dyn crate::File>, u64, Completion)>>,
+        >,
+    }
+
+    impl crate::File for DeferredReadFile {
+        fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> crate::Result<()> {
+            self.inner.unlock_file()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
+            self.pending
+                .lock()
+                .push_back((self.inner.clone(), pos, c.clone()));
+            Ok(c)
+        }
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<Buffer>,
+            c: Completion,
+        ) -> crate::Result<Completion> {
+            self.inner.pwrite(pos, buffer, c)
+        }
+        fn pwritev(
+            &self,
+            pos: u64,
+            buffers: Vec<Arc<Buffer>>,
+            c: Completion,
+        ) -> crate::Result<Completion> {
+            self.inner.pwritev(pos, buffers, c)
+        }
+        fn sync(
+            &self,
+            c: Completion,
+            sync_type: crate::io::FileSyncType,
+        ) -> crate::Result<Completion> {
+            self.inner.sync(c, sync_type)
+        }
+        fn truncate(&self, len: u64, c: Completion) -> crate::Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+        fn size(&self) -> crate::Result<u64> {
+            self.inner.size()
+        }
+    }
+
+    /// Read every transaction frame from `file` non-blockingly, stepping the
+    /// deferred IO whenever the reader yields. Returns the collected ops and the
+    /// number of IO yields observed.
+    fn drain_frames_non_blocking(
+        file: Arc<dyn crate::File>,
+        io: &Arc<dyn crate::IO>,
+    ) -> (Vec<ParsedOp>, usize) {
+        use crate::types::IOResult;
+        let mut reader = StreamingLogicalLogReader::new(file, None);
+        let mut yields = 0usize;
+        loop {
+            match reader.try_read_header_io().unwrap() {
+                IOResult::Done(HeaderReadResult::Valid(_)) => break,
+                IOResult::Done(other) => panic!("expected valid header, got {other:?}"),
+                IOResult::IO(_) => {
+                    yields += 1;
+                    io.step().unwrap();
+                }
+            }
+        }
+        let mut ops = Vec::new();
+        loop {
+            match reader.next_frame_io(io).unwrap() {
+                IOResult::Done(Some(frame)) => ops.extend(frame),
+                IOResult::Done(None) => break,
+                IOResult::IO(_) => {
+                    yields += 1;
+                    io.step().unwrap();
+                }
+            }
+        }
+        (ops, yields)
+    }
+
+    /// What this test checks: the non-blocking streaming reader (`try_read_header_io` /
+    /// `next_frame_io`) is re-entrant — driving it one deferred read at a time yields the
+    /// exact same frames as the synchronous path, with no duplicated or dropped ops.
+    /// Why this matters: MVCC recovery must be able to yield to IO mid-replay without
+    /// corrupting its decode of the logical log.
+    #[test]
+    fn test_streaming_reader_reentrant_across_io_yields() {
+        init_tracing();
+        // Mix small frames with one frame larger than the 4096-byte read chunk, so the
+        // prefetch must issue (and re-enter across) multiple reads for a single frame.
+        let big = "x".repeat(20_000);
+        let payloads: [&str; 5] = ["a", "bb", big.as_str(), "ccc", "d"];
+
+        // Reference: write + read with plain MemoryIO (reads complete synchronously, so
+        // the reader never re-enters).
+        let mem: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file_a = mem
+            .open_file("reentrant-ref.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file_a.clone(), mem.clone(), None);
+        for (i, payload) in payloads.iter().enumerate() {
+            append_single_table_op_tx(
+                &mut log,
+                &mem,
+                (-2).into(),
+                i as i64 + 1,
+                i as u64 + 1,
+                false,
+                false,
+                payload,
+            );
+        }
+        let log_bytes = read_file_bytes(file_a.clone(), &mem);
+
+        let mut reference = StreamingLogicalLogReader::new(file_a, None);
+        reference.read_header(&mem).unwrap();
+        let mut ops_ref = Vec::new();
+        while let Some(frame) = reference.next_frame(&mem).unwrap() {
+            ops_ref.extend(frame);
+        }
+        assert_eq!(ops_ref.len(), payloads.len());
+
+        // Under test: copy the identical bytes into a deferred-read IO and drive the
+        // non-blocking reader, completing one read per yield.
+        let deferred = Arc::new(DeferredReadIo::new());
+        let io: Arc<dyn crate::IO> = deferred.clone();
+        let file_b = io
+            .open_file("reentrant-deferred.db-log", OpenFlags::Create, false)
+            .unwrap();
+        overwrite_file_bytes(file_b.clone(), &io, &log_bytes);
+        assert_eq!(
+            deferred.pending_reads(),
+            0,
+            "writing the log must not leave reads pending"
+        );
+
+        let (ops_deferred, yields) = drain_frames_non_blocking(file_b, &io);
+
+        // Reads are batched into >=4096-byte chunks, so small frames share a read.
+        // At minimum: the header read, the first chunk, and the >4096-byte frame's
+        // extra read each force a distinct re-entry.
+        assert!(
+            yields >= 3,
+            "expected the reader to re-enter across multiple IO yields, got {yields}"
+        );
+        assert_eq!(
+            deferred.pending_reads(),
+            0,
+            "every issued read must be consumed"
+        );
+        assert_eq!(
+            ops_deferred, ops_ref,
+            "re-entrant decode must match the synchronous decode exactly"
+        );
     }
 }
