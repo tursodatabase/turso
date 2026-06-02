@@ -100,6 +100,10 @@ export interface PipelineResponse {
   }>;
 }
 
+function toBase64(uint8: Uint8Array): string {
+  return Buffer.from(uint8.buffer, uint8.byteOffset, uint8.byteLength).toString('base64');
+}
+
 export function encodeValue(value: any): Value {
   if (value === null || value === undefined) {
     return { type: 'null' };
@@ -127,9 +131,12 @@ export function encodeValue(value: any): Value {
     return { type: 'text', value };
   }
   
-  if (value instanceof ArrayBuffer || value instanceof Uint8Array) {
-    const base64 = btoa(String.fromCharCode(...new Uint8Array(value)));
-    return { type: 'blob', base64 };
+  if (value instanceof ArrayBuffer) {
+    return { type: 'blob', base64: toBase64(new Uint8Array(value)) };
+  }
+
+  if (value instanceof Uint8Array) {
+    return { type: 'blob', base64: toBase64(value) };
   }
   
   return { type: 'text', value: String(value) };
