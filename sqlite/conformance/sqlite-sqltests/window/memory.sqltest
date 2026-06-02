@@ -497,15 +497,19 @@ setup named_window_ntile_data {
 }
 
 @setup named_window_ntile_data
-@skip-if sqlite "TODO: ntile() is not yet implemented."
 test named-window-ntile {
     SELECT a, ntile(3) OVER w1
     FROM t_nw_ntile
     WINDOW w1 AS (ORDER BY a)
     ORDER BY a;
 }
-expect error {
-    no such function: ntile
+expect {
+    1|1
+    2|1
+    3|2
+    4|2
+    5|3
+    6|3
 }
 
 setup named_window_sub_data {

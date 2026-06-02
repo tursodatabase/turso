@@ -6852,7 +6852,6 @@ fn op_window_step(
             };
             *pending = 1;
         }
-        // first_value(expr) — captures the argument value of the first row
         // last_value(expr) — captures the argument value of every source row,
         // so payload[0] always holds the value of the most recently stepped
         // row. With our default RANGE frame, AggValue is called once per
@@ -6869,6 +6868,46 @@ fn op_window_step(
                 unreachable!("last_value accumulator must be a Builtin payload");
             };
             payload[0] = arg_value;
+        }
+        // ntile(N) — mirrors SQLite's NtileCtx (window.c:410). Frame is
+        // ROWS CURRENT ROW TO UNBOUNDED FOLLOWING. The step fires for
+        // every row entering the frame end (i.e. every row in the
+        // partition); the inverse fires for every row leaving the
+        // frame start, advancing the iRow counter that xValue uses to
+        // pick a bucket.
+        //
+        // State (payload):
+        //   [0] = nTotal — partition row count, incremented per step.
+        //   [1] = nParam — the bucket count, captured from arg[0] on
+        //         first step.
+        //   [2] = iRow   — current output-row index within the
+        //         partition, incremented per inverse.
+        WindowFunc::Ntile => {
+            if let Register::Value(Value::Null) = state.registers[acc_reg] {
+                // ntile(N): N is coerced with SQLite's `sqlite3_value_int64`
+                // rules — the leading integer prefix of text, blobs read as
+                // text, floats truncated toward zero — then must be positive.
+                let nparam = extract_int_value(state.registers[arg_reg].get_value());
+                if nparam <= 0 {
+                    return Err(LimboError::InvalidArgument(
+                        "argument of ntile must be a positive integer".into(),
+                    ));
+                }
+                state.registers[acc_reg] =
+                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
+                        Value::from_i64(0),
+                        Value::from_i64(nparam),
+                        Value::from_i64(0),
+                    ]?));
+            }
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                unreachable!("ntile accumulator must be a Builtin payload");
+            };
+            let Value::Numeric(Numeric::Integer(ntotal)) = &mut payload[0] else {
+                unreachable!("ntile nTotal counter must be Integer");
+            };
+            *ntotal += 1;
         }
         other => {
             return Err(LimboError::InternalError(format!(
@@ -6959,6 +6998,42 @@ fn op_window_value(
             };
             std::mem::replace(&mut payload[0], Value::Null)
         }
+        // ntile bucket computation — mirrors SQLite's ntileValueFunc
+        // (window.c:453). The partition is split into nParam buckets;
+        // when nTotal isn't a clean multiple, the first nLarge buckets
+        // get one extra row each (size nSize+1) and the rest get nSize.
+        // iRow is the 0-based output position within the partition.
+        WindowFunc::Ntile => {
+            let Register::Aggregate(AggContext::Builtin(payload)) = &state.registers[acc_reg]
+            else {
+                unreachable!("ntile accumulator must be a Builtin payload (xStep runs first)");
+            };
+            let Value::Numeric(Numeric::Integer(ntotal)) = &payload[0] else {
+                unreachable!("ntile nTotal must be Integer");
+            };
+            let Value::Numeric(Numeric::Integer(nparam)) = &payload[1] else {
+                unreachable!("ntile nParam must be Integer");
+            };
+            let Value::Numeric(Numeric::Integer(irow)) = &payload[2] else {
+                unreachable!("ntile iRow must be Integer");
+            };
+            let ntotal = *ntotal;
+            let nparam = *nparam;
+            let irow = *irow;
+            let nsize = ntotal / nparam;
+            let bucket = if nsize == 0 {
+                irow + 1
+            } else {
+                let nlarge = ntotal - nparam * nsize;
+                let ismall = nlarge * (nsize + 1);
+                if irow < ismall {
+                    1 + irow / (nsize + 1)
+                } else {
+                    1 + nlarge + (irow - ismall) / nsize
+                }
+            };
+            Value::from_i64(bucket)
+        }
         other => {
             return Err(LimboError::InternalError(format!(
                 "window function {other} reached runtime dispatch but has no handler"
@@ -6974,12 +7049,32 @@ fn op_window_value(
 /// `op_window_step`: fires when a row crosses the frame-start cursor on its
 /// way out of the function's frame.
 fn op_window_inverse(
-    _state: &mut ProgramState,
-    _acc_reg: usize,
+    state: &mut ProgramState,
+    acc_reg: usize,
     _arg_reg: usize,
     func: &WindowFunc,
 ) -> Result<InsnFunctionStepResult> {
-    unreachable!("AggInverse fired for {func} but no inverse arm is wired");
+    match func {
+        // ntile's xInverse advances iRow — the output-row position
+        // within the partition that xValue reads. xStep has already
+        // populated nTotal and nParam by the time the flush loop fires
+        // inverse, so the payload is always Builtin here.
+        WindowFunc::Ntile => {
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                unreachable!(
+                    "ntile accumulator must be a Builtin payload at inverse (xStep runs first)"
+                );
+            };
+            let Value::Numeric(Numeric::Integer(irow)) = &mut payload[2] else {
+                unreachable!("ntile iRow must be Integer");
+            };
+            *irow += 1;
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        _ => unreachable!("AggInverse fired for {func} but no inverse arm is wired"),
+    }
 }
 
 pub fn op_agg_inverse(

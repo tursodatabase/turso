@@ -338,11 +338,18 @@ expect {
     lead|w|3
 }
 
+test pragma-function-list-window-ntile {
+    SELECT name, type, narg FROM pragma_function_list WHERE name = 'ntile';
+}
+expect {
+    ntile|w|1
+}
+
 @skip-if sqlite "Turso should not list window functions that it cannot run"
 test pragma-function-list-omits-unimplemented-window-functions {
     SELECT COUNT(*) FROM pragma_function_list
     WHERE name IN (
-        'percent_rank','cume_dist','ntile'
+        'percent_rank','cume_dist'
     );
 }
 expect {
