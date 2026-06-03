@@ -725,13 +725,17 @@ impl TursoDatabase {
                         .expect("db_file must be initialized in Init phase")
                         .clone();
                     let opts = state.opts.expect("opts must be initialized in Init phase");
+                    let mut open_flags = OpenFlags::default();
+                    if opts.enable_multiprocess_wal {
+                        open_flags |= OpenFlags::NoLock;
+                    }
 
                     match Database::open_with_flags_async(
                         &mut state.open_db_state,
                         io.clone(),
                         &self.config.path,
                         db_file,
-                        OpenFlags::default(),
+                        open_flags,
                         opts,
                         self.config.encryption.clone(),
                         None,
@@ -1442,6 +1446,9 @@ mod tests {
     use crate::rsapi::{
         TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR,
     };
+    use std::process::{Command, Output, Stdio};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
     use turso_core::Value;
 
     fn config_with_features(features: Option<&str>) -> TursoDatabaseConfig {
@@ -1453,6 +1460,73 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+        }
+    }
+
+    const MULTIPROCESS_WAL_SDK_TEST: &str =
+        "rsapi::tests::multiprocess_wal_sdk_open_allows_second_process";
+    const MULTIPROCESS_WAL_SDK_CHILD_ENV: &str = "TURSO_SDK_MULTIPROCESS_CHILD";
+    const MULTIPROCESS_WAL_SDK_CHILD_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[cfg(target_os = "windows")]
+    fn multiprocess_wal_test_vfs() -> Option<String> {
+        Some("experimental_win_iocp".to_string())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn multiprocess_wal_test_vfs() -> Option<String> {
+        None
+    }
+
+    fn open_multiprocess_wal_test_db(path: &str) -> Arc<TursoDatabase> {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: path.to_string(),
+            experimental_features: Some("multiprocess_wal".to_string()),
+            async_io: false,
+            encryption: None,
+            vfs: multiprocess_wal_test_vfs(),
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+        db
+    }
+
+    fn execute_sql(db: &TursoDatabase, sql: &str) {
+        let conn = db.connect().unwrap();
+        let mut stmt = conn.prepare_single(sql).unwrap();
+        assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+    }
+
+    fn query_i64(db: &TursoDatabase, sql: &str) -> i64 {
+        let conn = db.connect().unwrap();
+        let mut stmt = conn.prepare_single(sql).unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+        stmt.row_value(0).unwrap().as_int().unwrap()
+    }
+
+    fn output_with_timeout(command: &mut Command, label: &str) -> Output {
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + MULTIPROCESS_WAL_SDK_CHILD_TIMEOUT;
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                return child.wait_with_output().unwrap();
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "{label} timed out after {MULTIPROCESS_WAL_SDK_CHILD_TIMEOUT:?}: stdout={}; stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -1486,6 +1560,46 @@ mod tests {
         assert_eq!(
             config_with_features(Some("strict,unknown")).database_opts(),
             turso_core::DatabaseOpts::new()
+        );
+    }
+
+    #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+    fn multiprocess_wal_sdk_open_allows_second_process() {
+        if std::env::var_os(MULTIPROCESS_WAL_SDK_CHILD_ENV).is_some() {
+            let db_path = std::env::var_os("TURSO_SDK_MULTIPROCESS_DB_PATH")
+                .expect("child database path must be set");
+            let db = open_multiprocess_wal_test_db(db_path.to_str().unwrap());
+            execute_sql(&db, "insert into test values ('child')");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sdk-multiprocess-wal.db");
+        let db_path_str = db_path.to_str().unwrap();
+
+        let db = open_multiprocess_wal_test_db(db_path_str);
+        execute_sql(&db, "create table test(value text)");
+
+        let current_exe = std::env::current_exe().unwrap();
+        let child_output = output_with_timeout(
+            Command::new(&current_exe)
+                .arg(MULTIPROCESS_WAL_SDK_TEST)
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(MULTIPROCESS_WAL_SDK_CHILD_ENV, "1")
+                .env("TURSO_SDK_MULTIPROCESS_DB_PATH", db_path_str),
+            "multiprocess WAL SDK child",
+        );
+
+        assert!(
+            child_output.status.success(),
+            "multiprocess sdk child process failed: stdout={}; stderr={}",
+            String::from_utf8_lossy(&child_output.stdout),
+            String::from_utf8_lossy(&child_output.stderr)
+        );
+        assert_eq!(
+            query_i64(&db, "select count(*) from test where value = 'child'"),
+            1
         );
     }
 
