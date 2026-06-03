@@ -1171,7 +1171,12 @@ fn test_recover_logical_log_short_file_ignored() {
     conn.db.io.wait_for_completion(c).unwrap();
     assert_eq!(file.size().unwrap(), 1);
 
-    let recovered = mvcc_store.maybe_recover_logical_log(conn).unwrap();
+    use crate::util::IOExt as _;
+    let io = conn.db.io.clone();
+    let mut st = RecoverLogicalLogState::default();
+    let recovered = io
+        .block(|| mvcc_store.maybe_recover_logical_log(&conn, &mut st))
+        .unwrap();
     assert!(!recovered);
 }
 
@@ -1219,7 +1224,9 @@ fn test_recovery_rejects_schema_op_after_data_op_in_frame() {
     let c = log.log_tx(tx).unwrap();
     io.wait_for_completion(c).unwrap();
 
-    let result = mvcc_store.maybe_recover_logical_log(conn);
+    use crate::util::IOExt as _;
+    let mut st = RecoverLogicalLogState::default();
+    let result = io.block(|| mvcc_store.maybe_recover_logical_log(&conn, &mut st));
     assert!(
         matches!(&result, Err(LimboError::Corrupt(msg)) if msg.contains("schema op after a data op")),
     );
@@ -11526,7 +11533,7 @@ fn collect_mvcc_recovery_ops(conn: &Arc<Connection>) -> Vec<ParsedOp> {
     reader.read_header(&io).unwrap();
 
     let mut ops = Vec::new();
-    while let Some(frame_ops) = reader.next_frame(&io).unwrap() {
+    while let Some(frame_ops) = reader.next_frame_blocking(&io).unwrap() {
         ops.extend(frame_ops);
     }
     ops

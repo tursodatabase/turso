@@ -64,7 +64,7 @@ use super::persistent_storage::logical_log::{
     encode_delete_portable_extension, parse_ops_from_plaintext, LOG_RECORD_PREFIX_SIZE,
 };
 use super::persistent_storage::logical_log::{
-    HeaderReadResult, IndexOpKind, ParsedOp, StreamingLogicalLogReader, StreamingResult,
+    HeaderReadResult, IndexOpKind, LogHeader, ParsedOp, StreamingLogicalLogReader, StreamingResult,
     LOG_HDR_SIZE,
 };
 #[cfg(feature = "conn_raw_api")]
@@ -3367,12 +3367,55 @@ pub struct RowidAllocator {
 /// Sub state machine for [`MvStore::bootstrap_nonblock`]. Carried by the
 /// open state machine (`OpenDbAsyncPhase::BootstrapMvStore`) across the
 /// metadata-bootstrap IO chain so opening an MVCC database does not block on
-/// the log-header truncate / write / fsync sequence.
+/// the log-header truncate / write / fsync sequence, the interrupted-checkpoint
+/// reconciliation, the schema reparse, or the metadata-table reads/writes.
 #[derive(Default)]
 pub enum BootstrapState {
     #[default]
     Start,
+    /// Pre-metadata: reconcile an interrupted checkpoint (non-blocking).
+    PreCheckpoint {
+        tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
+        checkpoint_st: CompleteCheckpointState,
+    },
+    /// Pre-metadata: reparse the schema (non-blocking).
+    PreReparse {
+        tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
+        reparse_st: crate::connection::ReparseSchemaState,
+    },
+    /// Reading the persistent tx-ts-max from the MVCC metadata table to decide
+    /// whether the metadata-bootstrap IO chain is needed.
+    BeginReadTxTs {
+        read_st: ReadPersistentTxTsMaxState,
+    },
     MetadataIo(MetadataIoInFlight),
+    /// Finish: create/seed the MVCC metadata table (non-blocking).
+    FinishInit {
+        init_st: InitMetadataTableState,
+    },
+    /// Finish: reconcile the interrupted checkpoint again after metadata writes.
+    FinishCheckpoint {
+        checkpoint_st: CompleteCheckpointState,
+    },
+    /// Replay the logical log into the MVCC store (non-blocking), then promote
+    /// the bootstrap connection to a regular MVCC connection.
+    Recover {
+        recover_st: RecoverLogicalLogState,
+    },
+    /// Recover sequence descriptors from each backing table (non-blocking).
+    /// The pre-replay reparse missed backing tables created by committed-but-
+    /// not-checkpointed CREATE SEQUENCE statements; this pass registers pure
+    /// descriptors via the MVCC-aware SQL path. The runtime watermark is never
+    /// read — every nextval queries disk on demand.
+    LoadSequences {
+        load_st: crate::connection::LoadSequenceDescriptorsState,
+    },
+    /// Compatibility sync for AUTOINCREMENT tables created in WAL mode (where
+    /// the watermark lives in sqlite_sequence) and then reopened in MVCC mode
+    /// (where the disk-only allocation path reads backing tables). Non-blocking.
+    SyncAutoincrement {
+        sync_st: crate::connection::SyncAutoincrementState,
+    },
     AwaitingGlobalHeader,
 }
 
@@ -3394,6 +3437,143 @@ pub enum MetadataIoStep {
     AfterUpdateHeader { sync_mode_off: bool },
     /// `storage.sync` just finished — metadata IO chain done.
     AfterSync,
+}
+
+/// Sub state machine for
+/// [`MvStore::maybe_complete_interrupted_checkpoint_nonblock`]. Tracks the
+/// sequence of IO yields needed to reconcile an interrupted MVCC checkpoint
+/// without blocking: read log header → optional early WAL truncate, or
+/// WAL→DB backfill + db_file.sync + log-header rewrite (with a single-shot
+/// CRC retry) + final WAL truncate.
+#[derive(Default)]
+pub enum CompleteCheckpointState {
+    #[default]
+    Start,
+    /// Reading the log header via the streaming reader.
+    ReadingHeader {
+        reader: Box<StreamingLogicalLogReader>,
+    },
+    /// `wal_max_frame == 0` branch: driving the early `wal.truncate_wal`.
+    /// `checkpoint_result` must persist across IO yields because
+    /// `truncate_wal`/`truncate_log` tracks its truncate/sync progress through
+    /// its `wal_truncate_sent` / `wal_sync_sent` flags; recreating it each
+    /// re-entry would re-issue the truncate forever.
+    DriveEarlyTruncate {
+        header_result: HeaderReadResult,
+        checkpoint_result: CheckpointResult,
+    },
+    /// Main path: driving `wal.checkpoint(Truncate)`.
+    DriveCheckpoint { header: LogHeader },
+    /// Awaiting the `db_file.sync` completion after a successful backfill.
+    AwaitDbFileSync {
+        completion: Completion,
+        checkpoint_result: CheckpointResult,
+    },
+    /// Retry loop: rewriting the log header + verifying CRC. `retried_crc`
+    /// allows a single retry on torn-tail mismatch before failing closed.
+    RetryHeader {
+        checkpoint_result: CheckpointResult,
+        retried_crc: bool,
+        phase: RetryHeaderPhase,
+    },
+    /// Driving the final `wal.truncate_wal`.
+    DriveFinalTruncate { checkpoint_result: CheckpointResult },
+}
+
+#[doc(hidden)]
+pub enum RetryHeaderPhase {
+    /// Need to issue `storage.update_header`.
+    NeedUpdateHeader,
+    /// Awaiting the `storage.update_header` write.
+    AwaitUpdateHeader(Completion),
+    /// Awaiting `storage.sync` (only when `sync_mode != Off`).
+    AwaitLogSync(Completion),
+    /// Reading the log header to verify the CRC.
+    AwaitCrcCheck {
+        reader: Box<StreamingLogicalLogReader>,
+    },
+}
+
+/// Sub state machine for [`MvStore::try_read_persistent_tx_ts_max_nonblock`].
+/// Holds the prepared metadata-read statement + accumulated value across IO
+/// yields while the SELECT runs cooperatively.
+#[derive(Default)]
+pub enum ReadPersistentTxTsMaxState {
+    #[default]
+    Start,
+    Running {
+        stmt: Box<crate::Statement>,
+        value: Option<i64>,
+    },
+}
+
+/// Sub state machine for [`MvStore::initialize_mvcc_metadata_table_nonblock`].
+/// Sequences the CREATE TABLE then INSERT statements, holding each prepared
+/// statement across IO yields.
+#[derive(Default)]
+pub enum InitMetadataTableState {
+    #[default]
+    Start,
+    CreateTable {
+        stmt: Box<crate::Statement>,
+    },
+    Insert {
+        stmt: Box<crate::Statement>,
+    },
+}
+
+/// Sub state machine for [`MvStore::maybe_recover_logical_log`]. The
+/// setup phases (header read, persistent-tx-ts read, schema-cookie read,
+/// sqlite_schema scan) each yield IO; the `Replay` phase carries the loop
+/// accumulators in [`RecoverCtx`] across per-frame `next_frame` yields.
+#[derive(Default)]
+pub enum RecoverLogicalLogState {
+    #[default]
+    Start,
+    ReadHeader {
+        reader: Box<StreamingLogicalLogReader>,
+        preserved_tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
+    },
+    ReadTxTs {
+        reader: Box<StreamingLogicalLogReader>,
+        preserved_tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
+        header_present: bool,
+        txts_st: ReadPersistentTxTsMaxState,
+    },
+    ReadCookie {
+        reader: Box<StreamingLogicalLogReader>,
+        preserved_tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
+        persistent_tx_ts_max: u64,
+    },
+    QuerySchema {
+        reader: Box<StreamingLogicalLogReader>,
+        preserved_tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
+        persistent_tx_ts_max: u64,
+        cookie: u32,
+        stmt: Option<Box<crate::Statement>>,
+        schema_rows: HashMap<i64, ImmutableRecord>,
+    },
+    Replay {
+        ctx: Box<RecoverCtx>,
+    },
+    Done,
+}
+
+/// Accumulated state of the logical-log replay loop, persisted across
+/// `next_frame` IO yields. See [`MvStore::maybe_recover_logical_log`].
+pub struct RecoverCtx {
+    reader: Box<StreamingLogicalLogReader>,
+    preserved_table_valued_functions: Vec<Arc<crate::vtab::VirtualTable>>,
+    /// Fallback schema cookie (pre-read) used by `recover_build_schema` only
+    /// when `global_header` is unset.
+    cookie: u32,
+    persistent_tx_ts_max: u64,
+    replay_cutoff_ts: u64,
+    max_commit_ts_seen: u64,
+    schema_rows: HashMap<i64, ImmutableRecord>,
+    dropped_root_pages: HashSet<i64>,
+    current_schema: Arc<Schema>,
+    index_infos: HashMap<(MVTableId, IndexOpKind), Arc<IndexInfo>>,
 }
 
 /// A multi-version concurrency control database.
@@ -3696,39 +3876,45 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// `persistent_tx_ts_max` (initialized to 0). This table stores the durable replay
     /// boundary: on recovery, only logical-log frames with `commit_ts > persistent_tx_ts_max`
     /// are replayed. Called once during first MVCC bootstrap.
-    fn initialize_mvcc_metadata_table(&self, connection: &Arc<Connection>) -> Result<()> {
-        connection.execute(format!(
-            "CREATE TABLE IF NOT EXISTS {MVCC_META_TABLE_NAME}(k TEXT, v INTEGER NOT NULL)"
-        ))?;
-        connection.execute(format!(
-            "INSERT OR IGNORE INTO {MVCC_META_TABLE_NAME}(rowid, k, v) VALUES (1, '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}', 0)"
-        ))?;
-        Ok(())
+    /// Creates and seeds the MVCC metadata table, driving the CREATE TABLE then
+    /// INSERT statements cooperatively via the supplied [`InitMetadataTableState`]
+    /// so bootstrap does not block on backends without a synchronous IO pump.
+    fn initialize_mvcc_metadata_table_nonblock(
+        &self,
+        connection: &Arc<Connection>,
+        st: &mut InitMetadataTableState,
+    ) -> Result<IOResult<()>> {
+        loop {
+            match st {
+                InitMetadataTableState::Start => {
+                    let stmt = connection.prepare(format!(
+                        "CREATE TABLE IF NOT EXISTS {MVCC_META_TABLE_NAME}(k TEXT, v INTEGER NOT NULL)"
+                    ))?;
+                    *st = InitMetadataTableState::CreateTable {
+                        stmt: Box::new(stmt),
+                    };
+                }
+                InitMetadataTableState::CreateTable { stmt } => {
+                    return_if_io!(stmt.run_ignore_rows_nonblock());
+                    let stmt = connection.prepare(format!(
+                        "INSERT OR IGNORE INTO {MVCC_META_TABLE_NAME}(rowid, k, v) VALUES (1, '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}', 0)"
+                    ))?;
+                    *st = InitMetadataTableState::Insert {
+                        stmt: Box::new(stmt),
+                    };
+                }
+                InitMetadataTableState::Insert { stmt } => {
+                    return_if_io!(stmt.run_ignore_rows_nonblock());
+                    *st = InitMetadataTableState::Start;
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
     }
 
-    /// Read the persistent transaction timestamp maximum from the MVCC metadata table.
-    fn try_read_persistent_tx_ts_max(&self, connection: &Arc<Connection>) -> Result<Option<u64>> {
-        let query_result = connection.query(format!(
-            "SELECT v FROM {MVCC_META_TABLE_NAME}
-             WHERE k = '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}'"
-        ));
-        let maybe_stmt = match query_result {
-            Ok(stmt) => stmt,
-            Err(LimboError::ParseError(msg)) if msg.contains("no such table") => return Ok(None),
-            Err(err) => {
-                return Err(LimboError::Corrupt(format!(
-                    "Failed to read MVCC metadata table: {err}"
-                )));
-            }
-        };
-        let mut value: Option<i64> = None;
-        if let Some(mut stmt) = maybe_stmt {
-            stmt.run_with_row_callback(|row| {
-                value = Some(row.get::<i64>(0)?);
-                Ok(())
-            })?;
-        }
-
+    /// Shared validation/normalization for the persistent-tx-ts-max metadata
+    /// value used by both the blocking and non-blocking readers.
+    fn validate_persistent_tx_ts_max(value: Option<i64>) -> Result<Option<u64>> {
         let value = value.ok_or_else(|| {
             LimboError::Corrupt(format!(
                 "Missing MVCC metadata row for key {MVCC_META_KEY_PERSISTENT_TX_TS_MAX}"
@@ -3741,6 +3927,60 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             )));
         }
         Ok(Some(value as u64))
+    }
+
+    /// Non-blocking variant of [`Self::try_read_persistent_tx_ts_max`]: runs the
+    /// metadata SELECT cooperatively via the supplied
+    /// [`ReadPersistentTxTsMaxState`], yielding IO instead of pumping it. Returns
+    /// `None` if the metadata table does not exist yet.
+    fn try_read_persistent_tx_ts_max_nonblock(
+        &self,
+        connection: &Arc<Connection>,
+        st: &mut ReadPersistentTxTsMaxState,
+    ) -> Result<IOResult<Option<u64>>> {
+        loop {
+            match st {
+                ReadPersistentTxTsMaxState::Start => {
+                    let query_result = connection.query(format!(
+                        "SELECT v FROM {MVCC_META_TABLE_NAME}
+                         WHERE k = '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}'"
+                    ));
+                    let maybe_stmt = match query_result {
+                        Ok(stmt) => stmt,
+                        Err(LimboError::ParseError(msg)) if msg.contains("no such table") => {
+                            return Ok(IOResult::Done(None))
+                        }
+                        Err(err) => {
+                            return Err(LimboError::Corrupt(format!(
+                                "Failed to read MVCC metadata table: {err}"
+                            )))
+                        }
+                    };
+                    match maybe_stmt {
+                        Some(stmt) => {
+                            *st = ReadPersistentTxTsMaxState::Running {
+                                stmt: Box::new(stmt),
+                                value: None,
+                            };
+                        }
+                        // No statement to run — fall through to the missing-row
+                        // error path (matches the blocking variant).
+                        None => {
+                            return Self::validate_persistent_tx_ts_max(None).map(IOResult::Done)
+                        }
+                    }
+                }
+                ReadPersistentTxTsMaxState::Running { stmt, value } => {
+                    return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        *value = Some(row.get::<i64>(0)?);
+                        Ok(())
+                    }));
+                    let value = *value;
+                    *st = ReadPersistentTxTsMaxState::Start;
+                    return Self::validate_persistent_tx_ts_max(value).map(IOResult::Done);
+                }
+            }
+        }
     }
 
     /// Bootstrap the MV store from the SQLite schema table and logical log.
@@ -3771,15 +4011,60 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         loop {
             match st {
                 BootstrapState::Start => {
-                    self.bootstrap_pre_metadata(bootstrap_conn)?;
-                    if let Some(next) = self.bootstrap_begin_metadata_io(bootstrap_conn)? {
+                    // Capture built-in table-valued functions before the schema
+                    // reparse drops them (sync, no IO).
+                    let tvfs = Self::capture_table_valued_functions(&bootstrap_conn.schema.read());
+                    *st = BootstrapState::PreCheckpoint {
+                        tvfs,
+                        checkpoint_st: CompleteCheckpointState::default(),
+                    };
+                }
+                BootstrapState::PreCheckpoint {
+                    tvfs,
+                    checkpoint_st,
+                } => {
+                    return_if_io!(self.maybe_complete_interrupted_checkpoint_nonblock(
+                        bootstrap_conn,
+                        checkpoint_st
+                    ));
+                    let tvfs = std::mem::take(tvfs);
+                    *st = BootstrapState::PreReparse {
+                        tvfs,
+                        reparse_st: crate::connection::ReparseSchemaState::default(),
+                    };
+                }
+                BootstrapState::PreReparse { tvfs, reparse_st } => {
+                    return_if_io!(bootstrap_conn.reparse_schema_nonblock(reparse_st));
+                    self.rehydrate_connection_table_valued_functions(bootstrap_conn, tvfs);
+                    // pre_metadata done. Decide whether metadata bootstrap IO is needed.
+                    if !self.uses_durable_mvcc_metadata(bootstrap_conn) {
+                        self.bootstrap_map_root_pages(bootstrap_conn)?;
+                        *st = BootstrapState::Recover {
+                            recover_st: RecoverLogicalLogState::default(),
+                        };
+                    } else {
+                        *st = BootstrapState::BeginReadTxTs {
+                            read_st: ReadPersistentTxTsMaxState::default(),
+                        };
+                    }
+                }
+                BootstrapState::BeginReadTxTs { read_st } => {
+                    let persistent_tx_ts = return_if_io!(
+                        self.try_read_persistent_tx_ts_max_nonblock(bootstrap_conn, read_st)
+                    );
+                    if persistent_tx_ts.is_some() {
+                        // Metadata already durable — no bootstrap IO chain needed.
+                        self.bootstrap_map_root_pages(bootstrap_conn)?;
+                        *st = BootstrapState::Recover {
+                            recover_st: RecoverLogicalLogState::default(),
+                        };
+                    } else if let Some(next) = self.bootstrap_issue_metadata_io(bootstrap_conn)? {
                         *st = BootstrapState::MetadataIo(next);
                     } else {
-                        // No metadata IO needed (either non-durable mode, or
-                        // persistent_tx_ts already set). Run the post-metadata
-                        // sync work and transition.
-                        self.bootstrap_post_metadata_setup(bootstrap_conn)?;
-                        *st = BootstrapState::AwaitingGlobalHeader;
+                        self.bootstrap_map_root_pages(bootstrap_conn)?;
+                        *st = BootstrapState::Recover {
+                            recover_st: RecoverLogicalLogState::default(),
+                        };
                     }
                 }
                 BootstrapState::MetadataIo(phase) => {
@@ -3787,7 +4072,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let c = phase.completion.clone();
                         io_yield_one!(c);
                     }
-                    let pager = bootstrap_conn.pager.load().clone();
                     let sync_type = phase.sync_type;
                     match phase.next {
                         MetadataIoStep::AfterTruncate {
@@ -3804,9 +4088,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 };
                                 // Loop to re-check succeeded immediately
                             } else {
-                                self.bootstrap_finish_metadata_io(bootstrap_conn)?;
-                                self.bootstrap_post_metadata_setup(bootstrap_conn)?;
-                                *st = BootstrapState::AwaitingGlobalHeader;
+                                *st = BootstrapState::FinishInit {
+                                    init_st: InitMetadataTableState::default(),
+                                };
                             }
                         }
                         MetadataIoStep::AfterUpdateHeader { sync_mode_off } => {
@@ -3818,18 +4102,68 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                     next: MetadataIoStep::AfterSync,
                                 };
                             } else {
-                                self.bootstrap_finish_metadata_io(bootstrap_conn)?;
-                                self.bootstrap_post_metadata_setup(bootstrap_conn)?;
-                                *st = BootstrapState::AwaitingGlobalHeader;
+                                *st = BootstrapState::FinishInit {
+                                    init_st: InitMetadataTableState::default(),
+                                };
                             }
-                            let _ = pager; // silence unused on this arm
                         }
                         MetadataIoStep::AfterSync => {
-                            self.bootstrap_finish_metadata_io(bootstrap_conn)?;
-                            self.bootstrap_post_metadata_setup(bootstrap_conn)?;
-                            *st = BootstrapState::AwaitingGlobalHeader;
+                            *st = BootstrapState::FinishInit {
+                                init_st: InitMetadataTableState::default(),
+                            };
                         }
                     }
+                }
+                BootstrapState::FinishInit { init_st } => {
+                    return_if_io!(
+                        self.initialize_mvcc_metadata_table_nonblock(bootstrap_conn, init_st)
+                    );
+                    *st = BootstrapState::FinishCheckpoint {
+                        checkpoint_st: CompleteCheckpointState::default(),
+                    };
+                }
+                BootstrapState::FinishCheckpoint { checkpoint_st } => {
+                    return_if_io!(self.maybe_complete_interrupted_checkpoint_nonblock(
+                        bootstrap_conn,
+                        checkpoint_st
+                    ));
+                    self.bootstrap_map_root_pages(bootstrap_conn)?;
+                    *st = BootstrapState::Recover {
+                        recover_st: RecoverLogicalLogState::default(),
+                    };
+                }
+                BootstrapState::Recover { recover_st } => {
+                    // Recover the logical log while the bootstrap connection still
+                    // reads from the pager-backed schema, so recovery can merge
+                    // checkpointed sqlite_schema rows with non-checkpointed rows
+                    // from log replay.
+                    return_if_io!(self.maybe_recover_logical_log(bootstrap_conn, recover_st));
+                    // Recovery done; switch back to regular MVCC reads.
+                    bootstrap_conn.promote_to_regular_connection();
+                    *st = BootstrapState::LoadSequences {
+                        load_st: crate::connection::LoadSequenceDescriptorsState::default(),
+                    };
+                }
+                BootstrapState::LoadSequences { load_st } => {
+                    // After log replay, recover sequence descriptors from each
+                    // backing table (non-blocking). A read failure on an internal
+                    // backing table is on-disk corruption, surfaced as a hard
+                    // bootstrap failure rather than a misleading "sequence does
+                    // not exist" on the next nextval.
+                    return_if_io!(bootstrap_conn.load_sequence_descriptors_via_sql_nonblock(load_st));
+                    *st = BootstrapState::SyncAutoincrement {
+                        sync_st: crate::connection::SyncAutoincrementState::default(),
+                    };
+                }
+                BootstrapState::SyncAutoincrement { sync_st } => {
+                    // WAL→MVCC AUTOINCREMENT watermark compatibility sync (non-
+                    // blocking). A failure here cannot be downgraded: it would
+                    // leave the next AUTOINCREMENT INSERT able to re-emit a rowid
+                    // already on disk, so it propagates as a bootstrap failure.
+                    return_if_io!(bootstrap_conn
+                        .sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(sync_st));
+                    *bootstrap_conn.db.schema.lock() = bootstrap_conn.schema.read().clone();
+                    *st = BootstrapState::AwaitingGlobalHeader;
                 }
                 BootstrapState::AwaitingGlobalHeader => {
                     if self.global_header.read().is_none() {
@@ -3843,40 +4177,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
-    /// Synchronous prelude to bootstrap: capture vtabs, run the first
-    /// checkpoint reconciliation, reparse schema, rehydrate vtabs.
-    fn bootstrap_pre_metadata(&self, bootstrap_conn: &Arc<Connection>) -> Result<()> {
-        let preserved_table_valued_functions =
-            Self::capture_table_valued_functions(&bootstrap_conn.schema.read());
-        self.maybe_complete_interrupted_checkpoint(bootstrap_conn)?;
-        bootstrap_conn.reparse_schema()?;
-        self.rehydrate_connection_table_valued_functions(
-            bootstrap_conn,
-            &preserved_table_valued_functions,
-        );
-        Ok(())
-    }
-
-    /// Decide whether the metadata-bootstrap IO chain is required and, if so,
-    /// issue its first completion. Returns `Some(MetadataIoInFlight)` carrying
-    /// the in-flight completion and the next step to take after it completes;
-    /// returns `None` if the chain is not required (either the database does
-    /// not use durable MVCC metadata, or the persistent tx-ts max is already
-    /// set, or the log is in a clean state).
-    fn bootstrap_begin_metadata_io(
+    /// Issue the first completion of the metadata-bootstrap IO chain, if one is
+    /// needed. Called from the bootstrap state machine only after it has already
+    /// confirmed durable MVCC metadata is in use and the persistent tx-ts max is
+    /// absent. Returns `Some(MetadataIoInFlight)` with the in-flight completion
+    /// and next step, or `None` if the log is already in a clean state.
+    fn bootstrap_issue_metadata_io(
         &self,
         bootstrap_conn: &Arc<Connection>,
     ) -> Result<Option<MetadataIoInFlight>> {
-        if !self.uses_durable_mvcc_metadata(bootstrap_conn) {
-            return Ok(None);
-        }
-        if self
-            .try_read_persistent_tx_ts_max(bootstrap_conn)?
-            .is_some()
-        {
-            return Ok(None);
-        }
-
         let log_size = self.get_logical_log_file().size()?;
         let pager = bootstrap_conn.pager.load().clone();
         if bootstrap_conn.db.is_readonly() {
@@ -3920,81 +4229,36 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(None)
     }
 
-    /// Once the metadata-bootstrap IO chain has finished, initialize the MVCC
-    /// metadata table and reconcile any interrupted checkpoint immediately so
-    /// that subsequent opens (including read-only opens) do not depend on WAL
-    /// replay of those metadata writes.
-    fn bootstrap_finish_metadata_io(&self, bootstrap_conn: &Arc<Connection>) -> Result<()> {
-        self.initialize_mvcc_metadata_table(bootstrap_conn)?;
-        self.maybe_complete_interrupted_checkpoint(bootstrap_conn)?;
-        Ok(())
-    }
-
-    /// Sync work between the metadata IO chain (or its skip) and the final
-    /// global-header read: build the schema mapping, recover the logical log,
-    /// and promote the bootstrap connection to a regular MVCC connection.
-    fn bootstrap_post_metadata_setup(&self, bootstrap_conn: &Arc<Connection>) -> Result<()> {
-        {
-            let schema = bootstrap_conn.schema.read();
-            let sqlite_schema_root_pages = {
-                schema
-                    .tables
-                    .values()
-                    .filter_map(|t| {
-                        if let Table::BTree(btree) = t.as_ref() {
-                            Some(btree.root_page)
-                        } else {
-                            None
-                        }
-                    })
-                    .chain(
-                        schema
-                            .indexes
-                            .values()
-                            .flatten()
-                            .map(|index| index.root_page),
-                    )
-            };
-            // Map all existing checkpointed root pages to table ids so that if root_page=R, table_id=-R
-            for root_page in sqlite_schema_root_pages {
-                turso_assert!(root_page > 0, "root_page={root_page} must be positive");
-                let root_page_as_table_id = MVTableId::from(-(root_page));
-                self.insert_table_id_to_rootpage(root_page_as_table_id, Some(root_page as u64));
-            }
+    /// Sync prelude to logical-log recovery: map all existing checkpointed
+    /// sqlite_schema root pages to MVCC table ids (root_page=R → table_id=-R).
+    /// Recovery itself (and the connection promotion) is driven separately by
+    /// the bootstrap state machine's `Recover` phase so it can yield IO.
+    fn bootstrap_map_root_pages(&self, bootstrap_conn: &Arc<Connection>) -> Result<()> {
+        let schema = bootstrap_conn.schema.read();
+        let sqlite_schema_root_pages = {
+            schema
+                .tables
+                .values()
+                .filter_map(|t| {
+                    if let Table::BTree(btree) = t.as_ref() {
+                        Some(btree.root_page)
+                    } else {
+                        None
+                    }
+                })
+                .chain(
+                    schema
+                        .indexes
+                        .values()
+                        .flatten()
+                        .map(|index| index.root_page),
+                )
+        };
+        for root_page in sqlite_schema_root_pages {
+            turso_assert!(root_page > 0, "root_page={root_page} must be positive");
+            let root_page_as_table_id = MVTableId::from(-(root_page));
+            self.insert_table_id_to_rootpage(root_page_as_table_id, Some(root_page as u64));
         }
-
-        // Recover logical log while bootstrap connection still reads from pager-backed schema.
-        // This lets recovery merge checkpointed sqlite_schema rows with non-checkpointed rows from log replay.
-        let _recovered = self.maybe_recover_logical_log(bootstrap_conn.clone())?;
-
-        // Recovery is done, switch back to regular MVCC reads.
-        bootstrap_conn.promote_to_regular_connection();
-
-        // After log replay, recover sequence descriptors from each backing
-        // table. The pre-replay reparse at the top of bootstrap missed
-        // backing tables created by committed-but-not-checkpointed CREATE
-        // SEQUENCE statements; this pass goes through the normal SQL path
-        // (MVCC-aware) to register pure descriptors. The runtime watermark
-        // is never read — every nextval queries disk on demand.
-        //
-        // `load_sequence_descriptors_via_sql` classifies any read failure
-        // on an internal backing table as `LimboError::Corrupt`; bootstrap
-        // must fail rather than swallow that — opening a database whose
-        // sequence backing table is unreadable would leave the engine
-        // reporting "sequence does not exist" on the next nextval, hiding
-        // real on-disk corruption.
-        bootstrap_conn.load_sequence_descriptors_via_sql()?;
-        // Compatibility sync for AUTOINCREMENT tables created in WAL mode
-        // (where the watermark lives in sqlite_sequence) and then reopened
-        // in MVCC mode (where the new disk-only allocation path reads
-        // backing tables). Without this, the next MVCC AUTOINCREMENT
-        // INSERT would regress to start_value and collide with existing
-        // rowids — so a failure here cannot be downgraded to a warning;
-        // the inner helper now propagates I/O / corruption errors and
-        // we surface them to the caller as a hard bootstrap failure.
-        bootstrap_conn.sync_autoincrement_backing_tables_from_sqlite_sequence()?;
-        *bootstrap_conn.db.schema.lock() = bootstrap_conn.schema.read().clone();
-
         Ok(())
     }
 
@@ -6027,319 +6291,440 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(None)
     }
 
-    fn logical_log_header_crc_valid(&self, pager: &Arc<Pager>) -> Result<bool> {
-        let file = self.get_logical_log_file();
-        // Header is never encrypted; no need to pass EncryptionContext here.
-        let mut reader = StreamingLogicalLogReader::new(file, None);
-        match reader.try_read_header(&pager.io)? {
-            HeaderReadResult::Valid(_) => Ok(true),
-            HeaderReadResult::NoLog | HeaderReadResult::Invalid => Ok(false),
-        }
-    }
-
-    /// Runs during bootstrap to reconcile WAL state left by a prior crash or incomplete
-    /// checkpoint. Classifies startup state by WAL frame count and logical-log header
-    /// validity, then either completes the interrupted checkpoint (backfill WAL → DB,
-    /// sync, truncate) or fails closed on corrupt/inconsistent artifacts.
+    /// Reconcile WAL state left by a prior crash or incomplete checkpoint.
+    /// Classifies startup state by WAL frame count and logical-log header
+    /// validity, then either completes the interrupted checkpoint
+    /// (backfill WAL → DB, sync, truncate) or fails closed on corrupt /
+    /// inconsistent artifacts. Non-blocking: all IO yields through the
+    /// supplied [`CompleteCheckpointState`].
     /// See RECOVERY_SEMANTICS.md "Startup Case Classification" for the full case table.
-    fn maybe_complete_interrupted_checkpoint(&self, connection: &Arc<Connection>) -> Result<()> {
+    pub(crate) fn maybe_complete_interrupted_checkpoint_nonblock(
+        &self,
+        connection: &Arc<Connection>,
+        st: &mut CompleteCheckpointState,
+    ) -> Result<IOResult<()>> {
         let pager = connection.pager.load().clone();
         let Some(wal) = &pager.wal else {
-            return Ok(());
+            return Ok(IOResult::Done(()));
         };
-        // The bootstrap connection may have acquired a WAL read lock during earlier
-        // bootstrap steps (e.g. schema parsing). Drop it so the TRUNCATE checkpoint
-        // below isn't blocked by our own read lock.
-        if wal.holds_read_lock() {
-            wal.end_read_tx();
-        }
-
-        let wal_max_frame = wal.get_max_frame_in_wal();
-        let file = self.get_logical_log_file();
-        // This method only reads the header (never encrypted); no need to pass EncryptionContext.
-        let mut reader = StreamingLogicalLogReader::new(file, None);
-        let header_result = reader.try_read_header(&pager.io)?;
-
-        let is_readonly = connection.db.is_readonly();
-        if wal_max_frame == 0 {
-            if !is_readonly {
-                let mut checkpoint_result = CheckpointResult::new(0, 0, 0);
-                pager
-                    .io
-                    .block(|| wal.truncate_wal(&mut checkpoint_result, pager.get_sync_type()))?;
-                if let HeaderReadResult::Valid(header) = &header_result {
+        loop {
+            match st {
+                CompleteCheckpointState::Start => {
+                    // The bootstrap connection may have acquired a WAL read lock during
+                    // earlier bootstrap steps (e.g. schema parsing). Drop it so the
+                    // TRUNCATE checkpoint below isn't blocked by our own read lock.
+                    // Idempotent across re-entry (holds_read_lock is checked first).
+                    if wal.holds_read_lock() {
+                        wal.end_read_tx();
+                    }
+                    let file = self.get_logical_log_file();
+                    // Header is never encrypted; no EncryptionContext needed.
+                    *st = CompleteCheckpointState::ReadingHeader {
+                        reader: Box::new(StreamingLogicalLogReader::new(file, None)),
+                    };
+                }
+                CompleteCheckpointState::ReadingHeader { reader } => {
+                    let header_result = return_if_io!(reader.try_read_header_nonblock());
+                    let wal_max_frame = wal.get_max_frame_in_wal();
+                    let is_readonly = connection.db.is_readonly();
+                    if wal_max_frame == 0 {
+                        if is_readonly {
+                            // Nothing to reconcile in read-only mode with no committed frames.
+                            *st = CompleteCheckpointState::Start;
+                            return Ok(IOResult::Done(()));
+                        }
+                        *st = CompleteCheckpointState::DriveEarlyTruncate {
+                            header_result,
+                            checkpoint_result: CheckpointResult::new(0, 0, 0),
+                        };
+                        continue;
+                    }
+                    if is_readonly {
+                        return Err(LimboError::Corrupt(
+                            "Cannot reconcile interrupted MVCC checkpoint in read-only mode"
+                                .to_string(),
+                        ));
+                    }
+                    let header = match header_result {
+                        HeaderReadResult::Valid(header) => header,
+                        HeaderReadResult::NoLog => {
+                            return Err(LimboError::Corrupt(
+                                "WAL has committed frames but logical log header is missing"
+                                    .to_string(),
+                            ))
+                        }
+                        HeaderReadResult::Invalid => {
+                            return Err(LimboError::Corrupt(
+                                "WAL has committed frames but logical log header is invalid"
+                                    .to_string(),
+                            ))
+                        }
+                    };
                     self.storage.set_header(header.clone());
+                    *st = CompleteCheckpointState::DriveCheckpoint { header };
                 }
-            }
-            return Ok(());
-        }
-
-        if is_readonly {
-            return Err(LimboError::Corrupt(
-                "Cannot reconcile interrupted MVCC checkpoint in read-only mode".to_string(),
-            ));
-        }
-
-        let header = match header_result {
-            HeaderReadResult::Valid(header) => header,
-            HeaderReadResult::NoLog => {
-                return Err(LimboError::Corrupt(
-                    "WAL has committed frames but logical log header is missing".to_string(),
-                ));
-            }
-            HeaderReadResult::Invalid => {
-                return Err(LimboError::Corrupt(
-                    "WAL has committed frames but logical log header is invalid".to_string(),
-                ));
-            }
-        };
-        self.storage.set_header(header);
-
-        self.storage.on_checkpoint_start()?;
-
-        // NOTE: this uses `CheckpointMode::Truncate` to drive WAL backfill only; we still
-        // truncate the WAL explicitly below to preserve WAL-last ordering in recovery.
-        let mut checkpoint_result = match pager.io.block(|| {
-            wal.checkpoint(
-                &pager,
-                CheckpointMode::Truncate {
-                    upper_bound_inclusive: None,
-                },
-            )
-        }) {
-            Ok(result) => result,
-            Err(err) => {
-                self.storage.on_checkpoint_end(Err(err.clone()))?;
-                return Err(err);
-            }
-        };
-
-        let recovery_result = (|| -> Result<()> {
-            if !checkpoint_result.everything_backfilled() {
-                return Err(LimboError::Corrupt(
-                    "Unable to fully backfill committed WAL frames during MVCC recovery"
-                        .to_string(),
-                ));
-            }
-
-            if connection.get_sync_mode() != SyncMode::Off
-                && checkpoint_result.wal_checkpoint_backfilled > 0
-            {
-                let c = pager
-                    .db_file
-                    .sync(Completion::new_sync(|_| {}), pager.get_sync_type())?;
-                pager.io.wait_for_completion(c)?;
-            }
-
-            // Write a fresh log header (distinct from the checkpoint state machine which no
-            // longer rewrites the header). This is bootstrap-only: we need a valid header on
-            // disk before truncating WAL. CRC verify + retry guards against torn header writes.
-            let mut retried_crc = false;
-            loop {
-                let c = self.storage.update_header()?;
-                pager.io.wait_for_completion(c)?;
-
-                if connection.get_sync_mode() != SyncMode::Off {
-                    let c = self.storage.sync(pager.get_sync_type())?;
-                    pager.io.wait_for_completion(c)?;
+                CompleteCheckpointState::DriveEarlyTruncate {
+                    header_result,
+                    checkpoint_result,
+                } => {
+                    return_if_io!(wal.truncate_wal(checkpoint_result, pager.get_sync_type()));
+                    if let HeaderReadResult::Valid(header) = header_result {
+                        self.storage.set_header(header.clone());
+                    }
+                    *st = CompleteCheckpointState::Start;
+                    return Ok(IOResult::Done(()));
                 }
-
-                if self.logical_log_header_crc_valid(&pager)? {
-                    break;
-                }
-
-                if retried_crc {
-                    return Err(LimboError::Corrupt(
-                        "Logical log header CRC mismatch after retry".to_string(),
+                CompleteCheckpointState::DriveCheckpoint { header: _header } => {
+                    // NOTE: uses `CheckpointMode::Truncate` to drive WAL backfill
+                    // only; we still truncate the WAL explicitly below to preserve
+                    // WAL-last ordering in recovery.
+                    let checkpoint_result = return_if_io!(wal.checkpoint(
+                        &pager,
+                        CheckpointMode::Truncate {
+                            upper_bound_inclusive: None,
+                        },
                     ));
+                    if !checkpoint_result.everything_backfilled() {
+                        return Err(LimboError::Corrupt(
+                            "Unable to fully backfill committed WAL frames during MVCC recovery"
+                                .to_string(),
+                        ));
+                    }
+                    let need_db_sync = connection.get_sync_mode() != SyncMode::Off
+                        && checkpoint_result.wal_checkpoint_backfilled > 0;
+                    if need_db_sync {
+                        let c = pager
+                            .db_file
+                            .sync(Completion::new_sync(|_| {}), pager.get_sync_type())?;
+                        *st = CompleteCheckpointState::AwaitDbFileSync {
+                            completion: c,
+                            checkpoint_result,
+                        };
+                    } else {
+                        *st = CompleteCheckpointState::RetryHeader {
+                            checkpoint_result,
+                            retried_crc: false,
+                            phase: RetryHeaderPhase::NeedUpdateHeader,
+                        };
+                    }
                 }
-                retried_crc = true;
-            }
-
-            pager
-                .io
-                .block(|| wal.truncate_wal(&mut checkpoint_result, pager.get_sync_type()))?;
-            Ok(())
-        })();
-
-        match recovery_result {
-            Ok(()) => {
-                self.storage.on_checkpoint_end(Ok(&checkpoint_result))?;
-                Ok(())
-            }
-            Err(err) => {
-                self.storage.on_checkpoint_end(Err(err.clone()))?;
-                Err(err)
+                CompleteCheckpointState::AwaitDbFileSync {
+                    completion,
+                    checkpoint_result,
+                } => {
+                    if !completion.succeeded() {
+                        let c = completion.clone();
+                        io_yield_one!(c);
+                    }
+                    let checkpoint_result =
+                        std::mem::replace(checkpoint_result, CheckpointResult::new(0, 0, 0));
+                    *st = CompleteCheckpointState::RetryHeader {
+                        checkpoint_result,
+                        retried_crc: false,
+                        phase: RetryHeaderPhase::NeedUpdateHeader,
+                    };
+                }
+                CompleteCheckpointState::RetryHeader {
+                    checkpoint_result,
+                    retried_crc,
+                    phase,
+                } => match phase {
+                    RetryHeaderPhase::NeedUpdateHeader => {
+                        let c = self.storage.update_header()?;
+                        *phase = RetryHeaderPhase::AwaitUpdateHeader(c);
+                    }
+                    RetryHeaderPhase::AwaitUpdateHeader(completion) => {
+                        if !completion.succeeded() {
+                            let c = completion.clone();
+                            io_yield_one!(c);
+                        }
+                        if connection.get_sync_mode() != SyncMode::Off {
+                            let c = self.storage.sync(pager.get_sync_type())?;
+                            *phase = RetryHeaderPhase::AwaitLogSync(c);
+                        } else {
+                            let file = self.get_logical_log_file();
+                            *phase = RetryHeaderPhase::AwaitCrcCheck {
+                                reader: Box::new(StreamingLogicalLogReader::new(file, None)),
+                            };
+                        }
+                    }
+                    RetryHeaderPhase::AwaitLogSync(completion) => {
+                        if !completion.succeeded() {
+                            let c = completion.clone();
+                            io_yield_one!(c);
+                        }
+                        let file = self.get_logical_log_file();
+                        *phase = RetryHeaderPhase::AwaitCrcCheck {
+                            reader: Box::new(StreamingLogicalLogReader::new(file, None)),
+                        };
+                    }
+                    RetryHeaderPhase::AwaitCrcCheck { reader } => {
+                        let header_result = return_if_io!(reader.try_read_header_nonblock());
+                        let crc_valid = matches!(header_result, HeaderReadResult::Valid(_));
+                        if crc_valid {
+                            let checkpoint_result = std::mem::replace(
+                                checkpoint_result,
+                                CheckpointResult::new(0, 0, 0),
+                            );
+                            *st = CompleteCheckpointState::DriveFinalTruncate { checkpoint_result };
+                        } else {
+                            if *retried_crc {
+                                return Err(LimboError::Corrupt(
+                                    "Logical log header CRC mismatch after retry".to_string(),
+                                ));
+                            }
+                            *retried_crc = true;
+                            *phase = RetryHeaderPhase::NeedUpdateHeader;
+                        }
+                    }
+                },
+                CompleteCheckpointState::DriveFinalTruncate { checkpoint_result } => {
+                    match wal.truncate_wal(checkpoint_result, pager.get_sync_type()) {
+                        Ok(IOResult::Done(())) => {
+                            self.storage.on_checkpoint_end(Ok(checkpoint_result))?;
+                        }
+                        Ok(IOResult::IO(c)) => {
+                            return Ok(IOResult::IO(c));
+                        }
+                        Err(err) => {
+                            self.storage.on_checkpoint_end(Err(err.clone()))?;
+                            return Err(err);
+                        }
+                    }
+                    *st = CompleteCheckpointState::Start;
+                    return Ok(IOResult::Done(()));
+                }
             }
         }
     }
 
     /// Replays committed logical-log frames into the in-memory MVCC store.
-    /// Only frames with `commit_ts > persistent_tx_ts_max` (the durable replay boundary
-    /// from the metadata table) are applied; earlier frames were already checkpointed.
-    /// On success, reseeds the MVCC clock to `max(persistent_tx_ts_max, max_replayed_commit_ts) + 1`
-    /// and sets the log writer offset to `last_valid_offset` so torn-tail bytes are overwritten.
-    /// Returns true if any frames were replayed, false otherwise.
-    pub fn maybe_recover_logical_log(&self, connection: Arc<Connection>) -> Result<bool> {
-        let pager = connection.pager.load().clone();
-        let file = self.get_logical_log_file();
-        let enc_ctx = self.storage.encryption_ctx();
-        let mut reader = StreamingLogicalLogReader::new(file.clone(), enc_ctx);
-        let preserved_table_valued_functions =
-            Self::capture_table_valued_functions(&connection.schema.read());
+    /// Only frames with `commit_ts > persistent_tx_ts_max` (the durable replay
+    /// boundary from the metadata table) are applied; earlier frames were
+    /// already checkpointed. On success, reseeds the MVCC clock and sets the log
+    /// writer offset so torn-tail bytes are overwritten. Returns true if any
+    /// frames were replayed.
+    pub fn maybe_recover_logical_log(
+        &self,
+        connection: &Arc<Connection>,
+        st: &mut RecoverLogicalLogState,
+    ) -> Result<IOResult<bool>> {
+        loop {
+            match st {
+                RecoverLogicalLogState::Start => {
+                    let file = self.get_logical_log_file();
+                    let enc_ctx = self.storage.encryption_ctx();
+                    let reader = Box::new(StreamingLogicalLogReader::new(file, enc_ctx));
+                    let preserved_tvfs =
+                        Self::capture_table_valued_functions(&connection.schema.read());
+                    *st = RecoverLogicalLogState::ReadHeader {
+                        reader,
+                        preserved_tvfs,
+                    };
+                }
+                RecoverLogicalLogState::ReadHeader { reader, .. } => {
+                    let header = match return_if_io!(reader.try_read_header_nonblock()) {
+                        HeaderReadResult::Valid(header) => Some(header),
+                        HeaderReadResult::NoLog => None,
+                        HeaderReadResult::Invalid => {
+                            return Err(LimboError::Corrupt(
+                                "Logical log header corrupt and no WAL recovery available"
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                    if let Some(header) = &header {
+                        self.storage.set_header(header.clone());
+                    }
+                    let header_present = header.is_some();
+                    let RecoverLogicalLogState::ReadHeader {
+                        reader,
+                        preserved_tvfs,
+                    } = std::mem::take(st)
+                    else {
+                        unreachable!("state is ReadHeader");
+                    };
+                    *st = RecoverLogicalLogState::ReadTxTs {
+                        reader,
+                        preserved_tvfs,
+                        header_present,
+                        txts_st: ReadPersistentTxTsMaxState::default(),
+                    };
+                }
+                RecoverLogicalLogState::ReadTxTs {
+                    header_present,
+                    txts_st,
+                    ..
+                } => {
+                    let header_present = *header_present;
+                    let persistent_tx_ts_max = if self.uses_durable_mvcc_metadata(connection) {
+                        match return_if_io!(
+                            self.try_read_persistent_tx_ts_max_nonblock(connection, txts_st)
+                        ) {
+                            Some(ts) => ts,
+                            None if !header_present => 0,
+                            None => {
+                                return Err(LimboError::Corrupt(
+                                    "Missing MVCC metadata table".to_string(),
+                                ));
+                            }
+                        }
+                    } else {
+                        0
+                    };
+                    self.durable_txid_max
+                        .store(persistent_tx_ts_max, Ordering::SeqCst);
+                    self.clock.reset(persistent_tx_ts_max + 1);
 
-        let header = match reader.try_read_header(&pager.io)? {
-            HeaderReadResult::Valid(header) => Some(header),
-            HeaderReadResult::NoLog => None,
-            HeaderReadResult::Invalid => {
-                return Err(LimboError::Corrupt(
-                    "Logical log header corrupt and no WAL recovery available".to_string(),
-                ));
-            }
-        };
-
-        if let Some(header) = &header {
-            self.storage.set_header(header.clone());
-        }
-        let persistent_tx_ts_max = if self.uses_durable_mvcc_metadata(&connection) {
-            match self.try_read_persistent_tx_ts_max(&connection)? {
-                Some(ts) => ts,
-                None if header.is_none() => 0,
-                None => {
-                    return Err(LimboError::Corrupt(
-                        "Missing MVCC metadata table".to_string(),
-                    ));
+                    if !header_present || self.get_logical_log_file().size()? <= LOG_HDR_SIZE as u64
+                    {
+                        *st = RecoverLogicalLogState::Done;
+                        return Ok(IOResult::Done(false));
+                    }
+                    let RecoverLogicalLogState::ReadTxTs {
+                        reader,
+                        preserved_tvfs,
+                        ..
+                    } = std::mem::take(st)
+                    else {
+                        unreachable!("state is ReadTxTs");
+                    };
+                    *st = RecoverLogicalLogState::ReadCookie {
+                        reader,
+                        preserved_tvfs,
+                        persistent_tx_ts_max,
+                    };
+                }
+                RecoverLogicalLogState::ReadCookie { .. } => {
+                    let fallback_cookie = if self.global_header.read().is_some() {
+                        0
+                    } else {
+                        let pager = connection.pager.load().clone();
+                        return_if_io!(pager.with_header(|header| header.schema_cookie)).get()
+                    };
+                    let RecoverLogicalLogState::ReadCookie {
+                        reader,
+                        preserved_tvfs,
+                        persistent_tx_ts_max,
+                    } = std::mem::take(st)
+                    else {
+                        unreachable!("state is ReadCookie");
+                    };
+                    let stmt = connection
+                        .query(
+                            "SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema",
+                        )?
+                        .map(Box::new);
+                    *st = RecoverLogicalLogState::QuerySchema {
+                        reader,
+                        preserved_tvfs,
+                        persistent_tx_ts_max,
+                        cookie: fallback_cookie,
+                        stmt,
+                        schema_rows: HashMap::default(),
+                    };
+                }
+                RecoverLogicalLogState::QuerySchema {
+                    stmt, schema_rows, ..
+                } => {
+                    if let Some(stmt) = stmt {
+                        return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                            let rowid = row.get::<i64>(0)?;
+                            let values = (1..=5)
+                                .map(|i| row.get_value(i).clone())
+                                .collect::<Vec<_>>();
+                            schema_rows.insert(
+                                rowid,
+                                ImmutableRecord::from_values(&values, values.len())?,
+                            );
+                            Ok(())
+                        }));
+                    }
+                    let RecoverLogicalLogState::QuerySchema {
+                        reader,
+                        preserved_tvfs,
+                        persistent_tx_ts_max,
+                        cookie,
+                        schema_rows,
+                        ..
+                    } = std::mem::take(st)
+                    else {
+                        unreachable!("state is QuerySchema");
+                    };
+                    let current_schema = connection.schema.read().clone();
+                    *st = RecoverLogicalLogState::Replay {
+                        ctx: Box::new(RecoverCtx {
+                            reader,
+                            preserved_table_valued_functions: preserved_tvfs,
+                            cookie,
+                            persistent_tx_ts_max,
+                            replay_cutoff_ts: persistent_tx_ts_max,
+                            max_commit_ts_seen: persistent_tx_ts_max,
+                            schema_rows,
+                            dropped_root_pages: HashSet::default(),
+                            current_schema,
+                            index_infos: HashMap::default(),
+                        }),
+                    };
+                }
+                RecoverLogicalLogState::Replay { ctx } => {
+                    loop {
+                        let Some(frame) = return_if_io!(ctx.reader.next_frame()) else {
+                            let recovered_offset = ctx.reader.last_valid_offset() as u64;
+                            let recovered_running_crc = ctx.reader.running_crc();
+                            self.storage.restore_logical_log_state_after_recovery(
+                                recovered_offset,
+                                recovered_running_crc,
+                            );
+                            break;
+                        };
+                        self.recover_process_frame(connection, ctx, frame)?;
+                    }
+                    let max_commit_ts_seen = ctx.max_commit_ts_seen;
+                    let persistent_tx_ts_max = ctx.persistent_tx_ts_max;
+                    let dropped_root_pages = std::mem::take(&mut ctx.dropped_root_pages);
+                    assert!(
+                        max_commit_ts_seen >= persistent_tx_ts_max,
+                        "replay clock would rewind below metadata boundary: max_commit_ts_seen={max_commit_ts_seen} persistent_tx_ts_max={persistent_tx_ts_max}"
+                    );
+                    connection.with_schema_mut(|schema| {
+                        schema.dropped_root_pages = dropped_root_pages;
+                    });
+                    if let Some(header) = self.global_header.read().as_ref() {
+                        connection.with_schema_mut(|schema| {
+                            schema.schema_version = header.schema_cookie.get();
+                        });
+                    }
+                    *connection.db.schema.lock() = connection.schema.read().clone();
+                    self.clock.reset(max_commit_ts_seen + 1);
+                    self.last_committed_tx_ts
+                        .store(max_commit_ts_seen, Ordering::SeqCst);
+                    *st = RecoverLogicalLogState::Done;
+                    return Ok(IOResult::Done(true));
+                }
+                RecoverLogicalLogState::Done => {
+                    return Ok(IOResult::Done(false));
                 }
             }
-        } else {
-            0
-        };
-        self.durable_txid_max
-            .store(persistent_tx_ts_max, Ordering::SeqCst);
-        self.clock.reset(persistent_tx_ts_max + 1);
-
-        if header.is_none() || file.size()? <= LOG_HDR_SIZE as u64 {
-            return Ok(false);
         }
+    }
 
-        let mut max_commit_ts_seen = persistent_tx_ts_max;
-        let replay_cutoff_ts = persistent_tx_ts_max;
-        let mut schema_rows: HashMap<i64, ImmutableRecord> = HashMap::default();
-        let mut dropped_root_pages: HashSet<i64> = HashSet::default();
-        if let Some(mut stmt) = connection
-            .query("SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema")?
-        {
-            stmt.run_with_row_callback(|row| {
-                let rowid = row.get::<i64>(0)?;
-                let values = (1..=5)
-                    .map(|i| row.get_value(i).clone())
-                    .collect::<Vec<_>>();
-                schema_rows.insert(rowid, ImmutableRecord::from_values(&values, values.len())?);
-                Ok(())
-            })?;
-        }
-        let build_schema = |schema_rows: &HashMap<i64, ImmutableRecord>| -> Result<Arc<Schema>> {
-            let pager = connection.pager.load().clone();
-            let cookie = self
-                .global_header
-                .read()
-                .as_ref()
-                .map(|header| header.schema_cookie.get())
-                .unwrap_or(
-                    pager
-                        .io
-                        .block(|| pager.with_header(|header| header.schema_cookie))?
-                        .get(),
-                );
-            let mut fresh = Schema::new();
-            fresh.generated_columns_enabled =
-                connection.db.experimental_generated_columns_enabled();
-            fresh.schema_version = cookie;
-            let mut from_sql_indexes = Vec::with_capacity(10);
-            let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::default();
-            let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
-            let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-            let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
-            let syms = connection.syms.read();
-            let mv_store = connection.db.get_mv_store().clone();
-
-            let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
-            sorted_rowids.sort_unstable();
-            for rowid in &sorted_rowids {
-                let record = &schema_rows[rowid];
-                let ty = match record.get_value_opt(0) {
-                    Some(ValueRef::Text(v)) => v.as_str(),
-                    _ => {
-                        return Err(LimboError::Corrupt(
-                            "sqlite_schema type must be text".to_string(),
-                        ));
-                    }
-                };
-                let name = match record.get_value_opt(1) {
-                    Some(ValueRef::Text(v)) => v.as_str(),
-                    _ => {
-                        return Err(LimboError::Corrupt(
-                            "sqlite_schema name must be text".to_string(),
-                        ));
-                    }
-                };
-                let table_name = match record.get_value_opt(2) {
-                    Some(ValueRef::Text(v)) => v.as_str(),
-                    _ => {
-                        return Err(LimboError::Corrupt(
-                            "sqlite_schema tbl_name must be text".to_string(),
-                        ));
-                    }
-                };
-                let root_page = match record.get_value_opt(3) {
-                    Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
-                    _ => {
-                        return Err(LimboError::Corrupt(
-                            "sqlite_schema root_page must be integer".to_string(),
-                        ));
-                    }
-                };
-                let sql = match record.get_value_opt(4) {
-                    Some(ValueRef::Text(v)) => Some(v.as_str()),
-                    _ => None,
-                };
-                let attached_resolver = |alias: &str| -> Option<usize> {
-                    connection
-                        .attached_databases()
-                        .read()
-                        .get_database_by_name(&crate::util::normalize_ident(alias))
-                        .map(|(idx, _)| idx)
-                };
-                fresh.handle_schema_row(
-                    ty,
-                    name,
-                    table_name,
-                    root_page,
-                    sql,
-                    &syms,
-                    &mut from_sql_indexes,
-                    &mut automatic_indices,
-                    &mut dbsp_state_roots,
-                    &mut dbsp_state_index_roots,
-                    &mut materialized_view_info,
-                    &attached_resolver,
-                )?;
-            }
-            fresh.populate_indices(
-                &syms,
-                from_sql_indexes,
-                automatic_indices,
-                mv_store.is_some(),
-            )?;
-            fresh.populate_materialized_views(
-                materialized_view_info,
-                dbsp_state_roots,
-                dbsp_state_index_roots,
-            )?;
-            Self::rehydrate_table_valued_functions(&mut fresh, &preserved_table_valued_functions);
-
-            Ok(Arc::new(fresh))
-        };
+    /// Replay a single committed logical-log transaction frame into the MVCC
+    /// store. Fully synchronous (the only recovery IO is reading the next frame,
+    /// driven by the caller); operates on accumulators borrowed from `ctx`.
+    fn recover_process_frame(
+        &self,
+        connection: &Arc<Connection>,
+        ctx: &mut RecoverCtx,
+        frame: Vec<ParsedOp>,
+    ) -> Result<()> {
+        let mut max_commit_ts_seen = ctx.max_commit_ts_seen;
+        let replay_cutoff_ts = ctx.replay_cutoff_ts;
+        let cookie = ctx.cookie;
+        let mut schema_rows = std::mem::take(&mut ctx.schema_rows);
+        let mut dropped_root_pages = std::mem::take(&mut ctx.dropped_root_pages);
+        let mut current_schema = ctx.current_schema.clone();
+        let mut index_infos = std::mem::take(&mut ctx.index_infos);
 
         let install_schema = |schema: Arc<Schema>| {
             *connection.schema.write() = schema.clone();
@@ -6379,28 +6764,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             | ParsedOp::DeleteIndex { commit_ts, .. }
             | ParsedOp::UpdateHeader { commit_ts, .. } => *commit_ts,
         };
-
-        let mut current_schema = connection.schema.read().clone();
-        let mut index_infos: HashMap<(MVTableId, IndexOpKind), Arc<IndexInfo>> = HashMap::default();
-
-        loop {
-            // Read one committed transaction at a time. This is important for
-            // schema recovery: a single transaction can contain both sqlite_schema
-            // changes and index-row changes, and the index-row log records do not
-            // carry CREATE INDEX SQL. They carry only the serialized index key
-            // bytes plus the index root page encoded as an MVCC table id. To turn
-            // those bytes back into an index row, recovery needs IndexInfo from a
-            // schema that is valid for this transaction frame.
-            let Some(frame) = reader.next_frame(&pager.io)? else {
-                let recovered_offset = reader.last_valid_offset() as u64;
-                let recovered_running_crc = reader.running_crc();
-                self.storage.restore_logical_log_state_after_recovery(
-                    recovered_offset,
-                    recovered_running_crc,
-                );
-                break;
-            };
-
+        'frame: {
             let frame_commit_ts = parsed_op_commit_ts(
                 frame
                     .first()
@@ -6408,7 +6772,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             );
             max_commit_ts_seen = max_commit_ts_seen.max(frame_commit_ts);
             if frame_commit_ts <= replay_cutoff_ts {
-                continue;
+                break 'frame;
             }
 
             // A single transaction frame can mix sqlite_schema changes with
@@ -6448,7 +6812,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 } else {
                     if frame_changes_schema && schema_after.is_none() {
                         // Now that all schema ops have been seen, build this frame's AFTER schema.
-                        schema_after = Some(build_schema(&schema_rows)?);
+                        schema_after = Some(self.recover_build_schema(
+                            connection,
+                            &schema_rows,
+                            cookie,
+                            &ctx.preserved_table_valued_functions,
+                        )?);
                     }
                     seen_data_op = true;
                 }
@@ -6510,7 +6879,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     index_infos.insert((index_id, op_kind), index_info.clone());
                     Ok(index_info)
                 };
-                let next_rec = reader.parsed_op_to_streaming(parsed_op, &mut get_index_info)?;
+                let next_rec = ctx
+                    .reader
+                    .parsed_op_to_streaming(parsed_op, &mut get_index_info)?;
 
                 tracing::trace!("next_rec {next_rec:?}");
 
@@ -6803,7 +7174,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         // Earlier, we build the schema when encountering the first non-schema op,
                         // so the AFTER schema can still be None if the frame only contained schema
                         // ops.
-                        build_schema(&schema_rows)?
+                        self.recover_build_schema(
+                            connection,
+                            &schema_rows,
+                            cookie,
+                            &ctx.preserved_table_valued_functions,
+                        )?
                     }
                 };
 
@@ -6819,26 +7195,117 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         }
 
-        assert!(
-            max_commit_ts_seen >= persistent_tx_ts_max,
-            "replay clock would rewind below metadata boundary: max_commit_ts_seen={max_commit_ts_seen} persistent_tx_ts_max={persistent_tx_ts_max}"
-        );
-        connection.with_schema_mut(|schema| {
-            schema.dropped_root_pages = dropped_root_pages;
-        });
-        if let Some(header) = self.global_header.read().as_ref() {
-            // Replay may rebuild schema rows before seeing a later UpdateHeader op in the same
-            // logical-log tail. Normalize to the final recovered header cookie so VDBE schema
-            // cookie checks do not observe a stale in-memory schema version after restart.
-            connection.with_schema_mut(|schema| {
-                schema.schema_version = header.schema_cookie.get();
-            });
+        ctx.max_commit_ts_seen = max_commit_ts_seen;
+        ctx.schema_rows = schema_rows;
+        ctx.dropped_root_pages = dropped_root_pages;
+        ctx.current_schema = current_schema;
+        ctx.index_infos = index_infos;
+        Ok(())
+    }
+
+    /// Build a fresh `Schema` from the recovered `sqlite_schema` rows. Sync: the
+    /// schema cookie comes from `global_header` (in-memory) or `fallback_cookie`
+    /// (pre-read by the caller); no IO here.
+    fn recover_build_schema(
+        &self,
+        connection: &Arc<Connection>,
+        schema_rows: &HashMap<i64, ImmutableRecord>,
+        fallback_cookie: u32,
+        preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
+    ) -> Result<Arc<Schema>> {
+        let cookie = self
+            .global_header
+            .read()
+            .as_ref()
+            .map(|header| header.schema_cookie.get())
+            .unwrap_or(fallback_cookie);
+        let mut fresh = Schema::new();
+        fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
+        fresh.schema_version = cookie;
+        let mut from_sql_indexes = Vec::with_capacity(10);
+        let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::default();
+        let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
+        let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
+        let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
+        let syms = connection.syms.read();
+        let mv_store = connection.db.get_mv_store().clone();
+
+        let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
+        sorted_rowids.sort_unstable();
+        for rowid in &sorted_rowids {
+            let record = &schema_rows[rowid];
+            let ty = match record.get_value_opt(0) {
+                Some(ValueRef::Text(v)) => v.as_str(),
+                _ => {
+                    return Err(LimboError::Corrupt(
+                        "sqlite_schema type must be text".to_string(),
+                    ));
+                }
+            };
+            let name = match record.get_value_opt(1) {
+                Some(ValueRef::Text(v)) => v.as_str(),
+                _ => {
+                    return Err(LimboError::Corrupt(
+                        "sqlite_schema name must be text".to_string(),
+                    ));
+                }
+            };
+            let table_name = match record.get_value_opt(2) {
+                Some(ValueRef::Text(v)) => v.as_str(),
+                _ => {
+                    return Err(LimboError::Corrupt(
+                        "sqlite_schema tbl_name must be text".to_string(),
+                    ));
+                }
+            };
+            let root_page = match record.get_value_opt(3) {
+                Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
+                _ => {
+                    return Err(LimboError::Corrupt(
+                        "sqlite_schema root_page must be integer".to_string(),
+                    ));
+                }
+            };
+            let sql = match record.get_value_opt(4) {
+                Some(ValueRef::Text(v)) => Some(v.as_str()),
+                _ => None,
+            };
+            let attached_resolver = |alias: &str| -> Option<usize> {
+                connection
+                    .attached_databases()
+                    .read()
+                    .get_database_by_name(&crate::util::normalize_ident(alias))
+                    .map(|(idx, _)| idx)
+            };
+            fresh.handle_schema_row(
+                ty,
+                name,
+                table_name,
+                root_page,
+                sql,
+                &syms,
+                &mut from_sql_indexes,
+                &mut automatic_indices,
+                &mut dbsp_state_roots,
+                &mut dbsp_state_index_roots,
+                &mut materialized_view_info,
+                &attached_resolver,
+            )?;
         }
-        *connection.db.schema.lock() = connection.schema.read().clone();
-        self.clock.reset(max_commit_ts_seen + 1);
-        self.last_committed_tx_ts
-            .store(max_commit_ts_seen, Ordering::SeqCst);
-        Ok(true)
+        fresh.populate_indices(
+            &syms,
+            from_sql_indexes,
+            automatic_indices,
+            mv_store.is_some(),
+        )?;
+        fresh.populate_materialized_views(
+            materialized_view_info,
+            dbsp_state_roots,
+            dbsp_state_index_roots,
+        )?;
+        Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
+
+        Ok(Arc::new(fresh))
     }
 
     pub fn set_checkpoint_threshold(&self, threshold: i64) {
