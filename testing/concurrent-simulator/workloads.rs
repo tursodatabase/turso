@@ -235,12 +235,21 @@ impl Workload for AlterRenameColumnWorkload {
         }
         let table = tables[rng.random_range(0..tables.len())];
         let col = &table.columns[rng.random_range(0..table.columns.len())];
-        // Short alphanumeric suffix — long `_r<u32>` numeric names triggered
-        // Limbo's CREATE INDEX parser to bail with "invalid expression"
-        // (likely the parser's column-ref recognizer; worth following up but
-        // not what this workload is targeting).
-        let suffix: u16 = rng.random();
-        let new_col = format!("c{suffix:x}");
+        // Pick a fresh name that isn't already a column of this table, otherwise
+        // the rename fails with "duplicate column name" (a correct engine
+        // rejection the harness treats as fatal). Short alphanumeric suffix —
+        // long `_r<u32>` numeric names triggered Limbo's CREATE INDEX parser to
+        // bail with "invalid expression". Give up (skip) if every attempt
+        // collides, which is vanishingly unlikely with a 16-bit suffix.
+        let new_col = (0..8).find_map(|_| {
+            let suffix: u16 = rng.random();
+            let candidate = format!("c{suffix:x}");
+            let collides = table
+                .columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&candidate));
+            (!collides).then_some(candidate)
+        })?;
         Some(Operation::AlterRenameColumn {
             table_name: table.name.clone(),
             old_col: col.name.clone(),
