@@ -180,6 +180,7 @@ pub(crate) fn set_update_stmt_journal_flags(
     resolver: &Resolver,
     connection: &crate::sync::Arc<crate::Connection>,
 ) -> Result<()> {
+    use crate::alloc::*;
     let target_table = &plan.target_table;
     let Some(btree_table) = target_table.btree() else {
         return Ok(()); // Virtual table — keep conservative defaults.
@@ -190,7 +191,7 @@ pub(crate) fn set_update_stmt_journal_flags(
         .set_clauses
         .iter()
         .map(|set_clause| set_clause.column_index)
-        .collect();
+        .try_collect()?;
     let has_triggers = has_triggers_including_temp(
         resolver,
         database_id,

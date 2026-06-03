@@ -36,6 +36,7 @@ pub trait Capabilities: 'static + Clone {
     const ALTER_TABLE: bool;
     const CREATE_INDEX: bool;
     const DROP_INDEX: bool;
+    const PRAGMA: bool;
     const CREATE_TRIGGER: bool;
     const DROP_TRIGGER: bool;
 
@@ -106,6 +107,7 @@ impl Capabilities for Full {
     const ALTER_TABLE: bool = true;
     const CREATE_INDEX: bool = true;
     const DROP_INDEX: bool = true;
+    const PRAGMA: bool = true;
     const CREATE_TRIGGER: bool = true;
     const DROP_TRIGGER: bool = true;
     const BEGIN: bool = true;
@@ -147,6 +149,7 @@ impl Capabilities for DmlOnly {
     const ALTER_TABLE: bool = false;
     const CREATE_INDEX: bool = false;
     const DROP_INDEX: bool = false;
+    const PRAGMA: bool = false;
     const CREATE_TRIGGER: bool = false;
     const DROP_TRIGGER: bool = false;
     const BEGIN: bool = false;
@@ -188,6 +191,7 @@ impl Capabilities for SelectOnly {
     const ALTER_TABLE: bool = false;
     const CREATE_INDEX: bool = false;
     const DROP_INDEX: bool = false;
+    const PRAGMA: bool = false;
     const CREATE_TRIGGER: bool = false;
     const DROP_TRIGGER: bool = false;
     const BEGIN: bool = false;
@@ -226,6 +230,7 @@ impl Capabilities for NoSubquery {
     const ALTER_TABLE: bool = true;
     const CREATE_INDEX: bool = true;
     const DROP_INDEX: bool = true;
+    const PRAGMA: bool = true;
     const CREATE_TRIGGER: bool = true;
     const DROP_TRIGGER: bool = true;
     const BEGIN: bool = true;

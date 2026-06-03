@@ -115,7 +115,7 @@ fn get_table_names(
     stmt.bind_at(
         NonZero::new(1).unwrap(),
         Value::from_text(like_pattern.to_string()),
-    );
+    )?;
     let mut names = Vec::new();
 
     loop {
@@ -201,7 +201,7 @@ fn hash_schema(
     stmt.bind_at(
         NonZero::new(1).unwrap(),
         Value::from_text(like_pattern.to_string()),
-    );
+    )?;
     hash_rows(&mut stmt, io, hasher, debug)?;
     Ok(())
 }

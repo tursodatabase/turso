@@ -1,0 +1,33 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>Turso.Data.Sqlite</RootNamespace>
+
+    <PackageId>Turso.Data.Sqlite</PackageId>
+    <Title>Turso SQLite-compatible ADO.NET Provider</Title>
+    <Description>SQLite-compatible ADO.NET facade for Turso, intended to ease migration from Microsoft.Data.Sqlite.</Description>
+    <Version>0.0.2</Version>
+    <Authors>Turso authors</Authors>
+    <PackageTags>turso;sqlite;database;ado.net;system.data</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/tursodatabase/turso</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/tursodatabase/turso</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Turso.Raw\Turso.Raw.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\Readme.md" Pack="true" PackagePath="README.md" />
+  </ItemGroup>
+</Project>

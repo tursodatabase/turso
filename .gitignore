@@ -11,6 +11,8 @@
 *.ipynb
 *.o
 *.sqlite
+!bindings/dotnet/src/Turso.Data.Sqlite/
+!bindings/dotnet/src/Turso.Data.Sqlite/**
 # Python
 .mypy_cache/
 .pytest_cache/

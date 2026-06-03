@@ -132,3 +132,72 @@ expect {
     5|3
     6|-1
 }
+
+setup not_in_self_or_true {
+    CREATE TABLE t6(c0 INT, c1 INT);
+    INSERT INTO t6 VALUES (NULL, 1), (1, 2), (2, 3);
+}
+
+# NOT IN against self can evaluate to NULL; verify OR short-circuits correctly.
+@setup not_in_self_or_true
+test not-in-self-or-true-counts-all-rows {
+    SELECT COUNT(*)
+    FROM t6
+    WHERE ((t6.c0 NOT IN (t6.c0)) OR TRUE) AND (NOT FALSE);
+}
+expect {
+    3
+}
+
+@setup not_in_self_or_true
+test not-in-self-or-true-is-true-for-all-rows {
+    SELECT SUM((((t6.c0 NOT IN (t6.c0)) OR TRUE) AND (NOT FALSE)) IS TRUE) FROM t6;
+}
+expect {
+    3
+}
+
+@setup not_in_self_or_true
+test not-in-self-or-false-filters-all-rows {
+    SELECT COUNT(*) FROM t6 WHERE ((t6.c0 NOT IN (t6.c0)) OR FALSE);
+}
+expect {
+    0
+}
+
+@setup not_in_self_or_true
+test not-in-self-or-false-preserves-null-result {
+    SELECT SUM((((t6.c0 NOT IN (t6.c0)) OR FALSE) IS NULL)) FROM t6;
+}
+expect {
+    1
+}
+
+setup not_in_self_with_nullable_or_rhs {
+    CREATE TABLE t7(c0 INT, c1 INT);
+    INSERT INTO t7 VALUES (NULL, NULL), (1, 0), (2, 0);
+}
+
+@setup not_in_self_with_nullable_or_rhs
+test not-in-self-or-nullable-rhs-matches-null-rhs-row {
+    SELECT COUNT(*) FROM t7 WHERE (t7.c0 NOT IN (t7.c0)) OR (t7.c1 IS NULL);
+}
+expect {
+    1
+}
+
+setup left_join_is_not_predicate {
+    CREATE TABLE t2(c0 VARCHAR, c1 VARCHAR, PRIMARY KEY(c0));
+    CREATE TABLE t5(c0 VARCHAR, c1 VARCHAR(500), PRIMARY KEY(c0));
+    INSERT INTO t2(c0) VALUES ('a'), ('b');
+}
+
+@setup left_join_is_not_predicate
+test left-join-is-not-predicate-keeps-unmatched-rows {
+    SELECT COUNT(*)
+    FROM t2 NATURAL LEFT JOIN t5
+    WHERE ((t5.c1) IS NOT (1316559306));
+}
+expect {
+    2
+}

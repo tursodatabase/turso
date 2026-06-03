@@ -87,6 +87,8 @@ mod test;
 
 // Import assertion proc macro implementations
 mod assert;
+#[path = "trace_stack.rs"]
+mod trace_stack_impl;
 
 use assert::{
     comparison_auto_message, details_debug_check, details_format_args, details_json,
@@ -316,6 +318,35 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn scalar(attr: TokenStream, input: TokenStream) -> TokenStream {
     ext::scalar(attr, input)
+}
+
+/// Derive a context-aware scalar function for your extension by deriving
+/// `ScalarDerive` on a struct that implements the `ScalarFunc` trait.
+///
+/// The associated `State` is built once per registration via `init`, shared by
+/// reference across every call, and dropped when the function is unregistered or
+/// the owning connection is dropped. The derived `register_<Struct>` entry point
+/// can be listed directly in the `scalars: { .. }` section of `register_extension!`.
+/// ```ignore
+/// use turso_ext::{register_extension, ScalarDerive, ScalarFunc, Value};
+///
+/// #[derive(ScalarDerive)]
+/// struct Multiply;
+///
+/// impl ScalarFunc for Multiply {
+///     type State = i64;
+///     const NAME: &'static str = "ctx_multiply";
+///     fn init() -> Self::State {
+///         3
+///     }
+///     fn call(state: &Self::State, args: &[Value]) -> Value {
+///         Value::from_integer(args[0].to_integer().unwrap_or_default() * *state)
+///     }
+/// }
+/// ```
+#[proc_macro_derive(ScalarDerive)]
+pub fn derive_scalar(input: TokenStream) -> TokenStream {
+    ext::derive_scalar(input)
 }
 
 /// Define an aggregate function for your extension by deriving
@@ -645,6 +676,27 @@ pub fn derive_atomic_enum(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
     test::test_macro_attribute(args, input)
+}
+
+/// Wrap a function body in a stack trace guard and a `turso_stack` tracing span.
+///
+/// With no arguments, the label is inferred as `module_path!()::function_name`
+/// and the span name is the function name.
+/// A string literal argument overrides the label.
+///
+/// ```ignore
+/// #[turso_macros::trace_stack]
+/// fn prepare_select_plan(...) { ... }
+///
+/// #[turso_macros::trace_stack("select:translate")]
+/// fn translate_select(...) { ... }
+///
+/// #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
+/// fn translate_inner(stmt: ast::Stmt, ...) { ... }
+/// ```
+#[proc_macro_attribute]
+pub fn trace_stack(attr: TokenStream, input: TokenStream) -> TokenStream {
+    trace_stack_impl::trace_stack_attribute(attr, input)
 }
 
 /// Controls the `#[cfg(not(antithesis))]` fallback in "always" comparison macros.

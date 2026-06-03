@@ -25,5 +25,6 @@
     <ItemGroup>
         <ProjectReference Include="..\Turso.Raw\Turso.Raw.csproj" />
         <ProjectReference Include="..\Turso\Turso.csproj" />
+        <ProjectReference Include="..\Turso.Data.Sqlite\Turso.Data.Sqlite.csproj" />
     </ItemGroup>
 </Project>

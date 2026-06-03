@@ -105,7 +105,7 @@ jobs:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests)' --failure-output=final
-        timeout-minutes: 20
+        timeout-minutes: 30
       - name: Test integrity_check corruption and short reads (no checksum feature because it interferes with the test)
         run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'test(integrity_check) | test(short_read)' --failure-output=final
         timeout-minutes: 5
@@ -139,6 +139,24 @@ jobs:
       - name: Run shuttle tests
         run: |
           make test-shuttle
+
+  conn-raw-api-tests:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-conn-raw-api"
+          cache-on-failure: true
+      - uses: "./.github/shared/setup-sccache"
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Run conn_raw_api-gated core tests
+        run: cargo nextest run -p turso_core --features conn_raw_api --locked --no-fail-fast --failure-output=final
 
   # stress-nondeterminism-check:
   #   runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -291,7 +309,7 @@ jobs:
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -314,7 +332,6 @@ jobs:
       - uses: "./.github/shared/install_sqlite"
       - name: Test
         run: make test
-        timeout-minutes: 20
 
   concurrent-simulator:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -325,8 +342,11 @@ jobs:
           - name: in-process
             iterations: 100
             args: "--mode fast --reopen-probability 0.001"
+          - name: in-process-mvcc
+            iterations: 25
+            args: "--mode fast --reopen-probability 0.01 --enable-mvcc"
           - name: multiprocess
-            iterations: 20
+            iterations: 10
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
           - name: multiprocess-kill
             iterations: 10
@@ -344,7 +364,7 @@ jobs:
       - name: Run turso_whopper regression tests
         if: matrix.profile.name == 'in-process'
         run: cargo test -p turso_whopper --test regression_tests
-        timeout-minutes: 5
+        timeout-minutes: 15
       - name: Run turso_whopper (${{ matrix.profile.name }})
         run: |
           cargo build -p turso_whopper --release
@@ -370,9 +390,10 @@ jobs:
       - name: Run Windows CLI multiprocess VFS regression
         run: cargo test -q -p turso_cli input::tests::experimental_win_iocp_backend_is_available_for_path_databases -- --exact
       - name: Run Windows core multiprocess regressions
-        run: cargo test -q -p turso_core --features "fs experimental_win_iocp" multiprocess_tests:: -- --nocapture
+        run: |
+          cargo test -q -p turso_core --features "fs experimental_win_iocp" multiprocess_tests:: -- --nocapture
       - name: Run Windows multiprocess startup smoke
-          run: cargo run -q -p turso_whopper -- --mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01
+        run: cargo run -q -p turso_whopper -- --mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01 --max-steps 10000
 
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404

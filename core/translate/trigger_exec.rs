@@ -13,7 +13,7 @@ use crate::translate::{
 };
 use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::insn::Insn;
+use crate::vdbe::insn::{Insn, Subprogram};
 use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, QueryMode, Result};
 use std::cell::RefCell;
@@ -279,6 +279,7 @@ fn rewrite_upsert_exprs_for_subprogram(
 }
 
 /// Convert TriggerCmd to Stmt, rewriting NEW/OLD to Variable expressions (for subprogram compilation)
+#[turso_macros::trace_stack(detail = trigger_command_kind(cmd))]
 fn trigger_cmd_to_stmt_for_subprogram(
     cmd: &ast::TriggerCmd,
     subprogram_ctx: &TriggerSubprogramContext,
@@ -523,6 +524,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
 
 /// Execute trigger commands by compiling them as a subprogram and emitting Program instruction
 /// Returns true if there are triggers that will fire.
+#[turso_macros::trace_stack(detail = trigger_event_kind(&trigger.event))]
 fn execute_trigger_commands(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
@@ -631,10 +633,10 @@ fn execute_trigger_commands(
     // before OP_Program enters the subprogram.
     for db_id in &subprogram_prepared.write_databases {
         if db_id == crate::MAIN_DB_ID {
-            program.begin_write_operation();
+            program.begin_write_operation()?;
         } else {
             let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
-            program.begin_write_on_database(db_id, schema_cookie);
+            program.begin_write_on_database(db_id, schema_cookie)?;
         }
     }
     for db_id in &subprogram_prepared.read_databases {
@@ -642,10 +644,10 @@ fn execute_trigger_commands(
             continue;
         }
         if db_id == crate::MAIN_DB_ID {
-            program.begin_read_operation();
+            program.begin_read_operation()?;
         } else {
             let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
-            program.begin_read_on_database(db_id, schema_cookie);
+            program.begin_read_on_database(db_id, schema_cookie)?;
         }
     }
 
@@ -679,7 +681,7 @@ fn execute_trigger_commands(
 
     program.emit_insn(Insn::Program {
         param_registers,
-        program: built_subprogram.prepared().clone(),
+        program: Subprogram::PreparedProgram(built_subprogram.prepared().clone()),
         ignore_jump_target,
     });
 
@@ -855,6 +857,7 @@ pub fn has_triggers_including_temp(
     false
 }
 
+#[turso_macros::trace_stack(detail = trigger_event_kind(&trigger.event))]
 pub fn fire_trigger(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
@@ -880,6 +883,7 @@ pub fn fire_trigger(
     let result = (|| -> Result<()> {
         // Evaluate WHEN clause if present
         if let Some(mut when_expr) = trigger.when_clause.clone() {
+            crate::stack::trace_stack!("when_clause");
             // Rewrite NEW/OLD references in WHEN clause to use registers
             rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
 
@@ -949,6 +953,24 @@ pub fn fire_trigger(
     result
 }
 
+fn trigger_event_kind(event: &TriggerEvent) -> &'static str {
+    match event {
+        TriggerEvent::Delete => "delete",
+        TriggerEvent::Insert => "insert",
+        TriggerEvent::Update => "update",
+        TriggerEvent::UpdateOf(_) => "update_of",
+    }
+}
+
+fn trigger_command_kind(command: &ast::TriggerCmd) -> &'static str {
+    match command {
+        ast::TriggerCmd::Insert { .. } => "insert",
+        ast::TriggerCmd::Update { .. } => "update",
+        ast::TriggerCmd::Delete { .. } => "delete",
+        ast::TriggerCmd::Select(_) => "select",
+    }
+}
+
 /// Decode encoded custom type registers in a TriggerContext.
 /// OLD registers are always decoded (they always come from cursor reads on disk).
 /// NEW registers are decoded only when `ctx.new_encoded` is true (AFTER triggers).
@@ -1016,6 +1038,8 @@ fn populate_trigger_register_affinities(resolver: &mut Resolver, ctx: &TriggerCo
     populate_trigger_row_register_affinities(resolver, &ctx.table, ctx.old_registers.as_deref());
 }
 
+// NEW/OLD columns don't have affinities, except for rowids and rowid aliases,
+// which have INTEGER affinity. See https://www.sqlite.org/forum/forumpost/819f2d6627
 fn populate_trigger_row_register_affinities(
     resolver: &mut Resolver,
     table: &BTreeTable,
@@ -1026,13 +1050,13 @@ fn populate_trigger_row_register_affinities(
     };
 
     for (idx, column) in table.columns().iter().enumerate() {
-        let affinity = if column.is_rowid_alias() {
-            Affinity::Integer
-        } else {
-            column.affinity_with_strict(table.is_strict)
-        };
+        if !column.is_rowid_alias() {
+            continue;
+        }
         if let Some(&register) = registers.get(idx) {
-            resolver.register_affinities.insert(register, affinity);
+            resolver
+                .register_affinities
+                .insert(register, Affinity::Integer);
         }
     }
 
@@ -1044,6 +1068,7 @@ fn populate_trigger_row_register_affinities(
 }
 
 /// Rewrite NEW/OLD references in WHEN clause expressions (uses Register expressions, not Variable)
+#[turso_macros::trace_stack]
 fn rewrite_trigger_expr_for_when_clause(
     expr: &mut ast::Expr,
     table: &BTreeTable,

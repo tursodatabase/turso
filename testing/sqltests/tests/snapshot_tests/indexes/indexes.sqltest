@@ -100,6 +100,30 @@ setup unordered_materialized_prices {
     INSERT INTO products VALUES (10), (25), (15), (125);
 }
 
+setup attached_schema_indexes {
+    CREATE TABLE same_name (
+        id INTEGER PRIMARY KEY,
+        a INTEGER NOT NULL,
+        b TEXT NOT NULL
+    );
+    CREATE INDEX idx_same_main_a ON same_name(a);
+
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.same_name (
+        id INTEGER PRIMARY KEY,
+        a INTEGER NOT NULL,
+        b TEXT NOT NULL
+    );
+    CREATE INDEX aux.idx_same_aux_a ON same_name(a);
+
+    CREATE TEMP TABLE same_name (
+        id INTEGER PRIMARY KEY,
+        a INTEGER NOT NULL,
+        b TEXT NOT NULL
+    );
+    CREATE INDEX idx_same_temp_a ON same_name(a);
+}
+
 # =============================================================================
 # 1. Simple Index Lookup - WHERE indexed_col = ?
 # =============================================================================
@@ -790,4 +814,25 @@ snapshot-eqp indexed-by-three-way-join {
     JOIN orders o INDEXED BY idx_orders_status_shipping ON p.id = o.customer_id
     JOIN events e ON o.id = e.severity
     WHERE p.category = 'electronics' AND o.status = 'shipped';
+}
+
+@setup attached_schema_indexes
+snapshot-eqp attached-qualified-index-lookup {
+    SELECT b FROM aux.same_name WHERE a = 7;
+}
+
+@setup attached_schema_indexes
+snapshot-eqp same-name-main-and-attached-index-lookup {
+    SELECT m.b, x.b
+    FROM main.same_name AS m
+    JOIN aux.same_name AS x ON x.a = m.a
+    WHERE m.a = 1 AND x.a = 2;
+}
+
+@setup attached_schema_indexes
+snapshot-eqp same-name-temp-and-main-index-lookup {
+    SELECT t.b, m.b
+    FROM temp.same_name AS t
+    JOIN main.same_name AS m ON m.a = t.a
+    WHERE t.a = 1 AND m.a = 2;
 }

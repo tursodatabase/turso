@@ -45,7 +45,7 @@ pub fn translate_tx_begin(
                 tx_mode: TransactionMode::Write,
                 schema_cookie: temp_schema_cookie,
             });
-            for db_id in resolver.attached_database_ids_in_search_order() {
+            for db_id in resolver.attached_database_ids_in_search_order()? {
                 let cookie = resolver.with_schema(db_id, |s| s.schema_version);
                 program.emit_insn(Insn::Transaction {
                     db: db_id,
@@ -73,7 +73,7 @@ pub fn translate_tx_begin(
                 tx_mode: TransactionMode::Write,
                 schema_cookie: temp_schema_cookie,
             });
-            for db_id in resolver.attached_database_ids_in_search_order() {
+            for db_id in resolver.attached_database_ids_in_search_order()? {
                 let cookie = resolver.with_schema(db_id, |s| s.schema_version);
                 program.emit_insn(Insn::Transaction {
                     db: db_id,

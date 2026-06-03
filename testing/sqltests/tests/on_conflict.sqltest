@@ -959,3 +959,18 @@ test insert-or-replace-autoincrement {
 expect {
     2|one
 }
+
+# Regression test: INSERT ... ON CONFLICT(<col>) DO UPDATE that mutates the
+# row's primary key must not falsely raise a UNIQUE conflict on <col>.
+@skip-if sqlite "MVCC is not supported in SQLite"
+test mvcc-upsert-set-pk-on-conflict-target-resolves {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a UNIQUE);
+    INSERT INTO t VALUES (1, 'x');
+    INSERT INTO t VALUES (2, 'x') ON CONFLICT(a) DO UPDATE SET id = excluded.id;
+    SELECT * FROM t;
+}
+expect {
+    mvcc
+    2|x
+}

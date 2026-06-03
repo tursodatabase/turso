@@ -125,8 +125,8 @@ pub fn translate_create_trigger(
     }
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
-    program.begin_write_operation();
+    program.begin_write_on_database(database_id, schema_cookie)?;
+    program.begin_write_operation()?;
 
     // Temp-backed triggers follow SQLite's looser name-resolution rules and may
     // access objects across schemas. Ordinary triggers stay schema-local.
@@ -475,8 +475,8 @@ pub fn translate_drop_trigger(
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_trigger_database_id(trigger_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
-    program.begin_write_operation();
+    program.begin_write_on_database(database_id, schema_cookie)?;
+    program.begin_write_operation()?;
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
 
     // Check if trigger exists

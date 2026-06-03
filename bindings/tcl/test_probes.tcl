@@ -93,6 +93,24 @@ set result [db eval {SELECT add2(3, 7);}]
 assert_eq "db func with two args" 10 $result
 
 # ---------------------------------------------------------------------------
+# Probe 4: multi-statement `db eval` accumulates rows from every statement.
+# Regression test for the select3-8.100 failure where the per-statement reset
+# of the result list dropped rows from earlier statements (e.g. a SELECT
+# followed by `PRAGMA integrity_check`). Upstream tclsqlite appends rows from
+# every statement in the script to a single result list.
+# ---------------------------------------------------------------------------
+
+db eval {DROP TABLE IF EXISTS tm;}
+set multi_sql {
+    CREATE TABLE tm(a, b);
+    INSERT INTO tm VALUES (1, 'one'), (2, 'two');
+    SELECT a, b FROM tm ORDER BY a;
+    SELECT count(*) FROM tm;
+}
+assert_eq "multi-statement db eval keeps rows from every statement" \
+    {1 one 2 two 2} [db eval $multi_sql]
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

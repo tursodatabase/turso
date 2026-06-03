@@ -221,6 +221,17 @@ expect {
 }
 
 @cross-check-integrity
+test affinity-in-subquery-union-text-rhs {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT a FROM t WHERE a IN (SELECT '1' UNION SELECT '2') ORDER BY a;
+}
+expect {
+    1
+    2
+}
+
+@cross-check-integrity
 test affinity-scalar-subquery-text-comparison {
     CREATE TABLE t_text (a TEXT);
     CREATE TABLE t_real (b REAL);
@@ -527,4 +538,133 @@ expect {
     1|text
     1.5|text
     1a|text
+}
+
+@cross-check-integrity
+test cast-text-to-numeric-integral-float {
+    SELECT CAST('3.0' AS NUMERIC), typeof(CAST('3.0' AS NUMERIC));
+    SELECT CAST('3.5' AS NUMERIC), typeof(CAST('3.5' AS NUMERIC));
+    SELECT CAST('1e10' AS NUMERIC), typeof(CAST('1e10' AS NUMERIC));
+    SELECT CAST('1e-10' AS NUMERIC), typeof(CAST('1e-10' AS NUMERIC));
+    SELECT CAST('-0.0' AS NUMERIC), typeof(CAST('-0.0' AS NUMERIC));
+    SELECT CAST('1e100' AS NUMERIC), typeof(CAST('1e100' AS NUMERIC));
+    SELECT CAST('2251799813685247.0' AS NUMERIC), typeof(CAST('2251799813685247.0' AS NUMERIC));
+    SELECT CAST('2251799813685248.0' AS NUMERIC), typeof(CAST('2251799813685248.0' AS NUMERIC));
+}
+expect {
+    3|integer
+    3.5|real
+    10000000000|integer
+    1.0e-10|real
+    0|integer
+    1.0e+100|real
+    2251799813685247|integer
+    2.25179981368525e+15|real
+}
+expect @js {
+    3|integer
+    3.5|real
+    10000000000|integer
+    1e-10|real
+    0|integer
+    1e+100|real
+    2251799813685247|integer
+    2251799813685248|real
+}
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/4927
+# A compound (UNION/UNION ALL) subquery column's affinity must be combined
+# across all arms, not taken from the leftmost arm alone. Scanning left to
+# right, the affinity is the first arm that has one (leading no-affinity arms
+# are skipped); it is then downgraded to no affinity if a later arm has a
+# conflicting type class (text vs numeric), so the column compares by storage
+# class. This matches SQLite's sqlite3SubqueryColumnTypes.
+#
+# These select typeof(x) instead of x so the output never contains a float
+# literal (which the JavaScript driver mishandles); the second column is the
+# integer comparison result.
+
+@cross-check-integrity
+test affinity-compound-subquery-text-numeric-no-affinity {
+    SELECT typeof(x), x = 2 FROM (SELECT CAST(2 AS TEXT) AS x UNION ALL SELECT 2.0);
+}
+expect {
+    text|0
+    real|1
+}
+
+@cross-check-integrity
+test affinity-compound-subquery-order-independent {
+    SELECT typeof(x), x = 2 FROM (SELECT 2.0 AS x UNION ALL SELECT CAST(2 AS TEXT));
+}
+expect {
+    real|1
+    text|0
+}
+
+@cross-check-integrity
+test affinity-compound-subquery-all-text {
+    SELECT typeof(x), x = 2 FROM (SELECT CAST(2 AS TEXT) AS x UNION ALL SELECT CAST(3 AS TEXT));
+}
+expect {
+    text|1
+    text|0
+}
+
+@cross-check-integrity
+test affinity-compound-subquery-all-numeric {
+    SELECT typeof(x), x = 2 FROM (SELECT 2 AS x UNION ALL SELECT 2.0);
+}
+expect {
+    integer|1
+    real|1
+}
+
+@cross-check-integrity
+test affinity-compound-subquery-numeric-col-plus-numeric-literal {
+    CREATE TABLE ti (a INTEGER);
+    INSERT INTO ti VALUES (5);
+    SELECT typeof(x), x = '5' FROM (SELECT a AS x FROM ti UNION ALL SELECT 5.0);
+}
+expect {
+    integer|1
+    real|1
+}
+
+# Leading no-affinity arm (float literal) is skipped; the INTEGER column's
+# affinity is adopted, so x compares numerically.
+@cross-check-integrity
+test affinity-compound-subquery-numeric-literal-first-then-col {
+    CREATE TABLE ti (a INTEGER);
+    INSERT INTO ti VALUES (5);
+    SELECT typeof(x), x = '5' FROM (SELECT 5.0 AS x UNION ALL SELECT a FROM ti);
+}
+expect {
+    real|1
+    integer|1
+}
+
+@cross-check-integrity
+test affinity-compound-subquery-text-col-plus-numeric-literal {
+    CREATE TABLE tt (a TEXT);
+    INSERT INTO tt VALUES ('5');
+    SELECT typeof(x), x = 5 FROM (SELECT a AS x FROM tt UNION ALL SELECT 5);
+}
+expect {
+    text|0
+    integer|1
+}
+
+@cross-check-integrity
+test affinity-compound-subquery-three-arms-mixed {
+    SELECT typeof(x), x = '5' FROM (
+        SELECT CAST(5 AS INT) AS x
+        UNION ALL SELECT CAST(5 AS INTEGER)
+        UNION ALL SELECT CAST(5 AS TEXT)
+    );
+}
+expect {
+    integer|0
+    integer|0
+    text|1
 }

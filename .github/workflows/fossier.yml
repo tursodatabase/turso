@@ -26,9 +26,9 @@ jobs:
             echo "has_command=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: PThorpe92/fossier@main
+      - uses: PThorpe92/fossier@f4abfcf3ffb60b6d59337126d092ffbb41405685
         if: github.event_name != 'issue_comment' || steps.check-cmd.outputs.has_command == 'true'
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           registry-api-key: ${{ secrets.FOSSIER_REGISTRY_API_KEY }}
-          contact-url: "https://discord.gg/mNUkCHs2R"
+          contact-url: "https://discord.gg/CnXmpukt4"

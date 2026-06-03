@@ -352,6 +352,105 @@ ORDER BY region, id;
 | 4 | South | NULL | 150.0 | 3 |
 | 6 | South | 175.0 | 325.0 | 3 |
 
+## Ordered-Set Aggregates (WITHIN GROUP)
+
+<Info>
+`mode`, `percentile_cont` and `percentile_disc` with `WITHIN GROUP (ORDER BY ...)` are built in and available by default — no extension required. The syntax and results match PostgreSQL. (Standard SQLite does not support `WITHIN GROUP`.)
+</Info>
+
+Ordered-set aggregates compute a result over the values of an `ORDER BY` expression, sorted within each group:
+
+```sql
+mode() WITHIN GROUP (ORDER BY sort_expr)
+percentile_cont(fraction) WITHIN GROUP (ORDER BY sort_expr)
+percentile_disc(fraction) WITHIN GROUP (ORDER BY sort_expr)
+```
+
+The `ORDER BY` expression is the value being aggregated. For the percentile functions, the argument before `WITHIN GROUP` is the percentile *fraction*. NULL values of the `ORDER BY` expression are ignored; if there are no non-NULL values, the result is NULL.
+
+### mode()
+
+```sql
+mode() WITHIN GROUP (ORDER BY X)
+```
+
+Returns the most frequent value of X. If several values are equally frequent, the smallest is returned. Works with any type and returns the value in its original type.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| X | any | The expression whose most frequent value to return |
+
+**Return type:** same as X
+
+```sql
+SELECT mode() WITHIN GROUP (ORDER BY product) FROM sales;
+-- 'Widget' (the most frequent product)
+
+SELECT region, mode() WITHIN GROUP (ORDER BY product) AS top_product
+FROM sales
+GROUP BY region;
+```
+
+| region | top_product |
+|--------|-------------|
+| North | Widget |
+| South | Widget |
+
+<Info>
+`mode()` is only valid with `WITHIN GROUP`; calling `mode(X)` without it is an error.
+</Info>
+
+### percentile_cont(fraction) and percentile_disc(fraction)
+
+```sql
+percentile_cont(fraction) WITHIN GROUP (ORDER BY X)
+percentile_disc(fraction) WITHIN GROUP (ORDER BY X)
+```
+
+Compute the `fraction`-th percentile of X, where `fraction` is between 0.0 and 1.0:
+
+- `percentile_cont` returns a continuous, interpolated value (always REAL).
+- `percentile_disc` returns the actual element at the discrete percentile position, in its original type.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| fraction | REAL | Percentile fraction, 0.0 to 1.0 |
+| X | numeric (`percentile_cont`) / any (`percentile_disc`) | The values to compute the percentile over |
+
+**Return type:** REAL for `percentile_cont`; same as X for `percentile_disc`
+
+```sql
+-- Median, interpolated vs. an actual data point
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) FROM sales;  -- 175.0
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY amount) FROM sales;  -- 175.0
+
+-- Quartiles per region
+SELECT region,
+       percentile_cont(0.25) WITHIN GROUP (ORDER BY amount) AS q1,
+       percentile_cont(0.75) WITHIN GROUP (ORDER BY amount) AS q3
+FROM sales
+WHERE amount IS NOT NULL
+GROUP BY region;
+```
+
+The fraction must be a constant with respect to the rows being aggregated — a literal, a constant expression, or a parameter. It cannot reference the columns being aggregated, and an out-of-range constant fraction is reported regardless of how many rows match:
+
+```sql
+SELECT percentile_cont(2.0) WITHIN GROUP (ORDER BY amount) FROM sales;
+-- Error: percentile value 2 is not between 0 and 1
+```
+
+### Collation
+
+Text values are ordered using the applicable collation — an explicit `COLLATE` on the `ORDER BY` expression, the column's declared collation, or `BINARY` by default — consistent with `ORDER BY`.
+
+### Notes and limitations
+
+- A single `ORDER BY` expression is required. Multiple expressions, `DESC`, and `NULLS FIRST/LAST` inside `WITHIN GROUP` are not yet supported.
+- A subquery as the fraction argument is not currently supported.
+- These aggregates work with `GROUP BY`, `FILTER (WHERE ...)`, `HAVING`, subqueries, CTEs, joins, and attached databases.
+- The **percentile** extension also provides non-standard two-argument forms, `percentile_cont(Y, P)` and `percentile_disc(Y, P)` (see [Extension Aggregate Functions](#extension-aggregate-functions)). The `WITHIN GROUP` forms above are the SQL-standard versions and require no extension.
+
 ## Turso Extension: array_agg(X)
 
 <Info>
@@ -478,7 +577,7 @@ percentile_cont(Y, P)
 percentile_disc(Y, P)
 ```
 
-SQL-standard percentile functions. `percentile_cont` uses continuous (interpolated) distribution, while `percentile_disc` returns the nearest discrete input value.
+These two-argument forms are a convenience provided by the **percentile** extension. The SQL-standard spelling — `percentile_cont(P) WITHIN GROUP (ORDER BY Y)` — is built in and needs no extension; see [Ordered-Set Aggregates](#ordered-set-aggregates-within-group) above. `percentile_cont` uses a continuous (interpolated) distribution, while `percentile_disc` returns a discrete input value.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|

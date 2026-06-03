@@ -99,6 +99,45 @@ pub enum LimboError {
     CheckpointFailed(String),
     #[error("Unsupported text encoding: {0}. Only UTF-8 is supported.")]
     UnsupportedEncoding(String),
+    #[error("Out of memory")]
+    OutOfMemory,
+}
+
+impl From<crate::alloc::AllocError> for LimboError {
+    fn from(_: crate::alloc::AllocError) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+impl From<crate::alloc::TryReserveError> for LimboError {
+    fn from(_: crate::alloc::TryReserveError) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+#[cfg(not(nightly))]
+impl From<allocator_api2::collections::TryReserveError> for LimboError {
+    fn from(_: allocator_api2::collections::TryReserveError) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+impl From<std::collections::TryReserveError> for LimboError {
+    fn from(_: std::collections::TryReserveError) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+impl From<bumpalo::AllocErr> for LimboError {
+    fn from(_: bumpalo::AllocErr) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+impl From<bumpalo::collections::CollectionAllocErr> for LimboError {
+    fn from(_: bumpalo::collections::CollectionAllocErr) -> Self {
+        Self::OutOfMemory
+    }
 }
 
 #[cfg(target_family = "unix")]
@@ -143,6 +182,12 @@ pub enum CompletionError {
         offset: u64,
         expected: usize,
         actual: usize,
+    },
+    #[error("WAL frame page mismatch at frame {frame_id}: expected page {expected}, got {actual}")]
+    WalFramePageMismatch {
+        frame_id: u64,
+        expected: usize,
+        actual: u32,
     },
     #[error("Checksum mismatch on page {page_id}: expected {expected}, got {actual}")]
     ChecksumMismatch {

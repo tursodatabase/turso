@@ -1,6 +1,6 @@
 [package]
 name = "turso_sync_sdk_kit"
-description = "Turso sync SDK kit"
+description = "Low-level C ABI for Turso Cloud sync in language bindings. For Rust applications, use the `turso` crate instead."
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

@@ -1,7 +1,4 @@
-use std::{
-    num::{NonZero, NonZeroUsize},
-    sync::Arc,
-};
+use std::num::{NonZero, NonZeroUsize};
 
 /// Convert a usize to u16 for instruction fields (registers, counts).
 /// Panics if the value exceeds u16::MAX.
@@ -14,6 +11,7 @@ use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, Pag
 use crate::{
     schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
+    sync::{Arc, OnceLock, Weak},
     translate::{collate::CollationSeq, emitter::TransactionMode},
     types::KeyInfo,
     vdbe::affinity::Affinity,
@@ -23,6 +21,45 @@ use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
 use turso_parser::ast::{ResolveType, SortOrder};
+
+/// The program run by an `Insn::Program` instruction.
+///
+/// Most callers already have a finished trigger or foreign-key action program.
+/// Recursive foreign-key actions are different: while compiling one action
+/// program, the generated SQL can need to emit a call back to that same action
+/// program before it has finished compiling.
+#[derive(Debug, Clone)]
+pub enum Subprogram {
+    /// A finished trigger or foreign-key action program.
+    PreparedProgram(Arc<PreparedProgram>),
+    /// A recursive foreign-key action program that is still being compiled.
+    ///
+    /// Example: `t(id PRIMARY KEY, parent REFERENCES t(id) ON DELETE CASCADE)`.
+    /// The action that deletes child rows from `t` can itself delete more rows
+    /// from `t`, so it must call the same action program that is being built.
+    /// The slot is filled after compilation finishes. The stored reference is
+    /// weak so the finished program does not own itself.
+    Pending(Arc<OnceLock<Weak<PreparedProgram>>>),
+}
+
+impl Subprogram {
+    /// Return the finished program that `Insn::Program` should run.
+    ///
+    /// `Pending` must have been filled during compilation before execution
+    /// reaches the instruction. If it has not been filled, compilation emitted
+    /// a recursive foreign-key action call without connecting it to the
+    /// finished action program.
+    pub(super) fn prepared_program(&self) -> crate::Result<Arc<PreparedProgram>> {
+        match self {
+            Self::PreparedProgram(program) => Ok(program.clone()),
+            Self::Pending(program) => program.get().and_then(Weak::upgrade).ok_or_else(|| {
+                crate::LimboError::InternalError(
+                    "recursive foreign-key action subprogram was not resolved".into(),
+                )
+            }),
+        }
+    }
+}
 
 /// Known custom type comparator functions for sorting and MIN/MAX aggregates.
 /// These replace heap-allocated String names with a compact enum.
@@ -142,6 +179,7 @@ impl InsertFlags {
     pub const REQUIRE_SEEK: u8 = 0x02; // Flag indicating that a seek is required to insert the row
     pub const EPHEMERAL_TABLE_INSERT: u8 = 0x04; // Flag indicating that this is an insert into an ephemeral table
     pub const SKIP_LAST_ROWID: u8 = 0x08; // Flag indicating that last_insert_rowid() must not be updated
+    pub const SKIP_STATEMENT_CHANGE_COUNT: u8 = 0x10; // Flag indicating that changes() must not count this insert
 
     pub fn new() -> Self {
         InsertFlags(0)
@@ -168,6 +206,11 @@ impl InsertFlags {
 
     pub fn skip_last_rowid(mut self) -> Self {
         self.0 |= InsertFlags::SKIP_LAST_ROWID;
+        self
+    }
+
+    pub fn skip_statement_change_count(mut self) -> Self {
+        self.0 |= InsertFlags::SKIP_STATEMENT_CHANGE_COUNT;
         self
     }
 }
@@ -798,7 +841,7 @@ pub enum Insn {
         can_fallthrough: bool,
     },
 
-    /// Invoke a trigger subprogram.
+    /// Invoke a trigger or foreign-key action subprogram.
     ///
     /// According to SQLite documentation (https://sqlite.org/opcode.html):
     /// "The Program opcode invokes the trigger subprogram. The Program instruction
@@ -810,7 +853,7 @@ pub enum Insn {
         /// At runtime, values are copied from these parent registers into
         /// the child statement's parameters via bind_at.
         param_registers: Vec<usize>,
-        program: Arc<PreparedProgram>,
+        program: Subprogram,
         /// Jump target when RAISE(IGNORE) fires in the subprogram.
         /// Points to the "skip this row" address in the parent program.
         ignore_jump_target: BranchOffset,
@@ -1164,6 +1207,7 @@ pub enum Insn {
 
     MustBeInt {
         reg: usize,
+        target_pc: Option<BranchOffset>,
     },
 
     SoftNull {
@@ -1757,6 +1801,13 @@ pub enum Insn {
         dest_path: String,
     },
 
+    /// In-place VACUUM - compact the database (by writing to a temporary location and then copying
+    /// back)
+    Vacuum {
+        /// Database index to vacuum (0 = main)
+        db: usize,
+    },
+
     /// Ensure turso_cdc_version table exists and insert/replace a version row,
     /// then enable CDC on the connection. Runs nested SQL at VDBE execution time
     /// (same pattern as ParseSchema). CDC is enabled after version table operations
@@ -1993,6 +2044,7 @@ impl InsnVariants {
             InsnVariants::HashGraceNextProbe => execute::op_hash_grace_next_probe,
             InsnVariants::HashGraceAdvancePartition => execute::op_hash_grace_advance_partition,
             InsnVariants::VacuumInto => execute::op_vacuum_into,
+            InsnVariants::Vacuum => execute::op_vacuum,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
         }
     }
@@ -2049,9 +2101,15 @@ impl Insn {
             | Self::DropColumn { .. }
             | Self::AddColumn { .. }
             | Self::AlterColumn { .. }
-            | Self::JournalMode { .. } => false,
+            | Self::JournalMode { .. }
+            | Self::Vacuum { .. } => false,
             Self::MaxPgcnt { new_max, .. } => *new_max == 0,
-            Self::Program { program, .. } => program.is_readonly(),
+            // A recursive foreign-key action is treated as writable while it's still being
+            // compiled; only fully-prepared subprograms can declare themselves read-only.
+            Self::Program { program, .. } => match program {
+                Subprogram::PreparedProgram(p) => p.is_readonly(),
+                Subprogram::Pending(_) => false,
+            },
             _ => true,
         }
     }

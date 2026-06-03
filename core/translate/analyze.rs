@@ -149,8 +149,8 @@ pub fn translate_analyze(
     // epilogue emits a Transaction instruction (which starts the MVCC
     // exclusive transaction required by OpenWrite on sqlite_schema).
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
-    program.begin_write_operation();
+    program.begin_write_on_database(database_id, schema_cookie)?;
+    program.begin_write_operation()?;
 
     // This is emitted early because SQLite does, and thus generated VDBE matches a bit closer.
     let null_reg = program.alloc_register();

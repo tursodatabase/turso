@@ -939,6 +939,7 @@ impl ToTokens for Expr {
                 distinctness,
                 args,
                 order_by,
+                within_group,
                 filter_over,
             } => {
                 name.to_tokens(s, context)?;
@@ -955,6 +956,15 @@ impl ToTokens for Expr {
                     comma(order_by, s, context)?;
                 }
                 s.append(TK_RP, None)?;
+                if !within_group.is_empty() {
+                    s.append(TK_WITHIN, None)?;
+                    s.append(TK_GROUP, None)?;
+                    s.append(TK_LP, None)?;
+                    s.append(TK_ORDER, None)?;
+                    s.append(TK_BY, None)?;
+                    comma(within_group, s, context)?;
+                    s.append(TK_RP, None)?;
+                }
                 filter_over.to_tokens(s, context)?;
                 Ok(())
             }

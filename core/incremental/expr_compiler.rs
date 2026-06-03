@@ -62,6 +62,7 @@ fn transform_expr_for_dbsp(expr: &Expr, input_column_names: &[String]) -> Expr {
             distinctness,
             args,
             order_by,
+            within_group,
             filter_over,
         } => Expr::FunctionCall {
             name: name.clone(),
@@ -71,6 +72,7 @@ fn transform_expr_for_dbsp(expr: &Expr, input_column_names: &[String]) -> Expr {
                 .map(|arg| Box::new(transform_expr_for_dbsp(arg, input_column_names)))
                 .collect(),
             order_by: order_by.clone(),
+            within_group: within_group.clone(),
             filter_over: filter_over.clone(),
         },
         Expr::Parenthesized(exprs) => Expr::Parenthesized(

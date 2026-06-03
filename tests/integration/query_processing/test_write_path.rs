@@ -1327,6 +1327,42 @@ pub fn test_conflict_inside_txn(limbo: TempDatabase) {
     );
 }
 
+#[turso_macros::test]
+pub fn test_savepoint_rollback_uses_current_wal_snapshot(
+    limbo: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect()?;
+    let conn2 = limbo.db.connect()?;
+
+    conn1.execute("CREATE TABLE t (u1 TEXT UNIQUE, u2 INTEGER UNIQUE, payload TEXT)")?;
+    for i in 1..=8 {
+        conn1.execute(format!("INSERT INTO t VALUES ('u{i}', {i}, 'base')"))?;
+    }
+
+    // Leave conn1's local WAL snapshot behind the committed frames added by conn2.
+    for i in 9..=20 {
+        conn2.execute(format!("INSERT INTO t VALUES ('u{i}', {i}, 'from_conn2')"))?;
+    }
+
+    conn1.execute("SAVEPOINT sp")?;
+    let payload = "X".repeat(4000);
+    assert!(matches!(
+        conn1.execute(format!(
+            "UPDATE t SET payload = '{payload}', u2 = CASE WHEN u2 = 20 THEN 1 ELSE u2 END WHERE TRUE"
+        )),
+        Err(LimboError::Constraint(_))
+    ));
+    conn1.execute("ROLLBACK TO sp")?;
+    conn1.execute("RELEASE sp")?;
+
+    let count: Vec<(i64,)> = conn1.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(count, vec![(20,)]);
+    let integrity: Vec<(String,)> = conn1.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+    Ok(())
+}
+
 #[test]
 pub fn test_reopen_database_wal_restart() {
     let _ = env_logger::try_init();
@@ -1606,7 +1642,7 @@ pub fn test_empty_wal_truncate_checkpoint() {
 }
 
 #[test]
-pub fn test_mvcc_stale_snapshot_after_schema_updated() {
+pub fn test_mvcc_reader_stale_snapshot_after_schema_updated_returns_ok() {
     let _ = env_logger::try_init();
     let db_path = tempfile::NamedTempFile::new().unwrap();
     let (_file, db_path) = db_path.keep().unwrap();
@@ -1623,11 +1659,60 @@ pub fn test_mvcc_stale_snapshot_after_schema_updated() {
         .unwrap();
     // conn1: Start a CONCURRENT transaction
     conn1.execute("BEGIN CONCURRENT").unwrap();
-    // Do something to establish the MVCC snapshot
+    // Do something to establish the MVCC snapshot, we do not write anything so that tx
+    // is read only which would not trigger SchemaUpdated
     conn1.execute("SELECT * FROM t").unwrap();
     // conn2: Modify schema while conn1's CONCURRENT transaction is active
     conn2.execute("CREATE TABLE t2 (x)").unwrap();
-    // conn1: Try to COMMIT - should fail with SchemaConflict
+    // conn1: A read-only transaction can commit even though the schema changed.
+    let commit_result = conn1.execute("COMMIT");
+    assert!(matches!(commit_result, Ok(())));
+
+    // conn2: Insert a row and commit (this happens AFTER conn1's original snapshot)
+    conn2
+        .execute("INSERT INTO t VALUES ('test_key', 'test_value')")
+        .unwrap();
+
+    // conn1: Start a new CONCURRENT transaction. It must get a fresh
+    // snapshot after the earlier transaction committed.
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+
+    // conn1: SELECT should see the row inserted by conn2.
+    let rows: Vec<(String, String)> = conn1.exec_rows("SELECT * FROM t WHERE key = 'test_key'");
+
+    assert_eq!(
+        rows,
+        vec![("test_key".to_string(), "test_value".to_string())]
+    );
+
+    conn1.execute("COMMIT").unwrap();
+}
+
+#[test]
+pub fn test_mvcc_writer_stale_snapshot_after_schema_updated() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    tracing::info!("path: {:?}", db_path);
+    let tmp_db = TempDatabase::builder()
+        .with_db_path(&db_path)
+        .with_mvcc(true)
+        .build();
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+    // Setup: create initial table
+    conn1
+        .execute("CREATE TABLE t (key TEXT PRIMARY KEY, value TEXT)")
+        .unwrap();
+    // conn1: Start a CONCURRENT transaction
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    // Insert something so that we trigger schema updated
+    conn1
+        .execute("INSERT INTO t VALUES ('foo', 'var')")
+        .unwrap();
+    // conn2: Modify schema while conn1's CONCURRENT transaction is active.
+    conn2.execute("CREATE TABLE t2 (x)").unwrap();
+    // conn1: COMMIT should fail because its writer snapshot predates the schema change.
     let commit_result = conn1.execute("COMMIT");
     assert!(matches!(commit_result, Err(LimboError::SchemaConflict)));
 
@@ -1636,12 +1721,11 @@ pub fn test_mvcc_stale_snapshot_after_schema_updated() {
         .execute("INSERT INTO t VALUES ('test_key', 'test_value')")
         .unwrap();
 
-    // conn1: Start a new CONCURRENT transaction
-    // BUG: This should get a fresh MVCC snapshot, but it reuses the old one
+    // conn1: Start a new CONCURRENT transaction. It must get a fresh
+    // snapshot after the earlier transaction committed.
     conn1.execute("BEGIN CONCURRENT").unwrap();
 
-    // conn1: SELECT should see the row inserted by conn2
-    // BUG: Due to stale snapshot, this returns empty result
+    // conn1: SELECT should see the row inserted by conn2.
     let rows: Vec<(String, String)> = conn1.exec_rows("SELECT * FROM t WHERE key = 'test_key'");
 
     assert_eq!(

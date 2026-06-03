@@ -42,11 +42,18 @@ struct Args {
     /// Number of connections opened inside each worker process in multiprocess mode.
     #[arg(long, default_value_t = 1)]
     connections_per_process: usize,
-    #[arg(long, default_value_t = 0.0)]
-    reopen_probability: f64,
+    /// Reopen probability per step.
+    #[arg(long)]
+    reopen_probability: Option<f64>,
     /// Max steps
     #[arg(long)]
     max_steps: Option<usize>,
+    /// Max iterations the reopen drain loop runs before declaring an
+    /// engine-side infinite loop. Drain iterations do not count against
+    /// `--max-steps` — legitimate IO-heavy operations like
+    /// `PRAGMA integrity_check` can use thousands of yields per page.
+    #[arg(long)]
+    max_drain_steps: Option<usize>,
     /// Keep files on disk after run
     #[arg(long)]
     keep: bool,
@@ -243,6 +250,8 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         println!("cosmic ray probability = {}", opts.cosmic_ray_probability);
     }
 
+    let reopen_probability = args.reopen_probability.unwrap_or(opts.reopen_probability);
+
     let mut whopper = Whopper::new(opts)?;
 
     let max_steps = whopper.max_steps;
@@ -254,7 +263,7 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     progress_index += 1;
 
     while !whopper.is_done() {
-        if whopper.rng.random_bool(args.reopen_probability) {
+        if whopper.rng.random_bool(reopen_probability) {
             whopper.reopen().unwrap();
         }
         match whopper.step()? {
@@ -375,11 +384,15 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         "fast" => WhopperOpts::fast(),
         "chaos" => WhopperOpts::chaos(),
         "ragnarök" | "ragnarok" => WhopperOpts::ragnarok(),
+        "recovery-heavy" => WhopperOpts::recovery_heavy(),
         mode => return Err(anyhow::anyhow!("Unknown mode: {}", mode)),
     };
 
     if let Some(max_steps) = args.max_steps {
         base_opts = base_opts.with_max_steps(max_steps);
+    }
+    if let Some(max_drain_steps) = args.max_drain_steps {
+        base_opts = base_opts.with_max_drain_steps(max_drain_steps);
     }
 
     let (workloads, properties, elle_tables, chaotic_profiles) =

@@ -49,7 +49,7 @@ test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync concurrency', async ({ 
     }
     const qs = [];
     for (const db of dbs) {
-        qs.push(db.prepare("SELECT COUNT(*) as cnt FROM partial").all());
+        qs.push((await db.prepare("SELECT COUNT(*) as cnt FROM partial")).all());
     }
     const values = await Promise.all(qs);
     expect(values).toEqual(new Array(16).fill([{ cnt: 2000 }]))
@@ -86,12 +86,12 @@ test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync (prefix bootstrap strat
     expect((await db.stats()).networkReceivedBytes).toBeLessThanOrEqual(128 * (1024 + 128));
 
     // select of one record shouldn't increase amount of received data
-    expect(await db.prepare("SELECT length(value) as length FROM partial LIMIT 1").all()).toEqual([{ length: 1024 }]);
+    expect(await (await db.prepare("SELECT length(value) as length FROM partial LIMIT 1")).all()).toEqual([{ length: 1024 }]);
     expect((await db.stats()).networkReceivedBytes).toBeLessThanOrEqual(128 * (1024 + 128));
 
-    await db.prepare("INSERT INTO partial VALUES (-1)").run();
+    await (await db.prepare("INSERT INTO partial VALUES (-1)")).run();
 
-    expect(await db.prepare("SELECT COUNT(*) as cnt FROM partial").all()).toEqual([{ cnt: 2001 }]);
+    expect(await (await db.prepare("SELECT COUNT(*) as cnt FROM partial")).all()).toEqual([{ cnt: 2001 }]);
     expect((await db.stats()).networkReceivedBytes).toBeGreaterThanOrEqual(2000 * 1024);
 }, { timeout: 300_000 })
 
@@ -124,15 +124,15 @@ test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync (prefix bootstrap strat
 
     const startLast = performance.now();
     // select of one record shouldn't increase amount of received data
-    expect(await db.prepare("SELECT length(value) as length FROM partial LIMIT 1").all()).toEqual([{ length: 1024 }]);
+    expect(await (await db.prepare("SELECT length(value) as length FROM partial LIMIT 1")).all()).toEqual([{ length: 1024 }]);
     console.info('select last', 'elapsed', performance.now() - startLast);
 
     expect((await db.stats()).networkReceivedBytes).toBeLessThanOrEqual(2 * 128 * (1024 + 128));
 
-    await db.prepare("INSERT INTO partial VALUES (-1)").run();
+    await (await db.prepare("INSERT INTO partial VALUES (-1)")).run();
 
     const startAll = performance.now();
-    expect(await db.prepare("SELECT COUNT(*) as cnt FROM partial").all()).toEqual([{ cnt: 2001 }]);
+    expect(await (await db.prepare("SELECT COUNT(*) as cnt FROM partial")).all()).toEqual([{ cnt: 2001 }]);
     console.info('select all', 'elapsed', performance.now() - startAll);
 
     expect((await db.stats()).networkReceivedBytes).toBeGreaterThanOrEqual(2000 * 1024);
@@ -168,15 +168,15 @@ test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync (prefix bootstrap strat
 
     const startLast = performance.now();
     // select of one record shouldn't increase amount of received data
-    expect(await db.prepare("SELECT length(value) as length FROM partial LIMIT 1").all()).toEqual([{ length: 1024 }]);
+    expect(await (await db.prepare("SELECT length(value) as length FROM partial LIMIT 1")).all()).toEqual([{ length: 1024 }]);
     console.info('select last', 'elapsed', performance.now() - startLast);
 
     expect((await db.stats()).networkReceivedBytes).toBeLessThanOrEqual(10 * 128 * (1024 + 128));
 
-    await db.prepare("INSERT INTO partial VALUES (-1)").run();
+    await (await db.prepare("INSERT INTO partial VALUES (-1)")).run();
 
     const startAll = performance.now();
-    expect(await db.prepare("SELECT COUNT(*) as cnt FROM partial").all()).toEqual([{ cnt: 2001 }]);
+    expect(await (await db.prepare("SELECT COUNT(*) as cnt FROM partial")).all()).toEqual([{ cnt: 2001 }]);
     console.info('select all', 'elapsed', performance.now() - startAll);
 
     expect((await db.stats()).networkReceivedBytes).toBeGreaterThanOrEqual(2000 * 1024);
@@ -210,14 +210,14 @@ test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync (query bootstrap strate
     expect((await db.stats()).networkReceivedBytes).toBeLessThanOrEqual(10 * (4096 + 128));
 
     // select of one record shouldn't increase amount of received data by a lot
-    expect(await db.prepare("SELECT length(value) as length FROM partial_keyed LIMIT 1").all()).toEqual([{ length: 1024 }]);
+    expect(await (await db.prepare("SELECT length(value) as length FROM partial_keyed LIMIT 1")).all()).toEqual([{ length: 1024 }]);
     expect((await db.stats()).networkReceivedBytes).toBeLessThanOrEqual(10 * (4096 + 128));
 
-    await db.prepare("INSERT INTO partial_keyed VALUES (-1, -1)").run();
+    await (await db.prepare("INSERT INTO partial_keyed VALUES (-1, -1)")).run();
     const n1 = await db.stats();
 
     // same as bootstrap query - we shouldn't bring any more pages
-    expect(await db.prepare("SELECT length(value) as length FROM partial_keyed WHERE key = 1000").all()).toEqual([{ length: 1024 }]);
+    expect(await (await db.prepare("SELECT length(value) as length FROM partial_keyed WHERE key = 1000")).all()).toEqual([{ length: 1024 }]);
     const n2 = await db.stats();
     expect(n1.networkReceivedBytes).toEqual(n2.networkReceivedBytes);
 })
@@ -236,7 +236,7 @@ test('concurrent-actions-consistency', async ({ server }) => {
         await db.close();
     }
     const db1 = await connect({ path: ':memory:', url: server.dbUrl() });
-    console.info('run_info', await db1.prepare("SELECT * FROM sqlite_master").all());
+    console.info('run_info', await (await db1.prepare("SELECT * FROM sqlite_master")).all());
     await db1.exec("PRAGMA busy_timeout=100");
     const pull = async function (iterations: number) {
         for (let i = 0; i < iterations; i++) {
@@ -263,31 +263,55 @@ test('concurrent-actions-consistency', async ({ server }) => {
     const run = async function (iterations: number) {
         let rows = 0;
         for (let i = 0; i < iterations; i++) {
-            await db1.prepare("UPDATE rows SET value = value + 1 WHERE key = ?").run('key');
+            await (await db1.prepare("UPDATE rows SET value = value + 1 WHERE key = ?")).run('key');
             rows += 1;
-            const { cnt } = await db1.prepare("SELECT value as cnt FROM rows WHERE key = ?").get(['key']);
+            const { cnt } = await (await db1.prepare("SELECT value as cnt FROM rows WHERE key = ?")).get(['key']);
             expect(cnt).toBe(rows);
             await new Promise(resolve => setTimeout(resolve, 10 * (Math.random() + 1)));
         }
     }
     await Promise.all([pull(100), push(100), run(200)]);
-})
+}, 30_000)
 
 test('simple-db', async () => {
     const db = new Database({ path: ':memory:' });
-    expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }])
+    expect(await (await db.prepare("SELECT 1 as x")).all()).toEqual([{ x: 1 }])
     await db.exec("CREATE TABLE t(x)");
     await db.exec("INSERT INTO t VALUES (1), (2), (3)");
-    expect(await db.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }])
+    expect(await (await db.prepare("SELECT * FROM t")).all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }])
     await expect(async () => await db.pull()).rejects.toThrowError(/sync is disabled as database was opened without sync support/);
 })
 
 test('implicit connect', async ({ server }) => {
     const db = new Database({ path: ':memory:', url: server.dbUrl() });
-    const defer = db.prepare("SELECT * FROM not_found");
+    const defer = await db.prepare("SELECT * FROM not_found");
     await expect(async () => await defer.all()).rejects.toThrowError(/no such table: not_found/);
-    expect(() => db.prepare("SELECT * FROM not_found")).toThrowError(/no such table: not_found/);
-    expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
+    await expect(async () => await db.prepare("SELECT * FROM not_found")).rejects.toThrowError(/no such table: not_found/);
+    expect(await (await db.prepare("SELECT 1 as x")).all()).toEqual([{ x: 1 }]);
+})
+
+test('pull with no remote changes updates lastPullUnixTime', async ({ server }) => {
+    {
+        const db = await connect({ path: ':memory:', url: server.dbUrl() });
+        await db.exec("CREATE TABLE IF NOT EXISTS t(x)");
+        await db.exec("DELETE FROM t");
+        await db.exec("INSERT INTO t VALUES (1)");
+        await db.push();
+        await db.close();
+    }
+
+    // fresh client bootstraps from the remote - nothing new to pull afterwards
+    const db = await connect({ path: ':memory:', url: server.dbUrl() });
+    const before = (await db.stats()).lastPullUnixTime;
+
+    // unix time has 1s resolution - wait long enough for the timestamp to advance
+    await new Promise(resolve => setTimeout(resolve, 1500));
+
+    // remote has no new changes - pull returns false but must still bump lastPullUnixTime
+    expect(await db.pull()).toBe(false);
+
+    const after = (await db.stats()).lastPullUnixTime;
+    expect(after).toBeGreaterThan(before);
 })
 
 test('defered sync', async ({ server }) => {
@@ -302,13 +326,13 @@ test('defered sync', async ({ server }) => {
 
     let url: string | null = null;
     const db = new Database({ path: ':memory:', url: () => url });
-    await db.prepare("CREATE TABLE t(x)").run();
-    await db.prepare("INSERT INTO t VALUES (1), (2), (3), (42)").run();
-    expect(await db.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }, { x: 42 }]);
+    await (await db.prepare("CREATE TABLE t(x)")).run();
+    await (await db.prepare("INSERT INTO t VALUES (1), (2), (3), (42)")).run();
+    expect(await (await db.prepare("SELECT * FROM t")).all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }, { x: 42 }]);
     await expect(async () => await db.pull()).rejects.toThrow(/url is empty - sync is paused/);
     url = server.dbUrl();
     await db.pull();
-    expect(await db.prepare("SELECT * FROM t").all()).toEqual([{ x: 100 }, { x: 1 }, { x: 2 }, { x: 3 }, { x: 42 }]);
+    expect(await (await db.prepare("SELECT * FROM t")).all()).toEqual([{ x: 100 }, { x: 1 }, { x: 2 }, { x: 3 }, { x: 42 }]);
 })
 
 // TODO: re-enable encryption tests once local sync server supports the encrypted-tenant URL pattern.
@@ -374,7 +398,7 @@ test('select-after-push', async ({ server }) => {
     }
     {
         const db = await connect({ path: ':memory:', url: server.dbUrl() });
-        const rows = await db.prepare('SELECT * FROM t').all();
+        const rows = await (await db.prepare('SELECT * FROM t')).all();
         expect(rows).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }])
     }
 })
@@ -393,7 +417,7 @@ test('select-without-push', async ({ server }) => {
     }
     {
         const db = await connect({ path: ':memory:', url: server.dbUrl() });
-        const rows = await db.prepare('SELECT * FROM t').all();
+        const rows = await (await db.prepare('SELECT * FROM t')).all();
         expect(rows).toEqual([])
     }
 })
@@ -415,8 +439,8 @@ test('merge-non-overlapping-keys', async ({ server }) => {
     await Promise.all([db1.push(), db2.push()]);
     await Promise.all([db1.pull(), db2.pull()]);
 
-    const rows1 = await db1.prepare('SELECT * FROM q').all();
-    const rows2 = await db1.prepare('SELECT * FROM q').all();
+    const rows1 = await (await db1.prepare('SELECT * FROM q')).all();
+    const rows2 = await (await db1.prepare('SELECT * FROM q')).all();
     const expected = [{ x: 'k1', y: 'value1' }, { x: 'k2', y: 'value2' }, { x: 'k3', y: 'value3' }, { x: 'k4', y: 'value4' }, { x: 'k5', y: 'value5' }];
     expect(rows1.sort(localeCompare)).toEqual(expected.sort(localeCompare))
     expect(rows2.sort(localeCompare)).toEqual(expected.sort(localeCompare))
@@ -440,8 +464,8 @@ test('last-push-wins', async ({ server }) => {
     await db1.push();
     await Promise.all([db1.pull(), db2.pull()]);
 
-    const rows1 = await db1.prepare('SELECT * FROM q').all();
-    const rows2 = await db1.prepare('SELECT * FROM q').all();
+    const rows1 = await (await db1.prepare('SELECT * FROM q')).all();
+    const rows2 = await (await db1.prepare('SELECT * FROM q')).all();
     const expected = [{ x: 'k1', y: 'value1' }, { x: 'k2', y: 'value2' }, { x: 'k3', y: 'value5' }, { x: 'k4', y: 'value4' }];
     expect(rows1.sort(localeCompare)).toEqual(expected.sort(localeCompare))
     expect(rows2.sort(localeCompare)).toEqual(expected.sort(localeCompare))
@@ -466,8 +490,8 @@ test('last-push-wins-with-delete', async ({ server }) => {
     await db1.push();
     await Promise.all([db1.pull(), db2.pull()]);
 
-    const rows1 = await db1.prepare('SELECT * FROM q').all();
-    const rows2 = await db1.prepare('SELECT * FROM q').all();
+    const rows1 = await (await db1.prepare('SELECT * FROM q')).all();
+    const rows2 = await (await db1.prepare('SELECT * FROM q')).all();
     const expected = [{ x: 'k3', y: 'value5' }];
     expect(rows1).toEqual(expected)
     expect(rows2).toEqual(expected)
@@ -538,7 +562,7 @@ test('persistence-push', async ({ server }) => {
             const db2 = await connect({ path: path, url: server.dbUrl() });
             await db2.exec(`INSERT INTO q VALUES ('k3', 'v3')`);
             await db2.exec(`INSERT INTO q VALUES ('k4', 'v4')`);
-            const stmt = db2.prepare('SELECT * FROM q');
+            const stmt = await db2.prepare('SELECT * FROM q');
             const rows = await stmt.all();
             const expected = [{ x: 'k1', y: 'v1' }, { x: 'k2', y: 'v2' }, { x: 'k3', y: 'v3' }, { x: 'k4', y: 'v4' }];
             expect(rows).toEqual(expected)
@@ -554,7 +578,7 @@ test('persistence-push', async ({ server }) => {
 
         {
             const db4 = await connect({ path: path, url: server.dbUrl() });
-            const rows = await db4.prepare('SELECT * FROM q').all();
+            const rows = await (await db4.prepare('SELECT * FROM q')).all();
             const expected = [{ x: 'k1', y: 'v1' }, { x: 'k2', y: 'v2' }, { x: 'k3', y: 'v3' }, { x: 'k4', y: 'v4' }];
             expect(rows).toEqual(expected)
             await db4.close();
@@ -584,7 +608,7 @@ test('persistence-offline', async ({ server }) => {
         }
         {
             const db = await connect({ path: path, url: "https://not-valid-url.localhost" });
-            const rows = await db.prepare("SELECT * FROM q").all();
+            const rows = await (await db.prepare("SELECT * FROM q")).all();
             const expected = [{ x: 'k1', y: 'v1' }, { x: 'k2', y: 'v2' }];
             expect(rows.sort(localeCompare)).toEqual(expected.sort(localeCompare))
             await db.close();
@@ -620,8 +644,8 @@ test('persistence-pull-push', async ({ server }) => {
         console.info(stats1, stats2);
         expect(stats1.revision).not.toBe(stats2.revision);
 
-        const rows1 = await db1.prepare('SELECT * FROM q').all();
-        const rows2 = await db2.prepare('SELECT * FROM q').all();
+        const rows1 = await (await db1.prepare('SELECT * FROM q')).all();
+        const rows2 = await (await db2.prepare('SELECT * FROM q')).all();
         const expected = [{ x: 'k1', y: 'v1' }, { x: 'k2', y: 'v2' }, { x: 'k3', y: 'v3' }, { x: 'k4', y: 'v4' }];
         expect(rows1.sort(localeCompare)).toEqual(expected.sort(localeCompare))
         expect(rows2.sort(localeCompare)).toEqual(expected.sort(localeCompare))
@@ -816,9 +840,9 @@ test('checkpoint-and-actions', async ({ server }) => {
     let rows = 0;
     const run = async function (iterations: number) {
         for (let i = 0; i < iterations; i++) {
-            await db1.prepare("UPDATE rows SET value = value + 1 WHERE key = ?").run('key');
+            await (await db1.prepare("UPDATE rows SET value = value + 1 WHERE key = ?")).run('key');
             rows += 1;
-            const { cnt } = await db1.prepare("SELECT value as cnt FROM rows WHERE key = ?").get(['key']);
+            const { cnt } = await (await db1.prepare("SELECT value as cnt FROM rows WHERE key = ?")).get(['key']);
             console.info('CHECK', cnt, rows);
             expect(cnt).toBe(rows);
             await new Promise(resolve => setTimeout(resolve, 10 * (1 + Math.random())));
@@ -855,8 +879,8 @@ test('transform', async ({ server }) => {
     await Promise.all([db1.push(), db2.push()]);
     await Promise.all([db1.pull(), db2.pull()]);
 
-    const rows1 = await db1.prepare('SELECT * FROM counter').all();
-    const rows2 = await db2.prepare('SELECT * FROM counter').all();
+    const rows1 = await (await db1.prepare('SELECT * FROM counter')).all();
+    const rows2 = await (await db2.prepare('SELECT * FROM counter')).all();
     expect(rows1).toEqual([{ key: '1', value: 2 }]);
     expect(rows2).toEqual([{ key: '1', value: 2 }]);
 })
@@ -898,8 +922,8 @@ test('transform-many', async ({ server }) => {
     await Promise.all([db1.pull(), db2.pull()]);
     console.info('pull', performance.now() - start);
 
-    const rows1 = await db1.prepare('SELECT * FROM counter').all();
-    const rows2 = await db2.prepare('SELECT * FROM counter').all();
+    const rows1 = await (await db1.prepare('SELECT * FROM counter')).all();
+    const rows2 = await (await db2.prepare('SELECT * FROM counter')).all();
     expect(rows1).toEqual([{ key: '1', value: 1001 + 1002 }]);
     expect(rows2).toEqual([{ key: '1', value: 1001 + 1002 }]);
 })
@@ -942,9 +966,9 @@ test('push operations threshold splits batches', async ({ server }) => {
     // Fresh client bootstraps from the remote — every row pushed in batches
     // must be visible.
     const db2 = await connect({ path: ':memory:', url: server.dbUrl() });
-    const cnt = await db2.prepare('SELECT COUNT(*) as c FROM q').all();
+    const cnt = await (await db2.prepare('SELECT COUNT(*) as c FROM q')).all();
     expect(cnt).toEqual([{ c: expectedTotal }]);
-    const last = await db2.prepare('SELECT MAX(x) as m FROM q').all();
+    const last = await (await db2.prepare('SELECT MAX(x) as m FROM q')).all();
     expect(last).toEqual([{ m: expectedTotal - 1 }]);
 })
 
@@ -959,7 +983,7 @@ test('custom fetch override is invoked', async ({ server }) => {
     await db.exec("INSERT INTO t VALUES (1), (2), (3)");
     await db.push();
     expect(calls).toBeGreaterThan(0);
-    const rows = await db.prepare('SELECT x FROM t ORDER BY x').all();
+    const rows = await (await db.prepare('SELECT x FROM t ORDER BY x')).all();
     expect(rows).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
 })
 
@@ -986,7 +1010,7 @@ test('retryFetch retries transient network failures', async ({ server }) => {
     expect(attemptsObserved).toBeGreaterThanOrEqual(2);
     expect(dropsRemaining).toBe(0);
     const db2 = await connect({ path: ':memory:', url: server.dbUrl() });
-    const rows = await db2.prepare('SELECT x FROM t ORDER BY x').all();
+    const rows = await (await db2.prepare('SELECT x FROM t ORDER BY x')).all();
     expect(rows).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
 })
 
@@ -1041,9 +1065,9 @@ test('pullBytesThreshold splits bootstrap into multiple chunks', async ({ server
     expect(pullUpdatesCalls).toBe(expectedChunks);
 
     // Bootstrapped data must be intact regardless of the chunked fetch.
-    const cnt = await db.prepare("SELECT COUNT(*) as c FROM big").all();
+    const cnt = await (await db.prepare("SELECT COUNT(*) as c FROM big")).all();
     expect(cnt).toEqual([{ c: 50 }]);
-    const sizes = await db.prepare("SELECT length(y) as len FROM big LIMIT 1").all();
+    const sizes = await (await db.prepare("SELECT length(y) as len FROM big LIMIT 1")).all();
     expect(sizes).toEqual([{ len: 1024 }]);
 })
 
@@ -1120,7 +1144,7 @@ test('unreliable fetch eventually drains all push batches', async ({ server }) =
     // fresh client, in the exact order they were inserted (no gaps, no
     // duplicates, no reordering across batch boundaries).
     const db2 = await connect({ path: ':memory:', url: server.dbUrl() });
-    const rows = await db2.prepare('SELECT x FROM q ORDER BY x').all();
+    const rows = await (await db2.prepare('SELECT x FROM q ORDER BY x')).all();
     const expected = Array.from({ length: TOTAL_ROWS }, (_, i) => ({ x: i }));
     expect(rows).toEqual(expected);
 })
@@ -1172,6 +1196,6 @@ test('push failure leaves server state on transaction boundary', async ({ server
     // present (rows 0..4); the second must not have leaked any rows
     // (transaction-boundary respected, not split mid-flight).
     const db2 = await connect({ path: ':memory:', url: server.dbUrl() });
-    const rows = await db2.prepare('SELECT x FROM q ORDER BY x').all();
+    const rows = await (await db2.prepare('SELECT x FROM q ORDER BY x')).all();
     expect(rows).toEqual([{ x: 0 }, { x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }]);
 })

@@ -11,7 +11,7 @@ use garde::Validate;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sql_generation::generation::{
-    InsertOpts, LargeTableOpts, Opts, QueryOpts, TableOpts, UpdateOpts,
+    InsertOpts, LargeTableOpts, Opts, QueryOpts, SelectOpts, TableOpts, UpdateOpts,
 };
 use strum::EnumString;
 
@@ -129,6 +129,63 @@ impl Profile {
         profile
     }
 
+    /// Profile that biases generation toward named savepoint rollback under
+    /// cache pressure, where WAL spill and page restoration bugs tend to hide.
+    pub fn savepoint_stress() -> Self {
+        let profile = Profile {
+            io: IOProfile {
+                fault: FaultProfile {
+                    enable: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            cache_size_pages: Some(200),
+            query: QueryProfile {
+                gen_opts: Opts {
+                    table: TableOpts {
+                        large_table: LargeTableOpts {
+                            large_table_prob: 0.15,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    query: QueryOpts {
+                        select: SelectOpts {
+                            free_expr_size: 1,
+                            ..Default::default()
+                        },
+                        insert: InsertOpts {
+                            min_rows: NonZeroU32::new(5).unwrap(),
+                            max_rows: NonZeroU32::new(20).unwrap(),
+                            ..Default::default()
+                        },
+                        update: UpdateOpts {
+                            padding_size: Some(4_000),
+                            force_late_failure: true,
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                select_weight: 0,
+                insert_weight: 35,
+                update_weight: 35,
+                delete_weight: 5,
+                create_index_weight: 15,
+                create_table_weight: 8,
+                drop_table_weight: 0,
+                alter_table_weight: 0,
+                drop_index: 0,
+                pragma_weight: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        profile.validate().unwrap();
+        profile
+    }
+
     pub fn faultless() -> Self {
         let profile = Profile {
             io: IOProfile {
@@ -177,6 +234,7 @@ impl Profile {
             ProfileType::Faultless => Self::faultless(),
             ProfileType::SimpleMvcc => Self::simple_mvcc(),
             ProfileType::WriteStress => Self::write_stress(),
+            ProfileType::SavepointStress => Self::savepoint_stress(),
             ProfileType::Custom(path) => {
                 Self::parse(path).with_context(|| "failed to parse JSON profile")?
             }
@@ -218,6 +276,7 @@ pub enum ProfileType {
     Faultless,
     SimpleMvcc,
     WriteStress,
+    SavepointStress,
     #[strum(disabled)]
     Custom(PathBuf),
 }

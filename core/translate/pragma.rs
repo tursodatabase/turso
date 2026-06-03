@@ -1,10 +1,11 @@
 //! VDBE bytecode generation for pragma statements.
 //! More info: https://www.sqlite.org/pragma.html.
 
+use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
 use crate::turso_soft_unreachable;
 use chrono::Datelike;
-use turso_macros::match_ignore_ascii_case;
+use turso_macros::{match_ignore_ascii_case, turso_debug_assert};
 use turso_parser::ast::PragmaName;
 use turso_parser::ast::{self, Expr, Literal};
 
@@ -47,19 +48,20 @@ fn parse_max_errors_from_value(value: &Option<Expr>) -> usize {
     }
 }
 
-fn visible_database_ids_for_table_list(connection: &crate::Connection) -> BitSet {
+fn visible_database_ids_for_table_list(connection: &crate::Connection) -> crate::Result<BitSet> {
+    use crate::alloc::*;
     let mut ids = BitSet::default();
-    ids.set(crate::MAIN_DB_ID);
-    ids.set(crate::TEMP_DB_ID);
-    ids.extend(
+    ids.set(crate::MAIN_DB_ID)?;
+    ids.set(crate::TEMP_DB_ID)?;
+    ids.try_extend(
         connection
             .attached_databases()
             .read()
             .index_to_data
             .keys()
             .copied(),
-    );
-    ids
+    )?;
+    Ok(ids)
 }
 
 fn display_table_list_name(database_id: usize, name: &str) -> String {
@@ -119,6 +121,16 @@ fn resolve_index_pragma_database_id(
         alias: None,
     };
     resolver.resolve_existing_index_database_id(&qualified_name)
+}
+
+fn foreign_key_action_name(action: ast::RefAct) -> &'static str {
+    match action {
+        ast::RefAct::SetNull => "SET NULL",
+        ast::RefAct::SetDefault => "SET DEFAULT",
+        ast::RefAct::Cascade => "CASCADE",
+        ast::RefAct::Restrict => "RESTRICT",
+        ast::RefAct::NoAction => "NO ACTION",
+    }
 }
 
 fn emit_table_list_rows_for_schema(
@@ -237,6 +249,7 @@ pub fn translate_pragma(
             PragmaName::IndexInfo
             | PragmaName::IndexXinfo
             | PragmaName::IndexList
+            | PragmaName::ForeignKeyList
             | PragmaName::TableList
             | PragmaName::TableInfo
             | PragmaName::TableXinfo
@@ -268,13 +281,13 @@ pub fn translate_pragma(
         TransactionMode::None => {}
         TransactionMode::Read => {
             let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-            program.begin_read_on_database(database_id, schema_cookie);
-            program.begin_read_operation();
+            program.begin_read_on_database(database_id, schema_cookie)?;
+            program.begin_read_operation()?;
         }
         TransactionMode::Write => {
             let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-            program.begin_write_on_database(database_id, schema_cookie);
-            program.begin_write_operation();
+            program.begin_write_on_database(database_id, schema_cookie)?;
+            program.begin_write_operation()?;
         }
         TransactionMode::Concurrent => {
             program.begin_concurrent_operation();
@@ -537,9 +550,9 @@ fn update_pragma(
                 }
             };
             match auto_vacuum_mode {
-                0 => update_auto_vacuum_mode(AutoVacuumMode::None, 0, pager)?,
-                1 => update_auto_vacuum_mode(AutoVacuumMode::Full, 1, pager)?,
-                2 => update_auto_vacuum_mode(AutoVacuumMode::Incremental, 1, pager)?,
+                0 => pager.persist_auto_vacuum_mode(AutoVacuumMode::None)?,
+                1 => pager.persist_auto_vacuum_mode(AutoVacuumMode::Full)?,
+                2 => pager.persist_auto_vacuum_mode(AutoVacuumMode::Incremental)?,
                 _ => {
                     return Err(LimboError::InvalidArgument(
                         "invalid auto vacuum mode".to_string(),
@@ -600,6 +613,7 @@ fn update_pragma(
         PragmaName::IndexInfo => unreachable!("index_info cannot be set"),
         PragmaName::IndexXinfo => unreachable!("index_xinfo cannot be set"),
         PragmaName::IndexList => unreachable!("index_list cannot be set"),
+        PragmaName::ForeignKeyList => unreachable!("foreign_key_list cannot be set"),
         PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
@@ -740,6 +754,12 @@ fn update_pragma(
             connection.set_temp_store(temp_store);
             Ok(TransactionMode::None)
         }
+        PragmaName::VdbeTrace => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_vdbe_trace(enabled);
+            Ok(TransactionMode::None)
+        }
+
         PragmaName::FunctionList => query_pragma(
             PragmaName::FunctionList,
             resolver,
@@ -931,14 +951,18 @@ fn query_pragma(
             }
 
             // External (extension) functions
-            for (name, is_agg, argc) in connection.get_syms_functions() {
+            for (name, is_agg, argc, deterministic) in connection.get_syms_functions() {
                 let func_type = if is_agg { "a" } else { "s" };
+                let mut flags = 0;
+                if deterministic {
+                    flags |= SQLITE_DETERMINISTIC;
+                }
                 program.emit_string8(name, base_reg);
                 program.emit_int(0, base_reg + 1); // builtin = 0
                 program.emit_string8(func_type.to_string(), base_reg + 2);
                 program.emit_string8("utf8".to_string(), base_reg + 3);
                 program.emit_int(argc as i64, base_reg + 4);
-                program.emit_int(0, base_reg + 5); // flags = 0 for extensions
+                program.emit_int(flags, base_reg + 5);
                 program.emit_result_row(base_reg, 6);
             }
 
@@ -1134,6 +1158,71 @@ fn query_pragma(
             }
             Ok(TransactionMode::None)
         }
+        PragmaName::ForeignKeyList => {
+            let table_name = match value {
+                Some(ast::Expr::Name(name)) => Some(name),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // 8 columns: id, seq, table, from, to, on_update, on_delete, match
+            program.alloc_registers(7);
+
+            if let Some(table_name) = table_name {
+                let table_name = table_name.as_str();
+                let table_database_id = resolve_table_pragma_database_id(
+                    resolver,
+                    database_id,
+                    schema_was_explicit,
+                    table_name,
+                )?;
+                resolver.with_schema(table_database_id, |schema| {
+                    let Some(table) = schema.get_table(table_name).and_then(|table| table.btree())
+                    else {
+                        return;
+                    };
+
+                    let mut foreign_keys = table.foreign_keys.iter().collect::<Vec<_>>();
+                    foreign_keys.sort_by_key(|fk| std::cmp::Reverse(fk.decl_order));
+
+                    for (id, fk) in foreign_keys.into_iter().enumerate() {
+                        turso_debug_assert!(
+                            fk.parent_columns.is_empty()
+                                || fk.parent_columns.len() == fk.child_columns.len()
+                        );
+                        for (idx, child_column) in fk.child_columns.iter().enumerate() {
+                            let parent_column = fk
+                                .parent_columns
+                                .get(idx)
+                                .map(String::as_str)
+                                .unwrap_or_default();
+
+                            program.emit_int(id as i64, base_reg);
+                            program.emit_int(idx as i64, base_reg + 1);
+                            program.emit_string8(fk.parent_table.clone(), base_reg + 2);
+                            program.emit_string8(child_column.clone(), base_reg + 3);
+                            program.emit_string8(parent_column.to_string(), base_reg + 4);
+                            program.emit_string8(
+                                foreign_key_action_name(fk.on_update).to_string(),
+                                base_reg + 5,
+                            );
+                            program.emit_string8(
+                                foreign_key_action_name(fk.on_delete).to_string(),
+                                base_reg + 6,
+                            );
+                            program.emit_string8("NONE".to_string(), base_reg + 7);
+                            program.emit_result_row(base_reg, 8);
+                        }
+                    }
+                });
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok(TransactionMode::None)
+        }
         PragmaName::TableList => {
             let name = match value {
                 Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
@@ -1145,9 +1234,9 @@ fn query_pragma(
             program.alloc_registers(5);
 
             let database_ids = if schema_was_explicit {
-                [database_id].into_iter().collect::<BitSet>()
+                [database_id].into_iter().try_collect::<BitSet>()?
             } else {
-                visible_database_ids_for_table_list(connection.as_ref())
+                visible_database_ids_for_table_list(connection.as_ref())?
             };
             for current_database_id in &database_ids {
                 let database_name = connection
@@ -1375,6 +1464,7 @@ fn query_pragma(
 
             Ok(TransactionMode::None)
         }
+        PragmaName::VdbeTrace => Ok(TransactionMode::None),
         PragmaName::FreelistCount => {
             let value = pager.freepage_list();
             let register = program.alloc_register();
@@ -1623,20 +1713,6 @@ fn emit_columns_for_table_info(
 
         program.emit_result_row(base_reg, 6 + if extended { 1 } else { 0 });
     }
-}
-
-fn update_auto_vacuum_mode(
-    auto_vacuum_mode: AutoVacuumMode,
-    largest_root_page_number: u32,
-    pager: Arc<Pager>,
-) -> crate::Result<()> {
-    pager.io.block(|| {
-        pager.with_header_mut(|header| {
-            header.vacuum_mode_largest_root_page = largest_root_page_number.into()
-        })
-    })?;
-    pager.set_auto_vacuum_mode(auto_vacuum_mode);
-    Ok(())
 }
 
 fn update_cache_size(

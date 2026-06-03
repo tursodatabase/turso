@@ -1,21 +1,28 @@
 import {
   executeCursor,
   executePipeline,
-  encodeValue,
   decodeValue,
+  type BatchStep,
   type CursorRequest,
   type CursorResponse,
   type CursorEntry,
   type PipelineRequest,
+  type PipelineResponse,
   type SequenceRequest,
   type CloseRequest,
   type DescribeRequest,
   type DescribeResult,
+  type GetAutocommitRequest,
   type QueryOptions,
-  type NamedArg,
-  type Value
 } from './protocol.js';
 import { DatabaseError } from './error.js';
+import { encodeSqlArgs } from './args.js';
+
+/**
+ * Locking mode for atomic `batch()` execution. Accepts the same values
+ * as the variants of `Connection.transaction(...)`.
+ */
+export type BatchMode = 'deferred' | 'immediate' | 'exclusive' | 'concurrent';
 
 /**
  * Configuration options for a session.
@@ -52,10 +59,46 @@ export class Session {
   private config: SessionConfig;
   private baton: string | null = null;
   private baseUrl: string;
+  // Cached autocommit status from the server's last `get_autocommit` answer.
+  // A fresh connection is in autocommit (not in a transaction).
+  private autocommit: boolean = true;
 
   constructor(config: SessionConfig) {
     this.config = config;
     this.baseUrl = normalizeUrl(config.url);
+  }
+
+  /**
+   * Whether the connection is currently inside a transaction.
+   *
+   * Derived from the server's authoritative `get_autocommit` answer (the same
+   * value as `sqlite3_get_autocommit()`), which we refresh on every pipeline
+   * request. This is the only reliable signal: a non-null baton does NOT imply
+   * a transaction — the server also keeps the stream open for stored SQL or
+   * pragma side effects.
+   */
+  get inTransaction(): boolean {
+    return !this.autocommit;
+  }
+
+  /**
+   * Refresh the cached autocommit status from a pipeline response, reading the
+   * answer to the `get_autocommit` request we append to every pipeline call.
+   */
+  private updateAutocommit(response: PipelineResponse): void {
+    if (!response.results) {
+      return;
+    }
+    for (const result of response.results) {
+      if (
+        result.type === 'ok' &&
+        result.response?.type === 'get_autocommit' &&
+        typeof result.response.is_autocommit === 'boolean'
+      ) {
+        this.autocommit = result.response.is_autocommit;
+        return;
+      }
+    }
   }
 
   private createAbortSignal(queryOptions?: QueryOptions): AbortSignal | undefined {
@@ -75,10 +118,10 @@ export class Session {
   async describe(sql: string, queryOptions?: QueryOptions): Promise<DescribeResult> {
     const request: PipelineRequest = {
       baton: this.baton,
-      requests: [{
-        type: "describe",
-        sql: sql
-      } as DescribeRequest]
+      requests: [
+        { type: "describe", sql: sql } as DescribeRequest,
+        { type: "get_autocommit" } as GetAutocommitRequest,
+      ]
     };
 
     let response;
@@ -86,6 +129,7 @@ export class Session {
       response = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
+      this.autocommit = true;
       throw e;
     }
 
@@ -93,6 +137,7 @@ export class Session {
     if (response.base_url) {
       this.baseUrl = response.base_url;
     }
+    this.updateAutocommit(response);
 
     // Check for errors in the response
     if (response.results && response.results[0]) {
@@ -131,43 +176,7 @@ export class Session {
    * @returns Promise resolving to the raw response and cursor entries
    */
   async executeRaw(sql: string, args: any[] | Record<string, any> = [], queryOptions?: QueryOptions): Promise<{ response: CursorResponse; entries: AsyncGenerator<CursorEntry> }> {
-    let positionalArgs: Value[] = [];
-    let namedArgs: NamedArg[] = [];
-
-    if (Array.isArray(args)) {
-      positionalArgs = args.map(encodeValue);
-    } else {
-      // Check if this is an object with numeric keys (for ?1, ?2 style parameters)
-      const keys = Object.keys(args);
-      const isNumericKeys = keys.length > 0 && keys.every(key => /^\d+$/.test(key));
-      
-      if (isNumericKeys) {
-        // Convert numeric-keyed object to positional args
-        // Sort keys numerically to ensure correct order
-        const sortedKeys = keys.sort((a, b) => parseInt(a) - parseInt(b));
-        const maxIndex = parseInt(sortedKeys[sortedKeys.length - 1]);
-        
-        // Create array with undefined for missing indices
-        positionalArgs = new Array(maxIndex);
-        for (const key of sortedKeys) {
-          const index = parseInt(key) - 1; // Convert to 0-based index
-          positionalArgs[index] = encodeValue(args[key]);
-        }
-        
-        // Fill any undefined values with null
-        for (let i = 0; i < positionalArgs.length; i++) {
-          if (positionalArgs[i] === undefined) {
-            positionalArgs[i] = { type: 'null' };
-          }
-        }
-      } else {
-        // Convert object with named parameters to NamedArg array
-        namedArgs = Object.entries(args).map(([name, value]) => ({
-          name,
-          value: encodeValue(value)
-        }));
-      }
-    }
+    const encodedArgs = encodeSqlArgs(args);
 
     const request: CursorRequest = {
       baton: this.baton,
@@ -175,8 +184,8 @@ export class Session {
         steps: [{
           stmt: {
             sql,
-            args: positionalArgs,
-            named_args: namedArgs,
+            args: encodedArgs.args,
+            named_args: encodedArgs.namedArgs,
             want_rows: true
           }
         }]
@@ -281,23 +290,88 @@ export class Session {
 
   /**
    * Execute multiple SQL statements in a batch.
-   * 
-   * @param statements - Array of SQL statements to execute
-   * @returns Promise resolving to batch execution results
+   *
+   * When `mode` is set, the batch is sent as a single Hrana request that
+   * also carries `BEGIN <mode>` / `COMMIT` / `ROLLBACK` steps using the
+   * server-side condition chain, giving atomic execution in one round-trip.
+   * When `mode` is omitted, the user statements are sent as-is and run
+   * under autocommit (or whatever transaction is already active on this
+   * stream).
+   *
+   * @param statements - Array of SQL statements to execute.
+   * @param mode - Optional locking mode; when set, the batch executes
+   *   atomically. Accepts the same values as `Database.transaction(...)`
+   *   variants: `"deferred"`, `"immediate"`, `"exclusive"`, `"concurrent"`.
+   * @returns Promise resolving to batch execution results.
    */
-  async batch(statements: string[], queryOptions?: QueryOptions): Promise<any> {
+  async batch(
+    statements: Array<string | { sql: string; args?: any[] | Record<string, any> }>,
+    mode?: BatchMode,
+    queryOptions?: QueryOptions,
+  ): Promise<any> {
+    const userSteps: BatchStep[] = statements.map(statement => {
+      if (typeof statement === 'string') {
+        return {
+          stmt: { sql: statement, args: [], named_args: [], want_rows: false },
+        };
+      }
+      const encodedArgs = encodeSqlArgs(statement.args ?? []);
+      return {
+        stmt: {
+          sql: statement.sql,
+          args: encodedArgs.args,
+          named_args: encodedArgs.namedArgs,
+          want_rows: false,
+        },
+      };
+    });
+
+    let steps: BatchStep[];
+    let firstUserStepIdx = 0;
+    let lastUserStepIdx = userSteps.length - 1;
+    let beginIdx = -1;
+    let commitIdx = -1;
+    let rollbackIdx = -1;
+    if (mode === undefined) {
+      steps = userSteps;
+    } else {
+      // Atomic batch: BEGIN <mode>, then each user step gated on its
+      // predecessor succeeding, then COMMIT gated on the last user step
+      // succeeding, then ROLLBACK gated on BEGIN having succeeded *and*
+      // COMMIT not having succeeded. The extra ok(BEGIN) guard prevents
+      // ROLLBACK from aborting a transaction the caller opened on this
+      // stream out of band (e.g. via session.execute("BEGIN")).
+      beginIdx = 0;
+      firstUserStepIdx = 1;
+      lastUserStepIdx = userSteps.length; // 1..userSteps.length inclusive
+      commitIdx = lastUserStepIdx + 1;
+      rollbackIdx = commitIdx + 1;
+      steps = [
+        { stmt: { sql: `BEGIN ${mode.toUpperCase()}`, args: [], named_args: [], want_rows: false } },
+        ...userSteps.map((step, i) => ({
+          ...step,
+          condition: { type: 'ok' as const, step: i === 0 ? beginIdx : firstUserStepIdx + i - 1 },
+        })),
+        {
+          stmt: { sql: 'COMMIT', args: [], named_args: [], want_rows: false },
+          condition: { type: 'ok' as const, step: lastUserStepIdx },
+        },
+        {
+          stmt: { sql: 'ROLLBACK', args: [], named_args: [], want_rows: false },
+          condition: {
+            type: 'and' as const,
+            conds: [
+              { type: 'ok' as const, step: beginIdx },
+              { type: 'not' as const, cond: { type: 'ok' as const, step: commitIdx } },
+            ],
+          },
+        },
+      ];
+    }
+
     const request: CursorRequest = {
       baton: this.baton,
-      batch: {
-        steps: statements.map(sql => ({
-          stmt: {
-            sql,
-            args: [],
-            named_args: [],
-            want_rows: false
-          }
-        }))
-      }
+      batch: { steps },
     };
 
     let batchResult;
@@ -316,28 +390,66 @@ export class Session {
 
     let totalRowsAffected = 0;
     let lastInsertRowid: number | undefined;
+    let deferredError: DatabaseError | null = null;
+
+    // step_end entries don't carry a step index on the wire; the Hrana
+    // server only puts `step` on step_begin / step_error. Track the
+    // current step ourselves by watching step_begin so we know which
+    // step_end belongs to a user statement when running in atomic mode.
+    let currentStep: number | undefined;
+    const isUserStep = (step: number | undefined): boolean => {
+      if (mode === undefined) {
+        // Non-atomic batch: every step is a user step.
+        return true;
+      }
+      return step !== undefined && step >= firstUserStepIdx && step <= lastUserStepIdx;
+    };
 
     for await (const entry of entries) {
       switch (entry.type) {
+        case 'step_begin':
+          currentStep = entry.step;
+          break;
         case 'step_end':
-          if (entry.affected_row_count !== undefined) {
-            totalRowsAffected += entry.affected_row_count;
+          if (isUserStep(currentStep)) {
+            if (entry.affected_row_count !== undefined) {
+              totalRowsAffected += entry.affected_row_count;
+            }
+            if (entry.last_insert_rowid !== undefined && entry.last_insert_rowid !== null) {
+              lastInsertRowid = typeof entry.last_insert_rowid === 'number'
+                ? entry.last_insert_rowid
+                : parseInt(entry.last_insert_rowid, 10);
+            }
           }
-          if (entry.last_insert_rowid !== undefined && entry.last_insert_rowid !== null) {
-            lastInsertRowid = typeof entry.last_insert_rowid === 'number'
-              ? entry.last_insert_rowid
-              : parseInt(entry.last_insert_rowid, 10);
-          }
+          currentStep = undefined;
           break;
         case 'step_error':
+          if (mode === undefined) {
+            throw new DatabaseError(entry.error?.message || 'Batch execution failed', entry.error?.code);
+          }
+          // Atomic batch: capture the first error from BEGIN, any user
+          // step, or COMMIT and keep draining so ROLLBACK has a chance
+          // to clean up. Errors on the synthetic ROLLBACK step are
+          // suppressed — by the time it runs the transaction has
+          // already been undone and surfacing a ROLLBACK error would
+          // mask the real cause we already captured.
+          if (deferredError === null && entry.step !== rollbackIdx) {
+            deferredError = new DatabaseError(entry.error?.message || 'Batch execution failed', entry.error?.code);
+          }
+          currentStep = undefined;
+          break;
         case 'error':
           throw new DatabaseError(entry.error?.message || 'Batch execution failed', entry.error?.code);
       }
     }
 
+    if (deferredError !== null) {
+      throw deferredError;
+    }
+
     return {
       rowsAffected: totalRowsAffected,
-      lastInsertRowid
+      lastInsertRowid,
     };
   }
 
@@ -350,10 +462,10 @@ export class Session {
   async sequence(sql: string, queryOptions?: QueryOptions): Promise<void> {
     const request: PipelineRequest = {
       baton: this.baton,
-      requests: [{
-        type: "sequence",
-        sql: sql
-      } as SequenceRequest]
+      requests: [
+        { type: "sequence", sql: sql } as SequenceRequest,
+        { type: "get_autocommit" } as GetAutocommitRequest,
+      ]
     };
 
     let seqResponse;
@@ -361,6 +473,7 @@ export class Session {
       seqResponse = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
+      this.autocommit = true;
       throw e;
     }
 
@@ -368,6 +481,7 @@ export class Session {
     if (seqResponse.base_url) {
       this.baseUrl = seqResponse.base_url;
     }
+    this.updateAutocommit(seqResponse);
 
     // Check for errors in the response
     if (seqResponse.results && seqResponse.results[0]) {
@@ -405,5 +519,6 @@ export class Session {
     // Reset local state
     this.baton = null;
     this.baseUrl = '';
+    this.autocommit = true;
   }
 }

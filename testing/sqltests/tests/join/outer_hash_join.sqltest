@@ -465,15 +465,21 @@ expect {
     4|y|a
 }
 
-@skip-if sqlite "supported in sqlite"
+# A non-equality ON clause is supported: FULL OUTER falls back to a single-bucket
+# hash join with the predicate applied as a residual, emitting unmatched rows on
+# both sides.
 @cross-check-integrity
-test full-outer-join-non-equi-errors {
+test full-outer-join-non-equi {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
-    SELECT * FROM t1 FULL OUTER JOIN t2 ON t1.a > t2.b;
+    INSERT INTO t1 VALUES (2), (8);
+    INSERT INTO t2 VALUES (5), (10);
+    SELECT ifnull(t1.a, -1), ifnull(t2.b, -1) FROM t1 FULL OUTER JOIN t2 ON t1.a > t2.b ORDER BY 1, 2;
 }
-expect error {
-    FULL OUTER JOIN requires an equality condition in the ON clause
+expect {
+    -1|10
+    2|-1
+    8|5
 }
 
 @skip-if sqlite "supported in sqlite"
@@ -487,15 +493,19 @@ expect error {
     FULL OUTER JOIN requires an equality condition in the ON clause
 }
 
-@skip-if sqlite "supported in sqlite"
+# With no ON clause every pair matches, so FULL OUTER degenerates to a cross
+# product (no unmatched rows on either side).
 @cross-check-integrity
-test full-outer-join-no-on-clause-errors {
+test full-outer-join-no-on-clause {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
-    SELECT * FROM t1 FULL OUTER JOIN t2;
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (3);
+    SELECT ifnull(t1.a, -1), ifnull(t2.b, -1) FROM t1 FULL OUTER JOIN t2 ORDER BY 1, 2;
 }
-expect error {
-    FULL OUTER JOIN requires an equality condition in the ON clause
+expect {
+    1|3
+    2|3
 }
 
 @cross-check-integrity
@@ -945,15 +955,137 @@ expect {
     |4
 }
 
-# Self-join with FULL OUTER is unsupported (same root page).
-@skip-if sqlite "supported in sqlite"
+# Self-join with FULL OUTER goes through the hash join path (no nested-loop
+# form for FULL OUTER yet). The build and probe cursors share a root page but
+# operate via independent CursorKeys, and the hash table holds copied data.
 @cross-check-integrity
-test full-outer-self-join-errors {
+test full-outer-self-join-equi {
     CREATE TABLE t1(a, b);
-    SELECT a.a, b.a FROM t1 a FULL OUTER JOIN t1 b ON a.a = b.a;
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    SELECT a.a, b.a FROM t1 a FULL OUTER JOIN t1 b ON a.a = b.a ORDER BY 1, 2;
 }
-expect error {
-    FULL OUTER JOIN requires an equality condition in the ON clause
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+@cross-check-integrity
+test full-outer-self-join-non-equi {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    SELECT ifnull(a.a, -1), ifnull(b.a, -1) FROM t1 a FULL OUTER JOIN t1 b ON a.a < b.a ORDER BY 1, 2;
+}
+expect {
+    -1|1
+    1|2
+    1|3
+    2|3
+    3|-1
+}
+
+# Regression: FULL OUTER followed by an INNER JOIN must apply the FULL OUTER
+# first. The planner used to reorder into `(t1 INNER t3) FULL OUTER t2`, which
+# leaked NULL-filled probe rows through the inner join because `t3.c = NULL`
+# fails. Verified the bug by inverting the FULL OUTER barrier in the join-
+# order planner.
+@cross-check-integrity
+test full-outer-then-inner-equi {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (1), (2);
+    SELECT ifnull(t1.a, -1), ifnull(t2.b, -1), ifnull(t3.c, -1)
+      FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.b
+           JOIN t3 ON t3.c = t1.a
+      ORDER BY 1, 2, 3;
+}
+expect {
+    1|-1|1
+    2|2|2
+}
+
+@cross-check-integrity
+test full-outer-then-inner-non-equi {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (1), (3);
+    INSERT INTO t3 VALUES (1), (2);
+    SELECT ifnull(t1.a, -1), ifnull(t2.b, -1), ifnull(t3.c, -1)
+      FROM t1 FULL OUTER JOIN t2 ON t1.a < t2.b
+           JOIN t3 ON t3.c = t1.a
+      ORDER BY 1, 2, 3;
+}
+expect {
+    1|3|1
+    2|3|2
+}
+
+# INNER joins BEFORE a FULL OUTER may still be reordered (the barrier is only
+# in the "anything after a FULL OUTER" direction).
+@cross-check-integrity
+test inner-then-full-outer-reorderable {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (1), (2);
+    INSERT INTO t3 VALUES (2), (3);
+    SELECT ifnull(t1.a, -1), ifnull(t2.b, -1), ifnull(t3.c, -1)
+      FROM t1 JOIN t2 ON t1.a = t2.b
+           FULL OUTER JOIN t3 ON t3.c = t1.a
+      ORDER BY 1, 2, 3;
+}
+expect {
+    -1|-1|3
+    1|1|-1
+    2|2|2
+}
+
+# FULL OUTER followed by LEFT JOIN — LEFT JOIN must remain after FULL OUTER.
+@cross-check-integrity
+test full-outer-then-left {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (1), (3);
+    SELECT ifnull(t1.a, -1), ifnull(t2.b, -1), ifnull(t3.c, -1)
+      FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.b
+           LEFT JOIN t3 ON t3.c = t1.a
+      ORDER BY 1, 2, 3;
+}
+expect {
+    -1|3|-1
+    1|-1|1
+    2|2|-1
+}
+
+# Two INNER joins after a FULL OUTER — both must stay after the FULL OUTER.
+@cross-check-integrity
+test full-outer-then-two-inner {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    CREATE TABLE t4(d);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (1), (2);
+    INSERT INTO t4 VALUES (1), (2);
+    SELECT ifnull(t1.a, -1), ifnull(t2.b, -1), ifnull(t3.c, -1), ifnull(t4.d, -1)
+      FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.b
+           JOIN t3 ON t3.c = t1.a
+           JOIN t4 ON t4.d = t3.c
+      ORDER BY 1, 2, 3, 4;
+}
+expect {
+    1|-1|1|1
+    2|2|2|2
 }
 
 # FULL OUTER with GROUP BY and HAVING.
@@ -1576,4 +1708,22 @@ expect {
     2|-1
     3|-1
     4|-1
+}
+
+# Regression: non-equijoin FULL OUTER JOIN preserves duplicate and multi-match
+# rows (the ON predicate is applied as a residual inside a single-bucket hash join).
+@cross-check-integrity
+test full-outer-join-non-equijoin-duplicates {
+    CREATE TABLE a(x);
+    CREATE TABLE b(x);
+    INSERT INTO a VALUES (1), (2), (3);
+    INSERT INTO b VALUES (2), (2), (5);
+    SELECT ifnull(a.x, -1), ifnull(b.x, -1) FROM a FULL OUTER JOIN b ON a.x < b.x ORDER BY 1, 2;
+}
+expect {
+    1|2
+    1|2
+    1|5
+    2|5
+    3|5
 }

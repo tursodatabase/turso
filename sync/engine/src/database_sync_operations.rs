@@ -106,9 +106,10 @@ pub enum WalPushResult {
 
 pub fn connect_untracked(tape: &DatabaseTape) -> Result<Arc<turso_core::Connection>> {
     let conn = tape.connect_untracked()?;
-    assert!(
-        conn.is_wal_auto_checkpoint_disabled(),
-        "tape must be configured to have autocheckpoint disabled"
+    assert_eq!(
+        conn.wal_auto_actions(),
+        turso_core::WalAutoActions::empty(),
+        "tape must be configured to have all auto-WAL actions disabled"
     );
     Ok(conn)
 }
@@ -707,7 +708,7 @@ pub async fn has_table<Ctx>(
     stmt.bind_at(
         1.try_into().unwrap(),
         Value::Text(Text::new(table_name.to_string())),
-    );
+    )?;
 
     let count = match run_stmt_expect_one_row(coro, &mut stmt).await? {
         Some(row) => row[0]
@@ -724,7 +725,7 @@ pub async fn count_local_changes<Ctx>(
     change_id: i64,
 ) -> Result<i64> {
     let mut stmt = conn.prepare("SELECT COUNT(*) FROM turso_cdc WHERE change_id > ?")?;
-    stmt.bind_at(1.try_into().unwrap(), Value::from_i64(change_id));
+    stmt.bind_at(1.try_into().unwrap(), Value::from_i64(change_id))?;
 
     let count = match run_stmt_expect_one_row(coro, &mut stmt).await? {
         Some(row) => row[0]
@@ -751,21 +752,21 @@ pub async fn update_last_change_id<Ctx>(
     select_stmt.bind_at(
         1.try_into().unwrap(),
         turso_core::Value::Text(turso_core::types::Text::new(client_id.to_string())),
-    );
+    )?;
     let row = run_stmt_expect_one_row(coro, &mut select_stmt).await?;
     tracing::info!("update_last_change_id(client_id={client_id}): selected client row if any");
 
     if row.is_some() {
         let mut update_stmt = conn.prepare(TURSO_SYNC_UPDATE_LAST_CHANGE_ID)?;
-        update_stmt.bind_at(1.try_into().unwrap(), turso_core::Value::from_i64(pull_gen));
+        update_stmt.bind_at(1.try_into().unwrap(), turso_core::Value::from_i64(pull_gen))?;
         update_stmt.bind_at(
             2.try_into().unwrap(),
             turso_core::Value::from_i64(change_id),
-        );
+        )?;
         update_stmt.bind_at(
             3.try_into().unwrap(),
             turso_core::Value::Text(turso_core::types::Text::new(client_id.to_string())),
-        );
+        )?;
         run_stmt_ignore_rows(coro, &mut update_stmt).await?;
         tracing::info!("update_last_change_id(client_id={client_id}): updated row for the client");
     } else {
@@ -773,12 +774,12 @@ pub async fn update_last_change_id<Ctx>(
         update_stmt.bind_at(
             1.try_into().unwrap(),
             turso_core::Value::Text(turso_core::types::Text::new(client_id.to_string())),
-        );
-        update_stmt.bind_at(2.try_into().unwrap(), turso_core::Value::from_i64(pull_gen));
+        )?;
+        update_stmt.bind_at(2.try_into().unwrap(), turso_core::Value::from_i64(pull_gen))?;
         update_stmt.bind_at(
             3.try_into().unwrap(),
             turso_core::Value::from_i64(change_id),
-        );
+        )?;
         run_stmt_ignore_rows(coro, &mut update_stmt).await?;
         tracing::info!(
             "update_last_change_id(client_id={client_id}): inserted new row for the client"
@@ -805,7 +806,7 @@ pub async fn read_last_change_id<Ctx>(
     select_last_change_id_stmt.bind_at(
         1.try_into().unwrap(),
         Value::Text(Text::new(client_id.to_string())),
-    );
+    )?;
 
     match run_stmt_expect_one_row(coro, &mut select_last_change_id_stmt).await? {
         Some(row) => {
@@ -1090,7 +1091,7 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
                 sql_over_http_requests.push(step(replay.sql, convert_to_args(replay.values)))
             }
             DatabaseRowTransformResult::Keep => {
-                let replay_info = generator.replay_info(ctx.coro, &change).await?;
+                let replay_info = generator.replay_info(ctx.coro, change).await?;
                 // for now we try to support DDL statements which "extends" the schema (CREATE INDEX, CREATE TABLE, ALTER TABLE ADD COLUMN) and they have `IF NOT EXISTS` semantic
                 // as ALTER TABLE has no such syntax - we ignore error for such statements from remote for now
                 let is_alter_add_column =

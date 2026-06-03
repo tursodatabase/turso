@@ -89,10 +89,14 @@ pub struct Opts {
     pub experimental_index_method: bool,
     #[clap(long, help = "Enable experimental autovacuum feature")]
     pub experimental_autovacuum: bool,
+    #[clap(long, help = "Enable experimental vacuum feature")]
+    pub experimental_vacuum: bool,
     #[clap(long, help = "Enable experimental attach feature")]
     pub experimental_attach: bool,
     #[clap(long, help = "Enable experimental generated columns feature")]
     pub experimental_generated_columns: bool,
+    #[clap(long, help = "Enable experimental WITHOUT ROWID tables feature")]
+    pub experimental_without_rowid: bool,
     #[clap(
         long,
         help = "Enable experimental multiprocess WAL coordination (on Windows, use --vfs experimental_win_iocp)"
@@ -236,8 +240,10 @@ impl Limbo {
             .with_encryption(opts.experimental_encryption)
             .with_index_method(opts.experimental_index_method)
             .with_autovacuum(opts.experimental_autovacuum)
+            .with_vacuum(opts.experimental_vacuum)
             .with_attach(opts.experimental_attach)
             .with_generated_columns(opts.experimental_generated_columns)
+            .with_without_rowid(opts.experimental_without_rowid)
             .with_multiprocess_wal(opts.experimental_multiprocess_wal)
             .with_unsafe_testing(opts.unsafe_testing);
 
@@ -557,7 +563,9 @@ impl Limbo {
         let mut last_stmt_metrics = None;
         for mut output in runner {
             if let Ok(Some(ref mut stmt)) = output {
-                self.apply_parameter_bindings(stmt);
+                if let Err(err) = self.apply_parameter_bindings(stmt) {
+                    output = Err(err);
+                }
             }
             if self
                 .print_query_result(input, &mut output, stats.as_mut())
@@ -583,19 +591,20 @@ impl Limbo {
         }
     }
 
-    fn apply_parameter_bindings(&self, stmt: &mut Statement) {
+    fn apply_parameter_bindings(&self, stmt: &mut Statement) -> Result<(), LimboError> {
         for binding in &self.parameter_bindings {
             if let Some(index) = binding.index {
                 if stmt.parameters().has_slot(index) {
-                    stmt.bind_at(index, binding.value.clone());
+                    stmt.bind_at(index, binding.value.clone())?;
                 }
                 continue;
             }
 
             if let Some(index) = stmt.parameter_index(&binding.name) {
-                stmt.bind_at(index, binding.value.clone());
+                stmt.bind_at(index, binding.value.clone())?;
             }
         }
+        Ok(())
     }
 
     fn handle_parameter_command(&mut self, args: ParameterArgs) -> Result<(), String> {

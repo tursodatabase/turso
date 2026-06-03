@@ -127,7 +127,7 @@ impl WriteRowView {
 
                     // Create an ImmutableRecord from the values
                     let immutable_record =
-                        ImmutableRecord::from_values(&record_values, record_values.len());
+                        ImmutableRecord::from_values(&record_values, record_values.len())?;
                     let btree_key = BTreeKey::new_table_rowid(key_i64, Some(&immutable_record));
 
                     // Mark as Done before insert to avoid retry on I/O
@@ -504,7 +504,7 @@ impl DbspCircuit {
                 self.internal_state_index_root,
                 &index_def,
                 3,
-            );
+            )?;
             let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
             self.execute_node(root_id, pager, execute_state, false, &mut cursors)
         } else {
@@ -558,7 +558,7 @@ impl DbspCircuit {
                         self.internal_state_index_root,
                         &index_def,
                         3, // Index on first 3 columns
-                    );
+                    )?;
 
                     let state_cursors = Box::new(DbspStateCursors::new(
                         state_table_cursor,
@@ -745,7 +745,7 @@ impl DbspCircuit {
                             self.internal_state_index_root,
                             &index_def,
                             3,
-                        );
+                        )?;
                         let mut temp_cursors =
                             DbspStateCursors::new(temp_table_cursor, temp_index_cursor);
 
@@ -1717,6 +1717,7 @@ impl DbspCompiler {
                     distinctness: None,
                     args: ast_args,
                     order_by: Vec::new(),
+                    within_group: vec![],
                     filter_over: ast::FunctionTail {
                         filter_clause: None,
                         over_clause: None,
@@ -1762,6 +1763,7 @@ impl DbspCompiler {
                     },
                     args: ast_args,
                     order_by: Vec::new(),
+                    within_group: vec![],
                     filter_over: ast::FunctionTail {
                         filter_clause: None,
                         over_clause: None,

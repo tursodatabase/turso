@@ -5,7 +5,7 @@ use crate::io::FileSyncType;
 use crate::io::WriteBatch;
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
-use crate::storage::wal::PreparedFrames;
+use crate::storage::wal::{CheckpointLockSource, PreparedFrames};
 use crate::storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
@@ -36,6 +36,7 @@ use crate::{
 use arc_swap::ArcSwapOption;
 use roaring::RoaringBitmap;
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use tracing::{instrument, trace, Level};
 
 use super::btree::offset::{
@@ -52,7 +53,7 @@ use super::sqlite3_ondisk::{
     FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
     FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR,
 };
-use super::wal::CheckpointMode;
+use super::wal::{CheckpointMode, WalAutoActions};
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
 /// SQLite's default maximum page count
@@ -1018,6 +1019,8 @@ struct CheckpointState {
     result: Option<CheckpointResult>,
     /// The checkpoint mode, used to determine if WAL truncation is needed
     mode: Option<CheckpointMode>,
+    /// The checkpoint state machine should acquire the lock or use the one by caller
+    lock_source: CheckpointLockSource,
 }
 
 #[derive(Clone, Debug)]
@@ -1150,6 +1153,14 @@ impl From<u8> for AutoVacuumMode {
             2 => AutoVacuumMode::Incremental,
             _ => unreachable!("Invalid AutoVacuumMode value: {}", value),
         }
+    }
+}
+
+const fn auto_vacuum_header_fields(mode: AutoVacuumMode) -> (u32, u32) {
+    match mode {
+        AutoVacuumMode::None => (0, 0),
+        AutoVacuumMode::Full => (1, 0),
+        AutoVacuumMode::Incremental => (1, 1),
     }
 }
 
@@ -1321,6 +1332,14 @@ pub struct Pager {
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
+    /// Reads that have begun (disk IO issued, page allocated) but whose
+    /// `cache_insert` has not yet succeeded because the cache was full and we
+    /// yielded waiting for a spill to complete. The next call to
+    /// `read_page_nonblock(idx)` reuses the stored `(page, disk_read)` pair
+    /// instead of issuing a duplicate disk read.
+    pending_reads: RwLock<HashMap<i64, PendingRead>>,
+    #[cfg(test)]
+    spill_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
     subjournal: RwLock<Option<Subjournal>>,
@@ -1367,6 +1386,62 @@ pub struct Pager {
 }
 
 assert_send_sync!(Pager);
+
+/// State for a `read_page_nonblock` call that has issued its disk read but has
+/// not yet been able to insert the page into the cache (cache full, spill in
+/// flight). Stored in `Pager::pending_reads` so the next re-entry can resume
+/// without issuing a duplicate disk read.
+#[derive(Clone)]
+struct PendingRead {
+    page: PageRef,
+    /// `None` if the page was satisfied from WAL/cache shortcut and no
+    /// disk read completion needs to be surfaced to the caller.
+    disk_read: Option<Completion>,
+}
+
+/// Test-only deterministic spill-yield injector for `Pager::read_page`. When
+/// armed, the next matching call (after `skip` ignored matches) returns
+/// `IO(yield)` once, then disarms itself.
+#[cfg(test)]
+struct SpillYieldHook {
+    /// `-1` = disarmed; otherwise the `page_idx` to fire on.
+    target: std::sync::atomic::AtomicI64,
+    /// Number of matching calls to ignore before firing.
+    skip: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl SpillYieldHook {
+    const fn new() -> Self {
+        Self {
+            target: std::sync::atomic::AtomicI64::new(-1),
+            skip: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn arm(&self, page_id: i64, skip: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.skip.store(skip, Relaxed);
+        self.target.store(page_id, Relaxed);
+    }
+
+    /// Returns true exactly once per arming, when the (`skip + 1`)th call for
+    /// the armed page id arrives. Internal load-then-store is fine because
+    /// tests using this hook are single-threaded.
+    fn should_yield_for(&self, page_idx: i64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.target.load(Relaxed) != page_idx {
+            return false;
+        }
+        if self.skip.load(Relaxed) == 0 {
+            self.target.store(-1, Relaxed);
+            true
+        } else {
+            self.skip.fetch_sub(1, Relaxed);
+            false
+        }
+    }
+}
 
 #[cfg(not(feature = "omit_autovacuum"))]
 pub struct VacuumState {
@@ -1421,6 +1496,19 @@ enum SpillState {
     #[default]
     /// No spill operation in progress
     Idle,
+    /// Lazily initializing the WAL header before the first spill write.
+    /// Waiting for the header write (and possible truncate) to complete.
+    /// The pinned pages destined for spilling are carried across the yield.
+    PreparingWalStart {
+        pages: Vec<PinGuard>,
+        completion: Completion,
+    },
+    /// WAL header written; waiting for the fsync that marks the WAL
+    /// initialized before we append spill frames.
+    PreparingWalFinish {
+        pages: Vec<PinGuard>,
+        completion: Completion,
+    },
     /// WAL spill in progress, waiting for write completions
     WritingToWal {
         /// Pinned pages being spilled
@@ -1494,6 +1582,9 @@ impl Pager {
             wal,
             page_cache: Arc::new(RwLock::new(page_cache)),
             io,
+            pending_reads: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            spill_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
@@ -1580,7 +1671,10 @@ impl Pager {
                         return Ok(IOResult::Done(page1));
                     }
 
-                    let (page, c) = self.read_page(DatabaseHeader::PAGE_ID as i64)?;
+                    // On spill `return_if_io!` propagates IO up unchanged so
+                    // re-entry resumes here via the pager's `pending_reads`
+                    // memoization (no duplicate disk read).
+                    let (page, c) = return_if_io!(self.read_page(DatabaseHeader::PAGE_ID as i64));
                     *self.header_ref_state.write() = HeaderRefState::CreateHeader {
                         page,
                         completion: c.clone(),
@@ -1991,7 +2085,13 @@ impl Pager {
             turso_assert!(c.succeeded(), "memory IO should complete immediately");
             current_offset += page_size;
             rollback_bitset.insert(page_id);
-            self.upsert_page_in_cache(page_id as usize, page, false)?;
+            // The restored image is the transaction-visible state at the
+            // savepoint, not necessarily durable state. Keep it dirty so cache
+            // eviction cannot drop uncommitted changes that predate the
+            // rolled-back savepoint/statement.
+            page.set_dirty();
+            dirty_pages.insert(page_id);
+            self.force_upsert_page_in_cache(page_id as usize, page)?;
         }
 
         let truncate_completion = subjournal.truncate(journal_start_offset)?;
@@ -2021,6 +2121,14 @@ impl Pager {
                 frame: savepoint.wal_max_frame,
                 checksum: savepoint.wal_checksum,
             }));
+            self.page_cache
+                .write()
+                .delete_clean_pages_after_wal_frame(savepoint.wal_max_frame)
+                .map_err(|e| {
+                    LimboError::InternalError(format!(
+                        "failed to invalidate rolled-back WAL pages: {e:?}"
+                    ))
+                })?;
         }
 
         Ok(())
@@ -2083,6 +2191,34 @@ impl Pager {
         self.auto_vacuum_mode.store(mode.into(), Ordering::SeqCst);
     }
 
+    /// Persist the auto-vacuum mode to page 1 and keep the pager cache in sync.
+    pub fn persist_auto_vacuum_mode(&self, mode: AutoVacuumMode) -> Result<()> {
+        let (largest_root_page, incremental_vacuum_enabled) = auto_vacuum_header_fields(mode);
+
+        if self.db_initialized() {
+            self.io.block(|| {
+                self.with_header_mut(|header| {
+                    header.vacuum_mode_largest_root_page = largest_root_page.into();
+                    header.incremental_vacuum_enabled = incremental_vacuum_enabled.into();
+                })
+            })?;
+        } else {
+            let IOResult::Done(_) = self.with_header_mut(|header| {
+                header.vacuum_mode_largest_root_page = largest_root_page.into();
+                header.incremental_vacuum_enabled = incremental_vacuum_enabled.into();
+            })?
+            else {
+                panic!("fresh database auto-vacuum setup should not do any IO");
+            };
+            // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
+            // with_header_mut marks page 1 dirty as a side effect, but no transaction is active.
+            self.dirty_pages.write().clear();
+        }
+
+        self.set_auto_vacuum_mode(mode);
+        Ok(())
+    }
+
     /// Retrieves the pointer map entry for a given database page.
     /// `target_page_num` (1-indexed) is the page whose entry is sought.
     /// Returns `Ok(None)` if the page is not supposed to have a ptrmap entry (e.g. header, or a ptrmap page itself).
@@ -2118,7 +2254,9 @@ impl Pager {
                         ptrmap_pg_no
                     );
 
-                    let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as i64)?;
+                    // `return_if_io!` keeps `ptrmap_get_state` at `Start` on
+                    // spill so re-entry resumes via pending-read tracking.
+                    let (ptrmap_page, c) = return_if_io!(self.read_page(ptrmap_pg_no as i64));
                     self.vacuum_state.write().ptrmap_get_state = PtrMapGetState::Deserialize {
                         ptrmap_page,
                         offset_in_ptrmap_page,
@@ -2218,7 +2356,9 @@ impl Pager {
                         offset_in_ptrmap_page
                     );
 
-                    let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as i64)?;
+                    // `return_if_io!` keeps `ptrmap_put_state` at `Start` on
+                    // spill so re-entry resumes via pending-read tracking.
+                    let (ptrmap_page, c) = return_if_io!(self.read_page(ptrmap_pg_no as i64));
                     self.vacuum_state.write().ptrmap_put_state = PtrMapPutState::Deserialize {
                         ptrmap_page,
                         offset_in_ptrmap_page,
@@ -2629,14 +2769,43 @@ impl Pager {
 
     #[inline(always)]
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn begin_write_tx(&self) -> Result<IOResult<()>> {
+    /// `allowed_auto_actions` controls which automatic WAL maintenance the
+    /// caller permits during this begin. The only action consulted here is
+    /// `WalAutoActions::Restart`, which gates the WAL-header restart inside
+    /// `try_restart_log_before_write`. Callers managing WAL state externally
+    /// (sync engine) must not pass `Restart` because rotating the WAL header
+    /// behind their back invalidates watermarks they have already published.
+    pub fn begin_write_tx(&self, allowed_auto_actions: WalAutoActions) -> Result<IOResult<()>> {
         // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
         return_if_io!(self.maybe_allocate_page1());
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
         };
-        Ok(IOResult::Done(wal.begin_write_tx()?))
+        Ok(IOResult::Done(wal.begin_write_tx(allowed_auto_actions)?))
+    }
+
+    /// Acquire exclusive WAL access + block new transactions (used by VACUUM).
+    ///
+    /// This is a blocking alternative to normal `begin_read_tx`.
+    ///
+    /// VACUUM runs on an existing database, so page 1 must already be allocated
+    /// and a WAL must be present.
+    pub fn begin_vacuum_blocking_tx(&self) -> Result<IOResult<()>> {
+        if !self.db_initialized() {
+            return Err(LimboError::InternalError(
+                "begin_vacuum_blocking_tx can be done on an initialized database (page 1 must already be allocated)".into(),
+            ));
+        }
+        let wal = self.wal.as_ref().ok_or_else(|| {
+            LimboError::InternalError("begin_vacuum_blocking_tx requires WAL mode".into())
+        })?;
+        wal.begin_vacuum_blocking_tx()?;
+        // let's be conservative and clear all cache for vacuum
+        // todo: clear cache only if we detect that new writes have occurred like `begin_read_tx`
+        self.clear_page_cache(false);
+        self.set_schema_cookie(None);
+        Ok(IOResult::Done(()))
     }
 
     /// commit dirty pages from current transaction in WAL mode if this is not nested statement (for nested statements, parent will do the commit)
@@ -2684,7 +2853,7 @@ impl Pager {
                         Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                         Ok(IOResult::Done(_)) => complete_commit(),
                         Err(err) => {
-                            tracing::info!("auto-checkpoint failed: {err}");
+                            tracing::debug!("auto-checkpoint failed: {err}");
                             complete_commit();
                             self.cleanup_after_auto_checkpoint_failure();
                         }
@@ -2694,7 +2863,7 @@ impl Pager {
                 }
                 _ => {
                     return_if_io!(self.commit_dirty_pages(
-                        connection.is_wal_auto_checkpoint_disabled(),
+                        connection.wal_auto_actions(),
                         connection.get_sync_mode(),
                         connection.get_data_sync_retry(),
                     ));
@@ -2860,43 +3029,72 @@ impl Pager {
         Ok((page, c))
     }
 
-    /// Reads a page from the database.
+    /// Issue a non-blocking page read, inserting into the page cache, may spill to disk.
+    ///
+    /// * `Done((page, None))`: page was already in cache, no IO needed.
+    /// * `Done((page, Some(c_disk)))`: page was not in cache; it has been
+    ///   inserted into the cache and a disk-read is in flight against it.
+    ///   The caller must yield on `c_disk` before reading `page` contents.
+    /// * `IO(c_spill)`: the page cache was full and a spill is in flight.
+    ///   Caller must yield on `c_spill` and then call `read_page_nonblock(idx)`
+    ///   again. The disk read for this page has already been issued and will
+    ///   be reused on re-entry via `pending_reads` (no duplicate IO).
+    ///
+    /// Re-entrancy contract: the caller may invoke this with the same
+    /// `page_idx` arbitrarily many times. Each `Some(page_idx)` mapping in
+    /// `pending_reads` corresponds to a single outstanding disk read; the
+    /// entry is removed exactly when this method returns `Done`.
     #[tracing::instrument(skip_all, level = Level::TRACE)]
-    pub fn read_page(&self, page_idx: i64) -> Result<(PageRef, Option<Completion>)> {
+    pub fn read_page(&self, page_idx: i64) -> Result<IOResult<(PageRef, Option<Completion>)>> {
         turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
-        tracing::debug!("read_page(page_idx = {})", page_idx);
-
-        // First check if page is in cache
-        {
-            let mut page_cache = self.page_cache.write();
-            let page_key = PageCacheKey::new(page_idx as usize);
-            if let Some(page) = page_cache.get(&page_key)? {
-                turso_assert!(
-                    page_idx as usize == page.get().id,
-                    "attempted to read page but got different page",
-                    { "expected_page": page_idx, "actual_page": page.get().id }
-                );
-                return Ok((page, None));
-            }
+        tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
+        #[cfg(test)]
+        if self.spill_yield.should_yield_for(page_idx) {
+            io_yield_one!(crate::Completion::new_yield());
         }
+        let pending = self.pending_reads.read().get(&page_idx).cloned();
+        let (page, c_disk) = if let Some(pending) = pending {
+            // Re-entry: previous call yielded on spill before completing
+            // `cache_insert`. Reuse the same PageRef and in-flight disk read
+            // rather than issuing duplicate IO.
+            (pending.page, pending.disk_read)
+        } else {
+            // Fast path: cache hit.
+            {
+                let mut page_cache = self.page_cache.write();
+                let page_key = PageCacheKey::new(page_idx as usize);
+                if let Some(page) = page_cache.get(&page_key)? {
+                    turso_assert!(
+                        page_idx as usize == page.get().id,
+                        "attempted to read page but got different page",
+                        { "expected_page": page_idx, "actual_page": page.get().id }
+                    );
+                    return Ok(IOResult::Done((page, None)));
+                }
+            }
 
-        tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
-        // Page not in cache, read from disk
-        let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
-        loop {
-            match self.cache_insert(page_idx as usize, page.clone())? {
-                IOResult::Done(()) => {
-                    return Ok((page, Some(c)));
-                }
-                IOResult::IO(IOCompletions::Single(spill_c)) => {
-                    // NOTE: Because `cache_insert` can return completions as *multiple* different states, we cannot
-                    // simply create a new CompletionGroup and return it here without inserting the
-                    // page into the cache. In order to do this, we would need to make read_page
-                    // re-entrant so it continues to call cache_insert and have every caller
-                    // propogate the IOResult. For now, we will wait syncronously for spilling IO
-                    // on cache insertion on read_page.
-                    self.io.wait_for_completion(spill_c)?;
-                }
+            tracing::debug!("read_page_nonblock(page_idx = {page_idx}) = reading page from disk");
+            let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
+            self.pending_reads.write().insert(
+                page_idx,
+                PendingRead {
+                    page: page.clone(),
+                    disk_read: Some(c.clone()),
+                },
+            );
+            (page, Some(c))
+        };
+
+        match self.cache_insert(page_idx as usize, page.clone())? {
+            IOResult::Done(()) => {
+                self.pending_reads.write().remove(&page_idx);
+                Ok(IOResult::Done((page, c_disk)))
+            }
+            IOResult::IO(IOCompletions::Single(spill_c)) => {
+                // Leave the pending entry in place; the next call to
+                // `read_page_nonblock(page_idx)` will recover it and retry
+                // `cache_insert` without re-issuing the disk read.
+                io_yield_one!(spill_c);
             }
         }
     }
@@ -2949,6 +3147,13 @@ impl Pager {
             IOResult::Done(false) => Err(LimboError::Busy),
             IOResult::IO(c) => Ok(IOResult::IO(c)),
         }
+    }
+
+    /// Test-only: arm `read_page` to return `IO(yield)` once for `page_id`
+    /// after `skip` matching calls have passed through.
+    #[cfg(test)]
+    pub(crate) fn arm_spill_yield_on_read(&self, page_id: i64, skip: usize) {
+        self.spill_yield.arm(page_id, skip);
     }
 
     // Get a page from the cache, if it exists.
@@ -3289,7 +3494,7 @@ impl Pager {
             }
             Err(e) => {
                 self.io.cancel(&state.completions)?;
-                self.io.drain()?;
+                self.io.drain_completions(&state.completions)?;
                 Err(e)
             }
         }
@@ -3303,154 +3508,204 @@ impl Pager {
     /// For ephemeral tables: writes pages directly to the temp database file.
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn try_spill_dirty_pages(&self) -> Result<IOResult<bool>> {
-        let state = self.spill_state.read().clone();
-        match state {
-            SpillState::Idle => {
-                // Check if spilling is needed
-                let spill_result = {
-                    let cache = self.page_cache.read();
-                    cache.check_spill(IOV_MAX)
-                };
-                match spill_result {
-                    SpillResult::NotNeeded | SpillResult::Disabled => {
-                        return Ok(IOResult::Done(false));
-                    }
-                    SpillResult::CacheFull => {
-                        tracing::debug!("try_spill_dirty_pages: cache full, no spillable pages");
-                        return Ok(IOResult::Done(false));
-                    }
-                    SpillResult::PagesToSpill(pages) => {
-                        if pages.is_empty() {
+        loop {
+            let state = self.spill_state.read().clone();
+            match state {
+                SpillState::Idle => {
+                    // Check if spilling is needed
+                    let spill_result = {
+                        let cache = self.page_cache.read();
+                        cache.check_spill(IOV_MAX)
+                    };
+                    match spill_result {
+                        SpillResult::NotNeeded | SpillResult::Disabled => {
                             return Ok(IOResult::Done(false));
                         }
-                        let page_count = pages.len();
-                        tracing::debug!("try_spill_dirty_pages: spilling {} pages", page_count);
-                        if let Some(wal) = self.wal.as_ref() {
-                            let page_sz = self.get_page_size().unwrap_or_default();
-
-                            // Ensure WAL is initialized. Most of the time this is a no-op.
-                            let prepare = wal.prepare_wal_start(page_sz)?;
-                            if let Some(c) = prepare {
-                                self.io.wait_for_completion(c)?;
-                                let c = wal.prepare_wal_finish(self.get_sync_type())?;
-                                self.io.wait_for_completion(c)?;
+                        SpillResult::CacheFull => {
+                            tracing::debug!(
+                                "try_spill_dirty_pages: cache full, no spillable pages"
+                            );
+                            return Ok(IOResult::Done(false));
+                        }
+                        SpillResult::PagesToSpill(pages) => {
+                            if pages.is_empty() {
+                                return Ok(IOResult::Done(false));
                             }
+                            let page_count = pages.len();
+                            tracing::debug!("try_spill_dirty_pages: spilling {} pages", page_count);
+                            if let Some(wal) = self.wal.as_ref() {
+                                let page_sz = self.get_page_size().unwrap_or_default();
 
-                            let wal_pages: Vec<PageRef> = pages
-                                .iter()
-                                .map(|p| -> Result<PageRef> {
-                                    self.subjournal_page_if_required(p)?;
-                                    // Set write_pending on all pages before WAL write so callback can
-                                    // detect mid-write modifications.
-                                    p.set_write_pending();
-                                    Ok(p.to_page())
-                                })
-                                .collect::<Result<Vec<_>>>()?;
-                            let c = wal.append_frames_vectored(wal_pages, page_sz)?;
-
-                            if c.succeeded() {
-                                // Synchronous completion, WAL tags already set by callback.
-                                {
-                                    let mut cache = self.page_cache.write();
-                                    for page in &pages {
-                                        if page.has_wal_tag() {
-                                            let key = PageCacheKey::new(page.get().id);
-                                            cache.notify_page_spilled(key);
-                                            page.set_spilled();
-                                        }
+                                // Ensure WAL is initialized. Most of the time this
+                                // is a no-op (returns None). When it does require
+                                // IO we transition through `PreparingWalStart` /
+                                // `PreparingWalFinish` and yield rather than block,
+                                // carrying the pinned `pages` across each yield.
+                                match wal.prepare_wal_start(page_sz)? {
+                                    Some(c) => {
+                                        *self.spill_state.write() = SpillState::PreparingWalStart {
+                                            pages,
+                                            completion: c,
+                                        };
+                                        // Loop to handle the new state (which will
+                                        // yield if the completion isn't finished).
+                                        continue;
+                                    }
+                                    None => {
+                                        // WAL already initialized — append directly.
+                                        return self.spill_append_frames_to_wal(pages);
                                     }
                                 }
-                                *self.spill_state.write() = SpillState::Idle;
-                                return Ok(IOResult::Done(true));
+                            } else {
+                                let mut group = CompletionGroup::new(|_| {});
+                                // Ephemeral table case: write directly to temp file
+                                for page in &pages {
+                                    page.set_write_pending();
+                                }
+                                let completions = self.spill_pages_to_disk(&pages)?;
+                                if completions.is_empty() {
+                                    self.finish_ephemeral_spill(&pages);
+                                    return Ok(IOResult::Done(true));
+                                }
+                                for completion in &completions {
+                                    group.add(completion);
+                                }
+                                *self.spill_state.write() = SpillState::WritingToDisk {
+                                    pages,
+                                    completions: completions.clone(),
+                                };
+                                io_yield_one!(group.build());
                             }
-                            *self.spill_state.write() = SpillState::WritingToWal {
-                                pages,
-                                completions: vec![c.clone()],
-                            };
-                            io_yield_one!(c);
-                        } else {
-                            let mut group = CompletionGroup::new(|_| {});
-                            // Ephemeral table case: write directly to temp file
-                            for page in &pages {
-                                page.set_write_pending();
-                            }
-                            let completions = self.spill_pages_to_disk(&pages)?;
-                            if completions.is_empty() {
-                                self.finish_ephemeral_spill(&pages);
-                                return Ok(IOResult::Done(true));
-                            }
-                            for completion in &completions {
-                                group.add(completion);
-                            }
-                            *self.spill_state.write() = SpillState::WritingToDisk {
-                                pages,
-                                completions: completions.clone(),
-                            };
-                            io_yield_one!(group.build());
                         }
                     }
                 }
-            }
-            SpillState::WritingToWal { pages, completions } => {
-                for c in &completions {
-                    if !c.succeeded() {
-                        io_yield_one!(c.clone());
+                SpillState::PreparingWalStart { pages, completion } => {
+                    if !completion.succeeded() {
+                        io_yield_one!(completion);
                     }
+                    // Header (and any truncate) durable — issue the fsync that
+                    // marks the WAL initialized.
+                    let wal = self.wal.as_ref().expect("PreparingWalStart requires a WAL");
+                    let finish_c = wal.prepare_wal_finish(self.get_sync_type())?;
+                    *self.spill_state.write() = SpillState::PreparingWalFinish {
+                        pages,
+                        completion: finish_c,
+                    };
+                    continue;
                 }
-                // All I/O complete, pages are now in WAL.
-                // Mark spilled pages so they can be evicted while dirty.
-                // Only do so if page wasn't modified since write started (each page has valid wal_tag).
-                let mut spilled_count = 0;
-                {
-                    let mut cache = self.page_cache.write();
-                    for page in &pages {
-                        if page.has_wal_tag() {
-                            let key = PageCacheKey::new(page.get().id);
-                            cache.notify_page_spilled(key);
-                            page.set_spilled();
-                            spilled_count += 1;
-                        } else {
-                            // Page was modified during write, it will need to be re-spilled
-                            tracing::debug!(
-                                "try_spill_dirty_pages: page {} modified during write, not marking as spilled",
-                                page.get().id
-                            );
-                        }
+                SpillState::PreparingWalFinish { pages, completion } => {
+                    if !completion.succeeded() {
+                        io_yield_one!(completion);
                     }
+                    // WAL is now initialized; append the spill frames.
+                    return self.spill_append_frames_to_wal(pages);
                 }
-                if spilled_count == 0 && !pages.is_empty() {
-                    tracing::warn!(
-                        "try_spill_dirty_pages: no pages marked as spilled out of {}, all were modified during write",
-                        pages.len()
-                    );
-                }
-                *self.spill_state.write() = SpillState::Idle;
-                trace!(
-                    "try_spill_dirty_pages: successfully spilled {} / {} pages to WAL",
-                    spilled_count,
-                    pages.len(),
-                );
-                return Ok(IOResult::Done(true));
-            }
-            SpillState::WritingToDisk { pages, completions } => {
-                let all_done = completions.iter().all(|c| c.succeeded());
-                if !all_done {
+                SpillState::WritingToWal { pages, completions } => {
                     for c in &completions {
                         if !c.succeeded() {
                             io_yield_one!(c.clone());
                         }
                     }
+                    // All I/O complete, pages are now in WAL.
+                    // Mark spilled pages so they can be evicted while dirty.
+                    // Only do so if page wasn't modified since write started (each page has valid wal_tag).
+                    let mut spilled_count = 0;
+                    {
+                        let mut cache = self.page_cache.write();
+                        for page in &pages {
+                            if page.has_wal_tag() {
+                                let key = PageCacheKey::new(page.get().id);
+                                cache.notify_page_spilled(key);
+                                page.set_spilled();
+                                spilled_count += 1;
+                            } else {
+                                // Page was modified during write, it will need to be re-spilled
+                                tracing::debug!(
+                                "try_spill_dirty_pages: page {} modified during write, not marking as spilled",
+                                page.get().id
+                            );
+                            }
+                        }
+                    }
+                    if spilled_count == 0 && !pages.is_empty() {
+                        tracing::warn!(
+                        "try_spill_dirty_pages: no pages marked as spilled out of {}, all were modified during write",
+                        pages.len()
+                    );
+                    }
+                    *self.spill_state.write() = SpillState::Idle;
+                    trace!(
+                        "try_spill_dirty_pages: successfully spilled {} / {} pages to WAL",
+                        spilled_count,
+                        pages.len(),
+                    );
+                    return Ok(IOResult::Done(true));
                 }
-                // All I/O complete, finish ephemeral spill
-                self.finish_ephemeral_spill(&pages);
-                *self.spill_state.write() = SpillState::Idle;
-                trace!(
-                    "try_spill_dirty_pages: successfully spilled {} pages to disk",
-                    pages.len()
-                );
-                return Ok(IOResult::Done(true));
+                SpillState::WritingToDisk { pages, completions } => {
+                    let all_done = completions.iter().all(|c| c.succeeded());
+                    if !all_done {
+                        for c in &completions {
+                            if !c.succeeded() {
+                                io_yield_one!(c.clone());
+                            }
+                        }
+                    }
+                    // All I/O complete, finish ephemeral spill
+                    self.finish_ephemeral_spill(&pages);
+                    *self.spill_state.write() = SpillState::Idle;
+                    trace!(
+                        "try_spill_dirty_pages: successfully spilled {} pages to disk",
+                        pages.len()
+                    );
+                    return Ok(IOResult::Done(true));
+                }
             }
         }
+    }
+
+    /// Append the prepared spill `pages` as WAL frames. Returns
+    /// `Done(true)` if the write completed synchronously, otherwise
+    /// transitions to `SpillState::WritingToWal` and yields the write
+    /// completion. The WAL must already be initialized (callers route
+    /// through `PreparingWal*` first).
+    fn spill_append_frames_to_wal(&self, pages: Vec<PinGuard>) -> Result<IOResult<bool>> {
+        let wal = self
+            .wal
+            .as_ref()
+            .expect("spill_append_frames_to_wal requires a WAL");
+        let page_sz = self.get_page_size().unwrap_or_default();
+        let wal_pages: Vec<PageRef> = pages
+            .iter()
+            .map(|p| -> Result<PageRef> {
+                self.subjournal_page_if_required(p)?;
+                // Set write_pending on all pages before WAL write so callback can
+                // detect mid-write modifications.
+                p.set_write_pending();
+                Ok(p.to_page())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let c = wal.append_frames_vectored(wal_pages, page_sz)?;
+
+        if c.succeeded() {
+            // Synchronous completion, WAL tags already set by callback.
+            {
+                let mut cache = self.page_cache.write();
+                for page in &pages {
+                    if page.has_wal_tag() {
+                        let key = PageCacheKey::new(page.get().id);
+                        cache.notify_page_spilled(key);
+                        page.set_spilled();
+                    }
+                }
+            }
+            *self.spill_state.write() = SpillState::Idle;
+            return Ok(IOResult::Done(true));
+        }
+        *self.spill_state.write() = SpillState::WritingToWal {
+            pages,
+            completions: vec![c.clone()],
+        };
+        io_yield_one!(c);
     }
 
     /// Wait for any in-flight spill writes to finish.
@@ -3488,7 +3743,7 @@ impl Pager {
                 Ok(c) => completions.push(c),
                 Err(e) => {
                     self.io.cancel(&completions)?;
-                    self.io.drain()?;
+                    self.io.drain_completions(&completions)?;
                     return Err(e);
                 }
             }
@@ -3511,7 +3766,7 @@ impl Pager {
                     if spilled {
                         // After spilling, try to evict clean pages to make room in the cache
                         let mut cache = self.page_cache.write();
-                        if let Err(e) = cache.make_room_for(1) {
+                        if let Err(e) = cache.make_room_for(1, false) {
                             // Cache is completely full with unevictable pages
                             tracing::error!(
                                 "ensure_cache_space: {e} cache full, could not make room"
@@ -3532,10 +3787,15 @@ impl Pager {
     /// In the base case, it will write the dirty pages to the WAL and then fsync the WAL.
     /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to
     /// the database file and then fsync the database file.
+    ///
+    /// `allowed_auto_actions` controls automatic WAL maintenance permitted at
+    /// commit time. Only `WalAutoActions::Checkpoint` is consulted here — it
+    /// gates the post-commit auto-checkpoint when `should_checkpoint()` is
+    /// true.
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn commit_dirty_pages(
         &self,
-        wal_auto_checkpoint_disabled: bool,
+        allowed_auto_actions: WalAutoActions,
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> Result<IOResult<()>> {
@@ -3552,7 +3812,7 @@ impl Pager {
         }
 
         let result =
-            self.commit_dirty_pages_inner(wal_auto_checkpoint_disabled, sync_mode, data_sync_retry);
+            self.commit_dirty_pages_inner(allowed_auto_actions, sync_mode, data_sync_retry);
         if result.is_err() {
             self.commit_info.write().reset();
         }
@@ -3566,7 +3826,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn commit_dirty_pages_inner(
         &self,
-        wal_auto_checkpoint_disabled: bool,
+        allowed_auto_actions: WalAutoActions,
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> Result<IOResult<()>> {
@@ -3625,6 +3885,18 @@ impl Pager {
                         } else {
                             let (page, completion) =
                                 self.read_page_no_cache(page_id as i64, None, false)?;
+                            // If the read completed synchronously with an error,
+                            // surface it now. Otherwise we would silently drop the
+                            // failure (the completion is "finished" so we'd skip
+                            // pushing it into the wait list) and later trip the
+                            // page-buffer-not-loaded panic in prepare_frames when
+                            // it tries to read content from the evicted page.
+                            if completion.finished() && !completion.succeeded() {
+                                let err = completion.get_error().unwrap_or(
+                                    CompletionError::IOError(std::io::ErrorKind::Other, "read"),
+                                );
+                                return Err(LimboError::CompletionError(err));
+                            }
                             commit_info.page_sources.push(PageSource::Evicted(page));
                             if !completion.finished() {
                                 commit_info.completions.push(completion);
@@ -3691,6 +3963,17 @@ impl Pager {
                             }
                             PageSource::Evicted(page) => page.clone(),
                         };
+                        // Defensive check: prepare_frames will read page contents,
+                        // which panics if the buffer is not loaded. If we got here
+                        // with an unloaded page (e.g. an evicted dirty page whose
+                        // backing WAL frame was truncated by a savepoint rollback),
+                        // surface an internal error instead of panicking.
+                        if !page.is_loaded() {
+                            return Err(LimboError::InternalError(format!(
+                                "dirty page {} has no buffer loaded at commit time",
+                                page.get().id
+                            )));
+                        }
                         commit_info.page_source_cursor += 1;
                         commit_info.collected_pages.push(page);
 
@@ -3806,7 +4089,8 @@ impl Pager {
                     self.dirty_pages.write().clear();
                     commit_info.prepared_frames.clear();
 
-                    let need_checkpoint = !wal_auto_checkpoint_disabled && wal.should_checkpoint();
+                    let need_checkpoint = allowed_auto_actions.contains(WalAutoActions::Checkpoint)
+                        && wal.should_checkpoint();
                     if need_checkpoint {
                         commit_info.state = CommitState::AutoCheckpoint;
                     }
@@ -3950,11 +4234,16 @@ impl Pager {
         state.phase = CheckpointPhase::NotCheckpointing;
         state.result = None;
         state.mode = None;
+        state.lock_source = CheckpointLockSource::Acquire;
     }
 
     /// Clean up after a auto-checkpoint failure.
     /// Auto-checkpoint executed outside of the main transaction - so WAL transaction was already finalized
     pub fn cleanup_after_auto_checkpoint_failure(&self) {
+        self.cleanup_after_checkpoint_failure();
+    }
+
+    pub fn cleanup_after_checkpoint_failure(&self) {
         self.reset_checkpoint_state();
         if let Some(wal) = self.wal.as_ref() {
             wal.abort_checkpoint();
@@ -4000,6 +4289,36 @@ impl Pager {
         sync_mode: crate::SyncMode,
         clear_page_cache: bool,
     ) -> Result<IOResult<CheckpointResult>> {
+        self.checkpoint_inner(
+            mode,
+            sync_mode,
+            clear_page_cache,
+            CheckpointLockSource::Acquire,
+        )
+    }
+
+    pub fn vacuum_checkpoint_with_held_lock(
+        &self,
+        sync_mode: crate::SyncMode,
+        clear_page_cache: bool,
+    ) -> Result<IOResult<CheckpointResult>> {
+        self.checkpoint_inner(
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+            sync_mode,
+            clear_page_cache,
+            CheckpointLockSource::HeldByCaller,
+        )
+    }
+
+    fn checkpoint_inner(
+        &self,
+        mode: CheckpointMode,
+        sync_mode: crate::SyncMode,
+        clear_page_cache: bool,
+        lock_source: CheckpointLockSource,
+    ) -> Result<IOResult<CheckpointResult>> {
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("checkpoint() called on database without WAL");
             return Err(LimboError::InternalError(
@@ -4020,13 +4339,20 @@ impl Pager {
                         clear_page_cache,
                     };
                     state.mode = Some(mode);
+                    state.lock_source = lock_source;
                 }
                 CheckpointPhase::Checkpoint {
                     mode,
                     sync_mode,
                     clear_page_cache,
                 } => {
-                    let res = return_if_io!(wal.checkpoint(self, mode));
+                    let checkpoint_lock_source = self.checkpoint_state.read().lock_source;
+                    let res = return_if_io!(match checkpoint_lock_source {
+                        CheckpointLockSource::Acquire => wal.checkpoint(self, mode),
+                        CheckpointLockSource::HeldByCaller => {
+                            wal.vacuum_checkpoint_with_held_lock(self)
+                        }
+                    });
                     let mut state = self.checkpoint_state.write();
                     if matches!(mode, CheckpointMode::Truncate { .. })
                         // `should_truncate` will be true for successful truncate checkpoint
@@ -4272,6 +4598,7 @@ impl Pager {
                     let mut res = state.result.take().expect("result should be set");
                     state.phase = CheckpointPhase::NotCheckpointing;
                     state.mode = None;
+                    state.lock_source = CheckpointLockSource::Acquire;
 
                     // Clear page cache only if requested (explicit checkpoints do this, auto-checkpoint does not)
                     if clear_page_cache {
@@ -4352,7 +4679,7 @@ impl Pager {
     /// deletes the WAL file.
     pub fn checkpoint_shutdown(
         &self,
-        wal_auto_checkpoint_disabled: bool,
+        allowed_auto_actions: WalAutoActions,
         sync_mode: crate::SyncMode,
     ) -> Result<()> {
         let mut attempts = 0;
@@ -4367,7 +4694,7 @@ impl Pager {
             let c = wal.sync(self.get_sync_type())?;
             self.io.wait_for_completion(c)?;
         }
-        if !wal_auto_checkpoint_disabled {
+        if allowed_auto_actions.contains(WalAutoActions::Checkpoint) {
             while let Err(LimboError::Busy) = self.blocking_checkpoint(
                 CheckpointMode::Truncate {
                     upper_bound_inclusive: None,
@@ -4429,6 +4756,16 @@ impl Pager {
                         )));
                     }
 
+                    // The non-blocking read fork here is safe: if the caller
+                    // passes `Some(page)`, no IO occurs and the mutations
+                    // below run synchronously. If the caller passes `None`
+                    // and `read_page_nonblock` yields for spill, we leave
+                    // `state` at `Start` so re-entry re-takes either branch
+                    // (the pager's `pending_reads` memoization returns the
+                    // same `PageRef` the next time). Crucially, the
+                    // non-idempotent mutations (`freelist_pages` increment,
+                    // `page.pin()`, state advance) all happen AFTER both
+                    // branches converge.
                     let (page, c) = match page.take() {
                         Some(page) => {
                             turso_assert_eq!(
@@ -4443,7 +4780,7 @@ impl Pager {
                             }
                             (page, None)
                         }
-                        None => self.read_page(page_id as i64)?,
+                        None => return_if_io!(self.read_page(page_id as i64)),
                     };
                     header.freelist_pages = (header.freelist_pages.get() + 1).into();
 
@@ -4465,7 +4802,13 @@ impl Pager {
                 }
                 FreePageState::AddToTrunk { page } => {
                     let trunk_page_id = header.freelist_trunk_page.get();
-                    let (trunk_page, c) = self.read_page(trunk_page_id as i64)?;
+                    // Spill yield here keeps `state` at `AddToTrunk`. The
+                    // subsequent writes / `unpin()` only run after we have
+                    // a loaded `trunk_page`; on re-entry the pager's
+                    // `pending_reads` returns the same `trunk_page`, and the
+                    // writes are byte-identical (we haven't written yet so
+                    // `number_of_leaf_pages` is unchanged).
+                    let (trunk_page, c) = return_if_io!(self.read_page(trunk_page_id as i64));
                     if let Some(c) = c {
                         if !c.succeeded() {
                             io_yield_one!(c);
@@ -4655,11 +4998,24 @@ impl Pager {
                         {
                             // we will allocate a ptrmap page, so increment size
                             new_db_size += 1;
-                            let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
-                            self.add_dirty(&page)?;
-                            let page_key = PageCacheKey::new(page.get().id as usize);
-                            let mut cache = self.page_cache.write();
-                            cache.insert(page_key, page)?;
+                            // Make the ptrmap allocation idempotent across
+                            // spill-yield re-entries: only allocate + insert
+                            // if the cache doesn't already contain it. The
+                            // read-then-write pattern is safe because
+                            // `allocate_page` holds the only writer for
+                            // `database_size`/`freelist_trunk_page`; no
+                            // concurrent caller can race in between.
+                            let page_key = PageCacheKey::new(new_db_size as usize);
+                            let already_present = {
+                                let cache = self.page_cache.read();
+                                cache.contains_key(&page_key)
+                            };
+                            if !already_present {
+                                let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                                self.add_dirty(&page)?;
+                                let mut cache = self.page_cache.write();
+                                cache.insert(page_key, page)?;
+                            }
                         }
                     }
 
@@ -4670,8 +5026,11 @@ impl Pager {
                         };
                         continue;
                     }
-                    let (trunk_page, c) = self.read_page(first_freelist_trunk_page_id as i64)?;
-                    // Pin trunk_page to prevent eviction while stored in state machine
+                    // Spill yield routes back through `Start`; the ptrmap
+                    // allocation above is idempotent and `trunk_page.pin()`
+                    // happens only after `Done`, so no double-pin.
+                    let (trunk_page, c) =
+                        return_if_io!(self.read_page(first_freelist_trunk_page_id as i64));
                     trunk_page.pin();
                     *state = AllocatePageState::SearchAvailableFreeListLeaf { trunk_page };
                     if let Some(c) = c {
@@ -4696,8 +5055,10 @@ impl Pager {
                         let page_contents = trunk_page.get_contents();
                         let next_leaf_page_id =
                             page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR);
-                        let (leaf_page, c) = self.read_page(next_leaf_page_id as i64)?;
-
+                        // Pin + state-advance happen only on `Done` so a
+                        // spill yield doesn't double-pin the leaf page.
+                        let (leaf_page, c) =
+                            return_if_io!(self.read_page(next_leaf_page_id as i64));
                         turso_assert!(
                             number_of_freelist_leaves > 0,
                             "Freelist trunk page has no leaves",
@@ -4871,6 +5232,27 @@ impl Pager {
                 "Failed to insert loaded page {id} into cache: {e:?}"
             ))
         })?;
+        page.set_loaded();
+        page.clear_wal_tag();
+        Ok(())
+    }
+
+    fn force_upsert_page_in_cache(&self, id: usize, page: PageRef) -> Result<(), LimboError> {
+        let mut cache = self.page_cache.write();
+        let page_key = PageCacheKey::new(id);
+
+        turso_assert!(
+            page.is_dirty(),
+            "restored savepoint page must be dirty",
+            { "page_id": id }
+        );
+        cache
+            .force_upsert_page(page_key, page.clone())
+            .map_err(|e| {
+                LimboError::InternalError(format!(
+                    "Failed to restore savepoint page {id} into cache: {e:?}"
+                ))
+            })?;
         page.set_loaded();
         page.clear_wal_tag();
         Ok(())
@@ -5365,12 +5747,8 @@ mod ptrmap_tests {
             );
         }
         pager
-            .io
-            .block(|| {
-                pager.with_header_mut(|header| header.vacuum_mode_largest_root_page = 1.into())
-            })
+            .persist_auto_vacuum_mode(AutoVacuumMode::Full)
             .unwrap();
-        pager.set_auto_vacuum_mode(AutoVacuumMode::Full);
 
         //  Allocate all the pages as btree root pages
         const EXPECTED_FIRST_ROOT_PAGE_ID: u32 = 3; // page1 = 1,  first ptrmap page = 2, root page = 3
@@ -5402,6 +5780,50 @@ mod ptrmap_tests {
     }
 
     #[test]
+    fn persist_auto_vacuum_mode_updates_fresh_header_without_dirty_pages() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(
+            io.open_file("fresh-auto-vacuum.db", OpenFlags::Create, true)
+                .unwrap(),
+        ));
+        let buffer_pool = BufferPool::begin_init(&io, 65536);
+        let pager = Pager::new(
+            db_file,
+            None,
+            io,
+            PageCache::new(4),
+            buffer_pool,
+            Arc::new(Mutex::new(())),
+            Arc::new(ArcSwapOption::new(Some(default_page1(None)))),
+        )
+        .unwrap();
+
+        pager
+            .persist_auto_vacuum_mode(AutoVacuumMode::Incremental)
+            .unwrap();
+
+        let IOResult::Done((largest_root_page, incremental_vacuum_enabled)) = pager
+            .with_header(|header| {
+                (
+                    header.vacuum_mode_largest_root_page.get(),
+                    header.incremental_vacuum_enabled.get(),
+                )
+            })
+            .unwrap()
+        else {
+            panic!("fresh database header reads should not do any IO");
+        };
+
+        assert_eq!(largest_root_page, 1);
+        assert_eq!(incremental_vacuum_enabled, 1);
+        assert_eq!(pager.get_auto_vacuum_mode(), AutoVacuumMode::Incremental);
+        assert!(
+            pager.dirty_pages.read().is_empty(),
+            "fresh-db auto-vacuum setup must not leave dirty pages behind"
+        );
+    }
+
+    #[test]
     fn test_ptrmap_page_allocation() {
         let page_size = 4096;
         let initial_db_pages = 10;
@@ -5414,7 +5836,9 @@ mod ptrmap_tests {
         assert_eq!(expected_ptrmap_pg_no, FIRST_PTRMAP_PAGE_NO);
 
         //  Ensure the pointer map page ref is created and loadable via the pager
-        let ptrmap_page_ref = pager.read_page(expected_ptrmap_pg_no as i64);
+        let ptrmap_page_ref = pager
+            .io
+            .block(|| pager.read_page(expected_ptrmap_pg_no as i64));
         assert!(ptrmap_page_ref.is_ok());
 
         //  Ensure that the database header size is correctly reflected
@@ -5503,6 +5927,94 @@ mod ptrmap_tests {
             2 * PTRMAP_ENTRY_SIZE
         );
     }
+
+    /// Cache-hit fast path: `read_page_nonblock` must return `Done` with no
+    /// disk-read completion and must not touch `pending_reads`.
+    #[test]
+    fn read_page_nonblock_cache_hit_returns_done() {
+        let pager = test_pager_setup(4096, 10);
+
+        // Page 1 is unconditionally loaded into cache by `allocate_page1`.
+        let res = pager.read_page(1).unwrap();
+        match res {
+            IOResult::Done((page, c)) => {
+                assert_eq!(page.get().id, 1);
+                assert!(
+                    c.is_none(),
+                    "cache hit must not return a disk-read completion"
+                );
+            }
+            IOResult::IO(_) => panic!("cache hit should not yield"),
+        }
+        assert!(
+            pager.pending_reads.read().is_empty(),
+            "pending_reads must stay empty on cache-hit path"
+        );
+    }
+
+    /// Re-entry contract: if `pending_reads` already has a `PendingRead` for
+    /// this page (as happens after a previous call yielded for spill), the
+    /// next call must reuse that `(page, disk_read)` instead of allocating a
+    /// new page and issuing a duplicate disk read.
+    ///
+    /// This test does NOT force a real spill yield — that requires an IO
+    /// backend that returns non-finished completions, which we don't have at
+    /// the core unit-test layer. We instead synthesize the post-yield state
+    /// directly and assert the function honors it.
+    #[test]
+    fn read_page_nonblock_reentry_reuses_pending_entry() {
+        let pager = test_pager_setup(4096, 10);
+
+        // Pick a page id well beyond the initialized DB so it is *not* in
+        // the cache. We never actually issue IO against it (we short-circuit
+        // via the pre-populated `pending_reads` entry), so the page id only
+        // needs to be unique within the cache.
+        let target_idx: i64 = 9999;
+        assert!(
+            pager.cache_get(target_idx as usize).unwrap().is_none(),
+            "test precondition: target page must not be in cache"
+        );
+
+        // Synthesize the state that would exist after a previous call had to
+        // yield on spill: a `PendingRead` entry whose `page` is the
+        // PageRef we already handed back to the caller, and whose
+        // `disk_read` is the in-flight disk-read completion.
+        let synthetic_page: PageRef = Arc::new(Page::new(target_idx));
+        // Mark loaded so cache eviction logic treats it as a normal page; the
+        // contents don't matter for this test.
+        synthetic_page.set_loaded();
+        let stub_disk_read = Completion::new_yield();
+        pager.pending_reads.write().insert(
+            target_idx,
+            PendingRead {
+                page: synthetic_page.clone(),
+                disk_read: Some(stub_disk_read.clone()),
+            },
+        );
+
+        let res = pager.read_page(target_idx).unwrap();
+        let (page, c) = match res {
+            IOResult::Done(v) => v,
+            IOResult::IO(_) => panic!(
+                "with pending entry present and cache space available, \
+                 read_page_nonblock should complete without yielding"
+            ),
+        };
+
+        assert!(
+            Arc::ptr_eq(&page, &synthetic_page),
+            "read_page_nonblock must reuse the PageRef from pending_reads, \
+             not allocate a new page (this is the no-duplicate-IO invariant)"
+        );
+        assert!(
+            c.is_some(),
+            "the disk-read completion from pending_reads should be returned"
+        );
+        assert!(
+            pager.pending_reads.read().get(&target_idx).is_none(),
+            "pending_reads entry must be cleared once read_page_nonblock returns Done"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "fs", host_shared_wal))]
@@ -5515,6 +6027,21 @@ mod checkpoint_phase_tests {
     use crate::types::IOResult;
     use crate::Database;
 
+    /// Returns an IO backend that supports shared WAL coordination on the host.
+    /// On Windows the default `PlatformIO` (`WindowsIO`) lacks the byte-locking
+    /// and mapping primitives, so the experimental IOCP backend is used when
+    /// the `experimental_win_iocp` feature is enabled.
+    fn shared_wal_test_io() -> Arc<dyn IO> {
+        #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+        {
+            Arc::new(crate::WindowsIOCP::new().unwrap())
+        }
+        #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+        {
+            Arc::new(PlatformIO::new().unwrap())
+        }
+    }
+
     fn open_checkpoint_test_database() -> (Arc<Database>, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap().keep();
         let db_path = dir.join("test.db");
@@ -5524,7 +6051,7 @@ mod checkpoint_phase_tests {
                 .pragma_update(None, "journal_mode", "wal")
                 .unwrap();
         }
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let db = Database::open_file_with_flags(
             io,
             db_path.to_str().unwrap(),
@@ -5549,7 +6076,7 @@ mod checkpoint_phase_tests {
         let (db, dir) = open_checkpoint_test_database();
         let db_path = dir.join("test.db");
         let conn = db.connect().unwrap();
-        conn.wal_auto_checkpoint_disable();
+        conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value blob)")
             .unwrap();
         conn.execute("begin immediate").unwrap();

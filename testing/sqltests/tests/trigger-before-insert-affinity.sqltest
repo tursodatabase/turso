@@ -141,3 +141,101 @@ test after-trigger-affinity {
 expect {
     real
 }
+
+
+# see https://www.sqlite.org/forum/forumpost/819f2d6627
+test new-columns-have-no-affinity {
+    CREATE TABLE t(a TEXT);
+    CREATE TABLE log(msg);
+
+    CREATE TRIGGER tr_when AFTER INSERT ON t WHEN NEW.a = 5
+      BEGIN INSERT INTO log VALUES('when_fired'); END;
+
+    CREATE TRIGGER tr_where AFTER INSERT ON t
+      BEGIN INSERT INTO log SELECT 'body_where_fired' WHERE NEW.a = 5; END;
+
+    CREATE TRIGGER tr_having AFTER INSERT ON t
+      BEGIN
+        INSERT INTO log SELECT 'body_having_fired'
+        FROM (SELECT 1 AS x) GROUP BY x HAVING NEW.a = 5;
+      END;
+
+    INSERT INTO t VALUES('5');
+
+    SELECT 'where_match', count(*) FROM t WHERE a = 5
+    UNION ALL
+    SELECT 'when_fired', count(*) FROM log WHERE msg = 'when_fired'
+    UNION ALL
+    SELECT 'body_where_fired', count(*) FROM log WHERE msg = 'body_where_fired'
+    UNION ALL
+    SELECT 'body_having_fired', count(*) FROM log WHERE msg = 'body_having_fired';
+}
+expect {
+    where_match|1
+    when_fired|0
+    body_where_fired|0
+    body_having_fired|0
+}
+
+# see https://www.sqlite.org/forum/forumpost/819f2d6627
+test old-columns-have-no-affinity {
+    CREATE TABLE t(a TEXT);
+    CREATE TABLE log(msg);
+    INSERT INTO t VALUES('5');
+
+    CREATE TRIGGER tr_when AFTER UPDATE ON t WHEN OLD.a = 5
+      BEGIN INSERT INTO log VALUES('when_fired'); END;
+
+    CREATE TRIGGER tr_where AFTER UPDATE ON t
+      BEGIN INSERT INTO log SELECT 'body_where_fired' WHERE OLD.a = 5; END;
+
+    CREATE TRIGGER tr_having AFTER UPDATE ON t
+      BEGIN
+        INSERT INTO log SELECT 'body_having_fired'
+        FROM (SELECT 1 AS x) GROUP BY x HAVING OLD.a = 5;
+      END;
+
+    UPDATE t SET a = a;
+
+    SELECT 'where_match', count(*) FROM t WHERE a = 5
+    UNION ALL
+    SELECT 'when_fired', count(*) FROM log WHERE msg = 'when_fired'
+    UNION ALL
+    SELECT 'body_where_fired', count(*) FROM log WHERE msg = 'body_where_fired'
+    UNION ALL
+    SELECT 'body_having_fired', count(*) FROM log WHERE msg = 'body_having_fired';
+}
+expect {
+    where_match|1
+    when_fired|0
+    body_where_fired|0
+    body_having_fired|0
+}
+
+test when-rowid-alias-keeps-integer-affinity {
+    CREATE TABLE t12(id INTEGER PRIMARY KEY, v);
+    CREATE TABLE log12(msg);
+    CREATE TRIGGER tr12 AFTER INSERT ON t12 WHEN NEW.id = '1'
+      BEGIN
+        INSERT INTO log12 VALUES('fired');
+      END;
+    INSERT INTO t12 VALUES(1, 'x');
+    SELECT * FROM log12;
+}
+expect {
+    fired
+}
+
+test rowid-keeps-integer-affinity {
+    CREATE TABLE t12(id);
+    CREATE TABLE log12(msg);
+    CREATE TRIGGER tr12 AFTER INSERT ON t12 WHEN NEW.rowid = '1'
+      BEGIN
+        INSERT INTO log12 VALUES('fired');
+      END;
+    INSERT INTO t12 VALUES('x');
+    SELECT * FROM log12;
+}
+expect {
+    fired
+}

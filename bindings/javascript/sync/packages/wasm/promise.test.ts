@@ -13,7 +13,7 @@ test('open non-sync db', async () => {
     const db = await connect({ path: 'local.db' });
     await db.exec("CREATE TABLE t(x)");
     await db.exec("INSERT INTO t VALUES (1), (2), (3)");
-    expect(await (await db.prepare("SELECT * FROM t").all())).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }])
+    expect(await (await db.prepare("SELECT * FROM t")).all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }])
 })
 
 test('checkpoint-and-actions', async () => {
@@ -31,7 +31,7 @@ test('checkpoint-and-actions', async () => {
     }
     const db1 = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
     await db1.exec("PRAGMA busy_timeout=100");
-    console.info('run_info', await db1.prepare("SELECT * FROM sqlite_master").all());
+    console.info('run_info', await (await db1.prepare("SELECT * FROM sqlite_master")).all());
     const pull = async function (iterations: number) {
         for (let i = 0; i < iterations; i++) {
             console.info('pull', i);
@@ -60,9 +60,9 @@ test('checkpoint-and-actions', async () => {
         let rows = 0;
         for (let i = 0; i < iterations; i++) {
             console.info('run', i, rows);
-            await db1.prepare("UPDATE rows SET value = value + 1 WHERE key = ?").run('key');
+            await (await db1.prepare("UPDATE rows SET value = value + 1 WHERE key = ?")).run('key');
             rows += 1;
-            const { cnt } = await db1.prepare("SELECT value as cnt FROM rows WHERE key = ?").get(['key']);
+            const { cnt } = await (await db1.prepare("SELECT value as cnt FROM rows WHERE key = ?")).get(['key']);
             expect(cnt).toBe(rows);
             await new Promise(resolve => setTimeout(resolve, 1));
         }
@@ -72,31 +72,31 @@ test('checkpoint-and-actions', async () => {
 
 test('implicit connect', async () => {
     const db = new Database({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
-    const defer = db.prepare("SELECT * FROM not_found");
+    const defer = await db.prepare("SELECT * FROM not_found");
     await expect(async () => await defer.all()).rejects.toThrowError(/no such table: not_found/);
-    expect(() => db.prepare("SELECT * FROM not_found")).toThrowError(/no such table: not_found/);
-    expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
+    await expect(async () => await db.prepare("SELECT * FROM not_found")).rejects.toThrowError(/no such table: not_found/);
+    expect(await (await db.prepare("SELECT 1 as x")).all()).toEqual([{ x: 1 }]);
 })
 
 test('simple-db', async () => {
     const db = new Database({ path: ':memory:' });
-    expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }])
+    expect(await (await db.prepare("SELECT 1 as x")).all()).toEqual([{ x: 1 }])
     await db.exec("CREATE TABLE t(x)");
     await db.exec("INSERT INTO t VALUES (1), (2), (3)");
-    expect(await db.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }])
+    expect(await (await db.prepare("SELECT * FROM t")).all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }])
     await expect(async () => await db.pull()).rejects.toThrowError(/sync is disabled as database was opened without sync support/);
 })
 
 test('reconnect-db', async () => {
     {
         const db = await connect({ path: 'local.db', url: process.env.VITE_TURSO_DB_URL });
-        const stmt = db.prepare("SELECT * FROM turso_cdc");
+        const stmt = await db.prepare("SELECT * FROM turso_cdc");
         expect(await stmt.all()).toEqual([])
         stmt.close();
     }
     {
         const db = await connect({ path: 'local.db', url: process.env.VITE_TURSO_DB_URL });
-        const stmt = db.prepare("SELECT * FROM turso_cdc");
+        const stmt = await db.prepare("SELECT * FROM turso_cdc");
         expect(await stmt.all()).toEqual([])
         stmt.close();
     }
@@ -104,10 +104,10 @@ test('reconnect-db', async () => {
 
 test('implicit connect', async () => {
     const db = new Database({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
-    const defer = db.prepare("SELECT * FROM not_found");
+    const defer = await db.prepare("SELECT * FROM not_found");
     await expect(async () => await defer.all()).rejects.toThrowError(/no such table: not_found/);
-    expect(() => db.prepare("SELECT * FROM not_found")).toThrowError(/no such table: not_found/);
-    expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
+    await expect(async () => await db.prepare("SELECT * FROM not_found")).rejects.toThrowError(/no such table: not_found/);
+    expect(await (await db.prepare("SELECT 1 as x")).all()).toEqual([{ x: 1 }]);
 })
 
 test('defered sync', async () => {
@@ -122,13 +122,13 @@ test('defered sync', async () => {
 
     let url: string | null = null;
     const db = new Database({ path: ':memory:', url: () => url });
-    await db.prepare("CREATE TABLE t(x)").run();
-    await db.prepare("INSERT INTO t VALUES (1), (2), (3), (42)").run();
-    expect(await db.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }, { x: 42 }]);
+    await (await db.prepare("CREATE TABLE t(x)")).run();
+    await (await db.prepare("INSERT INTO t VALUES (1), (2), (3), (42)")).run();
+    expect(await (await db.prepare("SELECT * FROM t")).all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }, { x: 42 }]);
     await expect(async () => await db.pull()).rejects.toThrow(/url is empty - sync is paused/);
     url = process.env.VITE_TURSO_DB_URL ?? null;
     await db.pull();
-    expect(await db.prepare("SELECT * FROM t").all()).toEqual([{ x: 100 }, { x: 1 }, { x: 2 }, { x: 3 }, { x: 42 }]);
+    expect(await (await db.prepare("SELECT * FROM t")).all()).toEqual([{ x: 100 }, { x: 1 }, { x: 2 }, { x: 3 }, { x: 42 }]);
 })
 
 // TODO: re-enable encryption tests once local sync server supports the encrypted-tenant URL pattern.
@@ -194,7 +194,7 @@ test('select-after-push', async () => {
     }
     {
         const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
-        const rows = await db.prepare('SELECT * FROM t').all();
+        const rows = await (await db.prepare('SELECT * FROM t')).all();
         expect(rows).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }])
     }
 })
@@ -213,7 +213,7 @@ test('select-without-push', async () => {
     }
     {
         const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
-        const rows = await db.prepare('SELECT * FROM t').all();
+        const rows = await (await db.prepare('SELECT * FROM t')).all();
         expect(rows).toEqual([])
     }
 })
@@ -235,8 +235,8 @@ test('merge-non-overlapping-keys', async () => {
     await Promise.all([db1.push(), db2.push()]);
     await Promise.all([db1.pull(), db2.pull()]);
 
-    const rows1 = await db1.prepare('SELECT * FROM q').all();
-    const rows2 = await db1.prepare('SELECT * FROM q').all();
+    const rows1 = await (await db1.prepare('SELECT * FROM q')).all();
+    const rows2 = await (await db1.prepare('SELECT * FROM q')).all();
     const expected = [{ x: 'k1', y: 'value1' }, { x: 'k2', y: 'value2' }, { x: 'k3', y: 'value3' }, { x: 'k4', y: 'value4' }, { x: 'k5', y: 'value5' }];
     expect(rows1.sort(localeCompare)).toEqual(expected.sort(localeCompare))
     expect(rows2.sort(localeCompare)).toEqual(expected.sort(localeCompare))
@@ -260,8 +260,8 @@ test('last-push-wins', async () => {
     await db1.push();
     await Promise.all([db1.pull(), db2.pull()]);
 
-    const rows1 = await db1.prepare('SELECT * FROM q').all();
-    const rows2 = await db1.prepare('SELECT * FROM q').all();
+    const rows1 = await (await db1.prepare('SELECT * FROM q')).all();
+    const rows2 = await (await db1.prepare('SELECT * FROM q')).all();
     const expected = [{ x: 'k1', y: 'value1' }, { x: 'k2', y: 'value2' }, { x: 'k3', y: 'value5' }, { x: 'k4', y: 'value4' }];
     expect(rows1.sort(localeCompare)).toEqual(expected.sort(localeCompare))
     expect(rows2.sort(localeCompare)).toEqual(expected.sort(localeCompare))
@@ -286,8 +286,8 @@ test('last-push-wins-with-delete', async () => {
     await db1.push();
     await Promise.all([db1.pull(), db2.pull()]);
 
-    const rows1 = await db1.prepare('SELECT * FROM q').all();
-    const rows2 = await db1.prepare('SELECT * FROM q').all();
+    const rows1 = await (await db1.prepare('SELECT * FROM q')).all();
+    const rows2 = await (await db1.prepare('SELECT * FROM q')).all();
     const expected = [{ x: 'k3', y: 'value5' }];
     expect(rows1).toEqual(expected)
     expect(rows2).toEqual(expected)
@@ -356,7 +356,7 @@ test('persistence-push', async () => {
         const db2 = await connect({ path: path, url: process.env.VITE_TURSO_DB_URL });
         await db2.exec(`INSERT INTO q VALUES ('k3', 'v3')`);
         await db2.exec(`INSERT INTO q VALUES ('k4', 'v4')`);
-        const stmt = db2.prepare('SELECT * FROM q');
+        const stmt = await db2.prepare('SELECT * FROM q');
         const rows = await stmt.all();
         const expected = [{ x: 'k1', y: 'v1' }, { x: 'k2', y: 'v2' }, { x: 'k3', y: 'v3' }, { x: 'k4', y: 'v4' }];
         expect(rows).toEqual(expected)
@@ -372,7 +372,7 @@ test('persistence-push', async () => {
 
     {
         const db4 = await connect({ path: path, url: process.env.VITE_TURSO_DB_URL });
-        const rows = await db4.prepare('SELECT * FROM q').all();
+        const rows = await (await db4.prepare('SELECT * FROM q')).all();
         const expected = [{ x: 'k1', y: 'v1' }, { x: 'k2', y: 'v2' }, { x: 'k3', y: 'v3' }, { x: 'k4', y: 'v4' }];
         expect(rows).toEqual(expected)
         await db4.close();
@@ -397,7 +397,7 @@ test('persistence-offline', async () => {
     }
     {
         const db = await connect({ path: path, url: "https://not-valid-url.localhost" });
-        const rows = await db.prepare("SELECT * FROM q").all();
+        const rows = await (await db.prepare("SELECT * FROM q")).all();
         const expected = [{ x: 'k1', y: 'v1' }, { x: 'k2', y: 'v2' }];
         expect(rows.sort(localeCompare)).toEqual(expected.sort(localeCompare))
         await db.close();
@@ -429,8 +429,8 @@ test('persistence-pull-push', async () => {
     console.info(stats1, stats2);
     expect(stats1.revision).not.toBe(stats2.revision);
 
-    const rows1 = await db1.prepare('SELECT * FROM q').all();
-    const rows2 = await db2.prepare('SELECT * FROM q').all();
+    const rows1 = await (await db1.prepare('SELECT * FROM q')).all();
+    const rows2 = await (await db2.prepare('SELECT * FROM q')).all();
     const expected = [{ x: 'k1', y: 'v1' }, { x: 'k2', y: 'v2' }, { x: 'k3', y: 'v3' }, { x: 'k4', y: 'v4' }];
     expect(rows1.sort(localeCompare)).toEqual(expected.sort(localeCompare))
     expect(rows2.sort(localeCompare)).toEqual(expected.sort(localeCompare))
@@ -548,7 +548,7 @@ test('concurrent-updates', { timeout: 60000 }, async () => {
     await Promise.all(dbs.map(db => db.pull()));
     let results = [];
     for (let i = 0; i < dbs.length; i++) {
-        results.push((await dbs[i].prepare('SELECT x, y FROM three').all()).sort(localeCompare));
+        results.push((await (await dbs[i].prepare('SELECT x, y FROM three')).all()).sort(localeCompare));
     }
     for (let i = 0; i < dbs.length; i++) {
         expect(results[i]).toEqual(results[0]);
@@ -586,8 +586,8 @@ test('transform', async () => {
     await Promise.all([db1.push(), db2.push()]);
     await Promise.all([db1.pull(), db2.pull()]);
 
-    const rows1 = await db1.prepare('SELECT * FROM counter').all();
-    const rows2 = await db2.prepare('SELECT * FROM counter').all();
+    const rows1 = await (await db1.prepare('SELECT * FROM counter')).all();
+    const rows2 = await (await db2.prepare('SELECT * FROM counter')).all();
     expect(rows1).toEqual([{ key: '1', value: 2 }]);
     expect(rows2).toEqual([{ key: '1', value: 2 }]);
 })
@@ -629,8 +629,8 @@ test('transform-many', async () => {
     await Promise.all([db1.pull(), db2.pull()]);
     console.info('pull', performance.now() - start);
 
-    const rows1 = await db1.prepare('SELECT * FROM counter').all();
-    const rows2 = await db2.prepare('SELECT * FROM counter').all();
+    const rows1 = await (await db1.prepare('SELECT * FROM counter')).all();
+    const rows2 = await (await db2.prepare('SELECT * FROM counter')).all();
     expect(rows1).toEqual([{ key: '1', value: 1001 + 1002 }]);
     expect(rows2).toEqual([{ key: '1', value: 1001 + 1002 }]);
 })
