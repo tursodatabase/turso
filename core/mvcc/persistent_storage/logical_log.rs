@@ -1708,6 +1708,14 @@ pub struct StreamingLogicalLogReader {
     buffer: Arc<RwLock<Vec<u8>>>,
     /// Position to read from loaded buffer
     buffer_offset: usize,
+    /// Buffer index of the start of the transaction frame currently being
+    /// parsed. The reader yields mid-frame (any `try_consume_*` can need more
+    /// data), and `next_frame`/`parse_next_transaction` restart from the top on
+    /// re-entry — so on each parse entry we rewind `buffer_offset` to this
+    /// anchor and re-parse the whole frame, and the buffer is only compacted
+    /// (drained) up to this anchor, never mid-frame. Advanced to the new frame
+    /// boundary only once a frame is fully validated.
+    frame_anchor: usize,
     file_size: usize,
     state: StreamingState,
     /// Byte offset of the end of the last fully validated transaction frame. Used during
@@ -1747,6 +1755,7 @@ impl StreamingLogicalLogReader {
             header: None,
             buffer: Arc::new(RwLock::new(Vec::with_capacity(4096))),
             buffer_offset: 0,
+            frame_anchor: 0,
             file_size,
             state: StreamingState::NeedTransactionStart,
             last_valid_offset: 0,
@@ -1844,6 +1853,7 @@ impl StreamingLogicalLogReader {
                 self.offset = hdr_len;
                 self.buffer.write().clear();
                 self.buffer_offset = 0;
+                self.frame_anchor = 0;
                 self.last_valid_offset = hdr_len;
                 Ok(IOResult::Done(HeaderReadResult::Valid(header)))
             }
@@ -1860,6 +1870,7 @@ impl StreamingLogicalLogReader {
         self.offset = LOG_HDR_SIZE;
         self.buffer.write().clear();
         self.buffer_offset = 0;
+        self.frame_anchor = 0;
         self.last_valid_offset = LOG_HDR_SIZE;
     }
 
@@ -1881,6 +1892,11 @@ impl StreamingLogicalLogReader {
         loop {
             match self.state {
                 StreamingState::NeedTransactionStart => {
+                    // Rewind to the current frame anchor before the EOF check:
+                    // on a mid-frame re-entry `buffer_offset` is advanced, which
+                    // would undercount `remaining_bytes()` and stop recovery
+                    // early. `parse_next_transaction` rewinds again (idempotent).
+                    self.buffer_offset = self.frame_anchor;
                     if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
                         return Ok(IOResult::Done(None));
                     }
@@ -2610,6 +2626,13 @@ impl StreamingLogicalLogReader {
     }
 
     fn parse_next_transaction(&mut self) -> Result<IOResult<ParseResult>> {
+        // Rewind to the start of the current frame. This function consumes
+        // incrementally and can yield mid-frame; on re-entry it restarts from
+        // the top, so we must re-read from the frame boundary (not the
+        // partially-consumed position). `frame_anchor` bytes are kept buffered
+        // by `read_more_data` for exactly this. CRC is reseeded from
+        // `self.running_crc` and recomputed over the re-read bytes.
+        self.buffer_offset = self.frame_anchor;
         if self.remaining_bytes() < self.tx_min_frame_size() {
             return Ok(IOResult::Done(ParseResult::Eof));
         }
@@ -2870,6 +2893,10 @@ impl StreamingLogicalLogReader {
         self.last_valid_offset = self.offset.saturating_sub(self.bytes_can_read());
         // Advance the chain: this frame's CRC becomes the seed for the next frame.
         self.running_crc = running_crc;
+        // Commit the frame boundary: the next frame starts at the current
+        // consume cursor. Until now `frame_anchor` pointed at this frame's
+        // start so re-entry could rewind to it.
+        self.frame_anchor = self.buffer_offset;
         Ok(IOResult::Done(ParseResult::Frame(ParsedFrame {
             ops: parsed_ops,
             portable_changes,
@@ -2924,6 +2951,9 @@ impl StreamingLogicalLogReader {
     }
 
     fn parse_next_portable_changes_frame(&mut self) -> Result<IOResult<ParseResult>> {
+        // See `parse_next_transaction`: rewind to the frame anchor so a mid-frame
+        // IO yield resumes correctly on re-entry.
+        self.buffer_offset = self.frame_anchor;
         if self
             .header
             .as_ref()
@@ -3154,6 +3184,7 @@ impl StreamingLogicalLogReader {
 
         self.last_valid_offset = self.offset.saturating_sub(self.bytes_can_read());
         self.running_crc = running_crc;
+        self.frame_anchor = self.buffer_offset;
         Ok(IOResult::Done(ParseResult::Frame(ParsedFrame {
             ops: Vec::new(),
             portable_changes,
@@ -3394,12 +3425,6 @@ impl StreamingLogicalLogReader {
     /// and the method yields its completion until done. Re-entry picks up
     /// where it left off without re-issuing the read.
     pub fn read_more_data(&mut self, need: usize) -> Result<IOResult<()>> {
-        // Capture initial_buffer_offset only on the very first entry (no
-        // in-flight read yet). On a re-entry we want to preserve the
-        // post-loop buffer cleanup, but the cleanup is keyed off the
-        // current `self.buffer_offset` which has not changed across yields.
-        let initial_buffer_offset = self.buffer_offset;
-
         loop {
             // Resume hook: a pread that was issued by a previous call to
             // this method completed; observe its result and advance.
@@ -3432,15 +3457,18 @@ impl StreamingLogicalLogReader {
             let still_need = need.saturating_sub(bytes_available_in_buffer);
 
             if still_need == 0 {
-                // Cleanup consumed bytes. If everything was consumed, clear
-                // avoids memmove.
-                let mut buffer = self.buffer.write();
-                if initial_buffer_offset >= buffer.len() {
-                    buffer.clear();
-                } else if initial_buffer_offset > 0 {
-                    let _ = buffer.drain(0..initial_buffer_offset);
+                // Compact only the bytes *before* the current frame's anchor.
+                // The in-progress frame (`frame_anchor..`) must stay buffered so
+                // that a mid-frame IO yield can be resumed by rewinding
+                // `buffer_offset` back to `frame_anchor` and re-parsing. Draining
+                // up to `buffer_offset` (the consume cursor) instead would discard
+                // frame-start bytes and corrupt the re-parse.
+                let drain_to = self.frame_anchor.min(self.buffer.read().len());
+                if drain_to > 0 {
+                    let _ = self.buffer.write().drain(0..drain_to);
+                    self.buffer_offset -= drain_to;
+                    self.frame_anchor -= drain_to;
                 }
-                self.buffer_offset = 0;
                 return Ok(IOResult::Done(()));
             }
 
