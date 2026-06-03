@@ -127,3 +127,77 @@ compatTest("Compat interactive transaction rollback after constraint error keeps
   const countAfterCommit = await client.execute({ sql: "SELECT COUNT(*) AS count FROM compat_users WHERE name = ?", args: ["AfterRollback"] });
   t.is(toCount(countAfterCommit), 1);
 });
+
+// ==========================================================================
+// client.batch()
+//
+// The libSQL-compatible client.batch(stmts, mode?) returns
+// Promise<Array<ResultSet>> — one ResultSet per input statement, in order,
+// each with { columns, columnTypes, rows, rowsAffected }.
+// libSQL runs the whole batch as a single transaction, so any failure rolls
+// the entire batch back.
+// ==========================================================================
+
+compatTest("Compat batch() returns one ResultSet per statement, in order", async (t) => {
+  const { client } = t.context;
+
+  const results = await client.batch([
+    { sql: "INSERT INTO compat_users (name) VALUES (?)", args: ["Bob"] },
+    "SELECT id, name FROM compat_users ORDER BY id",
+  ]);
+
+  t.true(Array.isArray(results), "batch() returns an array");
+  t.is(results.length, 2, "one ResultSet per input statement");
+
+  // INSERT: nothing to read back, one row affected.
+  t.deepEqual(results[0].rows, []);
+  t.is(results[0].rowsAffected, 1);
+
+  // SELECT: rows surfaced, nothing affected.
+  t.deepEqual(results[1].columns, ["id", "name"]);
+  t.is(results[1].rowsAffected, 0);
+  t.is(results[1].rows.length, 2);
+  t.is(results[1].rows[0].name, "Alice");
+  t.is(results[1].rows[1].name, "Bob");
+});
+
+compatTest("Compat batch() honors bound args", async (t) => {
+  const { client } = t.context;
+
+  // Regression guard: the args of each statement must be bound, not ignored.
+  const results = await client.batch([
+    { sql: "INSERT INTO compat_users (name) VALUES (?)", args: ["Carol"] },
+    { sql: "SELECT name FROM compat_users WHERE name = ?", args: ["Carol"] },
+  ]);
+
+  t.is(results[1].rows.length, 1);
+  t.is(results[1].rows[0].name, "Carol");
+});
+
+compatTest("Compat batch() raw option returns positional rows", async (t) => {
+  const { client } = t.context;
+
+  const [rs] = await client.batch([
+    { sql: "SELECT id, name FROM compat_users WHERE id = ?", args: [1] },
+  ], { raw: true });
+
+  const row = rs.rows[0];
+  t.true(Array.isArray(row));
+  t.is(row[0], 1);
+  t.is(row[1], "Alice");
+});
+
+compatTest("Compat batch() is atomic: a failure rolls back the whole batch", async (t) => {
+  const { client } = t.context;
+
+  await t.throwsAsync(async () => {
+    await client.batch([
+      { sql: "INSERT INTO compat_users (name) VALUES (?)", args: ["Atomic1"] },
+      // Duplicate primary key with the seeded id = 1 row.
+      { sql: "INSERT INTO compat_users (id, name) VALUES (?, ?)", args: [1, "Dup"] },
+    ]);
+  }, { any: true });
+
+  const after = await client.execute({ sql: "SELECT COUNT(*) AS count FROM compat_users WHERE name = ?", args: ["Atomic1"] });
+  t.is(toCount(after), 0, "the earlier insert must not survive the failed batch");
+});

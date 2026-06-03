@@ -210,6 +210,75 @@ test.serial("Database.transaction().immediate()", async (t) => {
 });
 
 // ==========================================================================
+// Database.batch()
+// ==========================================================================
+
+test.serial("Database.batch() returns per-statement result sets", async (t) => {
+  if (!["turso", "libsql"].includes(t.context.provider)) {
+    t.pass();
+    return;
+  }
+  const db = t.context.db;
+
+  const results = db.batch([
+    { sql: "INSERT INTO users (id, name, email) VALUES (?, ?, ?)", args: [3, "Carol", "carol@example.org"] },
+    { sql: "UPDATE users SET email = ? WHERE id = ?", args: ["alice@new.org", 1] },
+    "SELECT id, name FROM users ORDER BY id",
+  ]);
+
+  t.true(Array.isArray(results));
+  t.is(results.length, 3);
+  t.deepEqual(results[0].columns, []);
+  t.deepEqual(results[0].columnTypes, []);
+  t.deepEqual(results[0].rows, []);
+  t.is(results[0].rowsAffected, 1);
+  t.false("lastInsertRowid" in results[0]);
+  t.is(results[0].toJSON, undefined);
+
+  t.is(results[1].rowsAffected, 1);
+  t.false("lastInsertRowid" in results[1]);
+
+  t.deepEqual(results[2].columns, ["id", "name"]);
+  t.is(results[2].rowsAffected, 0);
+  t.is(results[2].rows.length, 3);
+  t.false(Array.isArray(results[2].rows[0]));
+  t.is(results[2].rows[0].id, 1);
+  t.is(results[2].rows[0].name, "Alice");
+});
+
+test.serial("Database.batch() raw option returns array rows", async (t) => {
+  if (!["turso", "libsql"].includes(t.context.provider)) {
+    t.pass();
+    return;
+  }
+  const db = t.context.db;
+
+  const [rs] = db.batch([
+    { sql: "SELECT id, name FROM users WHERE id = ?", args: [1] },
+  ], { raw: true });
+
+  t.deepEqual(rs.rows, [[1, "Alice"]]);
+});
+
+test.serial("Database.batch() rolls back on error when given a mode", async (t) => {
+  if (!["turso", "libsql"].includes(t.context.provider)) {
+    t.pass();
+    return;
+  }
+  const db = t.context.db;
+
+  t.throws(() => {
+    db.batch([
+      { sql: "INSERT INTO users (id, name, email) VALUES (?, ?, ?)", args: [10, "Dan", "dan@example.org"] },
+      { sql: "INSERT INTO users (id, name, email) VALUES (?, ?, ?)", args: [1, "Dup", "dup@example.org"] },
+    ], "write");
+  }, { any: true });
+
+  const row = db.prepare("SELECT count(*) AS c FROM users WHERE id = 10").get();
+  t.is(row.c, 0);
+});
+
+// ==========================================================================
 // Statement.run()
 // ==========================================================================
 
