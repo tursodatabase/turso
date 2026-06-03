@@ -256,6 +256,81 @@ fn wait_for_create_index_result(injector: &CreateIndexOnCommitConflictChecksInje
     injector.result()
 }
 
+const EXCLUSIVE_DML_NOT_FIRED: u8 = 0;
+const EXCLUSIVE_DML_RUNNING: u8 = 1;
+const EXCLUSIVE_DML_OK: u8 = 2;
+const EXCLUSIVE_DML_WRITE_WRITE_CONFLICT: u8 = 3;
+const EXCLUSIVE_DML_BUSY: u8 = 4;
+const EXCLUSIVE_DML_UNEXPECTED: u8 = 5;
+
+struct ExclusiveDmlBeforeCommitTimestampInjector {
+    point: YieldPoint,
+    selection_key: u64,
+    exclusive: Arc<Connection>,
+    result: Arc<AtomicU8>,
+}
+
+impl ExclusiveDmlBeforeCommitTimestampInjector {
+    fn new(point: YieldPoint, selection_key: u64, exclusive: Arc<Connection>) -> Arc<Self> {
+        Arc::new(Self {
+            point,
+            selection_key,
+            exclusive,
+            result: Arc::new(AtomicU8::new(EXCLUSIVE_DML_NOT_FIRED)),
+        })
+    }
+
+    fn result(&self) -> u8 {
+        self.result.load(Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for ExclusiveDmlBeforeCommitTimestampInjector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExclusiveDmlBeforeCommitTimestampInjector")
+            .field("point", &self.point)
+            .field("selection_key", &self.selection_key)
+            .field("result", &self.result())
+            .finish_non_exhaustive()
+    }
+}
+
+impl YieldInjector for ExclusiveDmlBeforeCommitTimestampInjector {
+    fn should_yield(&self, _instance_id: u64, selection_key: u64, point: YieldPoint) -> bool {
+        if point != self.point
+            || selection_key != self.selection_key
+            || self
+                .result
+                .compare_exchange(
+                    EXCLUSIVE_DML_NOT_FIRED,
+                    EXCLUSIVE_DML_RUNNING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return false;
+        }
+
+        let outcome = match self
+            .exclusive
+            .execute("BEGIN IMMEDIATE")
+            .and_then(|_| self.exclusive.execute("INSERT INTO t VALUES (3, 'dup')"))
+            .and_then(|_| self.exclusive.execute("COMMIT"))
+        {
+            Ok(()) => EXCLUSIVE_DML_OK,
+            Err(LimboError::WriteWriteConflict) => EXCLUSIVE_DML_WRITE_WRITE_CONFLICT,
+            Err(LimboError::Busy) => EXCLUSIVE_DML_BUSY,
+            Err(_) => EXCLUSIVE_DML_UNEXPECTED,
+        };
+        if outcome != EXCLUSIVE_DML_OK && self.exclusive.get_mv_tx_id().is_some() {
+            let _ = self.exclusive.execute("ROLLBACK");
+        }
+        self.result.store(outcome, Ordering::Release);
+        true
+    }
+}
+
 #[derive(Debug)]
 struct FixedFailureInjector {
     remaining: Mutex<rustc_hash::FxHashMap<YieldPoint, LimboError>>,
@@ -14664,6 +14739,58 @@ fn test_create_index_exclusive_acquire_waits_for_commit_before_preparing() {
     let rows = get_rows(&observer, "SELECT id FROM t INDEXED BY idx_v WHERE v = 200");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    let integrity = get_rows(&observer, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(integrity[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_exclusive_dml_committed_before_concurrent_prepare_conflicts_on_unique_index() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (2, 'dup')").unwrap();
+    let writer_tx_id = writer
+        .get_mv_tx_id()
+        .expect("writer should have an active MVCC transaction");
+
+    let exclusive = db.connect();
+    let injector = ExclusiveDmlBeforeCommitTimestampInjector::new(
+        CommitYieldPoint::BeforeCommitTimestamp.point(),
+        commit_yield_key(writer_tx_id),
+        exclusive,
+    );
+    writer.set_yield_injector(Some(injector.clone()));
+
+    let writer_commit_result = writer.execute("COMMIT");
+    writer.set_yield_injector(None);
+
+    assert_eq!(
+        injector.result(),
+        EXCLUSIVE_DML_OK,
+        "exclusive DML should commit before the concurrent writer publishes Preparing"
+    );
+    assert!(
+        matches!(writer_commit_result, Err(LimboError::WriteWriteConflict)),
+        "concurrent writer must fail unique-index validation after exclusive DML commits, got {writer_commit_result:?}"
+    );
+    if writer.get_mv_tx_id().is_some() {
+        let _ = writer.execute("ROLLBACK");
+    }
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+    assert_eq!(rows[0][1].to_string(), "dup");
 
     let integrity = get_rows(&observer, "PRAGMA integrity_check");
     assert_eq!(integrity.len(), 1);

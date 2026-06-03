@@ -1283,6 +1283,7 @@ pub(crate) enum CommitYieldPoint {
     /// to reproduce divergence between `mv_store.txs` and `connection.mv_tx_id`.
     AfterRemoveTx,
     AfterCommitConflictChecksBeforePreparing,
+    BeforeCommitTimestamp,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -2524,6 +2525,23 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 let mut schema_conflict = false;
                 let mut exclusive_conflict = false;
+
+                #[cfg(any(test, injected_yields))]
+                {
+                    let yield_context = self.yield_context();
+                    if yield_context.injector.as_ref().is_some_and(|injector| {
+                        injector.should_yield(
+                            yield_context.instance_id,
+                            yield_context.selection_key,
+                            CommitYieldPoint::BeforeCommitTimestamp.point(),
+                        )
+                    }) {
+                        tracing::debug!(
+                            tx_id = self.tx_id,
+                            "injected commit interleaving before commit timestamp"
+                        );
+                    }
+                }
 
                 let end_ts = mvcc_store.get_commit_timestamp(|ts| {
                     turso_assert!(
