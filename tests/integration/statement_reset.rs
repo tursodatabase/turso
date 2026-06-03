@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::common::{limbo_exec_rows, TempDatabase};
+use crate::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
 use crate::queued_io::QueuedIo;
 use turso_core::vdbe::StepResult;
 use turso_core::{Database, LimboError};
@@ -13,6 +13,118 @@ fn step_blocking(stmt: &mut turso_core::Statement) -> turso_core::Result<StepRes
             other => return Ok(other),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum ResetHook {
+    None,
+    BusyHandlerAfterPrepare,
+}
+
+fn set_busy_handler_if_needed(conn: &Arc<turso_core::Connection>, hook: ResetHook) {
+    if matches!(hook, ResetHook::BusyHandlerAfterPrepare) {
+        conn.set_busy_handler(Some(Box::new(|_| 0)));
+    }
+}
+
+fn clear_busy_handler_if_needed(conn: &Arc<turso_core::Connection>, hook: ResetHook) {
+    if matches!(hook, ResetHook::BusyHandlerAfterPrepare) {
+        conn.set_busy_handler(None);
+    }
+}
+
+fn exec_with_reset(
+    conn: &Arc<turso_core::Connection>,
+    sql: &str,
+    hook: ResetHook,
+) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare(sql)?;
+    set_busy_handler_if_needed(conn, hook);
+    let result = stmt.run_ignore_rows();
+    clear_busy_handler_if_needed(conn, hook);
+    result?;
+    stmt.reset()?;
+    Ok(())
+}
+
+fn query_rows_with_reset(
+    conn: &Arc<turso_core::Connection>,
+    sql: &str,
+    hook: ResetHook,
+) -> anyhow::Result<Vec<Vec<rusqlite::types::Value>>> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = Vec::new();
+
+    set_busy_handler_if_needed(conn, hook);
+    let result = stmt.run_with_row_callback(|row| {
+        let row = row
+            .get_values()
+            .map(|value| match value {
+                turso_core::Value::Null => rusqlite::types::Value::Null,
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(value)) => {
+                    rusqlite::types::Value::Integer(*value)
+                }
+                turso_core::Value::Numeric(turso_core::Numeric::Float(value)) => {
+                    rusqlite::types::Value::Real(f64::from(*value))
+                }
+                turso_core::Value::Text(value) => {
+                    rusqlite::types::Value::Text(value.as_str().to_string())
+                }
+                turso_core::Value::Blob(value) => rusqlite::types::Value::Blob(value.to_vec()),
+            })
+            .collect();
+        rows.push(row);
+        Ok(())
+    });
+    clear_busy_handler_if_needed(conn, hook);
+    result?;
+    stmt.reset()?;
+    Ok(rows)
+}
+
+fn assert_temp_table_transaction_matches_rusqlite(
+    tmp_db: TempDatabase,
+    hook: ResetHook,
+) -> anyhow::Result<()> {
+    let turso = tmp_db.connect_limbo();
+    let sqlite = rusqlite::Connection::open_in_memory()?;
+
+    for sql in [
+        "CREATE TEMP TABLE temp_reset_probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+        "BEGIN",
+        "INSERT INTO temp_reset_probe VALUES (1, 'x')",
+    ] {
+        exec_with_reset(&turso, sql, hook)?;
+        sqlite.execute_batch(sql)?;
+    }
+
+    let query = "SELECT id, value FROM temp_reset_probe ORDER BY id";
+    assert_eq!(
+        query_rows_with_reset(&turso, query, hook)?,
+        sqlite_exec_rows(&sqlite, query)
+    );
+
+    exec_with_reset(&turso, "COMMIT", hook)?;
+    sqlite.execute_batch("COMMIT")?;
+
+    assert_eq!(
+        query_rows_with_reset(&turso, query, hook)?,
+        sqlite_exec_rows(&sqlite, query)
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn temp_table_transaction_survives_statement_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    assert_temp_table_transaction_matches_rusqlite(tmp_db, ResetHook::None)
+}
+
+#[turso_macros::test]
+fn busy_handler_change_after_prepare_does_not_reprepare_temp_transaction(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    assert_temp_table_transaction_matches_rusqlite(tmp_db, ResetHook::BusyHandlerAfterPrepare)
 }
 
 /// INSERT ... RETURNING: read one row then drop the statement.
