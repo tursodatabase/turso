@@ -3033,44 +3033,33 @@ pub enum WindowFunctionKind {
     Window(WindowFunc),
 }
 
+/// One window function call belonging to a `Window`.
+///
+/// Window queries are planned by wrapping the original FROM/WHERE in a
+/// subquery, pushing each window function's arguments and FILTER predicate
+/// into that subquery as new output columns, and rewriting the call to read
+/// those columns instead of the original tables. See `plan_windows` in
+/// `translate/window.rs` for the full rewrite, including worked examples.
+/// "Source subquery" below refers to that wrapper subquery.
 #[derive(Debug, Clone)]
 pub struct WindowFunction {
     /// The resolved function. Aggregate window functions and specialized window
     /// functions such as ROW_NUMBER() are supported.
     pub func: WindowFunctionKind,
-    /// Rewritten FILTER predicate, evaluated before `AggStep` to decide
-    /// whether the current input row contributes.
-    ///
-    /// Kept separate from `rewritten_expr`. Window planning emits an input
-    /// subquery that pre-computes each argument and FILTER predicate as one of
-    /// its result columns (`col0`, `col1`, ... below refer to those subquery
-    /// output columns). Given two calls in the same SELECT,
-    ///     sum(val) FILTER (WHERE flag = 1) OVER w,
-    ///     sum(val) FILTER (WHERE flag = 0) OVER w,
-    /// the input subquery computes `val` once as `col0`, `flag = 1` as `col1`,
-    /// and `flag = 0` as `col2`. Then:
-    ///
-    /// - `rewritten_expr` is `sum(col0) FILTER (WHERE col1) OVER w` for the
-    ///   first call and `sum(col0) FILTER (WHERE col2) OVER w` for the second.
-    ///   The FILTER clause is rewritten but still attached, so the two calls
-    ///   compare as distinct when later code looks up the result register by
-    ///   expression equality. Without that, both calls would share one entry
-    ///   and produce the same value.
-    /// - `filter_expr` is `col1` / `col2` on its own — the bare `Column`
-    ///   reference AggStep evaluates per input row to decide whether to step.
-    ///
-    /// Merging them would either lose the per-call distinction in
-    /// `rewritten_expr` or force AggStep to dig the predicate back out of the
-    /// function call. Storing the predicate separately avoids both.
+    /// The FILTER predicate, rewritten to reference the source subquery's
+    /// output columns. AggStep evaluates this once per input row and skips
+    /// the step when it is false. Stored as its own field so AggStep doesn't
+    /// have to pattern-match it back out of `rewritten_expr`'s `filter_over`
+    /// tail on every row.
     pub filter_expr: Option<Expr>,
     /// The expression from which the function was resolved. Used as the lookup
-    /// key when locating this function during window-to-subquery rewriting.
+    /// key when matching SQL occurrences back to this entry during rewriting.
     pub original_expr: Expr,
-    /// The rewritten form of `original_expr`, with arguments and the OVER clause
-    /// remapped to reference the window's input subquery. Set the first time
-    /// `rewrite_terminal_expr` matches this function. Subsequent occurrences of
-    /// the same `original_expr` reuse this cached rewrite so they end up pointing
-    /// at the same registers as the first occurrence.
+    /// `original_expr` with its arguments, FILTER predicate, and OVER clause
+    /// rewritten to reference the source subquery. Set the first time
+    /// `rewrite_terminal_expr` matches this function; later occurrences of
+    /// the same call reuse this cached rewrite so they resolve to the same
+    /// result register.
     pub rewritten_expr: Option<Expr>,
 }
 

@@ -359,10 +359,8 @@ fn rewrite_terminal_expr(
     )
 }
 
-/// Find the `WindowFunction` entry that this SQL occurrence corresponds to.
-/// Returns an entry that has not been rewritten yet when one exists, so
-/// repeated occurrences of a nondeterministic call each pick a distinct entry;
-/// otherwise returns any equivalent entry (the deduplicated case).
+/// Find the `WindowFunction` entry that this expression corresponds to.
+/// Returns an entry that has not been rewritten yet when one exists.
 fn find_window_function_entry<'a>(
     functions: &'a mut [WindowFunction],
     expr: &Expr,
@@ -382,11 +380,11 @@ fn find_window_function_entry<'a>(
     functions.get_mut(chosen.or(fallback)?)
 }
 
-/// Push `expr` into the input subquery as a result column and replace `*expr`
-/// in place with a reference to that column. Reuses an existing equivalent
-/// column when `expr` is deterministic; nondeterministic calls (e.g.
-/// `random()`) get a fresh column on every occurrence.
-fn push_into_input_subquery(
+/// Add `expr` as an output column of the source subquery (the one being built
+/// in `ctx`) and replace `*expr` with a reference to that column. Reuses an
+/// existing equivalent column when `expr` is deterministic; nondeterministic
+/// calls (e.g. `random()`) get a fresh column on every occurrence.
+fn push_into_source_subquery(
     expr: &mut Expr,
     aggregates: &mut Vec<Aggregate>,
     ctx: &mut WindowSubqueryContext,
@@ -402,8 +400,9 @@ fn push_into_input_subquery(
 }
 
 /// Rewrite a window function call `expr` so its arguments and FILTER predicate
-/// reference the input subquery, then record the rewritten form and the
-/// rewritten filter predicate on `window_function` for later emission.
+/// reference output columns of the source subquery (the one being built in
+/// `ctx`), then record the rewritten form and the rewritten filter predicate
+/// on `window_function` for later emission.
 fn rewrite_expr_referencing_current_window(
     aggregates: &mut Vec<Aggregate>,
     window_name: String,
@@ -419,7 +418,7 @@ fn rewrite_expr_referencing_current_window(
             ..
         } => {
             for arg in args.iter_mut() {
-                push_into_input_subquery(arg, aggregates, ctx)?;
+                push_into_source_subquery(arg, aggregates, ctx)?;
             }
             turso_assert!(
                 order_by.is_empty(),
@@ -432,7 +431,7 @@ fn rewrite_expr_referencing_current_window(
     };
 
     if let Some(filter_expr) = filter_over.filter_clause.as_deref_mut() {
-        push_into_input_subquery(filter_expr, aggregates, ctx)?;
+        push_into_source_subquery(filter_expr, aggregates, ctx)?;
     }
     window_function.filter_expr = filter_over.filter_clause.as_deref().cloned();
     filter_over.over_clause = Some(Over::Name(Name::exact(window_name)));
