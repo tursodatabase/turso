@@ -197,6 +197,20 @@ pub enum CompletionError {
     },
     #[error("tursodb not compiled with checksum feature")]
     ChecksumNotEnabled,
+    #[error("out of memory")]
+    OutOfMemory,
+}
+
+impl From<crate::alloc::TryReserveError> for CompletionError {
+    fn from(_: crate::alloc::TryReserveError) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+impl From<crate::alloc::AllocError> for CompletionError {
+    fn from(_: crate::alloc::AllocError) -> Self {
+        Self::OutOfMemory
+    }
 }
 
 /// Convert a `std::io::Error` into a `LimboError` with an operation label.

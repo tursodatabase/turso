@@ -1585,8 +1585,11 @@ impl BuildSharedWal {
                     };
                 }
                 BuildSharedWalPhase::AwaitChunk { completion, offset } => {
-                    if !completion.succeeded() {
+                    if !completion.finished() {
                         io_yield_one!(completion);
+                    }
+                    if let Some(err) = completion.get_error() {
+                        return Err(err.into());
                     }
                     let reader = self
                         .reader
@@ -1711,8 +1714,10 @@ impl StreamingWalReader {
         let completion: Box<ReadComplete> = Box::new(move |res| {
             tracing::debug!("WAL chunk read complete");
             let reader = me.clone();
-            reader.handle_chunk_read(res);
-            None
+            match reader.handle_chunk_read(res) {
+                Ok(()) => None,
+                Err(e) => Some(e.into()),
+            }
         });
         let c = Completion::new_read(buf, completion);
         let guard = self.file.pread(offset, c)?;
@@ -1784,10 +1789,13 @@ impl StreamingWalReader {
         self.page_atomic.store(page_sz as u64, Ordering::Release);
     }
 
-    fn handle_chunk_read(self: Arc<Self>, res: Result<(Arc<Buffer>, i32), CompletionError>) {
+    fn handle_chunk_read(
+        self: Arc<Self>,
+        res: Result<(Arc<Buffer>, i32), CompletionError>,
+    ) -> Result<(), TryReserveError> {
         let Ok((buf, bytes_read)) = res else {
             self.finalize_loading();
-            return;
+            return Ok(());
         };
         let buf_slice = &buf.as_slice()[..bytes_read as usize];
         // Snapshot salts/endianness once to avoid per-frame header locks
@@ -1797,16 +1805,22 @@ impl StreamingWalReader {
             (*h, st.use_native_endian)
         };
 
-        let consumed = self.process_frames(buf_slice, &header_copy, use_native);
+        let consumed = self.process_frames(buf_slice, &header_copy, use_native)?;
         self.off_atomic.fetch_add(consumed as u64, Ordering::AcqRel);
         // If we didn’t consume the full chunk, we hit a stop condition
         if consumed < buf_slice.len() || self.off_atomic.load(Ordering::Acquire) >= self.file_size {
             self.finalize_loading();
         }
+        Ok(())
     }
 
     // Processes frames from a buffer, returns bytes processed
-    fn process_frames(&self, buf: &[u8], header: &WalHeader, use_native: bool) -> usize {
+    fn process_frames(
+        &self,
+        buf: &[u8],
+        header: &WalHeader,
+        use_native: bool,
+    ) -> Result<usize, TryReserveError> {
         let mut st = self.state.write();
         let page_size = st.page_size;
         let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
@@ -1865,7 +1879,7 @@ impl StreamingWalReader {
             st.pending_frames
                 .entry(page_no as u64)
                 .or_default()
-                .push(frame_idx);
+                .try_push(frame_idx)?;
 
             if db_size > 0 {
                 st.last_valid_frame = st.frame_idx;
@@ -1876,17 +1890,17 @@ impl StreamingWalReader {
                     page_no,
                     db_size
                 );
-                self.flush_pending_frames(&mut st);
+                self.flush_pending_frames(&mut st)?;
             }
             st.frame_idx += 1;
             pos += frame_size;
         }
-        pos
+        Ok(pos)
     }
 
-    fn flush_pending_frames(&self, state: &mut StreamingState) {
+    fn flush_pending_frames(&self, state: &mut StreamingState) -> Result<(), TryReserveError> {
         if state.pending_frames.is_empty() {
-            return;
+            return Ok(());
         }
         let wfs = self.wal_shared.read();
         {
@@ -1895,13 +1909,14 @@ impl StreamingWalReader {
                 // Only include frames up to last valid commit
                 frames.retain(|&f| f <= state.last_valid_frame);
                 if !frames.is_empty() {
-                    frame_cache.entry(page).or_default().extend(frames);
+                    frame_cache.entry(page).or_default().try_extend(frames)?;
                 }
             }
         }
         wfs.metadata
             .max_frame
             .store(state.last_valid_frame, Ordering::Release);
+        Ok(())
     }
 
     /// Finalizes the loading process
