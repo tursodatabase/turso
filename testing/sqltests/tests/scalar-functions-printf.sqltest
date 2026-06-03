@@ -763,6 +763,21 @@ expect {
     1
 }
 
+test printf-empty-format-null {
+    SELECT printf('') IS NULL;
+}
+expect {
+    1
+}
+
+test printf-empty-result-not-null-constraint {
+    CREATE TABLE printf_empty_not_null(x TEXT NOT NULL);
+    INSERT INTO printf_empty_not_null VALUES (printf('', NULL));
+}
+expect error {
+    NOT NULL constraint failed: printf_empty_not_null.x
+}
+
 test printf-format-blob {
     SELECT printf(X'414243');
 }

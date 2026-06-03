@@ -467,6 +467,41 @@ CREATE TYPE point AS STRUCT(x INT, y INT);
 CREATE TABLE t(data point) STRICT;
 ```
 
+## Array Types
+
+Array columns store ordered collections of values. Unlike STRUCT and UNION, arrays don't require an explicit CREATE TYPE — declare them by appending `[]` to any base type name in a STRICT table column definition:
+
+```sql
+CREATE TABLE sensors (
+    id INTEGER PRIMARY KEY,
+    readings REAL[],
+    labels TEXT[],
+    flags INTEGER[]
+) STRICT;
+
+INSERT INTO sensors VALUES (1, ARRAY[1.5, 2.5, 3.5], ARRAY['temp','humidity'], '[0, 1, 1]');
+
+SELECT readings[0], labels[1], array_length(flags) FROM sensors;
+-- 1.5|humidity|3
+```
+
+Multi-dimensional arrays use multiple bracket pairs:
+
+```sql
+CREATE TABLE matrices (
+    id INTEGER PRIMARY KEY,
+    data INTEGER[][]
+) STRICT;
+
+INSERT INTO matrices VALUES (1, ARRAY[ARRAY[1,2], ARRAY[3,4]]);
+SELECT data[1][0] FROM matrices;
+-- 3
+```
+
+Element types are validated on insert — an `INTEGER[]` column rejects values that cannot be stored as integers. Arrays are stored internally as compact record-format BLOBs and displayed as JSON arrays on output.
+
+For the full set of array functions (`array_agg`, `array_append`, `array_contains`, `array_slice`, etc.), operators (`@>`, `&&`, `||`), and subscript syntax, see [Array Functions](/docs/sql-reference/functions/array).
+
 ## Restrictions
 
 - **STRICT tables only**: Custom type names are ignored in non-STRICT tables. The column uses standard type affinity rules instead.
@@ -580,4 +615,6 @@ SELECT amount + tax FROM transactions;
 - [DROP TYPE](/docs/sql-reference/statements/drop-type) for removing custom types
 - [CREATE DOMAIN](/docs/sql-reference/statements/create-domain) for defining constrained type aliases without ENCODE/DECODE logic
 - [Data Types](/docs/sql-reference/data-types) for an overview of the type system and type affinity
+- [Array Types](/docs/sql-reference/data-types#array-types) for native array columns (`INTEGER[]`, `TEXT[]`, etc.)
+- [Array Functions](/docs/sql-reference/functions/array) for array construction, manipulation, and operators
 - [CREATE TABLE](/docs/sql-reference/statements/create-table) for STRICT table definitions

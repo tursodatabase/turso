@@ -1,0 +1,103 @@
+@database :memory:
+
+@cross-check-integrity
+test avg_large_integers_rounds_like_sqlite {
+    SELECT avg(x)
+    FROM (
+      SELECT 9007199254740994 AS x
+      UNION ALL
+      SELECT -9007199254740993
+    );
+}
+expect {
+    0.5
+}
+
+@cross-check-integrity
+test avg_large_integers_ignore_nulls {
+    SELECT avg(x)
+    FROM (
+      SELECT 9007199254740994 AS x
+      UNION ALL
+      SELECT NULL
+      UNION ALL
+      SELECT -9007199254740993
+    );
+}
+expect {
+    0.5
+}
+
+@cross-check-integrity
+test avg_i64_edge_pair_positive {
+    SELECT avg(x)
+    FROM (
+      SELECT 9223372036854775807 AS x
+      UNION ALL
+      SELECT -9223372036854775806
+    );
+}
+expect {
+    0.5
+}
+
+@cross-check-integrity
+test avg_i64_edge_pair_negative {
+    SELECT avg(x)
+    FROM (
+      SELECT -9223372036854775808 AS x
+      UNION ALL
+      SELECT 9223372036854775807
+    );
+}
+expect {
+    -0.5
+}
+
+@cross-check-integrity
+test avg_large_integer_mixed_with_real {
+    SELECT avg(x)
+    FROM (
+      SELECT 9007199254740994 AS x
+      UNION ALL
+      SELECT -9007199254740993.0
+    );
+}
+expect {
+    1.0
+}
+expect @js {
+    1
+}
+
+@cross-check-integrity
+test avg_large_integers_grouped {
+    WITH t(g, x) AS (
+      SELECT 1, 9007199254740994 UNION ALL
+      SELECT 1, -9007199254740993 UNION ALL
+      SELECT 2, 10 UNION ALL
+      SELECT 2, 20
+    )
+    SELECT g, avg(x) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    1|0.5
+    2|15.0
+}
+expect @js {
+    1|0.5
+    2|15
+}
+
+@cross-check-integrity
+test avg_infinite_cancellation_returns_null {
+    SELECT typeof(avg(x)), avg(x)
+    FROM (
+      SELECT '1e999' AS x
+      UNION ALL
+      SELECT '-1e999'
+    );
+}
+expect {
+    null|
+}

@@ -1,5 +1,6 @@
 use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
+use crate::alloc::TursoIteratorExt;
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
@@ -8,7 +9,10 @@ use crate::vdbe::builder::SelfTableContext;
 use crate::{
     ast, emit_explain,
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
-    schema::{BTreeTable, CheckConstraint, Index, ROWID_SENTINEL},
+    schema::{
+        collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Index,
+        EXPR_INDEX_SENTINEL, ROWID_SENTINEL,
+    },
     sync::Arc,
     translate::{
         display::format_eqp_detail,
@@ -768,6 +772,7 @@ fn emit_update_column_values<'a>(
             )?;
             program.emit_insn(Insn::MustBeInt {
                 reg: rowid_set_clause_reg,
+                target_pc: None,
             });
         }
     }
@@ -813,6 +818,7 @@ fn emit_update_column_values<'a>(
 
                     program.emit_insn(Insn::MustBeInt {
                         reg: rowid_set_clause_reg,
+                        target_pc: None,
                     });
 
                     program.emit_null(target_reg, None);
@@ -830,7 +836,8 @@ fn emit_update_column_values<'a>(
                         GeneratedType::NotGenerated => None,
                     };
 
-                    program.with_self_table_context(
+                    t_ctx.resolver.with_self_table_context(
+                        program,
                         self_table_context.as_ref(),
                         |program, _| {
                             // Save/restore target_union_type so union_value() resolves tags
@@ -1147,7 +1154,7 @@ fn emit_update_insns<'a>(
     let updated_column_indices: ColumnMask = set_clauses
         .iter()
         .map(|set_clause| set_clause.column_index)
-        .collect();
+        .try_collect()?;
     let has_any_update_triggers = if let Some(btree_table) = target_table.table.btree() {
         has_triggers_including_temp(
             &t_ctx.resolver,
@@ -1472,59 +1479,21 @@ fn emit_update_insns<'a>(
         )?;
     }
 
-    let mut deferred_new_key_plans = Vec::new();
+    // Build a complete NEW row image for FK code now, while the old cursor is
+    // still positioned. This is only data preparation. FK counters must not be
+    // touched yet because later CHECK/PK/UNIQUE conflict handling may still
+    // decide that `ON CONFLICT IGNORE` makes this row a no-op.
     if connection.foreign_keys_enabled() {
         let rowid_new_reg = effective_rowid_reg;
         if let Some(table_btree) = target_table.table.btree() {
-            let updated_set_columns: ColumnMask = set_clauses
-                .iter()
-                .filter_map(|set_clause| {
-                    (set_clause.column_index != ROWID_SENTINEL).then_some(set_clause.column_index)
-                })
-                .collect();
             stabilize_new_row_for_fk(
                 program,
                 &table_btree,
-                &updated_set_columns,
+                &updated_column_indices,
                 target_table_cursor_id,
                 start,
                 rowid_new_reg,
             )?;
-            // Child-side FK checks are deferred to AFTER custom type encoding (see below).
-            // This is because child FK checks probe the parent's index which contains
-            // encoded values, so the NEW values must also be encoded.
-
-            // Parent-side NO ACTION/RESTRICT checks must happen BEFORE the update.
-            // This checks that no child rows reference the old parent key values.
-            // CASCADE/SET NULL actions are fired AFTER the update (see below after Insert).
-            if t_ctx.resolver.with_schema(update_database_id, |s| {
-                s.any_resolved_fks_referencing(table_name)
-            }) {
-                let new_key_probe_mode = if any_effective_replace(
-                    program.flags.has_statement_conflict(),
-                    or_conflict,
-                    table_btree.rowid_alias_conflict_clause,
-                    indexes_to_update.iter().map(|idx| idx.on_conflict),
-                ) {
-                    ParentKeyNewProbeMode::AfterReplace
-                } else {
-                    ParentKeyNewProbeMode::BeforeWrite
-                };
-                deferred_new_key_plans = emit_fk_update_parent_actions(
-                    program,
-                    &table_btree,
-                    indexes_to_update.iter(),
-                    target_table_cursor_id,
-                    beg,
-                    start,
-                    rowid_new_reg,
-                    rowid_set_clause_reg,
-                    &updated_set_columns,
-                    new_key_probe_mode,
-                    update_database_id,
-                    &t_ctx.resolver,
-                )?;
-            }
         }
     }
 
@@ -1534,8 +1503,6 @@ fn emit_update_insns<'a>(
     // the end of the function.
     {
         let columns = target_table.table.columns();
-        t_ctx.resolver.self_table_column_affinities =
-            columns.iter().map(|c| c.affinity()).collect();
         for (idx, col) in columns.iter().enumerate() {
             t_ctx
                 .resolver
@@ -1552,12 +1519,35 @@ fn emit_update_insns<'a>(
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
     if let Table::BTree(ref btree) = target_table.table {
         let has_check_constraints = !btree.check_constraints.is_empty();
+        let cols = btree.columns();
+        let virtual_col_names: HashSet<String> = cols
+            .iter()
+            .filter(|c| c.is_virtual_generated())
+            .filter_map(|c| c.name.as_ref().map(|n| normalize_ident(n)))
+            .collect();
+        let expr_references_virtual = |expr: &ast::Expr| {
+            !virtual_col_names.is_empty()
+                && !collect_column_dependencies_of_expr(expr, cols).is_disjoint(&virtual_col_names)
+        };
+        let index_references_virtual_column = indexes_to_update.iter().any(|idx| {
+            idx.columns.iter().any(|col| {
+                if col.pos_in_table != EXPR_INDEX_SENTINEL {
+                    cols[col.pos_in_table].is_virtual_generated()
+                } else {
+                    col.expr.as_deref().is_some_and(expr_references_virtual)
+                }
+            }) || idx
+                .where_clause
+                .as_deref()
+                .is_some_and(expr_references_virtual)
+        });
 
         if update_affects_virtual_columns
             || has_before_triggers
             || has_after_triggers
             || has_returning
             || has_check_constraints
+            || index_references_virtual_column
         {
             let columns = target_table.table.columns();
 
@@ -1666,7 +1656,7 @@ fn emit_update_insns<'a>(
             let set_col_indices: ColumnMask = set_clauses
                 .iter()
                 .map(|set_clause| set_clause.column_index)
-                .collect();
+                .try_collect()?;
 
             // Pre-encode TypeCheck: validate SET column input types.
             // Non-SET columns hold encoded values from disk, so skip them (ANY).
@@ -1678,7 +1668,7 @@ fn emit_update_insns<'a>(
                     &btree_table,
                     t_ctx.resolver.schema(),
                     Some(&set_col_indices),
-                ),
+                )?,
             });
 
             // Encode only SET clause columns. Non-SET columns were read from disk
@@ -1759,27 +1749,6 @@ fn emit_update_insns<'a>(
                 skip_row_label,
                 Some(&check_constraint_tables),
             )?;
-        }
-    }
-
-    // Child-side FK checks must run AFTER custom type encoding so that NEW values
-    // being probed against the parent's index are encoded (matching the index contents).
-    if connection.foreign_keys_enabled() {
-        if let Some(table_btree) = target_table.table.btree() {
-            if t_ctx.resolver.schema().has_child_fks(table_name) {
-                emit_fk_child_update_counters(
-                    program,
-                    &table_btree,
-                    table_name,
-                    target_table_cursor_id,
-                    start,
-                    effective_rowid_reg,
-                    &affected_columns,
-                    update_database_id,
-                    &t_ctx.resolver,
-                    &layout,
-                )?;
-            }
         }
     }
 
@@ -1902,7 +1871,7 @@ fn emit_update_insns<'a>(
             .columns
             .iter()
             .map(|ic| {
-                if ic.expr.is_some() {
+                if ic.pos_in_table == EXPR_INDEX_SENTINEL {
                     Affinity::Blob.aff_mask()
                 } else {
                     target_table.table.columns()[ic.pos_in_table]
@@ -2077,49 +2046,126 @@ fn emit_update_insns<'a>(
     // PK REPLACE: when the new rowid conflicts with an existing row, delete it.
     // Runs AFTER Phase 1 (all index constraint checks) so that non-REPLACE index
     // constraints fire before this deletion, matching SQLite's ordering.
-    if target_table.table.btree().is_some() {
-        if updates_rowid && matches!(effective_rowid_alias_conflict, ResolveType::Replace) {
-            let target_reg = rowid_set_clause_reg.expect("rowid_set_clause_reg must be set");
-            let no_rowid_conflict_label = program.allocate_label();
-            let row_not_found_label = check_rowid_not_exists_label
-                .expect("check_rowid_not_exists_label must be set when rowid is updated");
+    if target_table.table.btree().is_some()
+        && updates_rowid
+        && matches!(effective_rowid_alias_conflict, ResolveType::Replace)
+    {
+        let target_reg = rowid_set_clause_reg.expect("rowid_set_clause_reg must be set");
+        let no_rowid_conflict_label = program.allocate_label();
+        let row_not_found_label = check_rowid_not_exists_label
+            .expect("check_rowid_not_exists_label must be set when rowid is updated");
 
-            // If the new rowid equals the old rowid, no conflict.
-            program.emit_insn(Insn::Eq {
-                lhs: target_reg,
-                rhs: beg,
-                target_pc: no_rowid_conflict_label,
-                flags: CmpInsFlags::default(),
-                collation: program.curr_collation(),
-            });
+        // If the new rowid equals the old rowid, no conflict.
+        program.emit_insn(Insn::Eq {
+            lhs: target_reg,
+            rhs: beg,
+            target_pc: no_rowid_conflict_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
 
-            // If a row with the new rowid doesn't exist, no conflict.
-            program.emit_insn(Insn::NotExists {
-                cursor: target_table_cursor_id,
-                rowid_reg: target_reg,
-                target_pc: no_rowid_conflict_label,
-            });
+        // If a row with the new rowid doesn't exist, no conflict.
+        program.emit_insn(Insn::NotExists {
+            cursor: target_table_cursor_id,
+            rowid_reg: target_reg,
+            target_pc: no_rowid_conflict_label,
+        });
 
-            emit_replace_delete(
-                program,
-                connection,
-                table_references,
-                &target_table,
-                target_table_cursor_id,
-                all_index_cursors,
-                target_reg,
-                Some((start, effective_rowid_reg)),
-                update_database_id,
-                t_ctx,
-            )?;
+        emit_replace_delete(
+            program,
+            connection,
+            table_references,
+            &target_table,
+            target_table_cursor_id,
+            all_index_cursors,
+            target_reg,
+            Some((start, effective_rowid_reg)),
+            update_database_id,
+            t_ctx,
+        )?;
 
-            // Re-seek to the row under update so Phase 2's old-image reads are correct.
-            program.preassign_label_to_next_insn(no_rowid_conflict_label);
-            program.emit_insn(Insn::NotExists {
-                cursor: target_table_cursor_id,
-                rowid_reg: beg,
-                target_pc: row_not_found_label,
-            });
+        // Re-seek to the row under update so Phase 2's old-image reads are correct.
+        program.preassign_label_to_next_insn(no_rowid_conflict_label);
+        program.emit_insn(Insn::NotExists {
+            cursor: target_table_cursor_id,
+            rowid_reg: beg,
+            target_pc: row_not_found_label,
+        });
+    }
+
+    // This is the first point where FK counter changes are safe:
+    //
+    // * `ON CONFLICT IGNORE` no-op paths for CHECK/PK/UNIQUE have already
+    //   jumped away. A skipped row must not increment or decrement the single
+    //   deferred FK counter.
+    // * No table or index entry has been rewritten yet. If an immediate FK
+    //   check fails, the statement can stop without leaving partial mutations
+    //   behind.
+    //
+    // Both parent-side and child-side FK checks below run against the
+    // pre-rewrite table image. Self-referential rows therefore need explicit
+    // handling: table scans see OLD values, while the NEW parent/child keys
+    // live in registers until the rewrite.
+    let mut deferred_new_key_plans = Vec::new();
+    if connection.foreign_keys_enabled() {
+        let rowid_new_reg = effective_rowid_reg;
+        if let Some(table_btree) = target_table.table.btree() {
+            // Parent-side checks scan child rows that point at the OLD parent
+            // key. Each match means this update may create a new violation:
+            // RESTRICT halts immediately, while NO ACTION increments the FK
+            // counter so the statement/transaction can fail later if nothing
+            // fixes it.
+            if t_ctx.resolver.with_schema(update_database_id, |s| {
+                s.any_resolved_fks_referencing(table_name)
+            }) {
+                let new_key_probe_mode = if any_effective_replace(
+                    program.flags.has_statement_conflict(),
+                    or_conflict,
+                    table_btree.rowid_alias_conflict_clause,
+                    indexes_to_update.iter().map(|idx| idx.on_conflict),
+                ) {
+                    ParentKeyNewProbeMode::AfterReplace
+                } else {
+                    ParentKeyNewProbeMode::BeforeWrite
+                };
+                deferred_new_key_plans = emit_fk_update_parent_actions(
+                    program,
+                    &table_btree,
+                    indexes_to_update.iter(),
+                    target_table_cursor_id,
+                    beg,
+                    start,
+                    rowid_new_reg,
+                    rowid_set_clause_reg,
+                    &updated_column_indices,
+                    new_key_probe_mode,
+                    update_database_id,
+                    &t_ctx.resolver,
+                )?;
+            }
+        }
+    }
+
+    // Child-side checks answer the opposite question: does the row's NEW child
+    // key have a parent? They also have to run after no-op conflict paths and
+    // before the physical rewrite, for the same counter and rollback reasons as
+    // the parent-side checks above.
+    if connection.foreign_keys_enabled() {
+        if let Some(table_btree) = target_table.table.btree() {
+            if t_ctx.resolver.schema().has_child_fks(table_name) {
+                emit_fk_child_update_counters(
+                    program,
+                    &table_btree,
+                    table_name,
+                    target_table_cursor_id,
+                    start,
+                    effective_rowid_reg,
+                    &affected_columns,
+                    update_database_id,
+                    &t_ctx.resolver,
+                    &layout,
+                )?;
+            }
         }
     }
 
@@ -2542,6 +2588,5 @@ fn emit_update_insns<'a>(
     program.preassign_label_to_next_insn(trigger_ignore_jump_label);
 
     t_ctx.resolver.register_affinities.clear();
-    t_ctx.resolver.self_table_column_affinities.clear();
     Ok(())
 }

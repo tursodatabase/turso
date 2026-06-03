@@ -31,7 +31,7 @@ fn validate_delete(
     // Check if this is a system table that should be protected from direct writes
     if !connection.is_nested_stmt()
         && !connection.is_mvcc_bootstrap_connection()
-        && crate::schema::is_system_table(tbl_name)
+        && !crate::schema::allow_user_dml(tbl_name)
     {
         crate::bail_parse_error!("table {tbl_name} may not be modified");
     }
@@ -68,6 +68,7 @@ fn validate_delete(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub fn translate_delete(
     tbl_name: &QualifiedName,
     resolver: &Resolver,
@@ -90,7 +91,7 @@ pub fn translate_delete(
     )?;
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
 
     let mut delete_plan = prepare_delete_plan(
         program,
@@ -175,6 +176,7 @@ pub fn translate_delete(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub fn prepare_delete_plan(
     program: &mut ProgramBuilder,
     resolver: &Resolver,

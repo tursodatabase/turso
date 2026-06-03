@@ -3,6 +3,7 @@ use turso_parser::ast;
 use crate::{
     function::AggFunc,
     schema::Table,
+    sync::Arc,
     translate::collate::CollationSeq,
     vdbe::{
         builder::ProgramBuilder,
@@ -180,10 +181,11 @@ pub(crate) fn emit_collseq_if_needed(
     program: &mut ProgramBuilder,
     referenced_tables: &TableReferences,
     expr: &ast::Expr,
+    resolver: &Resolver,
 ) {
     // Check if this is a column expression with explicit COLLATE clause
     if let ast::Expr::Collate(_, collation_name) = expr {
-        if let Ok(collation) = CollationSeq::new(collation_name.as_str()) {
+        if let Ok(collation) = resolver.resolve_collation(collation_name.as_str()) {
             program.emit_insn(Insn::CollSeq {
                 reg: None,
                 collation,
@@ -345,6 +347,9 @@ pub fn translate_aggregation_step(
     agg_arg_source: AggArgumentSource,
     target_register: usize,
     resolver: &Resolver,
+    // For `percentile_cont` / `percentile_disc`: register pre-evaluated by
+    // `InitLoop::emit`. `None` for any other aggregate.
+    fraction_reg: Option<usize>,
 ) -> Result<usize> {
     let num_args = agg_arg_source.num_args();
     let func = agg_arg_source.agg_func();
@@ -425,7 +430,7 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
-            emit_collseq_if_needed(program, referenced_tables, expr);
+            emit_collseq_if_needed(program, referenced_tables, expr, resolver);
             let comparator =
                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
             program.emit_insn(Insn::AggStep {
@@ -444,7 +449,7 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
-            emit_collseq_if_needed(program, referenced_tables, expr);
+            emit_collseq_if_needed(program, referenced_tables, expr, resolver);
             let comparator =
                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
             program.emit_insn(Insn::AggStep {
@@ -555,18 +560,63 @@ pub fn translate_aggregation_step(
             });
             target_register
         }
+        AggFunc::Mode => {
+            // Planner rewrites `mode() WITHIN GROUP (ORDER BY x)` to a single arg `[x]`.
+            if num_args != 1 {
+                crate::bail_parse_error!("mode bad number of arguments");
+            }
+            let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            // Activate the value's collation so finalize can sort text correctly.
+            let expr = &agg_arg_source.arg_at(0);
+            emit_collseq_if_needed(program, referenced_tables, expr, resolver);
+            program.emit_insn(Insn::AggStep {
+                acc_reg: target_register,
+                col: value_reg,
+                delimiter: 0,
+                func: AggFunc::Mode,
+                comparator: None,
+            });
+            target_register
+        }
+        AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+            // Planner rewrites `percentile_*(fraction) WITHIN GROUP (ORDER BY x)` to
+            // args `[x, fraction]`: the value goes in `col`, the fraction in `delimiter`.
+            // The fraction is evaluated and range-checked once before the row loop
+            // in `InitLoop::emit` — including the input-column / subquery rejection.
+            if num_args != 2 {
+                crate::bail_parse_error!("percentile bad number of arguments");
+            }
+            let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            let fraction_reg =
+                fraction_reg.expect("percentile fraction register must be set by InitLoop::emit");
+            let expr = &agg_arg_source.arg_at(0);
+            emit_collseq_if_needed(program, referenced_tables, expr, resolver);
+            program.emit_insn(Insn::AggStep {
+                acc_reg: target_register,
+                col: value_reg,
+                delimiter: fraction_reg,
+                func: func.clone(),
+                comparator: None,
+            });
+            target_register
+        }
         AggFunc::External(ref func) => {
-            let argc = func.agg_args().map_err(|_| {
+            let registered_argc = func.agg_args().map_err(|_| {
                 LimboError::ExtensionError(
                     "External aggregate function called with wrong number of arguments".to_string(),
                 )
             })?;
-            if argc != num_args {
+            if registered_argc >= 0 && registered_argc as usize != num_args {
                 crate::bail_parse_error!(
                     "External aggregate function called with wrong number of arguments"
                 );
             }
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            let argc = num_args;
+            let expr_reg = if argc == 0 {
+                0
+            } else {
+                agg_arg_source.translate(program, referenced_tables, resolver, 0)?
+            };
             for i in 0..argc {
                 if i != 0 {
                     let _ = agg_arg_source.translate(program, referenced_tables, resolver, i)?;
@@ -580,7 +630,11 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::External(func.clone()),
+                func: AggFunc::External(if registered_argc < 0 {
+                    Arc::new(func.with_aggregate_arg_count(num_args))
+                } else {
+                    func.clone()
+                }),
                 comparator: None,
             });
             target_register

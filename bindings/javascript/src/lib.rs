@@ -279,9 +279,11 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
                     "encryption" => core_opts.with_encryption(true),
                     "index_method" => core_opts.with_index_method(true),
                     "autovacuum" => core_opts.with_autovacuum(true),
+                    "vacuum" => core_opts.with_vacuum(true),
                     "attach" => core_opts.with_attach(true),
                     "generated_columns" => core_opts.with_generated_columns(true),
                     "multiprocess_wal" => core_opts.with_multiprocess_wal(true),
+                    "without_rowid" => core_opts.with_without_rowid(true),
                     _ => core_opts,
                 };
             }
@@ -528,6 +530,20 @@ impl Database {
     #[napi]
     pub fn total_changes(&self) -> napi::Result<i64> {
         Ok(self.conn()?.total_changes())
+    }
+
+    /// Returns whether the connection is currently inside a transaction.
+    ///
+    /// This is the inverse of `sqlite3_get_autocommit()`: a connection in
+    /// autocommit mode is not in a transaction. It reflects the connection's
+    /// real state, including transactions opened with a raw `BEGIN`.
+    ///
+    /// # Returns
+    ///
+    /// `true` if a transaction is open, `false` if in autocommit mode.
+    #[napi]
+    pub fn in_transaction(&self) -> napi::Result<bool> {
+        Ok(!self.conn()?.get_auto_commit())
     }
 
     /// Closes the database connection.
@@ -791,7 +807,8 @@ impl Statement {
             .borrow_mut()
             .as_mut()
             .ok_or_else(|| create_generic_error("statement has been finalized"))?
-            .bind_at(non_zero_idx, turso_value);
+            .bind_at(non_zero_idx, turso_value)
+            .map_err(|err| create_generic_error(&err.to_string()))?;
         Ok(())
     }
 

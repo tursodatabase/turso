@@ -939,6 +939,138 @@ expect {
     3|has_items
 }
 
+# Regression for #5806: a correlated EXISTS subquery on the target table
+# was evaluated row-by-row against a partially-updated image of the table,
+# causing later predicate checks to observe rows already incremented by
+# earlier iterations and miss matches that depended on the pre-update value.
+@cross-check-integrity
+test update-correlated-self-exists-where {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INT);
+    INSERT INTO t VALUES (1,1),(2,2),(3,3),(4,4),(5,5);
+
+    UPDATE t
+    SET v = v + 10
+    WHERE EXISTS (
+        SELECT 1 FROM t AS t2
+        WHERE t2.id = t.id - 1 AND t2.v < 3
+    );
+
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|12
+    3|13
+    4|4
+    5|5
+}
+
+# Same shape but using IN instead of EXISTS, to cover the other subquery
+# expression flavor that lands in non_from_clause_subqueries.
+@cross-check-integrity
+test update-correlated-self-in-where {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INT);
+    INSERT INTO t VALUES (1,1),(2,2),(3,3),(4,4),(5,5);
+
+    UPDATE t
+    SET v = v + 10
+    WHERE id IN (SELECT id + 1 FROM t WHERE v < 3);
+
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|12
+    3|13
+    4|4
+    5|5
+}
+
+# NOT IN against the target — must observe the pre-update image of t.
+@cross-check-integrity
+test update-correlated-self-not-in-where {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INT);
+    INSERT INTO t VALUES (1,1),(2,2),(3,3),(4,4),(5,5);
+
+    UPDATE t
+    SET v = v + 10
+    WHERE id NOT IN (SELECT id FROM t WHERE v >= 3);
+
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|11
+    2|12
+    3|3
+    4|4
+    5|5
+}
+
+# NOT EXISTS — parsed as NOT (EXISTS ...). The Exists subquery still lands
+# in non_from_clause_subqueries with origin DmlWhere.
+@cross-check-integrity
+test update-correlated-self-not-exists-where {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INT);
+    INSERT INTO t VALUES (1,1),(2,2),(3,3),(4,4),(5,5);
+
+    UPDATE t
+    SET v = v + 10
+    WHERE NOT EXISTS (
+        SELECT 1 FROM t AS t2
+        WHERE t2.id = t.id - 1 AND t2.v < 3
+    );
+
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|11
+    2|2
+    3|3
+    4|14
+    5|15
+}
+
+# Scalar comparison subquery — `x op (SELECT ...)` goes through Expr::Subquery.
+@cross-check-integrity
+test update-correlated-self-scalar-cmp-where {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INT);
+    INSERT INTO t VALUES (1,1),(2,2),(3,3),(4,4),(5,5);
+
+    UPDATE t
+    SET v = v + 10
+    WHERE v < (SELECT MAX(v) FROM t);
+
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|11
+    2|12
+    3|13
+    4|14
+    5|5
+}
+
+# Row-value subquery — `(a, b) = (SELECT a, b FROM ...)` also goes through
+# Expr::Subquery and must trigger the stable write set.
+@cross-check-integrity
+test update-correlated-self-rowvalue-where {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INT);
+    INSERT INTO t VALUES (1,1),(2,2),(3,3),(4,4),(5,5);
+
+    UPDATE t
+    SET v = v + 10
+    WHERE (id, v) = (SELECT id, v FROM t WHERE v = 2);
+
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|12
+    3|3
+    4|4
+    5|5
+}
+
 # Test UPDATE with NOT EXISTS subquery
 
 @cross-check-integrity

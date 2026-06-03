@@ -709,3 +709,22 @@ test compare-int-float-lt-negative-zero {
 expect {
     -1
 }
+
+# Regression: comparing a REAL column with an integer literal whose i64-to-f64
+# conversion lands on the same double as the column's stored value must still
+# preserve the original integer's precision. We were applying REAL affinity to
+# the literal (Numeric::Integer -> f64) before comparing, which collapsed the
+# integer onto the column's float and lied about equality. SQLite only applies
+# numeric affinity to TEXT operands here, leaving the int/real comparison to
+# the precise sqlite3IntFloatCompare path.
+test compare-real-vs-int-literal-int-precision {
+    CREATE TABLE t (c REAL);
+    INSERT INTO t VALUES (1367756182.0 * -1367756182);
+    SELECT c, c = -1870756973399217200, c < -1870756973399217200, c > -1870756973399217200 FROM t;
+}
+expect {
+    -1.87075697339922e+18|0|0|1
+}
+expect @js {
+    -1870756973399217200|0|0|1
+}

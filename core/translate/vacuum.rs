@@ -2,13 +2,14 @@
 
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::Insn;
-use crate::{bail_parse_error, Result};
+use crate::{bail_parse_error, Connection, Result};
+use crate::{sync::Arc, LimboError};
 use turso_parser::ast::{Expr, Literal, Name};
 
 /// Translate a VACUUM statement into VDBE bytecode.
 ///
-/// Currently only VACUUM INTO is supported. Plain VACUUM (which compacts
-/// the database in place) is not yet implemented.
+/// We have `VACUUM INTO`. The in-place `VACUUM` is experimental and gated
+/// behind the experimental vacuum feature flag.
 ///
 /// # Arguments
 /// * `program` - The program builder to emit instructions to
@@ -21,6 +22,7 @@ pub fn translate_vacuum(
     program: &mut ProgramBuilder,
     schema_name: Option<&Name>,
     into: Option<&Expr>,
+    connection: Arc<Connection>,
 ) -> Result<()> {
     let schema_name = schema_name.map_or_else(|| "main".to_string(), |n| n.as_str().to_string());
     match into {
@@ -34,10 +36,29 @@ pub fn translate_vacuum(
             Ok(())
         }
         None => {
-            // Plain VACUUM - not yet supported
-            bail_parse_error!(
-                "VACUUM is not supported yet. Use VACUUM INTO 'filename' to create a compacted copy."
-            );
+            if !connection.experimental_vacuum_enabled() {
+                return Err(LimboError::ParseError(
+                    "VACUUM is an experimental feature. Enable with --experimental-vacuum flag"
+                        .to_string(),
+                ));
+            }
+            if connection.experimental_multiprocess_wal_enabled() {
+                return Err(LimboError::ParseError(
+                    "VACUUM is incompatible with experimental multiprocess WAL".to_string(),
+                ));
+            }
+
+            // Schema-qualified VACUUM is not supported yet.
+            if schema_name != "main" {
+                bail_parse_error!(
+                    "VACUUM is only supported for the main database; schema '{}' is not supported yet",
+                    schema_name
+                );
+            }
+            program.emit_insn(Insn::Vacuum {
+                db: crate::MAIN_DB_ID,
+            });
+            Ok(())
         }
     }
 }

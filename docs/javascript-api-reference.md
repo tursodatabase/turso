@@ -48,6 +48,34 @@ Prepares a SQL statement for execution.
 
 The function returns a `Statement` object.
 
+#### batch(statements, [mode]) ⇒ object
+
+Executes an array of SQL statements over the connection. Each statement is either a SQL string or an object of the form `{ sql, args }`, where `args` is an array of positional bind parameters or an object of named bind parameters.
+
+| Param      | Type                                                                                                                | Description                                                                                                                                                       |
+| ---------- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| statements | <code>Array&lt;string \| { sql: string, args?: any[] \| Record&lt;string, any&gt; }&gt;</code>                      | The SQL statements to execute as a batch.                                                                                                                         |
+| mode       | <code>"deferred" \| "immediate" \| "exclusive" \| "concurrent"</code>                                               | Optional. When set, the batch is wrapped in `BEGIN <mode>` / `COMMIT` (with `ROLLBACK` on failure). Ignored when already inside a `transaction(...)` callback.    |
+
+Without a `mode`, `batch()` is not transactional: each statement runs in its own autocommit step, so a failure mid-batch leaves earlier successful statements committed. With a `mode`, the batch becomes atomic — on the serverless driver the entire batch (including `BEGIN`, the user statements, `COMMIT`, and a conditional `ROLLBACK`) ships as a single Hrana request, so an atomic batch is still one round-trip.
+
+When `mode` is set, `batch()` owns the surrounding `BEGIN`/`COMMIT`/`ROLLBACK`. Do not include transaction-control SQL (`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`) in `statements`; the input is not validated, and a user-supplied `COMMIT` will close the wrapper transaction mid-batch and leave earlier statements committed.
+
+For flexible all-or-nothing work that mixes `batch()` with other calls, wrap them in `transaction(...)` (or one of its `deferred`/`immediate`/`exclusive`/`concurrent` variants):
+
+```js
+const txn = db.transaction(async () => {
+  await db.batch([
+    { sql: "INSERT INTO users(name) VALUES (?)", args: ["Alice"] },
+    { sql: "INSERT INTO users(name) VALUES (?)", args: ["Bob"] },
+  ]);
+  await db.exec("UPDATE counters SET n = n + 1");
+});
+await txn.immediate();
+```
+
+The function returns an object with two properties: `rowsAffected` (the total number of rows affected by all statements) and `lastInsertRowid` (the `rowid` of the last successful insert, or `undefined` if the batch performed no inserts).
+
 #### transaction(function) ⇒ function
 
 This function is currently not supported.

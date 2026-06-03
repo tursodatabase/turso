@@ -1,7 +1,7 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 use super::{
-    collate::{get_expr_collation_ctx, CollationSeq},
+    collate::{get_expr_collation_ctx_with_symbols, CollationSeq},
     compound_select::emit_program_for_compound_select,
     emitter::{
         delete::emit_program_for_delete, select::emit_program_for_select,
@@ -22,10 +22,13 @@ use super::{
     trigger_exec::{get_triggers_including_temp, has_triggers_including_temp},
     window::WindowMetadata,
 };
+use crate::alloc::TursoIteratorExt;
 use crate::instrument;
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
+    EXPR_INDEX_SENTINEL,
 };
+use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::ColumnMask;
 use crate::vdbe::{
     affinity::Affinity,
@@ -150,15 +153,13 @@ pub struct Resolver<'a> {
     /// mechanism, but operates as a side-channel since limbo rewrites the AST rather
     /// than redirecting column reads at codegen time.
     pub register_affinities: HashMap<usize, Affinity>,
-    /// Column affinities for the SELF_TABLE context (DML expression index evaluation).
-    /// Indexed by table column position. Populated alongside `register_affinities`
-    /// so that `get_expr_affinity_info` can resolve `Expr::Column { SELF_TABLE }`
-    /// affinities when `referenced_tables` is `None`.
-    pub self_table_column_affinities: Vec<Affinity>,
     /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
     /// This lets comparison affinity follow SQLite rules for expressions like
     /// `(SELECT text_col FROM ...) > some_numeric_expr`.
     pub(crate) subquery_affinities: RefCell<HashMap<TableInternalId, ExprAffinityInfo>>,
+    /// Context and metadata for resolving Expr::Column values that use
+    /// [TableInternalId::SELF_TABLE] as a placeholder.
+    self_table_scope: RefCell<Option<SelfTableScope>>,
     pub enable_custom_types: bool,
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
@@ -180,6 +181,72 @@ pub struct Resolver<'a> {
     /// (e.g. via a nested sub-program), update this field on that
     /// path or switch to a live read.
     has_temp_schema: bool,
+    /// Foreign-key action programs currently being compiled by this resolver.
+    ///
+    /// This is shared with forked resolvers because `translate_inner` can fork
+    /// the resolver while compiling generated foreign-key action SQL. Without
+    /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
+    /// that its own action program is already being built.
+    pub(super) fk_action_compile_stack: FkActionCompileStack,
+}
+
+#[derive(Clone)]
+struct SelfTableScope {
+    context: SelfTableContext,
+    affinities: Option<Arc<[Affinity]>>,
+}
+
+impl SelfTableScope {
+    fn new(context: SelfTableContext) -> Self {
+        let affinities = match &context {
+            SelfTableContext::ForDML { table, .. } => Some(
+                table
+                    .columns()
+                    .iter()
+                    .map(|c| c.affinity_with_strict(table.is_strict))
+                    .collect(),
+            ),
+            SelfTableContext::ForSelect {
+                table_ref_id,
+                referenced_tables,
+            } => referenced_tables
+                .find_table_by_internal_id(*table_ref_id)
+                .and_then(|(_, table_ref)| table_ref.btree())
+                .map(|btree| {
+                    btree
+                        .columns()
+                        .iter()
+                        .map(|c| c.affinity_with_strict(btree.is_strict))
+                        .collect()
+                }),
+        };
+
+        Self {
+            context,
+            affinities,
+        }
+    }
+
+    fn affinity(&self, column: usize) -> Option<Affinity> {
+        self.affinities
+            .as_ref()
+            .and_then(|affinities| affinities.get(column).copied())
+    }
+
+    fn column_type_str(&self, column: usize) -> Option<String> {
+        match &self.context {
+            SelfTableContext::ForDML { table, .. } => {
+                table.columns().get(column).map(|c| c.ty_str.clone())
+            }
+            SelfTableContext::ForSelect {
+                table_ref_id,
+                referenced_tables,
+            } => referenced_tables
+                .find_table_by_internal_id(*table_ref_id)
+                .and_then(|(_, table_ref)| table_ref.columns().get(column))
+                .map(|c| c.ty_str.clone()),
+        }
+    }
 }
 
 /// Context for restricting table resolution during trigger subprogram compilation.
@@ -221,12 +288,13 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
-            self_table_column_affinities: Vec::new(),
             subquery_affinities: RefCell::new(HashMap::default()),
+            self_table_scope: RefCell::new(None),
             enable_custom_types,
             dqs_dml,
             trigger_context: None,
             has_temp_schema,
+            fk_action_compile_stack: FkActionCompileStack::default(),
         }
     }
 
@@ -249,12 +317,13 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
-            self_table_column_affinities: Vec::new(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
+            self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
+            fk_action_compile_stack: self.fk_action_compile_stack.clone(),
         }
     }
 
@@ -269,12 +338,13 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
             register_affinities: self.register_affinities.clone(),
-            self_table_column_affinities: self.self_table_column_affinities.clone(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
+            self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
+            fk_action_compile_stack: self.fk_action_compile_stack.clone(),
         }
     }
 
@@ -283,6 +353,50 @@ impl<'a> Resolver<'a> {
             crate::bail_parse_error!("{} require --experimental-custom-types flag", feature);
         }
         Ok(())
+    }
+
+    pub(crate) fn with_self_table_context<T>(
+        &self,
+        program: &mut ProgramBuilder,
+        ctx: Option<&SelfTableContext>,
+        f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> Result<T>,
+    ) -> Result<T> {
+        match ctx {
+            Some(ctx) => {
+                let scope = SelfTableScope::new(ctx.clone());
+                let prev = self.self_table_scope.borrow_mut().replace(scope);
+                let result = f(program, Some(ctx));
+                *self.self_table_scope.borrow_mut() = prev;
+                result
+            }
+            None => f(program, None),
+        }
+    }
+
+    pub(crate) fn with_existing_self_table_context<T>(
+        &self,
+        f: impl FnOnce(Option<&SelfTableContext>) -> Result<T>,
+    ) -> Result<T> {
+        let ctx = self
+            .self_table_scope
+            .borrow()
+            .as_ref()
+            .map(|scope| scope.context.clone());
+        f(ctx.as_ref())
+    }
+
+    pub(crate) fn self_table_affinity(&self, column: usize) -> Option<Affinity> {
+        self.self_table_scope
+            .borrow()
+            .as_ref()
+            .and_then(|scope| scope.affinity(column))
+    }
+
+    pub(crate) fn self_table_column_type_str(&self, column: usize) -> Option<String> {
+        self.self_table_scope
+            .borrow()
+            .as_ref()
+            .and_then(|scope| scope.column_type_str(column))
     }
 
     fn cached_non_main_schema(&self, database_id: usize) -> Arc<Schema> {
@@ -388,9 +502,20 @@ impl<'a> Resolver<'a> {
         needs_decode: bool,
         referenced_tables: &TableReferences,
     ) -> Result<()> {
-        let collation = get_expr_collation_ctx(expr.as_ref(), referenced_tables)?;
+        let collation = get_expr_collation_ctx_with_symbols(
+            expr.as_ref(),
+            referenced_tables,
+            Some(self.symbol_table),
+        )?;
         self.cache_expr_reg(expr, reg, needs_decode, collation);
         Ok(())
+    }
+
+    pub fn resolve_collation(&self, name: &str) -> Result<CollationSeq> {
+        if let Some(collation) = self.symbol_table.resolve_collation(name) {
+            return Ok(collation);
+        }
+        CollationSeq::new(name)
     }
 
     /// Returns the register, decode flag, and collation metadata for a previously translated expression.
@@ -421,20 +546,21 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    pub(crate) fn attached_database_ids_in_search_order(&self) -> BitSet {
-        self.attached_databases
+    pub(crate) fn attached_database_ids_in_search_order(&self) -> Result<BitSet> {
+        Ok(self
+            .attached_databases
             .read()
             .index_to_data
             .keys()
             .copied()
-            .collect()
+            .try_collect()?)
     }
 
     fn resolve_unqualified_existing_database_id<F>(
         &self,
         object_name: &str,
         schema_contains_object: F,
-    ) -> usize
+    ) -> Result<usize>
     where
         F: Fn(&Schema, &str) -> bool,
     {
@@ -446,24 +572,24 @@ impl<'a> Resolver<'a> {
                 schema_contains_object(schema, object_name)
             })
         {
-            return crate::TEMP_DB_ID;
+            return Ok(crate::TEMP_DB_ID);
         }
 
         if self.with_schema(crate::MAIN_DB_ID, |schema| {
             schema_contains_object(schema, object_name)
         }) {
-            return crate::MAIN_DB_ID;
+            return Ok(crate::MAIN_DB_ID);
         }
 
-        for database_id in self.attached_database_ids_in_search_order() {
+        for database_id in self.attached_database_ids_in_search_order()? {
             if self.with_schema(database_id, |schema| {
                 schema_contains_object(schema, object_name)
             }) {
-                return database_id;
+                return Ok(database_id);
             }
         }
 
-        crate::MAIN_DB_ID
+        Ok(crate::MAIN_DB_ID)
     }
 
     fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
@@ -516,20 +642,20 @@ impl<'a> Resolver<'a> {
                 return Ok(ctx.database_id);
             }
 
-            return Ok(self.resolve_unqualified_existing_database_id(
+            return self.resolve_unqualified_existing_database_id(
                 table_name,
                 Self::schema_has_table_like_object,
-            ));
+            );
         }
 
         if let Some(database_id) = Self::resolve_schema_table_database_id(table_name) {
             return Ok(database_id);
         }
 
-        Ok(self.resolve_unqualified_existing_database_id(
+        self.resolve_unqualified_existing_database_id(
             table_name,
             Self::schema_has_table_like_object,
-        ))
+        )
     }
 
     pub(crate) fn resolve_existing_index_database_id(
@@ -541,7 +667,7 @@ impl<'a> Resolver<'a> {
         }
 
         let index_name = normalize_ident(qualified_name.name.as_str());
-        Ok(self.resolve_unqualified_existing_database_id(&index_name, Self::schema_has_index))
+        self.resolve_unqualified_existing_database_id(&index_name, Self::schema_has_index)
     }
 
     pub(crate) fn resolve_existing_trigger_database_id(
@@ -553,7 +679,7 @@ impl<'a> Resolver<'a> {
         }
 
         let trigger_name = qualified_name.name.as_str();
-        Ok(self.resolve_unqualified_existing_database_id(trigger_name, Self::schema_has_trigger))
+        self.resolve_unqualified_existing_database_id(trigger_name, Self::schema_has_trigger)
     }
 
     /// Resolve database ID from a qualified name
@@ -913,6 +1039,7 @@ pub enum TransactionMode {
 /// Main entry point for emitting bytecode for a SQL query
 /// Takes a query plan and generates the corresponding bytecode program
 #[instrument(skip_all, level = tracing::Level::DEBUG)]
+#[turso_macros::trace_stack]
 pub fn emit_program(
     connection: &Arc<Connection>,
     resolver: &Resolver,
@@ -1218,7 +1345,9 @@ fn emit_cdc_insns_v1(
         cursor: cdc_cursor_id,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: InsertFlags::new()
+            .skip_last_rowid()
+            .skip_statement_change_count(),
         table_name: "".to_string(),
     });
     Ok(())
@@ -1357,7 +1486,9 @@ fn emit_cdc_insns_v2(
         cursor: cdc_cursor_id,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: InsertFlags::new()
+            .skip_last_rowid()
+            .skip_statement_change_count(),
         table_name: "".to_string(),
     });
     Ok(())
@@ -1443,7 +1574,9 @@ pub fn emit_cdc_commit_insns(
         cursor: cdc_cursor_id,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: InsertFlags::new()
+            .skip_last_rowid()
+            .skip_statement_change_count(),
         table_name: "".to_string(),
     });
     Ok(())
@@ -1524,6 +1657,7 @@ pub(crate) fn init_limit(
                         program.add_comment(program.offset(), "LIMIT counter");
                         program.emit_insn(Insn::MustBeInt {
                             reg: limit_ctx.reg_limit,
+                            target_pc: None,
                         });
                     }
                     _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
@@ -1532,7 +1666,10 @@ pub(crate) fn init_limit(
                     let r = limit_ctx.reg_limit;
 
                     _ = translate_expr(program, None, expr, r, &t_ctx.resolver)?;
-                    program.emit_insn(Insn::MustBeInt { reg: r });
+                    program.emit_insn(Insn::MustBeInt {
+                        reg: r,
+                        target_pc: None,
+                    });
                 }
             }
         }
@@ -1555,7 +1692,10 @@ pub(crate) fn init_limit(
                             value: value.into(),
                             dest: offset_reg,
                         });
-                        program.emit_insn(Insn::MustBeInt { reg: offset_reg });
+                        program.emit_insn(Insn::MustBeInt {
+                            reg: offset_reg,
+                            target_pc: None,
+                        });
                     }
                     _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
                 },
@@ -1564,7 +1704,10 @@ pub(crate) fn init_limit(
                 }
             }
             program.add_comment(program.offset(), "OFFSET counter");
-            program.emit_insn(Insn::MustBeInt { reg: offset_reg });
+            program.emit_insn(Insn::MustBeInt {
+                reg: offset_reg,
+                target_pc: None,
+            });
 
             let combined_reg = program.alloc_register();
             t_ctx.reg_limit_offset_sum = Some(combined_reg);
@@ -1616,8 +1759,8 @@ pub(crate) fn emit_columns_and_dependencies(
     let target_base = program.alloc_registers(targets.len());
     let extra_base = {
         let mut dependencies_not_in_targets: ColumnMask = dependencies.clone();
-        let target_mask = targets.iter().copied().collect();
-        dependencies_not_in_targets -= &target_mask;
+        let target_mask = targets.iter().copied().try_collect()?;
+        dependencies_not_in_targets.union_with(&target_mask)?;
 
         let extra_count = dependencies_not_in_targets.count();
 
@@ -1690,7 +1833,7 @@ pub(crate) fn emit_index_column_value_old_image(
             table_ref_id: table_internal_id,
             referenced_tables: table_references.clone(),
         };
-        program.with_self_table_context(Some(&self_table_context), |program, _| {
+        resolver.with_self_table_context(program, Some(&self_table_context), |program, _| {
             translate_expr_no_constant_opt(
                 program,
                 Some(table_references),
@@ -1701,6 +1844,16 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
+        // For virtual generated column references, apply the column's
+        // declared affinity to the computed expression result.
+        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
+            if let Some(table) = program.btree_table_from_cursor(table_cursor_id) {
+                let column = &table.columns()[idx_col.pos_in_table];
+                if column.is_virtual_generated() {
+                    program.emit_column_affinity(dest_reg, column.affinity());
+                }
+            }
+        }
     } else if let Some(generated_column) = generated_column(program, table_cursor_id, idx_col) {
         emit_table_column(
             program,

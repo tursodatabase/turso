@@ -84,3 +84,64 @@ test rename-column-partial-index-insert-after-rename {
 expect {
     1|hello
 }
+
+@cross-check-integrity
+test rename-column-updates-expression-index-key {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (a + 1);
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    SELECT sql FROM sqlite_schema WHERE type = 'index';
+}
+expect pattern {
+    CREATE INDEX idx ON t\s*\(a2\s*\+\s*1\)
+}
+
+@cross-check-integrity
+test rename-column-updates-expression-index-multi-column {
+    CREATE TABLE t (a, b, c);
+    CREATE INDEX idx ON t (a + b * 2);
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    SELECT sql FROM sqlite_schema WHERE type = 'index';
+}
+expect pattern {
+    CREATE INDEX idx ON t\s*\(a2\s*\+\s*b\s*\*\s*2\)
+}
+
+@cross-check-integrity
+test rename-column-expression-index-other-col-unchanged {
+    CREATE TABLE t (a, b, c);
+    CREATE INDEX idx ON t (b + 1);
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    SELECT sql FROM sqlite_schema WHERE type = 'index';
+}
+expect pattern {
+    CREATE INDEX idx ON t\s*\(b\s*\+\s*1\)
+}
+
+# Quoted-identifier round-trip: renaming a quoted column referenced inside an
+# expression-index key must re-emit the new name with proper quoting where
+# needed.
+@cross-check-integrity
+test rename-column-expression-index-quoted-ident {
+    CREATE TABLE t ("e" INT, b);
+    CREATE INDEX idx ON t ("e" + 1);
+    ALTER TABLE t RENAME COLUMN "e" TO "ee";
+    SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND sql LIKE '%ee%';
+}
+expect {
+    1
+}
+
+# a follow-up ALTER on the renamed column must keep
+# expression-index text consistent.
+@cross-check-integrity
+test rename-column-expression-index-then-rename-again {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (a + 1);
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    ALTER TABLE t RENAME COLUMN a2 TO a3;
+    SELECT sql FROM sqlite_schema WHERE type = 'index';
+}
+expect pattern {
+    CREATE INDEX idx ON t\s*\(a3\s*\+\s*1\)
+}

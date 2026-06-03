@@ -145,7 +145,6 @@ expect {
 }
 
 # TEXT column uses text comparison: '10' > '5' is false (lexicographic)
-@skip "TODO needs virtual column affinity handling"
 test gencol_comparison_affinity_text_integer {
     CREATE TABLE t1(a TEXT, b INTEGER AS (a > 5));
     INSERT INTO t1(a) VALUES('10'), ('3'), ('7');
@@ -157,7 +156,6 @@ expect {
     7|1
 }
 
-@skip "TODO needs virtual column affinity handling"
 test gencol_comparison_affinity_equals {
     CREATE TABLE t1(a TEXT, b INTEGER AS (a = 10));
     INSERT INTO t1(a) VALUES('10'), ('5');
@@ -168,7 +166,6 @@ expect {
     5|0
 }
 
-@skip "TODO needs virtual column affinity handling"
 test gencol_comparison_affinity_null {
     CREATE TABLE t1(a TEXT, b INTEGER AS (a > 5));
     INSERT INTO t1(a) VALUES(NULL), ('10');
@@ -179,7 +176,6 @@ expect {
     10|0
 }
 
-@skip "TODO needs virtual column affinity handling"
 test gencol_comparison_affinity_negative {
     CREATE TABLE t1(a TEXT, b INTEGER AS (a > -5));
     INSERT INTO t1(a) VALUES('-3'), ('-7'), ('0');
@@ -191,7 +187,6 @@ expect {
     0|1
 }
 
-@skip "TODO needs virtual column affinity handling"
 test gencol_comparison_affinity_real {
     CREATE TABLE t1(a TEXT, b INTEGER AS (a > 5.5));
     INSERT INTO t1(a) VALUES('6'), ('5'), ('5.5');
@@ -201,6 +196,156 @@ expect {
     6|1
     5|0
     5.5|0
+}
+
+test gencol_self_table_affinity_update_not_null {
+    CREATE TABLE t(a TEXT, g AS (CASE WHEN a=10 THEN NULL ELSE 1 END) NOT NULL);
+    INSERT INTO t(a) VALUES('x');
+    UPDATE t SET a='10';
+}
+expect error {
+    NOT NULL constraint failed: t.g
+}
+
+test gencol_self_table_affinity_create_index_population {
+    CREATE TABLE t(a TEXT, g INT GENERATED ALWAYS AS (a >= 10) VIRTUAL);
+    INSERT INTO t(a) VALUES('0');
+    CREATE INDEX idx_g ON t(g);
+    SELECT 'g1', a, g FROM t INDEXED BY idx_g WHERE g=1;
+    SELECT 'g0', a, g FROM t INDEXED BY idx_g WHERE g=0;
+}
+expect {
+    g0|0|0
+}
+
+test gencol_self_table_affinity_delete_index_maintenance {
+    CREATE TABLE t(a TEXT, v AS (a = 10) VIRTUAL);
+    CREATE INDEX i ON t(v);
+    INSERT INTO t(a) VALUES('10');
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    ok
+}
+
+test gencol_self_table_affinity_hash_join_payload {
+    CREATE TABLE b(k INT, a TEXT, g INT GENERATED ALWAYS AS (a = 5) VIRTUAL);
+    CREATE TABLE p(k INT);
+    INSERT INTO b VALUES(1, '5');
+    INSERT INTO p VALUES(1);
+    SELECT 'plain', g FROM b;
+    SELECT 'hash', b.g FROM b FULL OUTER JOIN p ON b.k = p.k;
+}
+expect {
+    plain|1
+    hash|1
+}
+
+test gencol_self_table_affinity_integrity_check_not_null {
+    CREATE TABLE t(
+        a TEXT,
+        b INT GENERATED ALWAYS AS (CASE WHEN a < 40 THEN 1 END) VIRTUAL NOT NULL
+    );
+    INSERT INTO t(a) VALUES('10');
+    SELECT a, b, typeof(b), a < 40 FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    10|1|integer|1
+    ok
+}
+
+test gencol_self_table_affinity_integrity_check_index {
+    CREATE TABLE t(a TEXT, g INT GENERATED ALWAYS AS (a < 2) VIRTUAL);
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('10');
+    SELECT a, g, typeof(g) FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    10|1|integer
+    ok
+}
+
+test gencol_self_table_affinity_update_returning_not_null {
+    CREATE TABLE t(a TEXT, g INT AS (CASE WHEN a=10 THEN 1 END) VIRTUAL NOT NULL);
+    INSERT INTO t(a) VALUES('10');
+    UPDATE t SET a='10' RETURNING a, g, typeof(g);
+}
+expect {
+    10|1|integer
+}
+
+test gencol_self_table_affinity_indexed_update_returning {
+    CREATE TABLE t(a TEXT, g INT AS (a = 10) VIRTUAL);
+    INSERT INTO t(a) VALUES('10'), ('5');
+    CREATE INDEX idx_g ON t(g);
+    UPDATE t INDEXED BY idx_g SET a='11' WHERE g=1 RETURNING a, g, typeof(g);
+    SELECT 'all', a, g FROM t ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    11|0|integer
+    all|11|0
+    all|5|0
+    ok
+}
+
+test gencol_self_table_affinity_indexed_delete_returning {
+    CREATE TABLE t(a TEXT, g INT AS (a = 10) VIRTUAL);
+    INSERT INTO t(a) VALUES('10'), ('5');
+    CREATE INDEX idx_g ON t(g);
+    DELETE FROM t INDEXED BY idx_g WHERE g=0 RETURNING a, g, typeof(g);
+    SELECT 'left', a, g FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    5|0|integer
+    left|10|1
+    ok
+}
+
+test gencol_self_table_affinity_insert_returning_index_integrity {
+    CREATE TABLE t(a TEXT, g INT AS (a = 10) VIRTUAL);
+    CREATE INDEX idx_g ON t(g);
+    INSERT INTO t(a) VALUES('10'), ('5') RETURNING a, g, typeof(g);
+    SELECT 'idx1', a, g FROM t INDEXED BY idx_g WHERE g=1;
+    SELECT 'idx0', a, g FROM t INDEXED BY idx_g WHERE g=0;
+    PRAGMA integrity_check;
+}
+expect {
+    10|1|integer
+    5|0|integer
+    idx1|10|1
+    idx0|5|0
+    ok
+}
+
+test gencol_trigger_when_generated_text_affinity {
+    CREATE TABLE t(a TEXT, g TEXT AS (a > 5) VIRTUAL);
+    CREATE TABLE log(ev TEXT, val TEXT);
+
+    CREATE TRIGGER bi BEFORE INSERT ON t WHEN NEW.g = 0 BEGIN INSERT INTO log VALUES('BI:new', NEW.g || ':' || typeof(NEW.g)); END;
+    CREATE TRIGGER ai AFTER INSERT ON t WHEN NEW.g = 0 BEGIN INSERT INTO log VALUES('AI:new', NEW.g || ':' || typeof(NEW.g)); END;
+    INSERT INTO t(a) VALUES('10');
+
+    CREATE TRIGGER bu_old BEFORE UPDATE ON t WHEN OLD.g = 0 BEGIN INSERT INTO log VALUES('BU:old', OLD.g || ':' || typeof(OLD.g)); END;
+    CREATE TRIGGER bu_new BEFORE UPDATE ON t WHEN NEW.g = 0 BEGIN INSERT INTO log VALUES('BU:new', NEW.g || ':' || typeof(NEW.g)); END;
+    CREATE TRIGGER au_old AFTER UPDATE ON t WHEN OLD.g = 0 BEGIN INSERT INTO log VALUES('AU:old', OLD.g || ':' || typeof(OLD.g)); END;
+    CREATE TRIGGER au_new AFTER UPDATE ON t WHEN NEW.g = 0 BEGIN INSERT INTO log VALUES('AU:new', NEW.g || ':' || typeof(NEW.g)); END;
+    UPDATE t SET a='10';
+
+    CREATE TRIGGER bd BEFORE DELETE ON t WHEN OLD.g = 0 BEGIN INSERT INTO log VALUES('BD:old', OLD.g || ':' || typeof(OLD.g)); END;
+    CREATE TRIGGER ad AFTER DELETE ON t WHEN OLD.g = 0 BEGIN INSERT INTO log VALUES('AD:old', OLD.g || ':' || typeof(OLD.g)); END;
+    DELETE FROM t;
+
+    SELECT COALESCE(group_concat(ev || '=' || val, ','), 'EMPTY') FROM log;
+}
+expect {
+    EMPTY
 }
 
 # --- Unary operators ---
@@ -1529,6 +1674,82 @@ expect {
     2|4|4
 }
 
+test gencol_tvf_comma_join_json_each_virtual_column {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    SELECT t1.a, t1.b FROM t1, json_each('[1,2,3]') je WHERE t1.a = je.value;
+}
+expect {
+    1|2
+    2|4
+    3|6
+}
+
+test gencol_tvf_comma_join_generate_series_virtual_column {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    SELECT t1.a, t1.b FROM t1, generate_series(1, 3) gs WHERE t1.a = gs.value;
+}
+expect {
+    1|2
+    2|4
+    3|6
+}
+
+test gencol_tvf_left_join_virtual_column {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    SELECT t1.b FROM generate_series(1,3) gs LEFT JOIN t1 ON gs.value = t1.a;
+}
+expect {
+    2
+    4
+    6
+}
+
+test gencol_tvf_first_comma_join_virtual_column {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    SELECT t1.b FROM generate_series(1,3) gs, t1 WHERE gs.value = t1.a;
+}
+expect {
+    2
+    4
+    6
+}
+
+test gencol_tvf_comma_join_base_column {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    SELECT t1.a FROM t1, json_each('[1,2,3]') je WHERE t1.a = je.value;
+}
+expect {
+    1
+    2
+    3
+}
+
+test gencol_tvf_left_join_virtual_column_table_first {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    SELECT t1.b FROM t1 LEFT JOIN generate_series(1,3) gs ON t1.a = gs.value;
+}
+expect {
+    2
+    4
+    6
+}
+
+test gencol_tvf_subquery_virtual_column {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    SELECT * FROM t1 WHERE b IN (SELECT value FROM json_each('[2,6]'));
+}
+expect {
+    1|2
+    3|6
+}
+
 test gencol_window_sum_partition {
     CREATE TABLE t1(a INTEGER, b TEXT, c AS (a % 2) VIRTUAL);
     INSERT INTO t1(a, b) VALUES(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
@@ -2335,6 +2556,40 @@ expect {
 
 @cross-check-integrity
 @skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_expr_index_virtual_update_returning_halloween {
+    CREATE TABLE t1(a INTEGER, g INT AS (a = 10) VIRTUAL);
+    CREATE INDEX idx_expr ON t1(g + 0);
+    INSERT INTO t1(a) VALUES(10), (5);
+    UPDATE t1 SET a = 11 WHERE g + 0 = 1 RETURNING a, g, g + 0;
+    SELECT 'all', a, g FROM t1 ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    11|0|0
+    all|5|0
+    all|11|0
+    ok
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_expr_index_virtual_update_transitive_halloween {
+    CREATE TABLE t1(a INTEGER, g INT AS (a = 10) VIRTUAL, h INT AS (g + 0) VIRTUAL);
+    CREATE INDEX idx_expr ON t1(h + 0);
+    INSERT INTO t1(a) VALUES(10), (5);
+    UPDATE t1 SET a = 11 WHERE h + 0 = 1 RETURNING a, g, h, h + 0;
+    SELECT 'all', a, g, h FROM t1 ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    11|0|0|0
+    all|5|0|0
+    all|11|0|0
+    ok
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_virtual_delete {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
     CREATE INDEX idx1 ON t1(b + 10);
@@ -2871,6 +3126,18 @@ expect {
     5|100
 }
 
+setup gencol_drop_virtual_setup {
+    CREATE TABLE t (a);
+    ALTER TABLE t ADD COLUMN b AS (a);
+    INSERT INTO t (a) VALUES (1), (2), (3);
+}
+
+@setup gencol_drop_virtual_setup
+@skip-if mvcc "MVCC updates sqlite_schema using Delete then Insert, so the snapshot is slightly different"
+snapshot gencol_drop_virtual_column_no_row_rewrite {
+    ALTER TABLE t DROP COLUMN b;
+}
+
 # Only non-generated column — rejected before dependency check
 test gencol_drop_only_regular_column_error {
     CREATE TABLE t1(a INT, b AS (a * 2));
@@ -3159,6 +3426,31 @@ test gencol_rename_column_other_table_matching_name_unaffected {
 }
 expect pattern {
     ^CREATE TABLE t2 ?\(a, z AS \(a \+ 1\)\)$
+}
+
+test rename_then_drop_keeps_renamed_column {
+    CREATE TABLE t (a REAL AS (e), c INTEGER, d BLOB, f INTEGER AS (c * e), e REAL);
+    ALTER TABLE t RENAME COLUMN e TO ee;
+    ALTER TABLE t DROP COLUMN d;
+    SELECT sql FROM sqlite_master WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (a REAL AS (ee), c INTEGER, f INTEGER AS (c * ee), ee REAL)
+}
+
+test gencol_drop_column_shifts_index_expr {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER, d INTEGER AS (b + c));
+    INSERT INTO t (a, b, c) VALUES (1, 10, 20);
+    CREATE INDEX idx ON t (d);
+    ALTER TABLE t DROP COLUMN a;
+    INSERT INTO t (b, c) VALUES (100, 200);
+    SELECT * FROM t ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    10|20|30
+    100|200|300
+    ok
 }
 
 # =============================================================================
@@ -4474,6 +4766,16 @@ test delete-using-indexed-virtual-column {
 } expect {
 }
 
+@cross-check-integrity
+test delete-indexed-virtual-generated-column-old-image {
+    CREATE TABLE t (c0 TEXT, c1 INTEGER AS (c2 + 1), c2 INTEGER);
+    CREATE INDEX i ON t (c1, c0);
+    DELETE FROM t WHERE c0 < 'X';
+    SELECT count(*) FROM t;
+} expect {
+    0
+}
+
 test update-with-virtual-column-before-pk {
     PRAGMA foreign_keys = ON;
     CREATE TABLE t(a AS (1), b, c, PRIMARY KEY (b));
@@ -4549,4 +4851,129 @@ test update-virtual-column-index-via-single-column-unique-index-scan {
     CREATE TABLE t (a, b, c UNIQUE, f UNIQUE AS (b));
     UPDATE t SET b = 42 WHERE c = 'x';
 } expect {
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol-virtual-union-tag-select-resolves-self-table-type {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(
+        id INT,
+        val number,
+        tag TEXT GENERATED ALWAYS AS (union_tag(val)) VIRTUAL
+    ) STRICT;
+    INSERT INTO tagged(id, val) VALUES (1, union_value('i', 42));
+    INSERT INTO tagged(id, val) VALUES (2, union_value('f', 3.5));
+    SELECT id, tag FROM tagged ORDER BY id;
+} expect {
+    1|i
+    2|f
+}
+
+@cross-check-integrity
+test update-covering-index-chained-virtual-gencol {
+    CREATE TABLE t (a, c, e AS (a), d AS (e));
+    INSERT INTO t (a, c) VALUES (1, 'aaa');
+    CREATE INDEX idx_t ON t (d, c);
+    UPDATE t SET c = 'bbb';
+    SELECT d, c FROM t INDEXED BY idx_t WHERE d = 1;
+    PRAGMA integrity_check;
+} expect {
+    1|bbb
+    ok
+}
+
+@cross-check-integrity
+test update-partial-index-where-references-virtual-gencol {
+    CREATE TABLE t (a, c, e AS (a));
+    INSERT INTO t (a, c) VALUES (1, 'aaa'), (-1, 'xxx');
+    CREATE INDEX idx_t ON t (c) WHERE e > 0;
+    UPDATE t SET c = c || c;
+    SELECT a, c FROM t INDEXED BY idx_t WHERE e > 0;
+    PRAGMA integrity_check;
+} expect {
+    1|aaaaaa
+    ok
+}
+
+@cross-check-integrity
+test update-expression-index-references-virtual-gencol {
+    CREATE TABLE t (a, c, e AS (a));
+    INSERT INTO t (a, c) VALUES (1, 'aaa'), (2, 'xxx');
+    CREATE INDEX idx_t ON t (e+0, c);
+    UPDATE t SET c = c || c;
+    SELECT a, c FROM t INDEXED BY idx_t WHERE e+0 = 1;
+    PRAGMA integrity_check;
+} expect {
+    1|aaaaaa
+    ok
+}
+
+@cross-check-integrity
+test gencol-virtual-affinity-applied-to-index {
+    CREATE TABLE t (a INTEGER, b INTEGER, v REAL AS (a + b));
+    INSERT INTO t (a, b) VALUES (5000000000000001, 5000000000000002);
+    INSERT INTO t (a, b) VALUES (1, 2);
+    CREATE INDEX idx_v ON t (v);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@cross-check-integrity
+test gencol-virtual-real-affinity-applied-to-index {
+    CREATE TABLE t (a INTEGER, b INTEGER, v REAL AS (a + b));
+    INSERT INTO t (a, b) VALUES (5000000000000001, 5000000000000002);
+    INSERT INTO t (a, b) VALUES (1, 2);
+    CREATE INDEX idx_v ON t (v);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@cross-check-integrity
+test gencol-update-old-image-real-affinity-applied-to-index {
+    CREATE TABLE t (
+        a INTEGER,
+        b INTEGER,
+        c BLOB,
+        v1 INTEGER AS (a + b),
+        v2 REAL AS (-a - v1)
+    );
+    CREATE INDEX i ON t (c, v1, v2);
+    INSERT INTO t (a, b, c) VALUES (-2929861166669336, -5586410532100113, X'0102');
+    UPDATE t SET c = X'0303';
+    SELECT a, b, quote(c), v1, v2 FROM t INDEXED BY i;
+    PRAGMA integrity_check;
+}
+expect {
+    -2929861166669336|-5586410532100113|X'0303'|-8516271698769449|1.14461328654388e+16
+    ok
+}
+expect @js {
+    -2929861166669336|-5586410532100113|X'0303'|-8516271698769449|11446132865438784
+    ok
+}
+
+# UPDATE with an OR-decomposed WHERE that mixes a virtual gencol
+# predicate and a unique-column range predicate
+test update-or-virtual-deferred-seek-no-panic-implicit-index {
+    CREATE TABLE t (a TEXT UNIQUE, b INTEGER AS (395) VIRTUAL);
+    INSERT INTO t (a) VALUES ('u1'), ('u2');
+    UPDATE t SET a = 'q' WHERE (b = 395 AND a = 'u1') OR (a < 'z');
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+test update-or-virtual-deferred-seek-no-panic-explicit-index {
+    CREATE TABLE t (a TEXT UNIQUE, b INTEGER AS (395) VIRTUAL);
+    CREATE INDEX t_idx ON t (a DESC, b DESC);
+    INSERT INTO t (a) VALUES ('u1'), ('u2');
+    UPDATE t SET a = 'q' WHERE (b = 395 AND a = 'u1') OR (a < 'z');
+}
+expect error {
+    UNIQUE constraint failed
 }

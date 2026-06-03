@@ -333,12 +333,6 @@ static int exec_sql_collect(TursoDb *tdb,
         /* Bind TCL variables to any parameters */
         bind_tcl_variables(interp, stmt);
 
-        /* reset the list for each non-empty statement so the caller
-           sees the results of the final one (matches SQLite tclsqlite behaviour) */
-        Tcl_DecrRefCount(result_list);
-        result_list = Tcl_NewListObj(0, NULL);
-        Tcl_IncrRefCount(result_list);
-
         int ncols = sqlite3_column_count(stmt);
 
         while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {

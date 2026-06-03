@@ -1,6 +1,6 @@
 [package]
 name = "turso_sdk_kit"
-description = "Turso SDK kit"
+description = "Low-level C ABI for building Turso language bindings. For Rust applications, use the `turso` crate instead."
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -24,6 +24,7 @@ turso_core = { workspace = true, features = [
     "io_uring",
     "experimental_win_iocp",
 ] }
+turso_ext = { workspace = true }
 turso_sdk_kit_macros = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }

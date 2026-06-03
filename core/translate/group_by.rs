@@ -20,7 +20,7 @@ use crate::translate::{
 use crate::{
     emit_explain,
     schema::PseudoCursorType,
-    translate::collate::{get_collseq_from_expr, CollationSeq},
+    translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq},
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -168,7 +168,11 @@ impl EmitGroupBy {
                 .zip(sort_order.iter())
                 .zip(group_by.nulls_order.iter())
                 .map(|((expr, ord), nulls)| {
-                    let collation = get_collseq_from_expr(expr, &plan.table_references)?;
+                    let collation = get_collseq_from_expr_with_symbols(
+                        expr,
+                        &plan.table_references,
+                        Some(t_ctx.resolver.symbol_table),
+                    )?;
                     Ok((*ord, collation, *nulls))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -641,7 +645,11 @@ pub fn group_by_process_single_group(
         .enumerate()
         .take(group_by.exprs.len())
     {
-        let maybe_collation = get_collseq_from_expr(&group_by.exprs[i], &plan.table_references)?;
+        let maybe_collation = get_collseq_from_expr_with_symbols(
+            &group_by.exprs[i],
+            &plan.table_references,
+            Some(t_ctx.resolver.symbol_table),
+        )?;
         c.collation = maybe_collation.unwrap_or_default();
     }
 
@@ -755,6 +763,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -809,6 +818,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -1016,6 +1026,12 @@ pub fn group_by_emit_row_phase<'a>(
 
     t_ctx.resolver.enable_expr_to_reg_cache();
 
+    // Disable constant optimization within the GROUP BY output subroutine.
+    // Constants hoisted to the init section would cause the IfPos jump
+    // (targeting label_agg_final) to land in the init block, which ends
+    // with Goto back to the start of the program, creating an infinite loop.
+    let span_idx = program.constant_spans_next_idx();
+
     if let Some(having) = &group_by.having {
         emit_non_from_clause_subqueries_for_phase(
             program,
@@ -1046,11 +1062,6 @@ pub fn group_by_emit_row_phase<'a>(
         }
     }
 
-    // Disable constant optimization within the GROUP BY output subroutine.
-    // Constants hoisted to the init section would cause the IfPos jump
-    // (targeting label_agg_final) to land in the init block, which ends
-    // with Goto back to the start of the program, creating an infinite loop.
-    let span_idx = program.constant_spans_next_idx();
     emit_non_from_clause_subqueries_for_phase(
         program,
         &t_ctx.resolver,

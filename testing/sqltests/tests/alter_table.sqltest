@@ -633,6 +633,72 @@ expect {
     20|2
 }
 
+# Renaming a parent column referenced by a child table's FOREIGN KEY must
+# rewrite the child table's stored CREATE TABLE text.
+test alter-table-rename-column-updates-sibling-fk-table-level {
+    CREATE TABLE p (id INTEGER PRIMARY KEY, ref_col INTEGER UNIQUE);
+    CREATE TABLE c (x INTEGER, y INTEGER, FOREIGN KEY (y) REFERENCES p (ref_col));
+    ALTER TABLE p RENAME COLUMN ref_col TO renamed_ref;
+    SELECT count(*) FROM sqlite_schema WHERE name = 'c' AND sql LIKE '%REFERENCES%p%renamed_ref%';
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test alter-table-rename-column-updates-sibling-fk-inline {
+    CREATE TABLE p (id INTEGER PRIMARY KEY, ref_col INTEGER UNIQUE);
+    CREATE TABLE c (x INTEGER, y INTEGER REFERENCES p (ref_col));
+    ALTER TABLE p RENAME COLUMN ref_col TO renamed_ref;
+    SELECT count(*) FROM sqlite_schema WHERE name = 'c' AND sql LIKE '%REFERENCES%p%renamed_ref%';
+}
+expect {
+    1
+}
+
+# After renaming, FK enforcement must use the new column. An INSERT into the
+# child referencing a value present in the parent's renamed column must
+# succeed; an absent value must still fail.
+@cross-check-integrity
+test alter-table-rename-column-sibling-fk-still-enforced {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY, ref_col INTEGER UNIQUE);
+    CREATE TABLE c (x INTEGER, y INTEGER REFERENCES p (ref_col));
+    INSERT INTO p VALUES (1, 100);
+    ALTER TABLE p RENAME COLUMN ref_col TO renamed_ref;
+    INSERT INTO c VALUES (1, 100);
+    SELECT * FROM c;
+}
+expect {
+    1|100
+}
+
+@cross-check-integrity
+test alter-table-rename-column-sibling-fk-violation-after-rename {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY, ref_col INTEGER UNIQUE);
+    CREATE TABLE c (x INTEGER, y INTEGER REFERENCES p (ref_col));
+    INSERT INTO p VALUES (1, 100);
+    ALTER TABLE p RENAME COLUMN ref_col TO renamed_ref;
+    INSERT INTO c VALUES (1, 999);
+}
+expect error {
+}
+
+# RENAME a referenced parent column then trigger the child table's CREATE TABLE
+# text to be re-emitted via an unrelated DROP COLUMN on the child.
+@cross-check-integrity
+test alter-table-rename-parent-col-then-drop-on-child-keeps-renamed-fk {
+    CREATE TABLE p (id INTEGER PRIMARY KEY, ref_col INTEGER UNIQUE);
+    CREATE TABLE c (x INTEGER, y INTEGER, z INTEGER, FOREIGN KEY (y) REFERENCES p (ref_col));
+    ALTER TABLE p RENAME COLUMN ref_col TO renamed_ref;
+    ALTER TABLE c DROP COLUMN z;
+    SELECT count(*) FROM sqlite_schema WHERE name = 'c' AND sql LIKE '%REFERENCES%p%renamed_ref%';
+}
+expect {
+    1
+}
+
 @cross-check-integrity
 test drop-column-removes-check-constraint {
     CREATE TABLE t_check (a INTEGER PRIMARY KEY, b REAL CHECK (b BETWEEN 0.0 AND 1000.0), c INTEGER NOT NULL);
@@ -853,6 +919,19 @@ test alter-table-drop-column-expr-index-unreferenced {
 }
 expect {
     1|bee
+}
+
+@cross-check-integrity
+test alter-table-drop-column-preserves-expression-index-sentinel {
+    CREATE TABLE t(a INTEGER, b INTEGER, c TEXT, d INTEGER);
+    CREATE INDEX i_expr ON t(a, date(c), c);
+    INSERT INTO t VALUES(1, 2, '2026-01-01', 3);
+    ALTER TABLE t DROP COLUMN b;
+    UPDATE t SET a = 5 WHERE c = '2026-01-01';
+    SELECT a, c, d FROM t;
+}
+expect {
+    5|2026-01-01|3
 }
 
 @cross-check-integrity
@@ -1223,6 +1302,72 @@ expect {
     t2
 }
 
+# https://github.com/tursodatabase/turso/issues/5838
+# Self-referential AFTER INSERT trigger that INSERTs back into its own table
+# must have its body rewritten on ALTER TABLE RENAME, otherwise the trigger
+# fires against the old name and BLOB/TEXT values land in the wrong columns.
+@cross-check-integrity
+test alter-table-rename-trigger-self-insert-sql-rewritten {
+    CREATE TABLE t1 (a TEXT, b BLOB, c INTEGER);
+    CREATE TRIGGER tr AFTER INSERT ON t1 FOR EACH ROW WHEN NEW.c < 2 BEGIN
+        INSERT INTO t1 (a, b, c) VALUES (NEW.a, NEW.b, NEW.c + 1);
+    END;
+    ALTER TABLE t1 RENAME TO t2;
+    SELECT sql FROM sqlite_schema WHERE type = 'trigger';
+}
+expect pattern {
+    CREATE TRIGGER tr AFTER INSERT ON "?t2"? FOR EACH ROW WHEN NEW\.c < 2 BEGIN\s+INSERT INTO "?t2"? \(a, b, c\) VALUES \(NEW\.a, NEW\.b, NEW\.c \+ 1\);?\s+END
+}
+
+# https://github.com/tursodatabase/turso/issues/5838
+# Same as above but checks runtime behavior: BLOB/TEXT values forwarded by
+# the trigger via NEW.* must land in the correct columns of the renamed table.
+@cross-check-integrity
+test alter-table-rename-trigger-self-insert-blob-text-binding {
+    CREATE TABLE t1 (a TEXT, b BLOB, c INTEGER);
+    CREATE TRIGGER tr AFTER INSERT ON t1 FOR EACH ROW WHEN NEW.c < 2 BEGIN
+        INSERT INTO t1 (a, b, c) VALUES (NEW.a, NEW.b, NEW.c + 1);
+    END;
+    ALTER TABLE t1 RENAME TO t2;
+    INSERT INTO t2 VALUES ('hello', X'DEADBEEF', 1);
+    SELECT rowid, quote(a), quote(b), quote(c) FROM t2 ORDER BY rowid;
+}
+expect {
+    1|'hello'|X'DEADBEEF'|1
+    2|'hello'|X'DEADBEEF'|2
+}
+
+# https://github.com/tursodatabase/turso/issues/5838
+# Wide-row variant of the regression: when the trigger body mixes NEW.col
+# references with literal BLOB/TEXT/INT values across many columns, every
+# value must land in its declared column after the table rename. This is
+# the exact misbinding pattern the differential fuzzer reduced to issue 5838.
+@cross-check-integrity
+test alter-table-rename-trigger-self-insert-wide-row {
+    CREATE TABLE wide (
+        c1 TEXT, c2 BLOB, c3 INTEGER, c4 REAL, c5 BLOB,
+        c6 TEXT, c7 INTEGER, c8 BLOB, c9 TEXT, c10 INTEGER
+    );
+    CREATE TRIGGER tr AFTER INSERT ON wide FOR EACH ROW WHEN NEW.c10 = 0 BEGIN
+        INSERT INTO wide (c1, c2, c3, c4, c5, c6, c7, c8, c9, c10) VALUES
+            (NEW.c1, NEW.c2, NEW.c3, NEW.c4, NEW.c5,
+             NEW.c6, NEW.c7, NEW.c8, NEW.c9, NEW.c10 + 1);
+    END;
+    ALTER TABLE wide RENAME TO wide2;
+    INSERT INTO wide2 VALUES (
+        'tx1', X'AA', 100, 1.5, X'BB',
+        'tx2', 200, X'CC', 'tx3', 0
+    );
+    SELECT rowid,
+           quote(c1), quote(c2), quote(c3), quote(c4), quote(c5),
+           quote(c6), quote(c7), quote(c8), quote(c9), quote(c10)
+    FROM wide2 ORDER BY rowid;
+}
+expect {
+    1|'tx1'|X'AA'|100|1.5|X'BB'|'tx2'|200|X'CC'|'tx3'|0
+    2|'tx1'|X'AA'|100|1.5|X'BB'|'tx2'|200|X'CC'|'tx3'|1
+}
+
 # --- Trigger rewriting for ALTER TABLE RENAME COLUMN ---
 
 # Verify trigger fires after column rename (NEW refs updated)
@@ -1466,6 +1611,247 @@ test alter-table-rename-column-cross-table-insert {
 }
 expect {
     500
+}
+
+# https://github.com/tursodatabase/turso/issues/6332
+# Per SQLite's ORDER BY resolution rules, a bare identifier that matches
+# an output column alias refers to that alias, not to a FROM column. So
+# renaming src.b -> src.c must leave the trigger's `ORDER BY b` alone,
+# keeping the result ordered by the alias for src.a.
+test alter-table-rename-column-trigger-order-by-alias {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    INSERT INTO src VALUES (2, 100), (1, 200);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT a AS b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1);
+    SELECT group_concat(v, '|') FROM log;
+}
+expect {
+    1|2
+}
+
+# The stored trigger SQL must also preserve the alias name `b` in ORDER BY
+# (not rewrite it to `c`), since the alias-resolution rule means it never
+# referred to the renamed table column to begin with.
+test alter-table-rename-column-trigger-order-by-alias-stored-sql {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT a AS b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig';
+}
+expect pattern {
+    CREATE TRIGGER trig AFTER INSERT ON dst\s+BEGIN\s+INSERT INTO log SELECT a AS b FROM src ORDER BY b;?\s+END
+}
+
+# Compound SELECT: SQLite resolves a compound's ORDER BY alias by searching
+# every arm in order, so `ORDER BY b` matches the alias introduced in the
+# second arm and must be preserved across a column rename — even though the
+# first arm has no `b` alias.
+test alter-table-rename-column-trigger-order-by-alias-compound {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT a FROM src UNION ALL SELECT a AS b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig';
+}
+expect pattern {
+    CREATE TRIGGER trig AFTER INSERT ON dst\s+BEGIN\s+INSERT INTO log SELECT a FROM src UNION ALL SELECT a AS b FROM src ORDER BY b;?\s+END
+}
+
+# Counter-case: when the ORDER BY bare identifier does not match an output
+# column alias, it is a normal FROM-clause column reference and must be
+# rewritten consistently with the column rename.
+test alter-table-rename-column-trigger-order-by-not-alias {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    INSERT INTO src VALUES (2, 100), (1, 200);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT a FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1);
+    SELECT group_concat(v, '|') FROM log;
+}
+expect {
+    2|1
+}
+
+# Bare-column result column (no explicit AS) carries an implicit column-name
+# alias in the AST. That implicit alias is NOT a user-provided alias — it
+# tracks the original expression text. SQLite rewrites both the result column
+# and the ORDER BY ref consistently in this case, and so must we. Only an
+# explicit `AS x` (or its elided form) blocks the ORDER BY rewrite.
+test alter-table-rename-column-trigger-order-by-implicit-alias {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    INSERT INTO src VALUES (10, 1), (20, 2);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES (1);
+    SELECT group_concat(v, '|') FROM log;
+}
+expect {
+    1|2
+}
+
+# Stored SQL form of the implicit-alias case: both the result column and the
+# ORDER BY identifier must be rewritten from `b` to `c`.
+test alter-table-rename-column-trigger-order-by-implicit-alias-stored-sql {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig';
+}
+expect pattern {
+    CREATE TRIGGER trig AFTER INSERT ON dst\s+BEGIN\s+INSERT INTO log SELECT c FROM src ORDER BY c;?\s+END
+}
+
+# Qualified result column whose column-half matches the renamed column. The
+# ORDER BY bare identifier does not refer to a user-provided alias and must
+# be rewritten alongside both the result column and the FROM-clause column.
+test alter-table-rename-column-trigger-order-by-qualified-result-col {
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS dst;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE src (a, b);
+    CREATE TABLE dst (x);
+    CREATE TABLE log (v);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT src.b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig';
+}
+expect pattern {
+    CREATE TRIGGER trig AFTER INSERT ON dst\s+BEGIN\s+INSERT INTO log SELECT src\.c FROM src ORDER BY c;?\s+END
+}
+
+# Round-trip rename: renaming away and back must restore the original column
+# name in the stored trigger SQL (issue #6625). Previously the in-memory
+# trigger.sql was not refreshed after a column rename, so the second rename
+# saw the stale (pre-rename) text and made no change.
+@cross-check-integrity
+test alter-table-rename-column-trigger-round-trip-stored-sql {
+    CREATE TABLE log (msg TEXT);
+    CREATE TABLE core (id TEXT UNIQUE, row_rank TEXT UNIQUE);
+    CREATE TRIGGER core_ai AFTER INSERT ON core BEGIN
+        INSERT INTO log VALUES (NEW.id || ':' || NEW.row_rank);
+    END;
+    ALTER TABLE core RENAME COLUMN row_rank TO row_rank2;
+    ALTER TABLE core RENAME COLUMN row_rank2 TO row_rank;
+    SELECT sql FROM sqlite_schema WHERE name = 'core_ai';
+}
+expect pattern {
+    CREATE TRIGGER core_ai AFTER INSERT ON core\s+BEGIN\s+INSERT INTO log VALUES\s*\(NEW\.id \|\| ':' \|\| NEW\.row_rank\);?\s+END
+}
+
+# Round-trip rename: WHEN clause column references must also be restored.
+@cross-check-integrity
+test alter-table-rename-column-trigger-round-trip-when-clause {
+    CREATE TABLE log (v);
+    CREATE TABLE t1 (a, b);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 WHEN NEW.b > 0 BEGIN
+        INSERT INTO log VALUES (NEW.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO b2;
+    ALTER TABLE t1 RENAME COLUMN b2 TO b;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 WHEN NEW\.b > 0\s+BEGIN\s+INSERT INTO log VALUES\s*\(NEW\.b\);?\s+END
+}
+
+# Round-trip rename: UPDATE OF column list must also be restored.
+@cross-check-integrity
+test alter-table-rename-column-trigger-round-trip-update-of {
+    CREATE TABLE log (v);
+    CREATE TABLE t1 (a, b);
+    CREATE TRIGGER trig1 AFTER UPDATE OF b ON t1 BEGIN
+        INSERT INTO log VALUES (NEW.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO b2;
+    ALTER TABLE t1 RENAME COLUMN b2 TO b;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER UPDATE OF b ON t1\s+BEGIN\s+INSERT INTO log VALUES\s*\(NEW\.b\);?\s+END
+}
+
+# Round-trip rename: subsequent inserts must fire the trigger correctly.
+# Without the fix, the stored trigger SQL persists the intermediate name
+# (row_rank2), so reopening the database -- or any code path that recompiles
+# the trigger from the stored SQL -- would fail with "no such column: row_rank2".
+@cross-check-integrity
+test alter-table-rename-column-trigger-round-trip-fires {
+    CREATE TABLE log (msg TEXT);
+    CREATE TABLE core (id TEXT UNIQUE, row_rank TEXT UNIQUE);
+    CREATE TRIGGER core_ai AFTER INSERT ON core BEGIN
+        INSERT INTO log VALUES (NEW.id || ':' || NEW.row_rank);
+    END;
+    INSERT INTO core(id, row_rank) VALUES ('i-001', 'A001');
+    ALTER TABLE core RENAME COLUMN row_rank TO row_rank2;
+    ALTER TABLE core RENAME COLUMN row_rank2 TO row_rank;
+    INSERT INTO core(id, row_rank) VALUES ('i-002', 'A002');
+    SELECT msg FROM log ORDER BY rowid;
+}
+expect {
+    i-001:A001
+    i-002:A002
+}
+
+# Multi-hop rename A -> B -> C -> A: confirms the in-memory trigger.sql
+# refresh works for arbitrary chains, not just a single round trip.
+@cross-check-integrity
+test alter-table-rename-column-trigger-multi-hop-rename {
+    CREATE TABLE log (v);
+    CREATE TABLE t1 (a, b);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log VALUES (NEW.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO b2;
+    ALTER TABLE t1 RENAME COLUMN b2 TO b3;
+    ALTER TABLE t1 RENAME COLUMN b3 TO b;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON t1\s+BEGIN\s+INSERT INTO log VALUES\s*\(NEW\.b\);?\s+END
 }
 
 test alter-table-rename-column-temp-trigger-main-cross-table {

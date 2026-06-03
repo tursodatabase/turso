@@ -20,7 +20,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
@@ -34,7 +34,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
@@ -54,7 +54,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
@@ -73,7 +73,7 @@ jobs:
       run:
         working-directory: bindings/javascript
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
@@ -105,7 +105,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"

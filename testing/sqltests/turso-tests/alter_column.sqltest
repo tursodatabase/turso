@@ -632,3 +632,88 @@ expect {
     integer|1
     integer|2
 }
+
+# Issue #6624: Turning a virtual generated column into a regular column shifts
+# the on-disk row layout (a new physical slot is added). Existing rows must be
+# rewritten so the new schema's column indexes align with stored data, and
+# secondary indexes must remain consistent with the rewritten table.
+test alter-column-virtual-to-regular-rewrites-rows {
+    CREATE TABLE core (
+        id TEXT UNIQUE,
+        x TEXT AS (id || ':' || row_rank),
+        row_rank TEXT UNIQUE
+    );
+    INSERT INTO core(id, row_rank) VALUES('i-001','A001'),('i-002','A002');
+    ALTER TABLE core ALTER COLUMN x TO x2 TEXT;
+    INSERT INTO core(x2, id, row_rank) VALUES('x3','i-003','A003');
+    SELECT id, row_rank, x2 FROM core NOT INDEXED ORDER BY rowid;
+    SELECT row_rank FROM core INDEXED BY sqlite_autoindex_core_2 ORDER BY row_rank;
+    PRAGMA integrity_check;
+}
+expect {
+    i-001|A001|
+    i-002|A002|
+    i-003|A003|x3
+    A001
+    A002
+    A003
+    ok
+}
+
+# Same scenario as above under MVCC mode.
+test alter-column-virtual-to-regular-rewrites-rows-mvcc {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE core (
+        id TEXT UNIQUE,
+        x TEXT AS (id || ':' || row_rank),
+        row_rank TEXT UNIQUE
+    );
+    BEGIN;
+    INSERT INTO core(id, row_rank) VALUES('i-001','A001'),('i-002','A002');
+    COMMIT;
+    ALTER TABLE core ALTER COLUMN x TO x2 TEXT;
+    INSERT INTO core(x2, id, row_rank) VALUES('x3','i-003','A003');
+    SELECT id, row_rank, x2 FROM core NOT INDEXED ORDER BY rowid;
+    SELECT row_rank FROM core INDEXED BY sqlite_autoindex_core_2 ORDER BY row_rank;
+}
+expect {
+    mvcc
+    i-001|A001|
+    i-002|A002|
+    i-003|A003|x3
+    A001
+    A002
+    A003
+}
+
+# Rewriting must use the original physical layout when reading source columns.
+# With a virtual column at index 1, reading row_rank by its new logical index
+# (2) used to land on the wrong stored slot.
+test alter-column-virtual-to-regular-preserves-trailing-columns {
+    CREATE TABLE t (a TEXT, b TEXT AS (a || '_x'), c TEXT, d INTEGER);
+    INSERT INTO t(a, c, d) VALUES('aa','cc',1),('aaa','ccc',2);
+    ALTER TABLE t ALTER COLUMN b TO b2 TEXT;
+    SELECT a, b2, c, d FROM t ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    aa||cc|1
+    aaa||ccc|2
+    ok
+}
+
+# Reverse direction: regular -> virtual generated. The column that previously
+# held a stored value must be removed from the row record, and trailing
+# columns must keep their values.
+test alter-column-regular-to-virtual-rewrites-rows {
+    CREATE TABLE t (a TEXT UNIQUE, b TEXT, c TEXT);
+    INSERT INTO t VALUES('a1','b1','c1'),('a2','b2','c2');
+    ALTER TABLE t ALTER COLUMN b TO b2 TEXT GENERATED ALWAYS AS (a || c) VIRTUAL;
+    SELECT a, b2, c FROM t ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    a1|a1c1|c1
+    a2|a2c2|c2
+    ok
+}

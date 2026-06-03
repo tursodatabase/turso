@@ -1,3 +1,4 @@
+use crate::alloc::TursoFromIterator;
 use crate::function::{Deterministic, Func};
 use crate::incremental::view::IncrementalView;
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, operator::create_dbsp_state_index};
@@ -620,6 +621,8 @@ pub enum SchemaObjectType {
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
+    #[cfg(feature = "conn_raw_api")]
+    pub(crate) table_names_by_root_page: HashMap<i64, String>,
 
     /// Track which tables are actually materialized views
     pub materialized_view_names: HashSet<String>,
@@ -739,6 +742,8 @@ impl Schema {
 
     pub fn with_options(enable_custom_types: bool) -> crate::Result<Self> {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
+        #[cfg(feature = "conn_raw_api")]
+        let mut table_names_by_root_page = HashMap::default();
         let has_indexes = HashSet::default();
         let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
         #[allow(clippy::arc_with_non_send_sync)]
@@ -746,6 +751,8 @@ impl Schema {
             SCHEMA_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(sqlite_schema_table().into())),
         );
+        #[cfg(feature = "conn_raw_api")]
+        table_names_by_root_page.insert(1, SCHEMA_TABLE_NAME.to_string());
         for function in VirtualTable::builtin_functions(enable_custom_types) {
             tables.insert(
                 function.name.to_owned(),
@@ -765,6 +772,8 @@ impl Schema {
         }
         Ok(Self {
             tables,
+            #[cfg(feature = "conn_raw_api")]
+            table_names_by_root_page,
             materialized_view_names,
             materialized_view_sql,
             incremental_views,
@@ -949,6 +958,8 @@ impl Schema {
         let name = normalize_ident(view.name());
 
         // Add to tables (so it appears as a regular table)
+        #[cfg(feature = "conn_raw_api")]
+        self.register_table_root_page(&name, table.as_ref());
         self.tables.insert(name.clone(), table);
 
         // Track that this is a materialized view
@@ -1004,11 +1015,11 @@ impl Schema {
             Ok(())
         } else if self.materialized_view_names.contains(&name) {
             // Remove from tables
-            self.tables.remove(&name);
+            self.remove_table(&name);
 
             // Remove DBSP state table and its indexes from in-memory schema
             let dbsp_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{name}");
-            self.tables.remove(&dbsp_table_name);
+            self.remove_table(&dbsp_table_name);
             self.remove_indices_for_table(&dbsp_table_name);
 
             // Remove from materialized view tracking
@@ -1169,6 +1180,9 @@ impl Schema {
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
         self.check_object_name_conflict(&table.name)?;
         let name = normalize_ident(&table.name);
+        #[cfg(feature = "conn_raw_api")]
+        self.table_names_by_root_page
+            .insert(table.root_page, name.clone());
         self.tables.insert(name, Table::BTree(table).into());
         Ok(())
     }
@@ -1185,15 +1199,46 @@ impl Schema {
         self.tables.get(&name).cloned()
     }
 
+    #[cfg(feature = "conn_raw_api")]
+    pub fn table_name_for_root_page(&self, root_page: i64) -> Option<&str> {
+        self.table_names_by_root_page
+            .get(&root_page)
+            .map(String::as_str)
+    }
+
     pub fn remove_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
-        self.tables.remove(&name);
+        #[cfg(feature = "conn_raw_api")]
+        {
+            if let Some(table) = self.tables.remove(&name) {
+                self.unregister_table_root_page(&table);
+            }
+        }
+        #[cfg(not(feature = "conn_raw_api"))]
+        {
+            self.tables.remove(&name);
+        }
         self.analyze_stats.remove_table(&name);
 
         // If this was a materialized view, also clean up the metadata
         if self.materialized_view_names.remove(&name) {
             self.incremental_views.remove(&name);
             self.materialized_view_sql.remove(&name);
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn register_table_root_page(&mut self, name: &str, table: &Table) {
+        if let Table::BTree(table) = table {
+            self.table_names_by_root_page
+                .insert(table.root_page, normalize_ident(name));
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn unregister_table_root_page(&mut self, table: &Table) {
+        if let Table::BTree(table) = table {
+            self.table_names_by_root_page.remove(&table.root_page);
         }
     }
 
@@ -1470,7 +1515,14 @@ impl Schema {
         for unparsed_sql_from_index in from_sql_indexes {
             let table = self
                 .get_btree_table(&unparsed_sql_from_index.table_name)
-                .unwrap();
+                .ok_or_else(|| {
+                    LimboError::Corrupt(format!(
+                        "sqlite_schema contains index for missing table '{}': rootpage={} sql={}",
+                        unparsed_sql_from_index.table_name,
+                        unparsed_sql_from_index.root_page,
+                        unparsed_sql_from_index.sql
+                    ))
+                })?;
             let index = Index::from_sql(
                 syms,
                 &unparsed_sql_from_index.sql,
@@ -1488,7 +1540,12 @@ impl Schema {
             // The SQL statement parser enforces that the column definitions come first, and compounds are defined after that,
             // e.g. CREATE TABLE t (a, b, UNIQUE(a, b)), and you can't do something like CREATE TABLE t (a, b, UNIQUE(a, b), c);
             // Hence, we can process the singles first (unique_set.columns.len() == 1), and then the compounds (unique_set.columns.len() > 1).
-            let table = self.get_btree_table(&automatic_index.0).unwrap();
+            let table = self.get_btree_table(&automatic_index.0).ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "sqlite_schema contains automatic index for missing table '{}': indexes={:?}",
+                    automatic_index.0, automatic_index.1
+                ))
+            })?;
             let mut automatic_indexes = automatic_index.1;
             automatic_indexes.reverse(); // reverse so we can pop() without shifting array elements, while still processing in left-to-right order
 
@@ -1496,7 +1553,13 @@ impl Schema {
             let mut pk_index_added = false;
             for unique_set in &table.unique_sets {
                 if unique_set.is_primary_key {
-                    assert!(table.primary_key_columns.len() == unique_set.columns.len(), "trying to add a {}-column primary key index for table {}, but the table has {} primary key columns", unique_set.columns.len(), table.name, table.primary_key_columns.len());
+                    assert!(
+                        table.primary_key_columns.len() == unique_set.columns.len(),
+                        "trying to add a {}-column primary key index for table {}, but the table has {} primary key columns",
+                        unique_set.columns.len(),
+                        table.name,
+                        table.primary_key_columns.len()
+                    );
                     // Add composite primary key index
                     assert!(
                         !pk_index_added,
@@ -1572,7 +1635,11 @@ impl Schema {
             // In MVCC mode during recovery, not all automatic index schema rows might be visible yet
             // during incremental schema reparsing, so we may have extra entries
             if !mvcc_enabled {
-                assert!(automatic_indexes.is_empty(), "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain", automatic_indexes.len());
+                assert!(
+                    automatic_indexes.is_empty(),
+                    "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain",
+                    automatic_indexes.len()
+                );
             }
         }
         Ok(())
@@ -1737,7 +1804,9 @@ impl Schema {
                                     // This will cause populate_materialized_views to skip this view
                                     tracing::warn!(
                                         "Skipping materialized view '{}' - has version {} but current version is {}. DROP and recreate the view to use it.",
-                                        view_name, stored_version, DBSP_CIRCUIT_VERSION
+                                        view_name,
+                                        stored_version,
+                                        DBSP_CIRCUIT_VERSION
                                     );
                                     // We can't track incompatible views here since we're in handle_schema_row
                                     // which doesn't have mutable access to self
@@ -2197,6 +2266,8 @@ impl Clone for Schema {
         let incompatible_views = self.incompatible_views.clone();
         Self {
             tables,
+            #[cfg(feature = "conn_raw_api")]
+            table_names_by_root_page: self.table_names_by_root_page.clone(),
             materialized_view_names,
             materialized_view_sql,
             incremental_views,
@@ -2546,10 +2617,10 @@ impl GeneratedColGraph {
                     col.name.as_deref().unwrap_or("?")
                 );
             }
-            let direct_mask: ColumnMask = ColumnMask::from_iter(direct.iter());
-            direct_deps[j].union_with(&direct_mask);
+            let direct_mask: ColumnMask = ColumnMask::try_from_iter(direct.iter())?;
+            direct_deps[j].union_with(&direct_mask)?;
             for i in direct.iter() {
-                direct_dependents[i].set(j);
+                direct_dependents[i].set(j)?;
                 in_degree[j] += 1;
             }
         }
@@ -2585,7 +2656,7 @@ impl GeneratedColGraph {
             dependencies[j] = direct_deps[j].clone();
             for i in direct_deps[j].iter() {
                 let snapshot = dependencies[i].clone();
-                dependencies[j].union_with(&snapshot);
+                dependencies[j].union_with(&snapshot)?;
             }
         }
 
@@ -2595,7 +2666,7 @@ impl GeneratedColGraph {
             dependents[i] = direct_dependents[i].clone();
             for j in direct_dependents[i].iter() {
                 let snapshot = dependents[j].clone();
-                dependents[i].union_with(&snapshot);
+                dependents[i].union_with(&snapshot)?;
             }
         }
 
@@ -2737,31 +2808,33 @@ impl BTreeTable {
         table: &Arc<BTreeTable>,
         schema: &Schema,
         only_columns: Option<&ColumnMask>,
-    ) -> Arc<BTreeTable> {
+    ) -> Result<Arc<BTreeTable>> {
         let has_virtual = table.has_virtual_columns();
         let has_custom = table
             .columns
             .iter()
             .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
         if !has_custom && !has_virtual {
-            return Arc::clone(table);
+            return Ok(Arc::clone(table));
         }
         let mut modified = (**table).clone();
         let remapped_only_columns = if has_virtual {
-            let remapped = only_columns.map(|only| {
-                let mut new_set = ColumnMask::default();
-                let mut physical = 0usize;
-                for (orig, col) in modified.columns.iter().enumerate() {
-                    if col.is_virtual_generated() {
-                        continue;
+            let remapped = only_columns
+                .map(|only| {
+                    let mut new_set = ColumnMask::default();
+                    let mut physical = 0usize;
+                    for (orig, col) in modified.columns.iter().enumerate() {
+                        if col.is_virtual_generated() {
+                            continue;
+                        }
+                        if only.get(orig) {
+                            new_set.set(physical)?;
+                        }
+                        physical += 1;
                     }
-                    if only.get(orig) {
-                        new_set.set(physical);
-                    }
-                    physical += 1;
-                }
-                new_set
-            });
+                    Ok::<_, LimboError>(new_set)
+                })
+                .transpose()?;
             modified.columns.retain(|c| !c.is_virtual_generated());
             modified.has_virtual_columns = false;
             remapped
@@ -2784,7 +2857,7 @@ impl BTreeTable {
                 col.ty_str = type_def.value_input_type().to_uppercase();
             }
         }
-        Arc::new(modified)
+        Ok(Arc::new(modified))
     }
 
     /// Override column type metadata for custom type columns so that
@@ -2931,6 +3004,9 @@ impl BTreeTable {
             }
             if needs_pk_inline && column.primary_key() {
                 sql.push_str(" PRIMARY KEY");
+                if self.has_autoincrement && column.is_rowid_alias() {
+                    sql.push_str(" AUTOINCREMENT");
+                }
             }
 
             if let Some(default) = &column.default {
@@ -3219,10 +3295,10 @@ impl BTreeTable {
         let graph = self.column_graph()?;
         let mut affected = ColumnMask::default();
         for i in updated_cols {
-            affected.set(i);
+            affected.set(i)?;
             if i < graph.dependents.len() {
                 let snapshot = graph.dependents[i].clone();
-                affected.union_with(&snapshot);
+                affected.union_with(&snapshot)?;
             }
         }
         Ok(affected)
@@ -3236,12 +3312,12 @@ impl BTreeTable {
         let mut deps = ColumnMask::default();
         for j in targets {
             if !self.columns[j].is_virtual_generated() {
-                deps.set(j);
+                deps.set(j)?;
                 continue;
             }
             for i in graph.dependencies[j].iter() {
                 if !self.columns[i].is_virtual_generated() {
-                    deps.set(i);
+                    deps.set(i)?;
                 }
             }
         }
@@ -3388,16 +3464,16 @@ fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &
     let _ = walk_expr(expr, &mut |e| {
         match e {
             Expr::Column { table, column, .. } if table.is_self_table() => {
-                out.set(*column);
+                out.set(*column)?;
             }
             Expr::Id(name) | Expr::Name(name) => {
                 if let Some(idx) = find_column_index_by_name(columns, name.as_str()) {
-                    out.set(idx);
+                    out.set(idx)?;
                 }
             }
             Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
                 if let Some(idx) = find_column_index_by_name(columns, col.as_str()) {
-                    out.set(idx);
+                    out.set(idx)?;
                 }
             }
             Expr::Subquery(_)
@@ -3447,6 +3523,28 @@ pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -
         _ => Ok(WalkControl::Continue),
     })?;
     Ok(())
+}
+
+/// Re-render the SQL text of a generated-column expression using current column names. The input
+/// AST may have been previously resolved into `Expr::Column { table: SELF_TABLE, column: idx, .. }`
+/// nodes; we replace each such self-table reference with a fresh `Expr::Id(<col-name>)` before
+/// stringifying so the result round-trips through the parser, even if a referenced column was
+/// renamed since the original `original_sql` was captured.
+pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) -> Result<String> {
+    let mut clone = expr.clone();
+    walk_expr_mut(&mut clone, &mut |e| -> Result<WalkControl> {
+        if let Expr::Column { table, column, .. } = e {
+            if table.is_self_table() {
+                if let Some(col) = columns.get(*column) {
+                    if let Some(name) = col.name.as_ref() {
+                        *e = Expr::Id(Name::exact(name.clone()));
+                    }
+                }
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(clone.to_string())
 }
 
 pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
@@ -3598,11 +3696,22 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         } => {
             has_rowid = !options.contains_without_rowid();
             is_strict = options.contains_strict();
+            let column_fk_count = columns
+                .iter()
+                .flat_map(|col| col.constraints.iter())
+                .filter(|constraint| {
+                    matches!(
+                        &constraint.constraint,
+                        ast::ColumnConstraint::ForeignKey { .. }
+                    )
+                })
+                .count();
 
             // we need to preserve order of unique sets definition
             // but also, we analyze constraints first in order to check PRIMARY KEY constraint and recognize rowid alias properly
             // that's why we maintain 2 unique_set sequences and merge them together in the end
 
+            let mut table_fk_order = column_fk_count;
             for c in constraints {
                 if let ast::TableConstraint::PrimaryKey {
                     columns,
@@ -3730,7 +3839,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             })
                             .unwrap_or(RefAct::NoAction),
                         deferred,
+                        decl_order: table_fk_order,
                     };
+                    table_fk_order += 1;
                     foreign_keys.push(Arc::new(fk));
                 } else if let ast::TableConstraint::Check(expr) = &c.constraint {
                     check_constraints.push(CheckConstraint::new(c.name.as_ref(), expr, None));
@@ -3742,6 +3853,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             // Issue: https://github.com/tursodatabase/turso/issues/3665
             let mut primary_key_desc_columns_constraint = false;
 
+            let mut column_fk_order = 0;
             for ast::ColumnDefinition {
                 col_name,
                 col_type,
@@ -3862,7 +3974,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             });
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
-                            collation = Some(CollationSeq::new(collation_name.as_str())?);
+                            let collation_seq = CollationSeq::new(collation_name.as_str())?;
+                            if collation_seq.is_custom() {
+                                crate::bail_parse_error!(
+                                    "custom collations are not supported in schema definitions"
+                                );
+                            }
+                            collation = Some(collation_seq);
                         }
                         ast::ColumnConstraint::ForeignKey {
                             clause,
@@ -3916,7 +4034,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     }
                                     None => false,
                                 },
+                                decl_order: column_fk_order,
                             };
+                            column_fk_order += 1;
                             foreign_keys.push(Arc::new(fk));
                         }
                     }
@@ -4178,6 +4298,10 @@ pub struct ForeignKey {
     pub on_update: RefAct,
     /// DEFERRABLE INITIALLY DEFERRED
     pub deferred: bool,
+    /// Declaration order among this table's foreign key constraints.
+    ///
+    /// SQLite reports PRAGMA foreign_key_list rows in reverse declaration order.
+    pub decl_order: usize,
 }
 #[inline]
 fn fk_mismatch_err(child: &str, parent: &str) -> crate::LimboError {
@@ -4281,7 +4405,7 @@ pub struct Column {
     pub ty_params: Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
     generated_type: GeneratedType,
-    raw: u16,
+    raw: u32,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -4312,26 +4436,26 @@ pub enum GeneratedType {
 }
 
 // flags
-const F_PRIMARY_KEY: u16 = 1;
-const F_ROWID_ALIAS: u16 = 2;
-const F_NOTNULL: u16 = 4;
-const F_UNIQUE: u16 = 8;
-const F_HIDDEN: u16 = 16;
+const F_PRIMARY_KEY: u32 = 1;
+const F_ROWID_ALIAS: u32 = 2;
+const F_NOTNULL: u32 = 4;
+const F_UNIQUE: u32 = 8;
+const F_HIDDEN: u32 = 16;
 
 // pack Type and Collation in the remaining bits
-const TYPE_SHIFT: u16 = 5;
-const TYPE_MASK: u16 = 0b111 << TYPE_SHIFT;
-const COLL_SHIFT: u16 = TYPE_SHIFT + 3;
-const COLL_MASK: u16 = 0b11 << COLL_SHIFT;
+const TYPE_SHIFT: u32 = 5;
+const TYPE_MASK: u32 = 0b111 << TYPE_SHIFT;
+const COLL_SHIFT: u32 = TYPE_SHIFT + 3;
+const COLL_MASK: u32 = 0b1111_1111_1111 << COLL_SHIFT;
 
-// Bits 10-12: base type affinity override for custom type columns.
+// Bits 20-22: base type affinity override for custom type columns.
 // 0 = not set (use ty_str-based affinity), 1-5 = Affinity value + 1
-const BASE_AFF_SHIFT: u16 = COLL_SHIFT + 2;
-const BASE_AFF_MASK: u16 = 0b111 << BASE_AFF_SHIFT;
+const BASE_AFF_SHIFT: u32 = COLL_SHIFT + 12;
+const BASE_AFF_MASK: u32 = 0b111 << BASE_AFF_SHIFT;
 
-// Bits 13-15: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
-const ARRAY_DIM_SHIFT: u16 = 13;
-const ARRAY_DIM_MASK: u16 = 0b111 << ARRAY_DIM_SHIFT;
+// Bits 23-25: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
+const ARRAY_DIM_SHIFT: u32 = BASE_AFF_SHIFT + 3;
+const ARRAY_DIM_MASK: u32 = 0b111 << ARRAY_DIM_SHIFT;
 
 impl Column {
     pub fn affinity(&self) -> Affinity {
@@ -4354,7 +4478,7 @@ impl Column {
     /// This ensures affinity rules use the custom type's BASE type
     /// rather than applying SQLite name-based rules to the type name.
     pub fn set_base_affinity(&mut self, affinity: Affinity) {
-        let v: u16 = match affinity {
+        let v: u32 = match affinity {
             Affinity::Integer => 1,
             Affinity::Text => 2,
             Affinity::Blob => 3,
@@ -4417,10 +4541,10 @@ impl Column {
             }
             None => GeneratedType::NotGenerated,
         };
-        let mut raw = 0u16;
-        raw |= (ty as u16) << TYPE_SHIFT;
+        let mut raw = 0u32;
+        raw |= (ty as u32) << TYPE_SHIFT;
         if let Some(c) = col {
-            raw |= (c as u16) << COLL_SHIFT;
+            raw |= (u32::from(c.to_bits()) << COLL_SHIFT) & COLL_MASK;
         }
         if coldef.primary_key {
             raw |= F_PRIMARY_KEY
@@ -4456,7 +4580,7 @@ impl Column {
 
     #[inline]
     pub const fn set_ty(&mut self, ty: Type) {
-        self.raw = (self.raw & !TYPE_MASK) | (((ty as u16) << TYPE_SHIFT) & TYPE_MASK);
+        self.raw = (self.raw & !TYPE_MASK) | (((ty as u32) << TYPE_SHIFT) & TYPE_MASK);
     }
 
     #[inline]
@@ -4470,20 +4594,24 @@ impl Column {
 
     #[inline]
     pub const fn collation(&self) -> CollationSeq {
-        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u8;
-        CollationSeq::from_bits(v)
+        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u16;
+        if v == CollationSeq::Unset.to_bits() {
+            CollationSeq::Binary
+        } else {
+            CollationSeq::from_storage_bits(v)
+        }
     }
 
     #[inline]
     pub const fn has_explicit_collation(&self) -> bool {
-        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u8;
-        v != CollationSeq::Unset as u8
+        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u16;
+        v != CollationSeq::Unset.to_bits()
     }
 
     #[inline]
     pub const fn set_collation(&mut self, c: Option<CollationSeq>) {
         if let Some(c) = c {
-            self.raw = (self.raw & !COLL_MASK) | (((c as u16) << COLL_SHIFT) & COLL_MASK);
+            self.raw = (self.raw & !COLL_MASK) | (((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK);
         }
     }
 
@@ -4553,6 +4681,17 @@ impl Column {
     }
 
     #[inline]
+    pub fn set_generated_original_sql(&mut self, new_sql: String) {
+        if let GeneratedType::Virtual {
+            ref mut original_sql,
+            ..
+        } = self.generated_type
+        {
+            *original_sql = new_sql;
+        }
+    }
+
+    #[inline]
     pub const fn set_primary_key(&mut self, v: bool) {
         self.set_flag(F_PRIMARY_KEY, v);
     }
@@ -4581,17 +4720,17 @@ impl Column {
     /// Number of array dimensions (0 = scalar, 1 = `[]`, 2 = `[][]`, etc.)
     #[inline]
     pub const fn array_dimensions(&self) -> u32 {
-        ((self.raw & ARRAY_DIM_MASK) >> ARRAY_DIM_SHIFT) as u32
+        (self.raw & ARRAY_DIM_MASK) >> ARRAY_DIM_SHIFT
     }
 
     #[inline]
     pub fn set_array_dimensions(&mut self, dims: u32) {
         assert!(dims <= 7, "array dimensions must be <= 7");
-        self.raw = (self.raw & !ARRAY_DIM_MASK) | ((dims as u16) << ARRAY_DIM_SHIFT);
+        self.raw = (self.raw & !ARRAY_DIM_MASK) | (dims << ARRAY_DIM_SHIFT);
     }
 
     #[inline]
-    const fn set_flag(&mut self, mask: u16, val: bool) {
+    const fn set_flag(&mut self, mask: u32, val: bool) {
         if val {
             self.raw |= mask
         } else {
@@ -4631,7 +4770,13 @@ impl TryFrom<&ColumnDefinition> for Column {
                     );
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
-                    collation.replace(CollationSeq::new(collation_name.as_str())?);
+                    let collation_seq = CollationSeq::new(collation_name.as_str())?;
+                    if collation_seq.is_custom() {
+                        crate::bail_parse_error!(
+                            "custom collations are not supported in schema definitions"
+                        );
+                    }
+                    collation.replace(collation_seq);
                 }
                 ast::ColumnConstraint::Generated { expr, .. } => {
                     generated = Some(expr.clone());
@@ -5117,6 +5262,16 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         assert!(!table.has_rowid, "has_rowid should be set to false");
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_column_default_collation_is_effective_binary() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a TEXT);"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        let column = table.get_column("a").unwrap().1;
+        assert_eq!(column.collation(), CollationSeq::Binary);
+        assert_eq!(column.collation_opt(), None);
         Ok(())
     }
 
@@ -5778,6 +5933,20 @@ mod tests {
     }
 
     #[test]
+    fn test_autoincrement_preserved_in_to_sql() -> Result<()> {
+        let sql = r#"CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, doomed INT, v TEXT)"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+
+        assert!(table.has_autoincrement);
+        assert_eq!(
+            table.to_sql(),
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, doomed INT, v TEXT)"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_without_rowid_preserved_in_sql() -> Result<()> {
         let sql = r#"CREATE TABLE t(code TEXT PRIMARY KEY, val TEXT) WITHOUT ROWID"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -6044,7 +6213,7 @@ mod tests {
         )?;
         let mut expected = t.columns_affected_by_update([0])?;
         let b_mask = t.columns_affected_by_update([1])?;
-        expected.union_with(&b_mask);
+        expected.union_with(&b_mask).unwrap();
         let union_mask = t.columns_affected_by_update([0, 1])?;
         assert_eq!(indices(&union_mask), indices(&expected));
         Ok(())

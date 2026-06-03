@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    ffi::CString,
     fmt::Display,
     ops::Deref,
     sync::{
@@ -33,6 +34,10 @@ assert_send!(TursoDatabase, TursoConnection, TursoStatement);
 assert_sync!(TursoDatabase);
 
 pub use turso_core::types::FromValue;
+pub use turso_ext::{
+    AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarFunction,
+    StepFunction, Value as ExtensionValue, ValueDestructor,
+};
 pub type EncryptionOpts = turso_core::EncryptionOpts;
 pub type Value = turso_core::Value;
 pub type ValueRef<'a> = turso_core::types::ValueRef<'a>;
@@ -363,6 +368,14 @@ impl TursoStatusCode {
     }
 }
 
+fn result_code_to_result(result: ResultCode, operation: &str) -> Result<(), TursoError> {
+    if result.is_ok() {
+        Ok(())
+    } else {
+        Err(TursoError::Error(format!("{operation} failed: {result}")))
+    }
+}
+
 impl TursoError {
     /// # Safety
     /// error_opt_out must be a valid pointer or null
@@ -607,9 +620,7 @@ impl TursoDatabase {
                     ));
                 }
                 Some(vfs) => {
-                    return Err(TursoError::Error(format!(
-                        "unsupported VFS backend: '{vfs}'"
-                    )))
+                    Database::io_for_vfs(vfs).map_err(|e| TursoError::Error(format!("{e}")))?
                 }
                 None => match self.config.path.as_str() {
                     ":memory:" => Arc::new(turso_core::MemoryIO::new()),
@@ -641,14 +652,10 @@ impl TursoDatabase {
                     // Store the IO so that it can be retrieved with `io()` call even if the database is still opening
                     *self.io.lock().unwrap() = Some(io.clone());
 
-                    let open_flags = OpenFlags::default();
-                    let db_file = if let Some(db_file) = &self.config.db_file {
-                        db_file.clone()
-                    } else {
-                        let file = io.open_file(&self.config.path, open_flags, true)?;
-                        Arc::new(DatabaseFile::new(file))
-                    };
-
+                    // Opts must be computed BEFORE the file open so we can apply
+                    // OpenFlags::NoLock when multiprocess WAL is enabled — taking
+                    // the OS-level fcntl lock here would block every other
+                    // multiprocess process from opening the same file.
                     let mut opts = DatabaseOpts::new();
                     if let Some(experimental_features) = &self.config.experimental_features {
                         for features in experimental_features.split(",").map(|s| s.trim()) {
@@ -658,10 +665,12 @@ impl TursoDatabase {
                                 "strict" => opts, // strict is always enabled, kept for backwards compatibility
                                 "custom_types" => opts.with_custom_types(true),
                                 "autovacuum" => opts.with_autovacuum(true),
+                                "vacuum" => opts.with_vacuum(true),
                                 "encryption" => opts.with_encryption(true),
                                 "attach" => opts.with_attach(true),
                                 "generated_columns" => opts.with_generated_columns(true),
                                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
+                                "without_rowid" => opts.with_without_rowid(true),
                                 _ => opts,
                             };
                         }
@@ -672,6 +681,17 @@ impl TursoDatabase {
                             "encryption is experimental and must be explicitly enabled through experimental features list".to_string(),
                         ));
                     }
+
+                    let mut open_flags = OpenFlags::default();
+                    if opts.enable_multiprocess_wal {
+                        open_flags |= OpenFlags::NoLock;
+                    }
+                    let db_file = if let Some(db_file) = &self.config.db_file {
+                        db_file.clone()
+                    } else {
+                        let file = io.open_file(&self.config.path, open_flags, true)?;
+                        Arc::new(DatabaseFile::new(file))
+                    };
 
                     state.io = Some(io);
                     state.db_file = Some(db_file);
@@ -820,6 +840,113 @@ impl TursoConnection {
     }
     pub fn last_insert_rowid(&self) -> i64 {
         self.connection.last_insert_rowid()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_scalar_function(
+        &self,
+        name: String,
+        argc: i32,
+        deterministic: bool,
+        context: usize,
+        callback: ScalarFunction,
+        context_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> Result<(), TursoError> {
+        let name = CString::new(name).map_err(|err| {
+            TursoError::Misuse(format!(
+                "external scalar function name contains interior NUL: {err}"
+            ))
+        })?;
+        let api = unsafe { self.connection._build_turso_ext() };
+        let result = unsafe {
+            (api.register_scalar_function)(
+                api.ctx,
+                name.as_ptr(),
+                argc,
+                deterministic,
+                context,
+                callback,
+                context_destructor,
+                value_destructor,
+            )
+        };
+        unsafe { self.connection._free_extension_ctx(api) };
+        result_code_to_result(result, "register external scalar function")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_aggregate_function(
+        &self,
+        name: String,
+        argc: i32,
+        context: usize,
+        init: InitAggFunction,
+        step: StepFunction,
+        finalize: FinalizeFunction,
+        context_destructor: Option<ContextDestructor>,
+        aggregate_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> Result<(), TursoError> {
+        let name = CString::new(name).map_err(|err| {
+            TursoError::Misuse(format!(
+                "external aggregate function name contains interior NUL: {err}"
+            ))
+        })?;
+        let api = unsafe { self.connection._build_turso_ext() };
+        let result = unsafe {
+            (api.register_aggregate_function)(
+                api.ctx,
+                name.as_ptr(),
+                argc,
+                context,
+                init,
+                step,
+                finalize,
+                context_destructor,
+                aggregate_destructor,
+                value_destructor,
+            )
+        };
+        unsafe { self.connection._free_extension_ctx(api) };
+        result_code_to_result(result, "register external aggregate function")
+    }
+
+    pub fn unregister_external_function(&self, name: &str) -> Result<(), TursoError> {
+        let name = CString::new(name).map_err(|err| {
+            TursoError::Misuse(format!(
+                "external function name contains interior NUL: {err}"
+            ))
+        })?;
+        let api = unsafe { self.connection._build_turso_ext() };
+        let result = unsafe { (api.unregister_function)(api.ctx, name.as_ptr()) };
+        unsafe { self.connection._free_extension_ctx(api) };
+        result_code_to_result(result, "unregister external function")
+    }
+
+    pub fn register_external_collation(
+        &self,
+        name: String,
+        context: usize,
+        callback: turso_core::ContextCollationFunction,
+        context_destructor: Option<ContextDestructor>,
+    ) {
+        self.connection
+            .register_external_collation(name, context, callback, context_destructor);
+    }
+
+    pub fn unregister_external_collation(&self, name: &str) {
+        self.connection.unregister_external_collation(name);
+    }
+
+    pub fn set_load_extension_enabled(&self, enabled: bool) {
+        self.connection.set_load_extension_enabled(enabled);
+    }
+
+    pub fn load_extension(&self, path: &str) -> Result<(), TursoError> {
+        turso_core::resolve_ext_path(path)
+            .and_then(|path| self.connection.load_extension(path))
+            .map_err(TursoError::from)
     }
 
     /// prepares single SQL statement
@@ -1086,7 +1213,7 @@ impl TursoStatement {
                 "bind index {index} is out of bounds"
             )));
         }
-        stmt.bind_at(index, value);
+        stmt.bind_at(index, value)?;
         Ok(())
     }
     /// named parameter position.

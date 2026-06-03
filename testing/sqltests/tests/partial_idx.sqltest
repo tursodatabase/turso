@@ -496,6 +496,61 @@ expect error {
 }
 
 @cross-check-integrity
+test upsert-partial-target-where-doupdate {
+    CREATE TABLE u1w(id INTEGER PRIMARY KEY, email TEXT, status TEXT, note TEXT);
+    CREATE UNIQUE INDEX idx_active_email_w ON u1w(email) WHERE status='active';
+    INSERT INTO u1w VALUES (1,'a@test','active','old');
+    INSERT INTO u1w(email,status,note)
+        VALUES('a@test','active','new')
+        ON CONFLICT(email) WHERE status='active' DO UPDATE SET note=excluded.note;
+    SELECT id,email,status,note FROM u1w;
+}
+expect {
+    1|a@test|active|new
+}
+
+@cross-check-integrity
+test upsert-partial-target-qualified-where-doupdate {
+    CREATE TABLE u1wq(id INTEGER PRIMARY KEY, email TEXT, status TEXT, note TEXT);
+    CREATE UNIQUE INDEX idx_active_email_wq ON u1wq(email) WHERE status='active';
+    INSERT INTO u1wq VALUES (1,'a@test','active','old');
+    INSERT INTO u1wq(email,status,note)
+        VALUES('a@test','active','new')
+        ON CONFLICT(email) WHERE u1wq.status='active' DO UPDATE SET note=excluded.note;
+    SELECT id,email,status,note FROM u1wq;
+}
+expect {
+    1|a@test|active|new
+}
+
+# https://github.com/tursodatabase/turso/issues/7083
+@cross-check-integrity
+test uspsert-partial-unique {
+    CREATE TABLE t (
+  a TEXT,
+  b TEXT,
+  deleted INTEGER DEFAULT 0
+);
+
+CREATE UNIQUE INDEX t_ab_live
+  ON t (a, b)
+  WHERE deleted = 0;
+
+INSERT INTO t (a, b, deleted)
+  VALUES ('a', 'b', 0);
+
+INSERT INTO t (a, b, deleted)
+  VALUES ('a', 'b', 0)
+  ON CONFLICT (a, b) WHERE deleted = 0
+  DO UPDATE SET b = excluded.b;
+
+SELECT a, b, deleted FROM t;
+}
+expect {
+    a|b|0
+}
+
+@cross-check-integrity
 test upsert-partial-doupdate-basic {
     CREATE TABLE u2(id INTEGER PRIMARY KEY, email TEXT, status TEXT, note TEXT);
     CREATE UNIQUE INDEX idx_active_email ON u2(email) WHERE status='active';
@@ -1067,4 +1122,133 @@ test partial-index-long-between-chain {
 expect {
     1
     ok
+}
+
+# Query WHERE matches the index's compound WHERE exactly, plus an equality on
+# the indexed column -> should seek the partial index.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-partial-index-and-where-eq-seek {
+    CREATE TABLE samples (id INTEGER PRIMARY KEY, library_id INTEGER, attack_score INTEGER, name TEXT);
+    CREATE INDEX samples_pidx ON samples(name) WHERE library_id IS NULL AND attack_score IS NOT NULL;
+    EXPLAIN QUERY PLAN
+        SELECT name FROM samples
+        WHERE library_id IS NULL AND attack_score IS NOT NULL AND name = 'foo';
+}
+expect {
+    1|0|0|SEARCH samples USING INDEX samples_pidx (name=?)
+}
+
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-partial-index-and-where-reversed-order {
+    CREATE TABLE samples (id INTEGER PRIMARY KEY, library_id INTEGER, attack_score INTEGER, name TEXT);
+    CREATE INDEX samples_pidx ON samples(name) WHERE library_id IS NULL AND attack_score IS NOT NULL;
+    EXPLAIN QUERY PLAN
+        SELECT name FROM samples
+        WHERE attack_score IS NOT NULL AND library_id IS NULL AND name = 'foo';
+}
+expect {
+    1|0|0|SEARCH samples USING INDEX samples_pidx (name=?)
+}
+
+# Partial index WHERE uses qualified column references; query references the same columns unqualified.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-partial-index-qualified-where-matches {
+    CREATE TABLE samples (id INTEGER PRIMARY KEY, library_id INTEGER, attack_score INTEGER, name TEXT);
+    CREATE INDEX samples_pidx ON samples(name)
+        WHERE samples.library_id IS NULL AND samples.attack_score IS NOT NULL;
+    EXPLAIN QUERY PLAN
+        SELECT name FROM samples
+        WHERE library_id IS NULL AND attack_score IS NOT NULL AND name = 'foo';
+}
+expect {
+    1|0|0|SEARCH samples USING INDEX samples_pidx (name=?)
+}
+
+# Partial index drives a full scan when the query WHERE matches the index
+# WHERE but no column constraint is provided.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-partial-index-full-scan-when-where-matched {
+    CREATE TABLE samples (id INTEGER PRIMARY KEY, library_id INTEGER, attack_score INTEGER);
+    CREATE INDEX samples_user_processed_idx ON samples (id)
+        WHERE library_id IS NULL AND attack_score IS NOT NULL;
+    EXPLAIN QUERY PLAN SELECT COUNT(*) FROM samples
+        WHERE library_id IS NULL AND attack_score IS NOT NULL;
+}
+expect {
+    1|0|0|SCAN samples USING INDEX samples_user_processed_idx
+}
+
+# Partial index must NOT be used when the query only satisfies a subset of the
+# index WHERE conjuncts — the partial index would skip rows the query needs.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-partial-index-not-used-when-where-not-implied {
+    CREATE TABLE samples (id INTEGER PRIMARY KEY, library_id INTEGER, attack_score INTEGER, name TEXT);
+    CREATE INDEX samples_pidx ON samples(name) WHERE library_id IS NULL AND attack_score IS NOT NULL;
+    EXPLAIN QUERY PLAN
+        SELECT name FROM samples WHERE library_id IS NULL AND name = 'foo';
+}
+expect {
+    1|0|0|SCAN samples
+}
+
+# Partial index with equality predicate in WHERE.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-partial-index-equality-predicate {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER, status TEXT);
+    CREATE INDEX idx_active_sku ON products(sku) WHERE status = 'active';
+    EXPLAIN QUERY PLAN
+        SELECT id FROM products WHERE status = 'active' AND sku = 'X';
+}
+expect {
+    1|0|0|SEARCH products USING INDEX idx_active_sku (sku=?)
+}
+
+# Partial index with range predicate in WHERE.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-partial-index-range-predicate {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
+    CREATE INDEX idx_expensive ON products(sku) WHERE price > 100;
+    EXPLAIN QUERY PLAN SELECT id FROM products WHERE price > 100 AND sku = 'X';
+}
+expect {
+    1|0|0|SEARCH products USING INDEX idx_expensive (sku=?)
+}
+
+# Partial index whose WHERE predicate is *not* implied by the query → fallback
+# to full table scan.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-partial-index-range-not-implied {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
+    CREATE INDEX idx_expensive ON products(sku) WHERE price > 100;
+    EXPLAIN QUERY PLAN SELECT id FROM products WHERE price > 50 AND sku = 'X';
+}
+expect {
+    1|0|0|SCAN products
+}
+
+# Functional correctness: results match what you'd expect when the partial
+# index is consulted for a seek.
+@cross-check-integrity
+test partial-index-seek-correctness {
+    CREATE TABLE samples (id INTEGER PRIMARY KEY, library_id INTEGER, attack_score INTEGER, name TEXT);
+    CREATE INDEX samples_pidx ON samples(name) WHERE library_id IS NULL AND attack_score IS NOT NULL;
+    INSERT INTO samples VALUES (1, NULL, 5, 'a'), (2, NULL, NULL, 'a'),
+                                (3, 1,    7, 'a'), (4, NULL, 9, 'b');
+    SELECT id FROM samples WHERE library_id IS NULL AND attack_score IS NOT NULL AND name = 'a';
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test partial-index-full-scan-correctness {
+    CREATE TABLE samples (id INTEGER PRIMARY KEY, library_id INTEGER, attack_score INTEGER);
+    CREATE INDEX samples_user_processed_idx ON samples (id)
+        WHERE library_id IS NULL AND attack_score IS NOT NULL;
+    INSERT INTO samples VALUES (1, NULL, 5), (2, NULL, NULL),
+                                (3, 1,    7), (4, NULL, 9);
+    SELECT COUNT(*) FROM samples WHERE library_id IS NULL AND attack_score IS NOT NULL;
+}
+expect {
+    2
 }

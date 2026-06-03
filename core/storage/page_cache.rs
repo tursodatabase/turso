@@ -204,12 +204,27 @@ impl PageCache {
 
     #[inline]
     pub fn insert(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
-        self._insert(key, value, false)
+        self._insert(key, value, false, false)
     }
 
     #[inline]
     pub fn upsert_page(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
-        self._insert(key, value, true)
+        self._insert(key, value, true, false)
+    }
+
+    /// Insert or replace a page without enforcing the cache capacity.
+    ///
+    /// Savepoint rollback uses this while restoring subjournaled before-images:
+    /// rollback must restore every page it journaled even when the cache is full
+    /// of dirty pages that cannot be evicted yet. Normal cache insertions still
+    /// enforce capacity and will drain the temporary excess as pages become
+    /// spillable or clean.
+    pub fn force_upsert_page(
+        &mut self,
+        key: PageCacheKey,
+        value: PageRef,
+    ) -> Result<(), CacheError> {
+        self._insert(key, value, true, true)
     }
 
     pub fn _insert(
@@ -217,6 +232,7 @@ impl PageCache {
         key: PageCacheKey,
         value: PageRef,
         update_in_place: bool,
+        bypass_capacity: bool,
     ) -> Result<(), CacheError> {
         trace!("insert(key={:?})", key);
 
@@ -252,7 +268,7 @@ impl PageCache {
         }
 
         // Key doesn't exist, proceed with new entry
-        self.make_room_for(1)?;
+        self.make_room_for(1, bypass_capacity)?;
 
         // Track evictable count for the new page
         let is_evictable = Self::counted_as_evictable(&value);
@@ -585,17 +601,16 @@ impl PageCache {
     /// their ref_bit and leaving them in place; only pages with ref_bit == 0 are evicted.
     ///
     /// Returns `CacheError::Full` if not enough pages can be evicted
-    pub fn make_room_for(&mut self, n: usize) -> Result<(), CacheError> {
+    pub fn make_room_for(&mut self, n: usize, bypass_capacity: bool) -> Result<(), CacheError> {
+        if bypass_capacity {
+            return Ok(());
+        }
         if n > self.capacity {
             return Err(CacheError::Full);
         }
-        let available = self.capacity - self.len();
-        if n <= available {
-            return Ok(());
-        }
 
-        let need = n - available;
-        for _ in 0..need {
+        let target_len = self.capacity - n;
+        while self.len() > target_len {
             self.evict_one()?;
         }
         Ok(())
@@ -711,6 +726,32 @@ impl PageCache {
             .keys()
             .filter(|k| k.0 > max_page_num)
             .copied()
+            .collect::<Vec<_>>()
+        {
+            self.delete(key)?;
+        }
+        Ok(())
+    }
+
+    /// Removes clean cached pages that were read from WAL frames newer than a
+    /// rollback target. Dirty pages are preserved because they may contain
+    /// restored transaction-local state that still needs to be committed or
+    /// rolled back by an outer savepoint.
+    pub fn delete_clean_pages_after_wal_frame(&mut self, max_frame: u64) -> Result<(), CacheError> {
+        for key in self
+            .map
+            .iter()
+            .filter_map(|(key, &entry_ptr)| {
+                let entry = unsafe { &*entry_ptr };
+                let page = &entry.page;
+                if !page.is_dirty() && page.has_wal_tag() {
+                    let (frame, _) = page.wal_tag_pair();
+                    if frame > max_frame {
+                        return Some(*key);
+                    }
+                }
+                None
+            })
             .collect::<Vec<_>>()
         {
             self.delete(key)?;
@@ -1052,6 +1093,40 @@ mod tests {
 
         assert_eq!(result, Err(CacheError::Full));
         assert_eq!(cache.len(), 2);
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_force_upsert_allows_temporary_over_capacity_cache() {
+        let mut cache = PageCache::new_with_spill(2, true);
+        let key2 = insert_page(&mut cache, 2);
+        let key3 = insert_page(&mut cache, 3);
+
+        for key in [key2, key3] {
+            cache.notify_page_dirty(key);
+            cache.peek(&key, false).unwrap().set_dirty();
+        }
+
+        let key4 = create_key(4);
+        let page4 = page_with_content(4);
+        page4.set_dirty();
+        cache.force_upsert_page(key4, page4).unwrap();
+
+        assert_eq!(cache.len(), 3);
+        assert!(cache.contains_key(&key4));
+        cache.verify_cache_integrity();
+
+        for key in [key2, key3] {
+            cache.notify_page_spilled(key);
+            cache.peek(&key, false).unwrap().set_spilled();
+        }
+
+        let key5 = create_key(5);
+        cache.insert(key5, page_with_content(5)).unwrap();
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains_key(&key4));
+        assert!(cache.contains_key(&key5));
         cache.verify_cache_integrity();
     }
 

@@ -262,7 +262,7 @@ fn prepare_update_plan(
         bail_parse_error!("UPDATE of WITHOUT ROWID tables is not supported");
     }
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
     validate_update(
         schema,
         &body,
@@ -521,6 +521,7 @@ fn compose_update_set_clause(existing: &mut UpdateSetClause, expr: Box<Expr>) {
                 distinctness: None,
                 args: composed_args,
                 order_by: vec![],
+                within_group: vec![],
                 filter_over: turso_parser::ast::FunctionTail {
                     filter_clause: None,
                     over_clause: None,
@@ -542,9 +543,10 @@ fn collect_indexes_to_update(
     read_scope_tables: &mut TableReferences,
     resolver: &Resolver,
 ) -> crate::Result<Vec<Arc<crate::schema::Index>>> {
-    let indexes: Vec<_> = resolver.with_schema(database_id, |s| {
-        s.get_indices(table_name).cloned().collect()
-    });
+    use crate::alloc::TursoIteratorExt;
+    let indexes: crate::alloc::Vec<_> = resolver.with_schema(database_id, |s| {
+        s.get_indices(table_name).cloned().try_collect()
+    })?;
     let target_table_ref = read_scope_tables
         .joined_tables()
         .first()
@@ -553,8 +555,9 @@ fn collect_indexes_to_update(
     let rowid_alias_used = set_clauses.iter().any(|set| {
         set.column_index == ROWID_SENTINEL || columns[set.column_index].is_rowid_alias()
     });
-    let updated_cols: Option<ColumnMask> =
-        (!rowid_alias_used).then(|| set_clauses.iter().map(|set| set.column_index).collect());
+    let updated_cols: Option<ColumnMask> = (!rowid_alias_used)
+        .then(|| set_clauses.iter().map(|set| set.column_index).try_collect())
+        .transpose()?;
     let affected_cols = match (table.btree(), updated_cols.as_ref()) {
         (Some(bt), Some(updated)) => Some(bt.columns_affected_by_update(updated)?),
         (None, Some(updated)) => Some(updated.clone()),
@@ -571,7 +574,7 @@ fn collect_indexes_to_update(
             if let Some(expr) = col.expr.as_ref() {
                 let cols_used =
                     expression_index_column_usage(expr.as_ref(), target_table_ref, resolver)?;
-                expression_cols_used |= &cols_used;
+                expression_cols_used.union_with(&cols_used)?;
 
                 if !must_update
                     && affected_cols.as_ref().is_some_and(|affected_cols| {

@@ -1,13 +1,14 @@
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
-use std::collections::VecDeque;
 
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
+use crate::alloc::TursoIteratorExt;
 use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
+use crate::translate::collate::CollationSeq;
 use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, ordered_materialized_key_columns, BinaryExprSide, Constraint,
@@ -44,6 +45,7 @@ use super::{
         btree_access_order_consumed, subquery_intrinsic_order_consumed, ColumnTarget,
         EqualityPrefixScope, OrderTarget,
     },
+    AvailableIndexes,
 };
 use crate::translate::planner::TableMask;
 
@@ -204,11 +206,12 @@ pub(super) fn choose_best_btree_candidate(
     rhs_table_idx: usize,
     maybe_order_target: Option<&OrderTarget>,
     schema: &Schema,
+    available_indexes: &AvailableIndexes,
     analyze_stats: &AnalyzeStats,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
-) -> Option<ChosenBtreeCandidate> {
+) -> Result<Option<ChosenBtreeCandidate>> {
     // Seed the baseline with a table scan only if a rowid candidate exists
     // (i.e. no INDEXED BY has removed it). Otherwise start at infinite cost
     // so the forced index candidate always wins.
@@ -238,7 +241,7 @@ pub(super) fn choose_best_btree_candidate(
 
     // Build a mask for the rhs table itself.
     let mut rhs_table_mask = TableMask::default();
-    rhs_table_mask.set(rhs_table_idx);
+    rhs_table_mask.set(rhs_table_idx)?;
 
     // Estimate cost for each candidate index (including the rowid index) and
     // keep the best candidate.
@@ -322,12 +325,34 @@ pub(super) fn choose_best_btree_candidate(
             index: candidate.index.as_ref(),
             stats: analyze_stats,
         };
+        // For partial indexes, the index physically contains only the rows whose
+        // values pass the index's WHERE clause. Discount the row count estimate
+        // accordingly so the cost model recognizes the partial index as cheaper
+        // than a full table scan.
+        let candidate_base_row_count = match candidate
+            .index
+            .as_ref()
+            .and_then(|idx| idx.where_clause.as_ref())
+        {
+            Some(where_expr) => {
+                let selectivity = super::constraints::estimate_partial_index_where_selectivity(
+                    where_expr.as_ref(),
+                    rhs_table,
+                    schema,
+                    available_indexes,
+                    params,
+                )
+                .clamp(1e-6, 1.0);
+                RowCountEstimate::AnalyzeStats((*base_row_count * selectivity).max(1.0))
+            }
+            None => base_row_count,
+        };
         let cost = estimate_cost_for_scan_or_seek(
             Some(index_info),
             &rhs_constraints.constraints,
             &usable_constraint_refs,
             input_cardinality,
-            base_row_count,
+            candidate_base_row_count,
             is_index_ordered,
             params,
             Some(&analyze_ctx),
@@ -355,7 +380,7 @@ pub(super) fn choose_best_btree_candidate(
                 .flatten()
                 {
                     let c = &rhs_constraints.constraints[idx];
-                    mask = mask.iter().chain(c.lhs_mask.iter()).collect();
+                    mask = mask.iter().chain(c.lhs_mask.iter()).try_collect()?;
                 }
             }
             mask
@@ -365,7 +390,7 @@ pub(super) fn choose_best_btree_candidate(
         let allowed_mask: TableMask = loop_prereq_mask
             .iter()
             .chain(rhs_table_mask.iter())
-            .collect();
+            .try_collect()?;
 
         // Collect which constraint positions are consumed by the index seek.
         let consumed: SmallVec<[usize; 8]> = usable_constraint_refs
@@ -429,7 +454,7 @@ pub(super) fn choose_best_btree_candidate(
         }
     }
 
-    Some(best_choice)
+    Ok(Some(best_choice))
 }
 
 fn consumed_where_terms_from_constraint_refs(
@@ -636,7 +661,7 @@ pub fn find_best_access_method_for_join_order(
     join_order: &[JoinOrderMember],
     planning_context: JoinPlanningContext<'_>,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
@@ -690,7 +715,7 @@ fn find_best_access_method_for_btree(
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
@@ -704,7 +729,7 @@ fn find_best_access_method_for_btree(
         .iter()
         .take(join_order.len() - 1)
         .map(|member| member.original_idx)
-        .collect();
+        .try_collect()?;
     let best = choose_best_btree_candidate(
         rhs_table,
         rhs_constraints,
@@ -712,11 +737,12 @@ fn find_best_access_method_for_btree(
         rhs_table_idx,
         maybe_order_target,
         schema,
+        available_indexes,
         analyze_stats,
         input_cardinality,
         base_row_count,
         params,
-    )
+    )?
     .expect("btree candidate selection must always consider the rowid candidate");
 
     let estimated_rows_per_outer_row = if best.constraint_refs.is_empty() {
@@ -796,7 +822,7 @@ fn find_best_access_method_for_btree(
             best_access_method.cost,
             &lhs_mask,
             analyze_stats,
-        ) {
+        )? {
             best_access_method = multi_idx_method;
         }
 
@@ -813,7 +839,7 @@ fn find_best_access_method_for_btree(
             best_access_method.cost,
             &lhs_mask,
             analyze_stats,
-        ) {
+        )? {
             best_access_method = multi_idx_and_method;
         }
     }
@@ -829,7 +855,7 @@ fn find_best_access_method_for_vtab(
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
-    let vtab_constraints = convert_to_vtab_constraint(constraints, join_order);
+    let vtab_constraints = convert_to_vtab_constraint(constraints, join_order)?;
 
     // TODO: get proper order_by information to pass to the vtab.
     // maybe encode more info on t_ctx? we need: [col_idx , is_descending]
@@ -951,6 +977,20 @@ pub fn find_equijoin_conditions(
     join_keys
 }
 
+fn expr_uses_custom_collation(expr: &ast::Expr) -> bool {
+    let mut uses_custom = false;
+    let _ = walk_expr(expr, &mut |expr| -> Result<WalkControl> {
+        if let ast::Expr::Collate(_, collation_name) = expr {
+            uses_custom = CollationSeq::known_custom(collation_name.as_str()).is_some();
+            if uses_custom {
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    uses_custom
+}
+
 /// Estimate the cost of a hash join between two tables.
 ///
 /// The cost model accounts for:
@@ -1016,12 +1056,17 @@ pub fn try_hash_join_access_method(
     {
         return None;
     }
-    // Avoid hash join on self-joins over the same underlying table. The current
-    // implementation assumes distinct build/probe sources; sharing storage can
-    // lead to incorrect matches.
+    // Avoid hash join on self-joins over the same underlying table for INNER /
+    // LEFT joins: a nested-loop with index seek is usually preferred and avoids
+    // double-buffering the table in the hash table. FULL OUTER has no
+    // nested-loop form yet, so it must use hash join even for self-joins.
     let probe_root_page = probe_table.table.btree().expect("table is BTree").root_page;
     let build_root_page = build_table.table.btree().expect("table is BTree").root_page;
-    if build_root_page == probe_root_page {
+    let is_full_outer = probe_table
+        .join_info
+        .as_ref()
+        .is_some_and(|ji| ji.is_full_outer());
+    if build_root_page == probe_root_page && !is_full_outer {
         return None;
     }
     // Explicit INDEXED BY / NOT INDEXED directives must be honored. A hash join
@@ -1123,8 +1168,19 @@ pub fn try_hash_join_access_method(
         "hash-join equi-join keys"
     );
 
-    // Need at least one equi-join condition
-    if join_keys.is_empty() {
+    // A hash join normally needs at least one equi-join condition. A FULL OUTER
+    // JOIN is the exception: it has no nested-loop form, so when the ON clause has
+    // no equality (e.g. `a.x < b.x`) we still build a single-bucket hash join and
+    // let the predicate apply as a residual, rather than rejecting the query.
+    if join_keys.is_empty() && hash_join_type != HashJoinType::FullOuter {
+        return None;
+    }
+    // Custom-collated equality depends on a connection-owned callback, so the
+    // hash join planner cannot derive a stable hash/equality pair here.
+    if join_keys.iter().any(|join_key| {
+        expr_uses_custom_collation(join_key.get_build_expr(where_clause))
+            || expr_uses_custom_collation(join_key.get_probe_expr(where_clause))
+    }) {
         return None;
     }
 
@@ -1454,7 +1510,7 @@ fn find_best_access_method_for_subquery(
         &rhs_constraints.constraints,
         &temp_constraint_refs,
         join_order,
-    );
+    )?;
 
     let has_search_constraints = !usable_constraint_refs.is_empty();
     if !has_search_constraints {

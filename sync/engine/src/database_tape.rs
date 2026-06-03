@@ -136,14 +136,14 @@ impl DatabaseTape {
     pub(crate) fn connect_untracked(&self) -> Result<Arc<turso_core::Connection>> {
         let connection = self.inner.connect()?;
         if self.disable_auto_checkpoint {
-            connection.wal_auto_checkpoint_disable();
+            connection.wal_auto_actions_disable();
         }
         Ok(connection)
     }
     pub async fn connect<Ctx>(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
         let connection = self.inner.connect()?;
         if self.disable_auto_checkpoint {
-            connection.wal_auto_checkpoint_disable();
+            connection.wal_auto_actions_disable();
         }
         tracing::debug!("set '{CDC_PRAGMA_NAME}' for new connection");
         let mut stmt = connection.prepare(&self.pragma_query)?;
@@ -194,7 +194,7 @@ impl DatabaseTape {
         tracing::debug!("opening changes iterator with options {:?}", opts);
         let conn = self.inner.connect()?;
         if self.disable_auto_checkpoint {
-            conn.wal_auto_checkpoint_disable();
+            conn.wal_auto_actions_disable();
         }
 
         let cdc_version = self
@@ -489,7 +489,7 @@ impl DatabaseChangesIterator {
         query_stmt.bind_at(
             1.try_into().unwrap(),
             turso_core::Value::from_i64(change_id_filter),
-        );
+        )?;
 
         let mut last_change_id = None;
         while let Some(row) = run_stmt_once(coro, query_stmt).await? {
@@ -547,7 +547,7 @@ async fn replay_stmt<Ctx>(
 ) -> Result<()> {
     stmt.reset()?;
     for (i, value) in values.into_iter().enumerate() {
-        stmt.bind_at((i + 1).try_into().unwrap(), value);
+        stmt.bind_at((i + 1).try_into().unwrap(), value)?;
     }
     exec_stmt(coro, stmt).await?;
     Ok(())

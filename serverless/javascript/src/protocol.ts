@@ -33,6 +33,14 @@ export interface ExecuteRequest {
   };
 }
 
+export type BatchCondition =
+  | { type: 'ok'; step: number }
+  | { type: 'error'; step: number }
+  | { type: 'not'; cond: BatchCondition }
+  | { type: 'and'; conds: BatchCondition[] }
+  | { type: 'or'; conds: BatchCondition[] }
+  | { type: 'is_autocommit' };
+
 export interface BatchStep {
   stmt: {
     sql: string;
@@ -40,10 +48,7 @@ export interface BatchStep {
     named_args?: NamedArg[];
     want_rows: boolean;
   };
-  condition?: {
-    type: 'ok';
-    step: number;
-  };
+  condition?: BatchCondition;
 }
 
 export interface BatchRequest {
@@ -67,6 +72,10 @@ export interface DescribeRequest {
   sql: string;
 }
 
+export interface GetAutocommitRequest {
+  type: 'get_autocommit';
+}
+
 export interface DescribeResult {
   params: Array<{ name?: string }>;
   cols: Column[];
@@ -76,7 +85,7 @@ export interface DescribeResult {
 
 export interface PipelineRequest {
   baton: string | null;
-  requests: (ExecuteRequest | BatchRequest | SequenceRequest | CloseRequest | DescribeRequest)[];
+  requests: (ExecuteRequest | BatchRequest | SequenceRequest | CloseRequest | DescribeRequest | GetAutocommitRequest)[];
 }
 
 export interface PipelineResponse {
@@ -85,14 +94,19 @@ export interface PipelineResponse {
   results: Array<{
     type: 'ok' | 'error';
     response?: {
-      type: 'execute' | 'batch' | 'sequence' | 'close' | 'describe';
+      type: 'execute' | 'batch' | 'sequence' | 'close' | 'describe' | 'get_autocommit';
       result?: ExecuteResult | DescribeResult;
+      is_autocommit?: boolean;
     };
     error?: {
       message: string;
       code: string;
     };
   }>;
+}
+
+function toBase64(uint8: Uint8Array): string {
+  return Buffer.from(uint8.buffer, uint8.byteOffset, uint8.byteLength).toString('base64');
 }
 
 export function encodeValue(value: any): Value {
@@ -122,9 +136,12 @@ export function encodeValue(value: any): Value {
     return { type: 'text', value };
   }
   
-  if (value instanceof ArrayBuffer || value instanceof Uint8Array) {
-    const base64 = btoa(String.fromCharCode(...new Uint8Array(value)));
-    return { type: 'blob', base64 };
+  if (value instanceof ArrayBuffer) {
+    return { type: 'blob', base64: toBase64(new Uint8Array(value)) };
+  }
+
+  if (value instanceof Uint8Array) {
+    return { type: 'blob', base64: toBase64(value) };
   }
   
   return { type: 'text', value: String(value) };

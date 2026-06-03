@@ -1,7 +1,4 @@
-use std::collections::VecDeque;
-use std::sync::Arc;
-
-use crate::{turso_assert_eq, turso_assert_greater_than};
+use crate::{alloc::TryReserveError, turso_assert_eq, turso_assert_greater_than};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
@@ -13,10 +10,11 @@ use super::{
     constraints::TableConstraints,
     cost_params::CostModelParams,
     order::OrderTarget,
-    IndexMethodCandidate,
+    AvailableIndexes, IndexMethodCandidate,
 };
+use crate::alloc::TursoIteratorExt;
 use crate::{
-    schema::{Index, Schema},
+    schema::Schema,
     stats::AnalyzeStats,
     translate::{
         expr::{walk_expr, WalkControl},
@@ -164,7 +162,7 @@ pub fn join_lhs_and_rhs<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<JoinN>> {
@@ -207,8 +205,10 @@ pub fn join_lhs_and_rhs<'a>(
     {
         if constraint_refs.is_empty() {
             // Check if there are usable constraints that will create an ephemeral index
-            let lhs_mask_for_ephemeral: TableMask =
-                lhs.map_or_else(TableMask::default, |l| l.table_numbers().collect());
+            let lhs_mask_for_ephemeral: TableMask = match lhs {
+                Some(l) => l.table_numbers().try_collect()?,
+                None => TableMask::default(),
+            };
             let has_usable_constraints = rhs_constraints.constraints.iter().any(|c| {
                 c.usable
                     && c.table_col_pos.is_some()
@@ -229,13 +229,16 @@ pub fn join_lhs_and_rhs<'a>(
     let mut best_access_method = method;
 
     // Reuse for hash cost and output cardinality computation
-    let lhs_mask = lhs.map_or_else(TableMask::default, |l| l.table_numbers().collect());
+    let lhs_mask = match lhs {
+        Some(l) => l.table_numbers().try_collect()?,
+        None => TableMask::default(),
+    };
 
     // Self-constraints are conditions comparing columns within the same table
     // (e.g., t.col1 < t.col2). Include them in selectivity since they filter rows.
     let rhs_self_mask = {
         let mut m = TableMask::default();
-        m.set(rhs_table_number);
+        m.set(rhs_table_number)?;
         m
     };
 
@@ -274,7 +277,7 @@ pub fn join_lhs_and_rhs<'a>(
     if let Some(lhs) = lhs {
         let rhs_table_idx = join_order.last().unwrap().original_idx;
         let last_lhs_table_idx = join_order[join_order.len() - 2].original_idx;
-        let lhs_table_numbers: TableMask = lhs.table_numbers().collect();
+        let lhs_table_numbers: TableMask = lhs.table_numbers().try_collect()?;
 
         let rhs_has_selective_seek = matches!(
             best_access_method.params,
@@ -397,7 +400,7 @@ pub fn join_lhs_and_rhs<'a>(
                             }
                         })
                     })
-                    .collect()
+                    .try_collect()?
             };
 
             let build_has_prior_constraints = {
@@ -838,7 +841,10 @@ fn build_self_constraint_selectivity(
     build_constraints: &TableConstraints,
     build_table_idx: usize,
 ) -> f64 {
-    let build_only_mask: TableMask = [build_table_idx].into_iter().collect();
+    let build_only_mask: TableMask = [build_table_idx]
+        .into_iter()
+        .try_collect()
+        .expect("does not heap allocate with just a single value");
     let mut selectivity = 1.0;
     let mut saw_constraint = false;
     for constraint in build_constraints.constraints.iter() {
@@ -892,7 +898,7 @@ pub fn compute_best_join_order<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -930,7 +936,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -1044,7 +1050,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // there were no other tables.
     for i in 0..num_tables {
         let mut mask = TableMask::default();
-        mask.set(i);
+        mask.set(i)?;
         let table_ref = &joined_tables[i];
         join_order[0] = JoinOrderMember {
             table_id: table_ref.internal_id,
@@ -1093,7 +1099,10 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     .is_some_and(|j| j.is_ordering_constrained())
             })
             .count();
-        if ordering_constrained_count == 0 {
+        let has_full_outer = joined_tables
+            .iter()
+            .any(|t| t.join_info.as_ref().is_some_and(|j| j.is_full_outer()));
+        if ordering_constrained_count == 0 && !has_full_outer {
             None
         } else {
             // map from rhs table index to lhs table index
@@ -1110,12 +1119,31 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     {
                         // bitwise OR the masks
                         if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
-                            illegal_lhs.set(j);
+                            illegal_lhs.set(j)?;
                         } else {
                             let mut mask = TableMask::default();
-                            mask.set(j);
+                            mask.set(j)?;
                             left_join_illegal_map.insert(i, mask);
                         }
+                    }
+                }
+            }
+            // FULL OUTER acts as a reordering barrier in both directions: tables
+            // originally after a FULL OUTER table cannot be moved before it, or
+            // the planner produces e.g. `(t1 INNER t3) FULL OUTER t2` instead of
+            // the requested `(t1 FULL OUTER t2) INNER t3`, which can leak
+            // NULL-filled probe rows past the inner join.
+            for (k, t) in joined_tables.iter().enumerate() {
+                if !t.join_info.as_ref().is_some_and(|j| j.is_full_outer()) {
+                    continue;
+                }
+                for j in (k + 1)..joined_tables.len() {
+                    if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&k) {
+                        illegal_lhs.set(j)?;
+                    } else {
+                        let mut mask = TableMask::default();
+                        mask.set(j)?;
+                        left_join_illegal_map.insert(k, mask);
                     }
                 }
             }
@@ -1127,6 +1155,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // Try to join each single table to each other table.
     for subset_size in 2..=num_tables {
         for mask in generate_join_bitmasks(num_tables, subset_size) {
+            let mask = mask?;
             // Keep track of the best way to join this subset of tables per possible last table.
             // This preserves alternative join orders that may be more expensive for the subset
             // but enable cheaper joins when adding more tables.
@@ -1169,7 +1198,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                 };
 
                 // Stable iteration keeps tie-breaks consistent across runs.
-                let lhs_keys: TableMask = lhs_variants.keys().copied().collect();
+                let lhs_keys: TableMask = lhs_variants.keys().copied().try_collect()?;
                 for lhs_key in &lhs_keys {
                     let lhs = &lhs_variants[&lhs_key];
                     // Build a JoinOrder out of the table bitmask under consideration.
@@ -1364,7 +1393,7 @@ pub fn compute_greedy_join_order<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -1385,18 +1414,18 @@ pub fn compute_greedy_join_order<'a>(
         .map(|(j, _)| {
             let mut required = TableMask::default();
             for k in 0..j {
-                required.set(k);
+                required.set(k)?;
             }
-            (j, required)
+            Ok((j, required))
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
-    let mut remaining: TableMask = (0..num_tables).collect();
+    let mut remaining: TableMask = (0..num_tables).try_collect()?;
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
 
     // Pick starting table: prefer tables with high "hub score" (referenced by many constraints).
     let first_idx =
-        find_best_starting_table(num_tables, constraints, base_table_rows, &left_join_deps);
+        find_best_starting_table(num_tables, constraints, base_table_rows, &left_join_deps)?;
     let first_table = &joined_tables[first_idx];
     join_order.push(JoinOrderMember {
         table_id: first_table.internal_id,
@@ -1436,7 +1465,7 @@ pub fn compute_greedy_join_order<'a>(
 
     // Greedily add remaining tables, always picking lowest marginal cost.
     while !remaining.is_empty() {
-        let current_mask: TableMask = join_order.iter().map(|m| m.original_idx).collect();
+        let current_mask: TableMask = join_order.iter().map(|m| m.original_idx).try_collect()?;
 
         // Placeholder for candidate evaluation (avoids cloning)
         join_order.push(JoinOrderMember::default());
@@ -1559,7 +1588,7 @@ fn find_best_starting_table(
     constraints: &[TableConstraints],
     base_table_rows: &[RowCountEstimate],
     left_join_deps: &HashMap<usize, TableMask>,
-) -> usize {
+) -> Result<usize> {
     // hub_score[t] = count of usable constraints on OTHER tables that reference t.
     // If we join t first, each such constraint becomes usable for an index lookup.
     let mut hub_score = vec![0usize; num_tables];
@@ -1584,7 +1613,7 @@ fn find_best_starting_table(
         // Self-constraints compare columns within the same table (e.g., t.col1 < t.col2).
         let self_mask = {
             let mut m = TableMask::default();
-            m.set(t);
+            m.set(t)?;
             m
         };
 
@@ -1604,7 +1633,7 @@ fn find_best_starting_table(
     }
 
     // Table 0 can never be outer join RHS, so best is always Some.
-    best.expect("no valid starting table").0
+    Ok(best.expect("no valid starting table").0)
 }
 
 /// Specialized version of [compute_best_join_order] that just joins tables in the order they are given
@@ -1624,7 +1653,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<JoinN>> {
@@ -1755,14 +1784,17 @@ impl JoinBitmaskIter {
 }
 
 impl Iterator for JoinBitmaskIter {
-    type Item = TableMask;
+    type Item = Result<TableMask, TryReserveError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current >= self.max_exclusive {
             return None;
         }
 
-        let result = self.current.into();
+        let result = match TableMask::try_from(self.current) {
+            Ok(res) => res,
+            Err(e) => return Some(Err(e)),
+        };
 
         // Gosper's hack: compute next k-bit combination in lexicographic order
         let c = self.current & (!self.current + 1); // rightmost set bit
@@ -1771,7 +1803,7 @@ impl Iterator for JoinBitmaskIter {
         let ones = (ones >> 2) / c; // right-adjust shifted bits
         self.current = r | ones; // form the next combination
 
-        Some(result)
+        Some(Ok(result))
     }
 }
 
@@ -1817,21 +1849,22 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_bitmasks() {
-        let bitmasks = generate_join_bitmasks(4, 2).collect::<Vec<_>>();
-        assert!(bitmasks.contains(&0b0011.into())); // {0,1}
-        assert!(bitmasks.contains(&0b0101.into())); // {0,2}
-        assert!(bitmasks.contains(&0b0110.into())); // {1,2}
-        assert!(bitmasks.contains(&0b1001.into())); // {0,3}
-        assert!(bitmasks.contains(&0b1010.into())); // {1,3}
-        assert!(bitmasks.contains(&0b1100.into())); // {2,3}
+    fn test_generate_bitmasks() -> std::result::Result<(), TryReserveError> {
+        let bitmasks = generate_join_bitmasks(4, 2).collect::<std::result::Result<Vec<_>, _>>()?;
+        assert!(bitmasks.contains(&TableMask::try_from(0b0011u128)?)); // {0,1}
+        assert!(bitmasks.contains(&TableMask::try_from(0b0101u128)?)); // {0,2}
+        assert!(bitmasks.contains(&TableMask::try_from(0b0110u128)?)); // {1,2}
+        assert!(bitmasks.contains(&TableMask::try_from(0b1001u128)?)); // {0,3}
+        assert!(bitmasks.contains(&TableMask::try_from(0b1010u128)?)); // {1,3}
+        assert!(bitmasks.contains(&TableMask::try_from(0b1100u128)?)); // {2,3}
+        Ok(())
     }
 
     #[test]
     /// Test that [compute_best_join_order] returns None when there are no table references.
     fn test_compute_best_join_order_empty() {
         let table_references = TableReferences::new(vec![], vec![]);
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
         let mut where_clause = vec![];
 
         let mut access_methods_arena = Vec::new();
@@ -1874,7 +1907,7 @@ mod tests {
         let mut table_id_counter = TableRefIdCounter::new();
         let joined_tables = vec![_create_table_reference(t1, None, table_id_counter.next())];
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
         let mut where_clause = vec![];
 
         let mut access_methods_arena = Vec::new();
@@ -1932,7 +1965,7 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let mut access_methods_arena = Vec::new();
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -1998,7 +2031,7 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let mut access_methods_arena = Vec::new();
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
         let index = Arc::new(Index {
             name: "sqlite_autoindex_test_table_1".to_string(),
             table_name: "test_table".to_string(),
@@ -2018,7 +2051,11 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("test_table".to_string(), VecDeque::from([index]));
+        available_indexes.insert_for_table_name(
+            table_references.joined_tables(),
+            "test_table",
+            VecDeque::from([index]),
+        );
 
         let table_constraints = constraints_from_where_clause(
             &where_clause,
@@ -2090,7 +2127,7 @@ mod tests {
         const TABLE1: usize = 0;
         const TABLE2: usize = 1;
 
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
         // Index on the outer table (table1)
         let index1 = Arc::new(Index {
             name: "index1".to_string(),
@@ -2111,7 +2148,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("table1".to_string(), VecDeque::from([index1]));
+        available_indexes.insert_for_table_name(&joined_tables, "table1", VecDeque::from([index1]));
 
         // SELECT * FROM table1 JOIN table2 WHERE table1.id = table2.id
         // expecting table2 to be chosen first due to the index on table1.id
@@ -2228,7 +2265,7 @@ mod tests {
         const TABLE_NO_CUSTOMERS: usize = 1;
         const TABLE_NO_ORDER_ITEMS: usize = 2;
 
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
         ["orders", "customers", "order_items"]
             .iter()
             .for_each(|table_name| {
@@ -2253,7 +2290,11 @@ mod tests {
                     index_method: None,
                     on_conflict: None,
                 });
-                available_indexes.insert(table_name.to_string(), VecDeque::from([index]));
+                available_indexes.insert_for_table_name(
+                    &joined_tables,
+                    table_name,
+                    VecDeque::from([index]),
+                );
             });
         let customer_id_idx = Arc::new(Index {
             name: "orders_customer_id_idx".to_string(),
@@ -2294,12 +2335,8 @@ mod tests {
             on_conflict: None,
         });
 
-        available_indexes
-            .entry("orders".to_string())
-            .and_modify(|v| v.push_front(customer_id_idx));
-        available_indexes
-            .entry("order_items".to_string())
-            .and_modify(|v| v.push_front(order_id_idx));
+        available_indexes.push_front_for_table_name(&joined_tables, "orders", customer_id_idx);
+        available_indexes.push_front_for_table_name(&joined_tables, "order_items", order_id_idx);
 
         // SELECT * FROM orders JOIN customers JOIN order_items
         // WHERE orders.customer_id = customers.id AND orders.id = order_items.order_id AND customers.id = 42
@@ -2456,7 +2493,7 @@ mod tests {
         ];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
         let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
@@ -2583,7 +2620,7 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let mut access_methods_arena = Vec::new();
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -2663,7 +2700,7 @@ mod tests {
             tables.push(_create_btree_table(&format!("t{}", i + 1), columns));
         }
 
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
 
         let mut table_id_counter = TableRefIdCounter::new();
         // Create table references
@@ -2798,8 +2835,7 @@ mod tests {
             on_conflict: None,
         });
 
-        let mut available_indexes = HashMap::default();
-        available_indexes.insert("t1".to_string(), VecDeque::from([index]));
+        let mut available_indexes = AvailableIndexes::default();
 
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
@@ -2814,6 +2850,7 @@ mod tests {
             database_id: MAIN_DB_ID,
             indexed: None,
         });
+        available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
 
         // Create where clause that only references second column
         let mut where_clause = vec![WhereTerm {
@@ -2876,7 +2913,7 @@ mod tests {
     fn test_index_skips_middle_column() {
         let mut table_id_counter = TableRefIdCounter::new();
         let mut joined_tables = Vec::new();
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
 
         let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
         let table = _create_btree_table("t1", columns);
@@ -2917,8 +2954,6 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("t1".to_string(), VecDeque::from([index]));
-
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
@@ -2932,6 +2967,7 @@ mod tests {
             database_id: MAIN_DB_ID,
             indexed: None,
         });
+        available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
 
         // Create where clause that references first and third columns
         let mut where_clause = vec![
@@ -3015,7 +3051,7 @@ mod tests {
     fn test_index_stops_at_range_operator() {
         let mut table_id_counter = TableRefIdCounter::new();
         let mut joined_tables = Vec::new();
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
 
         let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
         let table = _create_btree_table("t1", columns);
@@ -3056,8 +3092,6 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("t1".to_string(), VecDeque::from([index]));
-
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
@@ -3071,6 +3105,7 @@ mod tests {
             database_id: MAIN_DB_ID,
             indexed: None,
         });
+        available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
 
         // Create where clause: c1 = 5 AND c2 > 10 AND c3 = 7
         let mut where_clause = vec![
@@ -3314,7 +3349,7 @@ mod tests {
         const TABLE2: usize = 1;
 
         // Index on t2.a
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
         let index_t2_a = Arc::new(Index {
             name: "idx_t2_a".to_string(),
             table_name: "t2".to_string(),
@@ -3334,7 +3369,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("t2".to_string(), VecDeque::from([index_t2_a]));
+        available_indexes.insert_for_table_name(&joined_tables, "t2", VecDeque::from([index_t2_a]));
 
         // WHERE t1.a = t2.a
         let mut where_clause = vec![_create_binary_expr(

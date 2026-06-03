@@ -422,33 +422,11 @@ EOF
 
 We'd love to have you contribute to Turso Database! Please check out the [contribution guide] to get started.
 
-### Found a data corruption bug? Get up to $1,000.00
-
-SQLite is loved because it is the most reliable database in the world. The next evolution of SQLite has
-to match or surpass this level of reliability. Turso is built with [Deterministic Simulation Testing](testing/simulator/README.md/)
-from the ground up, and is also tested by [Antithesis](https://antithesis.com).
-
-Even during Beta, if you find a bug that leads to a data corruption and demonstrate
-how our simulator failed to catch it, you can get up to $1,000.00. As the project matures we will
-increase the size of the prize, and the scope of the bugs.
-
-List of rewarded cases:
-
-* B-Tree interior cell replacement issue in btrees with depth >=3 ([#2106](https://github.com/tursodatabase/turso/issues/2106))
-* Don't allow autovacuum to be flipped on non-empty databases ([#3830](https://github.com/tursodatabase/turso/pull/3830))
-* Self-insert with nested subquery generates corrupt data ([#3436](https://github.com/tursodatabase/turso/pull/3436))
-* Ptrmap data corruption with pre-initialized autovacuum database ([#3894](https://github.com/tursodatabase/turso/pull/3894))
-* WAL corruption on statement rollback with constraint violation ([#4493](https://github.com/tursodatabase/turso/pull/4493))
-
-More details [here](https://turso.algora.io).
-
-Turso core staff are not eligible.
-
 ## FAQ
 
 ### Is Turso Database ready for production use?
 
-Turso Database is currently under heavy development and is **not** ready for production use.
+Turso powers production apps today. That includes [Turso Cloud](https://turso.tech/signup), the [Kin AI assistant](https://mykin.ai/), and [Spice.ai](https://github.com/spiceai/spiceai). However, it is still under active development and for mission-critical applications, caution is advised. Independent backups are encouraged. Turso is extensively tested by a collection of tools including a native Deterministic Simulation Testing suite and [Antithesis](https://antithesis.com), so we are generally confident in the end result. But our bar is SQLite-level reliability, and we will still recommend caution until we are confident it meets that bar.
 
 ### How is Turso Database different from Turso's libSQL?
 
@@ -460,6 +438,7 @@ Rewriting SQLite in Rust started as an unassuming experiment, and due to its inc
 
 * Pekka Enberg, Sasu Tarkoma, Jon Crowcroft Ashwin Rao (2024). Serverless Runtime / Database Co-Design With Asynchronous I/O. In _EdgeSys ‘24_. [[PDF]](https://penberg.org/papers/penberg-edgesys24.pdf)
 * Pekka Enberg, Sasu Tarkoma, and Ashwin Rao (2023). Towards Database and Serverless Runtime Co-Design. In _CoNEXT-SW ’23_. [[PDF](https://penberg.org/papers/penberg-conext-sw-23.pdf)] [[Slides](https://penberg.org/papers/penberg-conext-sw-23-slides.pdf)]
+* Alperen Keles, Ethan Chou, Harrison Goldstein, Leonidas Lampropoulos (2026). DIRT: Database-Integrated Random Testing. In _DBTest '26_. [[PDF]](https://arxiv.org/pdf/2604.16373)
 
 ## License
 

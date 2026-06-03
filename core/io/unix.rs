@@ -16,6 +16,12 @@ use std::{io::ErrorKind, sync::Arc};
 use tracing::debug;
 use tracing::{instrument, trace, Level};
 
+// Darwin fails pwrite() and pwritev() calls with buffer size larger than INT_MAX so let's treat
+// that as maximum buffer size.
+const MAX_PWRITE_LEN: usize = i32::MAX as usize;
+
+const MAX_IOV: usize = 1024;
+
 pub struct UnixIO {}
 
 impl UnixIO {
@@ -33,61 +39,6 @@ impl Clock for UnixIO {
 
     fn current_time_wall_clock(&self) -> WallClockInstant {
         DefaultClock.current_time_wall_clock()
-    }
-}
-
-fn try_pwritev_raw(
-    fd: RawFd,
-    off: u64,
-    bufs: &[Arc<crate::Buffer>],
-    start_idx: usize,
-    start_off: usize,
-) -> std::io::Result<usize> {
-    const MAX_IOV: usize = 1024;
-    let iov_len = std::cmp::min(bufs.len() - start_idx, MAX_IOV);
-    let mut iov: Vec<libc::iovec> = Vec::with_capacity(iov_len);
-
-    let mut last_end: Option<(*const u8, usize)> = None;
-    let mut iov_count = 0;
-    for (i, b) in bufs.iter().enumerate().skip(start_idx).take(iov_len) {
-        let s = b.as_slice();
-        let slice = if i == start_idx { &s[start_off..] } else { s };
-        let ptr = slice.as_ptr();
-        let len = slice.len();
-
-        if let Some((last_ptr, last_len)) = last_end {
-            // Check if this buffer is adjacent to the last
-            if unsafe { last_ptr.add(last_len) } == ptr {
-                // Extend the last iovec instead of adding new
-                iov[iov_count - 1].iov_len += len;
-                last_end = Some((last_ptr, last_len + len));
-                continue;
-            }
-        }
-        last_end = Some((ptr, len));
-        iov_count += 1;
-        iov.push(libc::iovec {
-            iov_base: ptr as *mut libc::c_void,
-            iov_len: len,
-        });
-    }
-    // On Android, off_t is i32. Cast to libc::off_t instead of hardcoding i64 for portability.
-    let n = if iov.len().eq(&1) {
-        unsafe {
-            libc::pwrite(
-                fd,
-                iov[0].iov_base as *const libc::c_void,
-                iov[0].iov_len,
-                off as libc::off_t,
-            )
-        }
-    } else {
-        unsafe { libc::pwritev(fd, iov.as_ptr(), iov.len() as i32, off as libc::off_t) }
-    };
-    if n < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(n as usize)
     }
 }
 
@@ -396,11 +347,12 @@ impl File for UnixFile {
 
         while total_written < total_size {
             let remaining_slice = &buf_slice[total_written..];
+            let write_len = remaining_slice.len().min(MAX_PWRITE_LEN);
             let result = unsafe {
                 libc::pwrite(
                     self.file.as_raw_fd(),
                     remaining_slice.as_ptr() as *const libc::c_void,
-                    remaining_slice.len(),
+                    write_len,
                     current_pos as libc::off_t,
                 )
             };
@@ -442,59 +394,57 @@ impl File for UnixFile {
             return self.pwrite(pos, buffers[0].clone(), c);
         }
 
-        let mut total_written = 0usize;
-        let mut current_pos = pos;
+        let total_size: usize = buffers.iter().map(|b| b.as_slice().len()).sum();
+        let mut iov: Vec<libc::iovec> = Vec::with_capacity(MAX_IOV);
         let mut buf_idx = 0;
         let mut buf_offset = 0;
+        let mut total_written = 0usize;
+        let mut current_pos = pos;
 
-        let total_size: usize = buffers.iter().map(|b| b.len()).sum();
-        while total_written < total_size {
-            match try_pwritev_raw(
-                self.file.as_raw_fd(),
-                current_pos,
-                &buffers,
-                buf_idx,
-                buf_offset,
-            ) {
-                Ok(written) => {
-                    if written == 0 {
-                        // Unexpected EOF
-                        return Err(LimboError::CompletionError(CompletionError::IOError(
-                            ErrorKind::UnexpectedEof,
-                            "pwritev",
-                        )));
-                    }
-                    total_written += written;
-                    current_pos += written as u64;
-
-                    let mut remaining = written;
-                    while remaining > 0 && buf_idx < buffers.len() {
-                        let buf_remaining = buffers[buf_idx].len() - buf_offset;
-
-                        if remaining >= buf_remaining {
-                            // Consumed rest of current buffer
-                            remaining -= buf_remaining;
-                            buf_idx += 1;
-                            buf_offset = 0;
-                        } else {
-                            // Partial write within current buffer
-                            buf_offset += remaining;
-                            remaining = 0;
-                        }
-                    }
-
-                    trace!(
-                        "pwritev iteration: wrote {written}, total {total_written}/{total_size}"
-                    );
+        // This loop converts buffers into MAX_IOV iovecs, submits them for I/O, and runs again.
+        // If we we run out of iovecs before we convert a buffer in full, we keep track of buffer
+        // offset, and resume conversion from there.
+        loop {
+            while buf_idx < buffers.len() {
+                let buf = buffers[buf_idx].as_slice();
+                buf_offset += buf_to_iovecs(&buf[buf_offset..], &mut iov, MAX_IOV);
+                // If we ran out of iovecs, let's submit them for I/O.
+                if buf_offset < buf.len() {
+                    break;
                 }
-                Err(e) if e.kind() == ErrorKind::Interrupted => {
-                    // EINTR - retry without advancing
+                // Buffer was fully conveted to iovec, move to next buffer.
+                buf_idx += 1;
+                buf_offset = 0;
+            }
+            if iov.is_empty() {
+                break;
+            }
+            let n = unsafe {
+                libc::pwritev(
+                    self.file.as_raw_fd(),
+                    iov.as_ptr(),
+                    iov.len() as i32,
+                    current_pos as libc::off_t,
+                )
+            };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == ErrorKind::Interrupted {
                     continue;
                 }
-                Err(e) => {
-                    return Err(io_error(e, "pwritev"));
-                }
+                return Err(io_error(e, "pwritev"));
             }
+            let written = n as usize;
+            if written == 0 {
+                return Err(LimboError::CompletionError(CompletionError::IOError(
+                    ErrorKind::UnexpectedEof,
+                    "pwritev",
+                )));
+            }
+            total_written += written;
+            current_pos += written as u64;
+            trim_iovecs(&mut iov, written);
+            trace!("pwritev iteration: wrote {written}, total {total_written}/{total_size}");
         }
         trace!("pwritev complete: wrote {total_written} bytes");
         c.complete(total_written as i32);
@@ -590,6 +540,42 @@ impl File for UnixFile {
 
     fn shared_wal_map(&self, offset: u64, len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
         unix_shared_wal_map(offset, len, self.file.as_raw_fd())
+    }
+}
+
+/// Append iovec entries for `buf` to `iovecs`, splitting `buf` into chunks of
+/// at most `MAX_PWRITE_LEN` bytes. Stops once `iovecs.len()` reaches `max_iovecs`.
+/// Returns the number of bytes consumed from `buf`.
+fn buf_to_iovecs(buf: &[u8], iovecs: &mut Vec<libc::iovec>, max_iovecs: usize) -> usize {
+    let mut slice = buf;
+    while !slice.is_empty() && iovecs.len() < max_iovecs {
+        let chunk_len = slice.len().min(MAX_PWRITE_LEN);
+        iovecs.push(libc::iovec {
+            iov_base: slice.as_ptr() as *mut libc::c_void,
+            iov_len: chunk_len,
+        });
+        slice = &slice[chunk_len..];
+    }
+    buf.len() - slice.len()
+}
+
+/// Drop the first `n` bytes from the front of `iov`, advancing the leading
+/// entry's pointer if a partial iovec was consumed.
+fn trim_iovecs(iov: &mut Vec<libc::iovec>, mut n: usize) {
+    let mut idx = 0;
+    while idx < iov.len() {
+        if iov[idx].iov_len > n {
+            break;
+        }
+        n -= iov[idx].iov_len;
+        idx += 1;
+    }
+    iov.drain(..idx);
+    if n > 0 {
+        assert!(!iov.is_empty());
+        let front = &mut iov[0];
+        front.iov_base = unsafe { (front.iov_base as *mut u8).add(n) as *mut libc::c_void };
+        front.iov_len -= n;
     }
 }
 

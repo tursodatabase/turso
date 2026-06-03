@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Pragma {
     AutoVacuumMode(VacuumMode),
+    ForeignKeyList(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +27,10 @@ impl Display for Pragma {
 
                 write!(f, "PRAGMA auto_vacuum={mode}")?;
                 Ok(())
+            }
+            Pragma::ForeignKeyList(table_name) => {
+                let table_name = table_name.replace('\'', "''");
+                write!(f, "PRAGMA foreign_key_list('{table_name}')")
             }
         }
     }
