@@ -11,7 +11,7 @@ use crate::translate::expr::{
 use crate::translate::order_by::EmitOrderBy;
 use crate::translate::plan::{
     Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination, ResultSetColumn,
-    SelectPlan, TableReferences, Window, WindowFunction, WindowFunctionKind,
+    RewrittenWindowCall, SelectPlan, TableReferences, Window, WindowFunction, WindowFunctionKind,
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
@@ -319,20 +319,20 @@ fn rewrite_terminal_expr(
                     {
                         // Window function tied to the current window: rewrite its
                         // children to reference the subquery, not the call itself.
-                        if let Some(rewritten) = &window_function.rewritten_expr {
-                            *expr = rewritten.clone();
+                        if let Some(rewritten) = &window_function.rewritten {
+                            *expr = rewritten.expr.clone();
                         } else {
                             let window_name = current_window
                                 .name
                                 .clone()
                                 .expect("current_window must always have a name here");
-                            rewrite_expr_referencing_current_window(
-                                aggregates,
-                                window_name,
-                                ctx,
-                                expr,
-                                window_function,
-                            )?;
+                            window_function.rewritten =
+                                Some(rewrite_expr_referencing_current_window(
+                                    aggregates,
+                                    window_name,
+                                    ctx,
+                                    expr,
+                                )?);
                         }
                         return Ok(WalkControl::SkipChildren);
                     } else {
@@ -371,7 +371,7 @@ fn find_window_function_entry<'a>(
         if !exprs_are_equivalent(&f.original_expr, expr) {
             continue;
         }
-        if f.rewritten_expr.is_none() {
+        if f.rewritten.is_none() {
             chosen = Some(i);
             break;
         }
@@ -401,15 +401,14 @@ fn push_into_source_subquery(
 
 /// Rewrite a window function call `expr` so its arguments and FILTER predicate
 /// reference output columns of the source subquery (the one being built in
-/// `ctx`), then record the rewritten form and the rewritten filter predicate
-/// on `window_function` for later emission.
+/// `ctx`). Returns the rewritten form, ready to be stored on the matching
+/// `WindowFunction`.
 fn rewrite_expr_referencing_current_window(
     aggregates: &mut Vec<Aggregate>,
     window_name: String,
     ctx: &mut WindowSubqueryContext,
     expr: &mut Expr,
-    window_function: &mut WindowFunction,
-) -> crate::Result<()> {
+) -> crate::Result<RewrittenWindowCall> {
     let filter_over = match expr {
         Expr::FunctionCall {
             args,
@@ -433,10 +432,12 @@ fn rewrite_expr_referencing_current_window(
     if let Some(filter_expr) = filter_over.filter_clause.as_deref_mut() {
         push_into_source_subquery(filter_expr, aggregates, ctx)?;
     }
-    window_function.filter_expr = filter_over.filter_clause.as_deref().cloned();
+    let filter_expr = filter_over.filter_clause.as_deref().cloned();
     filter_over.over_clause = Some(Over::Name(Name::exact(window_name)));
-    window_function.rewritten_expr = Some(expr.clone());
-    Ok(())
+    Ok(RewrittenWindowCall {
+        expr: expr.clone(),
+        filter_expr,
+    })
 }
 
 /// Rewrites an expression into a reference to a subquery column. If an
@@ -619,9 +620,8 @@ impl EmitWindow {
             // Cache by the rewritten form (when available) so lookups against the
             // result-column / ORDER-BY expressions — which were rewritten to
             // reference this window's subquery — find the cached register.
-            let cache_expr = func.rewritten_expr.as_ref().unwrap_or(&func.original_expr);
             t_ctx.resolver.cache_expr_reg(
-                std::borrow::Cow::Borrowed(cache_expr),
+                std::borrow::Cow::Borrowed(func.current_expr()),
                 reg_acc_result_start + i,
                 false,
                 None,
@@ -1034,8 +1034,7 @@ fn emit_aggregation_step(
         // values directly by evaluating the expressions that reference the subquery result columns.
         // Use the rewritten form when available so the args reference the subquery
         // rather than the (no-longer-visible) original tables.
-        let func_expr = func.rewritten_expr.as_ref().unwrap_or(&func.original_expr);
-        let args = match func_expr {
+        let args = match func.current_expr() {
             Expr::FunctionCall { args, .. } => args.iter().map(|a| (**a).clone()).collect(),
             Expr::FunctionCallStar { .. } => vec![],
             _ => unreachable!(
@@ -1046,7 +1045,9 @@ fn emit_aggregation_step(
         let reg_acc_start = registers.acc_start + i;
         // FILTER controls whether the current input row contributes to the
         // running aggregate; it does not suppress the output row itself.
-        let filter_skip_label = if let Some(filter_expr) = &func.filter_expr {
+        let filter_skip_label = if let Some(filter_expr) =
+            func.rewritten.as_ref().and_then(|r| r.filter_expr.as_ref())
+        {
             let label = program.allocate_label();
             let filter_reg = program.alloc_register();
             translate_expr(

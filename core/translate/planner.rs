@@ -443,9 +443,8 @@ fn link_with_window(
         }
         window.functions.push(WindowFunction {
             func,
-            filter_expr: None,
             original_expr: expr.clone(),
-            rewritten_expr: None,
+            rewritten: None,
         });
     } else {
         let func_name = match &func {

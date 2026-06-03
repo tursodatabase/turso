@@ -3046,21 +3046,39 @@ pub struct WindowFunction {
     /// The resolved function. Aggregate window functions and specialized window
     /// functions such as ROW_NUMBER() are supported.
     pub func: WindowFunctionKind,
-    /// The FILTER predicate, rewritten to reference the source subquery's
-    /// output columns. AggStep evaluates this once per input row and skips
-    /// the step when it is false. Stored as its own field so AggStep doesn't
-    /// have to pattern-match it back out of `rewritten_expr`'s `filter_over`
-    /// tail on every row.
-    pub filter_expr: Option<Expr>,
     /// The expression from which the function was resolved. Used as the lookup
     /// key when matching SQL occurrences back to this entry during rewriting.
     pub original_expr: Expr,
-    /// `original_expr` with its arguments, FILTER predicate, and OVER clause
-    /// rewritten to reference the source subquery. Set the first time
-    /// `rewrite_terminal_expr` matches this function; later occurrences of
-    /// the same call reuse this cached rewrite so they resolve to the same
-    /// result register.
-    pub rewritten_expr: Option<Expr>,
+    /// Populated the first time `rewrite_terminal_expr` matches this function.
+    /// Later occurrences of the same call reuse this cached rewrite so they
+    /// resolve to the same result register.
+    pub rewritten: Option<RewrittenWindowCall>,
+}
+
+/// The rewritten form of a window function call, populated once `WindowFunction`
+/// has been mapped onto its source subquery.
+#[derive(Debug, Clone)]
+pub struct RewrittenWindowCall {
+    /// `WindowFunction::original_expr` with its arguments, FILTER predicate, and
+    /// OVER clause rewritten to reference the source subquery.
+    pub expr: Expr,
+    /// The FILTER predicate, rewritten to reference the source subquery's
+    /// output columns. AggStep evaluates this once per input row and skips
+    /// the step when it is false. A copy of the predicate already inside
+    /// `expr.filter_over`, lifted to a bare `Expr` so AggStep doesn't have to
+    /// pattern-match it back out on every row.
+    pub filter_expr: Option<Expr>,
+}
+
+impl WindowFunction {
+    /// The expression that downstream lookups should match against: the
+    /// rewritten form once available, otherwise the original.
+    pub fn current_expr(&self) -> &Expr {
+        self.rewritten
+            .as_ref()
+            .map(|r| &r.expr)
+            .unwrap_or(&self.original_expr)
+    }
 }
 
 #[derive(Debug, Clone)]
