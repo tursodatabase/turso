@@ -1022,20 +1022,27 @@ impl std::fmt::Display for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         write!(
             f,
-            "{{ state: {}, id: {}, begin_ts: {}, write_set: [",
+            "{{ state: {}, id: {}, begin_ts: {}, write_set: ",
             self.state.load(),
             self.tx_id,
             self.begin_ts,
         )?;
 
-        for (i, (id, _chain)) in self.write_set.lock().iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?
+        match self.write_set.try_lock() {
+            Some(write_set) => {
+                write!(f, "[")?;
+                for (i, (id, _chain)) in write_set.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?
+                    }
+                    write!(f, "{id:?}")?;
+                }
+                write!(f, "]")?;
             }
-            write!(f, "{id:?}")?;
+            None => write!(f, "<locked>")?,
         }
 
-        write!(f, "] }}")
+        write!(f, " }}")
     }
 }
 
