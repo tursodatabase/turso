@@ -655,12 +655,26 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             // chain; if a newer version is skipped, the older state still
             // correctly reflects what's in the DB file.
             if begin_ts.is_some_and(|b| b > self.snapshot_ts) {
+                tracing::debug!(
+                    "ckpt-filter SKIP begin>snapshot table_id={table_id:?} row_id={:?} begin={begin_ts:?} end={end_ts:?} snapshot_ts={} durable_old={:?}",
+                    version.row.id.row_id, self.snapshot_ts, self.durable_txid_max_old
+                );
                 continue;
             }
-            if end_ts.is_some_and(|e| e > self.snapshot_ts) {
-                // Tombstone arrived after our snapshot; treat the row as still
-                // present from this pass's perspective.
-                continue;
+            // A deletion committed AFTER our snapshot is invisible to this pass: the
+            // row is still live at snapshot_ts. Treat its end as None (not deleted)
+            // for every decision below instead of skipping the version — otherwise a
+            // live, never-checkpointed row is stranded (its data rows get collected
+            // with no B-tree to write them into). The matching `checkpoint_version`
+            // pushed below also has its end cleared, so downstream consumers
+            // (is_delete in the collectors, the writer) treat it as a live insert.
+            let future_committed_tombstone = end_ts.is_some_and(|e| e > self.snapshot_ts);
+            if future_committed_tombstone {
+                tracing::debug!(
+                    "ckpt-filter CLAMP end>snapshot table_id={table_id:?} row_id={:?} begin={begin_ts:?} end={end_ts:?} snapshot_ts={} durable_old={:?}",
+                    version.row.id.row_id, self.snapshot_ts, self.durable_txid_max_old
+                );
+                end_ts = None;
             }
             // Rows marked btree_resident existed in the DB file before MVCC tracked them.
             // This also applies to synthetic tombstones that use begin=None.
@@ -708,12 +722,23 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     .is_none_or(|txid_max_old| end_ts.is_some_and(|e| e > u64::from(txid_max_old)));
             let should_checkpoint =
                 is_uncheckpointed_insert || is_delete_and_exists_in_db_file || is_schema_delete;
+            tracing::debug!(
+                "ckpt-filter DECIDE table_id={table_id:?} row_id={:?} begin={begin_ts:?} end={end_ts:?} snapshot_ts={} durable_old={:?} exists_in_db_file={exists_in_db_file} unckpt_insert={is_uncheckpointed_insert} del_exists={is_delete_and_exists_in_db_file} schema_del={is_schema_delete} => should_checkpoint={should_checkpoint}",
+                version.row.id.row_id, self.snapshot_ts, self.durable_txid_max_old
+            );
             if should_checkpoint {
+                let checkpoint_version = if future_committed_tombstone {
+                    let mut v = version.clone();
+                    v.end = None;
+                    v
+                } else {
+                    version.clone()
+                };
                 if table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
                     if versions_to_checkpoint.is_empty() {
-                        versions_to_checkpoint.push(version.clone())
+                        versions_to_checkpoint.push(checkpoint_version)
                     } else {
-                        versions_to_checkpoint[0] = version.clone()
+                        versions_to_checkpoint[0] = checkpoint_version
                     }
                     continue;
                 }
@@ -726,7 +751,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     }
                 }
 
-                versions_to_checkpoint.push(version.clone());
+                versions_to_checkpoint.push(checkpoint_version);
             }
         }
 
@@ -1346,6 +1371,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // Resample after serializing (via `checkpoint_in_progress`) so
                 // already-durable index deletes are not replayed.
                 self.refresh_checkpoint_bounds();
+                tracing::debug!(
+                    "ckpt-prepare snapshot_ts={} durable_old={:?} durable_new={}",
+                    self.snapshot_ts,
+                    self.durable_txid_max_old,
+                    self.durable_txid_max_new
+                );
                 self.state = CheckpointState::BuildLocalSchemaView;
                 Ok(TransitionResult::Continue)
             }
@@ -1519,10 +1550,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     // BEFORE publish_checkpointed_schema_roots, which reads
                     // `table_id_to_rootpage` to translate still-negative
                     // schema entries to their real root_page.
+                    let drained: Vec<MVTableId> =
+                        self.pending_root_page_allocations.keys().copied().collect();
                     for (table_id, root_page) in self.pending_root_page_allocations.drain() {
                         self.mvstore
                             .insert_table_id_to_rootpage(table_id, Some(root_page));
                     }
+                    tracing::debug!(
+                        "ckpt-store(markers) durable_txid_max={} has_pager_work={has_pager_work} drained_allocs={:?}",
+                        self.durable_txid_max_new, drained
+                    );
                     self.mvstore
                         .durable_txid_max
                         .store(self.durable_txid_max_new, Ordering::SeqCst);
@@ -1552,6 +1589,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     // Idempotent for the has-pager-work path (already set in
                     // the marker block); required for the empty-write_set
                     // backfill-only path that skipped that block.
+                    tracing::debug!(
+                        "ckpt-store(gc_unlock) durable_txid_max={} has_pager_work={has_pager_work} markers_published={} pending_remaining={:?}",
+                        self.durable_txid_max_new,
+                        self.markers_published,
+                        self.pending_root_page_allocations.keys().copied().collect::<Vec<_>>()
+                    );
                     self.mvstore
                         .durable_txid_max
                         .store(self.durable_txid_max_new, Ordering::SeqCst);
