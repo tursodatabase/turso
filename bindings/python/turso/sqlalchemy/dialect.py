@@ -820,7 +820,7 @@ def get_sync_connection(connection):
     return dbapi_conn
 
 
-def get_async_sync_connection(connection):
+def get_aio_sync_connection(connection):
     """
     Get the underlying turso.aio.sync.ConnectionSync from a SQLAlchemy AsyncConnection.
 

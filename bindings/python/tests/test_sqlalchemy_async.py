@@ -15,7 +15,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column  # noqa: E402
 from turso.sqlalchemy import (  # noqa: E402
     AioTursoDialect,
     AioTursoSyncDialect,
-    get_async_sync_connection,
+    get_aio_sync_connection,
 )
 
 registry.register("sqlite.aioturso_sync", "turso.sqlalchemy", "AioTursoSyncDialect")
@@ -358,8 +358,8 @@ async def test_sync_async_core_crud(server):
 
 
 @pytest.mark.asyncio
-async def test_get_async_sync_connection(server):
-    """get_async_sync_connection returns the async sync driver connection."""
+async def test_get_aio_sync_connection(server):
+    """get_aio_sync_connection returns the aio sync driver connection."""
     from turso.lib_sync_aio import ConnectionSync
 
     engine = create_async_engine(
@@ -368,7 +368,7 @@ async def test_get_async_sync_connection(server):
     )
 
     async with engine.connect() as conn:
-        sync = get_async_sync_connection(conn)
+        sync = get_aio_sync_connection(conn)
         assert isinstance(sync, ConnectionSync)
 
     await engine.dispose()
@@ -386,7 +386,7 @@ async def test_sync_async_bootstrap_push_pull(server):
     )
 
     async with engine.connect() as conn:
-        sync = get_async_sync_connection(conn)
+        sync = get_aio_sync_connection(conn)
 
         result = await conn.execute(text("SELECT * FROM t"))
         assert result.fetchall() == [("remote",)]

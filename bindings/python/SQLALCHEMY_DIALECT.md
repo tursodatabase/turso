@@ -97,7 +97,7 @@ await engine.dispose()
 ```python
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
-from turso.sqlalchemy import get_async_sync_connection
+from turso.sqlalchemy import get_aio_sync_connection
 
 engine = create_async_engine(
     "sqlite+aioturso_sync:///local.db",
@@ -108,7 +108,7 @@ engine = create_async_engine(
 )
 
 async with engine.connect() as conn:
-    sync = get_async_sync_connection(conn)
+    sync = get_aio_sync_connection(conn)
     await sync.pull()
 
     result = await conn.execute(text("SELECT * FROM users"))
@@ -258,7 +258,7 @@ _TursoDialectMixin (reflection overrides)
                 ├── uses turso.aio.sync.connect()
                 ├── adapts turso.aio.sync to SQLAlchemy's DBAPI-shaped async contract
                 ├── pool: StaticPool (:memory:) / AsyncAdaptedQueuePool (file)
-                └── get_async_sync_connection() → async ConnectionSync (pull/push/checkpoint/stats)
+                └── get_aio_sync_connection() → async ConnectionSync (pull/push/checkpoint/stats)
 ```
 
 The sync dialects use Python MRO: `_TursoDialectMixin` provides PRAGMA-related overrides, `SQLiteDialect_pysqlite` provides core SQLite dialect behavior for blocking engines, and `SQLiteDialect_aiosqlite` provides core async SQLite behavior for async engines. The async dialects use an adapter that maps `turso.aio` modules into SQLAlchemy's async DBAPI wrapper.
@@ -356,7 +356,7 @@ Dialects are registered via `pyproject.toml` entry points:
 
 ## Files
 
-- `turso/sqlalchemy/__init__.py` - Module exports (`TursoDialect`, `AioTursoDialect`, `TursoSyncDialect`, `get_sync_connection`)
+- `turso/sqlalchemy/__init__.py` - Module exports (`TursoDialect`, `AioTursoDialect`, `TursoSyncDialect`, `get_sync_connection`, `get_aio_sync_connection`)
 - `turso/sqlalchemy/dialect.py` - Dialect implementations, async DBAPI adapter, and `_TursoDialectMixin`
 - `tests/test_sqlalchemy.py` - Sync SQLAlchemy dialect tests
 - `tests/test_sqlalchemy_async.py` - Async SQLAlchemy dialect tests

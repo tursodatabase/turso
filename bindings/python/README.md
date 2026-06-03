@@ -170,7 +170,7 @@ asyncio.run(main())
 ```python
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
-from turso.sqlalchemy import get_async_sync_connection
+from turso.sqlalchemy import get_aio_sync_connection
 
 engine = create_async_engine(
     "sqlite+aioturso_sync:///local.db",
@@ -178,7 +178,7 @@ engine = create_async_engine(
 )
 
 async with engine.connect() as conn:
-    sync = get_async_sync_connection(conn)
+    sync = get_aio_sync_connection(conn)
     await sync.pull()
     await conn.execute(text("INSERT INTO t VALUES ('hello from sqlalchemy asyncio')"))
     await conn.commit()
