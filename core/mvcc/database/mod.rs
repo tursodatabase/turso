@@ -5382,6 +5382,113 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// On success, reseeds the MVCC clock to `max(persistent_tx_ts_max, max_replayed_commit_ts) + 1`
     /// and sets the log writer offset to `last_valid_offset` so torn-tail bytes are overwritten.
     /// Returns true if any frames were replayed, false otherwise.
+    pub(crate) fn build_schema_from_rows(
+        &self,
+        connection: &Arc<Connection>,
+        schema_rows: &HashMap<i64, ImmutableRecord>,
+        preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
+    ) -> Result<Arc<Schema>> {
+        let pager = connection.pager.load().clone();
+        let cookie = self
+            .global_header
+            .read()
+            .as_ref()
+            .map(|header| header.schema_cookie.get())
+            .unwrap_or(
+                pager
+                    .io
+                    .block(|| pager.with_header(|header| header.schema_cookie))?
+                    .get(),
+            );
+        let mut fresh = Schema::new();
+        fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
+        fresh.schema_version = cookie;
+        let mut from_sql_indexes = Vec::with_capacity(10);
+        let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::default();
+        let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
+        let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
+        let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
+        let syms = connection.syms.read();
+        let mv_store = connection.db.get_mv_store().clone();
+
+        let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
+        sorted_rowids.sort_unstable();
+        for rowid in &sorted_rowids {
+            let record = &schema_rows[rowid];
+            let ty = match record.get_value_opt(0) {
+                Some(ValueRef::Text(v)) => v.as_str(),
+                _ => {
+                    return Err(LimboError::Corrupt(
+                        "sqlite_schema type must be text".to_string(),
+                    ))
+                }
+            };
+            let name = match record.get_value_opt(1) {
+                Some(ValueRef::Text(v)) => v.as_str(),
+                _ => {
+                    return Err(LimboError::Corrupt(
+                        "sqlite_schema name must be text".to_string(),
+                    ))
+                }
+            };
+            let table_name = match record.get_value_opt(2) {
+                Some(ValueRef::Text(v)) => v.as_str(),
+                _ => {
+                    return Err(LimboError::Corrupt(
+                        "sqlite_schema tbl_name must be text".to_string(),
+                    ))
+                }
+            };
+            let root_page = match record.get_value_opt(3) {
+                Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
+                _ => {
+                    return Err(LimboError::Corrupt(
+                        "sqlite_schema root_page must be integer".to_string(),
+                    ))
+                }
+            };
+            let sql = match record.get_value_opt(4) {
+                Some(ValueRef::Text(v)) => Some(v.as_str()),
+                _ => None,
+            };
+            let attached_resolver = |alias: &str| -> Option<usize> {
+                connection
+                    .attached_databases()
+                    .read()
+                    .get_database_by_name(&crate::util::normalize_ident(alias))
+                    .map(|(idx, _)| idx)
+            };
+            fresh.handle_schema_row(
+                ty,
+                name,
+                table_name,
+                root_page,
+                sql,
+                &syms,
+                &mut from_sql_indexes,
+                &mut automatic_indices,
+                &mut dbsp_state_roots,
+                &mut dbsp_state_index_roots,
+                &mut materialized_view_info,
+                &attached_resolver,
+            )?;
+        }
+        fresh.populate_indices(
+            &syms,
+            from_sql_indexes,
+            automatic_indices,
+            mv_store.is_some(),
+        )?;
+        fresh.populate_materialized_views(
+            materialized_view_info,
+            dbsp_state_roots,
+            dbsp_state_index_roots,
+        )?;
+        Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
+
+        Ok(Arc::new(fresh))
+    }
+
     pub fn maybe_recover_logical_log(&self, connection: Arc<Connection>) -> Result<bool> {
         let pager = connection.pager.load().clone();
         let file = self.get_logical_log_file();
@@ -5440,109 +5547,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 Ok(())
             })?;
         }
-        let build_schema = |schema_rows: &HashMap<i64, ImmutableRecord>| -> Result<Arc<Schema>> {
-            let pager = connection.pager.load().clone();
-            let cookie = self
-                .global_header
-                .read()
-                .as_ref()
-                .map(|header| header.schema_cookie.get())
-                .unwrap_or(
-                    pager
-                        .io
-                        .block(|| pager.with_header(|header| header.schema_cookie))?
-                        .get(),
-                );
-            let mut fresh = Schema::new();
-            fresh.generated_columns_enabled =
-                connection.db.experimental_generated_columns_enabled();
-            fresh.schema_version = cookie;
-            let mut from_sql_indexes = Vec::with_capacity(10);
-            let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::default();
-            let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
-            let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-            let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
-            let syms = connection.syms.read();
-            let mv_store = connection.db.get_mv_store().clone();
-
-            let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
-            sorted_rowids.sort_unstable();
-            for rowid in &sorted_rowids {
-                let record = &schema_rows[rowid];
-                let ty = match record.get_value_opt(0) {
-                    Some(ValueRef::Text(v)) => v.as_str(),
-                    _ => {
-                        return Err(LimboError::Corrupt(
-                            "sqlite_schema type must be text".to_string(),
-                        ))
-                    }
-                };
-                let name = match record.get_value_opt(1) {
-                    Some(ValueRef::Text(v)) => v.as_str(),
-                    _ => {
-                        return Err(LimboError::Corrupt(
-                            "sqlite_schema name must be text".to_string(),
-                        ))
-                    }
-                };
-                let table_name = match record.get_value_opt(2) {
-                    Some(ValueRef::Text(v)) => v.as_str(),
-                    _ => {
-                        return Err(LimboError::Corrupt(
-                            "sqlite_schema tbl_name must be text".to_string(),
-                        ))
-                    }
-                };
-                let root_page = match record.get_value_opt(3) {
-                    Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
-                    _ => {
-                        return Err(LimboError::Corrupt(
-                            "sqlite_schema root_page must be integer".to_string(),
-                        ))
-                    }
-                };
-                let sql = match record.get_value_opt(4) {
-                    Some(ValueRef::Text(v)) => Some(v.as_str()),
-                    _ => None,
-                };
-                let attached_resolver = |alias: &str| -> Option<usize> {
-                    connection
-                        .attached_databases()
-                        .read()
-                        .get_database_by_name(&crate::util::normalize_ident(alias))
-                        .map(|(idx, _)| idx)
-                };
-                fresh.handle_schema_row(
-                    ty,
-                    name,
-                    table_name,
-                    root_page,
-                    sql,
-                    &syms,
-                    &mut from_sql_indexes,
-                    &mut automatic_indices,
-                    &mut dbsp_state_roots,
-                    &mut dbsp_state_index_roots,
-                    &mut materialized_view_info,
-                    &attached_resolver,
-                )?;
-            }
-            fresh.populate_indices(
-                &syms,
-                from_sql_indexes,
-                automatic_indices,
-                mv_store.is_some(),
-            )?;
-            fresh.populate_materialized_views(
-                materialized_view_info,
-                dbsp_state_roots,
-                dbsp_state_index_roots,
-            )?;
-            Self::rehydrate_table_valued_functions(&mut fresh, &preserved_table_valued_functions);
-
-            Ok(Arc::new(fresh))
-        };
-
         let install_schema = |schema: Arc<Schema>| {
             *connection.schema.write() = schema.clone();
             *connection.db.schema.lock() = schema;
@@ -5667,7 +5671,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let schema_rows_after = schema_rows_after;
 
             let schema_after = match schema_rows_after.as_ref() {
-                Some(schema_rows_after) => Some(build_schema(schema_rows_after)?),
+                Some(schema_rows_after) => Some(self.build_schema_from_rows(
+                    &connection,
+                    schema_rows_after,
+                    &preserved_table_valued_functions,
+                )?),
                 None => None,
             };
 

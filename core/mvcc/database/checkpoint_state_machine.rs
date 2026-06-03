@@ -7,7 +7,7 @@ use crate::mvcc::database::{
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
-use crate::schema::Index;
+use crate::schema::{Index, Schema};
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
@@ -30,6 +30,9 @@ use strum::EnumCount;
 
 const COLLECT_PREEMPTION_THRESHOLD: usize = 1024;
 
+const SQLITE_SCHEMA_ROOT_PAGE: i64 = 1;
+const SQLITE_SCHEMA_COLUMN_COUNT: usize = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointState {
     /// Unlocked prelude: claim `MvStore::checkpoint_in_progress` (the
@@ -39,6 +42,7 @@ pub enum CheckpointState {
     /// runs through the preemptible `CollectTableRows`/`CollectIndexRows` states.
     /// No `blocking_checkpoint_lock` is held.
     PrepareCheckpoint,
+    BuildLocalSchemaView,
     /// Preemptible collection of committed table-row versions into `write_set`,
     /// yielding every `COLLECT_PREEMPTION_THRESHOLD` rows (resumed via
     /// `collect_table_cursor`). Runs off-lock; `maybe_get_checkpointable_versions`
@@ -199,6 +203,9 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     /// All committed versions to write to the B-tree.
     /// In the case of CREATE TABLE / DROP TABLE ops, contains a [SpecialWrite] to create/destroy the B-tree.
     write_set: Vec<(RowVersion, Option<SpecialWrite>)>,
+    build_local_schema_sm: Option<StateMachine<BuildLocalSchemaViewStateMachine<Clock>>>,
+    build_local_schema_began_read_tx: bool,
+    local_schema: Option<Arc<Schema>>,
     /// State machine for writing rows to the B-tree
     write_row_state_machine: Option<StateMachine<WriteRowStateMachine>>,
     /// State machine for deleting rows from the B-tree
@@ -456,18 +463,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         // Unlike in WAL mode we actually write stuff from mv store to pager in checkpoint
         // so this is important.
         let schema = connection.db.clone_schema();
-        let index_id_to_index = schema
-            .indexes
-            .values()
-            .flatten()
-            .map(|index| {
-                turso_assert!(index.root_page != 0, "index root_page must be non-zero");
-                (
-                    mvstore.get_table_id_from_root_page(index.root_page),
-                    index.clone(),
-                )
-            })
-            .collect();
+        let index_id_to_index = HashMap::default();
         let mvcc_meta_table = schema.get_btree_table(MVCC_META_TABLE_NAME).map(|table| {
             turso_assert!(
                 table.root_page != 0,
@@ -499,6 +495,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             yield_instance_id,
             checkpoint_lock,
             write_set: Vec::new(),
+            build_local_schema_sm: None,
+            build_local_schema_began_read_tx: false,
+            local_schema: None,
             write_row_state_machine: None,
             delete_row_state_machine: None,
             cursors: HashMap::default(),
@@ -829,7 +828,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 // CREATE INDEX (root page is negative so the index has not been checkpointed yet).
                                 let index_id = MVTableId::from(root_page);
                                 let sqlite_schema_rowid = version.row.id.row_id.to_int_or_panic();
-
                                 special_write = Some(SpecialWrite::BTreeCreateIndex {
                                     index_id,
                                     sqlite_schema_rowid,
@@ -949,8 +947,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     // Only a committed delete is a real delete -- see the
                     // collector and the table-write dispatcher for the same
                     // discriminator and reasoning.
-                    let is_delete =
-                        matches!(version.end, Some(TxTimestampOrID::Timestamp(_)));
+                    let is_delete = matches!(version.end, Some(TxTimestampOrID::Timestamp(_)));
 
                     // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
                     // the database file.
@@ -1079,7 +1076,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 .tables
                 .values()
                 .any(|table| table.btree().is_some_and(|btree| ours(btree.root_page)))
-            || schema.indexes.values().flatten().any(|index| ours(index.root_page))
+            || schema
+                .indexes
+                .values()
+                .flatten()
+                .any(|index| ours(index.root_page))
     }
 
     fn has_pending_root_publication(&self) -> bool {
@@ -1345,8 +1346,66 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // Resample after serializing (via `checkpoint_in_progress`) so
                 // already-durable index deletes are not replayed.
                 self.refresh_checkpoint_bounds();
-                self.state = CheckpointState::CollectTableRows;
+                self.state = CheckpointState::BuildLocalSchemaView;
                 Ok(TransitionResult::Continue)
+            }
+            CheckpointState::BuildLocalSchemaView => {
+                if self.build_local_schema_sm.is_none() {
+                    let began = !self
+                        .pager
+                        .wal
+                        .as_ref()
+                        .is_some_and(|wal| wal.holds_read_lock());
+                    if began {
+                        self.pager.begin_read_tx()?;
+                    }
+                    self.build_local_schema_began_read_tx = began;
+                    let cursor = BTreeCursor::new_table(
+                        self.pager.clone(),
+                        SQLITE_SCHEMA_ROOT_PAGE,
+                        SQLITE_SCHEMA_COLUMN_COUNT,
+                    );
+                    self.build_local_schema_sm =
+                        Some(StateMachine::new(BuildLocalSchemaViewStateMachine::new(
+                            cursor,
+                            self.mvstore.clone(),
+                            self.connection.clone(),
+                            self.snapshot_ts,
+                        )));
+                }
+                let sm = self
+                    .build_local_schema_sm
+                    .as_mut()
+                    .expect("build_local_schema_sm just set");
+                match sm.step(&())? {
+                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                    IOResult::Done(schema) => {
+                        self.local_schema = Some(schema);
+                        let local = self
+                            .local_schema
+                            .as_ref()
+                            .expect("local_schema just set")
+                            .clone();
+                        self.index_id_to_index = local
+                            .indexes
+                            .values()
+                            .flatten()
+                            .map(|index| {
+                                (
+                                    self.mvstore.get_table_id_from_root_page(index.root_page),
+                                    index.clone(),
+                                )
+                            })
+                            .collect();
+                        self.build_local_schema_sm = None;
+                        if self.build_local_schema_began_read_tx {
+                            self.pager.end_read_tx();
+                            self.build_local_schema_began_read_tx = false;
+                        }
+                        self.state = CheckpointState::CollectTableRows;
+                        Ok(TransitionResult::Continue)
+                    }
+                }
             }
             CheckpointState::CollectTableRows => {
                 if let Some(io) = self.collect_table_rows() {
@@ -2283,6 +2342,169 @@ impl<Clock: LogicalClock> Drop for CheckpointStateMachine<Clock> {
                 .checkpoint_in_progress
                 .store(false, Ordering::Release);
         }
+    }
+}
+
+enum BuildLocalSchemaViewState {
+    Rewind,
+    ReadRowid,
+    ReadRecord { rowid: i64 },
+    Advance,
+    MergeMvccDelta,
+    Done,
+}
+
+pub struct BuildLocalSchemaViewStateMachine<Clock: LogicalClock> {
+    cursor: BTreeCursor,
+    mvstore: Arc<MvStore<Clock>>,
+    connection: Arc<Connection>,
+    snapshot_ts: u64,
+    state: BuildLocalSchemaViewState,
+    rows: HashMap<i64, ImmutableRecord>,
+    finalized: bool,
+}
+
+impl<Clock: LogicalClock> BuildLocalSchemaViewStateMachine<Clock> {
+    fn new(
+        cursor: BTreeCursor,
+        mvstore: Arc<MvStore<Clock>>,
+        connection: Arc<Connection>,
+        snapshot_ts: u64,
+    ) -> Self {
+        Self {
+            cursor,
+            mvstore,
+            connection,
+            snapshot_ts,
+            state: BuildLocalSchemaViewState::Rewind,
+            rows: HashMap::default(),
+            finalized: false,
+        }
+    }
+
+    fn merge_mvcc_delta(&mut self) {
+        let snapshot_ts = self.snapshot_ts;
+        for entry in self.mvstore.rows.iter() {
+            let key = entry.key();
+            if key.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                continue;
+            }
+            let rowid = key.row_id.to_int_or_panic();
+            let versions = entry.value().read();
+            let present = versions.iter().find(|version| {
+                let begin_committed = matches!(
+                    version.begin,
+                    Some(TxTimestampOrID::Timestamp(b)) if b <= snapshot_ts
+                );
+                if !begin_committed {
+                    return false;
+                }
+                match version.end {
+                    None => true,
+                    Some(TxTimestampOrID::Timestamp(e)) => e > snapshot_ts,
+                    Some(TxTimestampOrID::TxID(_)) => true,
+                }
+            });
+            match present {
+                Some(version) => {
+                    let data = version
+                        .row
+                        .data
+                        .as_ref()
+                        .expect("present schema version must carry row data at snapshot_ts");
+                    self.rows
+                        .insert(rowid, ImmutableRecord::from_bin_record(data.clone()));
+                }
+                None => {
+                    let existed_and_gone = versions.iter().any(|version| {
+                        matches!(
+                            version.begin,
+                            Some(TxTimestampOrID::Timestamp(b)) if b <= snapshot_ts
+                        ) || matches!(
+                            version.end,
+                            Some(TxTimestampOrID::Timestamp(e)) if e <= snapshot_ts
+                        )
+                    });
+                    if existed_and_gone {
+                        self.rows.remove(&rowid);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<Clock: LogicalClock> StateTransition for BuildLocalSchemaViewStateMachine<Clock> {
+    type Context = ();
+    type SMResult = Arc<Schema>;
+
+    fn step(&mut self, _context: &()) -> Result<TransitionResult<Self::SMResult>> {
+        match self.state {
+            BuildLocalSchemaViewState::Rewind => match self.cursor.rewind()? {
+                IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                IOResult::Done(()) => {
+                    self.state = BuildLocalSchemaViewState::ReadRowid;
+                    Ok(TransitionResult::Continue)
+                }
+            },
+            BuildLocalSchemaViewState::ReadRowid => {
+                if !self.cursor.has_record() {
+                    self.state = BuildLocalSchemaViewState::MergeMvccDelta;
+                    return Ok(TransitionResult::Continue);
+                }
+                match self.cursor.rowid()? {
+                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                    IOResult::Done(Some(rowid)) => {
+                        self.state = BuildLocalSchemaViewState::ReadRecord { rowid };
+                        Ok(TransitionResult::Continue)
+                    }
+                    IOResult::Done(None) => {
+                        self.state = BuildLocalSchemaViewState::Advance;
+                        Ok(TransitionResult::Continue)
+                    }
+                }
+            }
+            BuildLocalSchemaViewState::ReadRecord { rowid } => {
+                let record = match self.cursor.record()? {
+                    IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
+                    IOResult::Done(Some(record)) => Some(record.clone()),
+                    IOResult::Done(None) => None,
+                };
+                if let Some(record) = record {
+                    self.rows.insert(rowid, record);
+                }
+                self.state = BuildLocalSchemaViewState::Advance;
+                Ok(TransitionResult::Continue)
+            }
+            BuildLocalSchemaViewState::Advance => match self.cursor.next()? {
+                IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                IOResult::Done(()) => {
+                    self.state = BuildLocalSchemaViewState::ReadRowid;
+                    Ok(TransitionResult::Continue)
+                }
+            },
+            BuildLocalSchemaViewState::MergeMvccDelta => {
+                self.merge_mvcc_delta();
+                self.state = BuildLocalSchemaViewState::Done;
+                Ok(TransitionResult::Continue)
+            }
+            BuildLocalSchemaViewState::Done => {
+                self.finalized = true;
+                let schema =
+                    self.mvstore
+                        .build_schema_from_rows(&self.connection, &self.rows, &[])?;
+                Ok(TransitionResult::Done(schema))
+            }
+        }
+    }
+
+    fn finalize(&mut self, _context: &()) -> Result<()> {
+        self.finalized = true;
+        Ok(())
+    }
+
+    fn is_finalized(&self) -> bool {
+        self.finalized
     }
 }
 
