@@ -1272,16 +1272,35 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
     fn has_unpublished_schema_changes(&self) -> bool {
         let schema = self.connection.db.schema.lock();
-        !schema.dropped_root_pages.is_empty()
-            || schema
-                .tables
-                .values()
-                .any(|table| table.btree().is_some_and(|btree| btree.root_page < 0))
-            || schema
-                .indexes
-                .values()
-                .flatten()
-                .any(|index| index.root_page < 0)
+        if !schema.dropped_root_pages.is_empty() {
+            return true;
+        }
+        // A negative root page only counts as "unpublished" if THIS checkpoint
+        // materialized that object — i.e. it has a real root page in
+        // `table_id_to_rootpage` that we have not yet written back into the
+        // schema. A table/index created by a transaction that committed AFTER
+        // this checkpoint's snapshot is legitimately deferred to a later
+        // checkpoint and has no mapping yet, so its negative placeholder must
+        // NOT be treated as our unpublished work (that was the false-positive
+        // that panicked the TruncateWal assert under off-lock collection).
+        let owned_negative = |root_page: i64| -> bool {
+            root_page < 0
+                && self
+                    .mvstore
+                    .table_id_to_rootpage
+                    .get(&MVTableId::from(root_page))
+                    .and_then(|entry| *entry.value())
+                    .is_some()
+        };
+        schema.tables.values().any(|table| {
+            table
+                .btree()
+                .is_some_and(|btree| owned_negative(btree.root_page))
+        }) || schema
+            .indexes
+            .values()
+            .flatten()
+            .any(|index| owned_negative(index.root_page))
     }
 
     fn has_pending_root_publication(&self) -> bool {
@@ -1327,9 +1346,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             return Ok(());
         }
 
-        // Patch in-memory schema to do the same. This must happen as soon as the
-        // pager commit succeeds because the committed root pages are then visible
-        // through WAL even if the later WAL checkpoint/log truncation is busy.
+        // Patch the LIVE connection/db schema (NOT local_schema): this is what
+        // `clone_schema()` below propagates to the connection, so subsequent
+        // queries resolve the real root pages. Writing local_schema (the
+        // checkpoint's private snapshot) would leave the live schema pointing at
+        // the negative placeholders, orphaning the freshly-allocated btree pages.
+        // This must happen as soon as the pager commit succeeds because the
+        // committed root pages are then visible through WAL even if the later WAL
+        // checkpoint/log truncation is busy.
         let mut schema_ref = self.connection.db.schema.lock();
         let schema = Schema::try_make_mut(&mut schema_ref)?;
         for (name, table) in schema.tables.iter_mut() {

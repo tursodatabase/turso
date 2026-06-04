@@ -3221,10 +3221,9 @@ fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
 /// Correct behavior: the checkpoint completes; the concurrently-created table survives with
 /// its negative placeholder root page (a later checkpoint resolves it); integrity holds.
 ///
-/// KNOWN-FAILING (reproduces the bug): currently panics at the assert. This is the acceptance
-/// criterion for the Task 9 fix (make `has_pending_root_publication` deferral-aware). Run with
-/// `cargo test -- --ignored`. Un-ignore once fixed.
-#[ignore = "reproduces non-blocking-checkpoint vs concurrent-CREATE panic; un-ignore when Task 9 fix lands"]
+/// Fixed by making `has_unpublished_schema_changes` deferral-aware (only flag negative root
+/// pages this checkpoint actually materialized, via `table_id_to_rootpage`) while keeping
+/// `publish_checkpointed_schema_roots` writing the live schema.
 #[test]
 fn test_passive_checkpoint_tolerates_concurrent_create_after_snapshot() {
     let db = MvccTestDbNoConn::new_with_random_db();
