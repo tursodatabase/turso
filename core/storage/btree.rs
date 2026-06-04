@@ -601,6 +601,20 @@ pub enum CursorSeekState {
     },
 }
 
+/// Outcome of [`CursorTrait::try_save_position_for_external_balance`]. Mirrors
+/// the two paths SQLite's saveCursorPosition takes (btree.c:756) — succeed and
+/// have the caller skip invalidation, or fall through to clearing the cached
+/// page stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavePositionResult {
+    /// Position captured via [`CursorTrait::save_context`]; cursor will re-seek
+    /// on next use. Caller does not need to invalidate.
+    Saved,
+    /// Position cannot be represented (MVCC cursor, mid-operation page stack,
+    /// stale record state). Caller must fall back to `invalidate_btree_cache`.
+    MustInvalidate,
+}
+
 pub trait CursorTrait: Any + Send + Sync {
     /// Move cursor to last entry.
     fn last(&mut self) -> Result<IOResult<()>>;
@@ -665,10 +679,11 @@ pub trait CursorTrait: Any + Send + Sync {
     /// crosses the 1↔2 threshold.
     fn set_has_peers_for_external_writes(&self, _has_peers: bool) {}
     /// Save position so the cursor can re-seek after a peer write. Returns
-    /// `false` when the position can't be represented (MVCC cursors, stale
-    /// page stack); the caller falls back to invalidate_btree_cache.
-    fn try_save_position_for_external_balance(&mut self) -> Result<IOResult<bool>> {
-        Ok(IOResult::Done(false))
+    /// [`SavePositionResult::MustInvalidate`] when the position can't be
+    /// represented (MVCC cursors, stale page stack); the caller falls back to
+    /// invalidate_btree_cache.
+    fn try_save_position_for_external_balance(&mut self) -> Result<IOResult<SavePositionResult>> {
+        Ok(IOResult::Done(SavePositionResult::MustInvalidate))
     }
     // --- end: BTreeCursor specific functions ----
 }
@@ -5310,9 +5325,9 @@ impl BTreeCursor {
         while *idx < peers.len() {
             let peer = peers[*idx];
             // SAFETY: see RegisteredCursor's invariant.
-            let saved =
+            let outcome =
                 unsafe { return_if_io!(peer.as_mut().try_save_position_for_external_balance()) };
-            if !saved {
+            if outcome == SavePositionResult::MustInvalidate {
                 // SAFETY: see RegisteredCursor's invariant.
                 unsafe { peer.as_mut().invalidate_btree_cache() };
             }
@@ -6318,29 +6333,33 @@ impl CursorTrait for BTreeCursor {
 
     /// Mirrors SQLite's saveCursorPosition (btree.c:756). Saves rowid for
     /// table btrees, the cell record for index btrees; index records can
-    /// yield IO via the overflow chain walk (`record()`). Returns `false`
-    /// when the page stack is in a sentinel/dirty state we can't save from
-    /// — has_record can lag the stack across an in-flight Insert/Delete —
-    /// in which case the caller falls back to invalidate_btree_cache.
-    fn try_save_position_for_external_balance(&mut self) -> Result<IOResult<bool>> {
+    /// yield IO via the overflow chain walk (`record()`). Returns
+    /// [`SavePositionResult::MustInvalidate`] when the page stack is in a
+    /// sentinel/dirty state we can't save from — has_record can lag the stack
+    /// across an in-flight Insert/Delete — in which case the caller falls back
+    /// to invalidate_btree_cache.
+    fn try_save_position_for_external_balance(&mut self) -> Result<IOResult<SavePositionResult>> {
         if self.valid_state != CursorValidState::Valid || !self.has_record() {
-            return Ok(IOResult::Done(true));
+            // Nothing to save: cursor has no live position. No invalidation
+            // needed either — the stack is already in a state where the next
+            // entry point will re-navigate from the root.
+            return Ok(IOResult::Done(SavePositionResult::Saved));
         }
         // A peer mid-Insert/Delete may not yet have reached its own
         // save_context-at-balance point, so we can't claim it's saved. Fall
         // back to invalidation; the peer will re-navigate on next use.
         if !matches!(self.state, CursorState::None) {
-            return Ok(IOResult::Done(false));
+            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
         }
         if self.stack.current_page < 0
             || (self.stack.current_page as usize) >= self.stack.stack.len()
             || self.stack.stack[self.stack.current_page as usize].is_none()
         {
-            return Ok(IOResult::Done(false));
+            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
         }
         let cell_idx = self.stack.current_cell_index();
         if cell_idx < 0 {
-            return Ok(IOResult::Done(false));
+            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
         }
         let (is_table, cell_count) = {
             let page = self.stack.top_ref();
@@ -6348,7 +6367,7 @@ impl CursorTrait for BTreeCursor {
             (contents.page_type()?.is_table(), contents.cell_count())
         };
         if (cell_idx as usize) >= cell_count {
-            return Ok(IOResult::Done(false));
+            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
         }
         if is_table {
             let page = self.stack.top_ref();
@@ -6362,7 +6381,7 @@ impl CursorTrait for BTreeCursor {
                 key: CursorContextKey::TableRowId(rowid),
                 seek_op: SeekOp::GE { eq_only: true },
             });
-            return Ok(IOResult::Done(true));
+            return Ok(IOResult::Done(SavePositionResult::Saved));
         }
         // Index btree: yield IO for overflow chains. Allocate to the actual
         // payload size so wide-key indexes don't keep a page-sized buffer
@@ -6379,7 +6398,7 @@ impl CursorTrait for BTreeCursor {
             key: CursorContextKey::IndexKeyRowId(cloned),
             seek_op: SeekOp::GE { eq_only: true },
         });
-        Ok(IOResult::Done(true))
+        Ok(IOResult::Done(SavePositionResult::Saved))
     }
 
     #[inline]
