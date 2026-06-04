@@ -530,8 +530,14 @@ fn resolve_window<'a>(
             Ok(windows.last_mut().expect("just pushed, so must exist"))
         }
         Over::Window(window) => {
-            if !Window::is_default_frame_spec(&window.frame_clause) {
-                crate::bail_parse_error!("Custom frame specifications are not supported yet");
+            // User-written FRAME clauses aren't supported yet. Still call
+            // the validator so SQLite-invalid shapes get the matching
+            // error; for anything else, bail.
+            if let Some(_user_frame) = crate::translate::plan::validate_frame_clause(
+                &window.frame_clause,
+                window.order_by.len(),
+            )? {
+                crate::bail_parse_error!("user-specified frame clauses are not supported");
             }
             let base_name = normalize_ident(
                 window

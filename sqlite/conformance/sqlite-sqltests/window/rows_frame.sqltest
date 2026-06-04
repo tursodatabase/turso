@@ -1,0 +1,118 @@
+@database :memory:
+
+setup base {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40),(5,50);
+}
+
+# Moving 3-wide sum: previous, current, next.
+@setup base
+test rows-3-wide-moving-sum {
+    SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;
+}
+expect error {
+}
+
+# Trailing 3-row sum.
+@setup base
+test rows-trailing-3 {
+    SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+}
+
+# Leading 3-row sum.
+@setup base
+test rows-leading-3 {
+    SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) FROM t;
+}
+expect error {
+}
+
+@setup base
+test rows-unbounded-preceding-to-current {
+    SELECT id, sum(v) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) FROM t;
+}
+expect error {
+}
+
+@setup base
+test rows-current-row-only {
+    SELECT id, sum(v) OVER (ORDER BY id ROWS CURRENT ROW) FROM t;
+}
+expect error {
+}
+
+# min/max can't be inverted; ROWS frames with a moving start must
+# either error or fall back to a slow rescan. The "supported" case
+# (UNBOUNDED PRECEDING + CURRENT ROW) requires no inverse.
+@setup base
+test rows-min-no-inverse-needed {
+    SELECT id, min(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+}
+
+@setup base
+test rows-min-moving-frame-not-invertible {
+    SELECT id, min(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;
+}
+expect error {
+}
+
+# Bound combinations that can never describe a real frame. SQLite
+# rejects the same set at window.c:1217-1221.
+
+@setup base
+test rows-end-cannot-be-unbounded-preceding {
+    SELECT sum(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED PRECEDING) FROM t;
+}
+expect error {
+}
+
+@setup base
+test rows-start-cannot-be-unbounded-following {
+    SELECT sum(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING) FROM t;
+}
+expect error {
+}
+
+@setup base
+test rows-start-current-end-preceding {
+    SELECT sum(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t;
+}
+expect error {
+}
+
+@setup base
+test rows-start-following-end-preceding {
+    SELECT sum(v) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING) FROM t;
+}
+expect error {
+}
+
+@setup base
+test rows-start-following-end-current {
+    SELECT sum(v) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM t;
+}
+expect error {
+}
+
+# Offset can be any expression evaluating to a non-negative integer.
+# SQLite checks the runtime value at partition start via
+# `windowCheckValue` — negative or non-integer becomes a runtime error.
+# Literal negatives are caught at parse for a friendlier message.
+
+@setup base
+test rows-column-offset {
+    SELECT sum(v) OVER (ORDER BY id ROWS BETWEEN v PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+}
+
+@setup base
+test rows-negative-literal-offset {
+    SELECT sum(v) OVER (ORDER BY id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+}
