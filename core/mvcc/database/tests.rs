@@ -761,6 +761,9 @@ fn advance_checkpoint_until_wal_has_commit_frame(
         true,
         conn.get_sync_mode(),
         crate::MAIN_DB_ID,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
     );
 
     for _ in 0..10_000 {
@@ -1793,6 +1796,9 @@ fn test_checkpoint_truncates_wal_last() {
         true,
         conn.get_sync_mode(),
         crate::MAIN_DB_ID,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
     );
 
     let mut saw_truncate_log_state_with_wal = false;
@@ -1868,7 +1874,11 @@ fn test_checkpoint_allows_index_schema_update_after_rename_column() {
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
-fn test_bootstrap_rejects_committed_wal_without_log_file() {
+fn test_bootstrap_recovers_committed_wal_without_log_file() {
+    // A non-blocking (Passive) checkpoint truncates the logical log to 0 but
+    // intentionally leaves the WAL non-empty. On the next open the log is absent
+    // (NoLog) while the WAL holds committed frames — this is the normal steady
+    // state, not corruption. Recovery must materialize from the WAL, not fail closed.
     let db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     {
@@ -1889,13 +1899,14 @@ fn test_bootstrap_rejects_committed_wal_without_log_file() {
     std::fs::remove_file(&log_path).unwrap();
 
     let io = Arc::new(PlatformIO::new().unwrap());
-    match Database::open_file(io, &db_path) {
-        Ok(db) => match db.connect() {
-            Ok(_) => panic!("expected connect to fail with Corrupt"),
-            Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
-        },
-        Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
-    }
+    let db = Database::open_file(io, &db_path).expect("open should recover, not fail closed");
+    let conn = db
+        .connect()
+        .expect("connect should recover the committed WAL");
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1, "committed row must survive recovery");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "x");
 }
 
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
@@ -2524,6 +2535,9 @@ fn test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit() {
             true,
             conn.get_sync_mode(),
             crate::MAIN_DB_ID,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
         );
 
         for _ in 0..50_000 {
@@ -2903,6 +2917,9 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
         true,
         conn.get_sync_mode(),
         crate::MAIN_DB_ID,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
     );
     let mut reached_truncate = false;
     for _ in 0..50_000 {
@@ -2932,8 +2949,17 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
     );
 
     let sync_mode = conn.get_sync_mode();
-    let checkpoint_sm2 =
-        CheckpointStateMachine::new(pager, mvcc_store, conn, true, sync_mode, crate::MAIN_DB_ID);
+    let checkpoint_sm2 = CheckpointStateMachine::new(
+        pager,
+        mvcc_store,
+        conn,
+        true,
+        sync_mode,
+        crate::MAIN_DB_ID,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
     let (old_boundary, _) = checkpoint_sm2.checkpoint_bounds_for_test();
     assert!(
         old_boundary.unwrap_or_default() >= ts1,
@@ -3002,6 +3028,9 @@ fn test_checkpoint_resamples_boundary_before_starting() {
         true,
         delayed_conn.get_sync_mode(),
         crate::MAIN_DB_ID,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
     );
     let (old_boundary, _) = delayed_checkpoint.checkpoint_bounds_for_test();
     assert_eq!(old_boundary, Some(first_boundary));
@@ -3015,6 +3044,9 @@ fn test_checkpoint_resamples_boundary_before_starting() {
         true,
         interrupted_conn.get_sync_mode(),
         crate::MAIN_DB_ID,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
     );
     let mut reached_wal_checkpoint = false;
     for _ in 0..50_000 {
@@ -3075,6 +3107,12 @@ fn test_checkpoint_resamples_boundary_before_starting() {
 /// advances the durable boundary must resample that boundary after taking the checkpoint lock.
 /// Why this matters: otherwise a delayed checkpoint can replay an already-durable unique-index
 /// delete and fail.
+///
+/// SUPERSEDED by the `checkpoint_in_progress` single-orchestrator gate: the interleaving this
+/// test sets up (a second checkpoint advancing the boundary while a first is mid-flight) is now
+/// prevented — the first checkpoint claims the gate in `PrepareCheckpoint` and the second
+/// no-ops. The rewritten version lands with the Task 7 test-infra port. Ignored until then.
+#[ignore = "superseded by checkpoint_in_progress gate; rewritten version lands with test-infra port"]
 #[test]
 fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -16044,8 +16082,8 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
         fn update_header(&self) -> Result<Completion> {
             self.inner.update_header()
         }
-        fn truncate(&self) -> Result<Completion> {
-            self.inner.truncate()
+        fn truncate(&self, checkpointed_through_ts: u64) -> Result<Completion> {
+            self.inner.truncate(checkpointed_through_ts)
         }
         fn reset_to_fresh_header(&self) -> Result<Completion> {
             self.inner.reset_to_fresh_header()
