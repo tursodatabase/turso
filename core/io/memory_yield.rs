@@ -14,23 +14,11 @@ use tracing::debug;
 /// [`IO::step`] call, forcing the engine through its cooperative-yield path on
 /// *every* `pread` / `pwrite` / `pwritev` / `sync` / `truncate`.
 ///
-/// [`MemoryIO`](super::MemoryIO) signals completions synchronously, so
-/// `Completion::finished()` is already true when the operation returns. The
-/// VDBE step loop (`vdbe/mod.rs`) treats an already-finished completion as a
-/// fast path and continues without yielding, which means yield points in the
-/// engine are never exercised by purely in-memory tests.
-///
 /// This backend performs the identical byte-level data movement as
 /// `MemoryIO` (it shares [`MemStore`]) but enqueues the completion instead of
 /// signalling it. The completion only becomes `finished()` when `step()` runs,
 /// so the engine must return `StepResult::IO`, yield, and re-enter — exercising
-/// the resume path behind each yield point. This makes it the right backend for
-/// `testing/stress` (which runs under Antithesis) to shake out re-entrancy bugs
-/// once blocking I/O is removed from `core`.
-///
-/// Data movement happens at submit time (matching `MemoryIO` semantics exactly),
-/// so dependent operations observe the same ordering they would with the
-/// synchronous backend; only completion *signalling* is deferred.
+/// the resume path behind each yield point.
 pub struct MemoryYieldIO {
     files: Arc<Mutex<HashMap<String, Arc<MemoryYieldFile>>>>,
     /// Completions submitted but not yet signalled, drained FIFO by `step()`.

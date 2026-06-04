@@ -87,9 +87,7 @@ impl IO for MemoryIO {
 }
 
 /// In-memory page-backed storage shared by the synchronous [`MemoryIO`] and
-/// the yield-forcing [`super::MemoryYieldIO`] backends. Holds the raw
-/// data-movement logic so both backends stay byte-for-byte compatible; the
-/// only difference between the two is *when* the I/O completion is signalled.
+/// the yield-forcing [`super::MemoryYieldIO`] backends used for testing.
 pub(super) struct MemStore {
     pages: UnsafeCell<BTreeMap<usize, MemPage>>,
     size: Cell<u64>,

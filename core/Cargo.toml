@@ -29,9 +29,7 @@ time = []
 fuzz = []
 omit_autovacuum = []
 simulator = ["fuzz", "serde", "io_memory_yield"]
-# Enables the in-memory `memory_yield` VFS, which defers every I/O completion
-# to force the engine through its cooperative-yield path on every op. Test-only:
-# exposed to testing/stress and the simulator, never to regular library users.
+# Test only: exposed to testing/stress and the simulator, never to regular library users.
 io_memory_yield = []
 serde = ["dep:serde"]
 series = []
