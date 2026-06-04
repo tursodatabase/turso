@@ -60,6 +60,12 @@ setup schema {
 # SCALAR SUBQUERIES
 # =============================================================================
 
+# BETWEEN in WHERE should not duplicate a scalar subquery on the left-hand side.
+@setup schema
+snapshot between-lhs-scalar-subquery {
+    SELECT id FROM products WHERE (SELECT max(id) FROM products) BETWEEN 1 AND 3;
+}
+
 # Scalar subquery in SELECT - returns single value from aggregation
 @setup schema
 snapshot scalar-subquery-max-price {
