@@ -7399,6 +7399,17 @@ pub fn op_function(
             ScalarFunc::Random => {
                 state.registers[*dest].set_int(pager.io.generate_random_number());
             }
+            #[cfg(feature = "test_helper")]
+            ScalarFunc::TestNondetCounter => {
+                // Test-only: process-global atomic counter that increments on
+                // every evaluation. Used in sqltests to verify that the
+                // planner does not deduplicate equivalent SQL calls that
+                // contain nondeterministic functions.
+                static TEST_NONDET_COUNTER: std::sync::atomic::AtomicI64 =
+                    std::sync::atomic::AtomicI64::new(0);
+                let value = TEST_NONDET_COUNTER.fetch_add(1, Ordering::Relaxed);
+                state.registers[*dest].set_int(value);
+            }
             ScalarFunc::Trim => {
                 let reg_value = &state.registers[*start_reg];
                 let pattern_value = if func.arg_count == 2 {

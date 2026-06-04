@@ -652,6 +652,11 @@ pub enum ScalarFunc {
     TestUintDiv,
     TestUintLt,
     TestUintEq,
+    /// Test-only: returns a monotonically increasing 64-bit integer on every
+    /// evaluation. Used to verify that the planner does not deduplicate
+    /// equivalent SQL calls that contain nondeterministic functions.
+    #[cfg(feature = "test_helper")]
+    TestNondetCounter,
     StringReverse,
     // Built-in type support functions
     BooleanToInt,
@@ -769,6 +774,8 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::TestUintLt
             | ScalarFunc::TestUintEq
             | ScalarFunc::StringReverse => true,
+            #[cfg(feature = "test_helper")]
+            ScalarFunc::TestNondetCounter => false,
             ScalarFunc::BooleanToInt
             | ScalarFunc::IntToBoolean
             | ScalarFunc::ValidateIpAddr
@@ -904,6 +911,8 @@ impl Display for ScalarFunc {
             Self::TestUintDiv => "test_uint_div",
             Self::TestUintLt => "test_uint_lt",
             Self::TestUintEq => "test_uint_eq",
+            #[cfg(feature = "test_helper")]
+            Self::TestNondetCounter => "test_nondet_counter",
             Self::StringReverse => "string_reverse",
             Self::BooleanToInt => "boolean_to_int",
             Self::IntToBoolean => "int_to_boolean",
@@ -975,6 +984,8 @@ impl ScalarFunc {
             | Self::TursoVersion
             | Self::SqliteSourceId
             | Self::TotalChanges => &[0],
+            #[cfg(feature = "test_helper")]
+            Self::TestNondetCounter => &[0],
             // 1-arg
             Self::Abs
             | Self::Hex
@@ -1301,7 +1312,7 @@ impl Func {
         }
         match self {
             Self::Scalar(scalar_func) => {
-                matches!(
+                let basic = matches!(
                     scalar_func,
                     ScalarFunc::Changes
                         | ScalarFunc::Random
@@ -1310,7 +1321,10 @@ impl Func {
                         | ScalarFunc::TursoVersion
                         | ScalarFunc::SqliteSourceId
                         | ScalarFunc::LastInsertRowid
-                )
+                );
+                #[cfg(feature = "test_helper")]
+                let basic = basic || matches!(scalar_func, ScalarFunc::TestNondetCounter);
+                basic
             }
             Self::Math(math_func) => {
                 matches!(math_func.arity(), MathFuncArity::Nullary)
@@ -1608,6 +1622,8 @@ impl Func {
             "test_uint_div" => Ok(Some(Self::Scalar(ScalarFunc::TestUintDiv))),
             "test_uint_lt" => Ok(Some(Self::Scalar(ScalarFunc::TestUintLt))),
             "test_uint_eq" => Ok(Some(Self::Scalar(ScalarFunc::TestUintEq))),
+            #[cfg(feature = "test_helper")]
+            "test_nondet_counter" => Ok(Some(Self::Scalar(ScalarFunc::TestNondetCounter))),
             "string_reverse" => Ok(Some(Self::Scalar(ScalarFunc::StringReverse))),
             // Built-in type support functions
             "boolean_to_int" => Ok(Some(Self::Scalar(ScalarFunc::BooleanToInt))),

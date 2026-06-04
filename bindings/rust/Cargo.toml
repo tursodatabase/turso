@@ -18,6 +18,7 @@ mimalloc = ["dep:mimalloc"]
 pure-rust-crypto = ["turso_sdk_kit/pure-rust-crypto", "turso_sync_sdk_kit/pure-rust-crypto"]
 fts = ["turso_sdk_kit/fts"]
 stacker = ["turso_core/stacker"]
+test_helper = ["turso_core/test_helper"]
 sync = [
     "dep:hyper",
     "dep:tokio",

@@ -382,26 +382,29 @@ expect error {
 }
 
 @setup filter_over_base
-@cross-check-integrity
-test filter-over-repeated-nondeterministic-filter {
-    -- `random()*0 = 0` is always true but contains a nondeterministic call,
-    -- which must disable FILTER-clause dedup. Both result columns should still
-    -- evaluate to the same `flag=1` count; the test asserts the query plans
-    -- and executes correctly with two distinct subquery columns for the
-    -- otherwise-identical FILTER predicates.
-    SELECT id,
-           count(*) FILTER (WHERE flag=1 AND random()*0 = 0) OVER (PARTITION BY grp),
-           count(*) FILTER (WHERE flag=1 AND random()*0 = 0) OVER (PARTITION BY grp)
-    FROM filter_over_items ORDER BY id;
+@skip-if sqlite "uses turso-only test_nondet_counter() to observe nondet dedup behavior"
+test filter-over-repeated-nondeterministic-call {
+    -- Two window calls with identical nondeterministic arguments. The planner
+    -- must NOT dedup them: each call needs its own source-subquery column, so
+    -- the two aggregates accumulate independent counter streams.
+    --
+    -- Per source row, the source subquery evaluates the two argument columns
+    -- in order, so successive counter calls alternate between them. Each
+    -- column sees counter values that differ from the other column's by exactly
+    -- one per row — over 7 rows, abs(sum_a - sum_b) = 7. If the two calls were
+    -- wrongly deduped, both aggregates would read the same per-row counter
+    -- value and abs_diff would be 0.
+    --
+    -- The same `push_into_source_subquery` codepath handles dedup-skip for
+    -- both function arguments and FILTER predicates, so a single args-based
+    -- test exercises it.
+    SELECT DISTINCT
+           abs((sum(test_nondet_counter()) OVER ()) -
+               (sum(test_nondet_counter()) OVER ())) AS abs_diff
+    FROM filter_over_items;
 }
 expect {
-    1|2|2
-    2|2|2
-    3|2|2
-    4|1|1
-    5|1|1
-    6|1|1
-    7|0|0
+    7
 }
 
 @setup filter_over_base
@@ -439,27 +442,30 @@ expect @js {
 }
 
 @setup filter_over_base
-@cross-check-integrity
+@skip-if sqlite "uses turso-only test_nondet_counter() to observe walker pairing"
 test filter-over-mixed-deterministic-and-nondeterministic-dedup {
-    -- Exercises the planner's mixed-dedup pairing: three identical
-    -- deterministic FILTER calls collapse to one `WindowFunction` entry; the
-    -- nondeterministic copy gets its own entry. The walker must pair each SQL
-    -- occurrence with the correct entry.
-    SELECT id,
+    -- Two identical deterministic calls (a, b) collapse to one WindowFunction
+    -- entry. Two identical nondeterministic calls must each get their own
+    -- entry; the walker picks a fresh entry per SQL occurrence so the two
+    -- accumulators see independent counter streams.
+    --
+    -- Per source row, the source subquery evaluates one column for {a,b} (the
+    -- shared deterministic argument `val`) and two separate columns for the
+    -- two nondet occurrences (one fresh column per occurrence). Within the
+    -- same row, the first nondet call precedes the second, so one column sums
+    -- counter values at row offsets 0,2,4,... and the other at 1,3,5,... —
+    -- giving a difference of exactly one counter increment per row, i.e. 7.
+    -- If the walker wrongly paired both nondet occurrences with the same
+    -- entry, the two sums would be equal and the difference would be 0.
+    SELECT DISTINCT
            sum(val) FILTER (WHERE flag=1) OVER () AS a,
            sum(val) FILTER (WHERE flag=1) OVER () AS b,
-           sum(val) FILTER (WHERE flag=1) OVER () AS c,
-           count(*) FILTER (WHERE flag=1 AND random()*0=0) OVER () AS d
-    FROM filter_over_items ORDER BY id;
+           abs((sum(test_nondet_counter()) OVER ()) -
+               (sum(test_nondet_counter()) OVER ())) AS nondet_pair_diff
+    FROM filter_over_items;
 }
 expect {
-    1|25|25|25|3
-    2|25|25|25|3
-    3|25|25|25|3
-    4|25|25|25|3
-    5|25|25|25|3
-    6|25|25|25|3
-    7|25|25|25|3
+    25|25|7
 }
 
 @setup filter_over_base

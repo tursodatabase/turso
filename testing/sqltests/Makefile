@@ -26,7 +26,7 @@ build: build-tursodb build-runner
 
 # Build tursodb CLI
 build-tursodb:
-	cd $(ROOT_DIR) && cargo build $(CARGO_PROFILE) --package turso_cli
+	cd $(ROOT_DIR) && cargo build $(CARGO_PROFILE) --package turso_cli --features test_helper
 
 # Build the test runner
 build-runner:
@@ -72,7 +72,7 @@ run-rust: build-runner
 # Build JavaScript bindings (requires Node.js and yarn)
 JS_DIR := $(ROOT_DIR)/bindings/javascript
 build-js-bindings:
-	cd $(JS_DIR) && yarn install && yarn workspace @tursodatabase/database-common build && yarn workspace @tursodatabase/database build
+	cd $(JS_DIR) && yarn install && yarn workspace @tursodatabase/database-common build && yarn workspace @tursodatabase/database build:test-helper
 
 # Run tests with JavaScript backend (Node.js + @tursodatabase/database)
 run-js: build-runner build-js-bindings
