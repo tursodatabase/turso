@@ -66,7 +66,7 @@ use super::persistent_storage::logical_log::{
     encode_delete_portable_extension, parse_ops_from_plaintext, LOG_RECORD_PREFIX_SIZE,
 };
 use super::persistent_storage::logical_log::{
-    HeaderReadResult, IndexOpKind, LogHeader, ParsedOp, StreamingLogicalLogReader, StreamingResult,
+    HeaderReadResult, IndexOpKind, ParsedOp, StreamingLogicalLogReader, StreamingResult,
     LOG_HDR_SIZE,
 };
 #[cfg(feature = "conn_raw_api")]
@@ -3169,6 +3169,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         false,
                         self.connection.get_sync_mode(),
                         self.db_id,
+                        // Auto-checkpoint runs Passive so the WAL→DB backfill leaves the
+                        // WAL non-empty (no explicit truncation) and does not fight
+                        // concurrent readers/writers for WAL exclusivity. The WAL resets
+                        // via restart-on-write.
+                        crate::storage::wal::CheckpointMode::Passive {
+                            upper_bound_inclusive: None,
+                        },
                     ));
                     let state_machine = Mutex::new(state_machine);
                     self.state = CommitState::Checkpoint { state_machine };
@@ -3589,8 +3596,11 @@ pub enum CompleteCheckpointState {
         header_result: HeaderReadResult,
         checkpoint_result: CheckpointResult,
     },
-    /// Main path: driving `wal.checkpoint(Truncate)`.
-    DriveCheckpoint { header: LogHeader },
+    /// Main path: driving `wal.checkpoint(Truncate)`. Reached from either a
+    /// Valid header (already reused via `set_header`) or a `NoLog` log (the
+    /// normal Passive steady state) — the fresh header is (re)written later in
+    /// `RetryHeader`, so no header payload is needed here.
+    DriveCheckpoint,
     /// Awaiting the `db_file.sync` completion after a successful backfill.
     AwaitDbFileSync {
         completion: Completion,
@@ -3752,14 +3762,26 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     exclusive_tx: AtomicU64,
     commit_coordinator: Arc<CommitCoordinator>,
     global_header: Arc<RwLock<Option<DatabaseHeader>>>,
-    /// MVCC checkpoints are always TRUNCATE, plus they block all other transactions.
-    /// This guarantees that never need to let transactions read from the SQLite WAL.
-    /// In MVCC, the checkpoint procedure is roughly as follows:
-    /// - Take the blocking_checkpoint_lock
-    /// - Write everything in the logical log to the pager, and from there commit to the SQLite WAL.
-    /// - Immediately TRUNCATE checkpoint the WAL into the database file.
-    /// - Release the blocking_checkpoint_lock.
+    /// MVCC checkpoints lock readers and writers out of the engine only during the
+    /// in-memory marker-publication and metadata-mutation phase. The MvStore → WAL
+    /// write-out (BeginPagerTxn → WriteRow → WriteIndexRow → CommitPagerTxn) runs
+    /// WITHOUT this lock, so concurrent `BEGIN CONCURRENT`s don't observe the writer
+    /// flag and don't return Busy during the I/O-heavy portion of the checkpoint.
+    /// The procedure is:
+    /// - (unlocked) Snapshot MvStore via snapshot_ts; collect committed versions;
+    ///   begin pager txn; write rows; commit pager txn (WAL has the data, fsynced).
+    /// - (locked) Take the blocking_checkpoint_lock; publish durable_txid_max,
+    ///   global_header and schema roots; release the lock.
+    /// - (unlocked) GC; CheckpointWal → SyncDbFile → truncate logical log → TruncateWal.
     blocking_checkpoint_lock: Arc<TursoRwLock>,
+    /// Single-orchestrator gate for MVCC checkpoints. Set when a CheckpointStateMachine
+    /// is actively running its unlocked write-out phase; cleared on completion or
+    /// error. Multiple commits triggering `should_checkpoint()` race to set this;
+    /// only one wins and runs the checkpoint, the others skip it. Necessary because
+    /// the previously-implicit single-orchestrator invariant (provided by
+    /// `blocking_checkpoint_lock` being acquired in AcquireLock as the *first* state)
+    /// no longer holds once the lock is moved past the pager-write phase.
+    checkpoint_in_progress: AtomicBool,
     /// The highest transaction ID that has been made durable in the WAL.
     /// Used to skip checkpointing transactions from mv store to WAL that have already been processed.
     durable_txid_max: AtomicU64,
@@ -3924,6 +3946,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             commit_coordinator: Arc::new(CommitCoordinator::new()),
             global_header: Arc::new(RwLock::new(None)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
+            checkpoint_in_progress: AtomicBool::new(false),
             durable_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
@@ -7097,22 +7120,41 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 .to_string(),
                         ));
                     }
-                    let header = match header_result {
-                        HeaderReadResult::Valid(header) => header,
+                    match header_result {
+                        HeaderReadResult::Valid(header) => {
+                            // Interrupted checkpoint with the logical log still
+                            // present: reuse its header so the fresh-header write in
+                            // RetryHeader keeps the existing salt chain.
+                            self.storage.set_header(header);
+                        }
                         HeaderReadResult::NoLog => {
-                            return Err(LimboError::Corrupt(
-                                "WAL has committed frames but logical log header is missing"
-                                    .to_string(),
-                            ))
+                            // Empty/truncated logical log on top of committed WAL
+                            // frames is the NORMAL steady state of a Passive
+                            // checkpoint (which truncates the logical log to 0 but
+                            // intentionally leaves the WAL non-empty), NOT corruption.
+                            // The committed WAL holds the durable B-tree state plus
+                            // the `__turso_internal_mvcc_meta` boundary row; an empty
+                            // log means there are no uncheckpointed ops to replay.
+                            // Fall through to backfill WAL→DB and (re)write a fresh
+                            // header in RetryHeader, exactly like the interrupted
+                            // case — just with no existing header to reuse.
+                            //
+                            // NOTE: `NoLog` cannot distinguish a deliberately-
+                            // truncated log from a deleted one, so a deleted log atop
+                            // committed WAL also recovers here rather than failing
+                            // closed. That is correct — the WAL is the authoritative
+                            // durable state and no committed data is lost.
                         }
                         HeaderReadResult::Invalid => {
+                            // A present-but-undecodable header is a torn header write
+                            // / genuine corruption, not a clean truncation — fail
+                            // closed.
                             return Err(LimboError::Corrupt(
                                 "WAL has committed frames but logical log header is invalid"
                                     .to_string(),
-                            ))
+                            ));
                         }
-                    };
-                    self.storage.set_header(header.clone());
+                    }
                     // Enter the checkpoint lifecycle before any WAL→DB backfill so
                     // that `DurableStorage` implementations observing the
                     // start/end pairing (e.g. the diskless server, which arms its
@@ -7121,7 +7163,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     // exactly once at this transition (never on `DriveCheckpoint`
                     // re-entry) since `on_checkpoint_start` is not idempotent.
                     self.storage.on_checkpoint_start()?;
-                    *st = CompleteCheckpointState::DriveCheckpoint { header };
+                    *st = CompleteCheckpointState::DriveCheckpoint;
                 }
                 CompleteCheckpointState::DriveEarlyTruncate {
                     header_result,
@@ -7134,7 +7176,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     *st = CompleteCheckpointState::Start;
                     return Ok(IOResult::Done(()));
                 }
-                CompleteCheckpointState::DriveCheckpoint { header: _header } => {
+                CompleteCheckpointState::DriveCheckpoint => {
                     // NOTE: uses `CheckpointMode::Truncate` to drive WAL backfill
                     // only; we still truncate the WAL explicitly below to preserve
                     // WAL-last ordering in recovery.
@@ -7281,6 +7323,116 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
             }
         }
+    }
+
+    /// Build an `Arc<Schema>` from a set of sqlite_schema rows (keyed by rowid).
+    /// Shared by recovery (replayed rows) and the checkpoint's snapshot-consistent
+    /// `BuildLocalSchemaView` (btree + MVCC-delta merge at snapshot_ts).
+    pub(crate) fn build_schema_from_rows(
+        &self,
+        connection: &Arc<Connection>,
+        schema_rows: &HashMap<i64, ImmutableRecord>,
+        preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
+    ) -> Result<Arc<Schema>> {
+        let pager = connection.pager.load().clone();
+        let cookie = self
+            .global_header
+            .read()
+            .as_ref()
+            .map(|header| header.schema_cookie.get())
+            .unwrap_or(
+                pager
+                    .io
+                    .block(|| pager.with_header(|header| header.schema_cookie))?
+                    .get(),
+            );
+        let mut fresh = Schema::new();
+        fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
+        fresh.schema_version = cookie;
+        let mut from_sql_indexes = Vec::with_capacity(10);
+        let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::default();
+        let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
+        let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
+        let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
+        let syms = connection.syms.read();
+        let mv_store = connection.db.get_mv_store().clone();
+
+        let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
+        sorted_rowids.sort_unstable();
+        for rowid in &sorted_rowids {
+            let record = &schema_rows[rowid];
+            let ty = match record.get_value_opt(0) {
+                Some(ValueRef::Text(v)) => v.as_str(),
+                _ => {
+                    return Err(LimboError::Corrupt(
+                        "sqlite_schema type must be text".to_string(),
+                    ));
+                }
+            };
+            let name = match record.get_value_opt(1) {
+                Some(ValueRef::Text(v)) => v.as_str(),
+                _ => {
+                    return Err(LimboError::Corrupt(
+                        "sqlite_schema name must be text".to_string(),
+                    ));
+                }
+            };
+            let table_name = match record.get_value_opt(2) {
+                Some(ValueRef::Text(v)) => v.as_str(),
+                _ => {
+                    return Err(LimboError::Corrupt(
+                        "sqlite_schema tbl_name must be text".to_string(),
+                    ));
+                }
+            };
+            let root_page = match record.get_value_opt(3) {
+                Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
+                _ => {
+                    return Err(LimboError::Corrupt(
+                        "sqlite_schema root_page must be integer".to_string(),
+                    ));
+                }
+            };
+            let sql = match record.get_value_opt(4) {
+                Some(ValueRef::Text(v)) => Some(v.as_str()),
+                _ => None,
+            };
+            let attached_resolver = |alias: &str| -> Option<usize> {
+                connection
+                    .attached_databases()
+                    .read()
+                    .get_database_by_name(&crate::util::normalize_ident(alias))
+                    .map(|(idx, _)| idx)
+            };
+            fresh.handle_schema_row(
+                ty,
+                name,
+                table_name,
+                root_page,
+                sql,
+                &syms,
+                &mut from_sql_indexes,
+                &mut automatic_indices,
+                &mut dbsp_state_roots,
+                &mut dbsp_state_index_roots,
+                &mut materialized_view_info,
+                &attached_resolver,
+            )?;
+        }
+        fresh.populate_indices(
+            &syms,
+            from_sql_indexes,
+            automatic_indices,
+            mv_store.is_some(),
+        )?;
+        fresh.populate_materialized_views(
+            materialized_view_info,
+            dbsp_state_roots,
+            dbsp_state_index_roots,
+        )?;
+        Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
+
+        Ok(Arc::new(fresh))
     }
 
     /// Replays committed logical-log frames into the in-memory MVCC store.
