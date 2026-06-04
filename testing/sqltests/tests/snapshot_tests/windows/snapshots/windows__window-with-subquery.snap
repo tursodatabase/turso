@@ -43,7 +43,7 @@ addr  opcode              p1   p2  p3  p4                     p5  comment
    5      OpenRead         1    4   0  k(2,B)                  0  index=idx_employees_department, root=4, iDb=0
    6      Rewind           1   14   0                          0  Rewind index idx_employees_department
    7        DeferredSeek   1    0   0                          0
-   8        Column         0    2   4                          0  r[4]=employees.department
+   8        Column         1    0   4                          0  r[4]=idx_employees_department.department
    9        IdxRowId       1    5   0                          0  r[5]=cursor 1 for index idx_employees_department.rowid
   10        Column         0    1   6                          0  r[6]=employees.name
   11        Column         0    3   7                          0  r[7]=employees.salary

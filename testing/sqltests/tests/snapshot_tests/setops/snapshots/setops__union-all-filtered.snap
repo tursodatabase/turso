@@ -30,7 +30,7 @@ addr  opcode          p1  p2  p3  p4              p5  comment
    5    IdxGT          1  11   3                   0  key=[3..3]
    6    DeferredSeek   1   0   0                   0
    7    Column         0   1   1                   0  r[1]=current_employees.name
-   8    Column         0   2   2                   0  r[2]=current_employees.department
+   8    Column         1   0   2                   0  r[2]=idx_current_dept.department
    9    ResultRow      1   2   0                   0  output=r[1..2]
   10  Next             1   5   0                   0
   11  OpenRead         2   3   0  k(5,B,B,B,B,B)   0  table=former_employees, root=3, iDb=0
@@ -40,7 +40,7 @@ addr  opcode          p1  p2  p3  p4              p5  comment
   15    IdxGT          3  21   6                   0  key=[6..6]
   16    DeferredSeek   3   2   0                   0
   17    Column         2   1   4                   0  r[4]=former_employees.name
-  18    Column         2   2   5                   0  r[5]=former_employees.department
+  18    Column         3   0   5                   0  r[5]=idx_former_dept.department
   19    ResultRow      4   2   0                   0  output=r[4..5]
   20  Next             3  15   0                   0
   21  Halt             0   0   0                   0
