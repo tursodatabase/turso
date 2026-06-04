@@ -2253,7 +2253,7 @@ pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
             end,
         } = e
         {
-            if matches!(lhs.as_ref(), Expr::Subquery(_)) {
+            if expr_contains_subquery(lhs) {
                 return Ok(WalkControl::Continue);
             }
 
@@ -2295,6 +2295,21 @@ pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
         Ok(WalkControl::Continue)
     })?;
     Ok(())
+}
+
+fn expr_contains_subquery(expr: &Expr) -> bool {
+    let mut found_subquery = false;
+    let _ = walk_expr(expr, &mut |e| {
+        if matches!(
+            e,
+            Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
+        ) {
+            found_subquery = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found_subquery
 }
 
 /**
