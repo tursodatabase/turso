@@ -1474,6 +1474,10 @@ pub fn parse_where(
                     end,
                 } = e
                 {
+                    if matches!(lhs.as_ref(), Expr::Subquery(_)) {
+                        return Ok(WalkControl::Continue);
+                    }
+
                     let lhs_expr = std::mem::take(lhs.as_mut());
                     let start_expr = std::mem::take(start.as_mut());
                     let end_expr = std::mem::take(end.as_mut());
