@@ -19,6 +19,8 @@ pure-rust-crypto = ["turso_sdk_kit/pure-rust-crypto", "turso_sync_sdk_kit/pure-r
 fts = ["turso_sdk_kit/fts"]
 stacker = ["turso_core/stacker"]
 test_helper = ["turso_core/test_helper"]
+# Test-only: exposes the `memory_yield` VFS for stress/simulator harnesses.
+io_memory_yield = ["turso_core/io_memory_yield"]
 sync = [
     "dep:hyper",
     "dep:tokio",
