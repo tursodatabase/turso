@@ -3204,6 +3204,106 @@ fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
     assert_eq!(&integrity[0][0].to_string(), "ok");
 }
 
+/// Deterministic regression for the non-blocking checkpoint vs. concurrent-CREATE bug
+/// (reproduces whopper chaos+mvcc seeds 28 / 60, which panic at the
+/// `has_pending_root_publication()` assert in `TruncateWal`).
+///
+/// Mechanism: a Passive auto-checkpoint captures `snapshot_ts` in `PrepareCheckpoint`,
+/// then runs its collection off-lock. While it is parked there (before acquiring the
+/// blocking lock), another connection COMMITs a `CREATE TABLE` — its commit timestamp is
+/// ABOVE `snapshot_ts`, so this checkpoint does NOT materialize it, yet it now sits in the
+/// shared schema with a negative (uncheckpointed) root page. The single-orchestrator
+/// `checkpoint_in_progress` gate (held while parked) prevents the CREATE's own commit from
+/// checkpointing it. When the parked checkpoint resumes and reaches `TruncateWal`, the
+/// over-strict invariant — which flags ANY negative-root object in the LIVE schema, not just
+/// the ones this pass owns — panics.
+///
+/// Correct behavior: the checkpoint completes; the concurrently-created table survives with
+/// its negative placeholder root page (a later checkpoint resolves it); integrity holds.
+///
+/// KNOWN-FAILING (reproduces the bug): currently panics at the assert. This is the acceptance
+/// criterion for the Task 9 fix (make `has_pending_root_publication` deferral-aware). Run with
+/// `cargo test -- --ignored`. Un-ignore once fixed.
+#[ignore = "reproduces non-blocking-checkpoint vs concurrent-CREATE panic; un-ignore when Task 9 fix lands"]
+#[test]
+fn test_passive_checkpoint_tolerates_concurrent_create_after_snapshot() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t1 VALUES (0, 'seed')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    // Force an auto-checkpoint on the next commit.
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+
+    // Drive the auto-checkpoint via this INSERT's commit and park it at
+    // BeforeAcquireLock (snapshot_ts captured in PrepareCheckpoint; blocking lock
+    // not yet held, so a concurrent writer can still commit).
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforeAcquireLock.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut insert_stmt = conn.prepare("INSERT INTO t1 VALUES (1, 'a')").unwrap();
+    let mut parked = false;
+    for _ in 0..10_000 {
+        match insert_stmt.step().unwrap() {
+            StepResult::IO if injector.is_empty() => {
+                parked = true;
+                break;
+            }
+            StepResult::IO => {}
+            StepResult::Done => {
+                panic!("INSERT completed before the checkpoint acquire-lock yield fired")
+            }
+            other => panic!("unexpected INSERT step result before yield: {other:?}"),
+        }
+    }
+    assert!(
+        parked,
+        "auto-checkpoint should yield before acquiring the checkpoint lock"
+    );
+    conn.set_yield_injector(None);
+
+    // Concurrent connection creates a table that commits AFTER the checkpoint's
+    // snapshot. It lands in the shared schema with a negative root page but is NOT
+    // part of this checkpoint's write set; the in-progress gate stops its own commit
+    // from checkpointing it.
+    let other = db.connect();
+    other
+        .execute("CREATE TABLE t2(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    // Resume the parked checkpoint to completion. Before the fix this panics at the
+    // has_pending_root_publication assert in TruncateWal.
+    let mut done = false;
+    for _ in 0..100_000 {
+        match insert_stmt.step().unwrap() {
+            StepResult::Done => {
+                done = true;
+                break;
+            }
+            StepResult::IO => {}
+            other => panic!("unexpected resume step result: {other:?}"),
+        }
+    }
+    assert!(
+        done,
+        "checkpoint must complete despite a CREATE that committed after its snapshot"
+    );
+    drop(insert_stmt);
+
+    // Both tables survive; t2 is usable; integrity holds.
+    let tables = get_rows(
+        &conn,
+        "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('t1','t2') ORDER BY name",
+    );
+    assert_eq!(tables.len(), 2, "t1 and t2 must both exist: {tables:?}");
+    other.execute("INSERT INTO t2 VALUES (1, 'x')").unwrap();
+    let rows = get_rows(&other, "SELECT id, v FROM t2");
+    assert_eq!(rows.len(), 1);
+    let integrity = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(&integrity[0][0].to_string(), "ok");
+}
+
 /// What this test checks: if one checkpoint makes a unique-index delete durable in the B-tree
 /// but fails before MVCC cleanup finishes, a later checkpoint retry must not try to delete that
 /// same unique key again.
