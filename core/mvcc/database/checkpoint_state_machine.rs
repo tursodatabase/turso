@@ -1344,21 +1344,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 #[cfg(feature = "conn_raw_api")]
                 let old_root_page = btree_table.root_page;
                 let table_id = MVTableId::from(btree_table.root_page);
-                let entry = self
+                // Only resolve tables this checkpoint actually materialized. With
+                // off-lock collection + snapshot_ts deferral, the live connection
+                // schema can contain tables created AFTER our snapshot (still a
+                // negative placeholder root page) that this pass did NOT checkpoint.
+                // Leave those untouched — a later checkpoint that includes them
+                // publishes their real root page.
+                if let Some(root_page) = self
                     .mvstore
                     .table_id_to_rootpage
                     .get(&table_id)
-                    .expect("we should have checkpointed table with table_id {table_id:?}");
-                let value = entry
-                    .value()
-                    .expect("table with id {table_id:?} should have a mapping");
-                btree_table.root_page = value as i64;
-                #[cfg(feature = "conn_raw_api")]
+                    .and_then(|entry| *entry.value())
                 {
-                    schema.table_names_by_root_page.remove(&old_root_page);
-                    schema
-                        .table_names_by_root_page
-                        .insert(btree_table.root_page, name.clone());
+                    btree_table.root_page = root_page as i64;
+                    #[cfg(feature = "conn_raw_api")]
+                    {
+                        schema.table_names_by_root_page.remove(&old_root_page);
+                        schema
+                            .table_names_by_root_page
+                            .insert(btree_table.root_page, name.clone());
+                    }
                 }
             }
         }
@@ -1366,16 +1371,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             for index in table_index_list.iter_mut() {
                 if index.root_page < 0 {
                     let table_id = MVTableId::from(index.root_page);
-                    let entry = self
+                    // Same as tables above: skip indexes not materialized by this
+                    // pass (created after snapshot_ts); resolved by a later checkpoint.
+                    if let Some(root_page) = self
                         .mvstore
                         .table_id_to_rootpage
                         .get(&table_id)
-                        .expect("we should have checkpointed index with table_id {table_id:?}");
-                    let value = entry
-                        .value()
-                        .expect("index with id {table_id:?} should have a mapping");
-                    let index = Arc::make_mut(index);
-                    index.root_page = value as i64;
+                        .and_then(|entry| *entry.value())
+                    {
+                        let index = Arc::make_mut(index);
+                        index.root_page = root_page as i64;
+                    }
                 }
             }
         }
