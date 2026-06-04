@@ -596,12 +596,9 @@ pub fn op_checkpoint(
     // (e.g., when switching from WAL to MVCC mode via `PRAGMA journal_mode = "mvcc"`).
     let mv_store = program.connection.mv_store_for_db(*database);
     if let Some(mv_store) = mv_store.as_ref() {
-        if !matches!(checkpoint_mode, CheckpointMode::Truncate { .. }) {
-            return Err(LimboError::InvalidArgument(
-                "Only TRUNCATE checkpoint mode is supported for MVCC".to_string(),
-            ));
-        }
         use crate::state_machine::{StateTransition, TransitionResult};
+        // MVCC honors the requested checkpoint mode: Truncate/Restart reset the WAL
+        // file, Passive/Full backfill and leave it (relying on restart-on-write).
         let mut ckpt_sm = CheckpointStateMachine::new(
             pager.clone(),
             mv_store.clone(),
@@ -609,6 +606,7 @@ pub fn op_checkpoint(
             true,
             program.connection.get_sync_mode(),
             *database,
+            *checkpoint_mode,
         );
         let CheckpointResult {
             wal_max_frame,
@@ -16017,6 +16015,10 @@ fn op_journal_mode_inner(
                                 true,
                                 program.connection.get_sync_mode(),
                                 *db,
+                                // Changing journal mode requires the WAL fully reset.
+                                CheckpointMode::Truncate {
+                                    upper_bound_inclusive: None,
+                                },
                             ))));
                     }
 
