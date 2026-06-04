@@ -1289,6 +1289,23 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
+                        #[cfg(feature = "test_helper")]
+                        ScalarFunc::TestNondetCounter => {
+                            if !args.is_empty() {
+                                crate::bail_parse_error!(
+                                    "{} function with arguments",
+                                    srf.to_string()
+                                );
+                            }
+                            let regs = program.alloc_register();
+                            program.emit_insn(Insn::Function {
+                                constant_mask: 0,
+                                start_reg: regs,
+                                dest: target_register,
+                                func: func_ctx,
+                            });
+                            Ok(target_register)
+                        }
                         ScalarFunc::Date | ScalarFunc::DateTime | ScalarFunc::JulianDay => {
                             let start_reg = program.alloc_registers(args.len().max(1));
                             for (i, arg) in args.iter().enumerate() {
