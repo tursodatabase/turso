@@ -69,12 +69,17 @@ pub fn open_mv_store(
     durable_storage: Option<Arc<dyn mvcc::persistent_storage::DurableStorage>>,
     encryption_ctx: Option<crate::storage::encryption::EncryptionContext>,
 ) -> Result<Arc<MvStore>> {
-    if durable_storage.is_some() && encryption_ctx.is_some() {
-        return Err(LimboError::InvalidArgument(
-            "encrypted MVCC is not supported with custom DurableStorage".to_string(),
-        ));
+    // `encryption_ctx` encrypts database pages, but a custom DurableStorage
+    // writes the MVCC log itself. If the database is encrypted, the custom
+    // storage must also have an encryption context so the log is not plaintext
+    if let Some(storage) = &durable_storage {
+        if encryption_ctx.is_some() && storage.encryption_ctx().is_none() {
+            return Err(LimboError::InvalidArgument(
+                    "encrypted MVCC requires the custom DurableStorage to be configured with encryption"
+                        .to_string(),
+                ));
+        }
     }
-
     let storage: Arc<dyn mvcc::persistent_storage::DurableStorage> =
         if let Some(storage) = durable_storage {
             storage
