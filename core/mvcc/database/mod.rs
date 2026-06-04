@@ -526,7 +526,7 @@ fn portable_delete_op_extension_for_row_version<Clock: LogicalClock>(
 
     if row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
         let extension =
-            encode_delete_portable_extension(Some(row_version.row.payload()), None, Some(rowid));
+            encode_delete_portable_extension(Some(row_version.row.payload()), None, Some(rowid))?;
         return Ok((!extension.is_empty()).then_some(extension));
     }
 
@@ -577,7 +577,7 @@ fn portable_delete_op_extension_for_row_version<Clock: LogicalClock>(
     } else {
         ImmutableRecord::from_values(&pk_values, pk_values.len())?.into_payload()
     };
-    let extension = encode_delete_portable_extension(None, Some(&pk_record), Some(rowid));
+    let extension = encode_delete_portable_extension(None, Some(&pk_record), Some(rowid))?;
     Ok((!extension.is_empty()).then_some(extension))
 }
 

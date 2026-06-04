@@ -1075,6 +1075,104 @@ impl LogBufferWrite for Varint {
     }
 }
 
+struct ProtoVarint(u64);
+
+impl LogBufferWrite for ProtoVarint {
+    #[inline(always)]
+    fn upper_bound_len(&self) -> usize {
+        10
+    }
+
+    #[inline(always)]
+    fn write_to(self, buffer: &mut Vec<u8>) {
+        write_proto_varint(self.0, buffer);
+    }
+}
+
+const PROTO_WIRE_VARINT: u64 = 0;
+const PROTO_WIRE_LENGTH_DELIMITED: u64 = 2;
+
+struct ProtoKey {
+    field: u64,
+    wire_type: u64,
+}
+
+impl ProtoKey {
+    #[inline(always)]
+    fn new(field: u64, wire_type: u64) -> Self {
+        Self { field, wire_type }
+    }
+}
+
+impl LogBufferWrite for ProtoKey {
+    #[inline(always)]
+    fn upper_bound_len(&self) -> usize {
+        ProtoVarint(0).upper_bound_len()
+    }
+
+    #[inline(always)]
+    fn write_to(self, buffer: &mut Vec<u8>) {
+        ProtoVarint((self.field << 3) | self.wire_type).write_to(buffer);
+    }
+}
+
+struct ProtoSint64 {
+    field: u64,
+    value: i64,
+}
+
+impl ProtoSint64 {
+    #[inline(always)]
+    fn new(field: u64, value: i64) -> Self {
+        Self { field, value }
+    }
+}
+
+impl LogBufferWrite for ProtoSint64 {
+    #[inline(always)]
+    fn upper_bound_len(&self) -> usize {
+        ProtoKey::new(self.field, PROTO_WIRE_VARINT)
+            .upper_bound_len()
+            .saturating_add(ProtoVarint(0).upper_bound_len())
+    }
+
+    #[inline(always)]
+    fn write_to(self, buffer: &mut Vec<u8>) {
+        let zigzag = ((self.value << 1) ^ (self.value >> 63)) as u64;
+        ProtoKey::new(self.field, PROTO_WIRE_VARINT).write_to(buffer);
+        ProtoVarint(zigzag).write_to(buffer);
+    }
+}
+
+struct ProtoBytes<'a> {
+    field: u64,
+    value: &'a [u8],
+}
+
+impl<'a> ProtoBytes<'a> {
+    #[inline(always)]
+    fn new(field: u64, value: &'a [u8]) -> Self {
+        Self { field, value }
+    }
+}
+
+impl LogBufferWrite for ProtoBytes<'_> {
+    #[inline(always)]
+    fn upper_bound_len(&self) -> usize {
+        ProtoKey::new(self.field, PROTO_WIRE_LENGTH_DELIMITED)
+            .upper_bound_len()
+            .saturating_add(ProtoVarint(0).upper_bound_len())
+            .saturating_add(self.value.len())
+    }
+
+    #[inline(always)]
+    fn write_to(self, buffer: &mut Vec<u8>) {
+        ProtoKey::new(self.field, PROTO_WIRE_LENGTH_DELIMITED).write_to(buffer);
+        ProtoVarint(self.value.len() as u64).write_to(buffer);
+        buffer.extend_from_slice(self.value);
+    }
+}
+
 impl LogBufferWrite for u8 {
     #[inline(always)]
     fn upper_bound_len(&self) -> usize {
@@ -1125,9 +1223,8 @@ macro_rules! impl_log_buffer_write_tuple {
             fn upper_bound_len(&self) -> usize {
                 let ($($value,)+) = self;
                 let mut len = 0usize;
-                // TODO: currently panics on usize overflow
                 $(
-                    len += $value.upper_bound_len();
+                    len = len.saturating_add($value.upper_bound_len());
                 )+
                 len
             }
@@ -1148,6 +1245,7 @@ impl_log_buffer_write_tuple!((A, a), (B, b));
 impl_log_buffer_write_tuple!((A, a), (B, b), (C, c));
 impl_log_buffer_write_tuple!((A, a), (B, b), (C, c), (D, d));
 impl_log_buffer_write_tuple!((A, a), (B, b), (C, c), (D, d), (E, e));
+impl_log_buffer_write_tuple!((A, a), (B, b), (C, c), (D, d), (E, e), (F, f));
 
 macro_rules! log_write {
     ($serializer:expr, [$($value:expr),+ $(,)?]) => {
@@ -1261,42 +1359,35 @@ fn write_proto_varint(mut value: u64, buffer: &mut Vec<u8>) {
     buffer.push(value as u8);
 }
 
-fn write_proto_key(field: u64, wire_type: u64, buffer: &mut Vec<u8>) {
-    write_proto_varint((field << 3) | wire_type, buffer);
-}
-
-fn write_proto_sint64(field: u64, value: i64, buffer: &mut Vec<u8>) {
-    let zigzag = ((value << 1) ^ (value >> 63)) as u64;
-    write_proto_key(field, 0, buffer);
-    write_proto_varint(zigzag, buffer);
-}
-
-fn write_proto_bytes(field: u64, value: &[u8], buffer: &mut Vec<u8>) {
-    write_proto_key(field, 2, buffer);
-    write_proto_varint(value.len() as u64, buffer);
-    buffer.extend_from_slice(value);
-}
-
 pub(crate) fn encode_delete_portable_extension(
     identity_record: Option<&[u8]>,
     pk_record: Option<&[u8]>,
     rowid: Option<i64>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mut extension = Vec::new();
+    let mut serializer = LogBufferSerializer::new(&mut extension);
     if let Some(identity_record) = identity_record.filter(|record| !record.is_empty()) {
-        write_proto_bytes(
-            OP_EXT_FIELD_DELETE_IDENTITY_RECORD,
-            identity_record,
-            &mut extension,
-        );
+        log_write!(
+            serializer,
+            [ProtoBytes::new(
+                OP_EXT_FIELD_DELETE_IDENTITY_RECORD,
+                identity_record
+            )]
+        )?;
     }
     if let Some(pk_record) = pk_record.filter(|record| !record.is_empty()) {
-        write_proto_bytes(OP_EXT_FIELD_DELETE_PK_RECORD, pk_record, &mut extension);
+        log_write!(
+            serializer,
+            [ProtoBytes::new(OP_EXT_FIELD_DELETE_PK_RECORD, pk_record)]
+        )?;
     }
     if let Some(rowid) = rowid {
-        write_proto_sint64(OP_EXT_FIELD_DELETE_ROWID, rowid, &mut extension);
+        log_write!(
+            serializer,
+            [ProtoSint64::new(OP_EXT_FIELD_DELETE_ROWID, rowid)]
+        )?;
     }
-    extension
+    Ok(extension)
 }
 
 fn read_proto_varint_from_buf(bytes: &[u8], offset: &mut usize) -> Result<u64> {
@@ -1412,19 +1503,30 @@ fn encode_portable_change_payload(
     end_offset: u64,
     commit_ts: u64,
     encoded_metadata: &[u8],
-) -> Vec<u8> {
-    let body_len =
-        2 + proto_varint_len(end_offset) + proto_varint_len(commit_ts) + encoded_metadata.len();
-    let mut out = Vec::with_capacity(proto_varint_len(body_len as u64) + body_len);
-    write_proto_varint(body_len as u64, &mut out);
-    // PortableLogicalTxn.end_offset, field 1, varint.
-    write_proto_varint(1 << 3, &mut out);
-    write_proto_varint(end_offset, &mut out);
-    // PortableLogicalTxn.commit_ts, field 2, varint.
-    write_proto_varint(2 << 3, &mut out);
-    write_proto_varint(commit_ts, &mut out);
-    out.extend_from_slice(encoded_metadata);
-    out
+) -> Result<Vec<u8>> {
+    let body_len = checked_log_buffer_len(2, proto_varint_len(end_offset))
+        .and_then(|len| checked_log_buffer_len(len, proto_varint_len(commit_ts)))
+        .and_then(|len| checked_log_buffer_len(len, encoded_metadata.len()))?;
+    let body_len = u64::try_from(body_len).map_err(|_| {
+        LimboError::InternalError("portable logical payload size exceeds u64".to_string())
+    })?;
+
+    let mut out = Vec::new();
+    let mut serializer = LogBufferSerializer::new(&mut out);
+    log_write!(
+        serializer,
+        [
+            ProtoVarint(body_len),
+            // PortableLogicalTxn.end_offset, field 1, varint.
+            ProtoKey::new(1, PROTO_WIRE_VARINT),
+            ProtoVarint(end_offset),
+            // PortableLogicalTxn.commit_ts, field 2, varint.
+            ProtoKey::new(2, PROTO_WIRE_VARINT),
+            ProtoVarint(commit_ts),
+            encoded_metadata,
+        ]
+    )?;
+    Ok(out)
 }
 
 /// Wraps commit-built logical op messages in one length-delimited
@@ -1491,7 +1593,7 @@ fn encode_portable_change_payload_with_stable_end_offset(
 
     let mut end_offset = frame_end_offset(0)?;
     loop {
-        let payload = encode_portable_change_payload(end_offset, tx_timestamp, portable_changes);
+        let payload = encode_portable_change_payload(end_offset, tx_timestamp, portable_changes)?;
         let next_end_offset = frame_end_offset(payload.len())?;
         if next_end_offset == end_offset {
             return Ok(payload);
@@ -1508,11 +1610,17 @@ fn encode_extension_record(
     let payload_len = u32::try_from(payload.len()).map_err(|_| {
         LimboError::InternalError("Logical log extension record exceeds u32".to_string())
     })?;
-    let mut record = Vec::with_capacity(EXTENSION_RECORD_HEADER_SIZE + payload.len());
-    record.extend_from_slice(&extension_type.to_le_bytes());
-    record.extend_from_slice(&extension_flags.to_le_bytes());
-    record.extend_from_slice(&payload_len.to_le_bytes());
-    record.extend_from_slice(payload);
+    let mut record = Vec::new();
+    let mut serializer = LogBufferSerializer::new(&mut record);
+    log_write!(
+        serializer,
+        [
+            extension_type.to_le_bytes(),
+            extension_flags.to_le_bytes(),
+            payload_len.to_le_bytes(),
+            payload,
+        ]
+    )?;
     Ok(record)
 }
 
