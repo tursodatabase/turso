@@ -2036,6 +2036,10 @@ impl Connection {
                 true,
                 self.get_sync_mode(),
                 MAIN_DB_ID,
+                // Explicit Connection::checkpoint fully resets the WAL.
+                crate::storage::wal::CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                },
             );
             loop {
                 match ckpt_sm.step(&()) {

@@ -168,7 +168,7 @@ pub enum CheckpointMode {
 }
 
 impl CheckpointMode {
-    fn should_restart_log(&self) -> bool {
+    pub(crate) fn should_restart_log(&self) -> bool {
         matches!(
             self,
             CheckpointMode::Truncate { .. } | CheckpointMode::Restart
