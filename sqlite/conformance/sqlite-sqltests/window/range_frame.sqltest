@@ -1,0 +1,49 @@
+@database :memory:
+
+setup base {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, g INTEGER);
+    INSERT INTO t VALUES (1,10,1),(2,20,1),(3,30,2),(4,40,2),(5,50,2);
+}
+
+# Symmetric value window: include every row within ±5 of the current
+# row's ORDER BY value.
+@setup base
+test range-symmetric-offset {
+    SELECT id, v, sum(v) OVER (ORDER BY v RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM t;
+}
+expect error {
+}
+
+# Trailing range: include every row whose ORDER BY value is within 10
+# behind the current row.
+@setup base
+test range-trailing-offset {
+    SELECT id, v, sum(v) OVER (ORDER BY v RANGE 10 PRECEDING) FROM t;
+}
+expect error {
+}
+
+# DESC ordering: arithmetic and comparison still hold.
+@setup base
+test range-desc-symmetric-offset {
+    SELECT id, v, sum(v) OVER (ORDER BY v DESC RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM t;
+}
+expect error {
+}
+
+# RANGE with an offset bound requires exactly one ORDER BY column
+# (SQLite, window.c:680-684).
+
+@setup base
+test range-offset-rejects-multi-order-by {
+    SELECT sum(v) OVER (ORDER BY g, v RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+}
+
+@setup base
+test range-offset-rejects-zero-order-by {
+    SELECT sum(v) OVER (RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+}
