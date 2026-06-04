@@ -6346,14 +6346,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             }
                             let rowid_int = rowid.row_id.to_int_or_panic();
                             schema_rows.insert(rowid_int, record);
-                        } else if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
-                            // Data row references a table_id not yet in the map. This can happen
-                            // with logs written before the schema-first serialization fix: in a
-                            // same-transaction CREATE TABLE + INSERT + DROP TABLE, data rows were
-                            // serialized before the schema INSERT that registers the table_id.
-                            // The schema INSERT (or DELETE) for this table will follow later in
-                            // this transaction frame, so we register the table_id now.
-                            self.insert_table_id_to_rootpage(rowid.table_id, None);
                         }
 
                         let version_id = self.get_version_id();
