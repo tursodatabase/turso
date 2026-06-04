@@ -3048,8 +3048,11 @@ impl Window {
 
     /// Build a `Window` from an inline `OVER (...)` AST node
     pub fn new_unnamed(ast: &ast::Window, frame: Frame) -> Result<Self> {
-        if !Self::is_default_frame_spec(&ast.frame_clause) {
-            crate::bail_parse_error!("Custom frame specifications are not supported yet");
+        // User-written FRAME clauses aren't supported yet. Still call
+        // the validator so SQLite-invalid shapes get the matching
+        // error; for anything else, bail.
+        if let Some(_user_frame) = validate_frame_clause(&ast.frame_clause, ast.order_by.len())? {
+            crate::bail_parse_error!("user-specified frame clauses are not supported");
         }
         Ok(Window {
             name: None,
@@ -3092,7 +3095,12 @@ impl Window {
         if &self.frame != frame {
             return false;
         }
-        if !Self::is_default_frame_spec(&ast.frame_clause) {
+        // User-written FRAME clauses aren't supported yet, and
+        // `Window::new` is where they get rejected. Returning false
+        // here forces the planner to call `Window::new` for the new
+        // function instead of merging it into this Window (which would
+        // skip the rejection).
+        if ast.frame_clause.is_some() {
             return false;
         }
 
@@ -3120,32 +3128,135 @@ impl Window {
                     && *nulls_a == col_b.nulls
             })
     }
+}
 
-    pub(crate) fn is_default_frame_spec(frame: &Option<FrameClause>) -> bool {
-        if let Some(frame_clause) = frame {
-            let FrameClause {
-                mode,
-                start,
-                end,
-                exclude,
-            } = frame_clause;
-            if *mode != FrameMode::Range {
-                return false;
-            }
-            if *start != FrameBound::UnboundedPreceding {
-                return false;
-            }
-            if *end != Some(FrameBound::CurrentRow) {
-                return false;
-            }
-            if let Some(exclude) = exclude {
-                if *exclude != FrameExclude::NoOthers {
-                    return false;
-                }
+/// Convert a parsed `FRAME` clause into the planner's `Frame`.
+/// Returns `Ok(None)` when the user wrote no FRAME clause, `Ok(Some(frame))`
+/// for an accepted clause, `Err` for shapes SQLite rejects.
+/// Validation rules ported from `sqlite3WindowCreate` (`window.c:1179-1250`)
+/// and the parser-level guard at `window.c:680-684`.
+pub fn validate_frame_clause(
+    clause: &Option<FrameClause>,
+    order_by_len: usize,
+) -> Result<Option<Frame>> {
+    let Some(clause) = clause else {
+        return Ok(None);
+    };
+    let FrameClause {
+        mode,
+        start,
+        end,
+        exclude,
+    } = clause;
+
+    // EXCLUDE other than NO OTHERS isn't supported yet.
+    if let Some(exclude) = exclude {
+        if *exclude != FrameExclude::NoOthers {
+            crate::bail_parse_error!("EXCLUDE clauses are not supported");
+        }
+    }
+
+    let start_bound = translate_frame_bound(start, /* is_start = */ true, *mode)?;
+    let end_bound = match end {
+        Some(b) => translate_frame_bound(b, /* is_start = */ false, *mode)?,
+        // No END clause means CURRENT ROW per SQL standard.
+        None => FrameBoundary::CurrentRow,
+    };
+
+    // Combinations that can never describe a real frame (start past
+    // the end, etc.). SQLite rejects the same set at
+    // `window.c:1217-1221`.
+    let illegal = matches!(
+        (&start_bound, &end_bound),
+        (FrameBoundary::UnboundedFollowing, _)
+            | (_, FrameBoundary::UnboundedPreceding)
+            | (FrameBoundary::CurrentRow, FrameBoundary::Preceding(_))
+            | (FrameBoundary::Following(_), FrameBoundary::Preceding(_))
+            | (FrameBoundary::Following(_), FrameBoundary::CurrentRow)
+    );
+    if illegal {
+        crate::bail_parse_error!("unsupported frame specification");
+    }
+
+    // RANGE with an N PRECEDING/FOLLOWING bound does arithmetic on the
+    // ORDER BY value, so it needs exactly one ORDER BY column. SQLite
+    // enforces the same rule at `window.c:680-684`.
+    if *mode == FrameMode::Range
+        && (matches!(
+            &start_bound,
+            FrameBoundary::Preceding(_) | FrameBoundary::Following(_)
+        ) || matches!(
+            &end_bound,
+            FrameBoundary::Preceding(_) | FrameBoundary::Following(_)
+        ))
+        && order_by_len != 1
+    {
+        crate::bail_parse_error!(
+            "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression"
+        );
+    }
+
+    Ok(Some(Frame {
+        mode: *mode,
+        start: start_bound,
+        end: end_bound,
+    }))
+}
+
+/// Convert a parser-level `FrameBound` to the planner's `FrameBoundary`.
+/// Offset expressions are cloned out of the AST; the resulting `Expr`
+/// gets evaluated once at partition start by the emit code (mirroring
+/// SQLite's `windowCheckValue` at `window.c:1494-1522`, which also
+/// checks the runtime value is a non-negative integer). The
+/// literal-negative case is caught here at parse so the user sees a
+/// useful error instead of waiting for the runtime check.
+fn translate_frame_bound(
+    bound: &FrameBound,
+    is_start: bool,
+    mode: FrameMode,
+) -> Result<FrameBoundary> {
+    // The parser enforces start/end orientation: TK_PRECEDING is only
+    // emitted as a start bound, TK_FOLLOWING only as an end bound
+    // (parser.rs: `frame_start_bound` / `frame_end_bound`). Mirrors
+    // SQLite's parser-level guarantee at window.c:1213-1215.
+    match bound {
+        FrameBound::CurrentRow => Ok(FrameBoundary::CurrentRow),
+        FrameBound::UnboundedPreceding => {
+            debug_assert!(is_start, "parser only emits UNBOUNDED PRECEDING as a start bound");
+            Ok(FrameBoundary::UnboundedPreceding)
+        }
+        FrameBound::UnboundedFollowing => {
+            debug_assert!(!is_start, "parser only emits UNBOUNDED FOLLOWING as an end bound");
+            Ok(FrameBoundary::UnboundedFollowing)
+        }
+        FrameBound::Preceding(expr) => {
+            reject_negative_literal_offset(expr, mode)?;
+            Ok(FrameBoundary::Preceding(expr.clone()))
+        }
+        FrameBound::Following(expr) => {
+            reject_negative_literal_offset(expr, mode)?;
+            Ok(FrameBoundary::Following(expr.clone()))
+        }
+    }
+}
+
+/// Reject `... BETWEEN -1 PRECEDING ...` and similar at parse so the
+/// user gets a clean error. Non-literal offsets fall through — they're
+/// checked at evaluation time by the emit code.
+fn reject_negative_literal_offset(expr: &Expr, mode: FrameMode) -> Result<()> {
+    if let Expr::Literal(ast::Literal::Numeric(s)) = expr {
+        if let Ok(n) = s.parse::<i64>() {
+            if n < 0 {
+                let kind = match mode {
+                    FrameMode::Rows => "ROWS",
+                    FrameMode::Range => "RANGE",
+                    FrameMode::Groups => "GROUPS",
+                };
+                crate::bail_parse_error!("frame {kind} offset must be non-negative");
             }
         }
-        true
     }
+    Ok(())
 }
 
 /// A named WINDOW clause definition, captured before any function

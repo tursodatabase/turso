@@ -374,10 +374,14 @@ fn prepare_one_select_plan(
             {
                 trace_stack!("bind_windows");
                 for window_def in window_clause.iter() {
-                    if !Window::is_default_frame_spec(&window_def.window.frame_clause) {
-                        crate::bail_parse_error!(
-                            "Custom frame specifications are not supported yet"
-                        );
+                    // No user FRAME clauses on named windows yet — still
+                    // call the structured validator so SQLite-invalid
+                    // shapes get the matching error.
+                    if let Some(_user_frame) = crate::translate::plan::validate_frame_clause(
+                        &window_def.window.frame_clause,
+                        window_def.window.order_by.len(),
+                    )? {
+                        crate::bail_parse_error!("user-specified frame clauses are not supported");
                     }
                     let name = normalize_ident(window_def.name.as_str());
                     let mut partition_by: Vec<_> = window_def
