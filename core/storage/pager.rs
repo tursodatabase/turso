@@ -6124,7 +6124,7 @@ mod ptrmap_tests {
             target_idx,
             PendingRead {
                 page: synthetic_page.clone(),
-                disk_read: Some(stub_disk_read.clone()),
+                disk_read: Some(stub_disk_read),
             },
         );
 

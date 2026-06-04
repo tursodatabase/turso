@@ -51,9 +51,13 @@ cfg_block! {
 }
 
 mod memory;
+#[cfg(feature = "io_memory_yield")]
+mod memory_yield;
 #[cfg(feature = "fs")]
 mod vfs;
 pub use memory::MemoryIO;
+#[cfg(feature = "io_memory_yield")]
+pub use memory_yield::MemoryYieldIO;
 pub mod clock;
 mod common;
 mod completions;
