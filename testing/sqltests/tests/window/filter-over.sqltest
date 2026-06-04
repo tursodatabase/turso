@@ -355,6 +355,46 @@ expect {
 }
 
 @setup filter_over_base
+@cross-check-integrity
+test filter-over-repeated-deterministic-correlated-subquery-filter {
+    WITH markers(id) AS (VALUES (1),(3),(5))
+    SELECT DISTINCT
+           sum(val) FILTER (
+               WHERE EXISTS (SELECT 1 FROM markers m WHERE m.id = filter_over_items.id)
+           ) OVER () AS a,
+           sum(val) FILTER (
+               WHERE EXISTS (SELECT 1 FROM markers m WHERE m.id = filter_over_items.id)
+           ) OVER () AS b,
+           count(*) FILTER (
+               WHERE id IN (SELECT m.id FROM markers m)
+           ) OVER () AS marker_count
+    FROM filter_over_items;
+}
+expect {
+    25|25|3
+}
+
+@setup filter_over_base
+@cross-check-integrity
+test filter-over-multiple-window-layers-with-filters {
+    SELECT id,
+           sum(val) FILTER (WHERE flag=1) OVER (PARTITION BY grp ORDER BY id),
+           sum(val) FILTER (WHERE y IS NOT NULL) OVER (ORDER BY id DESC),
+           count(*) FILTER (WHERE kind='x') OVER (PARTITION BY kind ORDER BY id)
+    FROM filter_over_items
+    ORDER BY id;
+}
+expect {
+    1|10|55|1
+    2|10|45|0
+    3|10|45|2
+    4||45|3
+    5|15|40|0
+    6|15|25|4
+    7|||0
+}
+
+@setup filter_over_base
 test filter-over-distinct-argument-rejected {
     SELECT count(DISTINCT val) FILTER (WHERE flag) OVER (PARTITION BY grp)
     FROM filter_over_items;
@@ -379,6 +419,15 @@ test filter-over-non-aggregate-window-rejected {
 }
 expect error {
     FILTER clause may only be used with aggregate window functions
+}
+
+@setup filter_over_base
+test filter-over-scalar-function-rejected {
+    SELECT abs(val) FILTER (WHERE flag=1) OVER ()
+    FROM filter_over_items;
+}
+expect error {
+    may not be used as a window function
 }
 
 @setup filter_over_base
@@ -466,6 +515,84 @@ test filter-over-mixed-deterministic-and-nondeterministic-dedup {
 }
 expect {
     25|25|7
+}
+
+@setup filter_over_base
+@backend cli
+@skip-if sqlite "uses turso-only test_nondet_counter() to observe nondet dedup behavior"
+test filter-over-nondeterministic-subquery-filter-dedup {
+    -- The nondeterministic call is inside the FILTER subquery. Repeated
+    -- SQL occurrences must get independent filter columns; otherwise both
+    -- sums read the same predicate stream and the difference collapses to 0.
+    WITH diffs(ord, scenario, abs_diff) AS (
+        SELECT DISTINCT
+               1,
+               'exists',
+               abs(
+                   coalesce(sum(val) FILTER (
+                       WHERE EXISTS (
+                           SELECT 1
+                           WHERE filter_over_items.id > 0
+                             AND (test_nondet_counter() % 2) = 0
+                       )
+                   ) OVER (), 0)
+                   -
+                   coalesce(sum(val) FILTER (
+                       WHERE EXISTS (
+                           SELECT 1
+                           WHERE filter_over_items.id > 0
+                             AND (test_nondet_counter() % 2) = 0
+                       )
+                   ) OVER (), 0)
+               )
+        FROM filter_over_items
+        UNION ALL
+        SELECT DISTINCT
+               2,
+               'in-select',
+               abs(
+                   coalesce(sum(val) FILTER (
+                       WHERE id IN (
+                           SELECT filter_over_items.id
+                           WHERE (test_nondet_counter() % 2) = 0
+                       )
+                   ) OVER (), 0)
+                   -
+                   coalesce(sum(val) FILTER (
+                       WHERE id IN (
+                           SELECT filter_over_items.id
+                           WHERE (test_nondet_counter() % 2) = 0
+                       )
+                   ) OVER (), 0)
+               )
+        FROM filter_over_items
+        UNION ALL
+        SELECT DISTINCT
+               3,
+               'scalar-subquery',
+               abs(
+                   coalesce(sum(val) FILTER (
+                       WHERE (
+                           SELECT (test_nondet_counter() % 2) = 0
+                           WHERE filter_over_items.id > 0
+                       )
+                   ) OVER (), 0)
+                   -
+                   coalesce(sum(val) FILTER (
+                       WHERE (
+                           SELECT (test_nondet_counter() % 2) = 0
+                           WHERE filter_over_items.id > 0
+                       )
+                   ) OVER (), 0)
+               )
+        FROM filter_over_items
+    )
+    SELECT scenario, abs_diff FROM diffs ORDER BY ord;
+}
+expect {
+    exists|75
+    in-select|75
+    scalar-subquery|75
 }
 
 @setup filter_over_base

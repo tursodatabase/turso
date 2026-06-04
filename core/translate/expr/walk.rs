@@ -219,11 +219,6 @@ pub fn expr_references_any_subquery(expr: &ast::Expr) -> bool {
 /// `sum(x) FILTER (WHERE random() % 2 = 0) OVER w` cannot share the filter
 /// value, because SQLite runs `random()` separately at each place it appears.
 ///
-/// FIXME: `walk_expr` does not descend into `Expr::Subquery`, `Expr::Exists`,
-/// or the `Select` side of `Expr::InSelect`. A nondeterministic call buried
-/// inside such a subquery in a FILTER predicate will not be detected, and the
-/// two FILTERs would be incorrectly deduped. Lift the walker's subquery TODO
-/// before relying on this for correctness in those cases.
 pub fn expr_contains_nondeterministic_scalar_function(
     expr: &ast::Expr,
     resolver: &Resolver<'_>,
@@ -251,7 +246,7 @@ pub fn expr_contains_nondeterministic_scalar_function(
     }
 
     let mut found = false;
-    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+    crate::util::walk_expr_with_subqueries(expr, &mut |e| -> Result<WalkControl> {
         if found {
             return Ok(WalkControl::SkipChildren);
         }
