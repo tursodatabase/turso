@@ -756,11 +756,11 @@ pub struct BTreeCursor {
     /// Mirrors SQLite's BTCF_Multiple. Toggled by Pager::register_cursor /
     /// unregister_cursor when the bucket crosses the 1↔2 threshold; lets
     /// drive_pending_peer_save skip the registry mutex in the common case.
-    has_peers: std::sync::atomic::AtomicBool,
+    has_peers: crate::sync::atomic::AtomicBool,
     /// True if this cursor went through Cursor::new_btree (and thus pushed
     /// itself into the registry). Direct BTreeCursor::new callers (tests,
     /// internal utilities) bypass that path; their Drop skips unregister.
-    did_register: std::sync::atomic::AtomicBool,
+    did_register: crate::sync::atomic::AtomicBool,
 }
 
 /// Records the in-flight descent for `iteration_pending_descent`. The direction
@@ -838,8 +838,8 @@ impl BTreeCursor {
             reusable_cell_payload: Vec::new(),
             iteration_pending_descent: None,
             pending_peer_save: None,
-            has_peers: std::sync::atomic::AtomicBool::new(false),
-            did_register: std::sync::atomic::AtomicBool::new(false),
+            has_peers: crate::sync::atomic::AtomicBool::new(false),
+            did_register: crate::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -5294,7 +5294,7 @@ impl BTreeCursor {
     fn drive_pending_peer_save(&mut self) -> Result<IOResult<()>> {
         if self.pending_peer_save.is_none() && matches!(self.state, CursorState::None) {
             // BTCF_Multiple fast path (sqlite3 btree.c:9348).
-            if !self.has_peers.load(std::sync::atomic::Ordering::Relaxed) {
+            if !self.has_peers.load(crate::sync::atomic::Ordering::Relaxed) {
                 return Ok(IOResult::Done(()));
             }
             let dyn_ref: &dyn CursorTrait = self;
@@ -5417,7 +5417,10 @@ impl BTreeCursor {
 
 impl Drop for BTreeCursor {
     fn drop(&mut self) {
-        if !self.did_register.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self
+            .did_register
+            .load(crate::sync::atomic::Ordering::Relaxed)
+        {
             return;
         }
         let dyn_ref: &dyn CursorTrait = self;
@@ -6304,13 +6307,13 @@ impl CursorTrait for BTreeCursor {
         // Store before the push so a panic inside register_cursor still
         // triggers an (idempotent) unregister via Drop.
         self.did_register
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .store(true, crate::sync::atomic::Ordering::Relaxed);
         self.pager.register_cursor(self);
     }
 
     fn set_has_peers_for_external_writes(&self, has_peers: bool) {
         self.has_peers
-            .store(has_peers, std::sync::atomic::Ordering::Relaxed);
+            .store(has_peers, crate::sync::atomic::Ordering::Relaxed);
     }
 
     /// Mirrors SQLite's saveCursorPosition (btree.c:756). Saves rowid for
