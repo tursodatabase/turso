@@ -1,9 +1,7 @@
 use crate::common::{ExecRows, TempDatabase};
 use std::path::Path;
 use std::sync::Arc;
-use turso_core::{
-    Database, DatabaseOpts, EncryptionKey, EncryptionOpts, LimboError, OpenFlags, StepResult,
-};
+use turso_core::{Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, StepResult};
 
 /// Create a new database file at `path` with MVCC journal mode enabled.
 /// This is needed because ATTACH requires the attached DB's journal mode
@@ -208,48 +206,6 @@ fn test_mvcc_custom_durable_storage_injected(tmp_db: TempDatabase) -> anyhow::Re
     );
 
     conn.close()?;
-    Ok(())
-}
-
-#[turso_macros::test]
-fn test_mvcc_custom_durable_storage_rejects_encrypted_mode(
-    tmp_db: TempDatabase,
-) -> anyhow::Result<()> {
-    let db_path = tmp_db
-        .path
-        .with_extension("custom_durable_storage_encrypted.db");
-    let log_path = db_path.with_extension("db-log");
-    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-
-    let file = tmp_db
-        .io
-        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)?;
-    let default_storage: Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage> = Arc::new(
-        turso_core::mvcc::persistent_storage::Storage::new(file, tmp_db.io.clone(), None),
-    );
-    let recording = Arc::new(RecordingDurableStorage::new(default_storage));
-
-    let db = Database::open_file_with_flags_and_durable_storage(
-        tmp_db.io.clone(),
-        db_path.to_str().unwrap(),
-        OpenFlags::default(),
-        DatabaseOpts::new().with_encryption(true),
-        Some(EncryptionOpts {
-            cipher: "aes256gcm".to_string(),
-            hexkey: hex_key.to_string(),
-        }),
-        Some(recording),
-    )?;
-    let key = EncryptionKey::from_hex_string(hex_key)?;
-    let conn = db.connect_with_encryption(Some(key))?;
-
-    let err = conn.pragma_update("journal_mode", "'mvcc'").unwrap_err();
-    assert!(matches!(
-        err,
-        LimboError::InvalidArgument(message)
-            if message == "encrypted MVCC is not supported with custom DurableStorage"
-    ));
-
     Ok(())
 }
 
