@@ -160,7 +160,7 @@ impl DurableStorage for Storage {
             !log_record.has_header,
             "DatabaseHeader op appended more than once to a single LogRecord"
         );
-        serialize_header_entry(&mut log_record.buf, header);
+        serialize_header_entry(&mut log_record.buf, header)?;
         log_record.has_header = true;
         log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
             LimboError::InternalError("logical log op_count exceeds u32".to_string())

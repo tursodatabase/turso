@@ -450,7 +450,8 @@ impl LogRecord {
     #[cfg(test)]
     pub(crate) fn set_header_for_test(&mut self, header: &DatabaseHeader) {
         assert!(!self.has_header, "header op appended twice in test");
-        crate::mvcc::persistent_storage::logical_log::serialize_header_entry(&mut self.buf, header);
+        crate::mvcc::persistent_storage::logical_log::serialize_header_entry(&mut self.buf, header)
+            .expect("failed to serialize database header in test");
         self.has_header = true;
         self.op_count += 1;
     }

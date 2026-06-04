@@ -1026,6 +1026,135 @@ impl LogicalLog {
     }
 }
 
+/// A serialization fragment with a known upper bound.
+///
+/// Logical-log encoding still uses infallible byte writes after allocation has
+/// succeeded. Bundling fragments lets each call reserve once with `try_reserve`
+/// before writing varints and byte slices that cannot exceed their bounds.
+trait LogBufferWrite {
+    fn upper_bound_len(&self) -> usize;
+    fn write_to(self, buffer: &mut Vec<u8>);
+}
+
+struct LogBufferSerializer<'a> {
+    buffer: &'a mut Vec<u8>,
+}
+
+impl<'a> LogBufferSerializer<'a> {
+    #[inline(always)]
+    fn new(buffer: &'a mut Vec<u8>) -> Self {
+        Self { buffer }
+    }
+
+    #[inline(always)]
+    fn write<W: LogBufferWrite>(&mut self, value: W) -> Result<()> {
+        let upper_bound = value.upper_bound_len();
+        self.buffer.try_reserve(upper_bound)?;
+
+        let start = self.buffer.len();
+        value.write_to(self.buffer);
+        debug_assert!(
+            self.buffer.len() - start <= upper_bound,
+            "logical log serializer exceeded reserved upper bound"
+        );
+        Ok(())
+    }
+}
+
+struct Varint(u64);
+
+impl LogBufferWrite for Varint {
+    #[inline(always)]
+    fn upper_bound_len(&self) -> usize {
+        9
+    }
+
+    #[inline(always)]
+    fn write_to(self, buffer: &mut Vec<u8>) {
+        write_varint_to_vec(self.0, buffer);
+    }
+}
+
+impl LogBufferWrite for u8 {
+    #[inline(always)]
+    fn upper_bound_len(&self) -> usize {
+        1
+    }
+
+    #[inline(always)]
+    fn write_to(self, buffer: &mut Vec<u8>) {
+        buffer.push(self);
+    }
+}
+
+impl<const N: usize> LogBufferWrite for [u8; N] {
+    #[inline(always)]
+    fn upper_bound_len(&self) -> usize {
+        N
+    }
+
+    #[inline(always)]
+    fn write_to(self, buffer: &mut Vec<u8>) {
+        buffer.extend_from_slice(&self);
+    }
+}
+
+impl LogBufferWrite for &[u8] {
+    #[inline(always)]
+    fn upper_bound_len(&self) -> usize {
+        self.len()
+    }
+
+    #[inline(always)]
+    fn write_to(self, buffer: &mut Vec<u8>) {
+        buffer.extend_from_slice(self);
+    }
+}
+
+#[inline(always)]
+fn checked_log_buffer_len(lhs: usize, rhs: usize) -> Result<usize> {
+    lhs.checked_add(rhs).ok_or_else(|| {
+        LimboError::InternalError("logical log serialization size overflow".to_string())
+    })
+}
+
+macro_rules! impl_log_buffer_write_tuple {
+    ($(($ty:ident, $value:ident)),+) => {
+        impl<$($ty: LogBufferWrite),+> LogBufferWrite for ($($ty,)+) {
+            #[inline(always)]
+            fn upper_bound_len(&self) -> usize {
+                let ($($value,)+) = self;
+                let mut len = 0usize;
+                // TODO: currently panics on usize overflow
+                $(
+                    len += $value.upper_bound_len();
+                )+
+                len
+            }
+
+            #[inline(always)]
+            fn write_to(self, buffer: &mut Vec<u8>) {
+                let ($($value,)+) = self;
+                $(
+                    $value.write_to(buffer);
+                )+
+            }
+        }
+    };
+}
+
+impl_log_buffer_write_tuple!((A, a));
+impl_log_buffer_write_tuple!((A, a), (B, b));
+impl_log_buffer_write_tuple!((A, a), (B, b), (C, c));
+impl_log_buffer_write_tuple!((A, a), (B, b), (C, c), (D, d));
+impl_log_buffer_write_tuple!((A, a), (B, b), (C, c), (D, d), (E, e));
+
+macro_rules! log_write {
+    ($serializer:expr, [$($value:expr),+ $(,)?]) => {
+        $serializer.write(($($value,)+))
+    };
+}
+
 /// Serialize one op into `buffer`.
 /// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
 pub(crate) fn serialize_op_entry(
@@ -1033,6 +1162,7 @@ pub(crate) fn serialize_op_entry(
     row_version: &RowVersion,
     portable_extension: Option<&[u8]>,
 ) -> Result<()> {
+    let mut serializer = LogBufferSerializer::new(buffer);
     let is_delete = row_version.end.is_some();
 
     let mut flags = 0u8;
@@ -1054,62 +1184,73 @@ pub(crate) fn serialize_op_entry(
     );
     let table_id_i32 = table_id_i64 as i32;
 
-    let write_header = |buf: &mut Vec<u8>, tag: u8| {
-        buf.push(tag);
-        buf.push(flags);
-        buf.extend_from_slice(&table_id_i32.to_le_bytes());
-    };
-
     match (&row_version.row.id.row_id, is_delete) {
         (&RowKey::Int(rowid), false) => {
-            write_header(buffer, OP_UPSERT_TABLE);
+            log_write!(
+                serializer,
+                [OP_UPSERT_TABLE, flags, table_id_i32.to_le_bytes()]
+            )?;
             let record_bytes = row_version.row.payload();
             let rowid_u64 = rowid as u64;
             let rowid_len = varint_len(rowid_u64);
-            let payload_len = rowid_len + record_bytes.len();
-            write_varint_to_vec(payload_len as u64, buffer);
-            write_varint_to_vec(rowid_u64, buffer);
-            buffer.extend_from_slice(record_bytes);
+            let payload_len = checked_log_buffer_len(rowid_len, record_bytes.len())?;
+            log_write!(
+                serializer,
+                [Varint(payload_len as u64), Varint(rowid_u64), record_bytes]
+            )?;
         }
         (&RowKey::Int(rowid), true) => {
-            write_header(buffer, OP_DELETE_TABLE);
+            log_write!(
+                serializer,
+                [OP_DELETE_TABLE, flags, table_id_i32.to_le_bytes()]
+            )?;
             let rowid_u64 = rowid as u64;
             let rowid_len = varint_len(rowid_u64);
-            write_varint_to_vec(rowid_len as u64, buffer);
-            write_varint_to_vec(rowid_u64, buffer);
+            log_write!(serializer, [Varint(rowid_len as u64), Varint(rowid_u64)])?;
         }
         (RowKey::Record(_), is_delete) => {
-            write_header(
-                buffer,
-                if is_delete {
-                    OP_DELETE_INDEX
-                } else {
-                    OP_UPSERT_INDEX
-                },
-            );
+            log_write!(
+                serializer,
+                [
+                    if is_delete {
+                        OP_DELETE_INDEX
+                    } else {
+                        OP_UPSERT_INDEX
+                    },
+                    flags,
+                    table_id_i32.to_le_bytes(),
+                ]
+            )?;
             let key_bytes = row_version.row.payload();
-            write_varint_to_vec(key_bytes.len() as u64, buffer);
-            buffer.extend_from_slice(key_bytes);
+            log_write!(serializer, [Varint(key_bytes.len() as u64), key_bytes])?;
         }
     }
 
     if let Some(portable_extension) =
         portable_extension.filter(|portable_extension| !portable_extension.is_empty())
     {
-        write_varint_to_vec(portable_extension.len() as u64, buffer);
-        buffer.extend_from_slice(portable_extension);
+        log_write!(
+            serializer,
+            [Varint(portable_extension.len() as u64), portable_extension]
+        )?;
     }
 
     Ok(())
 }
 
-pub(crate) fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
+pub(crate) fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) -> Result<()> {
     // Header op uses tag-only addressing (table_id=0, flags=0) and fixed payload length.
-    buffer.push(OP_UPDATE_HEADER);
-    buffer.push(0);
-    buffer.extend_from_slice(&0i32.to_le_bytes());
-    write_varint_to_vec(DatabaseHeader::SIZE as u64, buffer);
-    buffer.extend_from_slice(bytemuck::bytes_of(header));
+    let mut serializer = LogBufferSerializer::new(buffer);
+    log_write!(
+        serializer,
+        [
+            OP_UPDATE_HEADER,
+            0,
+            0i32.to_le_bytes(),
+            Varint(DatabaseHeader::SIZE as u64),
+            bytemuck::bytes_of(header),
+        ]
+    )
 }
 
 fn write_proto_varint(mut value: u64, buffer: &mut Vec<u8>) {
@@ -6826,7 +6967,7 @@ mod tests {
         let mut header = DatabaseHeader::default();
         header.database_size = 123.into();
         header.schema_cookie = 456.into();
-        serialize_header_entry(&mut header_buf, &header);
+        serialize_header_entry(&mut header_buf, &header).unwrap();
 
         let filler_payload_size = ENCRYPTED_PAYLOAD_CHUNK_SIZE - (header_buf.len() - 1);
         let filler_len = text_len_for_single_upsert_table_op_size(filler_payload_size);
