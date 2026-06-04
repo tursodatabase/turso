@@ -3,6 +3,10 @@ use crate::assert::assert_send_sync;
 use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
 use crate::io::WriteBatch;
+#[cfg(any(test, injected_yields))]
+use crate::mvcc::yield_hooks::{maybe_inject_io_yield, YieldPointMarker};
+#[cfg(any(test, injected_yields))]
+use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
 use crate::storage::wal::{CheckpointLockSource, PreparedFrames};
@@ -1383,6 +1387,8 @@ pub struct Pager {
     /// Only stored on Apple platforms; on others, always returns Fsync.
     #[cfg(target_vendor = "apple")]
     sync_type: AtomicFileSyncType,
+    #[cfg(any(test, injected_yields))]
+    yield_injector: RwLock<Option<Arc<dyn YieldInjector>>>,
 }
 
 assert_send_sync!(Pager);
@@ -1485,8 +1491,37 @@ enum AllocatePage1State {
 #[derive(Debug, Clone)]
 enum FreePageState {
     Start,
-    AddToTrunk { page: Arc<Page> },
-    NewTrunk { page: Arc<Page> },
+    AddToTrunk { page: Arc<Page>, page_id: usize },
+    NewTrunk { page: Arc<Page>, page_id: usize },
+}
+
+#[cfg(any(test, injected_yields))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
+#[repr(u8)]
+pub enum PagerYieldPoint {
+    FreePageStateQueued,
+    AllocatePageStateQueued,
+}
+
+#[cfg(any(test, injected_yields))]
+impl PagerYieldPoint {
+    pub const FREE_PAGE_STATE_QUEUED: YieldPoint = YieldPoint {
+        ordinal: Self::FreePageStateQueued as u8,
+        point_count: <Self as strum::EnumCount>::COUNT as u8,
+    };
+    pub const ALLOCATE_PAGE_STATE_QUEUED: YieldPoint = YieldPoint {
+        ordinal: Self::AllocatePageStateQueued as u8,
+        point_count: <Self as strum::EnumCount>::COUNT as u8,
+    };
+}
+
+#[cfg(any(test, injected_yields))]
+impl YieldPointMarker for PagerYieldPoint {
+    const POINT_COUNT: u8 = <Self as strum::EnumCount>::COUNT as u8;
+
+    fn ordinal(self) -> u8 {
+        self as u8
+    }
 }
 
 /// State machine for async cache spilling.
@@ -1623,7 +1658,36 @@ impl Pager {
             init_page_1,
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
+            #[cfg(any(test, injected_yields))]
+            yield_injector: RwLock::new(None),
         })
+    }
+
+    #[cfg(any(test, injected_yields))]
+    pub fn set_yield_injector(&self, injector: Option<Arc<dyn YieldInjector>>) {
+        *self.yield_injector.write() = injector;
+    }
+
+    #[cfg(any(test, injected_yields))]
+    fn maybe_yield_free_page(&self, page_id: usize) -> Option<IOResult<()>> {
+        let injector = self.yield_injector.read().clone();
+        maybe_inject_io_yield(
+            injector.as_ref(),
+            0,
+            page_id as u64,
+            PagerYieldPoint::FreePageStateQueued,
+        )
+    }
+
+    #[cfg(any(test, injected_yields))]
+    fn maybe_yield_allocate_page(&self, page_id: usize) -> Option<IOResult<PageRef>> {
+        let injector = self.yield_injector.read().clone();
+        maybe_inject_io_yield(
+            injector.as_ref(),
+            0,
+            page_id as u64,
+            PagerYieldPoint::AllocatePageStateQueued,
+        )
     }
 
     /// Get the sync type setting.
@@ -2045,6 +2109,8 @@ impl Pager {
         savepoint: &SavepointSnapshot,
         journal_end_offset: u64,
     ) -> Result<()> {
+        self.reset_internal_states();
+
         let subjournal = self.subjournal.read();
         let Some(subjournal) = subjournal.as_ref() else {
             return Ok(());
@@ -4646,16 +4712,18 @@ impl Pager {
         }
     }
 
-    /// Invalidates entire page cache by removing all dirty and clean pages. Usually used in case
-    /// of a rollback or in case we want to invalidate page cache after starting a read transaction
-    /// right after new writes happened which would invalidate current page cache.
+    /// Invalidates cached pages. Rollback paths pass `clear_dirty=true` to
+    /// discard uncommitted writes; snapshot refresh paths pass `false` and must
+    /// preserve dirty pages owned by an active writer on the shared pager.
     pub fn clear_page_cache(&self, clear_dirty: bool) {
         let dirty_pages = self.dirty_pages.write();
         let mut cache = self.page_cache.write();
-        for page_id in dirty_pages.iter() {
-            let page_key = PageCacheKey::new(page_id as usize);
-            if let Some(page) = cache.get(&page_key).unwrap_or(None) {
-                page.clear_dirty();
+        if clear_dirty {
+            for page_id in dirty_pages.iter() {
+                let page_key = PageCacheKey::new(page_id as usize);
+                if let Some(page) = cache.get(&page_key).unwrap_or(None) {
+                    page.clear_dirty();
+                }
             }
         }
         cache
@@ -4782,25 +4850,36 @@ impl Pager {
                         }
                         None => return_if_io!(self.read_page(page_id as i64)),
                     };
-                    header.freelist_pages = (header.freelist_pages.get() + 1).into();
-
                     let trunk_page_id = header.freelist_trunk_page.get();
 
                     // Pin page to prevent eviction while stored in state machine
                     page.pin();
 
                     if trunk_page_id != 0 {
-                        *state = FreePageState::AddToTrunk { page };
+                        *state = FreePageState::AddToTrunk { page, page_id };
                     } else {
-                        *state = FreePageState::NewTrunk { page };
+                        *state = FreePageState::NewTrunk { page, page_id };
                     }
                     if let Some(c) = c {
                         if !c.succeeded() {
                             io_yield_one!(c);
                         }
                     }
+                    #[cfg(any(test, injected_yields))]
+                    if let Some(result) = self.maybe_yield_free_page(page_id) {
+                        return Ok(result);
+                    }
                 }
-                FreePageState::AddToTrunk { page } => {
+                FreePageState::AddToTrunk {
+                    page,
+                    page_id: pending_page_id,
+                } => {
+                    turso_assert_eq!(
+                        page.get().id,
+                        *pending_page_id,
+                        "free_page pending page id mismatch",
+                        { "expected": *pending_page_id, "actual": page.get().id }
+                    );
                     let trunk_page_id = header.freelist_trunk_page.get();
                     // Spill yield here keeps `state` at `AddToTrunk`. The
                     // subsequent writes / `unpin()` only run after we have
@@ -4837,20 +4916,27 @@ impl Pager {
                         trunk_page_contents.write_u32_no_offset(
                             FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR
                                 + (number_of_leaf_pages as usize * FREELIST_LEAF_PTR_SIZE),
-                            page_id as u32,
+                            *pending_page_id as u32,
                         );
+                        header.freelist_pages = (header.freelist_pages.get() + 1).into();
 
                         // Unpin page before finishing - it's added to freelist
                         page.unpin();
                         break;
                     }
                     // page remains pinned as it transitions to NewTrunk state
-                    *state = FreePageState::NewTrunk { page: page.clone() };
+                    *state = FreePageState::NewTrunk {
+                        page: page.clone(),
+                        page_id: *pending_page_id,
+                    };
                 }
-                FreePageState::NewTrunk { page } => {
+                FreePageState::NewTrunk {
+                    page,
+                    page_id: pending_page_id,
+                } => {
                     turso_assert!(page.is_loaded(), "page should be loaded");
                     // If we get here, need to make this page a new trunk
-                    turso_assert!(page.get().id == page_id, "page has unexpected id");
+                    turso_assert!(page.get().id == *pending_page_id, "page has unexpected id");
                     self.add_dirty(page)?;
 
                     let trunk_page_id = header.freelist_trunk_page.get();
@@ -4862,7 +4948,8 @@ impl Pager {
                     // Zero leaf count
                     contents.write_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT, 0);
                     // Update page 1 to point to new trunk
-                    header.freelist_trunk_page = (page_id as u32).into();
+                    header.freelist_trunk_page = (*pending_page_id as u32).into();
+                    header.freelist_pages = (header.freelist_pages.get() + 1).into();
                     // Unpin page before finishing - it's now a trunk page
                     page.unpin();
                     break;
@@ -5076,6 +5163,12 @@ impl Pager {
                         };
                         if let Some(c) = c {
                             io_yield_one!(c);
+                        }
+                        #[cfg(any(test, injected_yields))]
+                        if let Some(result) =
+                            self.maybe_yield_allocate_page(next_leaf_page_id as usize)
+                        {
+                            return Ok(result);
                         }
                         continue;
                     }
@@ -5292,12 +5385,12 @@ impl Pager {
         }
     }
 
-    fn reset_internal_states(&self) {
+    pub(crate) fn reset_internal_states(&self) {
         *self.checkpoint_state.write() = CheckpointState::default();
         self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.write().reset();
-        *self.allocate_page_state.write() = AllocatePageState::Start;
-        *self.free_page_state.write() = FreePageState::Start;
+        self.reset_allocate_page_state();
+        self.reset_free_page_state();
         *self.spill_state.write() = SpillState::Idle;
         #[cfg(not(feature = "omit_autovacuum"))]
         {
@@ -5308,6 +5401,40 @@ impl Pager {
         }
 
         *self.header_ref_state.write() = HeaderRefState::Start;
+    }
+
+    fn reset_allocate_page_state(&self) {
+        let state = {
+            let mut state = self.allocate_page_state.write();
+            std::mem::replace(&mut *state, AllocatePageState::Start)
+        };
+        match state {
+            AllocatePageState::SearchAvailableFreeListLeaf { trunk_page } => {
+                trunk_page.unpin();
+            }
+            AllocatePageState::ReuseFreelistLeaf {
+                trunk_page,
+                leaf_page,
+                ..
+            } => {
+                trunk_page.unpin();
+                leaf_page.unpin();
+            }
+            AllocatePageState::Start | AllocatePageState::AllocateNewPage { .. } => {}
+        }
+    }
+
+    fn reset_free_page_state(&self) {
+        let state = {
+            let mut state = self.free_page_state.write();
+            std::mem::replace(&mut *state, FreePageState::Start)
+        };
+        match state {
+            FreePageState::AddToTrunk { page, .. } | FreePageState::NewTrunk { page, .. } => {
+                page.unpin();
+            }
+            FreePageState::Start => {}
+        }
     }
 
     pub fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> Result<IOResult<T>> {
@@ -5639,13 +5766,17 @@ pub(crate) mod ptrmap {
 
 #[cfg(test)]
 mod tests {
-    use crate::sync::Arc;
+    use crate::sync::{Arc, Mutex};
 
     use crate::sync::RwLock;
+    use arc_swap::ArcSwapOption;
 
+    use crate::io::{MemoryIO, OpenFlags, IO};
+    use crate::storage::buffer_pool::BufferPool;
+    use crate::storage::database::{DatabaseFile, DatabaseStorage};
     use crate::storage::page_cache::{PageCache, PageCacheKey};
 
-    use super::Page;
+    use super::{default_page1, Page, Pager};
 
     #[test]
     fn test_shared_cache() {
@@ -5668,6 +5799,50 @@ mod tests {
         let page_key = PageCacheKey::new(1);
         let page = cache.get(&page_key).unwrap();
         assert_eq!(page.unwrap().get().id, 1);
+    }
+
+    #[test]
+    fn clear_page_cache_without_dirty_clear_preserves_dirty_pages() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(
+            io.open_file("cache-preserve-dirty.db", OpenFlags::Create, true)
+                .unwrap(),
+        ));
+        let pager = Pager::new(
+            db_file,
+            None,
+            io.clone(),
+            PageCache::new(10),
+            BufferPool::begin_init(&io, 65536),
+            Arc::new(Mutex::new(())),
+            Arc::new(ArcSwapOption::new(Some(default_page1(None)))),
+        )
+        .unwrap();
+
+        let clean_page = Arc::new(Page::new(2));
+        clean_page.set_loaded();
+        let dirty_page = Arc::new(Page::new(3));
+        dirty_page.set_loaded();
+        dirty_page.set_dirty();
+        {
+            let mut cache = pager.page_cache.write();
+            cache.insert(PageCacheKey::new(2), clean_page).unwrap();
+            cache
+                .insert(PageCacheKey::new(3), dirty_page.clone())
+                .unwrap();
+            cache.notify_page_dirty(PageCacheKey::new(3));
+        }
+        pager.dirty_pages.write().insert(3);
+
+        pager.clear_page_cache(false);
+
+        let mut cache = pager.page_cache.write();
+        assert!(cache.get(&PageCacheKey::new(2)).unwrap().is_none());
+        let cached_dirty = cache.get(&PageCacheKey::new(3)).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&cached_dirty, &dirty_page));
+        assert!(cached_dirty.is_dirty());
+        assert!(cached_dirty.is_loaded());
+        assert!(pager.dirty_pages.read().contains(3));
     }
 }
 
