@@ -11493,7 +11493,7 @@ fn collect_mvcc_portable_change_bytes(conn: &Arc<Connection>) -> Vec<u8> {
     reader.read_header(&io).unwrap();
 
     let mut portable_changes = Vec::new();
-    while let Some(frame) = reader.next_portable_changes(&io).unwrap() {
+    while let Some(frame) = io.block(|| reader.next_portable_changes()).unwrap() {
         portable_changes.extend_from_slice(&frame.payload);
     }
     portable_changes
@@ -11515,7 +11515,7 @@ fn collect_mvcc_portable_change_bytes_with_encryption(
     reader.read_header(&io).unwrap();
 
     let mut portable_changes = Vec::new();
-    while let Some(frame) = reader.next_portable_changes(&io).unwrap() {
+    while let Some(frame) = io.block(|| reader.next_portable_changes()).unwrap() {
         portable_changes.extend_from_slice(&frame.payload);
     }
     portable_changes
