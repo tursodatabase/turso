@@ -666,7 +666,7 @@ fn check_update_from_column_ambiguity(
             _ => continue,
         };
         for using_col in using {
-            let col_name = normalize_ident(using_col.as_str());
+            let col_name = normalize_ident(using_col.name.as_str());
 
             // Count how many *other* tables expose this column without it
             // being covered by their own USING clause.
@@ -688,14 +688,14 @@ fn check_update_from_column_ambiguity(
                 let already_deduped = other.join_info.as_ref().is_some_and(|info| {
                     info.using
                         .iter()
-                        .any(|u| u.as_str().eq_ignore_ascii_case(&col_name))
+                        .any(|u| u.name.as_str().eq_ignore_ascii_case(&col_name))
                 });
                 if !already_deduped {
                     found_count += 1;
                 }
             }
             if found_count > 1 {
-                bail_parse_error!("ambiguous column name: {}", using_col.as_str());
+                bail_parse_error!("ambiguous column name: {}", using_col.name.as_str());
             }
         }
     }

@@ -1,5 +1,5 @@
 use crate::{
-    alloc::{self, TursoIteratorExt},
+    alloc,
     function::{AggFunc, WindowFunc},
     schema::{
         BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table, Type, ROWID_SENTINEL,
@@ -964,7 +964,7 @@ pub fn select_star(
                 .iter()
                 .filter(|t| t.identifier == table.identifier)
                 .filter_map(|t| t.join_info.as_ref())
-                .flat_map(|ji| ji.using.iter().map(|u| u.as_str()))
+                .flat_map(|ji| ji.using.iter().map(|u| u.name.as_str()))
                 .collect();
             for col in table.columns().iter().filter(|c| !c.hidden()) {
                 if let Some(col_name) = &col.name {
@@ -990,9 +990,9 @@ pub fn select_star(
                     // that are also present in the USING clause.
                     if let Some(join_info) = &table.join_info {
                         !join_info.using.iter().any(|using_col| {
-                            col.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(using_col.as_str()))
+                            col.name.as_ref().is_some_and(|name| {
+                                name.eq_ignore_ascii_case(using_col.name.as_str())
+                            })
                         })
                     } else {
                         true
@@ -1039,13 +1039,37 @@ pub enum JoinType {
     Anti,
 }
 
+/// One column listed in a join's `USING(...)` clause (NATURAL JOINs are
+/// rewritten into this form). Name-keyed because at join-construction time we
+/// still have the syntactic column name from the AST.
+#[derive(Debug, Clone)]
+pub struct UsingJoinColumn {
+    /// The deduplicated column name.
+    pub name: ast::Name,
+    /// Left-side table that provides the kept canonical value.
+    pub left_source: TableInternalId,
+}
+
+/// A USING/NATURAL-deduplicated column on a specific table reference, paired
+/// with the left-side source that owns its canonical value. Index-keyed
+/// because outer-scope binding resolves by table-local `col_idx` rather than
+/// by name. Used at column resolution time to (a) detect that `<tbl>.<col>`
+/// on this ref is hidden by dedup, and (b) verify that a duplicate match is
+/// being merged into the correct previously-resolved reference.
+#[derive(Debug, Clone, Copy)]
+pub struct UsingHiddenColumn {
+    pub col_idx: usize,
+    pub left_source: TableInternalId,
+}
+
 /// Join information for a table reference.
 #[derive(Debug, Clone)]
 pub struct JoinInfo {
     /// The type of join.
     pub join_type: JoinType,
-    /// The USING clause for the join, if any. NATURAL JOIN is transformed into USING (col1, col2, ...).
-    pub using: Vec<ast::Name>,
+    /// The USING clause for the join, if any. NATURAL JOIN is transformed into
+    /// USING (col1, col2, ...), and each term tracks its canonical left source.
+    pub using: Vec<UsingJoinColumn>,
     /// When true, the optimizer must not reorder this table relative to its
     /// neighbors. Set for CROSS JOIN to match SQLite semantics.
     pub no_reorder: bool,
@@ -1081,6 +1105,15 @@ impl JoinInfo {
     pub fn is_ordering_constrained(&self) -> bool {
         self.is_outer() || self.is_semi_or_anti() || self.no_reorder
     }
+
+    /// Returns the left-side source table for a USING/NATURAL-deduplicated
+    /// column name, if this join records one.
+    pub fn using_left_source_for(&self, col_name: &str) -> Option<TableInternalId> {
+        self.using
+            .iter()
+            .find(|using_col| using_col.name.as_str().eq_ignore_ascii_case(col_name))
+            .map(|using_col| using_col.left_source)
+    }
 }
 
 /// A joined table in the query plan.
@@ -1092,7 +1125,8 @@ impl JoinInfo {
 /// - all have [Operation::Scan]
 /// - identifiers are `t`, `p`, `sub`
 /// - `t` and `p` are [Table::BTree] while `sub` is [Table::FromClauseSubquery]
-/// - join_info is None for the first table reference, and Some(JoinInfo { join_type: JoinType::Inner, using: vec![] }) for the second and third table references
+/// - join_info is None for the first table reference and Some(JoinInfo { .. })
+///   for the second and third table references
 #[derive(Debug, Clone)]
 pub struct JoinedTable {
     /// The operation that this table reference performs.
@@ -1129,25 +1163,28 @@ pub struct JoinedTable {
 }
 
 impl JoinedTable {
-    pub fn using_dedup_hidden_cols(&self) -> Result<ColumnMask> {
+    /// Returns one [UsingHiddenColumn] for each USING/NATURAL-deduplicated
+    /// column on this table — pairing the table-local column index with the
+    /// left-side source that owns the canonical value.
+    pub fn using_hidden_columns(&self) -> Vec<UsingHiddenColumn> {
         let Some(join_info) = self.join_info.as_ref() else {
-            return Ok(ColumnMask::default());
+            return vec![];
         };
-        let col_mask = self
-            .table
-            .columns()
+        join_info
+            .using
             .iter()
-            .enumerate()
-            .filter_map(|(idx, col)| {
-                let col_name = col.name.as_deref()?;
-                join_info
-                    .using
-                    .iter()
-                    .any(|using_col| using_col.as_str().eq_ignore_ascii_case(col_name))
-                    .then_some(idx)
+            .filter_map(|using_col| {
+                let col_idx = self.table.columns().iter().position(|col| {
+                    col.name
+                        .as_ref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(using_col.name.as_str()))
+                })?;
+                Some(UsingHiddenColumn {
+                    col_idx,
+                    left_source: using_col.left_source,
+                })
             })
-            .try_collect()?;
-        Ok(col_mask)
+            .collect()
     }
 }
 
@@ -1159,8 +1196,9 @@ pub struct OuterQueryReference {
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
-    /// Columns hidden by USING/NATURAL deduplication in the outer scope.
-    pub using_dedup_hidden_cols: ColumnMask,
+    /// Columns hidden by USING/NATURAL deduplication in the outer scope,
+    /// each paired with the left-side source that owns the canonical value.
+    pub using_hidden_columns: Vec<UsingHiddenColumn>,
     /// Bitmask of columns that are referenced in the query.
     /// Used to track dependencies, so that it can be resolved
     /// when a WHERE clause subquery should be evaluated;
@@ -1207,6 +1245,22 @@ impl OuterQueryReference {
     /// This is used primarily to determine at what loop depth a subquery should be evaluated.
     pub fn is_used(&self) -> bool {
         !self.col_used_mask.is_empty() || self.rowid_referenced
+    }
+
+    /// Returns the left-side source table for a USING/NATURAL-deduplicated
+    /// column index on this outer reference, if one exists.
+    pub fn using_left_source_for_col_idx(&self, col_idx: usize) -> Option<TableInternalId> {
+        self.using_hidden_columns
+            .iter()
+            .find(|entry| entry.col_idx == col_idx)
+            .map(|entry| entry.left_source)
+    }
+
+    /// Whether the given column index is hidden by USING/NATURAL dedup.
+    pub fn is_using_hidden(&self, col_idx: usize) -> bool {
+        self.using_hidden_columns
+            .iter()
+            .any(|entry| entry.col_idx == col_idx)
     }
 }
 

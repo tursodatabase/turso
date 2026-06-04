@@ -125,7 +125,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 // and the left table is used.
                                 if let Some(join_info) = &joined_table.join_info {
                                     if join_info.using.iter().any(|using_col| {
-                                        using_col.as_str().eq_ignore_ascii_case(&normalized_id)
+                                        using_col.name.as_str().eq_ignore_ascii_case(&normalized_id)
                                     }) {
                                         ok = true;
                                     }
@@ -195,7 +195,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             });
                             if col_idx.is_some() {
                                 let col_idx = col_idx.unwrap();
-                                if outer_ref.using_dedup_hidden_cols.get(col_idx) {
+                                if outer_ref.is_using_hidden(col_idx) {
                                     continue;
                                 }
                                 if match_result.is_some() {
@@ -304,15 +304,16 @@ pub fn bind_and_rewrite_expr<'a>(
 
                         // Multiple FROM tables share this identifier and both contain `id`.
                         // For column matches, a USING/NATURAL join on `id` lets the first
-                        // match stand (the duplicate side is implicitly merged). Rowid
-                        // matches never get this exception (rowid isn't a USING column).
-                        if resolved.is_some() {
+                        // match stand (the duplicate side is implicitly merged) — but only
+                        // when this join's USING actually dedupes against the previously
+                        // resolved reference. Rowid matches never get this exception (rowid
+                        // isn't a USING column).
+                        if let Some((resolved_table_id, _)) = resolved {
                             let allowed_by_using =
                                 matches!(candidate, QualifiedMatch::Column { .. })
                                     && joined_table.join_info.as_ref().is_some_and(|ji| {
-                                        ji.using.iter().any(|u| {
-                                            u.as_str().eq_ignore_ascii_case(&normalized_id)
-                                        })
+                                        ji.using_left_source_for(&normalized_id)
+                                            == Some(resolved_table_id)
                                     });
                             if !allowed_by_using {
                                 return Err(ambiguous());
@@ -365,13 +366,16 @@ pub fn bind_and_rewrite_expr<'a>(
                                 // When multiple outer refs share this identifier
                                 // (e.g. self-join `t1 JOIN t1 USING(a)`), a USING-hidden
                                 // column on the duplicate side lets the first match stand,
-                                // mirroring the Stage 1 logic for local-scope tables.
-                                if resolved.is_some() {
-                                    let allowed_by_using = matches!(
-                                        candidate,
-                                        QualifiedMatch::Column { col_idx, .. }
-                                            if outer_ref.using_dedup_hidden_cols.get(col_idx)
-                                    );
+                                // but only when that duplicate is hidden against the same
+                                // previously resolved left-source table.
+                                if let Some((resolved_table_id, _)) = resolved {
+                                    let allowed_by_using =
+                                        if let QualifiedMatch::Column { col_idx, .. } = candidate {
+                                            outer_ref.using_left_source_for_col_idx(col_idx)
+                                                == Some(resolved_table_id)
+                                        } else {
+                                            false
+                                        };
                                     if !allowed_by_using {
                                         return Err(ambiguous());
                                     }
