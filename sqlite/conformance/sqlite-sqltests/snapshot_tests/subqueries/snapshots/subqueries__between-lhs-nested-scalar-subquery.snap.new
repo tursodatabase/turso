@@ -1,0 +1,73 @@
+---
+source: subqueries.sqltest
+expression: SELECT id FROM products WHERE ((SELECT max(id) FROM products) + 1) BETWEEN 2 AND 4;
+info:
+  statement_type: SELECT
+  tables:
+  - products
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCALAR SUBQUERY 1
+|  `--SCAN products
+|--SCALAR SUBQUERY 2
+|  `--SCAN products
+`--SCAN products
+
+BYTECODE
+addr  opcode           p1  p2  p3  p4              p5  comment
+   0      Init          0  47   0                   0  Start at 47
+   1      Once         18   0   0                   0  goto 18
+   2      BeginSubrtn   3   0   0                   0  r[3]=NULL
+   3      Null          0   1   0                   0  r[1]=NULL
+   4      Null          0   5   0                   0  r[5]=NULL
+   5      Integer       1   6   0                   0  r[6]=1; LIMIT counter
+   6      IfNot         6  14   0                   0  if !r[6] goto 14
+   7      OpenRead      0   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+   8      Last          0  14   0                   0
+   9        RowId       0   7   0                   0  r[7]=products.rowid
+  10        CollSeq     0   0   0  Binary           0  collation=Binary
+  11        AggStep     0   7   5  max              0  accum=r[5] step(r[7])
+  12        Goto        0  14   0                   0
+  13      Prev          0   9   0                   0
+  14      AggFinal      0   5   0  max              0  accum=r[5]
+  15      Copy          5   4   0                   0  r[4]=r[5]
+  16      Copy          4   1   0                   0  r[1]=r[4]
+  17    Return          3   0   1                   0
+  18    Once           35   0   0                   0  goto 35
+  19    BeginSubrtn     8   0   0                   0  r[8]=NULL
+  20    Null            0   2   0                   0  r[2]=NULL
+  21    Null            0  10   0                   0  r[10]=NULL
+  22    Integer         1  11   0                   0  r[11]=1; LIMIT counter
+  23    IfNot          11  31   0                   0  if !r[11] goto 31
+  24    OpenRead        1   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  25    Last            1  31   0                   0
+  26      RowId         1  12   0                   0  r[12]=products.rowid
+  27      CollSeq       0   0   0  Binary           0  collation=Binary
+  28      AggStep       0  12  10  max              0  accum=r[10] step(r[12])
+  29      Goto          0  31   0                   0
+  30    Prev            1  26   0                   0
+  31    AggFinal        0  10   0  max              0  accum=r[10]
+  32    Copy           10   9   0                   0  r[9]=r[10]
+  33    Copy            9   2   0                   0  r[2]=r[9]
+  34  Return            8   0   1                   0
+  35  OpenRead          2   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  36  Copy              1  17   0                   0  r[17]=r[1]
+  37  Add              17  18  16                   0  r[16]=r[17]+r[18]
+  38  Gt               15  16  46                   0  if r[15]>r[16] goto 46
+  39  Copy              2  22   0                   0  r[22]=r[2]
+  40  Add              22  23  20                   0  r[20]=r[22]+r[23]
+  41  Gt               20  21  46                   0  if r[20]>r[21] goto 46
+  42  Rewind            2  46   0                   0  Rewind table products
+  43    RowId           2  13   0                   0  r[13]=products.rowid
+  44    ResultRow      13   1   0                   0  output=r[13]
+  45  Next              2  43   0                   0
+  46  Halt              0   0   0                   0
+  47  Transaction       0   1  11                   0  iDb=0 tx_mode=Read
+  48  Integer           2  15   0                   0  r[15]=2
+  49  Integer           1  18   0                   0  r[18]=1
+  50  Integer           1  23   0                   0  r[23]=1
+  51  Integer           4  21   0                   0  r[21]=4
+  52  Goto              0   1   0                   0
