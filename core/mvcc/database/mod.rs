@@ -60,7 +60,7 @@ pub use checkpoint_state_machine::{
 
 #[cfg(feature = "conn_raw_api")]
 use super::persistent_storage::logical_log::{
-    encode_delete_portable_extension, parse_ops_from_plaintext, LOG_RECORD_PREFIX_SIZE,
+    parse_ops_from_plaintext, LogSerializer, LOG_RECORD_PREFIX_SIZE,
 };
 use super::persistent_storage::logical_log::{
     HeaderReadResult, IndexOpKind, ParsedOp, StreamingLogicalLogReader, StreamingResult,
@@ -437,12 +437,9 @@ impl LogRecord {
     /// Test-only: append one row-version op to the payload buffer.
     #[cfg(test)]
     pub(crate) fn push_row_version_for_test(&mut self, row_version: &RowVersion) {
-        crate::mvcc::persistent_storage::logical_log::serialize_op_entry(
-            &mut self.buf,
-            row_version,
-            None,
-        )
-        .expect("failed to serialize row version in test");
+        crate::mvcc::persistent_storage::logical_log::LogSerializer::new(&mut self.buf)
+            .serialize_op_entry(row_version, None)
+            .expect("failed to serialize row version in test");
         self.op_count += 1;
     }
 
@@ -450,7 +447,8 @@ impl LogRecord {
     #[cfg(test)]
     pub(crate) fn set_header_for_test(&mut self, header: &DatabaseHeader) {
         assert!(!self.has_header, "header op appended twice in test");
-        crate::mvcc::persistent_storage::logical_log::serialize_header_entry(&mut self.buf, header)
+        crate::mvcc::persistent_storage::logical_log::LogSerializer::new(&mut self.buf)
+            .serialize_header_entry(header)
             .expect("failed to serialize database header in test");
         self.has_header = true;
         self.op_count += 1;
@@ -525,8 +523,11 @@ fn portable_delete_op_extension_for_row_version<Clock: LogicalClock>(
     };
 
     if row_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-        let extension =
-            encode_delete_portable_extension(Some(row_version.row.payload()), None, Some(rowid))?;
+        let extension = LogSerializer::encode_delete_portable_extension(
+            Some(row_version.row.payload()),
+            None,
+            Some(rowid),
+        )?;
         return Ok((!extension.is_empty()).then_some(extension));
     }
 
@@ -577,7 +578,8 @@ fn portable_delete_op_extension_for_row_version<Clock: LogicalClock>(
     } else {
         ImmutableRecord::from_values(&pk_values, pk_values.len())?.into_payload()
     };
-    let extension = encode_delete_portable_extension(None, Some(&pk_record), Some(rowid))?;
+    let extension =
+        LogSerializer::encode_delete_portable_extension(None, Some(&pk_record), Some(rowid))?;
     Ok((!extension.is_empty()).then_some(extension))
 }
 
