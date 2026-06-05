@@ -1,0 +1,65 @@
+@database :memory:
+
+# Text whose magnitude exceeds i64::MAX must coerce to REAL when used as a
+# number, matching SQLite's CAST/affinity semantics. Regression for
+# https://github.com/tursodatabase/turso/issues/7382 — the simulator's shadow
+# model parsed such literals as Integer(i64::MAX), which propagated to the
+# math/arithmetic codepaths that route Text through Numeric::from_value_strict.
+
+test ceil-text-overflow-i64 {
+    SELECT ceil('9223372036854776000'), typeof(ceil('9223372036854776000'));
+}
+expect {
+    9.22337203685478e+18|real
+}
+expect @js {
+    9223372036854776000|real
+}
+
+test floor-text-overflow-i64 {
+    SELECT floor('9223372036854776000'), typeof(floor('9223372036854776000'));
+}
+expect {
+    9.22337203685478e+18|real
+}
+expect @js {
+    9223372036854776000|real
+}
+
+test trunc-text-overflow-i64 {
+    SELECT trunc('9223372036854776000'), typeof(trunc('9223372036854776000'));
+}
+expect {
+    9.22337203685478e+18|real
+}
+expect @js {
+    9223372036854776000|real
+}
+
+test add-text-overflow-i64 {
+    SELECT '9223372036854776000' + 0, typeof('9223372036854776000' + 0);
+}
+expect {
+    9.22337203685478e+18|real
+}
+expect @js {
+    9223372036854776000|real
+}
+
+test mul-text-overflow-i64 {
+    SELECT '9223372036854776000' * 1, typeof('9223372036854776000' * 1);
+}
+expect {
+    9.22337203685478e+18|real
+}
+expect @js {
+    9223372036854776000|real
+}
+
+# Boundary: i64::MAX itself fits exactly in i64 and must stay INTEGER.
+test ceil-text-i64-max-stays-integer {
+    SELECT ceil('9223372036854775807'), typeof(ceil('9223372036854775807'));
+}
+expect {
+    9223372036854775807|integer
+}
