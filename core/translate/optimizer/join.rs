@@ -1665,33 +1665,9 @@ impl IndexedSeekBenefit {
 
 /// Compute directed indexed-seek benefits for single-table starting choices.
 ///
-/// Returns a vector of multipliers for each candidate starting table.
-/// A lower multiplier indicates a better starting choice.
-///
-/// ### Approach
-///
 /// A table enables a seek on another when its presence in the join prefix allows
-/// the second table to use an indexed seek instead of a scan. This function
-/// estimates these benefits by inspecting index candidates and their dependencies.
-///
-/// ### Algorithm
-///
-/// 1.  For each table, identify its potential index lookups.
-/// 2.  Constant Seek Benefits: Identify lookups that require no prior tables
-///     (e.g., WHERE col = 42). These benefit every starting table except the
-///     table being filtered itself.
-/// 3.  Specific Predecessors: Identify lookups that require exactly one specific
-///     table to be joined first (e.g., WHERE rhs.col = lhs.col).
-/// 4.  Aggregation: Combine these benefits. For each candidate starting
-///     table, its multiplier is derived from the sum of specific benefits it provides
-///     plus the total constant benefits provided by all other tables in the query.
-///
-/// ### Complexity
-///
-/// - Time: O(C + T), where C is the total number of constraint
-///   references scanned across all index candidates, including usable-prefix
-///   row-estimation work, and T is the number of tables.
-/// - Space: O(T) to store the benefits for each candidate table.
+/// the second table to use an indexed seek instead of a scan. The returned
+/// multiplier is lower for better starting choices.
 fn compute_indexed_seek_benefits(
     num_tables: usize,
     joined_tables: &[JoinedTable],
@@ -1705,85 +1681,90 @@ fn compute_indexed_seek_benefits(
 
     let mut total_constant_score = 0.0;
     let mut constant_scores = vec![0.0; num_tables];
+    let empty_lhs_mask = TableMask::default();
 
     for rhs in 0..num_tables {
-        let deps = left_join_deps.get(&rhs).cloned().unwrap_or_default();
-        // If a table requires more than one prior table to be joined (e.g., in complex
-        // join dependencies), choosing a single starting table will not enable its
-        // indexed seek. Thus, it doesn't contribute to any single table's score.
-        if deps.count() > 1 {
-            continue;
-        }
+        let rhs_constraints = &constraints[rhs];
+        let rhs_table = &joined_tables[rhs];
+        let rhs_base_rows = base_table_rows[rhs];
 
-        if let Some(dep_t) = deps.iter().next() {
-            let mut mask = TableMask::default();
-            mask.set(dep_t)?;
-            let score = get_best_seek_score(
-                &constraints[rhs],
-                &mask,
-                rhs,
-                &joined_tables[rhs],
-                base_table_rows[rhs],
-                analyze_stats,
-                params,
-            );
-            if score > 0.0 {
-                benefits[dep_t].reward += score;
-                benefits[rhs].penalty += score;
+        if let Some(deps) = left_join_deps.get(&rhs) {
+            if deps.count() > 1 {
+                continue;
             }
-        } else {
-            let mut potential_predecessors = TableMask::default();
-            for candidate in &constraints[rhs].candidates {
-                for cref in &candidate.refs {
-                    // Only the first index column can be enabled for an index
-                    // seek by joining a single table first.
-                    if cref.index_col_pos > 0 {
-                        break;
-                    }
-                    let c = &constraints[rhs].constraints[cref.constraint_vec_pos];
-                    if c.lhs_mask.count() == 1 {
-                        if let Some(t) = c.lhs_mask.iter().next() {
-                            potential_predecessors.set(t)?;
-                        }
-                    }
-                }
-            }
-
-            let constant_score = get_best_seek_score(
-                &constraints[rhs],
-                &TableMask::default(),
-                rhs,
-                &joined_tables[rhs],
-                base_table_rows[rhs],
-                analyze_stats,
-                params,
-            );
-            if constant_score > 0.0 {
-                total_constant_score += constant_score;
-                constant_scores[rhs] = constant_score;
-                benefits[rhs].penalty += constant_score * (num_tables.saturating_sub(1)) as f64;
-            }
-
-            for t in potential_predecessors.iter() {
-                if t == rhs {
-                    continue;
-                }
-                let mut mask = TableMask::default();
-                mask.set(t)?;
-                let specific_score = get_best_seek_score(
-                    &constraints[rhs],
-                    &mask,
+            if let Some(dep_t) = deps.iter().next() {
+                let mut lhs_mask = TableMask::default();
+                lhs_mask.set(dep_t)?;
+                let score = get_best_seek_score(
+                    rhs_constraints,
+                    &lhs_mask,
                     rhs,
-                    &joined_tables[rhs],
-                    base_table_rows[rhs],
+                    rhs_table,
+                    rhs_base_rows,
                     analyze_stats,
                     params,
                 );
-                let delta = specific_score - constant_score;
-                if delta != 0.0 {
-                    benefits[t].reward += delta;
-                    benefits[rhs].penalty += delta;
+                if score > 0.0 {
+                    benefits[dep_t].reward += score;
+                    benefits[rhs].penalty += score;
                 }
+                continue;
+            }
+        }
+
+        let mut potential_predecessors = TableMask::default();
+        for candidate in &rhs_constraints.candidates {
+            for cref in &candidate.refs {
+                // Only the first index column can be enabled for an index
+                // seek by joining a single table first.
+                if cref.index_col_pos > 0 {
+                    break;
+                }
+                let c = &rhs_constraints.constraints[cref.constraint_vec_pos];
+                if c.lhs_mask.count() != 1 {
+                    continue;
+                }
+                let Some(t) = c.lhs_mask.iter().next() else {
+                    continue;
+                };
+                potential_predecessors.set(t)?;
+            }
+        }
+
+        let constant_score = get_best_seek_score(
+            rhs_constraints,
+            &empty_lhs_mask,
+            rhs,
+            rhs_table,
+            rhs_base_rows,
+            analyze_stats,
+            params,
+        );
+        if constant_score > 0.0 {
+            total_constant_score += constant_score;
+            constant_scores[rhs] = constant_score;
+            benefits[rhs].penalty += constant_score * (num_tables.saturating_sub(1)) as f64;
+        }
+
+        for t in potential_predecessors.iter() {
+            if t == rhs {
+                continue;
+            }
+            let mut lhs_mask = TableMask::default();
+            lhs_mask.set(t)?;
+            let specific_score = get_best_seek_score(
+                rhs_constraints,
+                &lhs_mask,
+                rhs,
+                rhs_table,
+                rhs_base_rows,
+                analyze_stats,
+                params,
+            );
+            let delta = specific_score - constant_score;
+            if delta != 0.0 {
+                benefits[t].reward += delta;
+                benefits[rhs].penalty += delta;
             }
         }
     }
@@ -1795,16 +1776,11 @@ fn compute_indexed_seek_benefits(
     Ok(benefits.into_iter().map(|b| b.multiplier()).collect())
 }
 
-/// Calculate the best "seek score" for a table given a set of already joined tables (lhs_mask).
+/// Estimate how much `lhs_mask` improves indexed access to `rhs`.
 ///
-/// A higher score indicates that joining the LHS tables enables a more efficient indexed seek
-/// for the RHS table. The score is based on estimated row reduction:
+/// Higher is better, based on estimated row reduction:
 ///
 /// `ln(base_rows / estimated_rows_per_seek)`
-///
-/// This reuses the normal access-path row estimator, so longer usable index prefixes,
-/// selectivity defaults, and ANALYZE stats affect the greedy starting-table heuristic
-/// in the same direction as regular seek costing.
 fn get_best_seek_score(
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
