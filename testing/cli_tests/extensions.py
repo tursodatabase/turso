@@ -724,62 +724,62 @@ def test_fuzzy():
     )
     turso.run_test_fn(
         "SELECT fuzzy_rsoundex();",
-        lambda res: "Invalid Argument" in res, 
+        lambda res: "Invalid Argument" in res,
         "fuzzy rsoundex function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_leven('awesome');",
-        lambda res: "Invalid Argument" in res, 
+        lambda res: "Invalid Argument" in res,
         "fuzzy levenshtein function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_damlev('awesome');",
-        lambda res: "Invalid Argument" in res, 
+        lambda res: "Invalid Argument" in res,
         "fuzzy damerau levenshtein1 function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_editdist('abc');",
-        lambda res: "Invalid Argument" in res, 
+        lambda res: "Invalid Argument" in res,
         "fuzzy editdist1 function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_jarowin('awesome');",
-        lambda res: "Invalid Argument" in res, 
+        lambda res: "Invalid Argument" in res,
         "fuzzy jarowin function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_osadist('awesome');",
-        lambda res: "Invalid Argument" in res, 
+        lambda res: "Invalid Argument" in res,
         "fuzzy osadist function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_phonetic();",
-        lambda res: "Invalid Argument" in res, 
+        lambda res: "Invalid Argument" in res,
         "fuzzy phonetic function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_caver();",
-        lambda res: "Invalid Argument" in res, 
+        lambda res: "Invalid Argument" in res,
         "fuzzy caver function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_soundex();",
-        lambda res: "Invalid Argument" in res, 
+        lambda res: "Invalid Argument" in res,
         "fuzzy soundex function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_hamming('awesome');",
-        lambda res: "Invalid Argument" in res, 
+        lambda res: "Invalid Argument" in res,
         "fuzzy hamming function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_translit();",
-        lambda res: "Invalid Argument" in res, 
+        lambda res: "Invalid Argument" in res,
         "fuzzy translit function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_script();",
-        lambda res: "Invalid Argument" in res, 
+        lambda res: "Invalid Argument" in res,
         "fuzzy script function works",
     )
 
