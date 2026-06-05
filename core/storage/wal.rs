@@ -4004,8 +4004,14 @@ impl Wal for WalFile {
         let file = self.coordination.wal_file()?;
         let coordination = self.coordination.clone();
         let c = file.sync(
-            Completion::new_sync(move |_| {
-                coordination.mark_initialized();
+            Completion::new_sync(move |res| {
+                // Only mark the WAL header durable once its sync has actually
+                // succeeded. A failed sync must leave the WAL uninitialized so
+                // the header is re-issued before the next append, keeping the
+                // in-memory initialized state consistent with what is on disk.
+                if res.is_ok() {
+                    coordination.mark_initialized();
+                }
             }),
             sync_type,
         )?;
