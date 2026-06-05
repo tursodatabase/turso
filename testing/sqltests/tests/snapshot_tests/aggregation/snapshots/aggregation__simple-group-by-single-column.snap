@@ -34,7 +34,7 @@ addr  opcode                  p1  p2  p3  p4                  p5  comment
    7          OpenRead         2   4   0  k(2,B)               0  index=idx_sales_category, root=4, iDb=0
    8          Rewind           2  23   0                       0  Rewind index idx_sales_category
    9            DeferredSeek   2   1   0                       0
-  10            Column         1   1  11                       0  r[11]=sales.category
+  10            Column         2   0  11                       0  r[11]=idx_sales_category.category
   11            Column         1   4  12                       0  r[12]=sales.amount
   12            Compare        7  11   1  k(1, Binary)         0  r[7..7]==r[11..11]
   13            Jump          14  18  14                       0  ; start new group if comparison is not equal
@@ -44,7 +44,7 @@ addr  opcode                  p1  p2  p3  p4                  p5  comment
   17            Gosub         13  35   0                       0  ; goto clear accumulator subroutine
   18            AggStep        0  12   9  sum                  0  accum=r[9] step(r[12])
   19            If             5  21   0                       0  if r[5] goto 21; don't emit group columns if continuing existing group
-  20            Column         1   1   8                       0  r[8]=sales.category
+  20            Column         2   0   8                       0  r[8]=idx_sales_category.category
   21            Integer        1   5   0                       0  r[5]=1; indicate data in accumulator
   22          Next             2   9   0                       0
   23          Gosub            4  27   0                       0  ; emit row for final group

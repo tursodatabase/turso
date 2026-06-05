@@ -13,7 +13,10 @@ use super::{
 use crate::translate::plan::BitSet;
 use crate::translate::{
     emitter::Resolver,
-    expr::{expr_vector_size, unwrap_parens, BindingBehavior, WalkControl},
+    expr::{
+        expr_contains_nondeterministic_scalar_function, expr_vector_size, unwrap_parens,
+        BindingBehavior, WalkControl,
+    },
     plan::{NonFromClauseSubquery, SubqueryState},
 };
 use crate::{
@@ -258,9 +261,11 @@ pub fn resolve_window_and_aggregate_functions(
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
+                                resolver,
                                 expr,
                                 WindowFunctionKind::Agg(f),
                                 over_clause,
+                                filter_over.filter_clause.as_deref(),
                                 distinctness,
                             )?;
                         } else {
@@ -280,9 +285,11 @@ pub fn resolve_window_and_aggregate_functions(
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
+                                resolver,
                                 expr,
                                 WindowFunctionKind::Window(f),
                                 over_clause,
+                                filter_over.filter_clause.as_deref(),
                                 distinctness,
                             )?;
                         } else {
@@ -300,9 +307,11 @@ pub fn resolve_window_and_aggregate_functions(
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
                                     link_with_window(
                                         windows.as_deref_mut(),
+                                        resolver,
                                         expr,
                                         WindowFunctionKind::Agg(func),
                                         over_clause,
+                                        filter_over.filter_clause.as_deref(),
                                         distinctness,
                                     )?;
                                 } else {
@@ -336,9 +345,11 @@ pub fn resolve_window_and_aggregate_functions(
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
+                                resolver,
                                 expr,
                                 WindowFunctionKind::Agg(f),
                                 over_clause,
+                                filter_over.filter_clause.as_deref(),
                                 Distinctness::NonDistinct,
                             )?;
                         } else {
@@ -358,9 +369,11 @@ pub fn resolve_window_and_aggregate_functions(
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
+                                resolver,
                                 expr,
                                 WindowFunctionKind::Window(f),
                                 over_clause,
+                                filter_over.filter_clause.as_deref(),
                                 Distinctness::NonDistinct,
                             )?;
                         } else {
@@ -393,9 +406,11 @@ pub fn resolve_window_and_aggregate_functions(
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
                                     link_with_window(
                                         windows.as_deref_mut(),
+                                        resolver,
                                         expr,
                                         WindowFunctionKind::Agg(func),
                                         over_clause,
+                                        filter_over.filter_clause.as_deref(),
                                         Distinctness::NonDistinct,
                                     )?;
                                 } else {
@@ -428,32 +443,41 @@ pub fn resolve_window_and_aggregate_functions(
 
 fn link_with_window(
     windows: Option<&mut Vec<Window>>,
+    resolver: &Resolver,
     expr: &Expr,
     func: WindowFunctionKind,
     over_clause: &Over,
+    filter_clause: Option<&Expr>,
     distinctness: Distinctness,
 ) -> Result<()> {
     if distinctness.is_distinct() {
         crate::bail_parse_error!("DISTINCT is not supported for window functions");
     }
+    // FILTER decides which input rows contribute to a running aggregate, so
+    // it is only meaningful for aggregating window functions. Non-aggregate
+    // ones (`row_number`/`lag`/`lead`) have nothing to filter.
+    if matches!(func, WindowFunctionKind::Window(_)) && filter_clause.is_some() {
+        crate::bail_parse_error!("FILTER clause may only be used with aggregate window functions");
+    }
     expr_vector_size(expr)?;
     if let Some(windows) = windows {
         let window = resolve_window(windows, over_clause)?;
-        // Dedup: if an equivalent window function expression is already linked to
-        // this window, skip adding it again. Multiple occurrences of the same
-        // window function should share a single entry so the rewrite + emit code
-        // can rely on each entry being rewritten exactly once.
-        if window
-            .functions
-            .iter()
-            .any(|f| exprs_are_equivalent(&f.original_expr, expr))
+        // Two equivalent window expressions can share one `WindowFunction`
+        // entry unless they contain nondeterministic calls like `random()`,
+        // which SQLite evaluates separately at each SQL occurrence.
+        let deduplicate = !expr_contains_nondeterministic_scalar_function(expr, resolver)?;
+        if deduplicate
+            && window
+                .functions
+                .iter()
+                .any(|f| exprs_are_equivalent(&f.original_expr, expr))
         {
             return Ok(());
         }
         window.functions.push(WindowFunction {
             func,
             original_expr: expr.clone(),
-            rewritten_expr: None,
+            rewritten: None,
         });
     } else {
         let func_name = match &func {

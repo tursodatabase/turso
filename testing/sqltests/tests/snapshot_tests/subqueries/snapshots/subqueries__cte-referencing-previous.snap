@@ -62,7 +62,7 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
    9          OpenRead           1  11   0  k(2,B)           0  index=idx_order_items_product, root=11, iDb=0
   10          Rewind             1  30   0                   0  Rewind index idx_order_items_product
   11            DeferredSeek     1   0   0                   0
-  12            Column           0   2  15                   0  r[15]=order_items.product_id
+  12            Column           1   0  15                   0  r[15]=idx_order_items_product.product_id
   13            Column           0   3  16                   0  r[16]=order_items.quantity
   14            Column           0   3  19                   0  r[19]=order_items.quantity
   15            Column           0   4  20                   0  r[20]=order_items.unit_price
@@ -77,7 +77,7 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
   24            AggStep          0  16  12  sum              0  accum=r[12] step(r[16])
   25            AggStep          0  17  13  sum              0  accum=r[13] step(r[17])
   26            If               8  28   0                   0  if r[8] goto 28; don't emit group columns if continuing existing group
-  27            Column           0   2  11                   0  r[11]=order_items.product_id
+  27            Column           1   0  11                   0  r[11]=idx_order_items_product.product_id
   28            Integer          1   8   0                   0  r[8]=1; indicate data in accumulator
   29          Next               1  11   0                   0
   30          Gosub              7  34   0                   0  ; emit row for final group

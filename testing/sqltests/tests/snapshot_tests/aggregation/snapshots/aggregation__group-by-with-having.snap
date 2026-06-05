@@ -37,7 +37,7 @@ addr  opcode                     p1  p2  p3  p4                  p5  comment
    7          OpenRead            2   4   0  k(2,B)               0  index=idx_sales_category, root=4, iDb=0
    8          Rewind              2  25   0                       0  Rewind index idx_sales_category
    9            DeferredSeek      2   1   0                       0
-  10            Column            1   1  13                       0  r[13]=sales.category
+  10            Column            2   0  13                       0  r[13]=idx_sales_category.category
   11            Column            1   4  14                       0  r[14]=sales.amount
   12            Column            1   4  15                       0  r[15]=sales.amount
   13            Compare           8  13   1  k(1, Binary)         0  r[8..8]==r[13..13]
@@ -49,7 +49,7 @@ addr  opcode                     p1  p2  p3  p4                  p5  comment
   19            AggStep           0  14  10  sum                  0  accum=r[10] step(r[14])
   20            AggStep           0  15  11  avg                  0  accum=r[11] step(r[15])
   21            If                6  23   0                       0  if r[6] goto 23; don't emit group columns if continuing existing group
-  22            Column            1   1   9                       0  r[9]=sales.category
+  22            Column            2   0   9                       0  r[9]=idx_sales_category.category
   23            Integer           1   6   0                       0  r[6]=1; indicate data in accumulator
   24          Next                2   9   0                       0
   25          Gosub               5  29   0                       0  ; emit row for final group

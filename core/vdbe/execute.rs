@@ -6608,7 +6608,9 @@ pub fn op_agg_final(
             state.registers[dest_reg].set_value(value);
         }
         Register::Value(Value::Null) => {
-            // When the set is empty, return appropriate default
+            // No row was stepped: write the empty-set default explicitly.
+            // For window aggregates `dest_reg` differs from `acc_reg` and may
+            // still hold an earlier partition's result.
             match func {
                 AggFunc::Total => {
                     state.registers[dest_reg]
@@ -6662,7 +6664,9 @@ pub fn op_agg_final(
                     };
                     state.registers[dest_reg].set_value(value);
                 }
-                _ => {}
+                _ => {
+                    state.registers[dest_reg].set_value(Value::Null);
+                }
             }
         }
         other => {
@@ -7577,6 +7581,17 @@ pub fn op_function(
             }
             ScalarFunc::Random => {
                 state.registers[*dest].set_int(pager.io.generate_random_number());
+            }
+            #[cfg(feature = "test_helper")]
+            ScalarFunc::TestNondetCounter => {
+                // Test-only: process-global atomic counter that increments on
+                // every evaluation. Used in sqltests to verify that the
+                // planner does not deduplicate equivalent SQL calls that
+                // contain nondeterministic functions.
+                static TEST_NONDET_COUNTER: std::sync::atomic::AtomicI64 =
+                    std::sync::atomic::AtomicI64::new(0);
+                let value = TEST_NONDET_COUNTER.fetch_add(1, Ordering::Relaxed);
+                state.registers[*dest].set_int(value);
             }
             ScalarFunc::Trim => {
                 let reg_value = &state.registers[*start_reg];
@@ -11115,27 +11130,6 @@ pub fn op_reset_sorter(
         CursorType::BTreeTable(_) => {
             let cursor = cursor.as_btree_mut();
             return_if_io!(cursor.clear_btree());
-            // FIXME: cuurently we don't have a good way to identify cursors that are
-            // iterating in the same underlying BTree
-
-            // After clearing the btree, invalidate cached navigation state on all
-            // other cursors that share the same underlying btree (e.g. OpenDup cursors).
-            // Without this, dup cursors may use stale cached rightmost-page info and
-            // attempt to insert into freed pages, causing corruption.
-            let cleared_pager = {
-                let cursor = state.get_cursor(*cursor_id);
-                cursor.as_btree_mut().get_pager()
-            };
-            for (i, other_cursor_opt) in state.cursors.iter_mut().enumerate() {
-                if i == *cursor_id {
-                    continue;
-                }
-                if let Some(Cursor::BTree(ref mut btree_cursor)) = other_cursor_opt {
-                    if Arc::ptr_eq(&btree_cursor.get_pager(), &cleared_pager) {
-                        btree_cursor.invalidate_btree_cache();
-                    }
-                }
-            }
         }
         CursorType::Sorter => {
             return Err(LimboError::InternalError(
