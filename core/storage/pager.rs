@@ -2761,6 +2761,25 @@ impl Pager {
         // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
         // Rebuilding init_page_1 must not leak any stale 4 KiB page-1 image into the first write.
         self.dirty_pages.write().clear();
+
+        // Invariant: this is the sole pre-initialization page-size retargeting
+        // hook for the fresh DB / fresh ATTACH / in-place VACUUM temp DB paths.
+        // Any encryption context installed before this point (PRAGMA
+        // cipher/hexkey, URI-supplied cipher/hexkey, fresh-attach `_init`) was
+        // built against the prior page size and would panic on the first
+        // encrypted write with a stale buffer-length assertion. Retarget it in
+        // place and propagate to the WAL IOContext when one is installed.
+        let retargeted = {
+            let mut io_ctx = self.io_ctx.write();
+            io_ctx.retarget_encryption_page_size(size)
+        };
+        if !retargeted {
+            return Ok(());
+        }
+        let Some(wal) = self.wal.as_ref() else {
+            return Ok(());
+        };
+        wal.set_io_context(self.io_ctx.read().clone());
         Ok(())
     }
 

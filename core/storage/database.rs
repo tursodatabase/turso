@@ -1,6 +1,7 @@
 use crate::io::FileSyncType;
 use crate::storage::checksum::ChecksumContext;
 use crate::storage::encryption::EncryptionContext;
+use crate::storage::sqlite3_ondisk::PageSize;
 use crate::sync::Arc;
 use crate::{io::Completion, Buffer, CompletionError, LimboError, Result};
 use crate::{
@@ -39,6 +40,22 @@ impl IOContext {
 
     pub fn set_encryption(&mut self, encryption_ctx: EncryptionContext) {
         self.encryption_or_checksum = EncryptionOrChecksum::Encryption(encryption_ctx);
+    }
+
+    /// Retarget the installed encryption context's expected page size to match a
+    /// pre-initialization layout change (e.g. `PRAGMA page_size`, fresh encrypted
+    /// `ATTACH`, in-place `VACUUM` temp DB). This is layout repair, not normal
+    /// configuration: it must only be called while the pager is uninitialized,
+    /// and never to change cipher or key. Returns true when a context was
+    /// present and updated; false when no encryption context is installed.
+    pub(crate) fn retarget_encryption_page_size(&mut self, page_size: PageSize) -> bool {
+        match &mut self.encryption_or_checksum {
+            EncryptionOrChecksum::Encryption(ctx) => {
+                ctx.set_page_size(page_size);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn encryption_or_checksum(&self) -> &EncryptionOrChecksum {
