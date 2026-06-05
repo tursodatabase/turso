@@ -5,6 +5,7 @@ setup base {
     INSERT INTO t VALUES (1,10),(2,10),(3,20),(4,20),(5,30);
 }
 
+@skip-if sqlite "sqlite supports EXCLUDE frames; turso rejects them as unimplemented"
 @setup base
 test exclude-current-row {
     SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM t;
@@ -12,6 +13,7 @@ test exclude-current-row {
 expect error {
 }
 
+@skip-if sqlite "sqlite supports EXCLUDE frames; turso rejects them as unimplemented"
 @setup base
 test exclude-group {
     SELECT id, sum(v) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE GROUP) FROM t;
@@ -19,6 +21,7 @@ test exclude-group {
 expect error {
 }
 
+@skip-if sqlite "sqlite supports EXCLUDE frames; turso rejects them as unimplemented"
 @setup base
 test exclude-ties {
     SELECT id, sum(v) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM t;
@@ -26,11 +29,16 @@ test exclude-ties {
 expect error {
 }
 
-# EXCLUDE NO OTHERS is the default — equivalent to omitting EXCLUDE.
-# Still errors today because the surrounding ROWS clause isn't supported.
+# EXCLUDE NO OTHERS is the default — equivalent to omitting EXCLUDE,
+# so a supported frame with it still works.
 @setup base
 test exclude-no-others {
     SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE NO OTHERS) FROM t;
 }
-expect error {
+expect {
+    1|10
+    2|20
+    3|30
+    4|40
+    5|50
 }

@@ -6,6 +6,7 @@ setup base {
 }
 
 # Peer-group window: ± 1 peer group around the current row's group.
+@skip-if sqlite "sqlite supports GROUPS frames; turso rejects them as unimplemented"
 @setup base
 test groups-symmetric {
     SELECT id, g, sum(v) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;
@@ -13,6 +14,7 @@ test groups-symmetric {
 expect error {
 }
 
+@skip-if sqlite "sqlite supports GROUPS frames; turso rejects them as unimplemented"
 @setup base
 test groups-current-row {
     SELECT id, g, count(*) OVER (ORDER BY g GROUPS CURRENT ROW) FROM t;

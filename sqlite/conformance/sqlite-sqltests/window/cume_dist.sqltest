@@ -745,3 +745,23 @@ expect @js {
     2|3|0.5
     2|4|1
 }
+
+# A user frame with EXCLUDE must also be dropped by the built-in
+# frame override (sqlite3WindowUpdate replaces eExclude too).
+setup exclude_vals {
+    CREATE TABLE ex(v);
+    INSERT INTO ex VALUES (1),(2),(2),(4);
+}
+
+@setup exclude_vals
+test cume-dist-exclude-ties-overridden {
+    SELECT cume_dist() OVER
+        (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES)
+    FROM ex;
+}
+expect {
+    0.25
+    0.75
+    0.75
+    1.0
+}

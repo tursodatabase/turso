@@ -7,6 +7,7 @@ setup base {
 
 # Symmetric value window: include every row within ±5 of the current
 # row's ORDER BY value.
+@skip-if sqlite "sqlite supports RANGE offset frames; turso rejects them as unimplemented"
 @setup base
 test range-symmetric-offset {
     SELECT id, v, sum(v) OVER (ORDER BY v RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM t;
@@ -16,6 +17,7 @@ expect error {
 
 # Trailing range: include every row whose ORDER BY value is within 10
 # behind the current row.
+@skip-if sqlite "sqlite supports RANGE offset frames; turso rejects them as unimplemented"
 @setup base
 test range-trailing-offset {
     SELECT id, v, sum(v) OVER (ORDER BY v RANGE 10 PRECEDING) FROM t;
@@ -24,6 +26,7 @@ expect error {
 }
 
 # DESC ordering: arithmetic and comparison still hold.
+@skip-if sqlite "sqlite supports RANGE offset frames; turso rejects them as unimplemented"
 @setup base
 test range-desc-symmetric-offset {
     SELECT id, v, sum(v) OVER (ORDER BY v DESC RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM t;
