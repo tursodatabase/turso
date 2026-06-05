@@ -1,0 +1,28 @@
+[verify.cache]
+strategy = "local"
+commit_specs = true
+
+[stamp]
+hooks = "pre-commit"
+hash_crate_root = false
+
+[telemetry]
+enabled = false
+
+[lint]
+pre_commit = "check"
+strict = false
+
+[corpus]
+contribute = false
+
+[doc]
+commit_artifacts = true
+position = "before"
+
+[index]
+
+[canon]
+enabled = true
+threshold_stamp = 0.85
+threshold_critique = 0.65
