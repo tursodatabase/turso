@@ -4065,7 +4065,11 @@ pub fn op_auto_commit(
         };
     }
 
-    turso_debug_assert!(matches!(tx_op, TxOp::Commit | TxOp::Rollback), "tx_op should be commit or rollback by now", {"tx_op": tx_op});
+    turso_debug_assert!(
+        matches!(tx_op, TxOp::Commit | TxOp::Rollback),
+        "tx_op should be commit or rollback by now",
+        { "tx_op": tx_op }
+    );
 
     // For explicit COMMIT, flush any pending index method writes first
     if matches!(tx_op, TxOp::Commit) {
@@ -10370,10 +10374,9 @@ fn new_rowid_inner(
                                     state.registers[*prev_largest_reg]
                                         .set_int(prev_rowid.unwrap_or(0));
                                 }
-                                *state.active_op_state.new_rowid() =
-                                    OpNewRowidState::SeekingToLast {
-                                        mvcc_already_initialized: true,
-                                    };
+                                state.active_op_state.clear();
+                                state.pc += 1;
+                                return Ok(InsnFunctionStepResult::Step);
                             }
                             NextRowidResult::FindRandom => {
                                 mvcc_cursor.end_new_rowid();
