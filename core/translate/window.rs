@@ -1,4 +1,4 @@
-use crate::function::WindowFunc;
+use crate::function::AccumulatorFunc;
 use crate::schema::{BTreeCharacteristics, BTreeTable, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
@@ -11,7 +11,7 @@ use crate::translate::expr::{
 use crate::translate::order_by::EmitOrderBy;
 use crate::translate::plan::{
     Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination, ResultSetColumn,
-    RewrittenWindowCall, SelectPlan, TableReferences, Window, WindowFunction, WindowFunctionKind,
+    RewrittenWindowCall, SelectPlan, TableReferences, Window, WindowFunction,
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
@@ -894,11 +894,6 @@ fn emit_reset_state_if_new_partition(
         dest: registers.acc_start,
         dest_end: Some(registers.acc_start + window.functions.len() - 1),
     });
-    for (i, func) in window.functions.iter().enumerate() {
-        if matches!(func.func, WindowFunctionKind::Window(WindowFunc::RowNumber)) {
-            program.emit_int(0, registers.acc_result_start + i);
-        }
-    }
 
     program.preassign_label_to_next_insn(label_skip_reset_state);
 }
@@ -1027,7 +1022,7 @@ fn emit_aggregation_step(
     registers: &WindowRegisters,
 ) -> crate::Result<()> {
     for (i, func) in window.functions.iter().enumerate() {
-        let WindowFunctionKind::Agg(agg_func) = &func.func else {
+        let AccumulatorFunc::Agg(agg_func) = &func.func else {
             continue;
         };
         // The aggregation step is performed incrementally as each row from the subquery is
@@ -1160,27 +1155,21 @@ fn emit_return_buffered_rows(
         ..
     } = t_ctx.meta_window.as_ref().expect("missing window metadata");
 
+    // Aggregate window functions: capture the running accumulator value once
+    // per flush. Every buffered row in the just-finished peer group sees the
+    // same value (RANGE UNBOUNDED PRECEDING TO CURRENT ROW semantics).
     for (i, func) in window.functions.iter().enumerate() {
-        if let WindowFunctionKind::Agg(agg_func) = &func.func {
+        if let AccumulatorFunc::Agg(agg_func) = &func.func {
             program.emit_insn(Insn::AggValue {
                 acc_reg: registers.acc_start + i,
                 dest_reg: registers.acc_result_start + i,
-                func: agg_func.clone(),
+                func: AccumulatorFunc::Agg(agg_func.clone()),
             });
         }
     }
 
     let label_skip_returning_row = program.allocate_label();
     let label_loop_start = program.allocate_label();
-    let reg_one = window
-        .functions
-        .iter()
-        .any(|func| matches!(func.func, WindowFunctionKind::Window(WindowFunc::RowNumber)))
-        .then(|| {
-            let reg = program.alloc_register();
-            program.emit_int(1, reg);
-            reg
-        });
     program.preassign_label_to_next_insn(label_loop_start);
 
     // Propagate subquery result column values to the outer query (if any) or directly to
@@ -1190,14 +1179,26 @@ fn emit_return_buffered_rows(
         let reg_result = registers.result_columns_start + i;
         program.emit_column_or_rowid(cursors.buffer_read, *col_idx, reg_result);
     }
+    // Pure window functions (e.g. row_number) advance their accumulator and
+    // read it out once per buffered row as the buffer is replayed. Aggregate
+    // window functions instead advance their accumulator once per source row
+    // (in emit_aggregation_step) and only their final value is read out per
+    // emitted row (the AggValue loop earlier in this function).
     for (i, func) in window.functions.iter().enumerate() {
-        if let WindowFunctionKind::Window(WindowFunc::RowNumber) = &func.func {
-            let reg_one = reg_one.expect("row_number must allocate reg_one");
-            let reg_row_number = registers.acc_result_start + i;
-            program.emit_insn(Insn::Add {
-                lhs: reg_row_number,
-                rhs: reg_one,
-                dest: reg_row_number,
+        if let AccumulatorFunc::Window(win_func) = &func.func {
+            let acc_reg = registers.acc_start + i;
+            let dest_reg = registers.acc_result_start + i;
+            program.emit_insn(Insn::AggStep {
+                acc_reg,
+                col: 0,
+                delimiter: 0,
+                func: AccumulatorFunc::Window(win_func.clone()),
+                comparator: None,
+            });
+            program.emit_insn(Insn::AggValue {
+                acc_reg,
+                dest_reg,
+                func: AccumulatorFunc::Window(win_func.clone()),
             });
         }
     }

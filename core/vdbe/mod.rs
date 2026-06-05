@@ -38,7 +38,7 @@ pub mod value;
 pub use crate::translate::collate::CollationSeq;
 use crate::{
     error::LimboError,
-    function::{AggFunc, FuncCtx},
+    function::FuncCtx,
     mvcc::{database::CommitStateMachine, MvccClock},
     numeric::Numeric,
     return_if_io,

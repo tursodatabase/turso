@@ -7,7 +7,8 @@ pub fn to_u16(v: usize) -> u16 {
     v.try_into().expect("value exceeds u16::MAX")
 }
 
-use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
+use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
+use crate::function::AccumulatorFunc;
 use crate::{
     schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
@@ -1033,14 +1034,14 @@ pub enum Insn {
         acc_reg: usize,
         col: usize,
         delimiter: usize,
-        func: AggFunc,
+        func: AccumulatorFunc,
         /// Optional custom type comparator for MIN/MAX aggregates.
         comparator: Option<SortComparatorType>,
     },
 
     AggFinal {
         register: usize,
-        func: AggFunc,
+        func: AccumulatorFunc,
     },
 
     /// Similar to AggFinal, but instead of writing the result back into the
@@ -1049,7 +1050,7 @@ pub enum Insn {
     AggValue {
         acc_reg: usize,
         dest_reg: usize,
-        func: AggFunc,
+        func: AccumulatorFunc,
     },
 
     /// Open a sorter.

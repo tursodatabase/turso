@@ -1,7 +1,7 @@
 use turso_parser::ast;
 
 use crate::{
-    function::AggFunc,
+    function::{AccumulatorFunc, AggFunc},
     schema::Table,
     sync::Arc,
     translate::collate::CollationSeq,
@@ -36,7 +36,7 @@ pub fn emit_ungrouped_aggregation<'a>(
         let agg_result_reg = agg_start_reg + i;
         program.emit_insn(Insn::AggFinal {
             register: agg_result_reg,
-            func: agg.func.clone(),
+            func: AccumulatorFunc::Agg(agg.func.clone()),
         });
     }
     // we now have the agg results in (agg_start_reg..agg_start_reg + aggregates.len() - 1)
@@ -364,7 +364,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::Avg,
+                func: AccumulatorFunc::Agg(AggFunc::Avg),
                 comparator: None,
             });
             target_register
@@ -377,7 +377,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::Count0,
+                func: AccumulatorFunc::Agg(AggFunc::Count0),
                 comparator: None,
             });
             target_register
@@ -392,7 +392,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::Count,
+                func: AccumulatorFunc::Agg(AggFunc::Count),
                 comparator: None,
             });
             target_register
@@ -417,7 +417,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: delimiter_reg,
-                func: AggFunc::GroupConcat,
+                func: AccumulatorFunc::Agg(AggFunc::GroupConcat),
                 comparator: None,
             });
 
@@ -437,7 +437,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::Max,
+                func: AccumulatorFunc::Agg(AggFunc::Max),
                 comparator,
             });
             target_register
@@ -456,7 +456,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::Min,
+                func: AccumulatorFunc::Agg(AggFunc::Min),
                 comparator,
             });
             target_register
@@ -474,7 +474,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: value_reg,
-                func: AggFunc::JsonGroupObject,
+                func: AccumulatorFunc::Agg(AggFunc::JsonGroupObject),
                 comparator: None,
             });
             target_register
@@ -490,7 +490,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::JsonGroupArray,
+                func: AccumulatorFunc::Agg(AggFunc::JsonGroupArray),
                 comparator: None,
             });
             target_register
@@ -508,7 +508,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: delimiter_reg,
-                func: AggFunc::StringAgg,
+                func: AccumulatorFunc::Agg(AggFunc::StringAgg),
                 comparator: None,
             });
 
@@ -524,7 +524,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::Sum,
+                func: AccumulatorFunc::Agg(AggFunc::Sum),
                 comparator: None,
             });
             target_register
@@ -539,7 +539,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::Total,
+                func: AccumulatorFunc::Agg(AggFunc::Total),
                 comparator: None,
             });
             target_register
@@ -555,7 +555,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::ArrayAgg,
+                func: AccumulatorFunc::Agg(AggFunc::ArrayAgg),
                 comparator: None,
             });
             target_register
@@ -573,7 +573,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: value_reg,
                 delimiter: 0,
-                func: AggFunc::Mode,
+                func: AccumulatorFunc::Agg(AggFunc::Mode),
                 comparator: None,
             });
             target_register
@@ -595,7 +595,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: value_reg,
                 delimiter: fraction_reg,
-                func: func.clone(),
+                func: AccumulatorFunc::Agg(func.clone()),
                 comparator: None,
             });
             target_register
@@ -630,11 +630,11 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::External(if registered_argc < 0 {
+                func: AccumulatorFunc::Agg(AggFunc::External(if registered_argc < 0 {
                     Arc::new(func.with_aggregate_arg_count(num_args))
                 } else {
                     func.clone()
-                }),
+                })),
                 comparator: None,
             });
             target_register

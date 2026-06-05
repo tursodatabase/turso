@@ -460,29 +460,146 @@ pub enum AggFunc {
     External(Arc<ExtFunc>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
+#[derive(Debug, Clone, strum::EnumIter)]
 pub enum WindowFunc {
     RowNumber,
+    Rank,
+    DenseRank,
+    PercentRank,
+    CumeDist,
+    Ntile,
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    NthValue,
+    #[strum(disabled)]
+    External(Arc<ExtFunc>),
 }
 
 impl WindowFunc {
+    /// SQL name of this window function. Matches the strings used by
+    /// `Display` so EXPLAIN output and error messages agree.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RowNumber => "row_number",
+            Self::Rank => "rank",
+            Self::DenseRank => "dense_rank",
+            Self::PercentRank => "percent_rank",
+            Self::CumeDist => "cume_dist",
+            Self::Ntile => "ntile",
+            Self::Lag => "lag",
+            Self::Lead => "lead",
+            Self::FirstValue => "first_value",
+            Self::LastValue => "last_value",
+            Self::NthValue => "nth_value",
+            Self::External(_) => unreachable!(
+                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
+            ),
+        }
+    }
+
     pub fn arities(&self) -> &'static [i32] {
         match self {
-            Self::RowNumber => &[0],
+            Self::RowNumber | Self::Rank | Self::DenseRank | Self::PercentRank | Self::CumeDist => {
+                &[0]
+            }
+            Self::Ntile | Self::FirstValue | Self::LastValue => &[1],
+            Self::NthValue => &[2],
+            Self::Lag | Self::Lead => &[1, 2, 3],
+            Self::External(_) => unreachable!(
+                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
+            ),
+        }
+    }
+
+    /// Whether name resolution + runtime dispatch are wired up. Stub variants
+    /// must not be advertised via `pragma_function_list`, or introspection
+    /// drifts ahead of the resolver and users get "no such function" when
+    /// they try to call them.
+    pub fn is_implemented(&self) -> bool {
+        matches!(self, Self::RowNumber)
+    }
+}
+
+impl PartialEq for WindowFunc {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::RowNumber, Self::RowNumber)
+            | (Self::Rank, Self::Rank)
+            | (Self::DenseRank, Self::DenseRank)
+            | (Self::PercentRank, Self::PercentRank)
+            | (Self::CumeDist, Self::CumeDist)
+            | (Self::Ntile, Self::Ntile)
+            | (Self::Lag, Self::Lag)
+            | (Self::Lead, Self::Lead)
+            | (Self::FirstValue, Self::FirstValue)
+            | (Self::LastValue, Self::LastValue)
+            | (Self::NthValue, Self::NthValue) => true,
+            (Self::External(a), Self::External(b)) => Arc::ptr_eq(a, b),
+            _ => false,
         }
     }
 }
 
+impl Eq for WindowFunc {}
+
 impl Deterministic for WindowFunc {
     fn is_deterministic(&self) -> bool {
-        true
+        match self {
+            Self::RowNumber
+            | Self::Rank
+            | Self::DenseRank
+            | Self::PercentRank
+            | Self::CumeDist
+            | Self::Ntile
+            | Self::Lag
+            | Self::Lead
+            | Self::FirstValue
+            | Self::LastValue
+            | Self::NthValue => true,
+            Self::External(_) => unreachable!(
+                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
+            ),
+        }
     }
 }
 
 impl std::fmt::Display for WindowFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Function reference used by AggStep / AggValue / AggFinal opcodes.
+/// Aggregates used in window context and pure window functions share the same
+/// step/value dispatch path; this enum carries which side of that split a
+/// particular call belongs to.
+#[derive(Debug, Clone)]
+pub enum AccumulatorFunc {
+    Agg(AggFunc),
+    Window(WindowFunc),
+}
+
+impl AccumulatorFunc {
+    /// Extract the inner `AggFunc` when this kind is known to be an
+    /// aggregate. `unreachable!`s on `Window(...)` — the only opcodes
+    /// that carry an `AccumulatorFunc` are the AggStep / AggValue /
+    /// AggFinal trio, and the call sites that emit those wrap aggregates
+    /// only. A `Window` value reaching here is a planner bug.
+    pub fn expect_agg(&self) -> &AggFunc {
         match self {
-            Self::RowNumber => write!(f, "row_number"),
+            Self::Agg(f) => f,
+            Self::Window(f) => {
+                unreachable!("window function {f} reached an aggregate-only dispatch path")
+            }
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Agg(f) => f.as_str(),
+            Self::Window(f) => f.as_str(),
         }
     }
 }
@@ -1721,8 +1838,11 @@ impl Func {
             push(f.to_string(), "w", f.arities(), f.is_deterministic());
         }
 
-        // Window functions.
+        // Window functions (skip stub variants until they're wired up).
         for f in WindowFunc::iter() {
+            if !f.is_implemented() {
+                continue;
+            }
             push(f.to_string(), "w", f.arities(), f.is_deterministic());
         }
 

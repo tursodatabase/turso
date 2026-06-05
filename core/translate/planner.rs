@@ -27,11 +27,11 @@ use crate::{
     Result,
 };
 use crate::{
-    function::{AggFunc, ExtFunc},
+    function::{AccumulatorFunc, AggFunc, ExtFunc},
     translate::expr::bind_and_rewrite_expr,
 };
 use crate::{
-    translate::plan::{Window, WindowFunction, WindowFunctionKind},
+    translate::plan::{Window, WindowFunction},
     vdbe::builder::ProgramBuilder,
 };
 use smallvec::SmallVec;
@@ -263,7 +263,7 @@ pub fn resolve_window_and_aggregate_functions(
                                 windows.as_deref_mut(),
                                 resolver,
                                 expr,
-                                WindowFunctionKind::Agg(f),
+                                AccumulatorFunc::Agg(f),
                                 over_clause,
                                 filter_over.filter_clause.as_deref(),
                                 distinctness,
@@ -287,7 +287,7 @@ pub fn resolve_window_and_aggregate_functions(
                                 windows.as_deref_mut(),
                                 resolver,
                                 expr,
-                                WindowFunctionKind::Window(f),
+                                AccumulatorFunc::Window(f),
                                 over_clause,
                                 filter_over.filter_clause.as_deref(),
                                 distinctness,
@@ -309,7 +309,7 @@ pub fn resolve_window_and_aggregate_functions(
                                         windows.as_deref_mut(),
                                         resolver,
                                         expr,
-                                        WindowFunctionKind::Agg(func),
+                                        AccumulatorFunc::Agg(func),
                                         over_clause,
                                         filter_over.filter_clause.as_deref(),
                                         distinctness,
@@ -347,7 +347,7 @@ pub fn resolve_window_and_aggregate_functions(
                                 windows.as_deref_mut(),
                                 resolver,
                                 expr,
-                                WindowFunctionKind::Agg(f),
+                                AccumulatorFunc::Agg(f),
                                 over_clause,
                                 filter_over.filter_clause.as_deref(),
                                 Distinctness::NonDistinct,
@@ -371,7 +371,7 @@ pub fn resolve_window_and_aggregate_functions(
                                 windows.as_deref_mut(),
                                 resolver,
                                 expr,
-                                WindowFunctionKind::Window(f),
+                                AccumulatorFunc::Window(f),
                                 over_clause,
                                 filter_over.filter_clause.as_deref(),
                                 Distinctness::NonDistinct,
@@ -408,7 +408,7 @@ pub fn resolve_window_and_aggregate_functions(
                                         windows.as_deref_mut(),
                                         resolver,
                                         expr,
-                                        WindowFunctionKind::Agg(func),
+                                        AccumulatorFunc::Agg(func),
                                         over_clause,
                                         filter_over.filter_clause.as_deref(),
                                         Distinctness::NonDistinct,
@@ -445,7 +445,7 @@ fn link_with_window(
     windows: Option<&mut Vec<Window>>,
     resolver: &Resolver,
     expr: &Expr,
-    func: WindowFunctionKind,
+    func: AccumulatorFunc,
     over_clause: &Over,
     filter_clause: Option<&Expr>,
     distinctness: Distinctness,
@@ -456,7 +456,7 @@ fn link_with_window(
     // FILTER decides which input rows contribute to a running aggregate, so
     // it is only meaningful for aggregating window functions. Non-aggregate
     // ones (`row_number`/`lag`/`lead`) have nothing to filter.
-    if matches!(func, WindowFunctionKind::Window(_)) && filter_clause.is_some() {
+    if matches!(func, AccumulatorFunc::Window(_)) && filter_clause.is_some() {
         crate::bail_parse_error!("FILTER clause may only be used with aggregate window functions");
     }
     expr_vector_size(expr)?;
@@ -481,8 +481,8 @@ fn link_with_window(
         });
     } else {
         let func_name = match &func {
-            WindowFunctionKind::Agg(f) => f.as_str().to_string(),
-            WindowFunctionKind::Window(f) => f.to_string(),
+            AccumulatorFunc::Agg(f) => f.as_str().to_string(),
+            AccumulatorFunc::Window(f) => f.to_string(),
         };
         crate::bail_parse_error!("misuse of window function: {}()", func_name);
     }

@@ -266,7 +266,7 @@ fn emit_loop_source<'a>(
                     acc_reg: start_reg,
                     col: expr_reg,
                     delimiter: 0,
-                    func: min_max.func.clone(),
+                    func: crate::function::AccumulatorFunc::Agg(min_max.func.clone()),
                     comparator,
                 });
                 program.emit_insn(Insn::Goto {
