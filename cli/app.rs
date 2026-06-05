@@ -793,9 +793,7 @@ impl Limbo {
                 }
                 CommandParser::try_parse_from(args)
             }
-            _ => {
-                CommandParser::try_parse_from(args)
-            }
+            _ => CommandParser::try_parse_from(args),
         };
         match parse {
             Err(err) => {
