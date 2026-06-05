@@ -1866,7 +1866,12 @@ fn parse_join(
                 .take(table_references.joined_tables().len() - 1)
             {
                 for left_col in left_table.columns().iter().filter(|col| !col.hidden()) {
-                    if left_col.name == right_col.name {
+                    if left_col
+                        .name
+                        .as_deref()
+                        .zip(right_col.name.as_deref())
+                        .is_some_and(|(l, r)| l.eq_ignore_ascii_case(r))
+                    {
                         distinct_names.push(ast::Name::exact(
                             left_col.name.clone().expect("column name is None"),
                         ));
@@ -1927,8 +1932,8 @@ fn parse_join(
                             .filter(|(_, col)| !natural || !col.hidden())
                             .find(|(_, col)| {
                                 col.name
-                                    .as_ref()
-                                    .is_some_and(|name| *name == name_normalized)
+                                    .as_deref()
+                                    .is_some_and(|name| name.eq_ignore_ascii_case(&name_normalized))
                             })
                             .map(|(idx, col)| {
                                 (left_table_offset, left_table.internal_id, idx, col)
@@ -1945,8 +1950,8 @@ fn parse_join(
                     }
                     let right_col = right_table.columns().iter().enumerate().find(|(_, col)| {
                         col.name
-                            .as_ref()
-                            .is_some_and(|name| *name == name_normalized)
+                            .as_deref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(&name_normalized))
                     });
                     if right_col.is_none() {
                         crate::bail_parse_error!(
