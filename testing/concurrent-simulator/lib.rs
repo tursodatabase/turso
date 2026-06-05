@@ -253,6 +253,8 @@ pub struct WhopperOpts {
     pub max_drain_steps: usize,
     /// Probability of cosmic ray bit flip on each step (0.0-1.0).
     pub cosmic_ray_probability: f64,
+    /// Probability that an `ftruncate()` call fails with an injected I/O error (0.0-1.0).
+    pub truncate_fault_probability: f64,
     /// Keep mmap I/O files on disk after run.
     pub keep_files: bool,
     /// Enable MVCC (Multi-Version Concurrency Control).
@@ -313,6 +315,7 @@ impl Default for WhopperOpts {
             max_steps: 100_000,
             max_drain_steps: 1_000_000,
             cosmic_ray_probability: 0.0,
+            truncate_fault_probability: 0.0,
             keep_files: false,
             enable_mvcc: false,
             enable_encryption: false,
@@ -329,27 +332,31 @@ impl Default for WhopperOpts {
 }
 
 impl WhopperOpts {
-    /// Create options for "fast" mode: 100k steps, no cosmic rays.
+    /// Create options for "fast" mode: 100k steps, no cosmic rays, 1% ftruncate faults.
     pub fn fast() -> Self {
         Self {
             max_steps: 100_000,
+            truncate_fault_probability: 0.01,
             ..Default::default()
         }
     }
 
-    /// Create options for "chaos" mode: 10M steps, no cosmic rays.
+    /// Create options for "chaos" mode: 10M steps, no cosmic rays, 1% ftruncate faults.
     pub fn chaos() -> Self {
         Self {
             max_steps: 10_000_000,
+            truncate_fault_probability: 0.01,
             ..Default::default()
         }
     }
 
-    /// Create options for "ragnarök" mode: 1M steps, 0.01% cosmic ray probability.
+    /// Create options for "ragnarök" mode: 1M steps, 0.01% cosmic ray probability,
+    /// 1% ftruncate faults.
     pub fn ragnarok() -> Self {
         Self {
             max_steps: 1_000_000,
             cosmic_ray_probability: 0.0001,
+            truncate_fault_probability: 0.01,
             ..Default::default()
         }
     }
@@ -392,6 +399,11 @@ impl WhopperOpts {
 
     pub fn with_cosmic_ray_probability(mut self, probability: f64) -> Self {
         self.cosmic_ray_probability = probability;
+        self
+    }
+
+    pub fn with_truncate_fault_probability(mut self, probability: f64) -> Self {
+        self.truncate_fault_probability = probability;
         self
     }
 
@@ -602,6 +614,7 @@ impl Whopper {
 
         let fault_config = IOFaultConfig {
             cosmic_ray_probability: opts.cosmic_ray_probability,
+            truncate_fault_probability: opts.truncate_fault_probability,
         };
 
         let io = Arc::new(SimulatorIO::new(opts.keep_files, io_rng, fault_config));
