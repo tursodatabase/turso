@@ -789,6 +789,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         let schema_for_task = schema.clone();
         let busy_timeout = opts.busy_timeout;
         let tx_mode = opts.tx_mode;
+        let truncate_checkpoint_probability = opts.truncate_checkpoint_probability;
         let sql_log = sql_log.clone();
 
         let progress_bar = multi_progress.add(ProgressBar::new(nr_iterations as u64));
@@ -822,6 +823,87 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     let db_guard = db.lock().await;
                     conn = db_guard.connect()?;
                     conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
+                }
+
+                // Occasionally issue a TRUNCATE checkpoint to exercise the WAL
+                // truncate + sync path (and its error propagation). This runs
+                // outside of any transaction, since checkpointing requires no
+                // active transaction on the connection.
+                if gen_bool(&mut rng, truncate_checkpoint_probability) {
+                    let checkpoint_sql = "PRAGMA wal_checkpoint(TRUNCATE)";
+                    // wal_checkpoint returns a (busy, log, checkpointed) row, so
+                    // use query() and drain it rather than execute().
+                    match conn.query(checkpoint_sql, ()).await {
+                        Ok(mut rows) => {
+                            // Drive the statement to completion by draining rows.
+                            loop {
+                                match rows.next().await {
+                                    Ok(Some(_)) => {}
+                                    Ok(None) => {
+                                        log_sql(&sql_log, thread, checkpoint_sql, "OK");
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        log_sql(
+                                            &sql_log,
+                                            thread,
+                                            checkpoint_sql,
+                                            &format!("ERROR: {e}"),
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(turso::Error::Busy(e)) => {
+                            log_sql(
+                                &sql_log,
+                                thread,
+                                checkpoint_sql,
+                                &format!("ERROR(busy): {e}"),
+                            );
+                        }
+                        Err(turso::Error::BusySnapshot(e)) => {
+                            log_sql(
+                                &sql_log,
+                                thread,
+                                checkpoint_sql,
+                                &format!("ERROR(busy_snapshot): {e}"),
+                            );
+                        }
+                        Err(turso::Error::DatabaseFull(e)) => {
+                            log_sql(
+                                &sql_log,
+                                thread,
+                                checkpoint_sql,
+                                &format!("ERROR(database_full): {e}"),
+                            );
+                            eprintln!("thread#{thread} Database full during checkpoint: {e}");
+                        }
+                        Err(turso::Error::IoError(kind, op)) => {
+                            log_sql(
+                                &sql_log,
+                                thread,
+                                checkpoint_sql,
+                                &format!("ERROR(io): {op}: {kind:?}"),
+                            );
+                            eprintln!(
+                                "thread#{thread} I/O error during checkpoint ({op}: {kind:?}), continuing..."
+                            );
+                        }
+                        Err(turso::Error::Corrupt(e)) => {
+                            log_sql(
+                                &sql_log,
+                                thread,
+                                checkpoint_sql,
+                                &format!("ERROR(corrupt): {e}"),
+                            );
+                            turso_macros::turso_assert_unreachable!("corrupt error during checkpoint", { "thread": thread, "error": e });
+                        }
+                        Err(e) => {
+                            log_sql(&sql_log, thread, checkpoint_sql, &format!("ERROR: {e}"));
+                        }
+                    }
                 }
 
                 let tx = if rng.get_random() % 2 == 0 {
