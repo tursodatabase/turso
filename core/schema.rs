@@ -1,4 +1,6 @@
+use crate::alloc::vec;
 use crate::alloc::TursoFromIterator;
+use crate::alloc::*;
 use crate::function::{Deterministic, Func};
 use crate::incremental::view::IncrementalView;
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, operator::create_dbsp_state_index};
@@ -427,7 +429,7 @@ impl TypeDef {
                         base_affinity: Affinity::affinity(&f.field_type.name),
                         type_name: f.field_type.name.clone(),
                     })
-                    .collect();
+                    .try_collect()?;
                 Self {
                     name: type_name.to_string(),
                     is_builtin,
@@ -456,7 +458,7 @@ impl TypeDef {
                         base_affinity: Affinity::affinity(&f.field_type.name),
                         type_name: f.field_type.name.clone(),
                     })
-                    .collect();
+                    .try_collect()?;
                 Self {
                     name: type_name.to_string(),
                     is_builtin,
@@ -468,7 +470,7 @@ impl TypeDef {
                         tag_names: variants
                             .iter()
                             .map(|v| v.tag_name.clone())
-                            .collect::<Vec<_>>()
+                            .try_collect::<Vec<_>>()?
                             .into(),
                         variants,
                     }),
@@ -857,7 +859,7 @@ impl Schema {
             }
             match self.type_registry.get(&current) {
                 Some(td) => {
-                    chain.push(Arc::clone(td));
+                    chain.try_push(Arc::clone(td))?;
                     current = td.base().to_lowercase();
                 }
                 None => {
@@ -919,14 +921,14 @@ impl Schema {
         for sql in type_sqls {
             self.add_type_from_sql(sql)?;
         }
-        self.resolve_all_custom_type_affinities();
+        self.resolve_all_custom_type_affinities()?;
         Ok(())
     }
 
     /// Resolve custom type affinities for all STRICT tables in the schema.
     /// Call this after loading user-defined types from __turso_internal_types
     /// so that columns declared with custom types use the BASE type's affinity.
-    pub fn resolve_all_custom_type_affinities(&mut self) {
+    pub fn resolve_all_custom_type_affinities(&mut self) -> Result<()> {
         let mut tables: SmallVec<[(String, Arc<Table>); 8]> = SmallVec::with_capacity(8);
         for (name, table) in self.tables.iter().filter(|(_, t)| {
             t.is_strict()
@@ -939,12 +941,13 @@ impl Schema {
             let bt = table.btree().expect("checked btree table");
             let mut modified = (*bt).clone();
             modified.resolve_custom_type_affinities(self);
-            modified.propagate_domain_constraints(self);
+            modified.propagate_domain_constraints(self)?;
             tables.push((name.clone(), Arc::new(Table::BTree(Arc::new(modified)))));
         }
         for (name, table) in tables {
             self.tables.insert(name, table);
         }
+        Ok(())
     }
 
     pub fn is_unique_idx_name(&self, name: &str) -> bool {
@@ -1381,7 +1384,7 @@ impl Schema {
                     state.read_tx_active = true;
 
                     state.accumulators = Some(MakeFromBtreeAccumulators {
-                        from_sql_indexes: Vec::with_capacity(10),
+                        from_sql_indexes: Vec::try_with_capacity_ext(10)?,
                         automatic_indices: HashMap::with_capacity_and_hasher(10, FxBuildHasher),
                         dbsp_state_roots: HashMap::default(),
                         dbsp_state_index_roots: HashMap::default(),
@@ -1602,7 +1605,7 @@ impl Schema {
                 } else {
                     // Add composite unique index
                     let mut column_indices_and_sort_orders =
-                        Vec::with_capacity(unique_set.columns.len());
+                        Vec::try_with_capacity_ext(unique_set.columns.len())?;
                     for (col_name, sort_order) in unique_set.columns.iter() {
                         let Some((pos_in_table, _)) = table.get_column(col_name) else {
                             return Err(crate::LimboError::ParseError(format!(
@@ -1610,6 +1613,7 @@ impl Schema {
                                 col_name, table.name
                             )));
                         };
+                        // preallocated enough to no use try_push
                         column_indices_and_sort_orders.push((pos_in_table, *sort_order));
                     }
                     if let Some(index_entry) = automatic_indexes.pop() {
@@ -1817,7 +1821,7 @@ impl Schema {
 
                     let mut table = table;
                     table.resolve_custom_type_affinities(self);
-                    table.propagate_domain_constraints(self);
+                    table.propagate_domain_constraints(self)?;
                     self.add_btree_table(Arc::new(table))?;
                 }
             }
@@ -1998,7 +2002,7 @@ impl Schema {
             .get_btree_table(&target)
             .ok_or_else(|| fk_mismatch_err("<unknown>", &target))?;
 
-        let mut out = Vec::with_capacity(4); // arbitrary estimate
+        let mut out = Vec::try_with_capacity_ext(4)?; // arbitrary estimate
         for t in self.tables.values() {
             let Some(child) = t.btree() else {
                 continue;
@@ -2007,12 +2011,12 @@ impl Schema {
                 if !fk.parent_table.eq_ignore_ascii_case(&target) {
                     continue;
                 }
-                out.push(self.resolve_fk(
+                out.try_push(self.resolve_fk(
                     fk,
                     &child,
                     &parent_tbl,
                     /*require_unique=*/ false,
-                )?);
+                )?)?;
             }
         }
         Ok(out)
@@ -2027,12 +2031,13 @@ impl Schema {
             .get_btree_table(&child_name)
             .ok_or_else(|| fk_mismatch_err(&child_name, "<unknown>"))?;
 
-        let mut out = Vec::with_capacity(child.foreign_keys.len());
+        let mut out = Vec::try_with_capacity_ext(child.foreign_keys.len())?;
         for fk in &child.foreign_keys {
             let parent_name = normalize_ident(&fk.parent_table);
             let parent_tbl = self
                 .get_btree_table(&parent_name)
                 .ok_or_else(|| fk_mismatch_err(&child.name, &parent_name))?;
+            // Preallocated enough to not use try_push
             out.push(self.resolve_fk(fk, &child, &parent_tbl, /*require_unique=*/ true)?);
         }
         Ok(out)
@@ -2054,11 +2059,12 @@ impl Schema {
             return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
         }
 
-        let mut child_pos: Vec<usize> = Vec::with_capacity(fk.child_columns.len());
+        let mut child_pos: Vec<usize> = Vec::try_with_capacity_ext(fk.child_columns.len())?;
         for cname in fk.child_columns.iter() {
             let (i, _) = child
                 .get_column(cname)
                 .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?;
+            // Preallocated enough to not use try_push
             child_pos.push(i);
         }
 
@@ -2071,7 +2077,7 @@ impl Schema {
                 .primary_key_columns
                 .iter()
                 .map(|(col, _)| col.clone())
-                .collect()
+                .try_collect()?
         } else {
             fk.parent_columns.clone()
         };
@@ -2080,7 +2086,7 @@ impl Schema {
             return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
         }
 
-        let mut parent_pos: Vec<usize> = Vec::with_capacity(parent_cols.len());
+        let mut parent_pos: Vec<usize> = Vec::try_with_capacity_ext(parent_cols.len())?;
         for pc in parent_cols.iter() {
             let pos = parent_tbl.get_column(pc).map(|(i, _)| i).or_else(|| {
                 ROWID_STRS
@@ -2091,6 +2097,7 @@ impl Schema {
             let Some(p) = pos else {
                 return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
             };
+            // Preallocated enough to not use try_push
             parent_pos.push(p);
         }
 
@@ -2229,7 +2236,8 @@ impl Clone for Schema {
                     ))),
                 ),
             })
-            .collect();
+            .try_collect()
+            .expect("TODO: Clone is supposed to be fallible");
         let indexes = self
             .indexes
             .iter()
@@ -2237,32 +2245,41 @@ impl Clone for Schema {
                 let indexes = indexes
                     .iter()
                     .map(|index| Arc::new((**index).clone()))
-                    .collect();
-                (name.clone(), indexes)
+                    .try_collect()?;
+                Ok::<_, LimboError>((name.clone(), indexes))
             })
-            .collect();
+            .try_collect::<Result<_>>()
+            .expect("TODO: Clone is supposed to be fallible")
+            .unwrap();
         let materialized_view_names = self.materialized_view_names.clone();
         let materialized_view_sql = self.materialized_view_sql.clone();
         let incremental_views = self
             .incremental_views
             .iter()
             .map(|(name, view)| (name.clone(), view.clone()))
-            .collect();
+            .try_collect()
+            .expect("TODO: Clone is supposed to be fallible");
         let views = self
             .views
             .iter()
             .map(|(name, view)| (name.clone(), Arc::new((**view).clone())))
-            .collect();
+            .try_collect()
+            .expect("TODO: Clone is supposed to be fallible");
         let triggers = self
             .triggers
             .iter()
             .map(|(table_name, triggers)| {
-                (
+                Ok::<_, LimboError>((
                     table_name.clone(),
-                    triggers.iter().map(|t| Arc::new((**t).clone())).collect(),
-                )
+                    triggers
+                        .iter()
+                        .map(|t| Arc::new((**t).clone()))
+                        .try_collect()?,
+                ))
             })
-            .collect();
+            .try_collect::<Result<_>>()
+            .expect("TODO: Clone is supposed to be fallible")
+            .unwrap();
         let incompatible_views = self.incompatible_views.clone();
         Self {
             tables,
@@ -2626,14 +2643,14 @@ impl GeneratedColGraph {
         }
 
         // Kahn's algorithm (topological sort) over direct_deps.
-        let mut topological_sort: Vec<usize> = Vec::with_capacity(n);
-        let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+        let mut topological_sort: Vec<usize> = Vec::try_with_capacity_ext(n)?;
+        let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).try_collect()?;
         while let Some(i) = ready.pop() {
-            topological_sort.push(i);
+            topological_sort.try_push(i)?;
             for j in direct_dependents[i].iter() {
                 in_degree[j] -= 1;
                 if in_degree[j] == 0 {
-                    ready.push(j);
+                    ready.try_push(j)?;
                 }
             }
         }
@@ -2643,7 +2660,7 @@ impl GeneratedColGraph {
             let cycle_names: Vec<&str> = (0..n)
                 .filter(|i| in_degree[*i] > 0)
                 .filter_map(|i| columns[i].name.as_deref())
-                .collect();
+                .try_collect()?;
             bail_parse_error!(
                 "circular dependency in generated columns: {}",
                 cycle_names.join(", ")
@@ -2888,9 +2905,9 @@ impl BTreeTable {
     /// - Sets the column's NOT NULL flag if any domain in the chain has NOT NULL
     /// - Adds domain CHECK constraints (with `value` rewritten to the column name)
     ///   to the table's check_constraints list
-    pub fn propagate_domain_constraints(&mut self, schema: &Schema) {
+    pub fn propagate_domain_constraints(&mut self, schema: &Schema) -> Result<()> {
         if !self.is_strict {
-            return;
+            return Ok(());
         }
         // Collect new constraints and notnull flags to avoid borrowing issues
         let mut new_checks = Vec::new();
@@ -2906,7 +2923,7 @@ impl BTreeTable {
             let col_name = col.name.as_deref().unwrap_or("").to_string();
             for td in &resolved.chain {
                 if td.not_null {
-                    notnull_cols.push(col_idx);
+                    notnull_cols.try_push(col_idx)?;
                 }
                 for (i, dc) in td.domain_checks.iter().enumerate() {
                     let rewritten = rewrite_value_to_column(&dc.check, &col_name);
@@ -2914,11 +2931,11 @@ impl BTreeTable {
                         .name
                         .clone()
                         .unwrap_or_else(|| format!("{}_{}", td.name, i));
-                    new_checks.push(CheckConstraint {
+                    new_checks.try_push(CheckConstraint {
                         name: Some(name),
                         expr: *rewritten,
                         column: Some(col_name.clone()),
-                    });
+                    })?;
                 }
             }
         }
@@ -2926,7 +2943,8 @@ impl BTreeTable {
         for col_idx in notnull_cols {
             self.columns[col_idx].set_notnull(true);
         }
-        self.check_constraints.extend(new_checks);
+        self.check_constraints.try_extend(new_checks)?;
+        Ok(())
     }
 
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
@@ -3152,11 +3170,12 @@ impl BTreeTable {
         !self.has_rowid && self.primary_key_columns.len() == 1 && column.primary_key()
     }
 
-    pub fn column_collations(&self) -> Vec<CollationSeq> {
-        self.columns
+    pub fn column_collations(&self) -> Result<Vec<CollationSeq>> {
+        Ok(self
+            .columns
             .iter()
             .map(|column| column.collation())
-            .collect()
+            .try_collect()?)
     }
 
     #[inline]
@@ -3752,8 +3771,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     conflict_clause,
                 } = &c.constraint
                 {
-                    let mut unique_columns = Vec::with_capacity(columns.len());
+                    let mut unique_columns = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
+                        // preallocated enough to not need try_push
                         match column.expr.as_ref() {
                             Expr::Id(id) => unique_columns.push((
                                 id.as_str().to_string(),
@@ -3783,14 +3803,14 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     let child_columns: Box<[String]> = columns
                         .iter()
                         .map(|ic| normalize_ident(ic.col_name.as_str()))
-                        .collect();
+                        .try_collect()?;
                     // derive parent columns: explicit or default to parent PK
                     let parent_table = normalize_ident(clause.tbl_name.as_str());
                     let parent_columns: Box<[String]> = clause
                         .columns
                         .iter()
                         .map(|ic| normalize_ident(ic.col_name.as_str()))
-                        .collect();
+                        .try_collect()?;
 
                     // Only check arity if parent columns were explicitly listed
                     if !parent_columns.is_empty() && child_columns.len() != parent_columns.len() {
@@ -3999,8 +4019,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     .columns
                                     .iter()
                                     .map(|c| normalize_ident(c.col_name.as_str()))
-                                    .collect::<Vec<_>>()
-                                    .into_boxed_slice(),
+                                    .try_collect()?,
                                 on_delete: clause
                                     .args
                                     .iter()
@@ -4147,7 +4166,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut unique_sets = unique_sets_columns
         .into_iter()
         .chain(unique_sets_constraints)
-        .collect::<Vec<_>>();
+        .try_collect::<Vec<_>>()?;
     // Capture PK conflict clause before the rowid-alias UniqueSet is removed.
     let rowid_alias_conflict_clause = unique_sets
         .iter()
@@ -5036,7 +5055,7 @@ impl Index {
         assert!(has_primary_key_index);
         let (index_name, root_page) = auto_index;
 
-        let mut primary_keys = Vec::with_capacity(column_count);
+        let mut primary_keys = Vec::try_with_capacity_ext(column_count)?;
         for (col_name, order) in table.primary_key_columns.iter() {
             let Some((pos_in_table, _)) = table.get_column(col_name) else {
                 return Err(crate::LimboError::ParseError(format!(
@@ -5045,6 +5064,7 @@ impl Index {
                 )));
             };
             let (_, column) = table.get_column(col_name).unwrap();
+            // preallocated enough to not need try_push
             primary_keys.push(IndexColumn {
                 name: normalize_ident(col_name),
                 order: *order,
@@ -5079,7 +5099,7 @@ impl Index {
     ) -> Result<Index> {
         let (index_name, root_page) = auto_index;
 
-        let mut unique_cols = Vec::with_capacity(column_indices_and_sort_orders.len());
+        let mut unique_cols = Vec::try_with_capacity_ext(column_indices_and_sort_orders.len())?;
         for (pos, sort_order) in &column_indices_and_sort_orders {
             let Some((pos_in_table, col)) = table
                 .columns
@@ -5092,6 +5112,7 @@ impl Index {
                     table.name
                 )));
             };
+            // preallocated enough to not need try_push
             unique_cols.push(IndexColumn {
                 name: normalize_ident(col.name.as_ref().unwrap()),
                 order: *sort_order,
@@ -5248,6 +5269,7 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
 
     #[test]
     pub fn test_has_rowid_true() -> Result<()> {
