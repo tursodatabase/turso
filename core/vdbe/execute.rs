@@ -1,5 +1,5 @@
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
-use crate::function::AlterTableFunc;
+use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
@@ -3095,6 +3095,9 @@ pub fn halt(
                 program
                     .connection
                     .set_changes(state.n_change.load(Ordering::SeqCst));
+                program
+                    .connection
+                    .add_total_changes(state.n_total_change.load(Ordering::SeqCst));
             }
             Ok(InsnFunctionStepResult::Done)
         }
@@ -3110,6 +3113,9 @@ pub fn halt(
             program
                 .connection
                 .set_changes(state.n_change.load(Ordering::SeqCst));
+            program
+                .connection
+                .add_total_changes(state.n_total_change.load(Ordering::SeqCst));
         }
         Ok(InsnFunctionStepResult::Done)
     }
@@ -3274,12 +3280,15 @@ fn begin_mvcc_tx(
     pager: &Arc<Pager>,
     mode: &TransactionMode,
     existing_tx_id: Option<u64>,
+    connection: &Connection,
 ) -> Result<u64> {
     match mode {
         TransactionMode::None | TransactionMode::Read | TransactionMode::Concurrent => {
             mv_store.begin_tx(pager.clone())
         }
-        TransactionMode::Write => mv_store.begin_exclusive_tx(pager.clone(), existing_tx_id),
+        TransactionMode::Write => {
+            mv_store.begin_exclusive_tx(pager.clone(), existing_tx_id, connection)
+        }
     }
 }
 
@@ -3563,7 +3572,7 @@ pub fn op_transaction_inner(
                             // applies to all databases uniformly.
                             let effective_mode =
                                 conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or(*tx_mode);
-                            match begin_mvcc_tx(mv_store, &pager, &effective_mode, None) {
+                            match begin_mvcc_tx(mv_store, &pager, &effective_mode, None, &conn) {
                                 Ok(tx_id) => {
                                     conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
                                     started_secondary_tx = true;
@@ -3582,7 +3591,7 @@ pub fn op_transaction_inner(
                                 && matches!(tx_mode, TransactionMode::Write)
                             {
                                 if let Err(err) =
-                                    begin_mvcc_tx(mv_store, &pager, tx_mode, Some(tx_id))
+                                    begin_mvcc_tx(mv_store, &pager, tx_mode, Some(tx_id), &conn)
                                 {
                                     pager.end_read_tx();
                                     return Err(err);
@@ -3628,7 +3637,7 @@ pub fn op_transaction_inner(
                         }
 
                         if !has_existing_mv_tx {
-                            match begin_mvcc_tx(mv_store, &pager, tx_mode, None) {
+                            match begin_mvcc_tx(mv_store, &pager, tx_mode, None, &conn) {
                                 Ok(tx_id) => {
                                     // Check again in case checkpoint published roots after the
                                     // previous check and before this transaction was protected.
@@ -3671,9 +3680,13 @@ pub fn op_transaction_inner(
                             if matches!(new_transaction_state, TransactionState::Write { .. })
                                 && matches!(actual_tx_mode, TransactionMode::Write)
                             {
-                                if let Err(err) =
-                                    begin_mvcc_tx(mv_store, &pager, &actual_tx_mode, Some(tx_id))
-                                {
+                                if let Err(err) = begin_mvcc_tx(
+                                    mv_store,
+                                    &pager,
+                                    &actual_tx_mode,
+                                    Some(tx_id),
+                                    &conn,
+                                ) {
                                     if started_read_tx {
                                         pager.end_read_tx();
                                         conn.set_tx_state(TransactionState::None);
@@ -4052,7 +4065,11 @@ pub fn op_auto_commit(
         };
     }
 
-    turso_debug_assert!(matches!(tx_op, TxOp::Commit | TxOp::Rollback), "tx_op should be commit or rollback by now", {"tx_op": tx_op});
+    turso_debug_assert!(
+        matches!(tx_op, TxOp::Commit | TxOp::Rollback),
+        "tx_op should be commit or rollback by now",
+        { "tx_op": tx_op }
+    );
 
     // For explicit COMMIT, flush any pending index method writes first
     if matches!(tx_op, TxOp::Commit) {
@@ -4445,7 +4462,7 @@ fn finish_subprogram(
     saved_last_insert_rowid: Option<i64>,
     saved_changes_value: Option<i64>,
 ) {
-    let pending_changes = statement.n_change();
+    let pending_changes = statement.n_total_change();
     if pending_changes != 0 {
         program.connection.add_total_changes(pending_changes);
     }
@@ -4464,7 +4481,7 @@ fn finish_subprogram(
 
     // Restore `changes()`, but not `total_changes()`
     if let Some(changes) = saved_changes_value {
-        program.connection.set_changes_without_total(changes);
+        program.connection.set_changes(changes);
     }
 }
 
@@ -4479,7 +4496,9 @@ pub fn op_reset_count(
     }
 
     let nchange = state.n_change.swap(0, Ordering::SeqCst);
+    let ntotal_change = state.n_total_change.swap(0, Ordering::SeqCst);
     program.connection.set_changes(nchange);
+    program.connection.add_total_changes(ntotal_change);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -5827,6 +5846,17 @@ fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
             // We serialize to a record blob only in finalize, avoiding O(n²) re-serialization.
             payload.push(Value::from_i64(0));
         }
+        AggFunc::Mode => {
+            // [0] = collation bits, [1] = count, [2..] = buffered values.
+            payload.push(Value::from_i64(0)); // collation (recorded at step time)
+            payload.push(Value::from_i64(0)); // count
+        }
+        AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+            // [0] = collation bits, [1] = count, [2] = fraction, [3..] = buffered values.
+            payload.push(Value::from_i64(0)); // collation (recorded at step time)
+            payload.push(Value::from_i64(0)); // count
+            payload.push(Value::Null); // fraction (set on first step)
+        }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
             payload.push(Value::Blob(vec![]));
@@ -6103,6 +6133,13 @@ fn update_agg_payload(
                 "ArrayAgg should be handled directly in op_agg_step, not update_agg_payload".into(),
             ));
         }
+        AggFunc::Mode | AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+            // Ordered-set aggregates buffer values into a growable Vec, handled directly
+            // in op_agg_step (the slice here cannot grow).
+            return Err(LimboError::InternalError(
+                "ordered-set aggregate should be handled directly in op_agg_step".into(),
+            ));
+        }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
             // arg = value
@@ -6198,6 +6235,44 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                 Value::Blob(ImmutableRecord::from_values(elements, count)?.into_payload())
             }
         }
+        AggFunc::Mode => {
+            // payload: [0]=collation bits, [1]=count, [2..]=buffered values.
+            let collation =
+                CollationSeq::from_storage_bits(payload[0].as_int().unwrap_or(0) as u16);
+            let count = payload[1].as_int().unwrap_or(0) as usize;
+            if count == 0 || 2 + count > payload.len() {
+                Value::Null
+            } else {
+                ordered_set_mode(&payload[2..2 + count], collation)
+            }
+        }
+        AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+            // payload: [0]=collation bits, [1]=count, [2]=fraction, [3..]=buffered values.
+            // The fraction was range-checked in translate (pre-loop), so it is
+            // here either NULL (→ NULL output, matching PG) or a valid number.
+            if matches!(payload[2], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let collation =
+                CollationSeq::from_storage_bits(payload[0].as_int().unwrap_or(0) as u16);
+            let count = payload[1].as_int().unwrap_or(0) as usize;
+            let fraction = payload[2].as_float();
+            if count == 0 {
+                Value::Null
+            } else if 3 + count > payload.len() {
+                return Err(LimboError::InternalError(format!(
+                    "percentile: count ({count}) exceeds payload length ({})",
+                    payload.len()
+                )));
+            } else {
+                let values = &payload[3..3 + count];
+                if matches!(func, AggFunc::PercentileDisc) {
+                    ordered_set_percentile_disc(values, fraction, collation)
+                } else {
+                    ordered_set_percentile_cont(values, fraction)
+                }
+            }
+        }
         AggFunc::External(_) => {
             mark_unlikely();
             // External aggregates are finalized via AggContext::compute_external()
@@ -6230,6 +6305,147 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
     Ok(val)
 }
 
+/// Most frequent value of an ordered set (`mode() WITHIN GROUP (ORDER BY x)`).
+/// Ties are broken by the smallest value, matching PostgreSQL (the first value the
+/// ascending ordering would return).
+/// Compares two ordered-set values, honoring `collation` for text (built-in and locale
+/// collations are resolved without a connection; extension `Custom` collations fall back
+/// to BINARY, matching other connection-less comparison paths).
+fn ordered_set_compare(a: &Value, b: &Value, collation: CollationSeq) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Text(lhs), Value::Text(rhs)) => {
+            collation.compare_strings(lhs.as_str(), rhs.as_str())
+        }
+        _ => a.cmp(b),
+    }
+}
+
+fn ordered_set_mode(values: &[Value], collation: CollationSeq) -> Value {
+    // NULLs were already dropped at step time.
+    let mut sorted: Vec<Value> = values.to_vec();
+    sorted.sort_by(|a, b| ordered_set_compare(a, b, collation));
+    let mut best_idx = 0usize;
+    let mut best_count = 0usize;
+    let mut i = 0;
+    while i < sorted.len() {
+        let mut j = i + 1;
+        while j < sorted.len()
+            && ordered_set_compare(&sorted[j], &sorted[i], collation) == std::cmp::Ordering::Equal
+        {
+            j += 1;
+        }
+        // Strict `>` keeps the earliest (smallest, since sorted ascending) run on ties.
+        if j - i > best_count {
+            best_count = j - i;
+            best_idx = i;
+        }
+        i = j;
+    }
+    sorted[best_idx].clone()
+}
+
+/// Continuous (interpolated) percentile of an ordered set.
+///
+/// Non-numeric values are ignored (PostgreSQL instead requires a numeric/interval input
+/// type and errors otherwise, but columns are dynamically typed here). `percentile_disc`
+/// differs: it returns the actual element of any type, so it does not filter.
+fn ordered_set_percentile_cont(values: &[Value], fraction: f64) -> Value {
+    let mut floats: Vec<f64> = values
+        .iter()
+        .filter_map(|v| match v {
+            Value::Numeric(Numeric::Integer(i)) => Some(*i as f64),
+            Value::Numeric(Numeric::Float(f)) => Some(f64::from(*f)),
+            _ => None,
+        })
+        .collect();
+    if floats.is_empty() {
+        return Value::Null;
+    }
+    floats.sort_by(|a, b| a.total_cmp(b));
+    let n = floats.len() as f64;
+    let index = fraction * (n - 1.0);
+    let lower = index.floor() as usize;
+    let upper = index.ceil() as usize;
+    if lower == upper {
+        Value::from_f64(floats[lower])
+    } else {
+        let weight = index - lower as f64;
+        Value::from_f64(floats[lower] * (1.0 - weight) + floats[upper] * weight)
+    }
+}
+
+/// Discrete percentile of an ordered set: returns the actual element (in its original
+/// type) at the position PostgreSQL would select — the smallest value whose cumulative
+/// distribution (`row / n`) is at least `fraction`.
+fn ordered_set_percentile_disc(values: &[Value], fraction: f64, collation: CollationSeq) -> Value {
+    let mut sorted: Vec<Value> = values.to_vec();
+    sorted.sort_by(|a, b| ordered_set_compare(a, b, collation));
+    let n = sorted.len();
+    let index = if fraction <= 0.0 {
+        0
+    } else {
+        ((fraction * n as f64).ceil() as usize).saturating_sub(1)
+    };
+    sorted[index.min(n - 1)].clone()
+}
+
+fn op_window_step(
+    state: &mut ProgramState,
+    acc_reg: usize,
+    func: &WindowFunc,
+) -> Result<InsnFunctionStepResult> {
+    match func {
+        WindowFunc::RowNumber => {
+            if let Register::Value(Value::Null) = state.registers[acc_reg] {
+                state.registers[acc_reg] =
+                    Register::Aggregate(AggContext::Builtin(vec![Value::from_i64(0)]));
+            }
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                unreachable!("row_number accumulator must be a Builtin payload");
+            };
+            let Value::Numeric(Numeric::Integer(counter)) = &mut payload[0] else {
+                unreachable!("row_number counter must be Integer");
+            };
+            *counter += 1;
+        }
+        other => {
+            return Err(LimboError::InternalError(format!(
+                "window function {other} reached runtime dispatch but has no handler"
+            )))
+        }
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Per-row value read for pure window functions.
+fn op_window_value(
+    state: &mut ProgramState,
+    acc_reg: usize,
+    dest_reg: usize,
+    func: &WindowFunc,
+) -> Result<InsnFunctionStepResult> {
+    let value = match func {
+        WindowFunc::RowNumber => match &state.registers[acc_reg] {
+            Register::Aggregate(AggContext::Builtin(payload)) => payload[0].clone(),
+            other => {
+                return Err(LimboError::InternalError(format!(
+                    "row_number accumulator in unexpected register state: {other:?}"
+                )))
+            }
+        },
+        other => {
+            return Err(LimboError::InternalError(format!(
+                "window function {other} reached runtime dispatch but has no handler"
+            )))
+        }
+    };
+    state.registers[dest_reg].set_value(value);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_agg_step(
     program: &Program,
     state: &mut ProgramState,
@@ -6246,6 +6462,11 @@ pub fn op_agg_step(
         },
         insn
     );
+
+    if let AccumulatorFunc::Window(win_func) = func {
+        return op_window_step(state, *acc_reg, win_func);
+    }
+    let func = func.expect_agg();
 
     // Initialize aggregate state if not already done
     if let Register::Value(Value::Null) = state.registers[*acc_reg] {
@@ -6344,49 +6565,76 @@ pub fn op_agg_step(
         _ => {
             let arg = state.registers[*col].get_value().clone();
 
-            if matches!(func, AggFunc::ArrayAgg) {
-                // ArrayAgg grows the payload Vec directly (O(1) per row).
-                let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
-                    panic!(
-                        "Unexpected value {:?} in AggStep at register {}",
-                        state.registers[*acc_reg], *acc_reg
-                    );
-                };
-                let payload = agg.payload_vec_mut();
-                let count = payload[0]
-                    .as_int()
-                    .expect("array_agg count must be an integer")
-                    as usize;
-                payload[0] = Value::from_i64((count + 1) as i64);
-                payload.push(arg);
-            } else {
-                // Only a subset of aggregate functions take two arguments
-                let maybe_arg2 = match func {
-                    AggFunc::GroupConcat | AggFunc::StringAgg => {
-                        Some(state.registers[*delimiter].get_value().clone())
+            // Read the optional second-argument register before borrowing the
+            // accumulator mutably (delimiter for group_concat/json, fraction for percentiles).
+            let maybe_arg2 = match func {
+                AggFunc::GroupConcat | AggFunc::StringAgg => {
+                    Some(state.registers[*delimiter].get_value().clone())
+                }
+                #[cfg(feature = "json")]
+                AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
+                    Some(state.registers[*delimiter].get_value().clone())
+                }
+                AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+                    Some(state.registers[*delimiter].get_value().clone())
+                }
+                _ => None,
+            };
+
+            let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+                panic!(
+                    "Unexpected value {:?} in AggStep at register {}",
+                    state.registers[*acc_reg], *acc_reg
+                );
+            };
+
+            match func {
+                // ArrayAgg and the ordered-set aggregates buffer values by growing the
+                // payload Vec directly (O(1) per row); they cannot use the fixed-size slice.
+                AggFunc::ArrayAgg => {
+                    let payload = agg.payload_vec_mut();
+                    let count = payload[0]
+                        .as_int()
+                        .expect("array_agg count must be an integer")
+                        as usize;
+                    payload[0] = Value::from_i64((count + 1) as i64);
+                    payload.push(arg);
+                }
+                AggFunc::Mode => {
+                    let payload = agg.payload_vec_mut();
+                    // Record the value's collation (constant per group) for finalize-time sorting.
+                    payload[0] = Value::from_i64(current_collation.to_bits() as i64);
+                    // Ordered-set aggregates ignore NULL inputs.
+                    if !matches!(arg, Value::Null) {
+                        let count = payload[1].as_int().unwrap_or(0) as usize;
+                        payload[1] = Value::from_i64((count + 1) as i64);
+                        payload.push(arg);
                     }
-                    #[cfg(feature = "json")]
-                    AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-                        Some(state.registers[*delimiter].get_value().clone())
+                }
+                AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+                    let payload = agg.payload_vec_mut();
+                    payload[0] = Value::from_i64(current_collation.to_bits() as i64);
+                    // The fraction is a per-group constant; record it on every step.
+                    if let Some(fraction) = maybe_arg2 {
+                        payload[2] = fraction;
                     }
-                    _ => None,
-                };
-                // Now get mutable borrow on payload
-                let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
-                    panic!(
-                        "Unexpected value {:?} in AggStep at register {}",
-                        state.registers[*acc_reg], *acc_reg
-                    );
-                };
-                let payload = agg.payload_mut();
-                update_agg_payload(
-                    func,
-                    arg,
-                    maybe_arg2,
-                    payload,
-                    current_collation,
-                    &comparator,
-                )?;
+                    if !matches!(arg, Value::Null) {
+                        let count = payload[1].as_int().unwrap_or(0) as usize;
+                        payload[1] = Value::from_i64((count + 1) as i64);
+                        payload.push(arg);
+                    }
+                }
+                _ => {
+                    let payload = agg.payload_mut();
+                    update_agg_payload(
+                        func,
+                        arg,
+                        maybe_arg2,
+                        payload,
+                        current_collation,
+                        &comparator,
+                    )?;
+                }
             }
         }
     };
@@ -6411,6 +6659,11 @@ pub fn op_agg_final(
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
 
+    if let AccumulatorFunc::Window(win_func) = func {
+        return op_window_value(state, acc_reg, dest_reg, win_func);
+    }
+    let func = func.expect_agg();
+
     match &state.registers[acc_reg] {
         Register::Aggregate(agg) => {
             let value = match agg {
@@ -6426,7 +6679,9 @@ pub fn op_agg_final(
             state.registers[dest_reg].set_value(value);
         }
         Register::Value(Value::Null) => {
-            // When the set is empty, return appropriate default
+            // No row was stepped: write the empty-set default explicitly.
+            // For window aggregates `dest_reg` differs from `acc_reg` and may
+            // still hold an earlier partition's result.
             match func {
                 AggFunc::Total => {
                     state.registers[dest_reg]
@@ -6480,7 +6735,9 @@ pub fn op_agg_final(
                     };
                     state.registers[dest_reg].set_value(value);
                 }
-                _ => {}
+                _ => {
+                    state.registers[dest_reg].set_value(Value::Null);
+                }
             }
         }
         other => {
@@ -7395,6 +7652,17 @@ pub fn op_function(
             }
             ScalarFunc::Random => {
                 state.registers[*dest].set_int(pager.io.generate_random_number());
+            }
+            #[cfg(feature = "test_helper")]
+            ScalarFunc::TestNondetCounter => {
+                // Test-only: process-global atomic counter that increments on
+                // every evaluation. Used in sqltests to verify that the
+                // planner does not deduplicate equivalent SQL calls that
+                // contain nondeterministic functions.
+                static TEST_NONDET_COUNTER: std::sync::atomic::AtomicI64 =
+                    std::sync::atomic::AtomicI64::new(0);
+                let value = TEST_NONDET_COUNTER.fetch_add(1, Ordering::Relaxed);
+                state.registers[*dest].set_int(value);
             }
             ScalarFunc::Trim => {
                 let reg_value = &state.registers[*start_reg];
@@ -9517,14 +9785,16 @@ pub fn op_insert(
                         if !flag.has(InsertFlags::SKIP_LAST_ROWID) {
                             program.connection.update_last_rowid(rowid);
                         }
-                        state
-                            .n_change
-                            .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
+                        if flag.has(InsertFlags::SKIP_STATEMENT_CHANGE_COUNT) {
+                            state.record_total_change();
+                        } else {
+                            state.record_statement_change();
+                        }
                     }
+                } else if flag.has(InsertFlags::SKIP_STATEMENT_CHANGE_COUNT) {
+                    state.record_total_change();
                 } else {
-                    state
-                        .n_change
-                        .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
+                    state.record_statement_change();
                 }
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
@@ -9736,9 +10006,7 @@ pub fn op_delete(
     if !is_part_of_update {
         // DELETEs do not count towards the total changes if they are part of an UPDATE statement,
         // i.e. the DELETE and subsequent INSERT of a row are the same "change".
-        state
-            .n_change
-            .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
+        state.record_statement_change();
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -10106,10 +10374,9 @@ fn new_rowid_inner(
                                     state.registers[*prev_largest_reg]
                                         .set_int(prev_rowid.unwrap_or(0));
                                 }
-                                *state.active_op_state.new_rowid() =
-                                    OpNewRowidState::SeekingToLast {
-                                        mvcc_already_initialized: true,
-                                    };
+                                state.active_op_state.clear();
+                                state.pc += 1;
+                                return Ok(InsnFunctionStepResult::Step);
                             }
                             NextRowidResult::FindRandom => {
                                 mvcc_cursor.end_new_rowid();
@@ -10933,27 +11200,6 @@ pub fn op_reset_sorter(
         CursorType::BTreeTable(_) => {
             let cursor = cursor.as_btree_mut();
             return_if_io!(cursor.clear_btree());
-            // FIXME: cuurently we don't have a good way to identify cursors that are
-            // iterating in the same underlying BTree
-
-            // After clearing the btree, invalidate cached navigation state on all
-            // other cursors that share the same underlying btree (e.g. OpenDup cursors).
-            // Without this, dup cursors may use stale cached rightmost-page info and
-            // attempt to insert into freed pages, causing corruption.
-            let cleared_pager = {
-                let cursor = state.get_cursor(*cursor_id);
-                cursor.as_btree_mut().get_pager()
-            };
-            for (i, other_cursor_opt) in state.cursors.iter_mut().enumerate() {
-                if i == *cursor_id {
-                    continue;
-                }
-                if let Some(Cursor::BTree(ref mut btree_cursor)) = other_cursor_opt {
-                    if Arc::ptr_eq(&btree_cursor.get_pager(), &cleared_pager) {
-                        btree_cursor.invalidate_btree_cache();
-                    }
-                }
-            }
         }
         CursorType::Sorter => {
             return Err(LimboError::InternalError(

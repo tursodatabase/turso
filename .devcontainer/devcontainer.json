@@ -5,6 +5,7 @@
   "remoteUser": "node",
   "workspaceFolder": "/workspace",
   "waitFor": "postStartCommand",
+  "initializeCommand": ".devcontainer/init-env.sh",
   "customizations": {
     "vscode": {
       "extensions": [

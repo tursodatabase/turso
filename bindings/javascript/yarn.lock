@@ -360,12 +360,12 @@
   resolved "https://registry.npmjs.org/@standard-schema/spec/-/spec-1.1.0.tgz"
   integrity sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==
 
-"@tursodatabase/database-common@^0.7.0-pre.4", "@tursodatabase/database-common@file:/Users/penberg/src/tursodatabase/turso-maint/bindings/javascript/packages/common":
-  version "0.7.0-pre.4"
+"@tursodatabase/database-common@^0.7.0-pre.5", "@tursodatabase/database-common@file:/Users/penberg/src/tursodatabase/turso-maint/bindings/javascript/packages/common":
+  version "0.7.0-pre.5"
   resolved "file:packages/common"
 
-"@tursodatabase/database-wasm-common@^0.7.0-pre.4", "@tursodatabase/database-wasm-common@file:/Users/penberg/src/tursodatabase/turso-maint/bindings/javascript/packages/wasm-common":
-  version "0.7.0-pre.4"
+"@tursodatabase/database-wasm-common@^0.7.0-pre.5", "@tursodatabase/database-wasm-common@file:/Users/penberg/src/tursodatabase/turso-maint/bindings/javascript/packages/wasm-common":
+  version "0.7.0-pre.5"
   resolved "file:packages/wasm-common"
   dependencies:
     "@emnapi/core" "1.8.1"
@@ -373,42 +373,42 @@
     "@napi-rs/wasm-runtime" "1.0.7"
 
 "@tursodatabase/database-wasm@file:/Users/penberg/src/tursodatabase/turso-maint/bindings/javascript/packages/wasm":
-  version "0.7.0-pre.4"
+  version "0.7.0-pre.5"
   resolved "file:packages/wasm"
   dependencies:
-    "@tursodatabase/database-common" "^0.7.0-pre.4"
-    "@tursodatabase/database-wasm-common" "^0.7.0-pre.4"
+    "@tursodatabase/database-common" "^0.7.0-pre.5"
+    "@tursodatabase/database-wasm-common" "^0.7.0-pre.5"
 
 "@tursodatabase/database@file:/Users/penberg/src/tursodatabase/turso-maint/bindings/javascript/packages/native":
-  version "0.7.0-pre.4"
+  version "0.7.0-pre.5"
   resolved "file:packages/native"
   dependencies:
-    "@tursodatabase/database-common" "^0.7.0-pre.4"
+    "@tursodatabase/database-common" "^0.7.0-pre.5"
 
 "@tursodatabase/serverless@^0.2.2":
   version "0.2.4"
 
-"@tursodatabase/sync-common@^0.7.0-pre.4", "@tursodatabase/sync-common@file:/Users/penberg/src/tursodatabase/turso-maint/bindings/javascript/sync/packages/common":
-  version "0.7.0-pre.4"
+"@tursodatabase/sync-common@^0.7.0-pre.5", "@tursodatabase/sync-common@file:/Users/penberg/src/tursodatabase/turso-maint/bindings/javascript/sync/packages/common":
+  version "0.7.0-pre.5"
   resolved "file:sync/packages/common"
   dependencies:
-    "@tursodatabase/database-common" "^0.7.0-pre.4"
+    "@tursodatabase/database-common" "^0.7.0-pre.5"
     "@tursodatabase/serverless" "^0.2.2"
 
 "@tursodatabase/sync-wasm@file:/Users/penberg/src/tursodatabase/turso-maint/bindings/javascript/sync/packages/wasm":
-  version "0.7.0-pre.4"
+  version "0.7.0-pre.5"
   resolved "file:sync/packages/wasm"
   dependencies:
-    "@tursodatabase/database-common" "^0.7.0-pre.4"
-    "@tursodatabase/database-wasm-common" "^0.7.0-pre.4"
-    "@tursodatabase/sync-common" "^0.7.0-pre.4"
+    "@tursodatabase/database-common" "^0.7.0-pre.5"
+    "@tursodatabase/database-wasm-common" "^0.7.0-pre.5"
+    "@tursodatabase/sync-common" "^0.7.0-pre.5"
 
 "@tursodatabase/sync@file:/Users/penberg/src/tursodatabase/turso-maint/bindings/javascript/sync/packages/native":
-  version "0.7.0-pre.4"
+  version "0.7.0-pre.5"
   resolved "file:sync/packages/native"
   dependencies:
-    "@tursodatabase/database-common" "^0.7.0-pre.4"
-    "@tursodatabase/sync-common" "^0.7.0-pre.4"
+    "@tursodatabase/database-common" "^0.7.0-pre.5"
+    "@tursodatabase/sync-common" "^0.7.0-pre.5"
 
 "@tybys/wasm-util@^0.10.1":
   version "0.10.1"

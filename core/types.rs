@@ -2860,6 +2860,8 @@ impl Debug for Cursor {
 
 impl Cursor {
     pub fn new_btree(cursor: Box<dyn CursorTrait>) -> Self {
+        // Matches sqlite3BtreeCursor adding to BtShared.pCursor (btree.c:4699).
+        cursor.register_with_pager();
         Self::BTree(cursor)
     }
 

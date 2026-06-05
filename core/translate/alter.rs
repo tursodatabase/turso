@@ -289,7 +289,7 @@ fn emit_delete_sqlite_sequence_entry(
     });
 }
 
-fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
+pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
     match literal {
         ast::Literal::Numeric(val) => parse_numeric_literal(val),
         ast::Literal::String(s) => Ok(Value::from_text(crate::translate::expr::sanitize_string(s))),
@@ -1283,8 +1283,8 @@ pub fn translate_alter_table(
             // added column. Without this, columns typed with a domain would
             // silently skip domain-level enforcement after ALTER TABLE.
             resolver.with_schema(database_id, |schema| {
-                btree.propagate_domain_constraints(schema);
-            });
+                btree.propagate_domain_constraints(schema)
+            })?;
             // Refresh local `column` from btree so that domain NOT NULL is
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();

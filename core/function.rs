@@ -444,33 +444,162 @@ pub enum AggFunc {
     #[cfg(feature = "json")]
     JsonGroupObject,
     ArrayAgg,
+    /// `mode() WITHIN GROUP (ORDER BY x)` — most frequent value of `x`.
+    /// Stored args (post-planning): `[value]`.
+    #[strum(disabled)]
+    Mode,
+    /// `percentile_cont(fraction) WITHIN GROUP (ORDER BY x)` — interpolated percentile.
+    /// Stored args (post-planning): `[value, fraction]`.
+    #[strum(disabled)]
+    PercentileCont,
+    /// `percentile_disc(fraction) WITHIN GROUP (ORDER BY x)` — discrete percentile.
+    /// Stored args (post-planning): `[value, fraction]`.
+    #[strum(disabled)]
+    PercentileDisc,
     #[strum(disabled)]
     External(Arc<ExtFunc>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
+#[derive(Debug, Clone, strum::EnumIter)]
 pub enum WindowFunc {
     RowNumber,
+    Rank,
+    DenseRank,
+    PercentRank,
+    CumeDist,
+    Ntile,
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    NthValue,
+    #[strum(disabled)]
+    External(Arc<ExtFunc>),
 }
 
 impl WindowFunc {
+    /// SQL name of this window function. Matches the strings used by
+    /// `Display` so EXPLAIN output and error messages agree.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RowNumber => "row_number",
+            Self::Rank => "rank",
+            Self::DenseRank => "dense_rank",
+            Self::PercentRank => "percent_rank",
+            Self::CumeDist => "cume_dist",
+            Self::Ntile => "ntile",
+            Self::Lag => "lag",
+            Self::Lead => "lead",
+            Self::FirstValue => "first_value",
+            Self::LastValue => "last_value",
+            Self::NthValue => "nth_value",
+            Self::External(_) => unreachable!(
+                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
+            ),
+        }
+    }
+
     pub fn arities(&self) -> &'static [i32] {
         match self {
-            Self::RowNumber => &[0],
+            Self::RowNumber | Self::Rank | Self::DenseRank | Self::PercentRank | Self::CumeDist => {
+                &[0]
+            }
+            Self::Ntile | Self::FirstValue | Self::LastValue => &[1],
+            Self::NthValue => &[2],
+            Self::Lag | Self::Lead => &[1, 2, 3],
+            Self::External(_) => unreachable!(
+                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
+            ),
+        }
+    }
+
+    /// Whether name resolution + runtime dispatch are wired up. Stub variants
+    /// must not be advertised via `pragma_function_list`, or introspection
+    /// drifts ahead of the resolver and users get "no such function" when
+    /// they try to call them.
+    pub fn is_implemented(&self) -> bool {
+        matches!(self, Self::RowNumber)
+    }
+}
+
+impl PartialEq for WindowFunc {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::RowNumber, Self::RowNumber)
+            | (Self::Rank, Self::Rank)
+            | (Self::DenseRank, Self::DenseRank)
+            | (Self::PercentRank, Self::PercentRank)
+            | (Self::CumeDist, Self::CumeDist)
+            | (Self::Ntile, Self::Ntile)
+            | (Self::Lag, Self::Lag)
+            | (Self::Lead, Self::Lead)
+            | (Self::FirstValue, Self::FirstValue)
+            | (Self::LastValue, Self::LastValue)
+            | (Self::NthValue, Self::NthValue) => true,
+            (Self::External(a), Self::External(b)) => Arc::ptr_eq(a, b),
+            _ => false,
         }
     }
 }
 
+impl Eq for WindowFunc {}
+
 impl Deterministic for WindowFunc {
     fn is_deterministic(&self) -> bool {
-        true
+        match self {
+            Self::RowNumber
+            | Self::Rank
+            | Self::DenseRank
+            | Self::PercentRank
+            | Self::CumeDist
+            | Self::Ntile
+            | Self::Lag
+            | Self::Lead
+            | Self::FirstValue
+            | Self::LastValue
+            | Self::NthValue => true,
+            Self::External(_) => unreachable!(
+                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
+            ),
+        }
     }
 }
 
 impl std::fmt::Display for WindowFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Function reference used by AggStep / AggValue / AggFinal opcodes.
+/// Aggregates used in window context and pure window functions share the same
+/// step/value dispatch path; this enum carries which side of that split a
+/// particular call belongs to.
+#[derive(Debug, Clone)]
+pub enum AccumulatorFunc {
+    Agg(AggFunc),
+    Window(WindowFunc),
+}
+
+impl AccumulatorFunc {
+    /// Extract the inner `AggFunc` when this kind is known to be an
+    /// aggregate. `unreachable!`s on `Window(...)` — the only opcodes
+    /// that carry an `AccumulatorFunc` are the AggStep / AggValue /
+    /// AggFinal trio, and the call sites that emit those wrap aggregates
+    /// only. A `Window` value reaching here is a planner bug.
+    pub fn expect_agg(&self) -> &AggFunc {
         match self {
-            Self::RowNumber => write!(f, "row_number"),
+            Self::Agg(f) => f,
+            Self::Window(f) => {
+                unreachable!("window function {f} reached an aggregate-only dispatch path")
+            }
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Agg(f) => f.as_str(),
+            Self::Window(f) => f.as_str(),
         }
     }
 }
@@ -486,7 +615,10 @@ impl PartialEq for AggFunc {
             | (Self::StringAgg, Self::StringAgg)
             | (Self::Sum, Self::Sum)
             | (Self::Total, Self::Total)
-            | (Self::ArrayAgg, Self::ArrayAgg) => true,
+            | (Self::ArrayAgg, Self::ArrayAgg)
+            | (Self::Mode, Self::Mode)
+            | (Self::PercentileCont, Self::PercentileCont)
+            | (Self::PercentileDisc, Self::PercentileDisc) => true,
             (Self::External(a), Self::External(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
@@ -517,6 +649,10 @@ impl AggFunc {
             Self::Sum => 1,
             Self::Total => 1,
             Self::ArrayAgg => 1,
+            // Ordered-set aggregates: args are rewritten by the planner to
+            // `[value]` (mode) or `[value, fraction]` (percentiles).
+            Self::Mode => 1,
+            Self::PercentileCont | Self::PercentileDisc => 2,
             #[cfg(feature = "json")]
             Self::JsonGroupArray | Self::JsonbGroupArray => 1,
             #[cfg(feature = "json")]
@@ -542,6 +678,8 @@ impl AggFunc {
             Self::Sum => &[1],
             Self::Total => &[1],
             Self::ArrayAgg => &[1],
+            Self::Mode => &[1],
+            Self::PercentileCont | Self::PercentileDisc => &[2],
             #[cfg(feature = "json")]
             Self::JsonGroupArray | Self::JsonbGroupArray => &[1],
             #[cfg(feature = "json")]
@@ -562,6 +700,9 @@ impl AggFunc {
             Self::Sum => "sum",
             Self::Total => "total",
             Self::ArrayAgg => "array_agg",
+            Self::Mode => "mode",
+            Self::PercentileCont => "percentile_cont",
+            Self::PercentileDisc => "percentile_disc",
             #[cfg(feature = "json")]
             Self::JsonbGroupArray => "jsonb_group_array",
             #[cfg(feature = "json")]
@@ -652,6 +793,11 @@ pub enum ScalarFunc {
     TestUintDiv,
     TestUintLt,
     TestUintEq,
+    /// Test-only: returns a monotonically increasing 64-bit integer on every
+    /// evaluation. Used to verify that the planner does not deduplicate
+    /// equivalent SQL calls that contain nondeterministic functions.
+    #[cfg(feature = "test_helper")]
+    TestNondetCounter,
     StringReverse,
     // Built-in type support functions
     BooleanToInt,
@@ -769,6 +915,8 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::TestUintLt
             | ScalarFunc::TestUintEq
             | ScalarFunc::StringReverse => true,
+            #[cfg(feature = "test_helper")]
+            ScalarFunc::TestNondetCounter => false,
             ScalarFunc::BooleanToInt
             | ScalarFunc::IntToBoolean
             | ScalarFunc::ValidateIpAddr
@@ -904,6 +1052,8 @@ impl Display for ScalarFunc {
             Self::TestUintDiv => "test_uint_div",
             Self::TestUintLt => "test_uint_lt",
             Self::TestUintEq => "test_uint_eq",
+            #[cfg(feature = "test_helper")]
+            Self::TestNondetCounter => "test_nondet_counter",
             Self::StringReverse => "string_reverse",
             Self::BooleanToInt => "boolean_to_int",
             Self::IntToBoolean => "int_to_boolean",
@@ -975,6 +1125,8 @@ impl ScalarFunc {
             | Self::TursoVersion
             | Self::SqliteSourceId
             | Self::TotalChanges => &[0],
+            #[cfg(feature = "test_helper")]
+            Self::TestNondetCounter => &[0],
             // 1-arg
             Self::Abs
             | Self::Hex
@@ -1301,7 +1453,7 @@ impl Func {
         }
         match self {
             Self::Scalar(scalar_func) => {
-                matches!(
+                let basic = matches!(
                     scalar_func,
                     ScalarFunc::Changes
                         | ScalarFunc::Random
@@ -1310,7 +1462,10 @@ impl Func {
                         | ScalarFunc::TursoVersion
                         | ScalarFunc::SqliteSourceId
                         | ScalarFunc::LastInsertRowid
-                )
+                );
+                #[cfg(feature = "test_helper")]
+                let basic = basic || matches!(scalar_func, ScalarFunc::TestNondetCounter);
+                basic
             }
             Self::Math(math_func) => {
                 matches!(math_func.arity(), MathFuncArity::Nullary)
@@ -1608,6 +1763,8 @@ impl Func {
             "test_uint_div" => Ok(Some(Self::Scalar(ScalarFunc::TestUintDiv))),
             "test_uint_lt" => Ok(Some(Self::Scalar(ScalarFunc::TestUintLt))),
             "test_uint_eq" => Ok(Some(Self::Scalar(ScalarFunc::TestUintEq))),
+            #[cfg(feature = "test_helper")]
+            "test_nondet_counter" => Ok(Some(Self::Scalar(ScalarFunc::TestNondetCounter))),
             "string_reverse" => Ok(Some(Self::Scalar(ScalarFunc::StringReverse))),
             // Built-in type support functions
             "boolean_to_int" => Ok(Some(Self::Scalar(ScalarFunc::BooleanToInt))),
@@ -1681,8 +1838,11 @@ impl Func {
             push(f.to_string(), "w", f.arities(), f.is_deterministic());
         }
 
-        // Window functions.
+        // Window functions (skip stub variants until they're wired up).
         for f in WindowFunc::iter() {
+            if !f.is_implemented() {
+                continue;
+            }
             push(f.to_string(), "w", f.arities(), f.is_deterministic());
         }
 

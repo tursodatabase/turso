@@ -7,7 +7,8 @@ pub fn to_u16(v: usize) -> u16 {
     v.try_into().expect("value exceeds u16::MAX")
 }
 
-use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
+use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
+use crate::function::AccumulatorFunc;
 use crate::{
     schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
@@ -179,6 +180,7 @@ impl InsertFlags {
     pub const REQUIRE_SEEK: u8 = 0x02; // Flag indicating that a seek is required to insert the row
     pub const EPHEMERAL_TABLE_INSERT: u8 = 0x04; // Flag indicating that this is an insert into an ephemeral table
     pub const SKIP_LAST_ROWID: u8 = 0x08; // Flag indicating that last_insert_rowid() must not be updated
+    pub const SKIP_STATEMENT_CHANGE_COUNT: u8 = 0x10; // Flag indicating that changes() must not count this insert
 
     pub fn new() -> Self {
         InsertFlags(0)
@@ -205,6 +207,11 @@ impl InsertFlags {
 
     pub fn skip_last_rowid(mut self) -> Self {
         self.0 |= InsertFlags::SKIP_LAST_ROWID;
+        self
+    }
+
+    pub fn skip_statement_change_count(mut self) -> Self {
+        self.0 |= InsertFlags::SKIP_STATEMENT_CHANGE_COUNT;
         self
     }
 }
@@ -1027,14 +1034,14 @@ pub enum Insn {
         acc_reg: usize,
         col: usize,
         delimiter: usize,
-        func: AggFunc,
+        func: AccumulatorFunc,
         /// Optional custom type comparator for MIN/MAX aggregates.
         comparator: Option<SortComparatorType>,
     },
 
     AggFinal {
         register: usize,
-        func: AggFunc,
+        func: AccumulatorFunc,
     },
 
     /// Similar to AggFinal, but instead of writing the result back into the
@@ -1043,7 +1050,7 @@ pub enum Insn {
     AggValue {
         acc_reg: usize,
         dest_reg: usize,
-        func: AggFunc,
+        func: AccumulatorFunc,
     },
 
     /// Open a sorter.

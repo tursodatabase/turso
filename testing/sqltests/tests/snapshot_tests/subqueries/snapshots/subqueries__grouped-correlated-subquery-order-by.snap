@@ -35,7 +35,7 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
    7            OpenRead         2   3   0  k(2,B)           0  index=idx_grouped_values_grp, root=3, iDb=0
    8            Rewind           2  23   0                   0  Rewind index idx_grouped_values_grp
    9              DeferredSeek   2   1   0                   0
-  10              Column         1   0  12                   0  r[12]=grouped_values.grp
+  10              Column         2   0  12                   0  r[12]=idx_grouped_values_grp.grp
   11              Column         1   1  13                   0  r[13]=grouped_values.val
   12              Compare        8  12   1  k(1, Binary)     0  r[8..8]==r[12..12]
   13              Jump          14  18  14                   0  ; start new group if comparison is not equal
@@ -45,7 +45,7 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
   17              Gosub         14  58   0                   0  ; goto clear accumulator subroutine
   18              AggStep        0  13  10  sum              0  accum=r[10] step(r[13])
   19              If             6  21   0                   0  if r[6] goto 21; don't emit group columns if continuing existing group
-  20              Column         1   0   9                   0  r[9]=grouped_values.grp
+  20              Column         2   0   9                   0  r[9]=idx_grouped_values_grp.grp
   21              Integer        1   6   0                   0  r[6]=1; indicate data in accumulator
   22            Next             2   9   0                   0
   23            Gosub            5  27   0                   0  ; emit row for final group

@@ -1841,18 +1841,12 @@ impl Connection {
         self.last_insert_rowid.store(rowid, Ordering::SeqCst);
     }
 
-    /// Sets the value of `changes()`, but without altering `total_changes()`.
-    pub(crate) fn set_changes_without_total(&self, num_changes: i64) {
-        self.changes.store(num_changes, Ordering::SeqCst);
-    }
-
     pub(crate) fn add_total_changes(&self, num_changes: i64) {
         self.total_changes.fetch_add(num_changes, Ordering::SeqCst);
     }
 
     pub fn set_changes(&self, num_changes: i64) {
-        self.set_changes_without_total(num_changes);
-        self.add_total_changes(num_changes);
+        self.changes.store(num_changes, Ordering::SeqCst);
     }
 
     pub fn changes(&self) -> i64 {

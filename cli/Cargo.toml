@@ -73,6 +73,7 @@ mimalloc = ["dep:mimalloc"]
 fts = ["turso_core/fts"]
 mvcc_repl = []
 stacker = ["turso_core/stacker"]
+test_helper = ["turso_core/test_helper"]
 
 [build-dependencies]
 syntect = { git = "https://github.com/trishume/syntect.git", rev = "64644ffe064457265cbcee12a0c1baf9485ba6ee", default-features = false, features = ["default-fancy"] }

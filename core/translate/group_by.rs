@@ -6,6 +6,7 @@ use super::{
     plan::{Distinctness, GroupBy, SelectPlan, SubqueryEvalPhase, SubqueryOrigin},
     result_row::emit_select_result,
 };
+use crate::function::AccumulatorFunc;
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     order_by::{custom_type_comparator, EmitOrderBy},
@@ -763,6 +764,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -817,6 +819,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -1012,7 +1015,7 @@ pub fn group_by_emit_row_phase<'a>(
         let agg_result_reg = agg_start_reg + i;
         program.emit_insn(Insn::AggFinal {
             register: agg_result_reg,
-            func: agg.func.clone(),
+            func: AccumulatorFunc::Agg(agg.func.clone()),
         });
         t_ctx.resolver.cache_expr_reg(
             std::borrow::Cow::Owned(agg.original_expr.clone()),

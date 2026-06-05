@@ -1,7 +1,7 @@
 use turso_parser::ast;
 
 use crate::{
-    function::AggFunc,
+    function::{AccumulatorFunc, AggFunc},
     schema::Table,
     sync::Arc,
     translate::collate::CollationSeq,
@@ -36,7 +36,7 @@ pub fn emit_ungrouped_aggregation<'a>(
         let agg_result_reg = agg_start_reg + i;
         program.emit_insn(Insn::AggFinal {
             register: agg_result_reg,
-            func: agg.func.clone(),
+            func: AccumulatorFunc::Agg(agg.func.clone()),
         });
     }
     // we now have the agg results in (agg_start_reg..agg_start_reg + aggregates.len() - 1)
@@ -347,6 +347,9 @@ pub fn translate_aggregation_step(
     agg_arg_source: AggArgumentSource,
     target_register: usize,
     resolver: &Resolver,
+    // For `percentile_cont` / `percentile_disc`: register pre-evaluated by
+    // `InitLoop::emit`. `None` for any other aggregate.
+    fraction_reg: Option<usize>,
 ) -> Result<usize> {
     let num_args = agg_arg_source.num_args();
     let func = agg_arg_source.agg_func();
@@ -361,7 +364,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::Avg,
+                func: AccumulatorFunc::Agg(AggFunc::Avg),
                 comparator: None,
             });
             target_register
@@ -374,7 +377,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::Count0,
+                func: AccumulatorFunc::Agg(AggFunc::Count0),
                 comparator: None,
             });
             target_register
@@ -389,7 +392,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::Count,
+                func: AccumulatorFunc::Agg(AggFunc::Count),
                 comparator: None,
             });
             target_register
@@ -414,7 +417,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: delimiter_reg,
-                func: AggFunc::GroupConcat,
+                func: AccumulatorFunc::Agg(AggFunc::GroupConcat),
                 comparator: None,
             });
 
@@ -434,7 +437,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::Max,
+                func: AccumulatorFunc::Agg(AggFunc::Max),
                 comparator,
             });
             target_register
@@ -453,7 +456,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::Min,
+                func: AccumulatorFunc::Agg(AggFunc::Min),
                 comparator,
             });
             target_register
@@ -471,7 +474,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: value_reg,
-                func: AggFunc::JsonGroupObject,
+                func: AccumulatorFunc::Agg(AggFunc::JsonGroupObject),
                 comparator: None,
             });
             target_register
@@ -487,7 +490,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::JsonGroupArray,
+                func: AccumulatorFunc::Agg(AggFunc::JsonGroupArray),
                 comparator: None,
             });
             target_register
@@ -505,7 +508,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: delimiter_reg,
-                func: AggFunc::StringAgg,
+                func: AccumulatorFunc::Agg(AggFunc::StringAgg),
                 comparator: None,
             });
 
@@ -521,7 +524,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::Sum,
+                func: AccumulatorFunc::Agg(AggFunc::Sum),
                 comparator: None,
             });
             target_register
@@ -536,7 +539,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::Total,
+                func: AccumulatorFunc::Agg(AggFunc::Total),
                 comparator: None,
             });
             target_register
@@ -552,7 +555,47 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::ArrayAgg,
+                func: AccumulatorFunc::Agg(AggFunc::ArrayAgg),
+                comparator: None,
+            });
+            target_register
+        }
+        AggFunc::Mode => {
+            // Planner rewrites `mode() WITHIN GROUP (ORDER BY x)` to a single arg `[x]`.
+            if num_args != 1 {
+                crate::bail_parse_error!("mode bad number of arguments");
+            }
+            let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            // Activate the value's collation so finalize can sort text correctly.
+            let expr = &agg_arg_source.arg_at(0);
+            emit_collseq_if_needed(program, referenced_tables, expr, resolver);
+            program.emit_insn(Insn::AggStep {
+                acc_reg: target_register,
+                col: value_reg,
+                delimiter: 0,
+                func: AccumulatorFunc::Agg(AggFunc::Mode),
+                comparator: None,
+            });
+            target_register
+        }
+        AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+            // Planner rewrites `percentile_*(fraction) WITHIN GROUP (ORDER BY x)` to
+            // args `[x, fraction]`: the value goes in `col`, the fraction in `delimiter`.
+            // The fraction is evaluated and range-checked once before the row loop
+            // in `InitLoop::emit` — including the input-column / subquery rejection.
+            if num_args != 2 {
+                crate::bail_parse_error!("percentile bad number of arguments");
+            }
+            let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            let fraction_reg =
+                fraction_reg.expect("percentile fraction register must be set by InitLoop::emit");
+            let expr = &agg_arg_source.arg_at(0);
+            emit_collseq_if_needed(program, referenced_tables, expr, resolver);
+            program.emit_insn(Insn::AggStep {
+                acc_reg: target_register,
+                col: value_reg,
+                delimiter: fraction_reg,
+                func: AccumulatorFunc::Agg(func.clone()),
                 comparator: None,
             });
             target_register
@@ -587,11 +630,11 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::External(if registered_argc < 0 {
+                func: AccumulatorFunc::Agg(AggFunc::External(if registered_argc < 0 {
                     Arc::new(func.with_aggregate_arg_count(num_args))
                 } else {
                     func.clone()
-                }),
+                })),
                 comparator: None,
             });
             target_register

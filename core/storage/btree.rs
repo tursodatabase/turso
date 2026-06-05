@@ -601,6 +601,20 @@ pub enum CursorSeekState {
     },
 }
 
+/// Outcome of [`CursorTrait::try_save_position_for_external_balance`]. Mirrors
+/// the two paths SQLite's saveCursorPosition takes (btree.c:756) — succeed and
+/// have the caller skip invalidation, or fall through to clearing the cached
+/// page stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavePositionResult {
+    /// Position captured via [`CursorTrait::save_context`]; cursor will re-seek
+    /// on next use. Caller does not need to invalidate.
+    Saved,
+    /// Position cannot be represented (MVCC cursor, mid-operation page stack,
+    /// stale record state). Caller must fall back to `invalidate_btree_cache`.
+    MustInvalidate,
+}
+
 pub trait CursorTrait: Any + Send + Sync {
     /// Move cursor to last entry.
     fn last(&mut self) -> Result<IOResult<()>>;
@@ -658,6 +672,19 @@ pub trait CursorTrait: Any + Send + Sync {
     /// share a btree (e.g. OpenDup cursors) when the btree structure is
     /// modified by another cursor (e.g. clear_btree via ResetSorter).
     fn invalidate_btree_cache(&mut self) {}
+    /// Opt into the pager's cursor_registry. Default no-op so non-BTreeCursor
+    /// impls (MvccLazyCursor) stay out. Opt-in impls must unregister in Drop.
+    fn register_with_pager(&self) {}
+    /// Mirror of SQLite's BTCF_Multiple flag; toggled by Pager when a bucket
+    /// crosses the 1↔2 threshold.
+    fn set_has_peers_for_external_writes(&self, _has_peers: bool) {}
+    /// Save position so the cursor can re-seek after a peer write. Returns
+    /// [`SavePositionResult::MustInvalidate`] when the position can't be
+    /// represented (MVCC cursors, stale page stack); the caller falls back to
+    /// invalidate_btree_cache.
+    fn try_save_position_for_external_balance(&mut self) -> Result<IOResult<SavePositionResult>> {
+        Ok(IOResult::Done(SavePositionResult::MustInvalidate))
+    }
     // --- end: BTreeCursor specific functions ----
 }
 
@@ -734,6 +761,21 @@ pub struct BTreeCursor {
     /// short-circuits to retry the read+descend rather than re-running those
     /// mutations and corrupting the cursor's cell-index state.
     iteration_pending_descent: Option<IterationPendingDescent>,
+    /// (peers, idx) snapshot for the saveAllCursors pass driven from
+    /// insert/delete. Carries iteration progress across IO re-entry
+    /// (index records can yield via the overflow chain walk).
+    pending_peer_save: Option<(
+        smallvec::SmallVec<[crate::storage::pager::RegisteredCursor; 4]>,
+        usize,
+    )>,
+    /// Mirrors SQLite's BTCF_Multiple. Toggled by Pager::register_cursor /
+    /// unregister_cursor when the bucket crosses the 1↔2 threshold; lets
+    /// drive_pending_peer_save skip the registry mutex in the common case.
+    has_peers: crate::sync::atomic::AtomicBool,
+    /// True if this cursor went through Cursor::new_btree (and thus pushed
+    /// itself into the registry). Direct BTreeCursor::new callers (tests,
+    /// internal utilities) bypass that path; their Drop skips unregister.
+    did_register: crate::sync::atomic::AtomicBool,
 }
 
 /// Records the in-flight descent for `iteration_pending_descent`. The direction
@@ -810,6 +852,9 @@ impl BTreeCursor {
             skip_advance: false,
             reusable_cell_payload: Vec::new(),
             iteration_pending_descent: None,
+            pending_peer_save: None,
+            has_peers: crate::sync::atomic::AtomicBool::new(false),
+            did_register: crate::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -5258,16 +5303,67 @@ impl BTreeCursor {
         matches!(self.state, CursorState::Write(_))
     }
 
+    /// saveAllCursors pass for this cursor's insert/delete entry. Iteration
+    /// state lives in `pending_peer_save` so we can resume across IO yields
+    /// from per-peer overflow-chain reads.
+    fn drive_pending_peer_save(&mut self) -> Result<IOResult<()>> {
+        if self.pending_peer_save.is_none() && matches!(self.state, CursorState::None) {
+            // BTCF_Multiple fast path (sqlite3 btree.c:9348).
+            if !self.has_peers.load(crate::sync::atomic::Ordering::Relaxed) {
+                return Ok(IOResult::Done(()));
+            }
+            let dyn_ref: &dyn CursorTrait = self;
+            let peers = self.pager.snapshot_peers_for_root(dyn_ref);
+            if peers.is_empty() {
+                return Ok(IOResult::Done(()));
+            }
+            self.pending_peer_save = Some((peers, 0));
+        }
+        let Some((peers, idx)) = self.pending_peer_save.as_mut() else {
+            return Ok(IOResult::Done(()));
+        };
+        while *idx < peers.len() {
+            let peer = peers[*idx];
+            // SAFETY: see RegisteredCursor's invariant.
+            let outcome =
+                unsafe { return_if_io!(peer.as_mut().try_save_position_for_external_balance()) };
+            if outcome == SavePositionResult::MustInvalidate {
+                // SAFETY: see RegisteredCursor's invariant.
+                unsafe { peer.as_mut().invalidate_btree_cache() };
+            }
+            *idx += 1;
+        }
+        self.pending_peer_save = None;
+        Ok(IOResult::Done(()))
+    }
+
     // Save cursor context, to be restored later
     pub fn save_context(&mut self, cursor_context: CursorContext) {
         self.valid_state = CursorValidState::RequireSeek;
         self.context = Some(cursor_context);
     }
 
-    /// If context is defined, restore it and set it None on success
+    /// Drop any pending saved seek-context; used by callers that re-navigate
+    /// from the root and don't want restore_context to clobber them.
+    #[inline]
+    fn clear_saved_seek(&mut self) {
+        self.context = None;
+        self.valid_state = CursorValidState::Valid;
+    }
+
+    #[inline]
+    fn needs_restore(&self) -> bool {
+        self.context.is_some() && !matches!(self.valid_state, CursorValidState::Valid)
+    }
+
+    /// If context is defined, restore it and set it None on success. Parallels
+    /// SQLite's btreeRestoreCursorPosition (btree.c:896). NotFound stays at
+    /// Valid with has_record=false rather than transitioning to Invalid: a
+    /// peer-deleted cursor is still recoverable via Rewind/Seek, whereas our
+    /// Invalid is reserved for cursors that can never be repositioned.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn restore_context(&mut self) -> Result<IOResult<()>> {
-        if self.context.is_none() || matches!(self.valid_state, CursorValidState::Valid) {
+        if !self.needs_restore() {
             return Ok(IOResult::Done(()));
         }
         if let CursorValidState::RequireAdvance(direction) = self.valid_state {
@@ -5288,14 +5384,30 @@ impl BTreeCursor {
         let res = self.seek(seek_key, ctx.seek_op)?;
         match res {
             IOResult::Done(res) => {
-                if let SeekResult::TryAdvance = res {
-                    self.valid_state =
-                        CursorValidState::RequireAdvance(ctx.seek_op.iteration_direction());
-                    self.context = Some(ctx);
-                    io_yield_one!(Completion::new_yield());
+                match res {
+                    SeekResult::Found => {
+                        self.valid_state = CursorValidState::Valid;
+                        Ok(IOResult::Done(()))
+                    }
+                    SeekResult::TryAdvance => {
+                        self.valid_state =
+                            CursorValidState::RequireAdvance(ctx.seek_op.iteration_direction());
+                        self.context = Some(ctx);
+                        io_yield_one!(Completion::new_yield());
+                    }
+                    SeekResult::NotFound => {
+                        // Saved row is gone (deleted by us, or by a peer).
+                        // The seek positioned the stack at the next-greater
+                        // cell, which is the correct iteration target for
+                        // forward iteration after the deletion. Signal that
+                        // via skip_advance so the next next() returns the
+                        // landed cell instead of advancing past it — mirrors
+                        // SQLite's CURSOR_SKIPNEXT (btree.c:915).
+                        self.skip_advance = true;
+                        self.valid_state = CursorValidState::Valid;
+                        Ok(IOResult::Done(()))
+                    }
                 }
-                self.valid_state = CursorValidState::Valid;
-                Ok(IOResult::Done(()))
             }
             IOResult::IO(io) => {
                 self.context = Some(ctx);
@@ -5318,34 +5430,49 @@ impl BTreeCursor {
     }
 }
 
+impl Drop for BTreeCursor {
+    fn drop(&mut self) {
+        if !self
+            .did_register
+            .load(crate::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let dyn_ref: &dyn CursorTrait = self;
+        self.pager.unregister_cursor(dyn_ref);
+    }
+}
+
 impl CursorTrait for BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn next(&mut self) -> Result<IOResult<()>> {
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
         }
-        if self.skip_advance {
-            // See DeleteState::RestoreContextAfterBalancing
-            self.skip_advance = false;
-            let mem_page = self.stack.top_ref();
-            let contents = mem_page.get_contents();
-            let cell_idx = self.stack.current_cell_index();
-            let cell_count = contents.cell_count();
-            let has_record = cell_idx >= 0 && cell_idx < cell_count as i32;
-            if has_record {
-                self.set_has_record(has_record);
-                // If we are positioned at a record, we stop here without advancing.
-                self.read_overflow_state = None;
-                return Ok(IOResult::Done(()));
-            }
-            // But: if we aren't currently positioned at a record (for example, we are at the end of a page),
-            // we need to advance despite the skip_advance flag
-            // because the intent is to find the next record immediately after the one we just deleted.
-        }
         loop {
             match self.advance_state {
                 AdvanceState::Start => {
                     return_if_io!(self.restore_context());
+                    // Set by DeleteState::RestoreContextAfterBalancing and by
+                    // restore_context on NotFound: the cursor is already at
+                    // the right iteration target, so return it without
+                    // advancing. If the landed cell has no record (past
+                    // EOF), fall through to Advance.
+                    if self.skip_advance {
+                        self.skip_advance = false;
+                        if self.stack.current_page >= 0 {
+                            let mem_page = self.stack.top_ref();
+                            let contents = mem_page.get_contents();
+                            let cell_idx = self.stack.current_cell_index();
+                            let cell_count = contents.cell_count();
+                            let has_record = cell_idx >= 0 && cell_idx < cell_count as i32;
+                            if has_record {
+                                self.set_has_record(true);
+                                self.read_overflow_state = None;
+                                return Ok(IOResult::Done(()));
+                            }
+                        }
+                    }
                     self.advance_state = AdvanceState::Advance;
                 }
                 AdvanceState::Advance => {
@@ -5361,6 +5488,10 @@ impl CursorTrait for BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn last(&mut self) -> Result<IOResult<()>> {
         self.set_null_flag(false);
+        if self.valid_state == CursorValidState::Invalid {
+            return Ok(IOResult::Done(()));
+        }
+        self.clear_saved_seek();
         let always_seek = false;
         let cursor_has_record = return_if_io!(self.move_to_rightmost(always_seek));
         self.set_has_record(cursor_has_record);
@@ -5389,6 +5520,9 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn rowid(&mut self) -> Result<IOResult<Option<i64>>> {
+        if self.needs_restore() {
+            return_if_io!(self.restore_context());
+        }
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
@@ -5451,6 +5585,11 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn record(&mut self) -> Result<IOResult<Option<&ImmutableRecord>>> {
+        // Mirrors sqlite3BtreeRestoreCursorPosition called at btree read
+        // entry points (btree.c:5315, etc).
+        if self.needs_restore() {
+            return_if_io!(self.restore_context());
+        }
         if !self.has_record() {
             return Ok(IOResult::Done(None));
         }
@@ -5505,6 +5644,8 @@ impl CursorTrait for BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
+        // saveAllCursors at the head of sqlite3BtreeInsert (btree.c:9348).
+        return_if_io!(self.drive_pending_peer_save());
         return_if_io!(self.insert_into_page(key));
         self.invalidate_count_cache();
         if key.maybe_rowid().is_some() {
@@ -5528,6 +5669,8 @@ impl CursorTrait for BTreeCursor {
     /// 10. Finish -> Delete operation is done. Return CursorResult(Ok())
     fn delete(&mut self) -> Result<IOResult<()>> {
         if let CursorState::None = &self.state {
+            // saveAllCursors at the head of sqlite3BtreeDelete (btree.c:9841).
+            return_if_io!(self.drive_pending_peer_save());
             self.invalidate_count_cache();
             self.state = CursorState::Delete(DeleteState::Start);
         }
@@ -5917,7 +6060,16 @@ impl CursorTrait for BTreeCursor {
     /// this method only clears the tree’s contents. The root page remains
     /// allocated and is reset to an empty leaf page.
     fn clear_btree(&mut self) -> Result<IOResult<Option<usize>>> {
-        self.invalidate_count_cache();
+        // First entry only — destroy_btree_contents yields IO and resumes
+        // through this method, so guard with the same state==None gate it
+        // uses for its own state machine. Every page in this btree is about
+        // to be freed; peers must drop their page stacks rather than save
+        // positions that wouldn't outlive the clear (cf. sqlite3BtreeClearTable,
+        // btree.c:10194).
+        if matches!(self.state, CursorState::None) {
+            self.pager.invalidate_peer_cursors(self);
+            self.invalidate_count_cache();
+        }
         self.destroy_btree_contents(true)
     }
 
@@ -5929,6 +6081,10 @@ impl CursorTrait for BTreeCursor {
     /// For cases where the B-Tree should remain allocated but emptied, see [`btree_clear`].
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn btree_destroy(&mut self) -> Result<IOResult<Option<usize>>> {
+        // See clear_btree for the state==None gate rationale.
+        if matches!(self.state, CursorState::None) {
+            self.pager.invalidate_peer_cursors(self);
+        }
         self.destroy_btree_contents(false)
     }
 
@@ -5940,10 +6096,15 @@ impl CursorTrait for BTreeCursor {
         let mut mem_page;
         let mut contents;
 
+        if self.valid_state == CursorValidState::Invalid {
+            return Ok(IOResult::Done(0));
+        }
+
         'outer: loop {
             let state = self.count_state;
             match state {
                 CountState::Start => {
+                    self.clear_saved_seek();
                     let c = return_if_io!(self.move_to_root_nonblock());
                     self.count_state = CountState::Loop;
                     if let Some(c) = c {
@@ -6095,6 +6256,7 @@ impl CursorTrait for BTreeCursor {
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
         }
+        self.clear_saved_seek();
         self.skip_advance = false;
         loop {
             match self.rewind_state {
@@ -6140,9 +6302,103 @@ impl CursorTrait for BTreeCursor {
         self.skip_advance
     }
 
+    /// Drop the page stack and auxiliary caches so the cursor will re-navigate
+    /// from the root on its next access. Used when saving the position via
+    /// try_save_position_for_external_balance isn't applicable (the peer
+    /// btree was cleared/destroyed, or the position can't be expressed).
+    /// valid_state stays Valid — only rewind/seek-style entry points are safe
+    /// next; next/prev land on `current_page == -1` and return Done(false).
     fn invalidate_btree_cache(&mut self) {
+        for slot in self.stack.stack.iter_mut() {
+            *slot = None;
+        }
+        self.stack.current_page = -1;
+        self.has_record = false;
         self.move_to_right_state.1 = None;
         self.invalidate_count_cache();
+    }
+
+    fn register_with_pager(&self) {
+        // Store before the push so a panic inside register_cursor still
+        // triggers an (idempotent) unregister via Drop.
+        self.did_register
+            .store(true, crate::sync::atomic::Ordering::Relaxed);
+        self.pager.register_cursor(self);
+    }
+
+    fn set_has_peers_for_external_writes(&self, has_peers: bool) {
+        self.has_peers
+            .store(has_peers, crate::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Mirrors SQLite's saveCursorPosition (btree.c:756). Saves rowid for
+    /// table btrees, the cell record for index btrees; index records can
+    /// yield IO via the overflow chain walk (`record()`). Returns
+    /// [`SavePositionResult::MustInvalidate`] when the page stack is in a
+    /// sentinel/dirty state we can't save from — has_record can lag the stack
+    /// across an in-flight Insert/Delete — in which case the caller falls back
+    /// to invalidate_btree_cache.
+    fn try_save_position_for_external_balance(&mut self) -> Result<IOResult<SavePositionResult>> {
+        if self.valid_state != CursorValidState::Valid || !self.has_record() {
+            // Nothing to save: cursor has no live position. No invalidation
+            // needed either — the stack is already in a state where the next
+            // entry point will re-navigate from the root.
+            return Ok(IOResult::Done(SavePositionResult::Saved));
+        }
+        // A peer mid-Insert/Delete may not yet have reached its own
+        // save_context-at-balance point, so we can't claim it's saved. Fall
+        // back to invalidation; the peer will re-navigate on next use.
+        if !matches!(self.state, CursorState::None) {
+            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
+        }
+        if self.stack.current_page < 0
+            || (self.stack.current_page as usize) >= self.stack.stack.len()
+            || self.stack.stack[self.stack.current_page as usize].is_none()
+        {
+            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
+        }
+        let cell_idx = self.stack.current_cell_index();
+        if cell_idx < 0 {
+            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
+        }
+        let (is_table, cell_count) = {
+            let page = self.stack.top_ref();
+            let contents = page.get_contents();
+            (contents.page_type()?.is_table(), contents.cell_count())
+        };
+        if (cell_idx as usize) >= cell_count {
+            return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
+        }
+        if is_table {
+            let page = self.stack.top_ref();
+            let contents = page.get_contents();
+            debug_assert!(
+                matches!(contents.page_type(), Ok(PageType::TableLeaf)),
+                "save_position: table cursor with has_record=true must be on a leaf"
+            );
+            let rowid = contents.cell_table_leaf_read_rowid(cell_idx as usize)?;
+            self.save_context(CursorContext {
+                key: CursorContextKey::TableRowId(rowid),
+                seek_op: SeekOp::GE { eq_only: true },
+            });
+            return Ok(IOResult::Done(SavePositionResult::Saved));
+        }
+        // Index btree: yield IO for overflow chains. Allocate to the actual
+        // payload size so wide-key indexes don't keep a page-sized buffer
+        // per saved cursor.
+        let cloned = {
+            let record = return_if_io!(self.record());
+            let record = record.expect("has_record=true but record() returned None");
+            let payload = record.get_payload();
+            let mut owned = ImmutableRecord::new(payload.len())?;
+            owned.start_serialization(payload)?;
+            owned
+        };
+        self.save_context(CursorContext {
+            key: CursorContextKey::IndexKeyRowId(cloned),
+            seek_op: SeekOp::GE { eq_only: true },
+        });
+        Ok(IOResult::Done(SavePositionResult::Saved))
     }
 
     #[inline]
@@ -6161,9 +6417,13 @@ impl CursorTrait for BTreeCursor {
     }
 
     fn seek_end(&mut self) -> Result<IOResult<()>> {
+        if self.valid_state == CursorValidState::Invalid {
+            return Ok(IOResult::Done(()));
+        }
         loop {
             match self.seek_end_state {
                 SeekEndState::Start => {
+                    self.clear_saved_seek();
                     let c = return_if_io!(self.move_to_root_nonblock());
                     self.seek_end_state = SeekEndState::ProcessPage;
                     if let Some(c) = c {
@@ -11614,6 +11874,278 @@ mod tests {
         )
         .unwrap();
         insert_into_cell(contents, &payload, cell_idx as usize, pager.usable_space()).unwrap();
+    }
+
+    /// Direct red-first coverage for the pager-level cursor registry and
+    /// saveAllCursors port introduced in #7341 (register_with_pager,
+    /// has_peers toggling, drive_pending_peer_save inside insert/delete,
+    /// clear_btree's auto-invalidation of peers).
+    ///
+    /// Pairs with the SQL-surface red-first cases in
+    /// testing/sqltests/tests/save-all-cursors.sqltest (window function
+    /// over triple self-joined source) and the pre-existing
+    /// testing/sqltests/tests/window-selfjoin-reset-sorter.sqltest.
+    /// Those exercise the same machinery end-to-end; the cases here
+    /// pin individual primitives (peer registration, save vs.
+    /// invalidate, restore semantics) so a regression bisects faster.
+    mod save_all_cursors {
+        use super::*;
+        use crate::storage::btree::SavePositionResult;
+        use test_log::test;
+
+        /// Boxed cursor pinned to its heap location for the duration of the
+        /// test — register_cursor stores raw pointers, so the cursor must
+        /// not be moved after registration.
+        fn make_registered_cursor(
+            pager: &Arc<Pager>,
+            root_page: i64,
+            num_columns: usize,
+        ) -> Box<BTreeCursor> {
+            let cursor = Box::new(BTreeCursor::new_table(
+                pager.clone(),
+                root_page,
+                num_columns,
+            ));
+            (*cursor).register_with_pager();
+            cursor
+        }
+
+        #[test]
+        fn registry_toggles_has_peers_flag() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let cursor_a = make_registered_cursor(&pager, root_page, 1);
+            assert!(
+                !cursor_a
+                    .has_peers
+                    .load(crate::sync::atomic::Ordering::Relaxed),
+                "single registered cursor must have has_peers=false"
+            );
+
+            let cursor_b = make_registered_cursor(&pager, root_page, 1);
+            assert!(
+                cursor_a
+                    .has_peers
+                    .load(crate::sync::atomic::Ordering::Relaxed),
+                "registering a peer must set has_peers on the original"
+            );
+            assert!(
+                cursor_b
+                    .has_peers
+                    .load(crate::sync::atomic::Ordering::Relaxed),
+                "the newly registered cursor must also see has_peers=true"
+            );
+
+            drop(cursor_b);
+            assert!(
+                !cursor_a
+                    .has_peers
+                    .load(crate::sync::atomic::Ordering::Relaxed),
+                "dropping the peer must clear has_peers on the survivor"
+            );
+        }
+
+        #[test]
+        fn registry_buckets_per_root_page() {
+            // Cursors on different root pages must not see each other as
+            // peers; saveAllCursors is per-root (SQLite btree.c:806).
+            let (pager, root_a, _db, _conn) = empty_btree();
+            let page_b = run_until_done(|| pager.allocate_page(), &pager).unwrap();
+            btree_init_page(&page_b, PageType::TableLeaf, 0, pager.usable_space());
+            let root_b = page_b.get().id as i64;
+
+            let cursor_a = make_registered_cursor(&pager, root_a, 1);
+            let cursor_b = make_registered_cursor(&pager, root_b, 1);
+            assert!(
+                !cursor_a
+                    .has_peers
+                    .load(crate::sync::atomic::Ordering::Relaxed)
+                    && !cursor_b
+                        .has_peers
+                        .load(crate::sync::atomic::Ordering::Relaxed),
+                "cursors on different roots must not be peers"
+            );
+        }
+
+        #[test]
+        fn try_save_position_table_returns_saved() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+            for rowid in 1..=5 {
+                insert_record(&mut cursor, &pager, rowid, Value::from_i64(rowid)).unwrap();
+            }
+            run_until_done(
+                || cursor.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            assert!(cursor.has_record());
+
+            let outcome = run_until_done(
+                || cursor.try_save_position_for_external_balance(),
+                pager.deref(),
+            )
+            .unwrap();
+            assert_eq!(outcome, SavePositionResult::Saved);
+            assert_eq!(cursor.valid_state, CursorValidState::RequireSeek);
+            assert!(cursor.context.is_some());
+        }
+
+        #[test]
+        fn try_save_position_unpositioned_returns_saved_noop() {
+            // valid_state=Valid + has_record=false ⇒ nothing to save and
+            // nothing to invalidate (stack already in a re-navigable state).
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+            let outcome = run_until_done(
+                || cursor.try_save_position_for_external_balance(),
+                pager.deref(),
+            )
+            .unwrap();
+            assert_eq!(outcome, SavePositionResult::Saved);
+            assert!(cursor.context.is_none());
+        }
+
+        #[test]
+        fn clear_btree_auto_invalidates_peer() {
+            // Without saveAllCursors, ResetSorter used to invalidate dup
+            // cursors via pointer-equality from op_reset_sorter. Now
+            // clear_btree itself does it via the pager registry.
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut peer = make_registered_cursor(&pager, root_page, 1);
+
+            for rowid in 1..=10 {
+                insert_record(&mut writer, &pager, rowid, Value::from_i64(rowid)).unwrap();
+            }
+            run_until_done(
+                || peer.seek(SeekKey::TableRowId(5), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            assert!(peer.has_record());
+            assert!(peer.stack.current_page >= 0);
+
+            run_until_done(|| writer.clear_btree(), &pager).unwrap();
+
+            assert!(
+                !peer.has_record(),
+                "peer must observe has_record=false after a peer's clear_btree"
+            );
+            assert_eq!(
+                peer.stack.current_page, -1,
+                "peer's page stack must be reset to the sentinel"
+            );
+        }
+
+        #[test]
+        fn delete_preserves_peer_logical_position() {
+            // Cursor1 deletes rowid=3 while cursor2 sits on rowid=5. Without
+            // the saveAllCursors port, cursor2's cached cell_idx points to
+            // the cell that shifted left into rowid=5's slot (now rowid=6),
+            // and rowid() silently returns 6. With the port, cursor2's
+            // position is saved on entry to delete and restored on next
+            // access — rowid() returns 5.
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut peer = make_registered_cursor(&pager, root_page, 1);
+
+            for rowid in 1..=10 {
+                insert_record(&mut writer, &pager, rowid, Value::from_i64(rowid)).unwrap();
+            }
+            run_until_done(
+                || peer.seek(SeekKey::TableRowId(5), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            assert_eq!(
+                run_until_done(|| peer.rowid(), pager.deref()).unwrap(),
+                Some(5)
+            );
+
+            run_until_done(
+                || writer.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            run_until_done(|| writer.delete(), pager.deref()).unwrap();
+
+            assert_eq!(
+                run_until_done(|| peer.rowid(), pager.deref()).unwrap(),
+                Some(5),
+                "peer must still observe its logical rowid after a peer delete"
+            );
+        }
+
+        #[test]
+        fn delete_of_peers_own_row_lands_on_next_greater() {
+            // SQLite's CURSOR_SKIPNEXT (btree.c:915): when restore_context's
+            // re-seek lands on NotFound, the cursor sets skip_advance so the
+            // next() returns the cell the seek landed on instead of stepping
+            // past it. Forward iteration continues correctly after a peer
+            // deletes the row we were sitting on.
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut peer = make_registered_cursor(&pager, root_page, 1);
+
+            for rowid in 1..=10 {
+                insert_record(&mut writer, &pager, rowid, Value::from_i64(rowid)).unwrap();
+            }
+            run_until_done(
+                || peer.seek(SeekKey::TableRowId(5), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+
+            run_until_done(
+                || writer.seek(SeekKey::TableRowId(5), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            run_until_done(|| writer.delete(), pager.deref()).unwrap();
+
+            // First access after a peer wipe-out triggers restore_context's
+            // NotFound branch and sets skip_advance.
+            run_until_done(|| peer.next(), pager.deref()).unwrap();
+            assert_eq!(
+                run_until_done(|| peer.rowid(), pager.deref()).unwrap(),
+                Some(6),
+                "next() after peer deletion of our row must land on the next-greater rowid"
+            );
+        }
+
+        #[test]
+        fn insert_preserves_peer_logical_position() {
+            // Cursor2 sits on rowid=5; cursor1 inserts rowid=2 (causes
+            // cells to shift right on the shared page). Without saveAllCursors,
+            // cursor2's cell_idx now points to rowid=4. With the port, the
+            // saved rowid=5 is restored on next access.
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut peer = make_registered_cursor(&pager, root_page, 1);
+
+            // Insert odd rowids so even slots are open for the peer-disrupting
+            // insert below.
+            for rowid in [1i64, 3, 5, 7, 9] {
+                insert_record(&mut writer, &pager, rowid, Value::from_i64(rowid)).unwrap();
+            }
+            run_until_done(
+                || peer.seek(SeekKey::TableRowId(5), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            assert_eq!(
+                run_until_done(|| peer.rowid(), pager.deref()).unwrap(),
+                Some(5)
+            );
+
+            insert_record(&mut writer, &pager, 2, Value::from_i64(2)).unwrap();
+
+            assert_eq!(
+                run_until_done(|| peer.rowid(), pager.deref()).unwrap(),
+                Some(5),
+                "peer must observe its saved rowid after a left-of-it peer insert"
+            );
+        }
     }
 
     /// Strict property tests for page-level btree mutations.

@@ -188,6 +188,12 @@ impl Statement {
             .load(crate::sync::atomic::Ordering::SeqCst)
     }
 
+    pub fn n_total_change(&self) -> i64 {
+        self.state
+            .n_total_change
+            .load(crate::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn set_mv_tx(&mut self, mv_tx: Option<(u64, TransactionMode)>) {
         self.program.connection.set_mv_tx(mv_tx);
     }
@@ -550,12 +556,15 @@ impl Statement {
             .filter(|&id| id != crate::MAIN_DB_ID)
             .try_collect()?;
         for db_id in &attached_db_ids {
-            // Discard any connection-local schema changes for this non-main DB
-            // (temp or attached) so the re-translate reads the committed schema.
-            conn.database_schemas().write().remove(&db_id);
-            if db_id == crate::TEMP_DB_ID && conn.temp.database.read().is_none() {
+            // Reprepare must not roll back an explicit transaction. SQLite allows
+            // reprepare inside a transaction, and uncommitted writes in temp or
+            // attached databases remain visible after the statement is retried.
+            if db_id == crate::TEMP_DB_ID || !conn.get_auto_commit() {
                 continue;
             }
+            // Discard any connection-local schema changes for this attached DB
+            // so the re-translate reads the committed schema.
+            conn.database_schemas().write().remove(&db_id);
             let pager = conn.get_pager_from_database_index(&db_id)?;
             if pager.holds_read_lock() {
                 pager.rollback_attached();
@@ -993,7 +1002,6 @@ impl Statement {
             self.release_active_root_if_counted();
         }
         self.state.reset(max_registers, max_cursors);
-        self.state.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
         self.busy_handler_state = None;
         self.query_timeout_override = None;

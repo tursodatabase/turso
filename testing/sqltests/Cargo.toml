@@ -53,8 +53,10 @@ fake = { version = "4.4", features = ["derive", "rand_core"] }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 
-# Turso Rust bindings
-turso = { workspace = true }
+# Turso Rust bindings.
+# `test_helper` exposes test-only SQL functions (e.g. test_nondet_counter)
+# that the sqltests use to observe planner behavior.
+turso = { workspace = true, features = ["test_helper"] }
 
 # Turso SQL parser (for splitting multi-statement SQL)
 turso_parser = { workspace = true }

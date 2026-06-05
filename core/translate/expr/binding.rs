@@ -668,6 +668,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                         args,
                                         filter_over: filter_over.clone(),
                                         order_by: vec![],
+                                        within_group: vec![],
                                     };
                                 }
                             }
