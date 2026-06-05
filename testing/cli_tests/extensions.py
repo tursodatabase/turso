@@ -368,6 +368,12 @@ def test_crypto():
         validate_url_decode,
         "url should decode correctly",
     )
+    turso.run_test_fn(
+        "SELECT crypto_decode('uuuuuuuuuuuuuuuuuuuu', 'base85');",
+        lambda res: "Error: Extension error: Error" == res,
+        "base85 overflow should return an error",
+    )
+
     turso.quit()
 
 
