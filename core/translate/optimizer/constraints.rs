@@ -3,7 +3,10 @@ use crate::{
     schema::{Column, Index, Schema},
     translate::{
         collate::get_collseq_from_expr,
-        expr::{as_binary_components, comparison_affinity, walk_expr_mut, WalkControl},
+        expr::{
+            as_binary_components, comparison_affinity, get_expr_affinity, unwrap_parens,
+            walk_expr_mut, WalkControl,
+        },
         expression_index::normalize_expr_for_index_matching,
         plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences, WhereTerm},
         planner::{break_predicate_at_and_boundaries, table_mask_from_expr, TableMask, ROWID_STRS},
@@ -70,6 +73,18 @@ pub struct Constraint {
     /// Whether this constraint references the implicit rowid (tables without an INTEGER PRIMARY KEY alias).
     /// When true and `table_col_pos` is None, this constraint targets the rowid pseudo-column.
     pub is_rowid: bool,
+    /// The constraint's resolved comparison affinity, as defined by SQLite's
+    /// `comparisonAffinity` in `expr.c`. Cached at construction time so the
+    /// `sqlite3IndexAffinityOk` check can run without re-resolving the
+    /// WhereTerm at every index-selection callsite.
+    ///
+    /// `None` for forms whose comparison affinity has no single resolved value:
+    /// FTS MATCH and virtual-table push-downs (operators outside SQLite's
+    /// comparison set), and row-value IN (`(a,b) IN (...)`, which SQLite
+    /// handles per-LHS-column via `sqlite3VectorFieldSubexpr` — Turso does
+    /// not yet plumb per-column affinity into the index-selection path, so
+    /// such constraints fall through to scans).
+    pub comparison_affinity: Option<Affinity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,8 +133,7 @@ impl Constraint {
             panic!("Expected a valid binary expression");
         };
         let mut affinity = Affinity::Blob;
-        if op.as_ast_operator().is_some_and(|op| op.is_comparison()) && self.table_col_pos.is_some()
-        {
+        if op.as_ast_operator().is_some_and(|op| op.is_comparison()) {
             affinity = comparison_affinity(lhs, rhs, referenced_tables, None);
         }
 
@@ -159,6 +173,35 @@ impl Constraint {
         } else {
             rhs
         }
+    }
+
+    /// Returns true when an index column with affinity `idx_aff` can satisfy
+    /// this constraint per SQLite's `sqlite3IndexAffinityOk`. Constraints
+    /// whose form has no SQLite-defined comparison affinity (FTS MATCH,
+    /// virtual-table push-downs, row-value IN) carry `None` and bypass the
+    /// check — those paths handle types themselves.
+    pub fn satisfies_index_affinity(&self, idx_aff: Affinity) -> bool {
+        match self.comparison_affinity {
+            Some(comparison_aff) => idx_aff.index_affinity_ok(comparison_aff),
+            None => true,
+        }
+    }
+
+    /// Whether this constraint can drive an index seek on its target column.
+    /// Composes the `usable`/`table_col_pos` gates with the affinity check
+    /// against the column at `table_col_pos` in `columns` (set `is_strict`
+    /// only for STRICT tables; subqueries pass `false`).
+    pub fn can_drive_index_seek(&self, columns: &[Column], is_strict: bool) -> bool {
+        if !self.usable {
+            return false;
+        }
+        let Some(pos) = self.table_col_pos else {
+            return false;
+        };
+        let col = columns.get(pos).unwrap_or_else(|| {
+            unreachable!("constraint table_col_pos {pos} out of bounds for {columns:?}")
+        });
+        self.satisfies_index_affinity(col.affinity_with_strict(is_strict))
     }
 }
 
@@ -449,6 +492,13 @@ pub fn constraints_from_where_clause(
 
             // Try to extract as binary expression first
             if let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? {
+                // Resolve the comparison affinity once per term per SQLite's
+                // `comparisonAffinity` (see `Constraint::comparison_affinity`)
+                // and propagate it to every constraint derived from this term.
+                let cmp_aff = operator
+                    .as_ast_operator()
+                    .filter(|op| op.is_comparison())
+                    .map(|_| comparison_affinity(lhs, rhs, Some(table_references), None));
                 // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
                 match lhs {
                     ast::Expr::Column { table, column, .. } => {
@@ -472,6 +522,7 @@ pub fn constraints_from_where_clause(
                                 ),
                                 usable: true,
                                 is_rowid: false,
+                                comparison_affinity: cmp_aff,
                             });
                         }
                     }
@@ -500,6 +551,7 @@ pub fn constraints_from_where_clause(
                                 ),
                                 usable: true,
                                 is_rowid: true,
+                                comparison_affinity: cmp_aff,
                             });
                         }
                     }
@@ -537,6 +589,7 @@ pub fn constraints_from_where_clause(
                             selectivity,
                             usable: true,
                             is_rowid: false,
+                            comparison_affinity: cmp_aff,
                         });
                     }
                     _ => {}
@@ -563,6 +616,7 @@ pub fn constraints_from_where_clause(
                                 ),
                                 usable: true,
                                 is_rowid: false,
+                                comparison_affinity: cmp_aff,
                             });
                         }
                     }
@@ -591,6 +645,7 @@ pub fn constraints_from_where_clause(
                                 ),
                                 usable: true,
                                 is_rowid: true,
+                                comparison_affinity: cmp_aff,
                             });
                         }
                     }
@@ -628,6 +683,7 @@ pub fn constraints_from_where_clause(
                             selectivity,
                             usable: true,
                             is_rowid: false,
+                            comparison_affinity: cmp_aff,
                         });
                     }
                     _ => {}
@@ -658,6 +714,9 @@ pub fn constraints_from_where_clause(
                     .unwrap_or(params.rows_per_table_fallback as u64)
                     as f64;
                 let selectivity = estimate_in_selectivity(estimated_values, row_count, *not);
+                // SQLite's `comparisonAffinity` for IN-list (`x IN (lit, ...)`)
+                // is the LHS column's affinity; the RHS literals are not folded.
+                let cmp_aff = Some(get_expr_affinity(lhs, Some(table_references), None));
 
                 match lhs.as_ref() {
                     ast::Expr::Column { table, column, .. }
@@ -677,6 +736,7 @@ pub fn constraints_from_where_clause(
                             selectivity,
                             usable: false, // IN uses a separate seek path, not the range-seek model
                             is_rowid,
+                            comparison_affinity: cmp_aff,
                         });
                     }
                     ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -693,6 +753,7 @@ pub fn constraints_from_where_clause(
                             selectivity,
                             usable: false,
                             is_rowid: true,
+                            comparison_affinity: cmp_aff,
                         });
                     }
                     _ => {}
@@ -704,7 +765,7 @@ pub fn constraints_from_where_clause(
                 subquery_id,
                 lhs: Some(lhs_expr),
                 not_in,
-                query_type: ast::SubqueryType::In { .. },
+                query_type: ast::SubqueryType::In { affinity_str, .. },
             } = &term.expr
             {
                 // Find the subquery to check if it's correlated
@@ -723,6 +784,19 @@ pub fn constraints_from_where_clause(
                         .unwrap_or(params.rows_per_table_fallback as u64)
                         as f64;
                     let selectivity = estimate_in_selectivity(estimated_values, row_count, *not_in);
+                    // SQLite's `comparisonAffinity` for IN-subquery combines the
+                    // LHS column affinity with each result column via
+                    // `sqlite3CompareAffinity` — that result is already cached on
+                    // `SubqueryType::In::affinity_str`. For a single-LHS-column
+                    // IN it is the first character; row-value IN has no single
+                    // resolved affinity and is left as `None`.
+                    let is_row_value = matches!(
+                        unwrap_parens(lhs_expr.as_ref()).ok(),
+                        Some(ast::Expr::Parenthesized(exprs)) if exprs.len() != 1
+                    );
+                    let cmp_aff = (!is_row_value)
+                        .then(|| affinity_str.chars().next().map(Affinity::from_char))
+                        .flatten();
 
                     match lhs_expr.as_ref() {
                         ast::Expr::Column { table, column, .. }
@@ -742,6 +816,7 @@ pub fn constraints_from_where_clause(
                                 selectivity,
                                 usable: false, // IN uses a separate seek path (consider_in_list_seek)
                                 is_rowid,
+                                comparison_affinity: cmp_aff,
                             });
                         }
                         ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -758,6 +833,7 @@ pub fn constraints_from_where_clause(
                                 selectivity,
                                 usable: false,
                                 is_rowid: true,
+                                comparison_affinity: cmp_aff,
                             });
                         }
                         _ => {}
@@ -860,6 +936,11 @@ pub fn constraints_from_where_clause(
                             .is_some()
                             && constraint.operator != ast::Operator::Equals.into()
                         {
+                            continue;
+                        }
+                        let idx_col_aff = constrained_column
+                            .affinity_with_strict(table_reference.table.is_strict());
+                        if !constraint.satisfies_index_affinity(idx_col_aff) {
                             continue;
                         }
                     }
@@ -1731,6 +1812,7 @@ pub(crate) fn analyze_binary_term_for_index(
         selectivity,
         usable: true,
         is_rowid,
+        comparison_affinity: Some(affinity),
     };
 
     Some(AnalyzedTerm {

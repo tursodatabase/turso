@@ -133,7 +133,7 @@ addr  opcode                            p1   p2   p3  p4              p5  commen
   98    Column                           2    1   21                   0  r[21]=ephemeral().avg_price
   99    Copy                            20   39    0                   0  r[39]=r[20]
  100    IsNull                          39  116    0                   0  if (r[39]==NULL) goto 116
- 101    Affinity                        39    1    0                   0  r[39..40] = D
+ 101    Affinity                        39    1    0                   0  r[39..40] = C
  102    SeekGE                           6  116   39                   0  key=[39..39]
  103      IdxGT                          6  116   39                   0  key=[39..39]
  104      DeferredSeek                   6    5    0                   0

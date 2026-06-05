@@ -1,0 +1,132 @@
+@database :memory:
+
+# Regression tests for #7373: when a JOIN ON predicate is satisfied by an
+# index seek, Turso was applying the *indexed column's* affinity to the
+# seek key. For a TEXT-affinity index probed by an INTEGER-affinity column,
+# that converted the integer to TEXT ("0") instead of leaving the integer
+# alone — and the BTREE comparator then ranked '' below '0' lexicographically
+# instead of using SQLite's type ordering (INTEGER < TEXT) which puts the
+# integer below every text value. The seek therefore reported false matches.
+#
+# The correct affinity for the seek key is the comparison affinity already
+# computed by the planner, not the column affinity: applied to an INTEGER
+# column it is a no-op, so the comparator sees the original integer value
+# and ranks it correctly against the stored TEXT keys.
+
+setup issue-7373-schema {
+    CREATE TABLE l(txt TEXT);
+    CREATE TABLE r(flag INTEGER);
+    INSERT INTO l VALUES ('');
+    INSERT INTO r VALUES (0);
+}
+
+@setup issue-7373-schema
+test issue-7373-derived-join-on-text-le-int {
+    SELECT 'inner', L.txt, R.flag
+    FROM (SELECT txt FROM l) AS L
+    JOIN r AS R ON L.txt <= R.flag
+    UNION ALL
+    SELECT 'cross', L.txt, R.flag
+    FROM (SELECT txt FROM l) AS L
+    CROSS JOIN r AS R
+    WHERE L.txt <= R.flag
+    ORDER BY 1, 2, 3;
+}
+expect {
+}
+
+# Same shape without a derived subquery — exercises the regular b-tree index
+# path on a TEXT column being probed by an INTEGER column.
+setup issue-7373-direct-index-schema {
+    CREATE TABLE l(txt TEXT);
+    CREATE INDEX l_txt ON l(txt);
+    CREATE TABLE r(flag INTEGER);
+    INSERT INTO l VALUES ('');
+    INSERT INTO r VALUES (0);
+}
+
+@setup issue-7373-direct-index-schema
+test issue-7373-direct-index-text-le-int {
+    SELECT l.txt, r.flag FROM l JOIN r ON l.txt <= r.flag;
+}
+expect {
+}
+
+@setup issue-7373-direct-index-schema
+test issue-7373-direct-index-text-eq-int {
+    SELECT l.txt, r.flag FROM l JOIN r ON l.txt = r.flag;
+}
+expect {
+}
+
+# Affinity application should still work when the seek key is a literal —
+# SQLite *does* apply TEXT affinity to literals against a TEXT index, which
+# is how `txt = 0` returns the row with txt='0'. The comparison affinity
+# computed for text-vs-literal is TEXT, so this path is preserved.
+setup issue-7373-literal-affinity-schema {
+    CREATE TABLE l(txt TEXT);
+    CREATE INDEX l_txt ON l(txt);
+    INSERT INTO l VALUES ('0'), ('a');
+}
+
+@setup issue-7373-literal-affinity-schema
+test issue-7373-literal-affinity-preserved {
+    SELECT txt FROM l WHERE txt = 0;
+}
+expect {
+0
+}
+
+# #7374: a RIGHT JOIN whose left side is a derived TEXT subquery and whose
+# right side is a derived numeric subquery used to drop the match because the
+# ephemeral index on the TEXT side coerced the integer probe to TEXT and the
+# resulting `>=` against the empty/text values diverged from a row-by-row
+# evaluation. Rejecting the TEXT index for a numeric comparison (and applying
+# the comparison affinity at seek time) brings Turso back in line with SQLite.
+setup issue-7374-schema {
+    CREATE TABLE l(id INTEGER PRIMARY KEY, txt TEXT);
+    CREATE TABLE r(id INTEGER PRIMARY KEY, flag BOOLEAN);
+    INSERT INTO l VALUES (1, '6');
+    INSERT INTO r VALUES (10, 0);
+}
+
+@setup issue-7374-schema
+test issue-7374-right-join-mixed-affinity {
+    SELECT l.id, l.txt, typeof(l.txt), r.id, r.flag, typeof(r.flag)
+    FROM (SELECT id, txt FROM l WHERE txt IS NOT NULL) AS l
+    RIGHT JOIN (SELECT DISTINCT id, flag FROM r) AS r
+    ON l.txt >= r.flag;
+}
+expect {
+1|6|text|10|0|integer
+}
+
+# An IN-list / IN-subquery against an affinity-incompatible index is the same
+# class of bug as the issues referenced above: the index seek bypasses the comparison affinity SQLite would
+# apply at WHERE time and silently returns wrong rows. Here
+# `l.txt IN (SELECT flag FROM r)` resolves to comparison affinity NUMERIC
+# (TEXT col vs INTEGER col), so the TEXT index `l_txt` must be rejected; the
+# row-by-row WHERE evaluation NUMERIC-coerces '0' to 0 and matches r.flag=0.
+setup in-list-text-idx-numeric-source-schema {
+    CREATE TABLE l(txt TEXT);
+    CREATE INDEX l_txt ON l(txt);
+    CREATE TABLE r(flag INTEGER);
+    INSERT INTO l VALUES (''), ('0');
+    INSERT INTO r VALUES (0), (1);
+}
+
+@setup in-list-text-idx-numeric-source-schema
+test in-subquery-text-idx-numeric-source {
+    SELECT l.txt FROM l WHERE l.txt IN (SELECT flag FROM r);
+}
+expect {
+0
+}
+
+@setup in-list-text-idx-numeric-source-schema
+test in-literal-list-text-idx-numeric-source {
+    SELECT l.txt FROM l WHERE l.txt IN (0, 1) ORDER BY l.txt;
+}
+expect {
+0
+}
