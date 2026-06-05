@@ -3153,12 +3153,6 @@ impl Window {
 
     /// Build a `Window` from an inline `OVER (...)` AST node
     pub fn new_unnamed(ast: &ast::Window, frame: Frame) -> Result<Self> {
-        // User-written FRAME clauses aren't supported yet. Still call
-        // the validator so SQLite-invalid shapes get the matching
-        // error; for anything else, bail.
-        if let Some(_user_frame) = validate_frame_clause(&ast.frame_clause, ast.order_by.len())? {
-            crate::bail_parse_error!("user-specified frame clauses are not supported");
-        }
         Ok(Window {
             name: None,
             partition_by: ast.partition_by.iter().map(|arg| *arg.clone()).collect(),
@@ -3343,13 +3337,9 @@ pub fn validate_frame_clause(
     }))
 }
 
-/// Convert a parser-level `FrameBound` to the planner's `FrameBoundary`.
-/// Offset expressions are cloned out of the AST and evaluated at
-/// partition start by the emit code, whose runtime non-negative check
-/// mirrors SQLite's `windowCheckValue` (window.c:1494-1522) — including
-/// its timing: a statement that never processes a partition (an empty
-/// table, say) never evaluates the offset and never errors, even for a
-/// literal negative.
+/// Convert a parser-level `FrameBound` to the planner's `FrameBoundary`,
+/// cloning any offset expression out of the AST for the emit code to
+/// evaluate.
 fn translate_frame_bound(bound: &FrameBound, is_start: bool) -> Result<FrameBoundary> {
     // The parser enforces start/end orientation: TK_PRECEDING is only
     // emitted as a start bound, TK_FOLLOWING only as an end bound
@@ -3390,6 +3380,14 @@ fn translate_frame_bound(bound: &FrameBound, is_start: bool) -> Result<FrameBoun
 #[derive(Debug, Clone)]
 pub struct NamedWindowDef {
     pub name: String,
+    /// User-written FRAME clause preserved so a function attaching by
+    /// `Over::Name` can compute its effective frame from it.
+    pub user_frame_clause: Option<FrameClause>,
+    /// The bound PARTITION BY / ORDER BY expressions. The first function
+    /// to attach takes them (leaving `None`); any later function under a
+    /// different coerced frame copies them back from a resolved `Window`.
+    /// They live here, rather than inside the frame, so taking them
+    /// doesn't disturb `user_frame_clause`.
     pub bound: Option<NamedWindowBound>,
     pub has_frame_clause: bool,
 }

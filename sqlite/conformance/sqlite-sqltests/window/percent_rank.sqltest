@@ -673,3 +673,24 @@ expect @js {
     2|3|0
     2|4|1
 }
+
+# A user frame with EXCLUDE must also be dropped by the built-in
+# frame override (sqlite3WindowUpdate replaces eExclude too).
+setup exclude_vals {
+    CREATE TABLE ex(v);
+    INSERT INTO ex VALUES (1),(2),(2),(4);
+}
+
+@setup exclude_vals
+test percent-rank-exclude-current-overridden {
+    SELECT printf('%.4f', percent_rank() OVER
+        (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+         EXCLUDE CURRENT ROW))
+    FROM ex;
+}
+expect {
+    0.0000
+    0.3333
+    0.3333
+    1.0000
+}
