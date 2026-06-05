@@ -94,6 +94,10 @@ impl<'a> LogSerializer<'a> {
             "table_id_i64 out of i32 range: {table_id_i64}"
         );
         let table_id_i32 = table_id_i64 as i32;
+        let portable_extension =
+            portable_extension.filter(|portable_extension| !portable_extension.is_empty());
+        let portable_extension_write =
+            portable_extension.map(|extension| (Varint(extension.len() as u64), extension));
 
         match (&row_version.row.id.row_id, is_delete) {
             (&RowKey::Int(rowid), false) => {
@@ -111,6 +115,7 @@ impl<'a> LogSerializer<'a> {
                         Varint(payload_len as u64),
                         Varint(rowid_u64),
                         record_bytes,
+                        portable_extension_write,
                     ]
                 )?;
             }
@@ -125,6 +130,7 @@ impl<'a> LogSerializer<'a> {
                         table_id_i32.to_le_bytes(),
                         Varint(rowid_len as u64),
                         Varint(rowid_u64),
+                        portable_extension_write,
                     ]
                 )?;
             }
@@ -142,18 +148,10 @@ impl<'a> LogSerializer<'a> {
                         table_id_i32.to_le_bytes(),
                         Varint(key_bytes.len() as u64),
                         key_bytes,
+                        portable_extension_write,
                     ]
                 )?;
             }
-        }
-
-        if let Some(portable_extension) =
-            portable_extension.filter(|portable_extension| !portable_extension.is_empty())
-        {
-            log_write!(
-                self,
-                [Varint(portable_extension.len() as u64), portable_extension]
-            )?;
         }
 
         Ok(())
@@ -187,27 +185,14 @@ impl<'a> LogSerializer<'a> {
     ) -> Result<Vec<u8>> {
         let mut extension = Vec::new();
         let mut serializer = LogSerializer::new(&mut extension);
-        if let Some(identity_record) = identity_record.filter(|record| !record.is_empty()) {
-            log_write!(
-                serializer,
-                [ProtoBytes::new(
-                    OP_EXT_FIELD_DELETE_IDENTITY_RECORD,
-                    identity_record
-                )]
-            )?;
-        }
-        if let Some(pk_record) = pk_record.filter(|record| !record.is_empty()) {
-            log_write!(
-                serializer,
-                [ProtoBytes::new(OP_EXT_FIELD_DELETE_PK_RECORD, pk_record)]
-            )?;
-        }
-        if let Some(rowid) = rowid {
-            log_write!(
-                serializer,
-                [ProtoSint64::new(OP_EXT_FIELD_DELETE_ROWID, rowid)]
-            )?;
-        }
+        let identity_record = identity_record
+            .filter(|record| !record.is_empty())
+            .map(|record| ProtoBytes::new(OP_EXT_FIELD_DELETE_IDENTITY_RECORD, record));
+        let pk_record = pk_record
+            .filter(|record| !record.is_empty())
+            .map(|record| ProtoBytes::new(OP_EXT_FIELD_DELETE_PK_RECORD, record));
+        let rowid = rowid.map(|rowid| ProtoSint64::new(OP_EXT_FIELD_DELETE_ROWID, rowid));
+        log_write!(serializer, [identity_record, pk_record, rowid])?;
         Ok(extension)
     }
 
@@ -495,6 +480,23 @@ impl LogBufferWrite for &[u8] {
     }
 }
 
+impl<W: LogBufferWrite> LogBufferWrite for Option<W> {
+    #[inline(always)]
+    fn encoded_len(&self) -> Option<usize> {
+        match self {
+            Some(value) => value.encoded_len(),
+            None => Some(0),
+        }
+    }
+
+    #[inline(always)]
+    fn write_to(self, buffer: &mut Vec<u8>) {
+        if let Some(value) = self {
+            value.write_to(buffer);
+        }
+    }
+}
+
 #[inline(always)]
 fn checked_log_buffer_len(lhs: usize, rhs: usize) -> Option<usize> {
     lhs.checked_add(rhs)
@@ -535,6 +537,82 @@ impl_log_buffer_write_tuple!((A, a), (B, b), (C, c));
 impl_log_buffer_write_tuple!((A, a), (B, b), (C, c), (D, d));
 impl_log_buffer_write_tuple!((A, a), (B, b), (C, c), (D, d), (E, e));
 impl_log_buffer_write_tuple!((A, a), (B, b), (C, c), (D, d), (E, e), (F, f));
+impl_log_buffer_write_tuple!((A, a), (B, b), (C, c), (D, d), (E, e), (F, f), (G, g));
+impl_log_buffer_write_tuple!(
+    (A, a),
+    (B, b),
+    (C, c),
+    (D, d),
+    (E, e),
+    (F, f),
+    (G, g),
+    (H, h)
+);
+impl_log_buffer_write_tuple!(
+    (A, a),
+    (B, b),
+    (C, c),
+    (D, d),
+    (E, e),
+    (F, f),
+    (G, g),
+    (H, h),
+    (I, i)
+);
+impl_log_buffer_write_tuple!(
+    (A, a),
+    (B, b),
+    (C, c),
+    (D, d),
+    (E, e),
+    (F, f),
+    (G, g),
+    (H, h),
+    (I, i),
+    (J, j)
+);
+impl_log_buffer_write_tuple!(
+    (A, a),
+    (B, b),
+    (C, c),
+    (D, d),
+    (E, e),
+    (F, f),
+    (G, g),
+    (H, h),
+    (I, i),
+    (J, j),
+    (K, k)
+);
+impl_log_buffer_write_tuple!(
+    (A, a),
+    (B, b),
+    (C, c),
+    (D, d),
+    (E, e),
+    (F, f),
+    (G, g),
+    (H, h),
+    (I, i),
+    (J, j),
+    (K, k),
+    (L, l)
+);
+impl_log_buffer_write_tuple!(
+    (A, a),
+    (B, b),
+    (C, c),
+    (D, d),
+    (E, e),
+    (F, f),
+    (G, g),
+    (H, h),
+    (I, i),
+    (J, j),
+    (K, k),
+    (L, l),
+    (M, m)
+);
 
 fn write_proto_varint(mut value: u64, buffer: &mut Vec<u8>) {
     while value >= 0x80 {
