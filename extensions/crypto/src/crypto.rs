@@ -191,9 +191,9 @@ fn decode_digit(
 
     let term = (byte as u32)
         .checked_mul(TABLE[*counter])
-        .ok_or_else(|| "decode overflow")?;
+        .ok_or("decode overflow")?;
 
-    *chunk = chunk.checked_add(term).ok_or_else(|| "decode overflow")?;
+    *chunk = chunk.checked_add(term).ok_or("decode overflow")?;
 
     if *counter == 4 {
         result.extend_from_slice(&chunk.to_be_bytes());
