@@ -1378,7 +1378,7 @@ pub const GREEDY_JOIN_THRESHOLD: usize = 12;
 /// Greedy Operator Ordering (GOO) for join optimization. O(n²) time, O(n) space.
 ///
 /// Builds a left-deep join tree by:
-/// 1. Starting with the table that has best hub score (enables most index lookups)
+/// 1. Starting with the table that best balances local filtering and indexed-seek benefits
 /// 2. Greedily adding the remaining table with lowest marginal cost
 ///
 /// Respects outer join ordering constraints.
@@ -1426,7 +1426,7 @@ pub fn compute_greedy_join_order<'a>(
     let mut remaining: TableMask = (0..num_tables).try_collect()?;
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
 
-    // Pick starting table: prefer tables with high "hub score" (referenced by many constraints).
+    // Pick the starting table using local filters and directed indexed-seek benefits.
     let first_idx = find_best_starting_table(
         num_tables,
         joined_tables,
@@ -1435,7 +1435,7 @@ pub fn compute_greedy_join_order<'a>(
         &left_join_deps,
         analyze_stats,
         params,
-    );
+    )?;
     let first_table = &joined_tables[first_idx];
     join_order.push(JoinOrderMember {
         table_id: first_table.internal_id,
@@ -1601,7 +1601,7 @@ fn find_best_starting_table(
     left_join_deps: &HashMap<usize, TableMask>,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
-) -> usize {
+) -> Result<usize> {
     let multipliers = compute_indexed_seek_benefits(
         num_tables,
         joined_tables,
@@ -1610,7 +1610,7 @@ fn find_best_starting_table(
         left_join_deps,
         analyze_stats,
         params,
-    );
+    )?;
 
     let mut best: Option<(usize, f64)> = None;
     for t in 0..num_tables {
@@ -1700,7 +1700,7 @@ fn compute_indexed_seek_benefits(
     left_join_deps: &HashMap<usize, TableMask>,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
-) -> Vec<f64> {
+) -> Result<Vec<f64>> {
     let mut benefits = vec![IndexedSeekBenefit::default(); num_tables];
 
     let mut total_constant_score = 0.0;
@@ -1717,7 +1717,7 @@ fn compute_indexed_seek_benefits(
 
         if let Some(dep_t) = deps.iter().next() {
             let mut mask = TableMask::default();
-            mask.set(dep_t);
+            mask.set(dep_t)?;
             let score = get_best_seek_score(
                 &constraints[rhs],
                 &mask,
@@ -1743,7 +1743,7 @@ fn compute_indexed_seek_benefits(
                     let c = &constraints[rhs].constraints[cref.constraint_vec_pos];
                     if c.lhs_mask.count() == 1 {
                         if let Some(t) = c.lhs_mask.iter().next() {
-                            potential_predecessors.set(t);
+                            potential_predecessors.set(t)?;
                         }
                     }
                 }
@@ -1769,7 +1769,7 @@ fn compute_indexed_seek_benefits(
                     continue;
                 }
                 let mut mask = TableMask::default();
-                mask.set(t);
+                mask.set(t)?;
                 let specific_score = get_best_seek_score(
                     &constraints[rhs],
                     &mask,
@@ -1792,7 +1792,7 @@ fn compute_indexed_seek_benefits(
         benefits[start].reward += total_constant_score - constant_scores[start];
     }
 
-    benefits.into_iter().map(|b| b.multiplier()).collect()
+    Ok(benefits.into_iter().map(|b| b.multiplier()).collect())
 }
 
 /// Calculate the best "seek score" for a table given a set of already joined tables (lhs_mask).
@@ -3629,8 +3629,8 @@ mod tests {
         where_clause: &[WhereTerm],
         indexes: VecDeque<Arc<Index>>,
     ) -> f64 {
-        let mut available_indexes = HashMap::default();
-        available_indexes.insert("table2".to_string(), indexes);
+        let mut available_indexes = AvailableIndexes::default();
+        available_indexes.insert_for_table_name(joined_tables, "table2", indexes);
         let table_references = TableReferences::new(joined_tables.to_vec(), vec![]);
         let constraints = constraints_from_where_clause(
             where_clause,
@@ -3643,7 +3643,7 @@ mod tests {
         .unwrap();
 
         let mut lhs_mask = TableMask::default();
-        lhs_mask.set(0);
+        lhs_mask.set(0).unwrap();
         get_best_seek_score(
             &constraints[1],
             &lhs_mask,
