@@ -573,12 +573,12 @@ pub struct WindowRegisters {
     pub peer_start_reg: Option<usize>,
     pub peer_current_reg: Option<usize>,
     pub peer_end_reg: Option<usize>,
-    /// Register holding the runtime-evaluated offset N for frames
-    /// whose start boundary is `Following(_)` — `cume_dist()`'s
-    /// `Following(1)`. Used as an `OP_IfPos` countdown by whichever
-    /// frame-cursor op needs to be deferred; cume_dist gates RETURN_ROW
-    /// with it so the first emit waits for the first AGGINVERSE. Mirrors
-    /// SQLite's `regStart` (window.c:2883).
+    /// Register holding the runtime-evaluated `N` for frames whose
+    /// start boundary is `Preceding(_)` or `Following(_)`. Used as an
+    /// `OP_IfPos` countdown — cume_dist gates RETURN_ROW with it
+    /// (`Following(1)`), `ROWS BETWEEN N PRECEDING AND CURRENT ROW`
+    /// gates AGGINVERSE with it. Mirrors SQLite's `regStart`
+    /// (window.c:2883).
     pub start_offset_reg: Option<usize>,
     /// Return-address register for the `labels.row_output` Gosub. Mirrors
     /// SQLite's `regGosub` (window.c:2793).
@@ -640,6 +640,56 @@ fn build_order_by_key_info(
             })
         })
         .collect()
+}
+
+/// Emit a runtime check that the frame-offset register holds a
+/// non-negative integer, halting the program with the standard SQLite
+/// error message on failure. Mirrors `windowCheckValue` at
+/// `window.c:1482-1523`.
+fn emit_window_check_offset(
+    program: &mut ProgramBuilder,
+    offset_reg: usize,
+    mode: turso_parser::ast::FrameMode,
+    is_start: bool,
+) {
+    use turso_parser::ast::FrameMode;
+    let label_halt = program.allocate_label();
+    let label_ok = program.allocate_label();
+    let reg_zero = program.alloc_register();
+    if mode != FrameMode::Range {
+        // ROWS / GROUPS: coerce to integer; route the failure into
+        // the frame-specific Halt so the user sees the SQLite-matching
+        // error instead of the generic "datatype mismatch".
+        program.emit_insn(Insn::MustBeInt {
+            reg: offset_reg,
+            target_pc: Some(label_halt),
+        });
+    }
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: reg_zero,
+    });
+    program.emit_insn(Insn::Ge {
+        lhs: offset_reg,
+        rhs: reg_zero,
+        target_pc: label_ok,
+        flags: crate::vdbe::insn::CmpInsFlags::default(),
+        collation: None,
+    });
+    program.preassign_label_to_next_insn(label_halt);
+    let msg = match (mode, is_start) {
+        (FrameMode::Range, true) => "frame starting offset must be a non-negative number",
+        (FrameMode::Range, false) => "frame ending offset must be a non-negative number",
+        (_, true) => "frame starting offset must be a non-negative integer",
+        (_, false) => "frame ending offset must be a non-negative integer",
+    };
+    program.emit_insn(Insn::Halt {
+        err_code: crate::error::SQLITE_ERROR,
+        description: msg.to_string(),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(label_ok);
 }
 
 pub struct EmitWindow;
@@ -835,7 +885,8 @@ impl EmitWindow {
                     None
                 },
                 start_offset_reg: match window.frame.start {
-                    crate::translate::plan::FrameBoundary::Following(_) => {
+                    crate::translate::plan::FrameBoundary::Preceding(_)
+                    | crate::translate::plan::FrameBoundary::Following(_) => {
                         Some(program.alloc_register())
                     }
                     _ => None,
@@ -968,9 +1019,10 @@ impl EmitWindow {
         // decrements ran. Mirrors SQLite's `regStart` init at `window.c:2942`.
         if let Some(start_offset_reg) = registers.start_offset_reg {
             let offset_expr = match &window.frame.start {
-                crate::translate::plan::FrameBoundary::Following(expr) => expr,
+                crate::translate::plan::FrameBoundary::Preceding(expr)
+                | crate::translate::plan::FrameBoundary::Following(expr) => expr,
                 _ => unreachable!(
-                    "start_offset_reg is only allocated when frame.start is Following"
+                    "start_offset_reg is only allocated when frame.start is Preceding/Following"
                 ),
             };
             translate_expr_no_constant_opt(
@@ -981,6 +1033,12 @@ impl EmitWindow {
                 &t_ctx.resolver,
                 NoConstantOptReason::RegisterReuse,
             )?;
+            emit_window_check_offset(
+                program,
+                start_offset_reg,
+                window.frame.mode,
+                /* is_start = */ true,
+            );
         }
         emit_insert_row_into_buffer(
             program,
@@ -1089,6 +1147,24 @@ impl EmitWindow {
         );
         if !cache_frame {
             emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None, None)?;
+            // For `ROWS BETWEEN N PRECEDING AND CURRENT ROW` the frame
+            // slides one row per output. AGGINVERSE is gated by the
+            // start-offset countdown so the first N+1 rows accumulate
+            // without ejecting anything. Mirrors SQLite's main-loop
+            // emit at `window.c:3032-3033`.
+            if matches!(
+                window.frame.start,
+                crate::translate::plan::FrameBoundary::Preceding(_)
+            ) {
+                emit_window_op(
+                    program,
+                    t_ctx,
+                    plan,
+                    WindowOp::AggInverse,
+                    registers.start_offset_reg,
+                    None,
+                )?;
+            }
         }
 
         // No explicit peer-tracker update needed here: AGGSTEP's
@@ -1315,8 +1391,9 @@ enum WindowOp {
 /// `countdown_reg` is `Some(reg)` when the caller wants the op gated by
 /// an `OP_IfPos` countdown — the op is skipped (and the register
 /// decremented) while `reg > 0`. cume_dist uses this on RETURN_ROW to
-/// defer the first emit until after the first AGGINVERSE has fired.
-/// Matches SQLite's `regCountdown` parameter at `window.c:2238`.
+/// defer the first emit; `ROWS BETWEEN N PRECEDING AND CURRENT ROW`
+/// uses it on AGGINVERSE to grow the frame to width N+1 before
+/// sliding. Matches SQLite's `regCountdown` parameter at `window.c:2238`.
 ///
 /// `break_on_eof` is `Some(label)` only at flush time, when the caller wants
 /// the `RETURN_ROW` loop to exit cleanly on EOF instead of falling through.
@@ -1363,9 +1440,9 @@ fn emit_window_op(
 
     // Optional `OP_IfPos` countdown — when the register is positive,
     // decrement and skip the op body. Mirrors SQLite at `window.c:2279`.
-    // The caller decides which op gets the gate; cume_dist gates
-    // RETURN_ROW with `start_offset_reg` so the first emit waits for
-    // the first AGGINVERSE.
+    // The caller decides which op gets the gate; for cume_dist's
+    // `Following(1)` start it gates RETURN_ROW, for `ROWS BETWEEN N
+    // PRECEDING` it gates AGGINVERSE.
     if let Some(reg) = countdown_reg {
         program.emit_insn(Insn::IfPos {
             reg,
@@ -1514,6 +1591,44 @@ fn emit_window_op(
 /// `translate_expr` resolves each `Expr::Column` to the arg-load register
 /// we just populated, instead of to `src_columns_start`. The cache is
 /// restored on the way out.
+/// Emit the per-row FILTER predicate read used by both `AggStep` (on
+/// `csr_end`, the row entering the frame) and `AggInverse` (on
+/// `csr_start`, the row leaving). Caller is responsible for pinning
+/// the returned label to the instruction the filtered emit should
+/// skip past.
+fn emit_filter_skip(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    resolver: &Resolver,
+    cursor: CursorID,
+    filter_expr: &Expr,
+) -> Result<BranchOffset> {
+    let label = program.allocate_label();
+    let filter_reg = program.alloc_register();
+    if let Expr::Column { column, .. } = filter_expr {
+        program.emit_insn(Insn::Column {
+            cursor_id: cursor,
+            column: *column,
+            dest: filter_reg,
+            default: None,
+        });
+    } else {
+        translate_expr(
+            program,
+            Some(table_references),
+            filter_expr,
+            filter_reg,
+            resolver,
+        )?;
+    }
+    program.emit_insn(Insn::IfNot {
+        reg: filter_reg,
+        target_pc: label,
+        jump_if_null: true,
+    });
+    Ok(label)
+}
+
 fn emit_function_step(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
@@ -1577,37 +1692,20 @@ fn emit_function_step(
 
         match &func.func {
             AccumulatorFunc::Agg(agg_func) => {
-                // FILTER predicate also loads from the frame cursor.
-                let filter_skip_label = if let Some(filter_expr) =
-                    func.rewritten.as_ref().and_then(|r| r.filter_expr.as_ref())
-                {
-                    let label = program.allocate_label();
-                    let filter_reg = program.alloc_register();
-                    if let Expr::Column { column, .. } = filter_expr {
-                        program.emit_insn(Insn::Column {
-                            cursor_id: read_csr,
-                            column: *column,
-                            dest: filter_reg,
-                            default: None,
-                        });
-                    } else {
-                        translate_expr(
+                let filter_skip_label = func
+                    .rewritten
+                    .as_ref()
+                    .and_then(|r| r.filter_expr.as_ref())
+                    .map(|f| {
+                        emit_filter_skip(
                             program,
-                            Some(&plan.table_references),
-                            filter_expr,
-                            filter_reg,
+                            &plan.table_references,
                             &t_ctx.resolver,
-                        )?;
-                    }
-                    program.emit_insn(Insn::IfNot {
-                        reg: filter_reg,
-                        target_pc: label,
-                        jump_if_null: true,
-                    });
-                    Some(label)
-                } else {
-                    None
-                };
+                            read_csr,
+                            f,
+                        )
+                    })
+                    .transpose()?;
 
                 translate_aggregation_step(
                     program,
@@ -1654,13 +1752,12 @@ fn emit_function_step(
 /// dispatch inside SQLite's `windowAggStep(... bInverse=1, ...)`
 /// (window.c:2329).
 ///
-/// For our supported moving-start frames (ntile, percent_rank,
-/// cume_dist) xInverse is purely state-mutating: it increments a
-/// counter the function's xValue reads. We pass `col = 0` because none
-/// of these read leaving-row columns. Aggregate inverses (sum / count
-/// / avg under a sliding frame) would need the leaving row's args loaded
-/// from `csr_start` first — that path lands when we accept user-specified
-/// custom frames.
+/// For ntile / percent_rank / cume_dist (window functions with a moving
+/// frame start) xInverse just mutates internal state; no arg load is
+/// needed. For aggregates with a moving start (`sum`, `count(arg)`,
+/// `avg`), the leaving row's arg column has to be loaded from
+/// `csr_start` so the runtime can subtract / decrement against it —
+/// mirrors how `emit_function_step` loads from `csr_end` for AggStep.
 fn emit_function_inverse(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
@@ -1669,14 +1766,65 @@ fn emit_function_inverse(
     let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
     let window = plan.window.as_ref().expect("missing window");
     let acc_start = meta.registers.acc_start;
+    let csr_start = meta.cursors.csr_start.expect(
+        "emit_function_inverse: csr_start must be allocated when any AGGINVERSE is emitted",
+    );
+
     for (i, func) in window.functions.iter().enumerate() {
+        let acc_reg = acc_start + i;
+        let args: Vec<Expr> = match func.current_expr() {
+            Expr::FunctionCall { args, .. } => args.iter().map(|a| (**a).clone()).collect(),
+            Expr::FunctionCallStar { .. } => vec![],
+            _ => unreachable!("window functions are FunctionCall or FunctionCallStar expressions"),
+        };
+
+        let arg_load_start = (!args.is_empty()).then(|| program.alloc_registers(args.len()));
+        if let Some(base) = arg_load_start {
+            for (j, arg) in args.iter().enumerate() {
+                let Expr::Column { column, .. } = arg else {
+                    unreachable!(
+                        "window-function args are rewritten to subquery columns by \
+                         push_into_input_subquery; got {arg:?}"
+                    );
+                };
+                program.emit_insn(Insn::Column {
+                    cursor_id: csr_start,
+                    column: *column,
+                    dest: base + j,
+                    default: None,
+                });
+            }
+        }
+
+        // A row skipped by FILTER on entry was never AggStep'd, so it
+        // must not be AggInverse'd either — otherwise the accumulator
+        // drifts and `count(*)` underflows.
+        let filter_skip_label = func
+            .rewritten
+            .as_ref()
+            .and_then(|r| r.filter_expr.as_ref())
+            .map(|f| {
+                emit_filter_skip(
+                    program,
+                    &plan.table_references,
+                    &t_ctx.resolver,
+                    csr_start,
+                    f,
+                )
+            })
+            .transpose()?;
+
         program.emit_insn(Insn::AggInverse {
-            acc_reg: acc_start + i,
-            col: 0,
+            acc_reg,
+            col: arg_load_start.unwrap_or(0),
             delimiter: 0,
             func: func.func.clone(),
             comparator: None,
         });
+
+        if let Some(label) = filter_skip_label {
+            program.preassign_label_to_next_insn(label);
+        }
     }
     Ok(())
 }
@@ -1835,19 +1983,16 @@ fn emit_lag_lead_lookup(
 ///     -- or --
 ///   tmp := arg[1] from csr_current           (nth_value, per-row N)
 ///   MustBeInt tmp; if tmp <= 0: error
-///   tmp := tmp + frame_start_rowid - 1       (frame_start_rowid = 1 for UB-CR)
+///   tmp := tmp + frame_start_rowid - 1
 ///   if tmp > csr_current.rowid: goto lbl     (target past frame end → NULL)
 ///   SeekRowid(csr_app, tmp)
 ///   reg_result := Column(csr_app, arg[0])
 ///   lbl:
 /// ```
 ///
-/// The frames the planner currently lets first_value/nth_value through
-/// with all have `frame_start_rowid = 1` (RANGE UNBOUNDED PRECEDING TO
-/// CURRENT ROW). Sliding `ROWS BETWEEN N PRECEDING AND CURRENT ROW` for
-/// these functions is rejected at parse — it needs a stable
-/// per-partition N register (parallel to SQLite's `pWin->regApp`) to
-/// compute `frame_start_rowid` at emit time.
+/// `frame_start_rowid` is `RowId(csr_start)` when a moving frame start
+/// is active (`ROWS BETWEEN N PRECEDING AND CURRENT ROW`) and `1`
+/// otherwise (default `RANGE UNBOUNDED PRECEDING TO CURRENT ROW`).
 fn emit_first_value_nth_value_lookup(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
@@ -1889,9 +2034,9 @@ fn emit_first_value_nth_value_lookup(
             dest_end: None,
         });
 
-        // Compute target rowid. For UB-CR frames, frame_start_rowid = 1,
-        // so target = N (read fresh per output row for nth_value, 1 for
-        // first_value).
+        // Compute target rowid. target = N + frame_start_rowid - 1.
+        // For UB-CR frames frame_start_rowid = 1 → target = N. For
+        // ROWS BETWEEN N PRECEDING AND CURRENT ROW it tracks csr_start.
         let target_reg = program.alloc_register();
         if is_nth {
             let n_col = match args.get(1) {
@@ -1943,8 +2088,28 @@ fn emit_first_value_nth_value_lookup(
             });
         }
 
-        // If target > csr_current.rowid (frame_end_rowid for UB-CR), the
-        // Nth row is past the frame end — result stays NULL.
+        // Apply frame_start_rowid offset: target += csr_start.rowid - 1
+        // when the frame has a moving start. Otherwise frame_start_rowid
+        // is 1 and target stays as N.
+        if let Some(csr_start) = cursors.csr_start {
+            let start_rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::RowId {
+                cursor_id: csr_start,
+                dest: start_rowid_reg,
+            });
+            program.emit_insn(Insn::Add {
+                lhs: target_reg,
+                rhs: start_rowid_reg,
+                dest: target_reg,
+            });
+            program.emit_insn(Insn::AddImm {
+                register: target_reg,
+                value: -1,
+            });
+        }
+
+        // If target > csr_current.rowid (frame_end_rowid for our frames),
+        // the Nth row is past the frame end — result stays NULL.
         let cur_rowid_reg = program.alloc_register();
         program.emit_insn(Insn::RowId {
             cursor_id: csr_current,
@@ -2128,8 +2293,8 @@ pub fn emit_window_flush(
     // remaining rows.
     emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None)?;
 
-    // The flush loop shape depends on the coerced frame's start
-    // boundary. Mirrors SQLite's three flush paths at window.c:3052-3094.
+    // The flush loop shape depends on the frame's start boundary.
+    // Mirrors SQLite's three flush paths at window.c:3052-3094.
     let window = plan.window.as_ref().expect("missing window");
     match window.frame.start {
         crate::translate::plan::FrameBoundary::Following(_) => {
@@ -2230,11 +2395,42 @@ pub fn emit_window_flush(
                 target_pc: label_loop_start,
             });
         }
-        crate::translate::plan::FrameBoundary::UnboundedFollowing
-        | crate::translate::plan::FrameBoundary::Preceding(_) => {
-            unreachable!(
-                "neither UNBOUNDED FOLLOWING nor N PRECEDING can be a coerced frame start"
-            );
+        crate::translate::plan::FrameBoundary::Preceding(_) => {
+            // `N PRECEDING` start (`ROWS BETWEEN N PRECEDING AND CURRENT
+            // ROW`). SQLite window.c:3085-3094: single loop with
+            // AGGINVERSE gated by the start-offset countdown.
+            //
+            //   loop:
+            //     RETURN_ROW (break_on_eof = label_break)
+            //     AGGINVERSE (countdown = start_offset_reg)
+            //     Goto loop
+            //
+            // The countdown ensures the frame grows to width N+1 before
+            // csr_start starts sliding.
+            let label_loop_start = program.allocate_label();
+            program.preassign_label_to_next_insn(label_loop_start);
+            emit_window_op(
+                program,
+                t_ctx,
+                plan,
+                WindowOp::ReturnRow,
+                None,
+                Some(label_break),
+            )?;
+            emit_window_op(
+                program,
+                t_ctx,
+                plan,
+                WindowOp::AggInverse,
+                registers.start_offset_reg,
+                None,
+            )?;
+            program.emit_insn(Insn::Goto {
+                target_pc: label_loop_start,
+            });
+        }
+        crate::translate::plan::FrameBoundary::UnboundedFollowing => {
+            unreachable!("UNBOUNDED FOLLOWING cannot be a coerced frame start");
         }
     }
 

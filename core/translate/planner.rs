@@ -28,7 +28,7 @@ use crate::{
     Result,
 };
 use crate::{
-    function::{AccumulatorFunc, AggFunc, ExtFunc},
+    function::{AccumulatorFunc, AggFunc, ExtFunc, WindowFunc},
     translate::expr::bind_and_rewrite_expr,
 };
 use crate::{
@@ -471,18 +471,68 @@ fn link_with_window(
     }
     expr_vector_size(expr)?;
     if let Some(windows) = windows {
-        // Every function carries a coerced frame (`WindowFunc::coerced_frame`
-        // for built-in window funcs, the default `RANGE UNBOUNDED PRECEDING
-        // TO CURRENT ROW` for aggregate window funcs). Functions whose
-        // coerced frames disagree cannot share a single ephemeral-table
-        // pass — see SQLite's invariant at window.c:1679 — so the planner
-        // groups them into separate `Window` entries.
-        let coerced_frame = match &func {
-            AccumulatorFunc::Window(w) => w.coerced_frame(),
-            AccumulatorFunc::Agg(_) => None,
+        // Per-function effective frame: built-ins with a coerced frame
+        // (rank, row_number, etc.) override the user clause; aggregates
+        // and first_value/last_value/nth_value honor it, defaulting to
+        // RANGE UNBOUNDED PRECEDING TO CURRENT ROW. Functions whose
+        // effective frames disagree can't share a single ephemeral-table
+        // pass (SQLite's invariant at `window.c:1679`), so they end up
+        // in separate `Window` entries.
+        //
+        // Skip user-frame validation entirely for built-ins with a
+        // coerced frame — SQLite's `sqlite3WindowUpdate` (window.c:687-725)
+        // silently drops the user's `eFrmType`, `eStart`, `eEnd`, and
+        // `eExclude` for these, so any user-supplied EXCLUDE or
+        // unsupported frame shape is also dropped without error.
+        let has_coerced_frame = matches!(
+            &func,
+            AccumulatorFunc::Window(w) if w.coerced_frame().is_some()
+        );
+        let user_frame = if has_coerced_frame {
+            None
+        } else {
+            match over_clause {
+                ast::Over::Window(window) => crate::translate::plan::validate_frame_clause(
+                    &window.frame_clause,
+                    window.order_by.len(),
+                )?,
+                ast::Over::Name(name) => {
+                    // Named windows store their FRAME clause on the
+                    // `NamedWindowDef`. Look it up and validate the
+                    // clause as this function's user_frame.
+                    let window_name = normalize_ident(name.as_str());
+                    let def = named_windows
+                        .iter()
+                        .rfind(|d| d.name == window_name)
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError(format!("no such window: {window_name}"))
+                        })?;
+                    // `bound` may already be `None` (taken on an earlier
+                    // attachment), but the def's order_by length we
+                    // need for validation lives on `bound`. After take
+                    // we know a sister resolved Window exists with the
+                    // same order_by length.
+                    let order_by_len = match def.bound.as_ref() {
+                        Some(b) => b.order_by.len(),
+                        None => windows
+                            .iter()
+                            .rfind(|w| w.name.as_ref() == Some(&window_name))
+                            .expect("sister Window exists after def bound was taken")
+                            .order_by
+                            .len(),
+                    };
+                    crate::translate::plan::validate_frame_clause(
+                        &def.user_frame_clause,
+                        order_by_len,
+                    )?
+                }
+            }
+        };
+        if let Some(frame) = user_frame.as_ref() {
+            check_frame_offsets_are_constant(frame, resolver)?;
         }
-        .unwrap_or_default();
-        let window = resolve_window(windows, named_windows, over_clause, coerced_frame)?;
+        let effective_frame = resolve_effective_frame(&func, user_frame)?;
+        let window = resolve_window(windows, named_windows, over_clause, effective_frame)?;
         // Two equivalent window expressions can share one `WindowFunction`
         // entry unless they contain nondeterministic calls like `random()`,
         // which SQLite evaluates separately at each SQL occurrence.
@@ -508,6 +558,116 @@ fn link_with_window(
         crate::bail_parse_error!("misuse of window function: {}()", func_name);
     }
     Ok(())
+}
+
+/// Reject per-row column references in offset expressions. SQLite
+/// substitutes NULL for non-constants at `window.c:1166-1171`; we
+/// match its user-visible message via the runtime check so this
+/// rejection is just a friendlier earlier failure.
+fn check_frame_offsets_are_constant(
+    frame: &crate::translate::plan::Frame,
+    resolver: &Resolver,
+) -> Result<()> {
+    use crate::translate::optimizer::Optimizable;
+    use crate::translate::plan::FrameBoundary;
+    for (bound, is_start) in [(&frame.start, true), (&frame.end, false)] {
+        let expr = match bound {
+            FrameBoundary::Preceding(expr) | FrameBoundary::Following(expr) => expr,
+            _ => continue,
+        };
+        if !expr.is_constant(resolver) {
+            let msg = if is_start {
+                "frame starting offset must be a non-negative integer"
+            } else {
+                "frame ending offset must be a non-negative integer"
+            };
+            crate::bail_parse_error!("{msg}");
+        }
+    }
+    Ok(())
+}
+
+/// Decide the frame a function actually runs with, given any user-written
+/// FRAME clause. Mirrors SQLite's `sqlite3WindowUpdate` policy at
+/// `window.c:687-725`: the eight listed built-ins (row_number, rank,
+/// dense_rank, percent_rank, cume_dist, ntile, lead, lag) ignore the
+/// user clause and run with their coerced frame; aggregates and
+/// first_value / last_value / nth_value honor whatever the user wrote
+/// and default to RANGE UNBOUNDED PRECEDING TO CURRENT ROW.
+fn resolve_effective_frame(
+    func: &AccumulatorFunc,
+    user_frame: Option<crate::translate::plan::Frame>,
+) -> Result<crate::translate::plan::Frame> {
+    use crate::translate::plan::{Frame, FrameBoundary};
+    use turso_parser::ast::FrameMode;
+
+    // Built-ins with a coerced frame ignore the user clause entirely
+    // (`Some(_)` from `coerced_frame()`). The rest honor it.
+    if let AccumulatorFunc::Window(w) = func {
+        if let Some(coerced) = w.coerced_frame() {
+            return Ok(coerced);
+        }
+    }
+
+    let Some(frame) = user_frame else {
+        return Ok(Frame {
+            mode: FrameMode::Range,
+            start: FrameBoundary::UnboundedPreceding,
+            end: FrameBoundary::CurrentRow,
+        });
+    };
+    reject_unsupported_frame(&frame)?;
+    // Aggregates we haven't ported an xInverse for. SQLite supports
+    // sliding frames over these via per-function strategies (sorted
+    // index for min/max, separator-length tracking for group_concat,
+    // JSON-buffer parsing for the json_group_* family); they will be
+    // wired up alongside the xInverse implementations themselves.
+    // first_value / nth_value don't need xInverse — they're WINDOWFUNCNOOP
+    // (window.c:591) and read positionally from csr_app at output time, so
+    // any frame shape works as long as csr_start's frame-start rowid is
+    // tracked.
+    let supports_sliding = matches!(
+        func,
+        AccumulatorFunc::Agg(
+            AggFunc::Sum | AggFunc::Total | AggFunc::Count | AggFunc::Count0 | AggFunc::Avg,
+        ) | AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue)
+    );
+    let moving_start = matches!(
+        frame.start,
+        crate::translate::plan::FrameBoundary::Preceding(_)
+    );
+    if moving_start && !supports_sliding {
+        crate::bail_parse_error!(
+            "{}() does not yet support window frames with a moving start; \
+             use a frame with UNBOUNDED PRECEDING start",
+            func.as_str()
+        );
+    }
+    Ok(frame)
+}
+
+/// Reject frame shapes the emit code doesn't handle. The accepted set
+/// is the default `RANGE UNBOUNDED PRECEDING AND CURRENT ROW` and
+/// `ROWS BETWEEN [UNBOUNDED PRECEDING | N PRECEDING] AND CURRENT ROW`.
+fn reject_unsupported_frame(frame: &crate::translate::plan::Frame) -> Result<()> {
+    use crate::translate::plan::FrameBoundary;
+    use turso_parser::ast::FrameMode;
+    let default_ok = frame.mode == FrameMode::Range
+        && matches!(frame.start, FrameBoundary::UnboundedPreceding)
+        && matches!(frame.end, FrameBoundary::CurrentRow);
+    let rows_ok = frame.mode == FrameMode::Rows
+        && matches!(
+            frame.start,
+            FrameBoundary::UnboundedPreceding | FrameBoundary::Preceding(_)
+        )
+        && matches!(frame.end, FrameBoundary::CurrentRow);
+    if default_ok || rows_ok {
+        return Ok(());
+    }
+    crate::bail_parse_error!(
+        "unsupported frame: only ROWS BETWEEN [UNBOUNDED PRECEDING | N PRECEDING] \
+         AND CURRENT ROW is supported"
+    );
 }
 
 /// Resolve the `Window` a function call should be attached to, given the

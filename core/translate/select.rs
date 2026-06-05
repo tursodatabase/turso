@@ -374,15 +374,6 @@ fn prepare_one_select_plan(
             {
                 trace_stack!("bind_windows");
                 for window_def in window_clause.iter() {
-                    // No user FRAME clauses on named windows yet — still
-                    // call the structured validator so SQLite-invalid
-                    // shapes get the matching error.
-                    if let Some(_user_frame) = crate::translate::plan::validate_frame_clause(
-                        &window_def.window.frame_clause,
-                        window_def.window.order_by.len(),
-                    )? {
-                        crate::bail_parse_error!("user-specified frame clauses are not supported");
-                    }
                     let name = normalize_ident(window_def.name.as_str());
                     let mut partition_by: Vec<_> = window_def
                         .window
@@ -402,6 +393,10 @@ fn prepare_one_select_plan(
                             )
                         })
                         .collect();
+                    // No eager validate_frame_clause here: validation
+                    // happens in the per-function planner path so the
+                    // coerced-frame built-ins (window.c:687-725) can
+                    // silently drop the clause, matching SQLite.
                     for expr in partition_by.iter_mut() {
                         bind_and_rewrite_expr(
                             expr,
@@ -422,6 +417,7 @@ fn prepare_one_select_plan(
                     }
                     named_windows.push(NamedWindowDef {
                         name,
+                        user_frame_clause: window_def.window.frame_clause.clone(),
                         bound: Some(NamedWindowBound {
                             partition_by,
                             order_by,

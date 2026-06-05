@@ -5,57 +5,121 @@ setup base {
     INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40),(5,50);
 }
 
-# Moving 3-wide sum: previous, current, next.
-@setup base
-test rows-3-wide-moving-sum {
-    SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;
-}
-expect error {
-}
-
-# Trailing 3-row sum.
+# Trailing 3-row sum (2 preceding + current).
 @setup base
 test rows-trailing-3 {
     SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t;
 }
-expect error {
+expect {
+    1|10
+    2|30
+    3|60
+    4|90
+    5|120
 }
 
-# Leading 3-row sum.
-@setup base
-test rows-leading-3 {
-    SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) FROM t;
-}
-expect error {
-}
-
+# Running sum (UNBOUNDED PRECEDING form).
 @setup base
 test rows-unbounded-preceding-to-current {
     SELECT id, sum(v) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) FROM t;
 }
-expect error {
+expect {
+    1|10
+    2|30
+    3|60
+    4|100
+    5|150
 }
 
+# `ROWS CURRENT ROW` (both bounds CURRENT ROW) is a single-row frame —
+# valid SQL but not in the supported scope yet (CurrentRow as start
+# needs per-row AGGINVERSE with no countdown).
 @setup base
-test rows-current-row-only {
+test rows-current-row-only-not-yet {
     SELECT id, sum(v) OVER (ORDER BY id ROWS CURRENT ROW) FROM t;
 }
 expect error {
 }
 
-# min/max can't be inverted; ROWS frames with a moving start must
-# either error or fall back to a slow rescan. The "supported" case
-# (UNBOUNDED PRECEDING + CURRENT ROW) requires no inverse.
+# Count under a sliding frame exercises the count xInverse path.
+@setup base
+test rows-trailing-3-count {
+    SELECT id, count(*) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    4|3
+    5|3
+}
+
+# Avg under a sliding frame.
+@setup base
+test rows-trailing-3-avg {
+    SELECT id, avg(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect {
+    1|10.0
+    2|15.0
+    3|20.0
+    4|30.0
+    5|40.0
+}
+
+# Large-integer precision under the approximate-sum path. Once a float
+# enters the sum, SQLite's `sumInverse` uses `kahanBabuskaNeumaierStepInt64`
+# for integer args (func.c:1873-1880), preserving exactness across the
+# subtraction; going through f64 loses precision past 2^53.
+setup int_precision {
+    CREATE TABLE tp(id INTEGER PRIMARY KEY, v);
+    INSERT INTO tp VALUES (1, 1.0), (2, 9007199254740993), (3, 9007199254740993), (4, 1);
+}
+
+@setup int_precision
+test rows-sum-inverse-int-precision {
+    SELECT id, printf('%.0f', sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)) FROM tp;
+}
+expect {
+    1|1
+    2|9007199254740994
+    3|18014398509481980
+    4|9007199254740994
+}
+
+# UNBOUNDED PRECEDING start needs no inverse — min works there.
 @setup base
 test rows-min-no-inverse-needed {
     SELECT id, min(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t;
+}
+expect {
+    1|10
+    2|10
+    3|10
+    4|10
+    5|10
+}
+
+# N FOLLOWING end isn't supported yet — should error cleanly.
+@setup base
+test rows-3-wide-moving-sum-not-yet {
+    SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;
 }
 expect error {
 }
 
 @setup base
+test rows-leading-3-not-yet {
+    SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) FROM t;
+}
+expect error {
+}
+
+# min / max / group_concat aren't invertible; using them with a
+# moving-start frame errors at runtime.
+@setup base
 test rows-min-moving-frame-not-invertible {
-    SELECT id, min(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;
+    SELECT id, min(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
 }
 expect error {
 }
@@ -98,16 +162,64 @@ test rows-start-following-end-current {
 expect error {
 }
 
-# Offset can be any expression evaluating to a non-negative integer.
-# SQLite checks the runtime value at partition start via
-# `windowCheckValue` — negative or non-integer becomes a runtime error.
-# Literal negatives are caught at parse for a friendlier message.
+# Offsets that reference per-row columns reject at parse — SQL requires
+# the offset to be a per-partition constant. Constant expressions
+# like `(1+1)` work.
 
 @setup base
-test rows-column-offset {
+test rows-column-offset-rejected {
     SELECT sum(v) OVER (ORDER BY id ROWS BETWEEN v PRECEDING AND CURRENT ROW) FROM t;
 }
 expect error {
+    frame starting offset must be a non-negative integer
+}
+
+# Named window definitions carry their FRAME clause through to the
+# attached function. SQLite honors `WINDOW w AS (... ROWS BETWEEN N
+# PRECEDING AND CURRENT ROW)` — using a default frame here would
+# silently produce running sums instead of trailing-2 sums.
+# count(v) (not count(*)) skips NULL inputs at step time, so xInverse
+# must also skip NULL leaving rows — otherwise the counter underflows.
+setup nulls_mixed {
+    CREATE TABLE tn(id INTEGER PRIMARY KEY, v);
+    INSERT INTO tn VALUES (1,NULL),(2,10),(3,NULL),(4,20),(5,NULL);
+}
+
+@setup nulls_mixed
+test rows-count-inverse-skips-null {
+    SELECT id, count(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM tn;
+}
+expect {
+    1|0
+    2|1
+    3|1
+    4|1
+    5|1
+}
+
+@setup base
+test rows-frame-on-named-window {
+    SELECT id, sum(v) OVER w FROM t
+    WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW);
+}
+expect {
+    1|10
+    2|30
+    3|50
+    4|70
+    5|90
+}
+
+@setup base
+test rows-constant-expr-offset {
+    SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN (1+1) PRECEDING AND CURRENT ROW) FROM t;
+}
+expect {
+    1|10
+    2|30
+    3|60
+    4|90
+    5|120
 }
 
 @setup base
@@ -115,4 +227,288 @@ test rows-negative-literal-offset {
     SELECT sum(v) OVER (ORDER BY id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM t;
 }
 expect error {
+    frame starting offset must be a non-negative integer
+}
+
+# Non-integer offset triggers the runtime `OP_MustBeInt` halt with the
+# same message SQLite emits from `windowCheckValue` (window.c:1484).
+@setup base
+test rows-non-integer-offset {
+    SELECT sum(v) OVER (ORDER BY id ROWS BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    frame starting offset must be a non-negative integer
+}
+
+# Literal larger than i64::MAX. Same runtime path as `-1 PRECEDING` —
+# the offset evaluator coerces to integer (truncating via SQLite's
+# `sqlite3Atoi64` overflow handling), then the negative-check trips
+# on the wrap-around or the float coercion fails MustBeInt.
+@setup base
+test rows-overflow-literal-offset {
+    SELECT sum(v) OVER (ORDER BY id ROWS BETWEEN 99999999999999999999 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    frame starting offset must be a non-negative integer
+}
+
+# `(-1)` and `0 - 1` parse as Unary/Binary, not Literal — the runtime
+# check still catches them via the same `OP_Ge offset, 0` test as the
+# direct literal case.
+@setup base
+test rows-negative-unary-offset {
+    SELECT sum(v) OVER (ORDER BY id ROWS BETWEEN (-1) PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    frame starting offset must be a non-negative integer
+}
+
+@setup base
+test rows-negative-binary-offset {
+    SELECT sum(v) OVER (ORDER BY id ROWS BETWEEN 0 - 1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    frame starting offset must be a non-negative integer
+}
+
+# FILTER decides per row whether step contributes; xInverse must apply
+# the same FILTER, otherwise filtered-out rows entering the frame are
+# silently skipped at step but still subtracted on departure.
+@setup base
+test rows-filter-skipped-row-not-inverted {
+    SELECT id, sum(v) FILTER (WHERE v <> 20) OVER
+        (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect {
+    1|10
+    2|10
+    3|30
+    4|70
+    5|90
+}
+
+# Same shape with count(v) — the bug underflows the counter and trips
+# `debug_assert!(*i > 0)` in debug builds.
+@setup base
+test rows-filter-count-underflow-guard {
+    SELECT id, count(v) FILTER (WHERE v <> 20) OVER
+        (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect {
+    1|1
+    2|1
+    3|1
+    4|2
+    5|2
+}
+
+# Sliding sum where text args are integer literals near 2^53. Step
+# routes text through `try_for_float`, dispatching `ParsedNumber::Integer`
+# to the KBN-int path so the integer-precision compensation kicks in;
+# xInverse must use the same dispatch (cross-checked against sqlite3 —
+# rows 3 and 4 land on the round-to-even neighbour of 9007199254740993).
+setup text_int_precision {
+    CREATE TABLE tt(id INTEGER PRIMARY KEY, v);
+    INSERT INTO tt VALUES (1, 1.5), (2, '9007199254740993'), (3, '0'), (4, '9007199254740993');
+}
+
+@setup text_int_precision
+test rows-sum-inverse-text-int-precision {
+    SELECT id, printf('%.0f', sum(v) OVER
+        (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)) FROM tt;
+}
+expect {
+    1|2
+    2|9007199254740994
+    3|9007199254740992
+    4|9007199254740992
+}
+
+# PARTITION BY + sliding frame: the partition reset must re-initialize
+# the start-offset countdown so the second partition doesn't start with
+# AGGINVERSE firing on row 1.
+setup partitioned {
+    CREATE TABLE tp(g INTEGER, id INTEGER, v INTEGER);
+    INSERT INTO tp VALUES
+        (1,1,10),(1,2,20),(1,3,30),
+        (2,1,100),(2,2,200),(2,3,300);
+}
+
+@setup partitioned
+test rows-partition-reset {
+    SELECT g, id, sum(v) OVER
+        (PARTITION BY g ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM tp;
+}
+expect {
+    1|1|10
+    1|2|30
+    1|3|50
+    2|1|100
+    2|2|300
+    2|3|500
+}
+
+# N equal to or larger than the partition size — the countdown never
+# depletes, AGGINVERSE never fires, the result is the running sum.
+@setup base
+test rows-offset-exceeds-partition {
+    SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 100 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect {
+    1|10
+    2|30
+    3|60
+    4|100
+    5|150
+}
+
+# DESC ORDER BY — the frame slides in reverse-id order.
+@setup base
+test rows-desc-order-by {
+    SELECT id, sum(v) OVER (ORDER BY id DESC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect {
+    5|50
+    4|90
+    3|70
+    2|50
+    1|30
+}
+
+# `Total` returns 0.0 for empty input and otherwise behaves like sum
+# but always returns REAL. Its xInverse goes through the same path.
+@setup base
+test rows-total-sliding {
+    SELECT id, printf('%.1f', total(v) OVER
+        (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)) FROM t;
+}
+expect {
+    1|10.0
+    2|30.0
+    3|50.0
+    4|70.0
+    5|90.0
+}
+
+# Avg over a frame containing only NULL inputs should return NULL.
+# count(v) skipping NULLs makes the divisor zero; SQLite returns NULL.
+setup all_nulls {
+    CREATE TABLE tnn(id INTEGER PRIMARY KEY, v);
+    INSERT INTO tnn VALUES (1,NULL),(2,NULL),(3,NULL);
+}
+
+@setup all_nulls
+test rows-avg-null-frame {
+    SELECT id, avg(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM tnn;
+}
+expect {
+    1|
+    2|
+    3|
+}
+
+# Sliding sum over an all-NULL column. The xInverse arm sees NULL on
+# every leaving row and early-returns; acc stays Null.
+@setup all_nulls
+test rows-sum-all-null {
+    SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM tnn;
+}
+expect {
+    1|
+    2|
+    3|
+}
+
+# `0 PRECEDING` is a single-row frame — the countdown register starts
+# at 1 (N+1) and depletes after the first RETURN_ROW, so AGGINVERSE
+# fires on every subsequent row.
+@setup base
+test rows-zero-preceding {
+    SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 0 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect {
+    1|10
+    2|20
+    3|30
+    4|40
+    5|50
+}
+
+# Mixed integer/float input — once a Float enters, sum promotes to
+# approximate mode. Subsequent integer-typed args still take the
+# KBN-int dispatch (preserving precision), and the leaving float
+# must take the KBN-float dispatch with sign flipped.
+setup mixed_int_float {
+    CREATE TABLE tm(id INTEGER PRIMARY KEY, v);
+    INSERT INTO tm VALUES (1, 1.25), (2, 100), (3, 200), (4, 300);
+}
+
+@setup mixed_int_float
+test rows-mixed-int-float-approx-transition {
+    SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM tm;
+}
+expect {
+    1|1.25
+    2|101.25
+    3|300.0
+    4|500.0
+}
+
+# first_value / nth_value over sliding ROWS frames. SQLite computes
+# these at output time via positional lookup (windowReturnOneRow,
+# window.c:1940-1965), so frame.start.rowid + N - 1 selects the right
+# row even as the frame slides. NULL when N is past the frame end.
+@setup base
+test rows-first-value-sliding {
+    SELECT id, first_value(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect {
+    1|10
+    2|10
+    3|20
+    4|30
+    5|40
+}
+
+@setup base
+test rows-nth-value-sliding-past-end-is-null {
+    SELECT id, nth_value(v, 3) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect {
+    1|
+    2|
+    3|
+    4|
+    5|
+}
+
+@setup base
+test rows-nth-value-sliding-fits-in-frame {
+    SELECT id, nth_value(v, 2) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect {
+    1|
+    2|20
+    3|20
+    4|20
+    5|30
+}
+
+setup partitioned_small {
+    CREATE TABLE tpsv(id INTEGER PRIMARY KEY, g INTEGER, v INTEGER);
+    INSERT INTO tpsv VALUES (1,1,10),(2,1,20),(3,1,30),(4,2,100),(5,2,200);
+}
+
+@setup partitioned_small
+test rows-first-value-sliding-resets-per-partition {
+    SELECT id, g,
+        first_value(v) OVER (PARTITION BY g ORDER BY id
+                             ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM tpsv;
+}
+expect {
+    1|1|10
+    2|1|10
+    3|1|20
+    4|2|100
+    5|2|100
 }

@@ -3048,12 +3048,6 @@ impl Window {
 
     /// Build a `Window` from an inline `OVER (...)` AST node
     pub fn new_unnamed(ast: &ast::Window, frame: Frame) -> Result<Self> {
-        // User-written FRAME clauses aren't supported yet. Still call
-        // the validator so SQLite-invalid shapes get the matching
-        // error; for anything else, bail.
-        if let Some(_user_frame) = validate_frame_clause(&ast.frame_clause, ast.order_by.len())? {
-            crate::bail_parse_error!("user-specified frame clauses are not supported");
-        }
         Ok(Window {
             name: None,
             partition_by: ast.partition_by.iter().map(|arg| *arg.clone()).collect(),
@@ -3204,12 +3198,9 @@ pub fn validate_frame_clause(
 }
 
 /// Convert a parser-level `FrameBound` to the planner's `FrameBoundary`.
-/// Offset expressions are cloned out of the AST; the resulting `Expr`
-/// gets evaluated once at partition start by the emit code (mirroring
-/// SQLite's `windowCheckValue` at `window.c:1494-1522`, which also
-/// checks the runtime value is a non-negative integer). The
-/// literal-negative case is caught here at parse so the user sees a
-/// useful error instead of waiting for the runtime check.
+/// Offset expressions are cloned out of the AST and evaluated at
+/// partition start by the emit code; the runtime non-negative-integer
+/// check mirrors SQLite's `windowCheckValue` at `window.c:1494-1522`.
 fn translate_frame_bound(
     bound: &FrameBound,
     is_start: bool,
@@ -3222,11 +3213,17 @@ fn translate_frame_bound(
     match bound {
         FrameBound::CurrentRow => Ok(FrameBoundary::CurrentRow),
         FrameBound::UnboundedPreceding => {
-            debug_assert!(is_start, "parser only emits UNBOUNDED PRECEDING as a start bound");
+            debug_assert!(
+                is_start,
+                "parser only emits UNBOUNDED PRECEDING as a start bound"
+            );
             Ok(FrameBoundary::UnboundedPreceding)
         }
         FrameBound::UnboundedFollowing => {
-            debug_assert!(!is_start, "parser only emits UNBOUNDED FOLLOWING as an end bound");
+            debug_assert!(
+                !is_start,
+                "parser only emits UNBOUNDED FOLLOWING as an end bound"
+            );
             Ok(FrameBoundary::UnboundedFollowing)
         }
         FrameBound::Preceding(expr) => {
@@ -3273,6 +3270,15 @@ fn reject_negative_literal_offset(expr: &Expr, mode: FrameMode) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct NamedWindowDef {
     pub name: String,
+    /// User-written FRAME clause preserved so a function attaching by
+    /// `Over::Name` can compute its effective frame from it.
+    pub user_frame_clause: Option<FrameClause>,
+    /// Already-bound partition/order exprs. Taken on first attachment
+    /// (move) and left `None` thereafter; subsequent attachments under
+    /// a different coerced frame deep-clone from a sister resolved
+    /// `Window`. Keeping the bound exprs outside the def's permanent
+    /// state means `user_frame_clause` stays readable even after the
+    /// take.
     pub bound: Option<NamedWindowBound>,
 }
 

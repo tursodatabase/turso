@@ -6287,33 +6287,10 @@ fn update_agg_payload(
                 r_err,
                 ..Default::default()
             };
-            match arg {
-                Value::Numeric(Numeric::Integer(i)) => {
-                    apply_kbn_step_int(sum_val, *i, &mut sum_state);
-                }
-                Value::Numeric(Numeric::Float(f)) => {
-                    apply_kbn_step(sum_val, f64::from(*f), &mut sum_state);
-                }
-                Value::Text(t) => {
-                    let (parse_result, parsed_number) = try_for_float(t.as_str().as_bytes());
-                    match parsed_number {
-                        ParsedNumber::Integer(i) => {
-                            if matches!(parse_result, NumericParseResult::ValidPrefixOnly) {
-                                apply_kbn_step(sum_val, i as f64, &mut sum_state);
-                            } else {
-                                apply_kbn_step_int(sum_val, i, &mut sum_state);
-                            }
-                        }
-                        ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
-                        ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
-                    }
-                }
-                Value::Blob(b) => match try_for_float(b).1 {
-                    ParsedNumber::Integer(i) => apply_kbn_step(sum_val, i as f64, &mut sum_state),
-                    ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
-                    ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
-                },
-                _ => unreachable!(),
+            match classify_numeric_arg(arg) {
+                NumericArg::Integer(i) => apply_kbn_step_int(sum_val, i, &mut sum_state),
+                NumericArg::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
+                NumericArg::Null => unreachable!("NULL early-returned above"),
             }
             *r_err_val = Value::from_f64(sum_state.r_err);
             *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
@@ -7182,6 +7159,15 @@ fn op_window_inverse(
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
+        // WINDOWFUNCNOOP functions: their value is computed at output
+        // time via positional lookup, not by accumulating state. They
+        // ride along with the window's csr_start advance but have no
+        // per-row inverse work. Mirrors SQLite's `xInverse = noopValueFunc`
+        // wiring at window.c:591.
+        WindowFunc::FirstValue | WindowFunc::NthValue | WindowFunc::Lag | WindowFunc::Lead => {
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
         _ => unreachable!("AggInverse fired for {func} but no inverse arm is wired"),
     }
 }
@@ -7206,15 +7192,193 @@ pub fn op_agg_inverse(
     if let AccumulatorFunc::Window(win_func) = func {
         return op_window_inverse(state, *acc_reg, *col, win_func);
     }
+    let func = func.expect_agg();
 
-    // Aggregate window functions all carry RANGE UNBOUNDED PRECEDING TO
-    // CURRENT ROW as their coerced frame, so the frame start never moves
-    // and AggInverse is never emitted for them. Reaching this arm is a
-    // planner bug.
-    unreachable!(
-        "AggInverse fired for aggregate {} but no inverse arm is wired",
-        func.expect_agg()
-    );
+    // sum / count / avg / total run their xInverse to undo a prior
+    // xStep when a row leaves the frame from the left. SQLite's
+    // matching implementations live at `func.c:1859-1986`. min / max /
+    // group_concat aren't invertible — SQLite falls back to a full
+    // frame rescan there (`window.c::windowFullScan`); we don't
+    // implement that fallback, so those error out.
+    let arg = state.registers[*col].get_value().clone();
+    let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+        return Err(LimboError::InternalError(format!(
+            "AggInverse: acc_reg {} not initialized — xStep should have run first",
+            *acc_reg
+        )));
+    };
+    let payload = agg.payload_mut();
+    inverse_agg_payload(func, arg, payload)?;
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Classify an arg for SQLite-style sum/avg dispatch — mirrors
+/// `sqlite3_value_numeric_type` (`vdbeapi.c`), applying numeric
+/// affinity to TEXT/BLOB. Returning the parsed pieces so callers don't
+/// re-parse and so step and inverse stay in lockstep on which KBN
+/// variant (int vs float) handles each row.
+enum NumericArg {
+    Integer(i64),
+    Float(f64),
+    Null,
+}
+
+fn classify_numeric_arg(v: &Value) -> NumericArg {
+    match v {
+        Value::Null => NumericArg::Null,
+        Value::Numeric(Numeric::Integer(i)) => NumericArg::Integer(*i),
+        Value::Numeric(Numeric::Float(f)) => NumericArg::Float(f64::from(*f)),
+        // Text PureInteger keeps the integer-KBN path so large textual
+        // integers don't lose precision. ValidPrefixOnly ("5abc")
+        // routes through float — partial-prefix integers shouldn't get
+        // exact accumulation. Matches SQLite's `sumStep` numeric-
+        // affinity behavior.
+        Value::Text(t) => match try_for_float(t.as_str().as_bytes()) {
+            (NumericParseResult::ValidPrefixOnly, ParsedNumber::Integer(i)) => {
+                NumericArg::Float(i as f64)
+            }
+            (_, ParsedNumber::Integer(i)) => NumericArg::Integer(i),
+            (_, ParsedNumber::Float(f)) => NumericArg::Float(f),
+            (_, ParsedNumber::None) => NumericArg::Float(0.0),
+        },
+        // Blobs always route through the float path even for integer
+        // parses — matches main's `sumStep` blob arm.
+        Value::Blob(b) => match try_for_float(b).1 {
+            ParsedNumber::Integer(i) => NumericArg::Float(i as f64),
+            ParsedNumber::Float(f) => NumericArg::Float(f),
+            ParsedNumber::None => NumericArg::Float(0.0),
+        },
+    }
+}
+
+/// Two-step add for `i64::MIN` keeps the integer-KBN path exact past
+/// 2^53; matches SQLite's `func.c:1875-1880`.
+fn kbn_step_int_neg(acc: &mut Value, i: i64, state: &mut SumAggState) {
+    if i == i64::MIN {
+        apply_kbn_step_int(acc, i64::MAX, state);
+        apply_kbn_step_int(acc, 1, state);
+    } else {
+        apply_kbn_step_int(acc, -i, state);
+    }
+}
+
+/// Subtract the contribution of a single row from the aggregate state,
+/// undoing a previous `update_agg_payload` call. Mirrors SQLite's
+/// xInverse implementations at `func.c:1859-1986`.
+fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Result<()> {
+    match func {
+        AggFunc::Count => {
+            if !matches!(arg, Value::Null) {
+                let Value::Numeric(Numeric::Integer(i)) = &mut payload[0] else {
+                    unreachable!("Count payload is Integer per init_agg_payload");
+                };
+                // Matches SQLite's `assert(p->n>0)` at `func.c:1976` —
+                // every xInverse is paired with a prior xStep for the
+                // same arg, so the counter can never fall below zero.
+                debug_assert!(*i > 0, "Count xInverse without matching xStep");
+                *i -= 1;
+            }
+        }
+        AggFunc::Count0 => {
+            let Value::Numeric(Numeric::Integer(i)) = &mut payload[0] else {
+                unreachable!("Count(*) payload is Integer per init_agg_payload");
+            };
+            debug_assert!(*i > 0, "Count(*) xInverse without matching xStep");
+            *i -= 1;
+        }
+        AggFunc::Sum | AggFunc::Total => {
+            let parsed = classify_numeric_arg(&arg);
+            if matches!(parsed, NumericArg::Null) {
+                return Ok(());
+            }
+            let [acc, r_err_val, approx_val, ovrfl_val, ..] = payload else {
+                unreachable!("Sum/Total payload has acc/r_err/approx/ovrfl per init_agg_payload");
+            };
+            let Value::Numeric(Numeric::Integer(approx_i)) = approx_val else {
+                unreachable!("Sum/Total approx slot is Integer per init_agg_payload");
+            };
+            // Exact integer subtract only applies when acc is still an
+            // Integer (sum() with no float input yet — Total never
+            // qualifies, its acc starts as Float(0.0)) and step hasn't
+            // promoted to approximate mode. SQLite's exact branch at
+            // `func.c:1872` always calls `sqlite3_value_int64`, which
+            // truncates floats — we restrict to Integer-typed args so
+            // step and inverse stay symmetric.
+            if *approx_i == 0 {
+                if let Value::Numeric(Numeric::Integer(acc_i)) = acc {
+                    if let NumericArg::Integer(sub) = parsed {
+                        *acc_i = acc_i.wrapping_sub(sub);
+                        return Ok(());
+                    }
+                }
+            }
+            let r_err = r_err_val.to_float_or_zero();
+            let ovrfl = matches!(ovrfl_val, Value::Numeric(Numeric::Integer(n)) if *n != 0);
+            let mut sum_state = SumAggState {
+                r_err,
+                approx: true,
+                ovrfl,
+            };
+            match parsed {
+                NumericArg::Integer(i) => kbn_step_int_neg(acc, i, &mut sum_state),
+                NumericArg::Float(f) => apply_kbn_step(acc, -f, &mut sum_state),
+                NumericArg::Null => unreachable!("Null was early-returned above"),
+            }
+            *r_err_val = Value::from_f64(sum_state.r_err);
+            *ovrfl_val = Value::from_i64(sum_state.ovrfl as i64);
+        }
+        AggFunc::Avg => {
+            let parsed = classify_numeric_arg(&arg);
+            if matches!(parsed, NumericArg::Null) {
+                return Ok(());
+            }
+            let [sum_val, r_err_val, count_val, ..] = payload else {
+                unreachable!("Avg payload has sum/r_err/count per init_agg_payload");
+            };
+            let r_err = r_err_val.to_float_or_zero();
+            let Value::Numeric(Numeric::Integer(count)) = count_val else {
+                unreachable!("Avg count slot is Integer per init_agg_payload");
+            };
+            let mut sum_state = SumAggState {
+                r_err,
+                ..Default::default()
+            };
+            match parsed {
+                NumericArg::Integer(i) => kbn_step_int_neg(sum_val, i, &mut sum_state),
+                NumericArg::Float(f) => apply_kbn_step(sum_val, -f, &mut sum_state),
+                NumericArg::Null => unreachable!("Null was early-returned above"),
+            }
+            *r_err_val = Value::from_f64(sum_state.r_err);
+            *count -= 1;
+        }
+        AggFunc::Min
+        | AggFunc::Max
+        | AggFunc::GroupConcat
+        | AggFunc::StringAgg
+        | AggFunc::ArrayAgg
+        | AggFunc::Mode
+        | AggFunc::PercentileCont
+        | AggFunc::PercentileDisc => {
+            // Aggregates without an xInverse. SQLite falls back to a
+            // full-frame rescan (`window.c::windowFullScan`); we reject
+            // such frames at parse time in `aggregate_supports_xinverse`,
+            // so reaching this arm is a planner regression.
+            unreachable!("planner should reject moving-start frame over non-invertible {func}");
+        }
+        AggFunc::External(_) => {
+            unreachable!("planner rejects moving-start frames over external aggregates");
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupObject
+        | AggFunc::JsonbGroupObject
+        | AggFunc::JsonGroupArray
+        | AggFunc::JsonbGroupArray => {
+            unreachable!("planner rejects moving-start frames over JSON group aggregates");
+        }
+    }
+    Ok(())
 }
 
 pub fn op_agg_step(
