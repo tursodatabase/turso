@@ -89,19 +89,13 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn set_header(&self, header: logical_log::LogHeader);
 
     /// Called when a checkpoint begins, before any rows are written to the B-tree.
-    /// `durable_txid_max` is the transaction watermark that will be durably persisted
-    /// once the checkpoint completes.
-    fn on_checkpoint_start(&self, _durable_txid_max: u64) -> Result<()> {
+    fn on_checkpoint_start(&self) -> Result<()> {
         Ok(())
     }
 
     /// Called after the checkpoint has fully completed: rows are flushed, WAL is
     /// truncated, and the logical log is reset.
-    fn on_checkpoint_end(
-        &self,
-        _durable_txid_max: u64,
-        _result: Result<&CheckpointResult>,
-    ) -> Result<()> {
+    fn on_checkpoint_end(&self, _result: Result<&CheckpointResult>) -> Result<()> {
         Ok(())
     }
 

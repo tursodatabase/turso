@@ -5864,60 +5864,83 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         };
         self.storage.set_header(header);
 
+        self.storage.on_checkpoint_start()?;
+
         // NOTE: this uses `CheckpointMode::Truncate` to drive WAL backfill only; we still
         // truncate the WAL explicitly below to preserve WAL-last ordering in recovery.
-        let mut checkpoint_result = pager.io.block(|| {
+        let mut checkpoint_result = match pager.io.block(|| {
             wal.checkpoint(
                 &pager,
                 CheckpointMode::Truncate {
                     upper_bound_inclusive: None,
                 },
             )
-        })?;
-        if !checkpoint_result.everything_backfilled() {
-            return Err(LimboError::Corrupt(
-                "Unable to fully backfill committed WAL frames during MVCC recovery".to_string(),
-            ));
-        }
+        }) {
+            Ok(result) => result,
+            Err(err) => {
+                self.storage.on_checkpoint_end(Err(err.clone()))?;
+                return Err(err);
+            }
+        };
 
-        if connection.get_sync_mode() != SyncMode::Off
-            && checkpoint_result.wal_checkpoint_backfilled > 0
-        {
-            let c = pager
-                .db_file
-                .sync(Completion::new_sync(|_| {}), pager.get_sync_type())?;
-            pager.io.wait_for_completion(c)?;
-        }
+        let recovery_result = (|| -> Result<()> {
+            if !checkpoint_result.everything_backfilled() {
+                return Err(LimboError::Corrupt(
+                    "Unable to fully backfill committed WAL frames during MVCC recovery"
+                        .to_string(),
+                ));
+            }
 
-        // Write a fresh log header (distinct from the checkpoint state machine which no
-        // longer rewrites the header). This is bootstrap-only: we need a valid header on
-        // disk before truncating WAL. CRC verify + retry guards against torn header writes.
-        let mut retried_crc = false;
-        loop {
-            let c = self.storage.update_header()?;
-            pager.io.wait_for_completion(c)?;
-
-            if connection.get_sync_mode() != SyncMode::Off {
-                let c = self.storage.sync(pager.get_sync_type())?;
+            if connection.get_sync_mode() != SyncMode::Off
+                && checkpoint_result.wal_checkpoint_backfilled > 0
+            {
+                let c = pager
+                    .db_file
+                    .sync(Completion::new_sync(|_| {}), pager.get_sync_type())?;
                 pager.io.wait_for_completion(c)?;
             }
 
-            if self.logical_log_header_crc_valid(&pager)? {
-                break;
+            // Write a fresh log header (distinct from the checkpoint state machine which no
+            // longer rewrites the header). This is bootstrap-only: we need a valid header on
+            // disk before truncating WAL. CRC verify + retry guards against torn header writes.
+            let mut retried_crc = false;
+            loop {
+                let c = self.storage.update_header()?;
+                pager.io.wait_for_completion(c)?;
+
+                if connection.get_sync_mode() != SyncMode::Off {
+                    let c = self.storage.sync(pager.get_sync_type())?;
+                    pager.io.wait_for_completion(c)?;
+                }
+
+                if self.logical_log_header_crc_valid(&pager)? {
+                    break;
+                }
+
+                if retried_crc {
+                    return Err(LimboError::Corrupt(
+                        "Logical log header CRC mismatch after retry".to_string(),
+                    ));
+                }
+                retried_crc = true;
             }
 
-            if retried_crc {
-                return Err(LimboError::Corrupt(
-                    "Logical log header CRC mismatch after retry".to_string(),
-                ));
+            pager
+                .io
+                .block(|| wal.truncate_wal(&mut checkpoint_result, pager.get_sync_type()))?;
+            Ok(())
+        })();
+
+        match recovery_result {
+            Ok(()) => {
+                self.storage.on_checkpoint_end(Ok(&checkpoint_result))?;
+                Ok(())
             }
-            retried_crc = true;
+            Err(err) => {
+                self.storage.on_checkpoint_end(Err(err.clone()))?;
+                Err(err)
+            }
         }
-
-        pager
-            .io
-            .block(|| wal.truncate_wal(&mut checkpoint_result, pager.get_sync_type()))?;
-        Ok(())
     }
 
     /// Replays committed logical-log frames into the in-memory MVCC store.
