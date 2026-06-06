@@ -1,0 +1,42 @@
+[package]
+name = "turso-sync-server"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Standalone Turso sync server"
+
+[[bin]]
+name = "turso-sync-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = "1.11.1"
+clap = { workspace = true, features = ["derive"] }
+ctrlc = "3.4.4"
+mimalloc = { workspace = true, optional = true }
+prost = "0.14.1"
+roaring = "0.11.2"
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+turso_core = { workspace = true, default-features = true, features = ["cli_only", "conn_raw_api", "fs", "fts"] }
+turso_sync_engine = { workspace = true }
+
+[features]
+default = ["io_uring", "mimalloc", "experimental_win_iocp"]
+io_uring = ["turso_core/io_uring"]
+experimental_win_iocp = ["turso_core/experimental_win_iocp"]
+tracing_release = ["turso_core/tracing_release"]
+mimalloc = ["dep:mimalloc"]
+fts = ["turso_core/fts"]
+stacker = ["turso_core/stacker"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

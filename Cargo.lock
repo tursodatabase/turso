@@ -6591,6 +6591,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso-sync-server"
+version = "0.7.0-pre.1"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "ctrlc",
+ "mimalloc",
+ "prost 0.14.1",
+ "roaring",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "turso_core",
+ "turso_sync_engine",
+]
+
+[[package]]
 name = "turso_cli"
 version = "0.7.0-pre.5"
 dependencies = [
@@ -6626,8 +6646,8 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "turso-sync-server",
  "turso_core",
- "turso_sync_engine",
  "validator",
 ]
 

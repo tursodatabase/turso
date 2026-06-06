@@ -8,7 +8,6 @@ mod manual;
 mod mcp_server;
 mod opcodes_dictionary;
 mod read_state_machine;
-mod sync_server;
 
 #[cfg(feature = "mvcc_repl")]
 mod mvcc_repl;
@@ -18,10 +17,9 @@ use mcp_server::TursoMcpServer;
 use rustyline::{error::ReadlineError, Config, Editor};
 use std::{
     path::PathBuf,
-    sync::{atomic::Ordering, LazyLock},
+    sync::{atomic::Ordering, Arc, LazyLock},
 };
-
-use crate::sync_server::TursoSyncServer;
+use turso_sync_server::{DatabaseProvider, TursoSyncServer};
 
 #[cfg(all(feature = "mimalloc", not(target_family = "wasm"), not(miri)))]
 #[global_allocator]
@@ -51,7 +49,8 @@ fn run_sync_server(app: app::Limbo) -> anyhow::Result<()> {
     let address = app.opts.sync_server_address.clone().unwrap();
     let conn = app.get_connection();
     let interrupt_count = app.get_interrupt_count();
-    let sync_server = TursoSyncServer::new(address, conn, interrupt_count);
+    let database_provider = Arc::new(DatabaseProvider::single(conn));
+    let sync_server = TursoSyncServer::new(address, database_provider, interrupt_count);
 
     sync_server.run()
 }

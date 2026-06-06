@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::{anyhow, Result};
@@ -19,21 +19,26 @@ use turso_sync_engine::server_proto::{
     StmtResult, StreamRequest, StreamResponse, StreamResult, Value,
 };
 
+use crate::database::{validate_db_name, DatabaseProvider};
+
 const WAL_FRAME_HEADER_SIZE: usize = 24;
 const PAGE_SIZE: usize = 4096;
 
 pub struct TursoSyncServer {
     address: String,
-    conn: Arc<Mutex<Arc<Connection>>>,
+    database_provider: Arc<DatabaseProvider>,
     interrupt_count: Arc<AtomicUsize>,
 }
 
 impl TursoSyncServer {
-    pub fn new(address: String, conn: Arc<Connection>, interrupt_count: Arc<AtomicUsize>) -> Self {
-        conn.wal_auto_actions_disable();
+    pub fn new(
+        address: String,
+        database_provider: Arc<DatabaseProvider>,
+        interrupt_count: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
             address,
-            conn: Arc::new(Mutex::new(conn)),
+            database_provider,
             interrupt_count,
         }
     }
@@ -119,28 +124,14 @@ impl TursoSyncServer {
         let (method, path, body) = parse_http_request(&request_data)?;
         info!("Request: {} {}", method, path);
 
-        let response = match (method.as_str(), path.as_str()) {
-            ("OPTIONS", _) => Ok(HttpResponse {
+        let response = match method.as_str() {
+            "OPTIONS" => Ok(HttpResponse {
                 status: 204,
                 content_type: "text/plain".to_string(),
                 body: Vec::new(),
             }),
-            ("POST", "/v2/pipeline") => {
-                debug!("Handling /v2/pipeline request");
-                self.handle_pipeline(&body)
-            }
-            ("POST", "/pull-updates") => {
-                debug!("Handling /pull-updates request");
-                self.handle_pull_updates(&body)
-            }
-            _ => {
-                info!("Unknown endpoint: {} {}", method, path);
-                Ok(HttpResponse {
-                    status: 404,
-                    content_type: "text/plain".to_string(),
-                    body: b"Not Found".to_vec(),
-                })
-            }
+            "POST" => self.handle_sync_request(&path, &body),
+            _ => Ok(not_found(&method, &path)),
         };
 
         let http_response = match response {
@@ -162,20 +153,47 @@ impl TursoSyncServer {
         Ok(())
     }
 
-    fn handle_pipeline(&self, body: &[u8]) -> Result<HttpResponse> {
+    fn handle_sync_request(&self, path: &str, body: &[u8]) -> Result<HttpResponse> {
+        let route = match parse_sync_route(path) {
+            Ok(Some(route)) => route,
+            Ok(None) => return Ok(not_found("POST", path)),
+            Err(error) => return Ok(bad_request(error.to_string())),
+        };
+
+        if let Err(error) = self.database_provider.validate_route(route.db_name) {
+            return Ok(bad_request(error.to_string()));
+        }
+
+        if !self.database_provider.database_exists(route.db_name)? {
+            return Ok(not_found("POST", path));
+        }
+
+        let connection = self.database_provider.connection(route.db_name)?;
+
+        match route.endpoint {
+            SyncEndpoint::Pipeline => {
+                debug!("Handling pipeline request");
+                self.handle_pipeline(&connection, body)
+            }
+            SyncEndpoint::PullUpdates => {
+                debug!("Handling pull-updates request");
+                self.handle_pull_updates(&connection, body)
+            }
+        }
+    }
+
+    fn handle_pipeline(&self, conn: &Arc<Connection>, body: &[u8]) -> Result<HttpResponse> {
         let req: PipelineReqBody = serde_json::from_slice(body)
             .map_err(|e| anyhow!("Failed to parse pipeline request: {}", e))?;
 
         debug!("Pipeline request: {:?}", req);
 
-        let conn = self.conn.lock().unwrap();
-
         let mut results = Vec::new();
 
         for request in req.requests {
             let result = match request {
-                StreamRequest::Execute(exec_req) => self.execute_statement(&conn, &exec_req),
-                StreamRequest::Batch(batch_req) => self.execute_batch(&conn, &batch_req),
+                StreamRequest::Execute(exec_req) => self.execute_statement(conn, &exec_req),
+                StreamRequest::Batch(batch_req) => self.execute_batch(conn, &batch_req),
                 StreamRequest::None => StreamResult::Error {
                     error: Error {
                         message: "Unknown request type".to_string(),
@@ -450,7 +468,7 @@ impl TursoSyncServer {
         }
     }
 
-    fn handle_pull_updates(&self, body: &[u8]) -> Result<HttpResponse> {
+    fn handle_pull_updates(&self, conn: &Arc<Connection>, body: &[u8]) -> Result<HttpResponse> {
         let req = <PullUpdatesReqProtoBody as Message>::decode(body)
             .map_err(|e| anyhow!("Failed to decode PullUpdatesRequest: {}", e))?;
 
@@ -465,8 +483,6 @@ impl TursoSyncServer {
         if encoding == PageUpdatesEncodingReq::Zstd {
             return Err(anyhow!("Zstd encoding is not supported"));
         }
-
-        let conn = self.conn.lock().unwrap();
 
         let wal_state = conn.wal_state()?;
         debug!("WAL state: max_frame={}", wal_state.max_frame);
@@ -597,6 +613,76 @@ struct HttpResponse {
     body: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncEndpoint {
+    Pipeline,
+    PullUpdates,
+}
+
+#[derive(Debug)]
+struct SyncRoute<'a> {
+    db_name: Option<&'a str>,
+    endpoint: SyncEndpoint,
+}
+
+fn parse_sync_route(path: &str) -> Result<Option<SyncRoute<'_>>> {
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+
+    match path {
+        "/v2/pipeline" => {
+            return Ok(Some(SyncRoute {
+                db_name: None,
+                endpoint: SyncEndpoint::Pipeline,
+            }));
+        }
+        "/pull-updates" => {
+            return Ok(Some(SyncRoute {
+                db_name: None,
+                endpoint: SyncEndpoint::PullUpdates,
+            }));
+        }
+        _ => {}
+    }
+
+    let Some(path) = path.strip_prefix("/db/") else {
+        return Ok(None);
+    };
+
+    let Some((db_name, endpoint)) = path.split_once('/') else {
+        return Err(anyhow!("missing sync endpoint"));
+    };
+
+    validate_db_name(db_name)?;
+
+    let endpoint = match endpoint {
+        "v2/pipeline" => SyncEndpoint::Pipeline,
+        "pull-updates" => SyncEndpoint::PullUpdates,
+        _ => return Ok(None),
+    };
+
+    Ok(Some(SyncRoute {
+        db_name: Some(db_name),
+        endpoint,
+    }))
+}
+
+fn bad_request(message: String) -> HttpResponse {
+    HttpResponse {
+        status: 400,
+        content_type: "text/plain".to_string(),
+        body: message.into_bytes(),
+    }
+}
+
+fn not_found(method: &str, path: &str) -> HttpResponse {
+    info!("Unknown endpoint: {} {}", method, path);
+    HttpResponse {
+        status: 404,
+        content_type: "text/plain".to_string(),
+        body: b"Not Found".to_vec(),
+    }
+}
+
 fn find_header_end(data: &[u8]) -> Option<usize> {
     (0..data.len().saturating_sub(3)).find(|&i| &data[i..i + 4] == b"\r\n\r\n")
 }
@@ -637,6 +723,7 @@ fn format_http_response(resp: &HttpResponse) -> Vec<u8> {
     let status_text = match resp.status {
         200 => "OK",
         204 => "No Content",
+        400 => "Bad Request",
         404 => "Not Found",
         500 => "Internal Server Error",
         _ => "Unknown",
@@ -699,5 +786,53 @@ fn convert_core_to_value(value: CoreValue) -> Value {
         CoreValue::Blob(b) => Value::Blob {
             value: Bytes::from(b),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_sync_route, SyncEndpoint};
+
+    #[test]
+    fn parse_sync_route_accepts_single_db_paths() {
+        let route = parse_sync_route("/v2/pipeline")
+            .unwrap()
+            .expect("route must match");
+        assert_eq!(route.db_name, None);
+        assert_eq!(route.endpoint, SyncEndpoint::Pipeline);
+
+        let route = parse_sync_route("/pull-updates")
+            .unwrap()
+            .expect("route must match");
+        assert_eq!(route.db_name, None);
+        assert_eq!(route.endpoint, SyncEndpoint::PullUpdates);
+    }
+
+    #[test]
+    fn parse_sync_route_accepts_multi_db_paths() {
+        let route = parse_sync_route("/db/alice.db/v2/pipeline")
+            .unwrap()
+            .expect("route must match");
+        assert_eq!(route.db_name, Some("alice.db"));
+        assert_eq!(route.endpoint, SyncEndpoint::Pipeline);
+
+        let route = parse_sync_route("/db/team-123.db/pull-updates")
+            .unwrap()
+            .expect("route must match");
+        assert_eq!(route.db_name, Some("team-123.db"));
+        assert_eq!(route.endpoint, SyncEndpoint::PullUpdates);
+    }
+
+    #[test]
+    fn parse_sync_route_rejects_invalid_db_names() {
+        parse_sync_route("/db/../v2/pipeline").unwrap_err();
+        parse_sync_route("/db/team%2Fother/v2/pipeline").unwrap_err();
+        parse_sync_route("/db//v2/pipeline").unwrap_err();
+    }
+
+    #[test]
+    fn parse_sync_route_ignores_unknown_paths() {
+        assert!(parse_sync_route("/health").unwrap().is_none());
+        assert!(parse_sync_route("/db/alice.db/unknown").unwrap().is_none());
     }
 }
