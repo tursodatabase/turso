@@ -597,6 +597,11 @@ pub struct Whopper {
     disable_mvcc_auto_checkpoint: bool,
     /// If false, drop fiber connections without first closing them.
     close_connections_gracefully: bool,
+    /// True when `ftruncate()` fault injection is active. Injected I/O errors
+    /// are then expected, so they are treated as recoverable (the operation is
+    /// rolled back) rather than crashing the run. With injection off, an
+    /// `IoError` still aborts the run so genuine I/O bugs are not masked.
+    truncate_fault_injection: bool,
 }
 
 impl Whopper {
@@ -743,6 +748,7 @@ impl Whopper {
             chaotic_profiles: opts.chaotic_profiles,
             disable_mvcc_auto_checkpoint: opts.disable_mvcc_auto_checkpoint,
             close_connections_gracefully: opts.close_connections_gracefully,
+            truncate_fault_injection: opts.truncate_fault_probability > 0.0,
         };
 
         whopper.open_connections()?;
@@ -779,6 +785,7 @@ impl Whopper {
     fn perform_work(&mut self, fiber_idx: usize) -> anyhow::Result<()> {
         let exec_id = self.context.fibers[fiber_idx].execution_id;
         let txn_id = self.context.fibers[fiber_idx].txn_id;
+        let truncate_fault_injection = self.truncate_fault_injection;
         trace!(
             "perform_work: step={}, fiber_idx={}/{} exec_id={:?} txn_id={:?}",
             self.current_step,
@@ -917,7 +924,23 @@ impl Whopper {
 
             if let Err(error) = op_result {
                 let in_tx = ctx.fiber.state.is_in_tx() && !ctx.fiber.connection.get_auto_commit();
-                match crate::error_handling::classify_op_error(&error, in_tx) {
+                // An injected ftruncate fault surfaces as a CompletionError from
+                // the WAL write/truncate path. Under active fault injection it is
+                // expected and recoverable, so roll back / clear txn instead of
+                // aborting the run; without injection it stays Fatal so real bugs
+                // are not masked.
+                let action = if truncate_fault_injection
+                    && matches!(error, turso_core::LimboError::CompletionError(..))
+                {
+                    if in_tx {
+                        crate::error_handling::ErrorAction::Rollback
+                    } else {
+                        crate::error_handling::ErrorAction::ClearTxn
+                    }
+                } else {
+                    crate::error_handling::classify_op_error(&error, in_tx)
+                };
+                match action {
                     crate::error_handling::ErrorAction::Rollback => {
                         ctx.fiber.current_op = Some(Operation::Rollback);
                     }

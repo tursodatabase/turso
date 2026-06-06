@@ -3991,6 +3991,12 @@ impl Wal for WalFile {
             }
         };
         if !should_skip_truncate {
+            // The callback only logs; the truncate's I/O error is *not* swallowed.
+            // `trunc_c` is added to the returned CompletionGroup, whose first
+            // member error is surfaced to the caller (via `wait_for_completion`
+            // or the VDBE driver's `get_error` check), so a failed truncate
+            // propagates as a real error and the write is retried rather than
+            // proceeding with orphaned frames still on disk.
             let trunc_c = file.truncate(
                 WAL_HEADER_SIZE as u64,
                 Completion::new_trunc(|res| {
