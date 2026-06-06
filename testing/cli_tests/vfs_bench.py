@@ -13,7 +13,14 @@ from typing import Dict
 from cli_tests.console import error, info, test
 from cli_tests.test_turso_cli import TestTursoShell
 
-LIMBO_BIN = Path("./target/release/tursodb")
+# Ask cargo where build artefacts live (honours CARGO_TARGET_DIR)
+_TARGET_DIR = subprocess.run(
+    [str(Path(__file__).resolve().parents[2] / "scripts" / "cargo-target-dir")],
+    capture_output=True,
+    text=True,
+    check=True,
+).stdout.strip()
+LIMBO_BIN = Path(_TARGET_DIR) / "release" / "tursodb"
 DB_FILE = Path("testing/system/temp.db")
 vfs_list = ["syscall"]
 if platform.system() == "Linux":

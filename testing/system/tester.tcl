@@ -5,13 +5,16 @@ set test_small_dbs [list "testing/system/testing_small.db" ]
 # Array storing loaded extensions
 array set extensions {}
 
+# Ask cargo where build artefacts live (honours CARGO_TARGET_DIR)
+set debug_dir "[exec ./scripts/cargo-target-dir]/debug"
+
 # Mapping of extension names to their respective library paths per database type
-set extension_map {
-    test_ext {
-        sqlite "./target/debug/liblimbo_sqlite_test_ext"
-        turso  "./target/debug/libturso_ext_tests"
-    }
-}
+set extension_map [list \
+    test_ext [list \
+        sqlite "$debug_dir/liblimbo_sqlite_test_ext" \
+        turso  "$debug_dir/libturso_ext_tests" \
+    ] \
+]
 
 proc load_extension {extension_name} {
     global extension_map

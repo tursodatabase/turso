@@ -8,6 +8,7 @@ Idempotent and incremental - safe to run multiple times.
 
 import argparse
 import logging
+import subprocess
 import sys
 from pathlib import Path
 
@@ -29,10 +30,28 @@ def setup_logging(verbose: bool = False):
     )
 
 
+def _cargo_target_dir() -> Path | None:
+    """Return cargo's target directory (honours CARGO_TARGET_DIR), or None."""
+    repo_root = Path(__file__).resolve().parents[3]
+    helper = repo_root / "scripts" / "cargo-target-dir"
+    if not helper.exists():
+        return None
+    try:
+        out = subprocess.run([str(helper)], capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return Path(out.stdout.strip())
+
+
 def find_tursodb() -> Path:
     """Find tursodb binary."""
     # Try common locations
-    locations = [
+    locations = []
+    target_dir = _cargo_target_dir()
+    if target_dir is not None:
+        locations.append(target_dir / "debug" / "tursodb")
+        locations.append(target_dir / "release" / "tursodb")
+    locations += [
         Path.home() / "work/limbo-main/target/debug/tursodb",
         Path.home() / "work/limbo-main/target/release/tursodb",
         Path("/usr/local/bin/tursodb"),
