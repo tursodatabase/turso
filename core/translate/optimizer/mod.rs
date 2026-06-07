@@ -2720,6 +2720,25 @@ fn mark_seek_constraints_consumed(
     is_outer_join: bool,
     defer_cross_table: bool,
 ) {
+    // BETWEEN contributes two range constraints that map back to one WhereTerm.
+    // Count how many constraints from each term are actually used so we only
+    // consume a BETWEEN term once both bounds are consumed; otherwise its
+    // residual predicate must still evaluate at runtime to enforce the
+    // unconsumed bound.
+    let mut used_constraints_per_term: HashMap<usize, usize> = HashMap::default();
+    for cref in constraint_refs.iter() {
+        for pos in [
+            cref.eq.as_ref().map(|e| e.constraint_pos),
+            cref.lower_bound,
+            cref.upper_bound,
+        ] {
+            let Some(pos) = pos else { continue };
+            let constraint = &constraints[pos];
+            *used_constraints_per_term
+                .entry(constraint.where_clause_pos.0)
+                .or_insert(0) += 1;
+        }
+    }
     for cref in constraint_refs.iter() {
         for pos in [
             cref.eq.as_ref().map(|e| e.constraint_pos),
@@ -2737,6 +2756,15 @@ fn mark_seek_constraints_consumed(
             }
             if defer_cross_table && !constraint.lhs_mask.is_empty() {
                 continue;
+            }
+            if matches!(where_term.expr, ast::Expr::Between { .. }) {
+                let used = used_constraints_per_term
+                    .get(&constraint.where_clause_pos.0)
+                    .copied()
+                    .unwrap_or(0);
+                if used < 2 {
+                    continue;
+                }
             }
             where_term.consumed = true;
         }
