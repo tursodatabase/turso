@@ -446,8 +446,22 @@ where
     Ok(())
 }
 
-/// Iterate a table and call `on_match` when all child columns equal the key at
-/// `parent_key_start`.
+fn emit_skip_if_any_null(
+    program: &mut ProgramBuilder,
+    reg_start: usize,
+    nregs: usize,
+    target_pc: BranchOffset,
+) {
+    for i in 0..nregs {
+        program.emit_insn(Insn::IsNull {
+            reg: reg_start + i,
+            target_pc,
+        });
+    }
+}
+
+/// Iterate a table and call `on_match` when all child columns equal the
+/// non-NULL key at `parent_key_start`.
 ///
 /// Rows with any NULL FK column do not reference a parent and are ignored. For
 /// self-referential UPDATEs, `self_exclude_rowid` skips the current row when
@@ -497,7 +511,7 @@ where
             lhs: tmp,
             rhs: parent_key_start + i,
             target_pc: cont,
-            flags: CmpInsFlags::default().jump_if_null(),
+            flags: CmpInsFlags::default(),
             collation: Some(CollationSeq::Binary),
         });
         program.emit_insn(Insn::Goto {
@@ -886,6 +900,8 @@ fn emit_fk_parent_key_probe(
     let child_cols = &fk_ref.fk.child_columns;
     let is_deferred = fk_ref.fk.deferred;
     let is_restrict = matches!(fk_ref.fk.on_update, RefAct::Restrict);
+    let skip_probe = program.allocate_label();
+    emit_skip_if_any_null(program, parent_key_start, n_cols, skip_probe);
 
     let on_match = |p: &mut ProgramBuilder| -> Result<()> {
         match (is_deferred, pass) {
@@ -954,6 +970,7 @@ fn emit_fk_parent_key_probe(
         )?;
     }
 
+    program.preassign_label_to_next_insn(skip_probe);
     Ok(())
 }
 
@@ -1380,6 +1397,9 @@ fn emit_fk_delete_parent_existence_check_single(
         resolver,
     )?;
 
+    let skip_check = program.allocate_label();
+    emit_skip_if_any_null(program, parent_key_start, ncols, skip_check);
+
     let child_cols = &fk_ref.fk.child_columns;
     let child_idx = if !is_self_ref {
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -1439,6 +1459,7 @@ fn emit_fk_delete_parent_existence_check_single(
             },
         )?;
     }
+    program.preassign_label_to_next_insn(skip_check);
     Ok(())
 }
 
