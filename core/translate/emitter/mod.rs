@@ -1749,15 +1749,33 @@ pub(crate) fn emit_columns_and_dependencies(
     resolver: &Resolver,
 ) -> Result<DmlColumnContext> {
     let targets: Vec<usize> = target_columns.into_iter().collect();
+    let target_mask: ColumnMask = targets.iter().copied().try_collect()?;
+    let non_rowid_targets: Vec<usize> = targets
+        .iter()
+        .copied()
+        .filter(|&idx| !table.columns()[idx].is_rowid_alias())
+        .collect();
+    let mut non_rowid_target_positions = vec![None; table.columns().len()];
+    for (pos, idx) in non_rowid_targets.iter().copied().enumerate() {
+        non_rowid_target_positions[idx] = Some(pos);
+    }
     let dependencies = table.dependencies_of_columns(targets.iter().copied())?;
 
-    let target_base = program.alloc_registers(targets.len());
+    let target_base = if non_rowid_targets.is_empty() {
+        0
+    } else {
+        program.alloc_registers(non_rowid_targets.len())
+    };
     let extra_base = {
         let mut dependencies_not_in_targets: ColumnMask = dependencies.clone();
-        let target_mask = targets.iter().copied().try_collect()?;
-        dependencies_not_in_targets.union_with(&target_mask)?;
+        dependencies_not_in_targets -= &target_mask;
 
-        let extra_count = dependencies_not_in_targets.count();
+        let extra_count = table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(idx, col)| dependencies_not_in_targets.get(*idx) && !col.is_rowid_alias())
+            .count();
 
         if extra_count > 0 {
             program.alloc_registers(extra_count)
@@ -1768,14 +1786,14 @@ pub(crate) fn emit_columns_and_dependencies(
 
     let mut extra_idx = 0;
     let pairs = table.columns().iter().enumerate().map(|(idx, col)| {
-        let reg = if col.is_rowid_alias() {
-            rowid_reg
-        } else if let Some(pos) = targets.iter().position(|&t| t == idx) {
+        let reg = if let Some(pos) = non_rowid_target_positions[idx] {
             let reg = target_base + pos;
             if !col.is_virtual_generated() {
                 program.emit_column_or_rowid(cursor_id, idx, reg);
             }
             reg
+        } else if col.is_rowid_alias() {
+            rowid_reg
         } else if dependencies.get(idx) {
             let reg = extra_base + extra_idx;
             program.emit_column_or_rowid(cursor_id, idx, reg);
