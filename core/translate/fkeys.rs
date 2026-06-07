@@ -175,6 +175,45 @@ pub struct DeferredNewKeyProbePlan {
     new_key_len: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ParentFkUpdateWork {
+    has_counter_checks: bool,
+    has_cascade_or_set_actions: bool,
+}
+
+impl ParentFkUpdateWork {
+    pub fn has_counter_checks(self) -> bool {
+        self.has_counter_checks
+    }
+
+    pub fn has_cascade_or_set_actions(self) -> bool {
+        self.has_cascade_or_set_actions
+    }
+}
+
+pub fn prepare_parent_fk_update_work(
+    resolver: &Resolver,
+    table_btree: &BTreeTable,
+    updated_positions: &ColumnMask,
+    database_id: usize,
+) -> Result<ParentFkUpdateWork> {
+    let mut work = ParentFkUpdateWork::default();
+    for fk in resolver.with_schema(database_id, |s| {
+        s.resolved_fks_referencing(&table_btree.name)
+    })? {
+        if !fk.parent_key_may_change(updated_positions, table_btree)? {
+            continue;
+        }
+        match fk.fk.on_update {
+            RefAct::NoAction | RefAct::Restrict => work.has_counter_checks = true,
+            RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault => {
+                work.has_cascade_or_set_actions = true;
+            }
+        }
+    }
+    Ok(work)
+}
+
 /// Emit parent-side OLD/NEW key probes when a parent key actually changes.
 ///
 /// In `AfterReplace` mode this returns the deferred NEW-key probe needed after
