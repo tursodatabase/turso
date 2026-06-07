@@ -1773,19 +1773,35 @@ pub(crate) fn emit_columns_and_dependencies(
 
     let mut extra_idx = 0;
     let pairs = table.columns().iter().enumerate().map(|(idx, col)| {
-        let reg = if col.is_rowid_alias() {
-            rowid_reg
-        } else if let Some(pos) = targets.iter().position(|&t| t == idx) {
+        let reg = if let Some(pos) = targets.iter().position(|&t| t == idx) {
+            // Keep requested target columns contiguous even when one is a rowid alias.
+            // Some callers pass this contiguous span directly to record/probe opcodes.
             let reg = target_base + pos;
-            if !col.is_virtual_generated() {
+            if col.is_rowid_alias() {
+                program.emit_insn(Insn::Copy {
+                    src_reg: rowid_reg,
+                    dst_reg: reg,
+                    extra_amount: 0,
+                });
+            } else if !col.is_virtual_generated() {
                 program.emit_column_or_rowid(cursor_id, idx, reg);
             }
             reg
         } else if dependencies.get(idx) {
             let reg = extra_base + extra_idx;
-            program.emit_column_or_rowid(cursor_id, idx, reg);
+            if col.is_rowid_alias() {
+                program.emit_insn(Insn::Copy {
+                    src_reg: rowid_reg,
+                    dst_reg: reg,
+                    extra_amount: 0,
+                });
+            } else {
+                program.emit_column_or_rowid(cursor_id, idx, reg);
+            }
             extra_idx += 1;
             reg
+        } else if col.is_rowid_alias() {
+            rowid_reg
         } else {
             0
         };

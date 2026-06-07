@@ -23,7 +23,7 @@ use crate::{
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
             emit_guarded_fk_decrement, index_probe, open_read_index, open_read_table,
-            ForeignKeyActions,
+            table_scan_match_any, ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -4174,6 +4174,14 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         });
 
         if let Some(ix) = idx {
+            let skip_decrement_probe = program.allocate_label();
+            for i in 0..n_cols {
+                program.emit_insn(Insn::IsNull {
+                    reg: new_pk_start + i,
+                    target_pc: skip_decrement_probe,
+                });
+            }
+
             let icur = open_read_index(program, ix, database_id);
             // Copy key into probe regs and apply child-index affinities
             let probe_start = program.alloc_registers(n_cols);
@@ -4210,57 +4218,23 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             program.emit_insn(Insn::Close { cursor_id: icur });
             emit_guarded_fk_decrement(program, skip, pref.fk.deferred);
             program.preassign_label_to_next_insn(skip);
+            program.preassign_label_to_next_insn(skip_decrement_probe);
         } else {
-            // fallback scan :(
-            let ccur = open_read_table(program, child_tbl, database_id);
-            let done = program.allocate_label();
-            program.emit_insn(Insn::Rewind {
-                cursor_id: ccur,
-                pc_if_empty: done,
-            });
-            let loop_top = program.allocate_label();
-            let next_row = program.allocate_label();
-            program.preassign_label_to_next_insn(loop_top);
-
-            for (i, child_name) in child_cols.iter().enumerate() {
-                let (pos, _) = child_tbl.get_column(child_name).ok_or_else(|| {
-                    crate::LimboError::InternalError(format!("child col {child_name} missing"))
-                })?;
-                let tmp = program.alloc_register();
-                program.emit_insn(Insn::Column {
-                    cursor_id: ccur,
-                    column: pos,
-                    dest: tmp,
-                    default: None,
-                });
-
-                program.emit_insn(Insn::IsNull {
-                    reg: tmp,
-                    target_pc: next_row,
-                });
-
-                let cont = program.allocate_label();
-                program.emit_insn(Insn::Eq {
-                    lhs: tmp,
-                    rhs: new_pk_start + i,
-                    target_pc: cont,
-                    flags: CmpInsFlags::default().jump_if_null(),
-                    collation: Some(super::collate::CollationSeq::Binary),
-                });
-                program.emit_insn(Insn::Goto {
-                    target_pc: next_row,
-                });
-                program.preassign_label_to_next_insn(cont);
-            }
-            // Matched one child row: guarded decrement of counter
-            emit_guarded_fk_decrement(program, next_row, pref.fk.deferred);
-            program.preassign_label_to_next_insn(next_row);
-            program.emit_insn(Insn::Next {
-                cursor_id: ccur,
-                pc_if_next: loop_top,
-            });
-            program.preassign_label_to_next_insn(done);
-            program.emit_insn(Insn::Close { cursor_id: ccur });
+            table_scan_match_any(
+                program,
+                child_tbl,
+                child_cols,
+                new_pk_start,
+                None,
+                database_id,
+                resolver,
+                |p| {
+                    let skip = p.allocate_label();
+                    emit_guarded_fk_decrement(p, skip, pref.fk.deferred);
+                    p.preassign_label_to_next_insn(skip);
+                    Ok(())
+                },
+            )?;
         }
     }
     Ok(())
