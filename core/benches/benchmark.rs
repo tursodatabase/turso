@@ -74,6 +74,97 @@ fn setup_rusqlite(temp_dir: &TempDir, query: &str) -> rusqlite::Connection {
     sqlite_conn
 }
 
+/// Creates a temp database in MVCC journal mode with a `users` table seeded
+/// with `num_rows` rows, committed in a single transaction. Returns the
+/// database (for `io.step()`) and an open connection.
+fn setup_mvcc_db(
+    temp_dir: &TempDir,
+    num_rows: usize,
+) -> (Arc<Database>, Arc<turso_core::Connection>) {
+    let db_path = temp_dir.path().join("mvcc_bench.db");
+    #[allow(clippy::arc_with_non_send_sync)]
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, age INTEGER, email TEXT)",
+    )
+    .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for i in 0..num_rows {
+        conn.execute(format!(
+            "INSERT INTO users VALUES ({i}, 'first_{i}', 'last_{i}', {}, 'user{i}@example.com')",
+            i % 100
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    (db, conn)
+}
+
+/// Drives a prepared statement to completion, discarding rows. Shared by the
+/// MVCC read benchmarks.
+fn drain_stmt(db: &Database, stmt: &mut turso_core::Statement) {
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                black_box(stmt.row());
+            }
+            StepResult::IO => {
+                db.io.step().unwrap();
+            }
+            StepResult::Done => break,
+            StepResult::Interrupt | StepResult::Busy => unreachable!(),
+        }
+    }
+    stmt.reset().unwrap();
+}
+
+/// Read-path benchmarks exercising the MVCC cursor: full table scan, bounded
+/// range scan, `count(*)`, and `LIMIT` scans.
+fn bench_mvcc_reads(criterion: &mut Criterion) {
+    const NUM_ROWS: usize = 10_000;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (db, conn) = setup_mvcc_db(&temp_dir, NUM_ROWS);
+
+    let mut group = criterion.benchmark_group("MVCC reads");
+
+    group.bench_function("limbo_mvcc_scan_all", |b| {
+        let mut stmt = conn
+            .prepare("SELECT id, first_name, age FROM users")
+            .unwrap();
+        b.iter(|| drain_stmt(&db, &mut stmt));
+    });
+
+    group.bench_function("limbo_mvcc_range_scan", |b| {
+        let mut stmt = conn
+            .prepare(format!(
+                "SELECT id, first_name, age FROM users WHERE id >= {} AND id < {}",
+                NUM_ROWS / 4,
+                NUM_ROWS / 2
+            ))
+            .unwrap();
+        b.iter(|| drain_stmt(&db, &mut stmt));
+    });
+
+    group.bench_function("limbo_mvcc_select_count", |b| {
+        let mut stmt = conn.prepare("SELECT count() FROM users").unwrap();
+        b.iter(|| drain_stmt(&db, &mut stmt));
+    });
+
+    for i in [1, 10, 100] {
+        group.bench_with_input(BenchmarkId::new("limbo_mvcc_select_rows", i), &i, |b, i| {
+            let mut stmt = conn
+                .prepare(format!("SELECT * FROM users LIMIT {}", *i))
+                .unwrap();
+            b.iter(|| drain_stmt(&db, &mut stmt));
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_open(criterion: &mut Criterion) {
     // https://github.com/tursodatabase/turso/issues/174
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
@@ -1127,14 +1218,14 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
+    targets = bench_mvcc_reads, bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
 }
 
 #[cfg(feature = "codspeed")]
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
+    targets = bench_mvcc_reads, bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
 }
 
 criterion_main!(benches);
