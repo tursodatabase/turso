@@ -9,9 +9,9 @@ set ALL_TESTS 1
 
 source $testdir/select1.test
 source $testdir/select2.test
-# FIXME: source $testdir/select3.test
+source $testdir/select3.test
 # FIXME: source $testdir/select4.test
-# FIXME: source $testdir/select5.test
+source $testdir/select5.test
 # FIXME: source $testdir/select6.test
 # FIXME: source $testdir/select7.test
 source $testdir/select8.test

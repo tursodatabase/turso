@@ -1125,6 +1125,7 @@ fn replace_column_number_with_copy_of_column_expr(
 /// ORDER BY in compound selects can reference columns by:
 /// 1. Numeric position (1-based): ORDER BY 1
 /// 2. Column name or alias from any constituent SELECT: ORDER BY name
+/// 3. Table-qualified column name: ORDER BY t.col (also schema.t.col)
 fn resolve_compound_order_by_expr(
     expr: &ast::Expr,
     all_plans: &[&SelectPlan],
@@ -1138,7 +1139,7 @@ fn resolve_compound_order_by_expr(
                 if column_number == 0 || column_number > num_result_columns {
                     crate::bail_parse_error!(
                         "{} ORDER BY term out of range - should be between 1 and {}",
-                        column_number,
+                        ordinal(term_number),
                         num_result_columns
                     );
                 }
@@ -1179,13 +1180,84 @@ fn resolve_compound_order_by_expr(
                 ordinal(term_number)
             );
         }
+        // Case 3: Table-qualified column reference (e.g., ORDER BY t1.col)
+        ast::Expr::Qualified(table_name, col_name) => {
+            resolve_compound_order_by_qualified(all_plans, table_name, col_name, term_number)
+        }
+        // Case 4: schema-qualified column reference (e.g., ORDER BY main.t1.col).
+        // We do not track a per-table schema namespace here, so accept any schema
+        // qualifier and resolve the rest like the table-qualified case.
+        ast::Expr::DoublyQualified(_schema_name, table_name, col_name) => {
+            resolve_compound_order_by_qualified(all_plans, table_name, col_name, term_number)
+        }
         _ => {
+            // Case 5: Arbitrary expression. SQLite matches such a term against the
+            // result expressions of the constituent SELECTs by structural
+            // equivalence, so e.g. `ORDER BY count(*)` in
+            //     SELECT log, count(*) FROM t1 GROUP BY log UNION ...
+            // resolves to the second column of the leftmost SELECT.
+            for plan in all_plans {
+                for (i, rc) in plan.result_columns.iter().enumerate() {
+                    if exprs_are_equivalent(&rc.expr, expr) {
+                        return Ok(i);
+                    }
+                }
+            }
             crate::bail_parse_error!(
                 "{} ORDER BY term does not match any column in the result set",
                 ordinal(term_number)
             );
         }
     }
+}
+
+/// Resolve a `table.col` (or `schema.table.col`) reference inside a compound
+/// SELECT ORDER BY. SQLite matches such a reference against the underlying
+/// columns of the constituent SELECTs; a result column with expression
+/// `tbl.colname` (regardless of any AS alias on that result column) qualifies.
+fn resolve_compound_order_by_qualified(
+    all_plans: &[&SelectPlan],
+    table_name: &ast::Name,
+    col_name: &ast::Name,
+    term_number: usize,
+) -> Result<usize> {
+    let table_norm = normalize_ident(table_name.as_str());
+    let col_norm = normalize_ident(col_name.as_str());
+    for plan in all_plans {
+        for (i, rc) in plan.result_columns.iter().enumerate() {
+            let ast::Expr::Column {
+                table: internal_id,
+                column,
+                ..
+            } = &rc.expr
+            else {
+                continue;
+            };
+            let Some(joined) = plan
+                .table_references
+                .find_joined_table_by_internal_id(*internal_id)
+            else {
+                continue;
+            };
+            let ident_matches = normalize_ident(&joined.identifier) == table_norm
+                || normalize_ident(joined.table.get_name()) == table_norm;
+            if !ident_matches {
+                continue;
+            }
+            let Some(col) = joined.table.get_column_at(*column) else {
+                continue;
+            };
+            if let Some(col_actual_name) = col.name.as_deref() {
+                if normalize_ident(col_actual_name) == col_norm {
+                    return Ok(i);
+                }
+            }
+        }
+    }
+    crate::bail_parse_error!(
+        "{} ORDER BY term does not match any column in the result set",
+        ordinal(term_number)
+    );
 }
 
 fn ordinal(n: usize) -> String {

@@ -15,8 +15,8 @@ use super::{
     main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
     order_by::SortMetadata,
     plan::{
-        BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn,
-        TableReferences,
+        BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, OuterResultAlias, Plan,
+        ResultSetColumn, TableReferences,
     },
     planner::{TableMask, ROWID_STRS},
     trigger_exec::{get_triggers_including_temp, has_triggers_including_temp},
@@ -160,6 +160,12 @@ pub struct Resolver<'a> {
     /// Context and metadata for resolving Expr::Column values that use
     /// [TableInternalId::SELF_TABLE] as a placeholder.
     self_table_scope: RefCell<Option<SelfTableScope>>,
+    /// Stack of result-column aliases from enclosing SELECTs that should be
+    /// visible to identifier resolution inside the current scope. Pushed when
+    /// planning subqueries embedded in an outer SELECT's ORDER BY, since
+    /// SQLite evaluates ORDER BY after the SELECT list and thus exposes
+    /// result aliases to those subqueries.
+    outer_result_aliases: RefCell<Vec<OuterResultAlias>>,
     pub enable_custom_types: bool,
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
@@ -249,6 +255,20 @@ impl SelfTableScope {
     }
 }
 
+/// Scope guard for [Resolver::push_outer_result_aliases]. Pops the pushed
+/// aliases on drop so each push is paired with an automatic cleanup even on
+/// the error path.
+pub(crate) struct OuterAliasScope<'a> {
+    stack: &'a RefCell<Vec<OuterResultAlias>>,
+    prev_len: usize,
+}
+
+impl Drop for OuterAliasScope<'_> {
+    fn drop(&mut self) {
+        self.stack.borrow_mut().truncate(self.prev_len);
+    }
+}
+
 /// Context for restricting table resolution during trigger subprogram compilation.
 #[derive(Debug, Clone)]
 pub(crate) struct TriggerDatabaseContext {
@@ -290,6 +310,7 @@ impl<'a> Resolver<'a> {
             register_affinities: HashMap::default(),
             subquery_affinities: RefCell::new(HashMap::default()),
             self_table_scope: RefCell::new(None),
+            outer_result_aliases: RefCell::new(Vec::new()),
             enable_custom_types,
             dqs_dml,
             trigger_context: None,
@@ -319,6 +340,7 @@ impl<'a> Resolver<'a> {
             register_affinities: HashMap::default(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
+            outer_result_aliases: RefCell::new(self.outer_result_aliases.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
@@ -340,6 +362,7 @@ impl<'a> Resolver<'a> {
             register_affinities: self.register_affinities.clone(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
+            outer_result_aliases: RefCell::new(self.outer_result_aliases.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
@@ -397,6 +420,33 @@ impl<'a> Resolver<'a> {
             .borrow()
             .as_ref()
             .and_then(|scope| scope.column_type_str(column))
+    }
+
+    /// Push `aliases` onto the outer-result-alias stack and return a scope
+    /// guard that pops them back on drop. Used to expose an outer SELECT's
+    /// column aliases to identifier resolution inside ORDER BY subqueries.
+    pub(crate) fn push_outer_result_aliases(
+        &self,
+        aliases: impl IntoIterator<Item = OuterResultAlias>,
+    ) -> OuterAliasScope<'_> {
+        let mut stack = self.outer_result_aliases.borrow_mut();
+        let prev_len = stack.len();
+        stack.extend(aliases);
+        OuterAliasScope {
+            stack: &self.outer_result_aliases,
+            prev_len,
+        }
+    }
+
+    /// Find an outer-scope result-column alias matching `name`. Walks the
+    /// stack innermost-first so the nearest enclosing scope wins.
+    pub(crate) fn find_outer_result_alias(&self, name: &str) -> Option<ast::Expr> {
+        self.outer_result_aliases
+            .borrow()
+            .iter()
+            .rev()
+            .find(|a| a.name.eq_ignore_ascii_case(name))
+            .map(|a| a.expr.clone())
     }
 
     fn cached_non_main_schema(&self, database_id: usize) -> Arc<Schema> {

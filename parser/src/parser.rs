@@ -3008,6 +3008,33 @@ impl<'a> Parser<'a> {
     fn parse_select_without_cte(&mut self, with: Option<With>) -> Result<Select> {
         let body = self.parse_select_body()?;
         let order_by = self.parse_order_by()?;
+        if !order_by.is_empty() {
+            if let Some(tok) = self.peek()? {
+                let compound_kind = match tok.token_type {
+                    TK_UNION => Some(TK_UNION),
+                    TK_EXCEPT => Some(TK_EXCEPT),
+                    TK_INTERSECT => Some(TK_INTERSECT),
+                    _ => None,
+                };
+                if let Some(kind) = compound_kind {
+                    let op = match kind {
+                        TK_UNION => {
+                            eat_assert!(self, TK_UNION);
+                            match self.peek()? {
+                                Some(t) if t.token_type == TK_ALL => "UNION ALL",
+                                _ => "UNION",
+                            }
+                        }
+                        TK_EXCEPT => "EXCEPT",
+                        TK_INTERSECT => "INTERSECT",
+                        _ => unreachable!(),
+                    };
+                    return Err(Error::Custom(format!(
+                        "ORDER BY clause should come after {op} not before",
+                    )));
+                }
+            }
+        }
         let limit = self.parse_limit()?;
         Ok(Select {
             with,

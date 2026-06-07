@@ -115,11 +115,23 @@ pub fn emit_query<'a>(
     // For non-grouped aggregation queries that also have non-aggregate columns,
     // we need to ensure non-aggregate columns are only emitted once.
     // This flag helps track whether we've already emitted these columns.
+    //
+    // The same first-iteration capture is also required when a HAVING clause
+    // without GROUP BY references a non-aggregated column: HAVING must see a
+    // stable column value from a row inside the implicit group (SQLite uses
+    // the first row), not a value read from an exhausted cursor after the
+    // aggregation loop has finished.
+    let having_without_group_by_refs_column = !plan.aggregates.is_empty()
+        && plan
+            .group_by
+            .as_ref()
+            .is_some_and(|gb| gb.exprs.is_empty() && gb.having.is_some())
+        && having_references_bare_column(plan);
     let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
         && plan.group_by.is_none()
         && plan.result_columns.iter().any(|c| !c.contains_aggregates);
 
-    if has_ungrouped_nonagg_cols {
+    if has_ungrouped_nonagg_cols || having_without_group_by_refs_column {
         let flag = program.alloc_register();
         program.emit_int(0, flag); // Initialize flag to 0 (not yet emitted)
         t_ctx.reg_nonagg_emit_once_flag = Some(flag);
@@ -294,6 +306,46 @@ pub fn emit_query<'a>(
     }
 
     Ok(t_ctx.reg_result_cols_start.unwrap())
+}
+
+/// Returns true when the HAVING-without-GROUP-BY clause references a column
+/// outside of any aggregate. Such references must be captured during the
+/// aggregation loop (matching SQLite's first-row semantics) because reading
+/// them from the cursor after the loop would yield NULL on an exhausted
+/// cursor and incorrectly suppress the implicit aggregate row.
+fn having_references_bare_column(plan: &SelectPlan) -> bool {
+    use crate::translate::expr::{walk_expr, WalkControl};
+    let Some(group_by) = &plan.group_by else {
+        return false;
+    };
+    if !group_by.exprs.is_empty() {
+        return false;
+    }
+    let Some(having) = &group_by.having else {
+        return false;
+    };
+    let mut found = false;
+    for expr in having.iter() {
+        let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+            match e {
+                Expr::Column { .. } | Expr::RowId { .. } => {
+                    found = true;
+                    Ok(WalkControl::SkipChildren)
+                }
+                _ => {
+                    if plan.aggregates.iter().any(|a| a.original_expr == *e) {
+                        Ok(WalkControl::SkipChildren)
+                    } else {
+                        Ok(WalkControl::Continue)
+                    }
+                }
+            }
+        });
+        if found {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone)]

@@ -18,10 +18,11 @@
 #   make build                   # local build when TCL headers are available
 #   make clean
 
-ROOT_DIR  := $(shell cd ../.. && pwd)
-TURSO_LIB := $(ROOT_DIR)/target/debug
-SRC       := $(ROOT_DIR)/bindings/tcl/turso_tcl.c
-INCLUDE   := $(ROOT_DIR)/sqlite3/include
+ROOT_DIR    := $(shell cd ../.. && pwd)
+TARGET_DIR  := $(shell $(ROOT_DIR)/scripts/cargo-target-dir)
+TURSO_LIB   := $(TARGET_DIR)/debug
+SRC         := $(ROOT_DIR)/bindings/tcl/turso_tcl.c
+INCLUDE     := $(ROOT_DIR)/sqlite3/include
 
 # Default target — local build (no Docker required).
 .PHONY: all

@@ -897,3 +897,186 @@ test union-order-by-expr-no-match {
 expect error {
     1st ORDER BY term does not match any column in the result set
 }
+
+# ===== Error: ORDER BY placed before a compound operator =====
+#
+# Mirrors sqlite3's select4-1.3 / 1.4 / 2.3 etc.: ORDER BY may only appear on
+# the right-most arm of a compound select. Previously the parser emitted a
+# generic 'near "UNION": syntax error'.
+
+@setup schema
+test order-by-before-union-all {
+    SELECT a FROM t1 ORDER BY a UNION ALL SELECT a FROM t2;
+}
+expect error {
+    ORDER BY clause should come after UNION ALL not before
+}
+
+@setup schema
+test order-by-before-union {
+    SELECT a FROM t1 ORDER BY a UNION SELECT a FROM t2;
+}
+expect error {
+    ORDER BY clause should come after UNION not before
+}
+
+@setup schema
+test order-by-before-except {
+    SELECT a FROM t1 ORDER BY a EXCEPT SELECT a FROM t2;
+}
+expect error {
+    ORDER BY clause should come after EXCEPT not before
+}
+
+@setup schema
+test order-by-before-intersect {
+    SELECT a FROM t1 ORDER BY a INTERSECT SELECT a FROM t2;
+}
+expect error {
+    ORDER BY clause should come after INTERSECT not before
+}
+
+@setup schema
+test order-by-on-middle-arm-of-three-way {
+    SELECT a FROM t1
+    UNION ALL
+    SELECT a FROM t2 ORDER BY 1
+    UNION ALL
+    SELECT x FROM t3;
+}
+expect error {
+    ORDER BY clause should come after UNION ALL not before
+}
+
+# ===== Table-qualified ORDER BY in compound SELECT =====
+#
+# Mirrors sqlite3 select4-4.1.2 (`ORDER BY t1.log`): a `table.col` reference in
+# the ORDER BY of a compound SELECT must resolve against the underlying
+# columns of the constituent SELECTs, not just bare result-set names.
+
+@setup schema
+test compound-order-by-qualified-name {
+    SELECT a FROM t1
+    UNION ALL
+    SELECT a FROM t2
+    ORDER BY t1.a;
+}
+expect {
+    1
+    2
+    2
+    3
+    4
+    4
+    5
+    6
+    7
+    8
+}
+
+@setup schema
+test compound-order-by-qualified-name-desc {
+    SELECT a FROM t1
+    UNION ALL
+    SELECT a FROM t2
+    ORDER BY t1.a DESC;
+}
+expect {
+    8
+    7
+    6
+    5
+    4
+    4
+    3
+    2
+    2
+    1
+}
+
+@setup schema
+test compound-order-by-schema-qualified-name {
+    SELECT a FROM t1
+    UNION ALL
+    SELECT a FROM t2
+    ORDER BY main.t1.a;
+}
+expect {
+    1
+    2
+    2
+    3
+    4
+    4
+    5
+    6
+    7
+    8
+}
+
+# Reproduces the exact shape of sqlite3 select4-4.1.2: a three-arm compound
+# (UNION ALL ... INTERSECT) ordered by a table-qualified column from the
+# leftmost arm.
+setup t1_log {
+    CREATE TABLE t1_log (n INTEGER, log INTEGER);
+    INSERT INTO t1_log VALUES (1, 5);
+    INSERT INTO t1_log VALUES (2, 6);
+    INSERT INTO t1_log VALUES (5, 3);
+    INSERT INTO t1_log VALUES (6, 3);
+}
+
+@setup t1_log
+test compound-order-by-qualified-three-arm {
+    SELECT DISTINCT log FROM t1_log
+    UNION ALL
+    SELECT 6
+    INTERSECT
+    SELECT n FROM t1_log WHERE log=3
+    ORDER BY t1_log.log;
+}
+expect {
+    5
+    6
+}
+
+# A qualified reference whose table identifier is not present in any arm must
+# still be rejected with the standard "does not match" error.
+@setup schema
+test compound-order-by-qualified-unknown-table {
+    SELECT a FROM t1 UNION SELECT a FROM t2 ORDER BY zzz.a;
+}
+expect error {
+    1st ORDER BY term does not match any column in the result set
+}
+
+# ===== Expression matching against constituent SELECTs' result expressions =====
+#
+# Mirrors sqlite3 select4-6.2: an ORDER BY term that is an unaliased aggregate
+# (or any expression) must resolve against the matching result expression of a
+# constituent SELECT in the compound query.
+
+setup t1_log_n {
+    CREATE TABLE t1_log_n (n int, log int);
+    INSERT INTO t1_log_n VALUES
+      (1,0),(2,1),(3,2),(4,2),(5,3),(6,3),(7,3),(8,3),
+      (9,4),(10,4),(11,4),(12,4),(13,4),(14,4),(15,4),(16,4),
+      (17,5),(18,5),(19,5),(20,5),(21,5),(22,5),(23,5),(24,5),
+      (25,5),(26,5),(27,5),(28,5),(29,5),(30,5),(31,5);
+}
+
+@setup t1_log_n
+test compound-order-by-aggregate-expr {
+    SELECT log, count(*) FROM t1_log_n GROUP BY log
+    UNION
+    SELECT log, n FROM t1_log_n WHERE n=7
+    ORDER BY count(*), log;
+}
+expect {
+    0|1
+    1|1
+    2|2
+    3|4
+    3|7
+    4|8
+    5|15
+}
