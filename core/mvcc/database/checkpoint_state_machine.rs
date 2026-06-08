@@ -815,14 +815,31 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             // A row is in the database file if:
             // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
             // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
-            let mut begin_ts = None;
-            if let Some(TxTimestampOrID::Timestamp(b)) = version.begin() {
-                begin_ts = Some(b);
-            }
-            let mut end_ts = None;
-            if let Some(TxTimestampOrID::Timestamp(e)) = version.end() {
-                end_ts = Some(e);
-            }
+            // Resolve in-flight TxID begin/end markers to the owning tx's true state
+            // (under off-lock collection the chain may not be rewritten to a Timestamp
+            // yet). Only a Committed tx contributes a timestamp; Active/Preparing/
+            // Aborted resolve to None (the insert/delete has not happened from this
+            // checkpoint's snapshot view). Uses the PackedTs accessors.
+            let begin_ts = match version.begin() {
+                Some(TxTimestampOrID::Timestamp(e)) => Some(e),
+                Some(TxTimestampOrID::TxID(t)) => {
+                    match lookup_tx_state(&self.mvstore.txs, &self.mvstore.finalized_tx_states, t) {
+                        Some(crate::mvcc::database::TransactionState::Committed(ts)) => Some(ts),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            let mut end_ts = match version.end() {
+                Some(TxTimestampOrID::Timestamp(e)) => Some(e),
+                Some(TxTimestampOrID::TxID(t)) => {
+                    match lookup_tx_state(&self.mvstore.txs, &self.mvstore.finalized_tx_states, t) {
+                        Some(crate::mvcc::database::TransactionState::Committed(ts)) => Some(ts),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
             // Upper bound: a version whose insert is not yet visible at our
             // snapshot committed during the off-lock prepare phase. Defer it to
             // the next checkpoint pass and don't let it influence DB-file
@@ -898,7 +915,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     v.set_end(None);
                     v
                 } else {
-                    version.clone()
+                    let mut version = version.clone();
+                    // Normalize the clone's end to the resolved end_ts: a Committed(ts)
+                    // delete stays a delete; an in-flight/aborted end (resolved to None)
+                    // becomes a live insert so the downstream is_delete is consistent and
+                    // we don't run a spurious delete on the row.
+                    version.set_end(end_ts.map(TxTimestampOrID::Timestamp));
+                    version
                 };
                 if table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
                     if versions_to_checkpoint.is_empty() {
@@ -1697,6 +1720,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
                 tracing::debug!("Collected {} committed versions", self.write_set.len());
                 self.state = CheckpointState::CollectIndexRows;
+                inject_transition_yield!(self, CheckpointYieldPoint::AfterCollectTableRows);
                 Ok(TransitionResult::Continue)
             }
             CheckpointState::CollectIndexRows => {
