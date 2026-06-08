@@ -219,7 +219,8 @@ fn parse_date_or_time(value: &str, p: &mut DateTime) -> Result<()> {
         set_to_current(p);
         return Ok(());
     }
-    if let Ok(val) = value.parse::<f64>() {
+    let numeric_value = value.trim_matches(|c: char| c.is_ascii_whitespace());
+    if let Ok(val) = numeric_value.parse::<f64>() {
         p.s = val;
         p.raw_s = true;
         if (0.0..5373484.5).contains(&val) {
@@ -2575,6 +2576,21 @@ mod tests {
 
         let result = exec_unixepoch(vec![Value::from_f64(2440587.5)]);
         assert_eq!(result, Value::from_i64(0));
+    }
+
+    #[test]
+    fn test_numeric_datetime_accepts_ascii_whitespace() {
+        let expected = Value::from_i64(-210866328000);
+        for input in ["5 ", " 5", " 5 ", "\t5\n"] {
+            let result = exec_unixepoch(vec![Value::build_text(input.to_string())]);
+            assert_eq!(result, expected, "input {input:?}");
+        }
+
+        let result = exec_julianday(vec![Value::build_text("5 ".to_string())]);
+        assert_eq!(result, Value::from_f64(5.0));
+
+        let result = exec_unixepoch(vec![Value::build_text("5 trailing".to_string())]);
+        assert_eq!(result, Value::Null);
     }
 
     #[test]
