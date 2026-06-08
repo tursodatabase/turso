@@ -1076,6 +1076,20 @@ fn replace_column_number_with_copy_of_column_expr(
     columns: &[ResultSetColumn],
     clause_name: &str,
 ) -> Result<()> {
+    match order_by_or_group_by_expr {
+        ast::Expr::Collate(inner, _) => {
+            return replace_column_number_with_copy_of_column_expr(inner, columns, clause_name);
+        }
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            return replace_column_number_with_copy_of_column_expr(
+                exprs[0].as_mut(),
+                columns,
+                clause_name,
+            );
+        }
+        _ => {}
+    }
+
     // Extract the numeric literal string, handling both bare integers (e.g. `2`)
     // and unary-plus integers (e.g. `+2`). In SQLite, `ORDER BY +2` strips the
     // unary plus and still resolves `2` as a column index reference.
