@@ -8,6 +8,7 @@ import { Session, type SessionConfig } from './session.js';
 import { type AsyncLock } from './async-lock.js';
 import { DatabaseError } from './error.js';
 import { normalizeArgs } from './args.js';
+import { createExpandedRow } from './row.js';
 
 /**
  * A prepared SQL statement that can be executed in multiple ways.
@@ -202,12 +203,7 @@ export class Statement {
         return [...row];
       }
 
-      // In expanded mode, convert to plain object with named properties
-      const obj: any = {};
-      result.columns.forEach((col: string, i: number) => {
-        obj[col] = row[i];
-      });
-      return obj;
+      return createExpandedRow(row, result.columns);
     });
   }
 
@@ -238,14 +234,7 @@ export class Statement {
         return result.rows.map((row: any) => [...row]);
       }
 
-      // In expanded mode, convert rows to plain objects with named properties
-      return result.rows.map((row: any) => {
-        const obj: any = {};
-        result.columns.forEach((col: string, i: number) => {
-          obj[col] = row[i];
-        });
-        return obj;
-      });
+      return result.rows.map((row: any) => createExpandedRow(row, result.columns));
     });
   }
 
@@ -300,12 +289,7 @@ export class Statement {
               // In raw mode, yield arrays of values
               yield decodedRow;
             } else {
-              // In expanded mode, yield plain objects with named properties (consistent with all())
-              const obj: any = {};
-              columns.forEach((col: string, i: number) => {
-                obj[col] = decodedRow[i];
-              });
-              yield obj;
+              yield createExpandedRow(decodedRow, columns);
             }
           }
           break;

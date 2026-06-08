@@ -39,6 +39,20 @@ test('exec multiple statements', async () => {
     expect(rows).toEqual([{ x: 1 }, { x: 2 }]);
 })
 
+test('expanded rows preserve positional values for duplicate column names', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE role(path TEXT); CREATE TABLE org_unit(path TEXT)");
+    await db.exec("INSERT INTO role VALUES ('/Employee'); INSERT INTO org_unit VALUES ('/')");
+
+    const [row] = await db.all("SELECT role.path, org_unit.path FROM role JOIN org_unit");
+
+    expect(Object.keys(row)).toEqual(["path"]);
+    expect(row.path).toBe("/");
+    expect(row[0]).toBe("/Employee");
+    expect(row[1]).toBe("/");
+    expect(row).toEqual({ path: "/" });
+})
+
 test('readonly-db', async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     try {
