@@ -1,3 +1,4 @@
+use crate::alloc::*;
 use crate::sync::{Arc, RwLock};
 use std::iter::successors;
 use std::result::Result;
@@ -75,7 +76,7 @@ impl InternalVirtualTable for JsonVirtualTable {
     ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor + 'static>>> {
         Ok(Arc::new(RwLock::new(JsonEachCursor::empty(
             self.traversal_mode.clone(),
-        ))))
+        )?)))
     }
 
     fn best_index(
@@ -83,13 +84,14 @@ impl InternalVirtualTable for JsonVirtualTable {
         constraints: &[turso_ext::ConstraintInfo],
         _order_by: &[turso_ext::OrderByInfo],
     ) -> Result<turso_ext::IndexInfo, ResultCode> {
-        let mut usages = vec![
+        let mut usages = try_vec![
             ConstraintUsage {
                 argv_index: None,
                 omit: false
             };
             constraints.len()
-        ];
+        ]
+        .map_err(|_| ResultCode::OoM)?;
 
         let mut json_idx: Option<usize> = None;
         let mut path_idx: Option<usize> = None;
@@ -203,22 +205,22 @@ struct TraversalState {
 }
 
 impl JsonEachCursor {
-    fn empty(traversal_mode: JsonTraversalMode) -> Self {
-        Self {
+    fn empty(traversal_mode: JsonTraversalMode) -> Result<Self, LimboError> {
+        Ok(Self {
             rowid: 0,
-            json: Jsonb::new(0, None),
+            json: Jsonb::empty(),
             traversal_states: Vec::new(),
-            path_to_current_value: InPlaceJsonPath::new_root(),
-            columns: Columns::default(),
+            path_to_current_value: InPlaceJsonPath::new_root()?,
+            columns: Columns::empty(),
             traversal_mode,
-        }
+        })
     }
 
     fn push_state(
         &mut self,
         iterator_state: IteratorState,
         innermost_container_cursor: InPlaceJsonPathCursor,
-    ) {
+    ) -> Result<(), TryReserveError> {
         let parent_id = self
             .traversal_states
             .last()
@@ -230,12 +232,13 @@ impl JsonEachCursor {
             _ => parent_id,
         };
 
-        self.traversal_states.push(TraversalState {
+        self.traversal_states.try_push(TraversalState {
             iterator_state,
             parent_id,
             innermost_container_id: innermost_container,
             innermost_container_cursor,
-        });
+        })?;
+        Ok(())
     }
 
     fn peek_state(&self) -> Option<&TraversalState> {
@@ -294,7 +297,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
 
         self.json = root_json;
         self.path_to_current_value =
-            InPlaceJsonPath::from_json_path(path.to_owned(), json_path(path)?);
+            InPlaceJsonPath::from_json_path(path.to_owned(), json_path(path)?)?;
         let iterator_state = json_iterator_from(&self.json)?;
         let innermost_container_path = if matches!(self.traversal_mode, JsonTraversalMode::Tree)
             && matches!(iterator_state, IteratorState::Primitive(_))
@@ -303,7 +306,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         } else {
             self.path_to_current_value.cursor()
         };
-        self.push_state(iterator_state, innermost_container_path);
+        self.push_state(iterator_state, innermost_container_path)?;
 
         let key = self.path_to_current_value.key().to_owned();
         match self.traversal_mode {
@@ -348,7 +351,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         };
         match traversal_state.iterator_state {
             IteratorState::Array(state) => {
-                let Some(((idx, value), new_state)) = self.json.array_iterator_next(&state) else {
+                let Some(((idx, value), new_state)) = self.json.array_iterator_next(&state)? else {
                     self.path_to_current_value.pop();
                     return self.next();
                 };
@@ -362,11 +365,11 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                 self.push_state(
                     IteratorState::Array(new_state),
                     self.path_to_current_value.cursor(),
-                );
+                )?;
                 let recurses = recursing_iterator.is_some();
-                self.path_to_current_value.push_array_index(&idx);
+                self.path_to_current_value.push_array_index(&idx)?;
                 if let Some(it) = recursing_iterator {
-                    self.push_state(it, self.path_to_current_value.cursor());
+                    self.push_state(it, self.path_to_current_value.cursor())?;
                 }
 
                 let key = self.path_to_current_value.key().to_owned();
@@ -385,7 +388,8 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                 }
             }
             IteratorState::Object(state) => {
-                let Some(((_idx, key, value), new_state)) = self.json.object_iterator_next(&state)
+                let Some(((_idx, key, value), new_state)) =
+                    self.json.object_iterator_next(&state)?
                 else {
                     self.path_to_current_value.pop();
                     return self.next();
@@ -394,17 +398,19 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                 self.push_state(
                     IteratorState::Object(new_state),
                     self.path_to_current_value.cursor(),
-                );
+                )?;
                 self.path_to_current_value
                     .push_object_key(&key.to_string()?)?;
-                let recursing = matches!(self.traversal_mode, JsonTraversalMode::Tree)
-                    && self
+                let mut recursing = false;
+                if matches!(self.traversal_mode, JsonTraversalMode::Tree) {
+                    if let Some(it) = self
                         .json
                         .container_property_iterator(&IteratorState::Object(state))
-                        .is_some_and(|it| {
-                            self.push_state(it, self.path_to_current_value.cursor());
-                            true
-                        });
+                    {
+                        self.push_state(it, self.path_to_current_value.cursor())?;
+                        recursing = true;
+                    }
+                }
 
                 self.columns = Columns::new(
                     self.path_to_current_value.key().to_owned(),
@@ -493,7 +499,7 @@ fn navigate_to_path(jsonb: &mut Jsonb, path: &Value) -> Result<Option<Jsonb>, Li
     let json_path = json_path_from_db_value(path, true)?.ok_or_else(|| {
         LimboError::InvalidArgument(format!("path '{path}' is not a valid json path"))
     })?;
-    let mut search_operation = SearchOperation::new(jsonb.len() / 2);
+    let mut search_operation = SearchOperation::new(jsonb.len() / 2)?;
     if jsonb
         .operate_on_path(&json_path, &mut search_operation)
         .is_err()
@@ -543,19 +549,17 @@ mod columns {
         innermost_container_path: String,
     }
 
-    impl Default for Columns {
-        fn default() -> Columns {
+    impl Columns {
+        pub(super) fn empty() -> Columns {
             Self {
                 key: Key::empty(),
-                value: Jsonb::new(0, None),
+                value: Jsonb::empty(),
                 fullkey: "".to_owned(),
                 parent_id: None,
                 innermost_container_path: "".to_owned(),
             }
         }
-    }
 
-    impl Columns {
         pub(super) fn new(
             key: Key,
             value: Jsonb,
@@ -684,12 +688,12 @@ struct InPlaceJsonPath {
 type InPlaceJsonPathCursor = usize;
 
 impl InPlaceJsonPath {
-    fn new_root() -> Self {
-        Self {
+    fn new_root() -> Result<Self, TryReserveError> {
+        Ok(Self {
             string: "$".to_owned(),
-            element_lengths: vec![1],
+            element_lengths: try_vec![1]?,
             last_element: Key::None,
-        }
+        })
     }
 
     fn pop(&mut self) {
@@ -700,9 +704,10 @@ impl InPlaceJsonPath {
         }
     }
 
-    fn push_array_index(&mut self, idx: &usize) {
+    fn push_array_index(&mut self, idx: &usize) -> Result<(), TryReserveError> {
         self.last_element = Key::Integer(*idx as i64);
-        self.push(format!("[{idx}]"));
+        self.push(format!("[{idx}]"))?;
+        Ok(())
     }
 
     fn push_object_key(&mut self, key: &str) -> crate::Result<()> {
@@ -723,13 +728,16 @@ impl InPlaceJsonPath {
             inner
         };
         self.last_element = Key::String(inner.to_owned());
-        self.push(format!(".{unquoted_if_necessary}"));
+        self.push(format!(".{unquoted_if_necessary}"))?;
         Ok(())
     }
 
-    fn push(&mut self, element: String) {
+    fn push(&mut self, element: String) -> Result<(), std::collections::TryReserveError> {
+        self.element_lengths.try_reserve(1)?;
+        self.string.try_reserve(element.len())?;
         self.element_lengths.push(element.len());
         self.string.push_str(&element);
+        Ok(())
     }
 
     fn cursor(&self) -> InPlaceJsonPathCursor {
@@ -740,11 +748,11 @@ impl InPlaceJsonPath {
         &self.string[0..cursor]
     }
 
-    fn from_json_path(path: String, json_path: JsonPath<'_>) -> Self {
+    fn from_json_path(path: String, json_path: JsonPath<'_>) -> crate::Result<Self> {
         let (json_path, last_element) = if json_path.elements.is_empty() {
             (
                 JsonPath {
-                    elements: vec![PathElement::Root()],
+                    elements: try_vec![PathElement::Root()]?,
                 },
                 Key::None,
             )
@@ -766,13 +774,13 @@ impl InPlaceJsonPath {
             .elements
             .iter()
             .map(Self::element_length)
-            .collect();
+            .try_collect()?;
 
-        Self {
+        Ok(Self {
             string: path,
             element_lengths,
             last_element,
-        }
+        })
     }
 
     fn element_length(element: &PathElement) -> usize {

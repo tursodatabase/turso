@@ -1638,7 +1638,7 @@ impl Connection {
                 self.clone(),
                 true,
                 self.get_sync_mode(),
-            );
+            )?;
             loop {
                 match ckpt_sm.step(&()) {
                     Ok(TransitionResult::Continue) => {}

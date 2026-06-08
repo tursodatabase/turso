@@ -1,4 +1,5 @@
 use rustc_hash::FxHashSet as HashSet;
+use std::vec;
 
 use super::*;
 use crate::io::PlatformIO;
@@ -290,7 +291,9 @@ fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
         .insert_table_id_to_rootpage(MVTableId::from(-999_i64), Some(999));
 
     db.mvcc_store.try_begin_vacuum_gate().unwrap();
-    db.mvcc_store.reset_after_vacuum(header, schema.as_ref());
+    db.mvcc_store
+        .reset_after_vacuum(header, schema.as_ref())
+        .unwrap();
     db.mvcc_store.release_vacuum_gate();
 
     assert_eq!(
@@ -386,7 +389,8 @@ fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
 
     db.mvcc_store.try_begin_vacuum_gate().unwrap();
     db.mvcc_store
-        .reset_after_vacuum(DatabaseHeader::default(), schema.as_ref());
+        .reset_after_vacuum(DatabaseHeader::default(), schema.as_ref())
+        .unwrap();
     db.mvcc_store.release_vacuum_gate();
 
     for row_id in checkpointed_row_ids {
@@ -616,7 +620,8 @@ fn advance_checkpoint_until_wal_has_commit_frame(
         conn.clone(),
         true,
         conn.get_sync_mode(),
-    );
+    )
+    .unwrap();
 
     for _ in 0..10_000 {
         if pager
@@ -1618,7 +1623,8 @@ fn test_checkpoint_truncates_wal_last() {
         conn.clone(),
         true,
         conn.get_sync_mode(),
-    );
+    )
+    .unwrap();
 
     let mut saw_truncate_log_state_with_wal = false;
     let mut finished = false;
@@ -2348,7 +2354,8 @@ fn test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit() {
             conn.clone(),
             true,
             conn.get_sync_mode(),
-        );
+        )
+        .unwrap();
 
         for _ in 0..50_000 {
             if checkpoint_sm.state_for_test() == CheckpointState::CheckpointWal {
@@ -2720,7 +2727,8 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
         conn.clone(),
         true,
         conn.get_sync_mode(),
-    );
+    )
+    .unwrap();
     let mut reached_truncate = false;
     for _ in 0..50_000 {
         if checkpoint_sm.state_for_test() == CheckpointState::TruncateLogicalLog {
@@ -2749,7 +2757,8 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
     );
 
     let sync_mode = conn.get_sync_mode();
-    let checkpoint_sm2 = CheckpointStateMachine::new(pager, mvcc_store, conn, true, sync_mode);
+    let checkpoint_sm2 =
+        CheckpointStateMachine::new(pager, mvcc_store, conn, true, sync_mode).unwrap();
     let (old_boundary, _) = checkpoint_sm2.checkpoint_bounds_for_test();
     assert!(
         old_boundary.unwrap_or_default() >= ts1,
@@ -2817,7 +2826,8 @@ fn test_checkpoint_resamples_boundary_before_starting() {
         delayed_conn.clone(),
         true,
         delayed_conn.get_sync_mode(),
-    );
+    )
+    .unwrap();
     let (old_boundary, _) = delayed_checkpoint.checkpoint_bounds_for_test();
     assert_eq!(old_boundary, Some(first_boundary));
 
@@ -2829,7 +2839,8 @@ fn test_checkpoint_resamples_boundary_before_starting() {
         interrupted_conn.clone(),
         true,
         interrupted_conn.get_sync_mode(),
-    );
+    )
+    .unwrap();
     let mut reached_wal_checkpoint = false;
     for _ in 0..50_000 {
         if interrupted_checkpoint.state_for_test() == CheckpointState::CheckpointWal {
@@ -3473,7 +3484,7 @@ fn test_commit() {
         .unwrap();
     commit_tx(db.mvcc_store.clone(), &db.conn, tx2).unwrap();
     assert_eq!(tx1_updated_row, row);
-    db.mvcc_store.drop_unused_row_versions();
+    db.mvcc_store.drop_unused_row_versions().unwrap();
 }
 
 /// What this test checks: Rollback/savepoint behavior restores exactly the intended state when statements or transactions fail.
@@ -4544,7 +4555,7 @@ fn test_read_only_commit_does_not_cache_finalized_state() {
         .unwrap();
 
     // Establish a clean baseline after schema/setup writes.
-    mvcc_store.drop_unused_row_versions();
+    mvcc_store.drop_unused_row_versions().unwrap();
     let baseline = mvcc_store.finalized_tx_states.len();
 
     conn.execute("BEGIN CONCURRENT").unwrap();
@@ -4567,7 +4578,7 @@ fn test_drop_unused_row_versions_prunes_unreferenced_finalized_tx_states() {
         .unwrap();
 
     // Establish a clean baseline after schema/setup writes.
-    mvcc_store.drop_unused_row_versions();
+    mvcc_store.drop_unused_row_versions().unwrap();
     let baseline = mvcc_store.finalized_tx_states.len();
 
     conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
@@ -4577,7 +4588,7 @@ fn test_drop_unused_row_versions_prunes_unreferenced_finalized_tx_states() {
         "write commit should add at least one finalized tx cache entry"
     );
 
-    mvcc_store.drop_unused_row_versions();
+    mvcc_store.drop_unused_row_versions().unwrap();
 
     assert_eq!(
         mvcc_store.finalized_tx_states.len(),
@@ -7472,7 +7483,7 @@ fn test_gc_integration_insert_commit_gc() {
 
     // No active transactions → LWM = u64::MAX.
     // ckpt_max = 0 (no checkpoint yet), so rule 3 won't fire (b > ckpt_max).
-    let dropped = db.mvcc_store.drop_unused_row_versions();
+    let dropped = db.mvcc_store.drop_unused_row_versions().unwrap();
     assert_eq!(dropped, 0);
     assert!(!db.mvcc_store.rows.is_empty());
 }
@@ -7514,7 +7525,7 @@ fn test_gc_integration_rollback_creates_aborted_garbage() {
 
     // GC should clean up the version. The SkipMap entry stays (lazy removal
     // in background GC avoids TOCTOU), but the version vec should be empty.
-    let dropped = db.mvcc_store.drop_unused_row_versions();
+    let dropped = db.mvcc_store.drop_unused_row_versions().unwrap();
     assert_eq!(dropped, 1);
     let entry = db
         .mvcc_store
@@ -7567,7 +7578,7 @@ fn test_gc_active_reader_pins_lwm() {
 
     // GC should NOT remove the superseded version (its end_ts > lwm).
     let row_id = RowID::new(table_id, RowKey::Int(1));
-    let dropped = db.mvcc_store.drop_unused_row_versions();
+    let dropped = db.mvcc_store.drop_unused_row_versions().unwrap();
     assert_eq!(
         dropped, 0,
         "GC should not remove versions visible to active reader"
@@ -7592,7 +7603,7 @@ fn test_gc_active_reader_pins_lwm() {
     assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
 
     // GC should now remove the superseded version.
-    let dropped = db.mvcc_store.drop_unused_row_versions();
+    let dropped = db.mvcc_store.drop_unused_row_versions().unwrap();
     assert_eq!(
         dropped, 1,
         "superseded version should be reclaimed after reader closes"
@@ -11340,7 +11351,7 @@ fn collect_mvcc_portable_change_bytes(conn: &Arc<Connection>) -> Vec<u8> {
         .expect("test database must be in MVCC mode")
         .clone();
     let io = conn.get_pager().io.clone();
-    let mut reader = StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), None);
+    let mut reader = StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), None).unwrap();
     reader.read_header(&io).unwrap();
 
     let mut portable_changes = Vec::new();
@@ -11362,7 +11373,8 @@ fn collect_mvcc_portable_change_bytes_with_encryption(
         .clone();
     let io = conn.get_pager().io.clone();
     let mut reader =
-        StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), Some(encryption_ctx));
+        StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), Some(encryption_ctx))
+            .unwrap();
     reader.read_header(&io).unwrap();
 
     let mut portable_changes = Vec::new();
@@ -11380,7 +11392,7 @@ fn collect_mvcc_recovery_ops(conn: &Arc<Connection>) -> Vec<ParsedOp> {
         .expect("test database must be in MVCC mode")
         .clone();
     let io = conn.get_pager().io.clone();
-    let mut reader = StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), None);
+    let mut reader = StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), None).unwrap();
     reader.read_header(&io).unwrap();
 
     let mut ops = Vec::new();
