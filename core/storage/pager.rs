@@ -4859,7 +4859,21 @@ impl Pager {
         mode: CheckpointMode,
         sync_mode: crate::SyncMode,
     ) -> Result<CheckpointResult> {
-        self.io.block(|| self.checkpoint(mode, sync_mode, true))
+        let result = self.io.block(|| self.checkpoint(mode, sync_mode, true));
+        if result.is_err() {
+            // When the checkpoint state machine errors mid-flight (e.g. a failed
+            // WAL ftruncate during a TRUNCATE checkpoint), `io.block` surfaces the
+            // completion error from `io.wait` *without* re-entering `checkpoint()`,
+            // so the state machine never reaches `Finalize` to release its guard.
+            // That guard holds the exclusive WRITER and read-mark-0 locks, so a
+            // leak would stall every subsequent reader into `Busy`. Reset the
+            // checkpoint state here, which drops the lingering `CheckpointResult`
+            // and releases those locks. The data is already durable in the synced
+            // DB file; any un-truncated WAL frames are stale and get cleaned up on
+            // the next write.
+            self.clear_checkpoint_state();
+        }
+        result
     }
 
     pub fn freepage_list(&self) -> u32 {
