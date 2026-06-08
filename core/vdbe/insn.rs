@@ -386,6 +386,14 @@ pub enum Insn {
         target_pc: BranchOffset,
         decrement_by: usize,
     },
+    /// Mirrors SQLite's OP_IfNotZero. P1 must be an integer.
+    /// If r[P1] > 0: decrement r[P1] by 1, then jump to P2.
+    /// If r[P1] < 0: leave r[P1] unchanged, jump to P2 (sticky "unlimited" sentinel).
+    /// If r[P1] == 0: fall through.
+    IfNotZero {
+        reg: usize,
+        target_pc: BranchOffset,
+    },
     /// If the given register is not NULL, jump to the given PC.
     NotNull {
         reg: usize,
@@ -1873,6 +1881,7 @@ impl InsnVariants {
             InsnVariants::Jump => execute::op_jump,
             InsnVariants::Move => execute::op_move,
             InsnVariants::IfPos => execute::op_if_pos,
+            InsnVariants::IfNotZero => execute::op_if_not_zero,
             InsnVariants::NotNull => execute::op_not_null,
             InsnVariants::Eq
             | InsnVariants::Ne
