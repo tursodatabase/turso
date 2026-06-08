@@ -28,6 +28,7 @@ use std::ops::Bound;
 #[cfg(any(test, injected_yields))]
 use strum::EnumCount;
 
+use super::lookup_tx_state;
 const COLLECT_PREEMPTION_THRESHOLD: usize = 1024;
 
 /// Root page of the `sqlite_schema` B-tree in the database file.
@@ -105,6 +106,7 @@ pub enum CheckpointState {
 pub(crate) enum CheckpointYieldPoint {
     BeforeAcquireLock,
     AfterDurableBoundaryAdvanced,
+    AfterCollectTableRows,
 }
 
 #[cfg(any(test, injected_yields))]
