@@ -18,7 +18,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode          p1  p2  p3  p4              p5  comment
-   0    Init           0  42   0                   0  Start at 42
+   0    Init           0  49   0                   0  Start at 49
    1    OpenWrite      0   2   0                   0  root=2; iDb=0
    2    OpenWrite      1   8   0                   0  root=8; iDb=0
    3    Null           0   1   0                   0  r[1]=NULL
@@ -40,27 +40,34 @@ addr  opcode          p1  p2  p3  p4              p5  comment
   19    Copy           4   2   0                   0  r[2]=r[4]
   20  Return           3   0   1                   0
   21  OpenRead         0   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
-  22  Copy             2  11   0                   0  r[11]=r[2]
-  23  Gt              10  11  30                   0  if r[10]>r[11] goto 30
-  24  Copy             2  13   0                   0  r[13]=r[2]
-  25  Gt              13  14  30                   0  if r[13]>r[14] goto 30
-  26  Rewind           0  30   0                   0  Rewind table products
-  27    RowId          0   8   0                   0  r[8]=products.rowid
-  28    RowSetAdd      1   8   0                   0
-  29  Next             0  27   0                   0
-  30  Close            0   0   0                   0
-  31  OpenWrite        0   2   0                   0  root=2; iDb=0
-  32  OpenWrite        3   8   0                   0  root=8; iDb=0
-  33    RowSetRead     1  41  15                   0
-  34    NotExists      0  40  15                   0
-  35    NotExists      0  40  15                   0
-  36    Column         0   2  16                   0  r[16]=products.category_id
-  37    RowId          0  17   0                   0  r[17]=products.rowid
-  38    IdxDelete      1  16   2                   1
-  39    Delete         0   0   0  products         0
-  40  Goto             0  33   0                   0
-  41  Halt             0   0   0                   0
-  42  Transaction      0   2  11                   0  iDb=0 tx_mode=Write
-  43  Integer          1  10   0                   0  r[10]=1
-  44  Integer        100  14   0                   0  r[14]=100
-  45  Goto             0   1   0                   0
+  22  Copy             2  10   0                   0  r[10]=r[2]
+  23  Copy            10  12   0                   0  r[12]=r[10]
+  24  Integer          1  11   0                   0  r[11]=1
+  25  Ge              12  13  27                   0  if r[12]>=r[13] goto 27
+  26  ZeroOrNull      12  11  13                   0  ((r[12]=NULL)|(r[13]=NULL)) ? r[11]=NULL : r[11]=0
+  27  Copy            10  15   0                   0  r[15]=r[10]
+  28  Integer          1  14   0                   0  r[14]=1
+  29  Le              15  16  31                   0  if r[15]<=r[16] goto 31
+  30  ZeroOrNull      15  14  16                   0  ((r[15]=NULL)|(r[16]=NULL)) ? r[14]=NULL : r[14]=0
+  31  And             14  11   9                   0  r[9]=(r[11] && r[14])
+  32  IfNot            9  37   1                   0  if !r[9] goto 37
+  33  Rewind           0  37   0                   0  Rewind table products
+  34    RowId          0   8   0                   0  r[8]=products.rowid
+  35    RowSetAdd      1   8   0                   0
+  36  Next             0  34   0                   0
+  37  Close            0   0   0                   0
+  38  OpenWrite        0   2   0                   0  root=2; iDb=0
+  39  OpenWrite        3   8   0                   0  root=8; iDb=0
+  40    RowSetRead     1  48  17                   0
+  41    NotExists      0  47  17                   0
+  42    NotExists      0  47  17                   0
+  43    Column         0   2  18                   0  r[18]=products.category_id
+  44    RowId          0  19   0                   0  r[19]=products.rowid
+  45    IdxDelete      1  18   2                   1
+  46    Delete         0   0   0  products         0
+  47  Goto             0  40   0                   0
+  48  Halt             0   0   0                   0
+  49  Transaction      0   2  11                   0  iDb=0 tx_mode=Write
+  50  Integer          1  13   0                   0  r[13]=1
+  51  Integer        100  16   0                   0  r[16]=100
+  52  Goto             0   1   0                   0
