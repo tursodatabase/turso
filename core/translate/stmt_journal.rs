@@ -22,12 +22,13 @@
 //! into this module to set them to `false` when safe.
 
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{walk_expr, WalkControl};
+use crate::translate::expr::WalkControl;
 use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
+use crate::util::walk_expr_with_subqueries;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::{sync::Arc, Connection, Result};
-use turso_parser::ast::{Expr, LikeOperator, ResolveType, TriggerEvent};
+use turso_parser::ast::{Expr, ResolveType, TriggerEvent};
 
 /// Check whether any DDL-level constraint (IPK or index) uses REPLACE.
 pub(crate) fn any_index_or_ipk_has_replace(
@@ -67,97 +68,46 @@ fn table_has_fks(
             || resolver.with_schema(database_id, |s| s.any_resolved_fks_referencing(table_name)))
 }
 
-fn expr_depends_on_row(expr: &Expr) -> bool {
-    let mut depends_on_row = false;
-    // Planned DML expressions are usually bound to Column/RowId. Schema-stored
-    // index expressions still contain identifiers, and here they only appear
-    // after the index was selected for maintenance.
-    let _ = walk_expr(expr, &mut |expr| -> Result<WalkControl> {
-        match expr {
+/// Conservative test for "this expression's value can change row-to-row".
+///
+/// Per-row expression evaluation can fail mid-loop (bad LIKE ESCAPE, malformed
+/// datetime, type cast overflow, etc.), and a multi-row DML that has already
+/// written earlier rows then needs a statement journal to roll those writes back.
+///
+/// DML expressions reach us bound (`Id`/`Qualified` rewritten to `Column`), but
+/// schema-stored index `expr`/`where_clause` are unbound — we match both forms.
+fn expr_is_row_dependent(expr: &Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr_with_subqueries(expr, &mut |e| -> Result<WalkControl> {
+        if matches!(
+            e,
             Expr::Column { .. }
-            | Expr::DoublyQualified(_, _, _)
-            | Expr::Id(_)
-            | Expr::Name(_)
-            | Expr::Qualified(_, _)
-            | Expr::RowId { .. }
-            | Expr::Register(_)
-            | Expr::SubqueryResult { .. }
-            | Expr::Exists(_)
-            | Expr::Subquery(_)
-            | Expr::InSelect { .. } => {
-                depends_on_row = true;
-                Ok(WalkControl::SkipChildren)
-            }
-            Expr::Array { elements } => {
-                if elements.iter().any(|expr| expr_depends_on_row(expr)) {
-                    depends_on_row = true;
-                }
-                Ok(WalkControl::SkipChildren)
-            }
-            Expr::Subscript { base, index } => {
-                if expr_depends_on_row(base) || expr_depends_on_row(index) {
-                    depends_on_row = true;
-                }
-                Ok(WalkControl::SkipChildren)
-            }
-            _ => Ok(WalkControl::Continue),
+                | Expr::RowId { .. }
+                | Expr::Register(_)
+                | Expr::SubqueryResult { .. }
+                | Expr::Id(_)
+                | Expr::Name(_)
+                | Expr::Qualified(..)
+                | Expr::DoublyQualified(..)
+        ) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
         }
+        Ok(WalkControl::Continue)
     });
-    depends_on_row
+    found
 }
 
-fn expr_has_runtime_abort_source(expr: &Expr) -> bool {
-    let mut has_runtime_abort_source = false;
-    let _ = walk_expr(expr, &mut |expr| -> Result<WalkControl> {
-        match expr {
-            Expr::FunctionCall { .. }
-            | Expr::FunctionCallStar { .. }
-            | Expr::Raise(_, _)
-            | Expr::Exists(_)
-            | Expr::Subquery(_)
-            | Expr::SubqueryResult { .. }
-            | Expr::InSelect { .. }
-            | Expr::InTable { .. }
-            | Expr::FieldAccess { .. }
-            | Expr::Subscript { .. } => {
-                has_runtime_abort_source = true;
-                Ok(WalkControl::SkipChildren)
-            }
-            Expr::Like { op, escape, .. }
-                if escape.is_some() || matches!(op, LikeOperator::Match | LikeOperator::Regexp) =>
-            {
-                has_runtime_abort_source = true;
-                Ok(WalkControl::SkipChildren)
-            }
-            Expr::Array { elements } => {
-                if elements
-                    .iter()
-                    .any(|expr| expr_has_runtime_abort_source(expr))
-                {
-                    has_runtime_abort_source = true;
-                }
-                Ok(WalkControl::SkipChildren)
-            }
-            _ => Ok(WalkControl::Continue),
-        }
-    });
-    has_runtime_abort_source
-}
-
-fn expr_may_abort_after_write(expr: &Expr) -> bool {
-    expr_depends_on_row(expr) && expr_has_runtime_abort_source(expr)
-}
-
-fn index_expr_may_abort_after_write(index: &crate::schema::Index) -> bool {
+fn index_has_row_dependent_expr(index: &Arc<crate::schema::Index>) -> bool {
     index
         .columns
         .iter()
         .filter_map(|column| column.expr.as_deref())
-        .any(expr_may_abort_after_write)
+        .any(expr_is_row_dependent)
         || index
             .where_clause
             .as_deref()
-            .is_some_and(expr_may_abort_after_write)
+            .is_some_and(expr_is_row_dependent)
 }
 
 /// Determine whether any constraint's effective resolution can trigger an
@@ -327,15 +277,15 @@ pub(crate) fn set_update_stmt_journal_flags(
     let row_expr_may_abort = plan
         .where_clause
         .iter()
-        .any(|term| expr_may_abort_after_write(&term.expr))
+        .any(|term| expr_is_row_dependent(&term.expr))
         || plan
             .set_clauses
             .iter()
-            .any(|set_clause| expr_may_abort_after_write(&set_clause.expr))
+            .any(|set_clause| expr_is_row_dependent(&set_clause.expr))
         || plan
             .indexes_to_update
             .iter()
-            .any(|index| index_expr_may_abort_after_write(index));
+            .any(index_has_row_dependent_expr);
 
     let may_abort = has_triggers
         || has_fks
@@ -385,11 +335,8 @@ pub(crate) fn set_delete_stmt_journal_flags(
     let row_expr_may_abort = plan
         .where_clause
         .iter()
-        .any(|term| expr_may_abort_after_write(&term.expr))
-        || plan
-            .indexes
-            .iter()
-            .any(|index| index_expr_may_abort_after_write(index));
+        .any(|term| expr_is_row_dependent(&term.expr))
+        || plan.indexes.iter().any(index_has_row_dependent_expr);
     if !has_triggers && !has_fks && !row_expr_may_abort {
         program.set_may_abort(false);
     }
