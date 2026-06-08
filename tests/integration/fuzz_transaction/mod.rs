@@ -481,13 +481,14 @@ async fn test_multiple_connections_fuzz_mvcc() {
     let mvcc_fuzz_options = FuzzOptions {
         mvcc_enabled: true,
         max_num_connections: 2,
+        operations_per_connection: 1000,
         query_gen_options: QueryGenOptions {
             weight_begin_deferred: 4,
             weight_begin_concurrent: 12,
             weight_commit: 8,
             weight_rollback: 8,
             weight_checkpoint: 2,
-            checkpoint_modes: vec![CheckpointMode::Truncate],
+            checkpoint_modes: vec![CheckpointMode::Passive],
             weight_ddl: 10,
             weight_dml: 66,
             dml_gen_options: DmlGenOptions {
