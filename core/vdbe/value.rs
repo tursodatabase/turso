@@ -793,9 +793,8 @@ impl Value {
             return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
         }
 
-        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
-            .expect("formatted float should always parse successfully")
-            .into();
+        let multiplier = 10f64.powi(precision as i32);
+        let f = (f * multiplier).round() / multiplier;
 
         Value::from_f64(f)
     }
@@ -2730,6 +2729,16 @@ mod tests {
         let input_val = Value::from_f64(100.123);
         let expected_val = Value::Null;
         assert_eq!(input_val.exec_round(Some(&Value::Null)), expected_val);
+
+        let input_val = Value::from_f64(2.25);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(2.3);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(2.225);
+        let precision_val = Value::from_i64(2);
+        let expected_val = Value::from_f64(2.23);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
     }
 
     #[test]
