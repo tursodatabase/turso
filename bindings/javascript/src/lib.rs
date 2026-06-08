@@ -609,8 +609,7 @@ impl Database {
                     Stmt::Select(..)
                     | Stmt::Pragma { .. }
                     | Stmt::Attach { .. }
-                    | Stmt::Detach { .. }
-                    | Stmt::Reindex { .. } => "read",
+                    | Stmt::Detach { .. } => "read",
                     Stmt::Begin { .. } | Stmt::Savepoint { .. } => "begin",
                     Stmt::Commit { .. } | Stmt::Release { .. } => "commit",
                     Stmt::Rollback { .. } => "rollback",

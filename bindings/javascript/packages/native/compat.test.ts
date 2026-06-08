@@ -1,6 +1,24 @@
 import { unlinkSync } from "node:fs";
 import { expect, test } from 'vitest'
 import { Database } from './compat.js'
+import { Database as NativeDatabase } from '#index'
+
+test('classifySql treats reindex as write', () => {
+    const db = new NativeDatabase(':memory:');
+    db.connectSync();
+    try {
+        expect(db.classifySql('SELECT 1')).toEqual('read');
+        expect(db.classifySql('BEGIN')).toEqual('begin');
+        expect(db.classifySql('COMMIT')).toEqual('commit');
+        expect(db.classifySql('ROLLBACK')).toEqual('rollback');
+
+        expect(db.classifySql('REINDEX')).toEqual('write');
+        expect(db.classifySql('REINDEX idx')).toEqual('write');
+        expect(db.classifySql('REINDEX main.idx')).toEqual('write');
+    } finally {
+        db.close();
+    }
+})
 
 test('insert returning test', () => {
     const db = new Database(':memory:');

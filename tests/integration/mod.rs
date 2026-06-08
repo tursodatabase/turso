@@ -14,6 +14,7 @@ mod pragma;
 mod query_processing;
 mod query_timeout;
 mod queued_io;
+mod reindex;
 mod statement_reset;
 mod stmt_journal;
 mod stmt_readonly;

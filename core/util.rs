@@ -120,8 +120,8 @@ const QUOTE_PAIRS: &[(char, char)] = &[
 
 pub fn normalize_ident(identifier: &str) -> String {
     // quotes normalization already happened in the parser layer (see Name ast node implementation)
-    // so, we only need to convert identifier string to lowercase
-    identifier.to_lowercase()
+    // so, we only need to apply SQLite's ASCII-only identifier case folding.
+    identifier.to_ascii_lowercase()
 }
 
 /// Escape a SQL string literal payload for safe interpolation inside single quotes.

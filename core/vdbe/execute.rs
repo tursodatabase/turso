@@ -11142,6 +11142,15 @@ pub enum OpDestroyState {
     DestroyBtree(Arc<RwLock<BTreeCursor>>),
 }
 
+/// State carried across asynchronous steps while clearing an existing b-tree.
+pub enum OpClearBtreeState {
+    CreateCursor,
+    ClearBtree {
+        pager: Arc<Pager>,
+        cursor: Arc<RwLock<BTreeCursor>>,
+    },
+}
+
 pub fn op_destroy(
     program: &Program,
     state: &mut ProgramState,
@@ -11183,6 +11192,76 @@ pub fn op_destroy(
                 let maybe_former_root_page = return_if_io!(cursor.write().btree_destroy());
                 state.registers[*former_root_reg]
                     .set_int(maybe_former_root_page.unwrap_or(0) as i64);
+                state.active_op_state.clear();
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
+}
+
+/// Executes `ClearBtree` by deleting all cells from a persistent b-tree root.
+///
+/// REINDEX uses this after sorting all replacement index records and before
+/// refilling the existing root page. The operation invalidates other b-tree
+/// cursors on the same pager because page contents and cursor positions may no
+/// longer be valid after the clear.
+pub fn op_clear_btree(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    match op_clear_btree_inner(program, state, insn, pager) {
+        Ok(result) => Ok(result),
+        Err(err) => {
+            if !matches!(err, LimboError::Busy | LimboError::BusySnapshot) {
+                state.active_op_state.clear();
+            }
+            Err(err)
+        }
+    }
+}
+
+fn op_clear_btree_inner(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(ClearBtree { db, root }, insn);
+
+    let mv_store = program.connection.mv_store_for_db(*db);
+    if mv_store.is_some() {
+        return Err(LimboError::InternalError(
+            "ClearBtree is not supported in MVCC mode".to_string(),
+        ));
+    }
+
+    let clear_pager = if *db != MAIN_DB_ID {
+        program.get_pager_from_database_index(db)?
+    } else {
+        pager.clone()
+    };
+
+    loop {
+        match state.active_op_state.clear_btree() {
+            OpClearBtreeState::CreateCursor => {
+                let cursor = BTreeCursor::new(clear_pager.clone(), *root, 0);
+                *state.active_op_state.clear_btree() = OpClearBtreeState::ClearBtree {
+                    pager: clear_pager.clone(),
+                    cursor: Arc::new(RwLock::new(cursor)),
+                };
+            }
+            OpClearBtreeState::ClearBtree { pager, cursor } => {
+                return_if_io!(cursor.write().clear_btree());
+                for other_cursor_opt in state.cursors.iter_mut().flatten() {
+                    if let Cursor::BTree(ref mut btree_cursor) = other_cursor_opt {
+                        if Arc::ptr_eq(&btree_cursor.get_pager(), pager) {
+                            btree_cursor.invalidate_btree_cache();
+                        }
+                    }
+                }
                 state.active_op_state.clear();
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
@@ -13519,12 +13598,15 @@ pub fn op_alter_column(
             .expect("btree column should be named")
             .clone();
 
-        // Update indexes on THIS table that name the old column (you already had this)
+        // Update this table's indexes that reference the old column.
         if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
             for idx in idxs {
                 let idx = Arc::make_mut(idx);
                 for ic in &mut idx.columns {
-                    if ic.name.eq_ignore_ascii_case(&existing_column_name) {
+                    if let Some(expr) = &mut ic.expr {
+                        rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
+                        ic.name = expr.to_string();
+                    } else if ic.name.eq_ignore_ascii_case(&existing_column_name) {
                         ic.name.clone_from(&new_name);
                     }
                 }

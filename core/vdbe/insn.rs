@@ -1292,6 +1292,12 @@ pub enum Insn {
         pc_if_empty: BranchOffset,
     },
 
+    /// Delete all contents from a persistent table or index b-tree while keeping its root page.
+    ClearBtree {
+        db: usize,
+        root: i64,
+    },
+
     /// Deletes an entire database table or index whose root page in the database file is given by P1.
     Destroy {
         /// The database index (0 = main, 1 = temp, 2+ = attached)
@@ -1977,6 +1983,7 @@ impl InsnVariants {
             InsnVariants::IndexMethodDestroy => execute::op_index_method_destroy,
             InsnVariants::IndexMethodOptimize => execute::op_index_method_optimize,
             InsnVariants::IndexMethodQuery => execute::op_index_method_query,
+            InsnVariants::ClearBtree => execute::op_clear_btree,
             InsnVariants::Destroy => execute::op_destroy,
             InsnVariants::ResetSorter => execute::op_reset_sorter,
             InsnVariants::DropTable => execute::op_drop_table,
@@ -2088,6 +2095,7 @@ impl Insn {
             | Self::IndexMethodCreate { .. }
             | Self::IndexMethodDestroy { .. }
             | Self::IndexMethodOptimize { .. }
+            | Self::ClearBtree { .. }
             | Self::Destroy { .. }
             | Self::DropTable { .. }
             | Self::DropView { .. }
