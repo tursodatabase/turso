@@ -8,7 +8,7 @@ if [ -z "$1" ]; then
     exit 1
 fi
 MAIN_BIN=$1
-CURR_BIN=${2:-./target/release/tursodb}
+CURR_BIN=${2:-$(./scripts/cargo-target-dir)/release/tursodb}
 DB=perf/tpc-h/TPC-H.db
 QUERY_GLOB=${TPCH_QUERY_GLOB:-*.sql}
 if [ ! -f "$DB" ]; then
