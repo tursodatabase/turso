@@ -1277,6 +1277,56 @@ expect {
     a|b|c|Z
 }
 
+@cross-check-integrity
+test collate_orderby_nested_parens_ordinal_with_explicit_collate {
+    CREATE TABLE t_orderby_nested_parens (x TEXT);
+    INSERT INTO t_orderby_nested_parens VALUES ('b'), ('Z'), ('c'), ('a');
+    SELECT group_concat(x, '|') FROM (
+        SELECT x FROM t_orderby_nested_parens ORDER BY ((1)) COLLATE NOCASE
+    );
+}
+expect {
+    a|b|c|Z
+}
+
+@cross-check-integrity
+test collate_orderby_ordinal_with_collate_inside_parens {
+    CREATE TABLE t_orderby_collate_in_parens (x TEXT);
+    INSERT INTO t_orderby_collate_in_parens VALUES ('b'), ('Z'), ('c'), ('a');
+    SELECT group_concat(x, '|') FROM (
+        SELECT x FROM t_orderby_collate_in_parens ORDER BY (1 COLLATE NOCASE)
+    );
+}
+expect {
+    a|b|c|Z
+}
+
+@cross-check-integrity
+test collate_orderby_ordinal_overrides_column_collate {
+    CREATE TABLE t_orderby_override (x TEXT);
+    INSERT INTO t_orderby_override VALUES ('b'), ('Z'), ('c'), ('a');
+    -- ORDER BY's explicit COLLATE NOCASE overrides the column-level COLLATE BINARY.
+    SELECT group_concat(y, '|') FROM (
+        SELECT x COLLATE BINARY AS y FROM t_orderby_override ORDER BY 1 COLLATE NOCASE
+    );
+}
+expect {
+    a|b|c|Z
+}
+
+@cross-check-integrity
+test collate_orderby_ordinal_inherits_column_collate {
+    CREATE TABLE t_orderby_inherit (x TEXT);
+    INSERT INTO t_orderby_inherit VALUES ('b'), ('Z'), ('c'), ('a');
+    -- No explicit COLLATE on ORDER BY: the column's COLLATE NOCASE applies.
+    SELECT group_concat(y, '|') FROM (
+        SELECT x COLLATE NOCASE AS y FROM t_orderby_inherit ORDER BY 1
+    );
+}
+expect {
+    a|b|c|Z
+}
+
 # =============================================================================
 # COLLATION PROPAGATION THROUGH CONCAT (||)
 # =============================================================================
