@@ -1498,6 +1498,10 @@ pub fn parse_where(
                     end,
                 } = e
                 {
+                    if expr_contains_subquery(lhs) {
+                        return Ok(WalkControl::Continue);
+                    }
+
                     let lhs_expr = std::mem::take(lhs.as_mut());
                     let start_expr = std::mem::take(start.as_mut());
                     let end_expr = std::mem::take(end.as_mut());
@@ -1566,6 +1570,21 @@ pub fn parse_where(
     } else {
         Ok(())
     }
+}
+
+fn expr_contains_subquery(expr: &Expr) -> bool {
+    let mut found_subquery = false;
+    let _ = walk_expr(expr, &mut |e| {
+        if matches!(
+            e,
+            Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
+        ) {
+            found_subquery = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found_subquery
 }
 
 /**
