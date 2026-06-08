@@ -1,18 +1,20 @@
 mod measure;
 mod profile;
+mod trace;
 
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use profile::{
-    Phase, Profile, WorkItem, checkpoint::Checkpoint, insert::InsertHeavy, mixed::Mixed,
-    read::ReadHeavy, scan::ScanHeavy, series_blob::SeriesBlob,
+    Phase, Profile, WorkItem, checkpoint::Checkpoint, create_index::CreateIndex,
+    insert::InsertHeavy, mixed::Mixed, read::ReadHeavy, scan::ScanHeavy, series_blob::SeriesBlob,
 };
 use turso::Connection;
 use turso::params::Params;
 
 use crate::measure::{MemoryReport, MemorySnapshot, file_size, take_snapshot};
+use crate::trace::{TraceContext, WorkloadTrace};
 
 // Workspace Clippy runs with `--all-features`, which enables `turso`'s
 // mimalloc-backed global allocator. Skip the benchmark-only dhat allocator
@@ -43,6 +45,7 @@ enum WorkloadProfile {
     Mixed,
     ScanHeavy,
     SeriesBlob,
+    CreateIndex,
 }
 
 impl std::fmt::Display for WorkloadProfile {
@@ -53,6 +56,7 @@ impl std::fmt::Display for WorkloadProfile {
             WorkloadProfile::Mixed => write!(f, "mixed"),
             WorkloadProfile::ScanHeavy => write!(f, "scan-heavy"),
             WorkloadProfile::SeriesBlob => write!(f, "series-blob"),
+            WorkloadProfile::CreateIndex => write!(f, "create-index"),
         }
     }
 }
@@ -103,11 +107,20 @@ struct Args {
     /// Run a final checkpoint after the workload completes
     #[arg(long)]
     checkpoint: bool,
+
+    /// Write a workload trace sidecar for correlating SQL phases with dhat timestamps
+    #[arg(long = "trace-workload")]
+    trace_workload: bool,
+
+    /// Path for --trace-workload output
+    #[arg(long = "trace-output", default_value = "memory-benchmark-trace.json")]
+    trace_output: String,
 }
 
 fn main() -> Result<()> {
     #[cfg(not(clippy))]
     let _profiler = dhat::Profiler::new_heap();
+    let dhat_start = Instant::now();
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -119,10 +132,10 @@ fn main() -> Result<()> {
         .worker_threads(args.connections.max(1))
         .build()?;
 
-    rt.block_on(async_main(args))
+    rt.block_on(async_main(args, dhat_start))
 }
 
-async fn async_main(args: Args) -> Result<()> {
+async fn async_main(args: Args, dhat_start: Instant) -> Result<()> {
     let db_path = "memory_benchmark.db";
     clean_db_files(db_path);
 
@@ -134,8 +147,9 @@ async fn async_main(args: Args) -> Result<()> {
     );
     let timeout = Duration::from_millis(args.timeout);
 
-    let start = Instant::now();
+    let start = dhat_start;
     let mut snapshots: Vec<MemorySnapshot> = Vec::new();
+    let trace = args.trace_workload.then(|| WorkloadTrace::new(dhat_start));
 
     // Baseline snapshot before any DB work
     snapshots.push(take_snapshot(start, "baseline"));
@@ -165,6 +179,7 @@ async fn async_main(args: Args) -> Result<()> {
 
     let mut last_phase = None;
     let mut peak_bytes = snapshots[0].rss_bytes;
+    let mut batch_id = 0;
 
     loop {
         let (phase, batches) = profile.next_batch(args.connections);
@@ -182,6 +197,9 @@ async fn async_main(args: Args) -> Result<()> {
                 Phase::Done => unreachable!(),
             };
             snapshots.push(take_snapshot(start, label));
+            if let Some(trace) = &trace {
+                trace.record_phase(phase);
+            }
             last_phase = Some(phase);
         }
 
@@ -194,24 +212,40 @@ async fn async_main(args: Args) -> Result<()> {
                 // Setup runs sequentially on a single connection.
                 let items = batches.into_iter().next().unwrap_or_default();
                 if !items.is_empty() {
+                    batch_id += 1;
+                    let ctx = TraceContext {
+                        phase,
+                        connection: 0,
+                        batch: batch_id,
+                    };
+                    let _batch_trace = trace.as_ref().map(|trace| trace.begin_batch(ctx, &items));
                     setup_conn.execute("BEGIN", ()).await?;
-                    execute_items(&setup_conn, items).await?;
+                    execute_items(&setup_conn, items, trace.clone(), Some(ctx)).await?;
                     setup_conn.execute("COMMIT", ()).await?;
                 }
             }
             Phase::Run => {
                 // Run phase: dispatch batches concurrently across connections.
                 let mut handles = Vec::with_capacity(batches.len());
-                for items in batches {
+                batch_id += 1;
+                for (connection, items) in batches.into_iter().enumerate() {
                     if items.is_empty() {
                         continue;
                     }
                     let conn = db.connect()?;
                     conn.busy_timeout(timeout)?;
                     let begin = begin_stmt.to_string();
+                    let trace = trace.clone();
+                    let ctx = TraceContext {
+                        phase,
+                        connection,
+                        batch: batch_id,
+                    };
                     handles.push(tokio::spawn(async move {
+                        let _batch_trace =
+                            trace.as_ref().map(|trace| trace.begin_batch(ctx, &items));
                         conn.execute(&begin, ()).await?;
-                        execute_items(&conn, items).await?;
+                        execute_items(&conn, items, trace, Some(ctx)).await?;
                         conn.execute("COMMIT", ()).await?;
                         Ok::<_, turso::Error>(())
                     }));
@@ -223,7 +257,14 @@ async fn async_main(args: Args) -> Result<()> {
             Phase::Checkpoint => {
                 let items = batches.into_iter().next().unwrap_or_default();
                 if !items.is_empty() {
-                    execute_checkpoint_items(&setup_conn, items).await?;
+                    batch_id += 1;
+                    let ctx = TraceContext {
+                        phase,
+                        connection: 0,
+                        batch: batch_id,
+                    };
+                    let _batch_trace = trace.as_ref().map(|trace| trace.begin_batch(ctx, &items));
+                    execute_checkpoint_items(&setup_conn, items, trace.clone(), Some(ctx)).await?;
                 }
             }
             Phase::Done => unreachable!(),
@@ -257,6 +298,7 @@ async fn async_main(args: Args) -> Result<()> {
         heap_peak_bytes: dhat_stats.max_bytes,
         total_allocs: dhat_stats.total_blocks,
         total_bytes_allocated: dhat_stats.total_bytes,
+        trace_file: args.trace_workload.then(|| args.trace_output.clone()),
         snapshots,
         db_file_bytes: file_size(db_path),
         wal_file_bytes: {
@@ -280,11 +322,33 @@ async fn async_main(args: Args) -> Result<()> {
         }
     }
 
+    if let Some(trace) = &trace {
+        trace.write_report(
+            &args.trace_output,
+            &report.mode,
+            &report.workload,
+            report.iterations,
+            report.batch_size,
+            report.connections,
+        )?;
+    }
+
     Ok(())
 }
 
-async fn execute_items(conn: &Connection, items: Vec<WorkItem>) -> Result<(), turso::Error> {
-    for item in items {
+async fn execute_items(
+    conn: &Connection,
+    items: Vec<WorkItem>,
+    trace: Option<WorkloadTrace>,
+    ctx: Option<TraceContext>,
+) -> Result<(), turso::Error> {
+    for (statement, item) in items.into_iter().enumerate() {
+        let _statement_trace = match (trace.as_ref(), ctx) {
+            (Some(trace), Some(ctx)) if ctx.phase != Phase::Setup => {
+                Some(trace.begin_statement(ctx, statement, &item.sql))
+            }
+            _ => None,
+        };
         let is_query = item
             .sql
             .trim_start()
@@ -317,6 +381,7 @@ fn create_profile(
         WorkloadProfile::Mixed => Box::new(Mixed::new(iterations, batch_size)),
         WorkloadProfile::ScanHeavy => Box::new(ScanHeavy::new(iterations, batch_size)),
         WorkloadProfile::SeriesBlob => Box::new(SeriesBlob::new(iterations, batch_size)),
+        WorkloadProfile::CreateIndex => Box::new(CreateIndex::new(iterations, batch_size)),
     };
 
     if checkpoint {
@@ -329,8 +394,14 @@ fn create_profile(
 async fn execute_checkpoint_items(
     conn: &Connection,
     items: Vec<WorkItem>,
+    trace: Option<WorkloadTrace>,
+    ctx: Option<TraceContext>,
 ) -> Result<(), turso::Error> {
-    for item in items {
+    for (statement, item) in items.into_iter().enumerate() {
+        let _statement_trace = trace
+            .as_ref()
+            .zip(ctx)
+            .map(|(trace, ctx)| trace.begin_statement(ctx, statement, &item.sql));
         let mut rows = conn
             .query(&item.sql, Params::Positional(item.params))
             .await?;

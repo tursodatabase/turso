@@ -41,6 +41,8 @@ pub struct MemoryReport {
     pub total_allocs: u64,
     /// Cumulative bytes allocated (including already-freed); measures allocation pressure
     pub total_bytes_allocated: u64,
+    /// Optional workload trace sidecar for correlating dhat timestamps to SQL execution
+    pub trace_file: Option<String>,
     /// Time-series of RSS snapshots taken at phase transitions and periodically
     pub snapshots: Vec<MemorySnapshot>,
     /// Size of the .db file on disk after the benchmark
@@ -102,6 +104,9 @@ impl MemoryReport {
             "Total bytes:   {}",
             format_bytes(self.total_bytes_allocated as usize)
         );
+        if let Some(trace_file) = &self.trace_file {
+            println!("Trace file:    {trace_file}");
+        }
 
         println!();
         println!("--- Disk ---");
