@@ -76,13 +76,12 @@ fn mvcc_checkpoint_index_inconsistency_seed_32() {
 /// reproduce this. (Also covered by the surgical unit test
 /// `test_passive_checkpoint_tolerates_concurrent_create_after_snapshot` in
 /// core/mvcc/database/tests.rs.)
-#[ignore = "reproduces non-blocking-checkpoint vs concurrent-CREATE assert (Task 9); un-ignore when fixed"]
+// Fixed: `has_unpublished_schema_changes` is now deferral-aware. These pass.
 #[test]
 fn mvcc_checkpoint_concurrent_create_assert_seed_28() {
     run_whopper_seed(28).expect("checkpoint must tolerate a CREATE committed after its snapshot");
 }
 
-#[ignore = "reproduces non-blocking-checkpoint vs concurrent-CREATE assert (Task 9); un-ignore when fixed"]
 #[test]
 fn mvcc_checkpoint_concurrent_create_assert_seed_60() {
     run_whopper_seed(60).expect("checkpoint must tolerate a CREATE committed after its snapshot");
