@@ -369,9 +369,7 @@ fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Resu
                     .iter()
                     .find(|s| s.internal_id == *subquery_id)
                     .is_some_and(|s| s.correlated);
-                if is_correlated
-                    && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr))
-                {
+                if is_correlated && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr)) {
                     leaf_columns.push(expr.clone());
                 }
                 Ok(WalkControl::SkipChildren)
