@@ -32,6 +32,7 @@ use std::ops::Bound;
 #[cfg(any(test, injected_yields))]
 use strum::EnumCount;
 
+use super::lookup_tx_state;
 const COLLECT_PREEMPTION_THRESHOLD: usize = 1024;
 
 macro_rules! with_mvcc_checkpoint_allocation_site {
@@ -118,6 +119,7 @@ pub enum CheckpointState {
 pub(crate) enum CheckpointYieldPoint {
     BeforeAcquireLock,
     AfterDurableBoundaryAdvanced,
+    AfterCollectTableRows,
 }
 
 #[cfg(any(test, injected_yields))]
