@@ -124,3 +124,106 @@ expect {
     2|p2
     3|2|c3
 }
+
+# The trigger mutates the target mid-scan; without pre-materialisation rows are skipped.
+@cross-check-integrity
+test fk-cascade-delete-writeback-trigger-no-rows-skipped {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, active INTEGER);
+    CREATE TABLE sessions(id INTEGER PRIMARY KEY,
+                         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE);
+    CREATE TRIGGER t AFTER DELETE ON sessions BEGIN
+        UPDATE users SET active = 0;
+    END;
+    INSERT INTO users    VALUES (1,'alice',0),(2,'bob',1),(3,'carol',1),(4,'dave',1),(5,'eve',1);
+    INSERT INTO sessions VALUES (100,1);
+    DELETE FROM users WHERE active = 0;
+    SELECT COUNT(*) FROM users;
+}
+expect {
+    4
+}
+
+# Trigger-inserted rows must not be consumed by the same DELETE statement.
+@cross-check-integrity
+test fk-cascade-delete-trigger-inserted-rows-not-consumed {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pid INTEGER REFERENCES parent(id) ON DELETE CASCADE);
+    CREATE TRIGGER tr AFTER DELETE ON child BEGIN
+        INSERT INTO parent VALUES (OLD.id + 1000, 9999);
+    END;
+    INSERT INTO parent VALUES (1,100),(2,200),(3,300);
+    INSERT INTO child  VALUES (10,1),(20,2),(30,3);
+    DELETE FROM parent;
+    SELECT * FROM parent ORDER BY id;
+}
+expect {
+    1010|9999
+    1020|9999
+    1030|9999
+}
+
+@cross-check-integrity
+test fk-cascade-delete-two-hop-trigger-no-rows-skipped {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, t_id INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    CREATE TABLE bridge(a INTEGER);
+    CREATE TRIGGER tr1 AFTER DELETE ON c      BEGIN INSERT INTO bridge VALUES (OLD.id); END;
+    CREATE TRIGGER tr2 AFTER INSERT ON bridge BEGIN UPDATE t SET x = 0 WHERE id > 0; END;
+    INSERT INTO t VALUES (1,100),(2,200),(3,300);
+    INSERT INTO c VALUES (10,1),(20,2),(30,3);
+    DELETE FROM t WHERE x > 150;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|0
+}
+
+@cross-check-integrity
+test fk-cascade-delete-grandchild-writeback-trigger-no-rows-skipped {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE grandparent(id INTEGER PRIMARY KEY, active INTEGER);
+    CREATE TABLE parent(id INTEGER PRIMARY KEY,
+                        gp_id INTEGER REFERENCES grandparent(id) ON DELETE CASCADE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       p_id INTEGER REFERENCES parent(id) ON DELETE CASCADE);
+    CREATE TRIGGER tr AFTER DELETE ON child BEGIN
+        UPDATE grandparent SET active = 0 WHERE id > 0;
+    END;
+    -- Only id=1 starts inactive; deleting it cascades through parent→child, then the
+    -- trigger zeros out the rest.  Only id=1 should be deleted.
+    INSERT INTO grandparent VALUES (1,0),(2,1),(3,1),(4,1),(5,1);
+    INSERT INTO parent VALUES (100,1);
+    INSERT INTO child  VALUES (1000,100);
+    DELETE FROM grandparent WHERE active = 0;
+    SELECT COUNT(*) FROM grandparent;
+}
+expect {
+    4
+}
+
+@cross-check-integrity
+test fk-cascade-delete-grandchild-trigger-inserted-rows-not-consumed {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE grandparent(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE TABLE parent(id INTEGER PRIMARY KEY,
+                        gp_id INTEGER REFERENCES grandparent(id) ON DELETE CASCADE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       p_id INTEGER REFERENCES parent(id) ON DELETE CASCADE);
+    CREATE TRIGGER tr AFTER DELETE ON child BEGIN
+        INSERT INTO grandparent VALUES (OLD.p_id + 1000, 9999);
+    END;
+    INSERT INTO grandparent VALUES (1,100),(2,200),(3,300);
+    INSERT INTO parent VALUES (10,1),(20,2),(30,3);
+    INSERT INTO child  VALUES (100,10),(200,20),(300,30);
+    DELETE FROM grandparent;
+    SELECT * FROM grandparent ORDER BY id;
+}
+expect {
+    1010|9999
+    1020|9999
+    1030|9999
+}
