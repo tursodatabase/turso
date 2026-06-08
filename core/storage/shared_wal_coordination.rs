@@ -24,6 +24,7 @@
 //! dead, it must leave that slot in place.
 
 use crate::{
+    alloc::{vec, *},
     io::{Completion, File, FileSyncType, OpenFlags, SharedWalLockKind, SharedWalMappedRegion, IO},
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -2452,14 +2453,18 @@ impl MappedSharedWalCoordination {
     /// Used by checkpoint to determine which pages need to be copied from the
     /// WAL to the DB file. For each page, only the highest-numbered frame is
     /// returned (that frame contains the most recent version of the page).
-    pub(crate) fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
+    pub(crate) fn iter_latest_frames(
+        &self,
+        min_frame: u64,
+        max_frame: u64,
+    ) -> Result<Vec<(u64, u64)>, TryReserveError> {
         let header = self.header();
         let len = header
             .frame_index_len
             .load(Ordering::Acquire)
             .min(header.frame_index_capacity);
         if len == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let required_blocks = len.div_ceil(FRAME_INDEX_BLOCK_CAPACITY);
         self.ensure_mapped_frame_index_blocks(required_blocks)
@@ -2467,7 +2472,7 @@ impl MappedSharedWalCoordination {
         let mappings = self.frame_index_blocks.read();
         let visible_slots = Self::visible_frame_index_slots(&mappings, len, max_frame);
         if visible_slots == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut seen_pages = std::collections::BTreeSet::new();
         let mut entries = Vec::new();
@@ -2486,12 +2491,12 @@ impl MappedSharedWalCoordination {
                 let slot = block_start_slot + local_index;
                 let frame_id = Self::frame_index_entry(&mappings, slot).frame_id;
                 if (min_frame..=max_frame).contains(&frame_id) {
-                    entries.push((page_id, frame_id));
+                    entries.try_push((page_id, frame_id))?;
                 }
             }
         }
         entries.sort_unstable_by_key(|&(page_id, _)| page_id);
-        entries
+        Ok(entries)
     }
 
     fn base_mapped_len(reader_slot_count: u32) -> usize {
@@ -2931,6 +2936,7 @@ impl MappedSharedWalCoordination {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
     #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
     use crate::io::PlatformIO;
     use crate::io::IO;
@@ -3886,12 +3892,18 @@ mod tests {
 
         assert_eq!(mapped.find_frame(7, 0, 5, None), Some(5));
         assert_eq!(mapped.find_frame(7, 0, 5, Some(4)), Some(2));
-        assert_eq!(mapped.iter_latest_frames(0, 5), vec![(7, 5), (9, 4)]);
+        assert_eq!(
+            mapped.iter_latest_frames(0, 5).unwrap(),
+            vec![(7, 5), (9, 4)]
+        );
 
         mapped.rollback_frames(4);
 
         assert_eq!(mapped.find_frame(7, 0, 5, None), Some(2));
-        assert_eq!(mapped.iter_latest_frames(0, 5), vec![(7, 2), (9, 4)]);
+        assert_eq!(
+            mapped.iter_latest_frames(0, 5).unwrap(),
+            vec![(7, 2), (9, 4)]
+        );
     }
 
     #[test]
@@ -3961,7 +3973,7 @@ mod tests {
         mapped.record_frame(13, boundary + 2);
 
         assert_eq!(
-            mapped.iter_latest_frames(0, boundary + 2),
+            mapped.iter_latest_frames(0, boundary + 2).unwrap(),
             vec![
                 (7, boundary),
                 (9, boundary + 1),
@@ -4071,7 +4083,7 @@ mod tests {
         assert_eq!(mapped.find_frame(colliding[2], 0, 10, None), Some(8));
         assert_eq!(mapped.find_frame(colliding[1], 0, 10, Some(9)), Some(4));
         assert_eq!(
-            mapped.iter_latest_frames(0, 10),
+            mapped.iter_latest_frames(0, 10).unwrap(),
             vec![(colliding[0], 6), (colliding[1], 10), (colliding[2], 8),]
         );
     }
@@ -4093,7 +4105,7 @@ mod tests {
         assert_eq!(mapped.find_frame(colliding[1], 0, 2, None), None);
         assert_eq!(mapped.find_frame(colliding[2], 0, 2, None), Some(2));
         assert_eq!(
-            mapped.iter_latest_frames(0, 2),
+            mapped.iter_latest_frames(0, 2).unwrap(),
             vec![(colliding[0], 1), (colliding[2], 2)]
         );
     }
@@ -4131,7 +4143,7 @@ mod tests {
         assert_eq!(mapped.find_frame(9, 5, 20, None), None);
         assert_eq!(mapped.find_frame(11, 0, 21, Some(7)), None);
         assert_eq!(
-            mapped.iter_latest_frames(0, 13),
+            mapped.iter_latest_frames(0, 13).unwrap(),
             vec![(7, 13), (9, 4), (11, 8)]
         );
     }

@@ -98,5 +98,5 @@ pub fn open_mv_store(
             ))
         };
 
-    Ok(Arc::new(MvStore::new(mvcc::MvccClock::new(), storage)))
+    Ok(Arc::new(MvStore::new(mvcc::MvccClock::new(), storage)?))
 }

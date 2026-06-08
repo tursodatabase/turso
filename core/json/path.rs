@@ -1,3 +1,4 @@
+use crate::alloc::*;
 use crate::bail_parse_error;
 use std::borrow::Cow;
 
@@ -72,7 +73,7 @@ pub fn json_path(path: &str) -> crate::Result<JsonPath<'_>> {
     let mut index_state = ArrayIndexState::Start;
     let mut key_start = 0;
     let mut index_buffer: i128 = 0;
-    let mut path_components = Vec::with_capacity(estimate_path_capacity(path));
+    let mut path_components = Vec::try_with_capacity_ext(estimate_path_capacity(path))?;
     let mut path_iter = path.char_indices();
 
     while let Some(ch) = path_iter.next() {
@@ -140,7 +141,7 @@ fn handle_start(
 ) -> crate::Result<()> {
     match ch {
         (_, '$') => {
-            path_components.push(PathElement::Root());
+            path_components.try_push(PathElement::Root())?;
             *parser_state = PPState::AfterRoot;
             Ok(())
         }
@@ -195,7 +196,7 @@ fn handle_in_key<'a>(
                 } else {
                     *key_start = idx + ch.1.len_utf8();
                 }
-                path_components.push(PathElement::Key(Cow::Borrowed(key), false));
+                path_components.try_push(PathElement::Key(Cow::Borrowed(key), false))?;
             } else {
                 bail_parse_error!("Bad json path: {}", path)
             }
@@ -226,7 +227,7 @@ fn handle_quoted_key<'a>(
             '"' => {
                 if key_content_start <= idx {
                     let key = &path[key_content_start..idx];
-                    path_components.push(PathElement::Key(Cow::Borrowed(key), true));
+                    path_components.try_push(PathElement::Key(Cow::Borrowed(key), true))?;
                     *parser_state = PPState::ExpectDotOrBracket;
                     return Ok(());
                 }
@@ -268,7 +269,7 @@ fn handle_array_index<'a>(
         }
         (ArrayIndexState::AfterHash, ']') => {
             *parser_state = PPState::ExpectDotOrBracket;
-            path_components.push(PathElement::ArrayLocator(None));
+            path_components.try_push(PathElement::ArrayLocator(None))?;
         }
         (ArrayIndexState::CollectingNumbers, '0'..='9') => {
             let (new_num, is_max) = collect_num(
@@ -286,7 +287,7 @@ fn handle_array_index<'a>(
         (ArrayIndexState::IsMax, '0'..='9') => (),
         (ArrayIndexState::CollectingNumbers | ArrayIndexState::IsMax, ']') => {
             *parser_state = PPState::ExpectDotOrBracket;
-            path_components.push(PathElement::ArrayLocator(Some(*index_buffer as i32)));
+            path_components.try_push(PathElement::ArrayLocator(Some(*index_buffer as i32)))?;
         }
         (_, _) => bail_parse_error!("Bad json path: {}", path),
     }
@@ -335,7 +336,7 @@ fn handle_bracket_quoted_key<'a>(
     match path_iter.next() {
         Some((_, ']')) => {
             let key = &path[key_content_start..key_end];
-            path_components.push(PathElement::BracketQuotedKey(Cow::Borrowed(key)));
+            path_components.try_push(PathElement::BracketQuotedKey(Cow::Borrowed(key)))?;
             *parser_state = PPState::ExpectDotOrBracket;
             Ok(())
         }
@@ -404,7 +405,7 @@ fn finalize_path<'a>(
                 {
                     bail_parse_error!("Bad json path: {}", path)
                 }
-                path_components.push(PathElement::Key(Cow::Borrowed(key), false));
+                path_components.try_push(PathElement::Key(Cow::Borrowed(key), false))?;
             } else {
                 bail_parse_error!("Bad json path: {}", path)
             }
@@ -417,6 +418,7 @@ fn finalize_path<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
 
     #[test]
     fn test_json_path_root() {

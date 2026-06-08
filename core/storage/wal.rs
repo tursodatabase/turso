@@ -1,5 +1,6 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use crate::alloc::*;
 use crate::io::FileSyncType;
 use crate::sync::Mutex;
 use crate::sync::OnceLock;
@@ -501,7 +502,11 @@ trait WalCoordination: Debug + Send + Sync {
     ) -> Option<u64>;
 
     /// Enumerate the latest visible frame per page in the requested frame range.
-    fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)>;
+    fn iter_latest_frames(
+        &self,
+        min_frame: u64,
+        max_frame: u64,
+    ) -> Result<Vec<(u64, u64)>, TryReserveError>;
 
     /// Read the current checkpoint epoch used to tag cached WAL pages.
     fn checkpoint_epoch(&self) -> u32;
@@ -574,7 +579,7 @@ trait WalCoordination: Debug + Send + Sync {
     fn mark_initialized(&self);
 
     /// Record a newly appended frame in the backend's page-to-frame lookup state.
-    fn cache_frame(&self, page_id: u64, frame_id: u64);
+    fn cache_frame(&self, page_id: u64, frame_id: u64) -> Result<(), TryReserveError>;
 
     /// Drop any cached frame mappings newer than `max_frame`.
     fn rollback_cache(&self, max_frame: u64);
@@ -689,7 +694,7 @@ pub trait Wal: Debug + Send + Sync {
 
     /// For each prepared frame, update in-memory WAL index and rolling checksum
     /// and advance max_frame to make committed frames visible to readers.
-    fn commit_prepared_frames(&self, prepared: &[PreparedFrames]);
+    fn commit_prepared_frames(&self, prepared: &[PreparedFrames]) -> Result<()>;
 
     /// Mark in-memory pages clean and set WAL tags after durable commit.
     fn finalize_committed_pages(&self, prepared: &[PreparedFrames]);
@@ -906,10 +911,14 @@ impl WalCoordination for InProcessWalCoordination {
         })
     }
 
-    fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
+    fn iter_latest_frames(
+        &self,
+        min_frame: u64,
+        max_frame: u64,
+    ) -> Result<Vec<(u64, u64)>, TryReserveError> {
         let shared = self.shared.read();
         let frame_cache = shared.runtime.frame_cache.lock();
-        let mut list = Vec::with_capacity(frame_cache.len());
+        let mut list = Vec::try_with_capacity_ext(frame_cache.len())?;
         for (&page_id, frames) in frame_cache.iter() {
             if let Some(&frame_id) = frames
                 .iter()
@@ -919,7 +928,7 @@ impl WalCoordination for InProcessWalCoordination {
             }
         }
         list.sort_unstable_by_key(|&(page_id, _)| page_id);
-        list
+        Ok(list)
     }
 
     fn checkpoint_epoch(&self) -> u32 {
@@ -1231,17 +1240,18 @@ impl WalCoordination for InProcessWalCoordination {
             .store(true, Ordering::Release);
     }
 
-    fn cache_frame(&self, page_id: u64, frame_id: u64) {
+    fn cache_frame(&self, page_id: u64, frame_id: u64) -> Result<(), TryReserveError> {
         let shared = self.shared.read();
         let mut frame_cache = shared.runtime.frame_cache.lock();
         match frame_cache.get_mut(&page_id) {
             Some(frames) => {
-                frames.push(frame_id);
+                frames.try_push(frame_id)?;
             }
             None => {
-                frame_cache.insert(page_id, vec![frame_id]);
+                frame_cache.insert(page_id, try_vec![frame_id]?);
             }
         }
+        Ok(())
     }
 
     fn rollback_cache(&self, max_frame: u64) {
@@ -1346,7 +1356,7 @@ impl ShmWalCoordination {
     fn new(
         shared: Arc<RwLock<WalFileShared>>,
         authority: Arc<MappedSharedWalCoordination>,
-    ) -> Self {
+    ) -> Result<Self, TryReserveError> {
         let fallback = InProcessWalCoordination::new(shared.clone());
         let coordination = Self {
             shared,
@@ -1355,8 +1365,8 @@ impl ShmWalCoordination {
             authority,
             active_reader: Mutex::new(None),
         };
-        coordination.seed_or_sync_authority();
-        coordination
+        coordination.seed_or_sync_authority()?;
+        Ok(coordination)
     }
 
     fn authority_is_uninitialized(snapshot: SharedWalCoordinationHeader) -> bool {
@@ -1430,14 +1440,14 @@ impl ShmWalCoordination {
         shared.runtime.overflow_fallback_coverage.lock().clear();
     }
 
-    fn sync_authority_frames_from_local(&self) {
+    fn sync_authority_frames_from_local(&self) -> Result<(), TryReserveError> {
         let entries = {
             let shared = self.shared.read();
             let frame_cache = shared.runtime.frame_cache.lock();
             let mut entries = Vec::new();
             for (&page_id, frames) in frame_cache.iter() {
                 for &frame_id in frames {
-                    entries.push((frame_id, page_id));
+                    entries.try_push((frame_id, page_id))?;
                 }
             }
             entries
@@ -1447,12 +1457,13 @@ impl ShmWalCoordination {
         for (frame_id, page_id) in entries {
             self.authority.record_frame(page_id, frame_id);
         }
+        Ok(())
     }
 
     fn repair_or_reseed_authority_from_local_disk_scan(
         &self,
         mut authority_snapshot: SharedWalCoordinationHeader,
-    ) {
+    ) -> Result<(), TryReserveError> {
         self.authority.repair_transient_state_for_exclusive_open();
         if authority_snapshot.nbackfills != 0 {
             // A local WAL scan can rebuild the visible WAL tail, but it cannot
@@ -1465,16 +1476,16 @@ impl ShmWalCoordination {
         let local_snapshot = self.local_authority_snapshot();
         if Self::local_scan_predates_zero_frame_authority(authority_snapshot, local_snapshot) {
             self.sync_local_to_zero_frame_authority(authority_snapshot);
-            return;
+            return Ok(());
         }
         if Self::local_scan_cannot_disprove_zero_frame_authority(authority_snapshot, local_snapshot)
         {
             self.sync_local_from_authority(authority_snapshot);
-            return;
+            return Ok(());
         }
         if Self::local_scan_cannot_disprove_positive_authority(authority_snapshot, local_snapshot) {
             self.sync_local_from_authority(authority_snapshot);
-            return;
+            return Ok(());
         }
         if Self::authority_matches_local_wal_scan(authority_snapshot, local_snapshot) {
             self.sync_local_from_authority(authority_snapshot);
@@ -1486,13 +1497,14 @@ impl ShmWalCoordination {
             // mappings directly and rebuild if they diverge.
             if self.authority.frame_index_overflowed()
                 || (self.authority.open_mode() == SharedWalCoordinationOpenMode::Exclusive
-                    && !self.authority_frame_index_matches_local_wal_scan(local_snapshot.max_frame))
+                    && !self
+                        .authority_frame_index_matches_local_wal_scan(local_snapshot.max_frame)?)
             {
                 self.authority
                     .discard_durable_frame_index_for_exclusive_rebuild();
-                self.sync_authority_frames_from_local();
+                self.sync_authority_frames_from_local()?;
             }
-            return;
+            return Ok(());
         }
         // The authority and disk scan are from the same generation (matching
         // checkpoint_seq/salts) but disagree on max_frame or checksums. This
@@ -1512,15 +1524,15 @@ impl ShmWalCoordination {
             {
                 self.authority
                     .discard_durable_frame_index_for_exclusive_rebuild();
-                self.sync_authority_frames_from_local();
+                self.sync_authority_frames_from_local()?;
             }
-            return;
+            return Ok(());
         }
 
         self.authority
             .discard_durable_frame_index_for_exclusive_rebuild();
         self.sync_authority_from_local();
-        self.sync_authority_frames_from_local();
+        self.sync_authority_frames_from_local()
     }
 
     fn local_scan_cannot_disprove_zero_frame_authority(
@@ -1597,9 +1609,12 @@ impl ShmWalCoordination {
             && authority_snapshot.checksum_2 == local_snapshot.checksum_2
     }
 
-    fn authority_frame_index_matches_local_wal_scan(&self, max_frame: u64) -> bool {
-        self.authority.iter_latest_frames(0, max_frame)
-            == self.fallback.iter_latest_frames(0, max_frame)
+    fn authority_frame_index_matches_local_wal_scan(
+        &self,
+        max_frame: u64,
+    ) -> Result<bool, TryReserveError> {
+        Ok(self.authority.iter_latest_frames(0, max_frame)?
+            == self.fallback.iter_latest_frames(0, max_frame)?)
     }
 
     fn local_zero_frame_generation_is_initialized(
@@ -1650,7 +1665,7 @@ impl ShmWalCoordination {
     ///    snapshot as our local state. If our local view also came from a
     ///    disk scan and the authority's frame index is empty, backfill it
     ///    from our local frame cache.
-    fn seed_or_sync_authority(&self) {
+    fn seed_or_sync_authority(&self) -> Result<(), TryReserveError> {
         let snapshot = self.authority.snapshot();
         let local_wal_view_loaded_from_disk = self
             .shared
@@ -1660,11 +1675,11 @@ impl ShmWalCoordination {
             .load(Ordering::Acquire);
         if Self::authority_is_uninitialized(snapshot) {
             self.sync_authority_from_local();
-            self.sync_authority_frames_from_local();
+            self.sync_authority_frames_from_local()?;
         } else if local_wal_view_loaded_from_disk
             && !self.authority.writer_or_checkpoint_lock_active()
         {
-            self.repair_or_reseed_authority_from_local_disk_scan(snapshot);
+            self.repair_or_reseed_authority_from_local_disk_scan(snapshot)?;
         } else {
             let needs_zero_frame_header_rewrite = snapshot.max_frame == 0 && {
                 let shared = self.shared.read();
@@ -1683,11 +1698,12 @@ impl ShmWalCoordination {
             }
             if local_wal_view_loaded_from_disk
                 && !self.authority.writer_or_checkpoint_lock_active()
-                && self.authority.iter_latest_frames(0, u64::MAX).is_empty()
+                && self.authority.iter_latest_frames(0, u64::MAX)?.is_empty()
             {
-                self.sync_authority_frames_from_local();
+                self.sync_authority_frames_from_local()?;
             }
         }
+        Ok(())
     }
 
     fn restart_snapshot_from_authority(
@@ -1873,7 +1889,11 @@ impl WalCoordination for ShmWalCoordination {
             .find_frame(page_id, min_frame, max_frame, frame_watermark)
     }
 
-    fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
+    fn iter_latest_frames(
+        &self,
+        min_frame: u64,
+        max_frame: u64,
+    ) -> Result<Vec<(u64, u64)>, TryReserveError> {
         // Same trade-off as find_frame(): if the reserved shared index space is
         // exhausted, keep correctness by consulting the local scanned cache.
         if self.authority.frame_index_overflowed() {
@@ -2231,9 +2251,10 @@ impl WalCoordination for ShmWalCoordination {
         self.fallback.mark_initialized();
     }
 
-    fn cache_frame(&self, page_id: u64, frame_id: u64) {
-        self.fallback.cache_frame(page_id, frame_id);
+    fn cache_frame(&self, page_id: u64, frame_id: u64) -> Result<(), TryReserveError> {
+        self.fallback.cache_frame(page_id, frame_id)?;
         self.authority.record_frame(page_id, frame_id);
+        Ok(())
     }
 
     fn rollback_cache(&self, max_frame: u64) {
@@ -3404,7 +3425,7 @@ impl Wal for WalFile {
 
         // Lock each target page and pre-allocate its destination buffer so the
         // completion callback only parses headers, decrypts/verifies, and copies.
-        let mut slots: Vec<(PageRef, Arc<Buffer>)> = Vec::with_capacity(count);
+        let mut slots: Vec<(PageRef, Arc<Buffer>)> = Vec::try_with_capacity_ext(count)?;
         for page in pages.iter() {
             #[cfg(debug_assertions)]
             {
@@ -3423,6 +3444,7 @@ impl Wal for WalFile {
                 );
             }
             page.set_locked();
+            // Preallocated to not need try_push
             slots.push((page.clone(), Arc::new(buffer_pool.get_page())));
         }
 
@@ -3694,7 +3716,7 @@ impl Wal for WalFile {
         let c = Completion::new_write(|_| {});
         let c = file.pwrite(offset, frame_bytes, c)?;
         self.io.wait_for_completion(c)?;
-        self.complete_append_frame(page_id, frame_id, checksums);
+        self.complete_append_frame(page_id, frame_id, checksums)?;
         if db_size > 0 {
             self.finish_append_frames_commit()?;
         } else {
@@ -3934,14 +3956,14 @@ impl Wal for WalFile {
     fn changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
         let frame_count = self.get_max_frame();
         let page_size = self.page_size();
-        let mut frame = vec![0u8; page_size as usize + WAL_FRAME_HEADER_SIZE];
+        let mut frame = try_vec![0u8; page_size as usize + WAL_FRAME_HEADER_SIZE]?;
         let mut seen = FxHashSet::default();
         turso_assert!(
             frame_count >= frame_watermark,
             "frame_count must be not less than frame_watermark",
             { "frame_count": frame_count, "frame_watermark": frame_watermark }
         );
-        let mut pages = Vec::with_capacity((frame_count - frame_watermark) as usize);
+        let mut pages = Vec::try_with_capacity_ext((frame_count - frame_watermark) as usize)?;
         for frame_no in frame_watermark + 1..=frame_count {
             let c = self.read_frame_raw(frame_no, &mut frame)?;
             self.io.wait_for_completion(c)?;
@@ -4112,8 +4134,8 @@ impl Wal for WalFile {
 
         let first_frame_id = next_frame_id;
 
-        let mut bufs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
-        let mut metadata = Vec::with_capacity(pages.len());
+        let mut bufs: Vec<Arc<Buffer>> = Vec::try_with_capacity_ext(pages.len())?;
+        let mut metadata = Vec::try_with_capacity_ext(pages.len())?;
 
         for (idx, page) in pages.iter().enumerate() {
             let page_id = page.get().id;
@@ -4149,6 +4171,7 @@ impl Wal for WalFile {
                 frame_db_size,
                 &data,
             );
+            // preallocated enough to not need try_push
             bufs.push(frame_buf);
             metadata.push((page.clone(), next_frame_id, checksum));
             rolling_checksum = checksum;
@@ -4167,11 +4190,11 @@ impl Wal for WalFile {
 
     /// For each prepared frame, update in-memory WAL index and rolling checksum.
     /// and advance max_frame to make frames visible to readers.
-    fn commit_prepared_frames(&self, batches: &[PreparedFrames]) {
+    fn commit_prepared_frames(&self, batches: &[PreparedFrames]) -> Result<()> {
         for batch in batches {
             for (page, frame_id, checksum) in &batch.metadata {
                 // Update WAL index mapping page -> frame
-                self.complete_append_frame(page.get().id as u64, *frame_id, *checksum);
+                self.complete_append_frame(page.get().id as u64, *frame_id, *checksum)?;
             }
             // Update rolling checksum
             *self.last_checksum.write() = batch.final_checksum;
@@ -4179,6 +4202,7 @@ impl Wal for WalFile {
             self.max_frame
                 .store(batch.final_max_frame, Ordering::Release);
         }
+        Ok(())
     }
 
     /// Mark pages clean and set WAL tags after durable commit.
@@ -4222,9 +4246,9 @@ impl Wal for WalFile {
         );
 
         // Prepare write buffers and bookkeeping
-        let mut iovecs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
+        let mut iovecs: Vec<Arc<Buffer>> = Vec::try_with_capacity_ext(pages.len())?;
         let mut page_frame_and_checksum: Vec<(PageRef, u64, (u32, u32))> =
-            Vec::with_capacity(pages.len());
+            Vec::try_with_capacity_ext(pages.len())?;
 
         // Rolling checksum input to each frame build
         let mut rolling_checksum: (u32, u32) = *self.last_checksum.read();
@@ -4300,7 +4324,7 @@ impl Wal for WalFile {
         self.io.drain_completions(std::slice::from_ref(&c))?;
 
         for (page, fid, csum) in &page_frame_and_checksum {
-            self.complete_append_frame(page.get().id as u64, *fid, *csum);
+            self.complete_append_frame(page.get().id as u64, *fid, *csum)?;
         }
 
         Ok(c)
@@ -4337,9 +4361,9 @@ impl WalFile {
         authority: Arc<MappedSharedWalCoordination>,
         _last_checksum_and_max_frame: ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
-    ) -> Self {
+    ) -> Result<Self, TryReserveError> {
         let coordination: Arc<dyn WalCoordination> =
-            Arc::new(ShmWalCoordination::new(shared, authority));
+            Arc::new(ShmWalCoordination::new(shared, authority)?);
         let snapshot = coordination.load_snapshot();
         Self::new_with_coordination(
             io,
@@ -4354,7 +4378,7 @@ impl WalFile {
         shared: Arc<RwLock<WalFileShared>>,
         (last_checksum, max_frame): ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
-    ) -> Self {
+    ) -> Result<Self, TryReserveError> {
         let coordination: Arc<dyn WalCoordination> =
             Arc::new(InProcessWalCoordination::new(shared));
         Self::new_with_coordination(io, coordination, (last_checksum, max_frame), buffer_pool)
@@ -4366,9 +4390,9 @@ impl WalFile {
         coordination: Arc<dyn WalCoordination>,
         (last_checksum, max_frame): ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
-    ) -> Self {
+    ) -> Result<Self, TryReserveError> {
         let now = io.current_time_monotonic();
-        Self {
+        Ok(Self {
             io,
             coordination,
             // default to max frame in WAL, so that when we read schema we can read from WAL too if it's there.
@@ -4382,7 +4406,7 @@ impl WalFile {
                 max_frame: 0,
                 current_page: 0,
                 pages_to_checkpoint: Vec::new(),
-                inflight_reads: Vec::with_capacity(MAX_INFLIGHT_READS),
+                inflight_reads: Vec::try_with_capacity_ext(MAX_INFLIGHT_READS)?,
             }),
             checkpoint_threshold: 1000,
             buffer_pool,
@@ -4397,7 +4421,7 @@ impl WalFile {
             checkpoint_guard: RwLock::new(None),
             io_ctx: RwLock::new(IOContext::default()),
             has_unpublished_frames: AtomicBool::new(false),
-        }
+        })
     }
 
     #[cfg(test)]
@@ -4439,10 +4463,16 @@ impl WalFile {
         tracing::debug!("increment checkpoint epoch: prev={}", prev);
     }
 
-    fn complete_append_frame(&self, page_id: u64, frame_id: u64, checksums: (u32, u32)) {
+    fn complete_append_frame(
+        &self,
+        page_id: u64,
+        frame_id: u64,
+        checksums: (u32, u32),
+    ) -> Result<()> {
+        self.coordination.cache_frame(page_id, frame_id)?;
         *self.last_checksum.write() = checksums;
         self.max_frame.store(frame_id, Ordering::Release);
-        self.coordination.cache_frame(page_id, frame_id);
+        Ok(())
     }
 
     /// Reset connection-private WAL state.
@@ -4539,7 +4569,7 @@ impl WalFile {
                     );
                     let mut to_checkpoint = self
                         .coordination
-                        .iter_latest_frames(oc_min_frame, oc_max_frame);
+                        .iter_latest_frames(oc_min_frame, oc_max_frame)?;
                     // sort by frame_id for read locality
                     to_checkpoint.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
                     {
@@ -4583,7 +4613,7 @@ impl WalFile {
                             .inflight_reads
                             .iter()
                             .map(|r| r.completion.clone())
-                            .collect();
+                            .try_collect()?;
                         pager.io.cancel(&to_cancel)?;
                         pager.io.drain_completions(&to_cancel)?;
                         return Err(LimboError::CompletionError(e));
@@ -4607,8 +4637,7 @@ impl WalFile {
                             // exact contents as one read from the WAL.
                             #[cfg(debug_assertions)]
                             {
-                                let mut raw =
-                                    vec![0u8; self.page_size() as usize + WAL_FRAME_HEADER_SIZE];
+                                let mut raw = try_vec![0u8; self.page_size() as usize + WAL_FRAME_HEADER_SIZE]?;
                                 self.io.wait_for_completion(
                                     self.read_frame_raw(target_frame, &mut raw)?,
                                 )?;
@@ -4771,7 +4800,7 @@ impl WalFile {
     /// because we might overwrite content the reader is reading from the database file.
     ///
     /// A checkpoint must never overwrite a page in the main DB file if some
-    /// active reader might still need to read that page from the WAL.  
+    /// active reader might still need to read that page from the WAL.
     /// Concretely: the checkpoint may only copy frames `<= aReadMark[k]` for
     /// every in-use reader slot `k > 0`.
     ///
@@ -5314,7 +5343,7 @@ impl WalFileShared {
         }
         if snapshot.max_frame > snapshot.nbackfills
             && authority
-                .iter_latest_frames(0, snapshot.max_frame)
+                .iter_latest_frames(0, snapshot.max_frame)?
                 .is_empty()
         {
             tracing::debug!(
@@ -5882,7 +5911,8 @@ pub mod test {
         let shared = WalFileShared::new_noop();
         let coordination: Arc<dyn WalCoordination> =
             Arc::new(InProcessWalCoordination::new(shared.clone()));
-        let wal = WalFile::new_with_coordination(io, coordination, ((0, 0), 0), buffer_pool);
+        let wal =
+            WalFile::new_with_coordination(io, coordination, ((0, 0), 0), buffer_pool).unwrap();
         (shared, wal)
     }
 
@@ -5890,7 +5920,7 @@ pub mod test {
         let io = shared_wal_test_io();
         let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
         let snapshot = shared.read().last_checksum_and_max_frame();
-        WalFile::new(io, shared, snapshot, buffer_pool)
+        WalFile::new(io, shared, snapshot, buffer_pool).unwrap()
     }
 
     fn make_initialized_memory_wal(page_size: u32) -> (Arc<dyn IO>, Arc<BufferPool>, WalFile) {
@@ -5903,7 +5933,7 @@ pub mod test {
             .open_file("direct-batch-read.db-wal", OpenFlags::Create, false)
             .unwrap();
         let shared = WalFileShared::new_shared(file).unwrap();
-        let wal = WalFile::new(io.clone(), shared, ((0, 0), 0), buffer_pool.clone());
+        let wal = WalFile::new(io.clone(), shared, ((0, 0), 0), buffer_pool.clone()).unwrap();
         let page_size = PageSize::new(page_size).unwrap();
 
         if let Some(c) = wal.prepare_wal_start(page_size).unwrap() {
@@ -5946,7 +5976,7 @@ pub mod test {
             )
             .unwrap();
         io.wait_for_completion(c).unwrap();
-        wal.commit_prepared_frames(&[prepared]);
+        wal.commit_prepared_frames(&[prepared]).unwrap();
         wal.finish_append_frames_commit().unwrap();
         expected
     }
@@ -6172,7 +6202,7 @@ pub mod test {
         let io = shared_wal_test_io();
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, path, 64).unwrap());
-        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
         (authority, coordination)
     }
 
@@ -6312,7 +6342,8 @@ pub mod test {
                 snapshot.max_frame,
             ),
             buffer_pool.clone(),
-        );
+        )
+        .unwrap();
 
         let page = Arc::new(crate::storage::pager::Page::new(7));
         let issued_epoch = wal.coordination.checkpoint_epoch();
@@ -6449,7 +6480,10 @@ pub mod test {
         assert_eq!(coordination.checkpoint_epoch(), 5);
         assert_eq!(coordination.find_frame(1, 4, 9, None), Some(8));
         assert_eq!(coordination.find_frame(2, 4, 9, Some(5)), Some(2));
-        assert_eq!(coordination.iter_latest_frames(4, 9), vec![(1, 8), (2, 6)]);
+        assert_eq!(
+            coordination.iter_latest_frames(4, 9).unwrap(),
+            vec![(1, 8), (2, 6)]
+        );
 
         coordination.publish_commit(WalCommitState {
             max_frame: 12,
@@ -6523,17 +6557,23 @@ pub mod test {
         let (shared, _wal) = make_test_wal();
         let coordination = make_test_coordination(&shared);
 
-        coordination.cache_frame(7, 2);
-        coordination.cache_frame(7, 5);
-        coordination.cache_frame(9, 4);
+        coordination.cache_frame(7, 2).unwrap();
+        coordination.cache_frame(7, 5).unwrap();
+        coordination.cache_frame(9, 4).unwrap();
 
         assert_eq!(coordination.find_frame(7, 0, 5, None), Some(5));
-        assert_eq!(coordination.iter_latest_frames(0, 5), vec![(7, 5), (9, 4)]);
+        assert_eq!(
+            coordination.iter_latest_frames(0, 5).unwrap(),
+            vec![(7, 5), (9, 4)]
+        );
 
         coordination.rollback_cache(4);
 
         assert_eq!(coordination.find_frame(7, 0, 5, None), Some(2));
-        assert_eq!(coordination.iter_latest_frames(0, 5), vec![(7, 2), (9, 4)]);
+        assert_eq!(
+            coordination.iter_latest_frames(0, 5).unwrap(),
+            vec![(7, 2), (9, 4)]
+        );
         assert_eq!(
             shared.read().runtime.frame_cache.lock().get(&7),
             Some(&vec![2])
@@ -6555,9 +6595,9 @@ pub mod test {
             },
         );
 
-        coordination.cache_frame(7, 10);
-        coordination.cache_frame(9, 20);
-        coordination.cache_frame(11, 30);
+        coordination.cache_frame(7, 10).unwrap();
+        coordination.cache_frame(9, 20).unwrap();
+        coordination.cache_frame(11, 30).unwrap();
         wal.max_frame.store(30, Ordering::Release);
 
         wal.rollback(Some(RollbackTo {
@@ -6644,9 +6684,9 @@ pub mod test {
 
         let (_authority_a, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
         let (authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
-        coordination_a.cache_frame(7, 2);
-        coordination_a.cache_frame(9, 4);
-        coordination_a.cache_frame(7, 5);
+        coordination_a.cache_frame(7, 2).unwrap();
+        coordination_a.cache_frame(9, 4).unwrap();
+        coordination_a.cache_frame(7, 5).unwrap();
 
         assert_eq!(coordination_b.load_snapshot(), snapshot);
         assert_eq!(coordination_b.wal_header().page_size, 4096);
@@ -6654,7 +6694,7 @@ pub mod test {
         assert_eq!(coordination_b.wal_header().salt_2, 23);
         assert_eq!(coordination_b.find_frame(7, 0, 5, None), Some(5));
         assert_eq!(
-            coordination_b.iter_latest_frames(0, 5),
+            coordination_b.iter_latest_frames(0, 5).unwrap(),
             vec![(7, 5), (9, 4)]
         );
         assert_eq!(coordination_a.checkpoint_epoch(), 0);
@@ -6692,7 +6732,7 @@ pub mod test {
         coordination_b.rollback_cache(4);
         assert_eq!(coordination_a.find_frame(7, 0, 5, None), Some(2));
         assert_eq!(
-            coordination_a.iter_latest_frames(0, 5),
+            coordination_a.iter_latest_frames(0, 5).unwrap(),
             vec![(7, 2), (9, 4)]
         );
         assert!(shm_path.exists());
@@ -6731,7 +6771,7 @@ pub mod test {
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
         let mut readers = Vec::new();
         for _ in 0..128 {
-            let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+            let coordination = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
             let read_guard = coordination
                 .try_begin_read_tx(snapshot)
                 .expect("same-snapshot readers should share a published reader barrier");
@@ -6786,9 +6826,9 @@ pub mod test {
 
         let authority =
             Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
-        let reader_a1 = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let reader_a1 = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
         let guard_a1 = reader_a1.try_begin_read_tx(snapshot_a).unwrap();
-        let reader_a2 = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let reader_a2 = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
         let guard_a2 = reader_a2.try_begin_read_tx(snapshot_a).unwrap();
         assert_eq!(
             authority.min_active_reader_frame(),
@@ -6809,9 +6849,9 @@ pub mod test {
             transaction_count: snapshot_b.transaction_count,
         });
 
-        let reader_b1 = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let reader_b1 = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
         let guard_b1 = reader_b1.try_begin_read_tx(snapshot_b).unwrap();
-        let reader_b2 = ShmWalCoordination::new(shared, authority.clone());
+        let reader_b2 = ShmWalCoordination::new(shared, authority.clone()).unwrap();
         let guard_b2 = reader_b2.try_begin_read_tx(snapshot_b).unwrap();
 
         assert_eq!(
@@ -6881,11 +6921,13 @@ pub mod test {
         let (_authority_a, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
         let (_authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
 
-        coordination_a.cache_frame(7, 2);
+        coordination_a.cache_frame(7, 2).unwrap();
         for frame_id in 3..=OLD_FIXED_LIMIT + 1 {
-            coordination_a.cache_frame(100 + (frame_id % 31), frame_id);
+            coordination_a
+                .cache_frame(100 + (frame_id % 31), frame_id)
+                .unwrap();
         }
-        coordination_a.cache_frame(7, OLD_FIXED_LIMIT + 2);
+        coordination_a.cache_frame(7, OLD_FIXED_LIMIT + 2).unwrap();
 
         assert_eq!(
             coordination_b.find_frame(7, 0, OLD_FIXED_LIMIT + 2, None),
@@ -6897,6 +6939,7 @@ pub mod test {
         );
         assert!(coordination_b
             .iter_latest_frames(0, OLD_FIXED_LIMIT + 2)
+            .unwrap()
             .contains(&(7, OLD_FIXED_LIMIT + 2)));
     }
 
@@ -6937,8 +6980,8 @@ pub mod test {
 
         let (_authority_a, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
         let (_authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
-        coordination_a.cache_frame(7, 2);
-        coordination_a.cache_frame(9, 4);
+        coordination_a.cache_frame(7, 2).unwrap();
+        coordination_a.cache_frame(9, 4).unwrap();
 
         {
             let mut shared = shared_b.write();
@@ -6995,7 +7038,10 @@ pub mod test {
         assert_ne!(header.salt_2, 23);
         assert_eq!(header.checksum_1, snapshot.last_checksum.0);
         assert_eq!(header.checksum_2, snapshot.last_checksum.1);
-        assert_eq!(coordination_a.iter_latest_frames(0, u64::MAX), Vec::new());
+        assert_eq!(
+            coordination_a.iter_latest_frames(0, u64::MAX).unwrap(),
+            Vec::new()
+        );
         assert_eq!(coordination_a.checkpoint_epoch(), 5);
 
         let shared = shared_b.read();
@@ -7043,8 +7089,8 @@ pub mod test {
             }
 
             let (authority, coordination) = make_test_shm_coordination(&shared, &shm_path);
-            coordination.cache_frame(7, 2);
-            coordination.cache_frame(7, 5);
+            coordination.cache_frame(7, 2).unwrap();
+            coordination.cache_frame(7, 5).unwrap();
             assert_eq!(
                 authority.open_mode(),
                 SharedWalCoordinationOpenMode::Exclusive
@@ -7075,7 +7121,9 @@ pub mod test {
             }
         );
         assert_eq!(
-            reopened_coordination.iter_latest_frames(0, u64::MAX),
+            reopened_coordination
+                .iter_latest_frames(0, u64::MAX)
+                .unwrap(),
             vec![(7, 5)]
         );
         assert_eq!(reopened_authority.min_active_reader_frame(), None);
@@ -7167,7 +7215,8 @@ pub mod test {
             reopened_authority.clone(),
             ((0, 0), 0),
             buffer_pool,
-        );
+        )
+        .unwrap();
 
         wal.begin_read_tx().unwrap();
         reopened_authority.mark_frame_index_overflowed_for_tests();
@@ -7274,7 +7323,8 @@ pub mod test {
         let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
         buffer_pool.finalize_with_page_size(4096).unwrap();
         let wal =
-            WalFile::new_with_shared_coordination(io, shared, authority, ((0, 0), 0), buffer_pool);
+            WalFile::new_with_shared_coordination(io, shared, authority, ((0, 0), 0), buffer_pool)
+                .unwrap();
 
         assert_eq!(wal.get_max_frame(), 1);
         assert_eq!(wal.get_last_checksum(), (31, 37));
@@ -7356,12 +7406,15 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
         assert!(
-            authority.iter_latest_frames(0, u64::MAX).is_empty(),
+            authority.iter_latest_frames(0, u64::MAX).unwrap().is_empty(),
             "open_shared_from_authority_if_exists should not republish authority before coordination reconciliation"
         );
 
-        let exclusive_coordination = ShmWalCoordination::new(exclusive, authority.clone());
-        assert_eq!(authority.iter_latest_frames(0, u64::MAX), vec![(7, 1)]);
+        let exclusive_coordination = ShmWalCoordination::new(exclusive, authority.clone()).unwrap();
+        assert_eq!(
+            authority.iter_latest_frames(0, u64::MAX).unwrap(),
+            vec![(7, 1)]
+        );
         assert_eq!(exclusive_coordination.find_frame(7, 0, 1, None), Some(1));
 
         drop(exclusive_coordination);
@@ -7387,7 +7440,8 @@ pub mod test {
             .metadata
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
-        let reopened_coordination = ShmWalCoordination::new(reopened_shared, reopened_authority);
+        let reopened_coordination =
+            ShmWalCoordination::new(reopened_shared, reopened_authority).unwrap();
         assert_eq!(reopened_coordination.find_frame(7, 0, 1, None), Some(1));
     }
 
@@ -7432,7 +7486,7 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
 
-        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone()).unwrap();
         let reopened = coordination.load_snapshot();
         assert_eq!(reopened.max_frame, 0);
         assert_eq!(reopened.nbackfills, 0);
@@ -7839,8 +7893,8 @@ pub mod test {
             header.checksum_2 = authoritative.last_checksum.1;
         }
         let (authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
-        coordination_a.cache_frame(7, 2);
-        coordination_a.cache_frame(7, 5);
+        coordination_a.cache_frame(7, 2).unwrap();
+        coordination_a.cache_frame(7, 5).unwrap();
         assert!(authority.try_acquire_writer(authority.owner_record()));
 
         let file_b = io
@@ -7916,8 +7970,8 @@ pub mod test {
             header.checksum_2 = authoritative.last_checksum.1;
         }
         let (authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
-        coordination_a.cache_frame(7, 2);
-        coordination_a.cache_frame(9, 5);
+        coordination_a.cache_frame(7, 2).unwrap();
+        coordination_a.cache_frame(9, 5).unwrap();
 
         let file_b = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
@@ -7955,7 +8009,9 @@ pub mod test {
         assert_eq!(authority.find_frame(7, 0, 5, None), Some(2));
         assert_eq!(authority.find_frame(9, 0, 5, None), Some(5));
         assert_eq!(
-            authority.iter_latest_frames(0, authoritative.max_frame),
+            authority
+                .iter_latest_frames(0, authoritative.max_frame)
+                .unwrap(),
             vec![(7, 2), (9, 5)]
         );
     }
@@ -7995,8 +8051,8 @@ pub mod test {
         }
         {
             let (_authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
-            coordination_a.cache_frame(7, 2);
-            coordination_a.cache_frame(9, 4);
+            coordination_a.cache_frame(7, 2).unwrap();
+            coordination_a.cache_frame(9, 4).unwrap();
         }
 
         let file_b = io
@@ -8038,7 +8094,9 @@ pub mod test {
             "matching snapshot metadata must not preserve a stale shared frame index across restart recovery"
         );
         assert_eq!(
-            authority.iter_latest_frames(0, authoritative.max_frame),
+            authority
+                .iter_latest_frames(0, authoritative.max_frame)
+                .unwrap(),
             vec![(7, 2), (9, 5)]
         );
     }
@@ -8081,7 +8139,7 @@ pub mod test {
                 .store(true, Ordering::Release);
         }
 
-        let coordination = ShmWalCoordination::new(shared, authority.clone());
+        let coordination = ShmWalCoordination::new(shared, authority.clone()).unwrap();
         let snapshot = authority.snapshot();
         assert_eq!(snapshot, authoritative);
         let header = coordination.wal_header();
@@ -8125,8 +8183,8 @@ pub mod test {
             header.checksum_2 = authoritative.last_checksum.1;
         }
         let (authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
-        coordination_a.cache_frame(7, 2);
-        coordination_a.cache_frame(9, 5);
+        coordination_a.cache_frame(7, 2).unwrap();
+        coordination_a.cache_frame(9, 5).unwrap();
 
         let file_b = io
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
@@ -8212,7 +8270,7 @@ pub mod test {
             shared.runtime.epoch.store(1, Ordering::Release);
         }
 
-        let coordination = ShmWalCoordination::new(shared.clone(), authority);
+        let coordination = ShmWalCoordination::new(shared.clone(), authority).unwrap();
         assert!(
             !coordination.wal_is_initialized(),
             "a stale local initialized bit must not suppress the first header rewrite after RESTART/TRUNCATE"
@@ -8257,7 +8315,7 @@ pub mod test {
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
             .unwrap();
         let shared = WalFileShared::new_shared(file).unwrap();
-        let coordination = ShmWalCoordination::new(shared, authority.clone());
+        let coordination = ShmWalCoordination::new(shared, authority.clone()).unwrap();
 
         let prepared = coordination
             .prepare_wal_header(io.as_ref(), PageSize::new(4096).unwrap())
@@ -8336,7 +8394,7 @@ pub mod test {
             .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
             .unwrap();
         let shared_b = WalFileShared::new_shared(file_b).unwrap();
-        let coordination_b = ShmWalCoordination::new(shared_b.clone(), authority.clone());
+        let coordination_b = ShmWalCoordination::new(shared_b.clone(), authority.clone()).unwrap();
         // Simulate a long-lived process whose process-wide shared WAL metadata
         // fell behind the authority after another process checkpointed and
         // restarted the WAL back to frame 0.

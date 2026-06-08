@@ -4217,7 +4217,7 @@ impl Pager {
                 CommitState::WalCommitDone => {
                     // all I/O complete, NOW it's safe to advance WAL state
                     let mut commit_info = self.commit_info.write();
-                    wal.commit_prepared_frames(&commit_info.prepared_frames);
+                    wal.commit_prepared_frames(&commit_info.prepared_frames)?;
                     wal.finalize_committed_pages(&commit_info.prepared_frames);
                     wal.finish_append_frames_commit()?;
                     self.dirty_pages.write().clear();
@@ -5854,12 +5854,15 @@ mod ptrmap_tests {
         )
         .unwrap();
         let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
-        let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
-            io.clone(),
-            wal_shared,
-            last_checksum_and_max_frame,
-            buffer_pool.clone(),
-        ));
+        let wal: Arc<dyn Wal> = Arc::new(
+            WalFile::new(
+                io.clone(),
+                wal_shared,
+                last_checksum_and_max_frame,
+                buffer_pool.clone(),
+            )
+            .unwrap(),
+        );
 
         // For new empty databases, init_page_1 must be Some(page) so allocate_page1() can be called
         let init_page_1 = Arc::new(ArcSwapOption::new(Some(default_page1(None))));
@@ -6124,7 +6127,7 @@ mod ptrmap_tests {
             target_idx,
             PendingRead {
                 page: synthetic_page.clone(),
-                disk_read: Some(stub_disk_read.clone()),
+                disk_read: Some(stub_disk_read),
             },
         );
 

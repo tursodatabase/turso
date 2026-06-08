@@ -1535,7 +1535,11 @@ fn install_mvcc_state_after_vacuum_commit(
     header: DatabaseHeader,
     schema: Arc<Schema>,
 ) {
-    mv_store.reset_after_vacuum(header, schema.as_ref());
+    // TODO: currently memory allocation makes this fallible. If Skiplist supported `retain` we could probably remove
+    // the allocation
+    mv_store
+        .reset_after_vacuum(header, schema.as_ref())
+        .expect("post-commit MVCC VACUUM metadata install must not fail: physical replacement image is already durable");
     replace_shared_schema_after_vacuum(source_db, schema);
 }
 
@@ -2057,7 +2061,7 @@ fn vacuum_in_place_step(
                 let prepared = prev_prepared
                     .as_ref()
                     .expect("VACUUM WriteWalBatch phase requires prepared frames");
-                wal.commit_prepared_frames(std::slice::from_ref(prepared.as_ref()));
+                wal.commit_prepared_frames(std::slice::from_ref(prepared.as_ref()))?;
 
                 // More pages to copy?
                 if *next_page <= *total_pages {
