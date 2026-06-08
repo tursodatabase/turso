@@ -23,7 +23,7 @@ addr  opcode          p1  p2  p3  p4                p5  comment
    5  Rewind           1  18   0                     0  Rewind table products
    6    Column         1   4   6                     0  r[6]=products.price
    7    RealAffinity   6   0   0                     0
-   8    IfPos          4  12   1                     0  r[4]>0 -> r[4]-=1, goto 12
+   8    IfNotZero      4  12   0                     0  if r[4]!=0 (decr if >0) goto 12
    9    Last           0  12   0                     0
   10    IdxLE          0  17   6                     0  key=[6..9]
   11    Delete         0   0   0                     0

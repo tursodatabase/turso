@@ -560,10 +560,14 @@ impl EmitOrderBy {
             let skip_label = program.allocate_label();
             let limit = t_ctx.limit_ctx.as_ref().expect("limit must be set");
             let limit_reg = t_ctx.reg_limit_offset_sum.unwrap_or(limit.reg_limit);
-            program.emit_insn(Insn::IfPos {
+            // IfNotZero: > 0 -> decrement & skip eviction (still have room);
+            //            < 0 -> leave sticky & skip eviction (unlimited);
+            //            == 0 -> fall through to evict largest before insert.
+            // OffsetLimit folds a non-positive limit into -1 in the combined
+            // register, so OFFSET with a "no limit" sentinel works too.
+            program.emit_insn(Insn::IfNotZero {
                 reg: limit_reg,
                 target_pc: insert_label,
-                decrement_by: 1,
             });
             program.emit_insn(Insn::Last {
                 cursor_id: *sort_cursor,
