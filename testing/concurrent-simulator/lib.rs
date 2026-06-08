@@ -924,14 +924,19 @@ impl Whopper {
 
             if let Err(error) = op_result {
                 let in_tx = ctx.fiber.state.is_in_tx() && !ctx.fiber.connection.get_auto_commit();
-                // An injected ftruncate fault surfaces as a CompletionError from
-                // the WAL write/truncate path. Under active fault injection it is
-                // expected and recoverable, so roll back / clear txn instead of
-                // aborting the run; without injection it stays Fatal so real bugs
-                // are not masked.
+                // An injected ftruncate fault is expected under active fault
+                // injection: a failed WAL write/truncate surfaces as a
+                // CompletionError, and a failed checkpoint truncate surfaces as a
+                // CheckpointFailed (the write is durable, only the checkpoint
+                // maintenance op failed). Both are recoverable here, so roll back /
+                // clear txn instead of aborting the run; without injection they stay
+                // Respawn/Fatal so real bugs are not masked.
                 let action = if truncate_fault_injection
-                    && matches!(error, turso_core::LimboError::CompletionError(..))
-                {
+                    && matches!(
+                        error,
+                        turso_core::LimboError::CompletionError(..)
+                            | turso_core::LimboError::CheckpointFailed(..)
+                    ) {
                     if in_tx {
                         crate::error_handling::ErrorAction::Rollback
                     } else {
