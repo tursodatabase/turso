@@ -4781,7 +4781,9 @@ pub mod tests {
     fn test_normalize_ident() {
         assert_eq!(normalize_ident("foo"), "foo");
         assert_eq!(normalize_ident("FOO"), "foo");
-        assert_eq!(normalize_ident("ὈΔΥΣΣΕΎΣ"), "ὀδυσσεύς");
+        // SQLite folds only ASCII; non-ASCII bytes pass through untouched.
+        assert_eq!(normalize_ident("ὈΔΥΣΣΕΎΣ"), "ὈΔΥΣΣΕΎΣ");
+        assert_eq!(normalize_ident("Foo_ΔΥΣ"), "foo_ΔΥΣ");
     }
 
     fn schema_with_tables(create_table_sqls: &[&str]) -> Schema {
