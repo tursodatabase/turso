@@ -664,10 +664,10 @@ impl LogicalLog {
             }
         }
         if has_portable_changes {
-            tx.buf.splice(
-                LOG_RECORD_PREFIX_SIZE..LOG_RECORD_PREFIX_SIZE,
+            LogSerializer::new(&mut tx.buf).insert(
+                LOG_RECORD_PREFIX_SIZE,
                 [0u8; TX_EXT_HEADER_SIZE - TX_HEADER_SIZE],
-            );
+            )?;
         }
 
         let tx_header_size = if has_portable_changes {
@@ -678,14 +678,12 @@ impl LogicalLog {
         let frame_payload_start = LOG_HDR_SIZE + tx_header_size;
 
         #[cfg(feature = "conn_raw_api")]
-        let extension_block = if !has_portable_changes {
-            Vec::new()
-        } else {
+        let extension_size = if has_portable_changes {
             let encryption_overhead = self
                 .encryption_ctx
                 .as_ref()
                 .map(|enc_ctx| (enc_ctx.tag_size(), enc_ctx.nonce_size()));
-            let portable_changes = encode_portable_change_payload_with_stable_end_offset(
+            let portable_changes = PortableChangePayload::with_stable_end_offset(
                 PortableEndOffsetCtx {
                     write_offset: self.offset,
                     includes_log_header: is_first_write,
@@ -697,20 +695,20 @@ impl LogicalLog {
                 tx.tx_timestamp,
                 &tx.portable_changes,
             )?;
-            encode_extension_record(EXTENSION_TYPE_PORTABLE_CHANGES, 0, &portable_changes)?
+            let extension_record =
+                ExtensionRecord::new(EXTENSION_TYPE_PORTABLE_CHANGES, 0, portable_changes);
+            let extension_record_len = extension_record_len(&extension_record)?;
+            let extension_size = u64::try_from(extension_record_len).map_err(|_| {
+                LimboError::InternalError("Logical log extension size exceeds u64".to_string())
+            })?;
+            LogSerializer::new(&mut tx.buf).insert(frame_payload_start, extension_record)?;
+            extension_size
+        } else {
+            0
         };
         #[cfg(not(feature = "conn_raw_api"))]
-        let extension_block = Vec::new();
-
-        let extension_size = u64::try_from(extension_block.len()).map_err(|_| {
-            LimboError::InternalError("Logical log extension size exceeds u64".to_string())
-        })?;
-        if !extension_block.is_empty() {
-            tx.buf
-                .splice(frame_payload_start..frame_payload_start, extension_block);
-        }
+        let extension_size = 0u64;
         let plaintext_size = tx.buf.len() - frame_payload_start;
-        let plaintext_size_u64 = plaintext_size as u64;
 
         // 2. Build the on-disk payload. Unencrypted is the zero-shift fast
         // path: plaintext is already after the TX header. Extension frames are
@@ -723,59 +721,15 @@ impl LogicalLog {
                 .as_ref()
                 .expect("log header must be set before writing")
                 .salt;
-            let on_disk_payload_size = encrypted_payload_blob_size(
+            LogSerializer::new(&mut tx.buf).encrypt_payload_in_place(EncryptedPayload {
+                enc_ctx,
+                payload_start: frame_payload_start,
                 plaintext_size,
-                self.encrypted_payload_chunk_size,
-                enc_ctx.tag_size(),
-                enc_ctx.nonce_size(),
-            )?;
-            let total = frame_payload_start + on_disk_payload_size + TX_TRAILER_SIZE;
-            // Move the plaintext out (`split_off` returns the tail past the
-            // framing prefix; `tx.buf` is left with just the header prefix
-            // to grow back into with encrypted chunks).
-            let plaintext = tx.buf.split_off(frame_payload_start);
-            debug_assert_eq!(plaintext.len(), plaintext_size);
-            tx.buf.reserve(total - tx.buf.len());
-
-            let chunk_count =
-                encrypted_payload_chunk_count(plaintext_size, self.encrypted_payload_chunk_size);
-            let payload_start = tx.buf.len();
-            for (chunk_index, plaintext_chunk) in plaintext
-                .chunks(self.encrypted_payload_chunk_size)
-                .enumerate()
-            {
-                let is_last_chunk = chunk_index + 1 == chunk_count;
-                let aad = build_encrypted_chunk_aad(
-                    salt,
-                    is_last_chunk.then_some(plaintext_size_u64),
-                    op_count,
-                    commit_ts,
-                    u32::try_from(chunk_index).map_err(|_| {
-                        LimboError::InternalError(
-                            "encrypted payload chunk index exceeds u32".to_string(),
-                        )
-                    })?,
-                );
-                let (ciphertext, nonce) = enc_ctx.encrypt_chunk(plaintext_chunk, &aad)?;
-                // encrypt_chunk returns ciphertext with the auth tag appended, so its
-                // length must be exactly plaintext_len + tag_size. The read path relies
-                // on this to split each chunk back into (ciphertext+tag, nonce).
-                debug_assert_eq!(
-                    ciphertext.len(),
-                    plaintext_chunk.len() + enc_ctx.tag_size(),
-                    "encrypt_chunk output size mismatch: expected plaintext({}) + tag({}), got {}",
-                    plaintext_chunk.len(),
-                    enc_ctx.tag_size(),
-                    ciphertext.len(),
-                );
-                tx.buf.extend_from_slice(&ciphertext);
-                tx.buf.extend_from_slice(&nonce);
-            }
-            turso_assert!(
-                tx.buf.len() - payload_start == on_disk_payload_size,
-                "encrypted on-disk payload size mismatch"
-            );
-            // `plaintext` is dropped here, freeing its allocation before pwrite.
+                chunk_size: self.encrypted_payload_chunk_size,
+                salt,
+                op_count,
+                commit_ts,
+            })?;
         }
         // Unencrypted: plaintext bytes are already in place after the TX header.
 
@@ -810,8 +764,7 @@ impl LogicalLog {
         // CRC stored within its 56 bytes.
         let payload_end = tx.buf.len();
         let crc = crc32c::crc32c_append(self.running_crc, &tx.buf[tx_header_start..payload_end]);
-        tx.buf.extend_from_slice(&crc.to_le_bytes());
-        tx.buf.extend_from_slice(&END_MAGIC.to_le_bytes());
+        LogSerializer::new(&mut tx.buf).serialize_tx_trailer(crc)?;
 
         // 5. Fill the LOG_HDR slot (first-write only). Non-first-write
         // commits leave it as zeros; those bytes never reach disk because
@@ -1026,354 +979,14 @@ impl LogicalLog {
     }
 }
 
-/// Serialize one op into `buffer`.
-/// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
-pub(crate) fn serialize_op_entry(
-    buffer: &mut Vec<u8>,
-    row_version: &RowVersion,
-    portable_extension: Option<&[u8]>,
-) -> Result<()> {
-    let is_delete = row_version.end.is_some();
+mod serializer;
 
-    let mut flags = 0u8;
-    if row_version.btree_resident {
-        flags |= OP_FLAG_BTREE_RESIDENT;
-    }
-    if portable_extension.is_some_and(|extension| !extension.is_empty()) {
-        flags |= OP_FLAG_PORTABLE_EXTENSION;
-    }
-
-    let table_id_i64: i64 = row_version.row.id.table_id.into();
-    turso_assert!(
-        table_id_i64 < 0,
-        "table_id_i64 should be negative, but got {table_id_i64}"
-    );
-    turso_assert!(
-        (i32::MIN as i64..=i32::MAX as i64).contains(&table_id_i64),
-        "table_id_i64 out of i32 range: {table_id_i64}"
-    );
-    let table_id_i32 = table_id_i64 as i32;
-
-    let write_header = |buf: &mut Vec<u8>, tag: u8| {
-        buf.push(tag);
-        buf.push(flags);
-        buf.extend_from_slice(&table_id_i32.to_le_bytes());
-    };
-
-    match (&row_version.row.id.row_id, is_delete) {
-        (&RowKey::Int(rowid), false) => {
-            write_header(buffer, OP_UPSERT_TABLE);
-            let record_bytes = row_version.row.payload();
-            let rowid_u64 = rowid as u64;
-            let rowid_len = varint_len(rowid_u64);
-            let payload_len = rowid_len + record_bytes.len();
-            write_varint_to_vec(payload_len as u64, buffer);
-            write_varint_to_vec(rowid_u64, buffer);
-            buffer.extend_from_slice(record_bytes);
-        }
-        (&RowKey::Int(rowid), true) => {
-            write_header(buffer, OP_DELETE_TABLE);
-            let rowid_u64 = rowid as u64;
-            let rowid_len = varint_len(rowid_u64);
-            write_varint_to_vec(rowid_len as u64, buffer);
-            write_varint_to_vec(rowid_u64, buffer);
-        }
-        (RowKey::Record(_), is_delete) => {
-            write_header(
-                buffer,
-                if is_delete {
-                    OP_DELETE_INDEX
-                } else {
-                    OP_UPSERT_INDEX
-                },
-            );
-            let key_bytes = row_version.row.payload();
-            write_varint_to_vec(key_bytes.len() as u64, buffer);
-            buffer.extend_from_slice(key_bytes);
-        }
-    }
-
-    if let Some(portable_extension) =
-        portable_extension.filter(|portable_extension| !portable_extension.is_empty())
-    {
-        write_varint_to_vec(portable_extension.len() as u64, buffer);
-        buffer.extend_from_slice(portable_extension);
-    }
-
-    Ok(())
-}
-
-pub(crate) fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
-    // Header op uses tag-only addressing (table_id=0, flags=0) and fixed payload length.
-    buffer.push(OP_UPDATE_HEADER);
-    buffer.push(0);
-    buffer.extend_from_slice(&0i32.to_le_bytes());
-    write_varint_to_vec(DatabaseHeader::SIZE as u64, buffer);
-    buffer.extend_from_slice(bytemuck::bytes_of(header));
-}
-
-fn write_proto_varint(mut value: u64, buffer: &mut Vec<u8>) {
-    while value >= 0x80 {
-        buffer.push((value as u8) | 0x80);
-        value >>= 7;
-    }
-    buffer.push(value as u8);
-}
-
-fn write_proto_key(field: u64, wire_type: u64, buffer: &mut Vec<u8>) {
-    write_proto_varint((field << 3) | wire_type, buffer);
-}
-
-fn write_proto_sint64(field: u64, value: i64, buffer: &mut Vec<u8>) {
-    let zigzag = ((value << 1) ^ (value >> 63)) as u64;
-    write_proto_key(field, 0, buffer);
-    write_proto_varint(zigzag, buffer);
-}
-
-fn write_proto_bytes(field: u64, value: &[u8], buffer: &mut Vec<u8>) {
-    write_proto_key(field, 2, buffer);
-    write_proto_varint(value.len() as u64, buffer);
-    buffer.extend_from_slice(value);
-}
-
-pub(crate) fn encode_delete_portable_extension(
-    identity_record: Option<&[u8]>,
-    pk_record: Option<&[u8]>,
-    rowid: Option<i64>,
-) -> Vec<u8> {
-    let mut extension = Vec::new();
-    if let Some(identity_record) = identity_record.filter(|record| !record.is_empty()) {
-        write_proto_bytes(
-            OP_EXT_FIELD_DELETE_IDENTITY_RECORD,
-            identity_record,
-            &mut extension,
-        );
-    }
-    if let Some(pk_record) = pk_record.filter(|record| !record.is_empty()) {
-        write_proto_bytes(OP_EXT_FIELD_DELETE_PK_RECORD, pk_record, &mut extension);
-    }
-    if let Some(rowid) = rowid {
-        write_proto_sint64(OP_EXT_FIELD_DELETE_ROWID, rowid, &mut extension);
-    }
-    extension
-}
-
-fn read_proto_varint_from_buf(bytes: &[u8], offset: &mut usize) -> Result<u64> {
-    let mut value = 0u64;
-    let mut shift = 0;
-    while *offset < bytes.len() {
-        let byte = bytes[*offset];
-        *offset += 1;
-        value |= ((byte & 0x7f) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err(LimboError::Corrupt("protobuf varint overflows u64".into()));
-        }
-    }
-    Err(LimboError::Corrupt("truncated protobuf varint".into()))
-}
-
-fn skip_proto_field(bytes: &[u8], offset: &mut usize, wire_type: u64) -> Result<()> {
-    match wire_type {
-        0 => {
-            let _ = read_proto_varint_from_buf(bytes, offset)?;
-        }
-        2 => {
-            let len = read_proto_varint_from_buf(bytes, offset)?;
-            let len = usize::try_from(len)
-                .map_err(|_| LimboError::Corrupt("protobuf field length overflows usize".into()))?;
-            let end = offset
-                .checked_add(len)
-                .ok_or_else(|| LimboError::Corrupt("protobuf field length overflow".into()))?;
-            if end > bytes.len() {
-                return Err(LimboError::Corrupt(
-                    "protobuf length-delimited field exceeds extension".into(),
-                ));
-            }
-            *offset = end;
-        }
-        other => {
-            return Err(LimboError::Corrupt(format!(
-                "unsupported protobuf wire type in op extension: {other}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn read_proto_sint64_from_buf(bytes: &[u8], offset: &mut usize) -> Result<i64> {
-    let value = read_proto_varint_from_buf(bytes, offset)?;
-    Ok(((value >> 1) as i64) ^ (-((value & 1) as i64)))
-}
-
-fn decode_delete_portable_extension(extension: &[u8]) -> Result<DeletePortableExtension> {
-    let mut offset = 0usize;
-    let mut decoded = DeletePortableExtension::default();
-    while offset < extension.len() {
-        let key = read_proto_varint_from_buf(extension, &mut offset)?;
-        let field = key >> 3;
-        let wire_type = key & 7;
-        match (field, wire_type) {
-            (OP_EXT_FIELD_DELETE_IDENTITY_RECORD, 2) => {
-                let len = read_proto_varint_from_buf(extension, &mut offset)?;
-                let len = usize::try_from(len).map_err(|_| {
-                    LimboError::Corrupt("delete identity record length overflows usize".into())
-                })?;
-                let end = offset.checked_add(len).ok_or_else(|| {
-                    LimboError::Corrupt("delete identity record length overflow".into())
-                })?;
-                if end > extension.len() {
-                    return Err(LimboError::Corrupt(
-                        "delete identity record exceeds op extension".into(),
-                    ));
-                }
-                decoded.identity_record = extension[offset..end].to_vec();
-                offset = end;
-            }
-            (OP_EXT_FIELD_DELETE_PK_RECORD, 2) => {
-                let len = read_proto_varint_from_buf(extension, &mut offset)?;
-                let len = usize::try_from(len).map_err(|_| {
-                    LimboError::Corrupt("delete PK record length overflows usize".into())
-                })?;
-                let end = offset.checked_add(len).ok_or_else(|| {
-                    LimboError::Corrupt("delete PK record length overflow".into())
-                })?;
-                if end > extension.len() {
-                    return Err(LimboError::Corrupt(
-                        "delete PK record exceeds op extension".into(),
-                    ));
-                }
-                decoded.pk_record = extension[offset..end].to_vec();
-                offset = end;
-            }
-            (OP_EXT_FIELD_DELETE_ROWID, 0) => {
-                let _ = read_proto_sint64_from_buf(extension, &mut offset)?;
-            }
-            _ => skip_proto_field(extension, &mut offset, wire_type)?,
-        }
-    }
-    Ok(decoded)
-}
-
-fn proto_varint_len(mut value: u64) -> usize {
-    let mut len = 1;
-    while value >= 0x80 {
-        len += 1;
-        value >>= 7;
-    }
-    len
-}
-
-fn encode_portable_change_payload(
-    end_offset: u64,
-    commit_ts: u64,
-    encoded_metadata: &[u8],
-) -> Vec<u8> {
-    let body_len =
-        2 + proto_varint_len(end_offset) + proto_varint_len(commit_ts) + encoded_metadata.len();
-    let mut out = Vec::with_capacity(proto_varint_len(body_len as u64) + body_len);
-    write_proto_varint(body_len as u64, &mut out);
-    // PortableLogicalTxn.end_offset, field 1, varint.
-    write_proto_varint(1 << 3, &mut out);
-    write_proto_varint(end_offset, &mut out);
-    // PortableLogicalTxn.commit_ts, field 2, varint.
-    write_proto_varint(2 << 3, &mut out);
-    write_proto_varint(commit_ts, &mut out);
-    out.extend_from_slice(encoded_metadata);
-    out
-}
-
-/// Wraps commit-built logical op messages in one length-delimited
-/// portable MVCC logical transaction payload and iterates until the embedded
-/// `end_offset` matches the final frame size.
-///
-/// `end_offset` is part of the raw-log replay cursor, but its varint width can
-/// change the payload length. The fixed-point loop converges after the varint
-/// width stops changing.
-struct PortableEndOffsetCtx {
-    write_offset: u64,
-    includes_log_header: bool,
-    tx_header_size: usize,
-    recovery_payload_size: usize,
-    encrypted_payload_chunk_size: usize,
-    encryption_overhead: Option<(usize, usize)>,
-}
-
-fn encode_portable_change_payload_with_stable_end_offset(
-    ctx: PortableEndOffsetCtx,
-    tx_timestamp: u64,
-    portable_changes: &[u8],
-) -> Result<Vec<u8>> {
-    let frame_end_offset = |portable_payload_len: usize| -> Result<u64> {
-        let extension_size = EXTENSION_RECORD_HEADER_SIZE
-            .checked_add(portable_payload_len)
-            .ok_or_else(|| {
-                LimboError::InternalError("portable logical extension size overflow".to_string())
-            })?;
-        let plaintext_size = ctx
-            .recovery_payload_size
-            .checked_add(extension_size)
-            .ok_or_else(|| {
-                LimboError::InternalError("portable logical plaintext size overflow".to_string())
-            })?;
-        let body_size = if let Some((tag_size, nonce_size)) = ctx.encryption_overhead {
-            encrypted_payload_blob_size(
-                plaintext_size,
-                ctx.encrypted_payload_chunk_size,
-                tag_size,
-                nonce_size,
-            )?
-        } else {
-            plaintext_size
-        };
-        let prefix_size = if ctx.includes_log_header {
-            LOG_HDR_SIZE
-        } else {
-            0
-        };
-        let frame_bytes = prefix_size
-            .checked_add(ctx.tx_header_size)
-            .and_then(|value| value.checked_add(body_size))
-            .and_then(|value| value.checked_add(TX_TRAILER_SIZE))
-            .ok_or_else(|| {
-                LimboError::InternalError("portable logical frame size overflow".to_string())
-            })?;
-        ctx.write_offset
-            .checked_add(frame_bytes as u64)
-            .ok_or_else(|| {
-                LimboError::InternalError("portable logical frame offset overflow".to_string())
-            })
-    };
-
-    let mut end_offset = frame_end_offset(0)?;
-    loop {
-        let payload = encode_portable_change_payload(end_offset, tx_timestamp, portable_changes);
-        let next_end_offset = frame_end_offset(payload.len())?;
-        if next_end_offset == end_offset {
-            return Ok(payload);
-        }
-        end_offset = next_end_offset;
-    }
-}
-
-fn encode_extension_record(
-    extension_type: u16,
-    extension_flags: u16,
-    payload: &[u8],
-) -> Result<Vec<u8>> {
-    let payload_len = u32::try_from(payload.len()).map_err(|_| {
-        LimboError::InternalError("Logical log extension record exceeds u32".to_string())
-    })?;
-    let mut record = Vec::with_capacity(EXTENSION_RECORD_HEADER_SIZE + payload.len());
-    record.extend_from_slice(&extension_type.to_le_bytes());
-    record.extend_from_slice(&extension_flags.to_le_bytes());
-    record.extend_from_slice(&payload_len.to_le_bytes());
-    record.extend_from_slice(payload);
-    Ok(record)
-}
+pub(crate) use serializer::LogSerializer;
+use serializer::{decode_delete_portable_extension, EncryptedPayload};
+#[cfg(feature = "conn_raw_api")]
+use serializer::{
+    extension_record_len, ExtensionRecord, PortableChangePayload, PortableEndOffsetCtx,
+};
 
 fn find_extension_payload(
     extension_block: &[u8],
@@ -3527,12 +3140,11 @@ mod tests {
 
     use super::{
         build_encrypted_chunk_aad, encrypted_chunk_blob_size, encrypted_chunk_plaintext_len,
-        encrypted_payload_blob_size, encrypted_payload_chunk_count, serialize_header_entry,
-        serialize_op_entry, HeaderReadResult, LogHeader, LogicalLog, ParseResult, ParsedOp,
-        StreamingLogicalLogReader, ENCRYPTED_CHUNK_AAD_SIZE, ENCRYPTED_PAYLOAD_CHUNK_SIZE,
-        END_MAGIC, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_CRC_START, LOG_HDR_RESERVED_START,
-        LOG_HDR_SIZE, LOG_VERSION, LOG_VERSION_V2, TX_EXT_HEADER_SIZE, TX_HEADER_SIZE,
-        TX_HEADER_SIZE_V2, TX_TRAILER_SIZE,
+        encrypted_payload_blob_size, encrypted_payload_chunk_count, HeaderReadResult, LogHeader,
+        LogSerializer, LogicalLog, ParseResult, ParsedOp, StreamingLogicalLogReader,
+        ENCRYPTED_CHUNK_AAD_SIZE, ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC, EXT_FRAME_MAGIC,
+        FRAME_MAGIC, LOG_HDR_CRC_START, LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION,
+        LOG_VERSION_V2, TX_EXT_HEADER_SIZE, TX_HEADER_SIZE, TX_HEADER_SIZE_V2, TX_TRAILER_SIZE,
     };
     #[cfg(feature = "conn_raw_api")]
     use super::{EXTENSION_RECORD_HEADER_SIZE, EXTENSION_TYPE_PORTABLE_CHANGES, OP_UPSERT_TABLE};
@@ -5503,7 +5115,9 @@ mod tests {
         let mut encoded = Vec::new();
         let value = "x".repeat(text_len);
         let row_version = make_test_row_version((-2).into(), rowid, &value, 100);
-        serialize_op_entry(&mut encoded, &row_version, None).unwrap();
+        LogSerializer::new(&mut encoded)
+            .serialize_op_entry(&row_version, None)
+            .unwrap();
         encoded.len()
     }
 
@@ -5859,11 +5473,17 @@ mod tests {
         chunk_size: usize,
     ) {
         let mut filler_buf = Vec::new();
-        serialize_op_entry(&mut filler_buf, short_filler, None).unwrap();
+        LogSerializer::new(&mut filler_buf)
+            .serialize_op_entry(short_filler, None)
+            .unwrap();
         let mut short_upsert_buf = Vec::new();
-        serialize_op_entry(&mut short_upsert_buf, short_upsert, None).unwrap();
+        LogSerializer::new(&mut short_upsert_buf)
+            .serialize_op_entry(short_upsert, None)
+            .unwrap();
         let mut long_upsert_buf = Vec::new();
-        serialize_op_entry(&mut long_upsert_buf, long_upsert, None).unwrap();
+        LogSerializer::new(&mut long_upsert_buf)
+            .serialize_op_entry(long_upsert, None)
+            .unwrap();
 
         turso_assert_less_than!(
             filler_buf.len(),
@@ -5913,7 +5533,9 @@ mod tests {
             false,
         );
         let mut short_upsert_buf = Vec::new();
-        serialize_op_entry(&mut short_upsert_buf, &short_upsert, None).unwrap();
+        LogSerializer::new(&mut short_upsert_buf)
+            .serialize_op_entry(&short_upsert, None)
+            .unwrap();
         turso_assert_less_than!(
             short_upsert_buf.len(),
             StreamingLogicalLogReader::MAX_SERIALIZED_OP_PREFIX_LEN,
@@ -6782,11 +6404,15 @@ mod tests {
         let expected_second_record_bytes = second.row.payload().to_vec();
 
         let mut filler_buf = Vec::new();
-        serialize_op_entry(&mut filler_buf, &filler, None).unwrap();
+        LogSerializer::new(&mut filler_buf)
+            .serialize_op_entry(&filler, None)
+            .unwrap();
         assert_eq!(filler_buf.len(), ENCRYPTED_PAYLOAD_CHUNK_SIZE - 7);
 
         let mut second_buf = Vec::new();
-        serialize_op_entry(&mut second_buf, &second, None).unwrap();
+        LogSerializer::new(&mut second_buf)
+            .serialize_op_entry(&second, None)
+            .unwrap();
         // Table ops begin with a fixed 6-byte prelude:
         // 1 byte op tag + 1 byte flags + 4 bytes table_id.
         // The payload_len varint begins immediately after that prefix.
@@ -6826,7 +6452,9 @@ mod tests {
         let mut header = DatabaseHeader::default();
         header.database_size = 123.into();
         header.schema_cookie = 456.into();
-        serialize_header_entry(&mut header_buf, &header);
+        LogSerializer::new(&mut header_buf)
+            .serialize_header_entry(&header)
+            .unwrap();
 
         let filler_payload_size = ENCRYPTED_PAYLOAD_CHUNK_SIZE - (header_buf.len() - 1);
         let filler_len = text_len_for_single_upsert_table_op_size(filler_payload_size);
@@ -6835,7 +6463,9 @@ mod tests {
         let expected_filler_record_bytes = filler.row.payload().to_vec();
 
         let mut filler_buf = Vec::new();
-        serialize_op_entry(&mut filler_buf, &filler, None).unwrap();
+        LogSerializer::new(&mut filler_buf)
+            .serialize_op_entry(&filler, None)
+            .unwrap();
         assert_eq!(filler_buf.len(), filler_payload_size);
         assert_eq!(
             filler_buf.len() + header_buf.len() - 1,
