@@ -1,4 +1,4 @@
-use crate::schema::Table;
+use crate::schema::{BTreeTable, Table};
 use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
@@ -16,6 +16,7 @@ use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
+use smallvec::SmallVec;
 use turso_parser::ast::{Expr, Limit, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
@@ -258,10 +259,10 @@ pub fn prepare_delete_plan(
         })
         .unwrap_or(false);
 
-    let has_fk_cascade_triggers = btree_table_for_triggers
-        .as_ref()
-        .map(|bt| table_has_fk_cascade_triggers(resolver, database_id, &bt.name, &mut vec![]))
-        .unwrap_or(false);
+    let has_fk_cascade_triggers = match btree_table_for_triggers.as_ref() {
+        Some(bt) => table_has_fk_cascade_triggers(resolver, database_id, &bt.name)?,
+        None => false,
+    };
 
     let mut safety = DmlSafety::default();
     if has_delete_triggers {
@@ -303,45 +304,53 @@ fn table_has_fk_cascade_triggers(
     resolver: &crate::translate::emitter::Resolver,
     database_id: usize,
     table_name: &str,
-    visited: &mut Vec<String>,
-) -> bool {
-    let normalized = crate::util::normalize_ident(table_name);
-    if visited.iter().any(|v| v == &normalized) {
-        return false;
-    }
-    visited.push(normalized.clone());
+) -> Result<bool> {
+    let check_temp = database_id != crate::TEMP_DB_ID && resolver.has_temp_database();
 
-    let referencing_fks =
-        resolver.with_schema(database_id, |s| s.resolved_fks_referencing(&normalized));
-    let referencing_fks = match referencing_fks {
-        Ok(fks) => fks,
-        Err(_) => return false,
-    };
+    let mut visited: SmallVec<[Arc<BTreeTable>; 2]> = SmallVec::new();
+    let mut worklist: SmallVec<[Arc<BTreeTable>; 2]> = SmallVec::new();
 
-    for fk_ref in &referencing_fks {
-        if matches!(fk_ref.fk.on_delete, RefAct::NoAction | RefAct::Restrict) {
+    let start = resolver
+        .with_schema(database_id, |s| s.get_btree_table(table_name))
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "btree table {table_name} missing from schema after delete validation"
+            ))
+        })?;
+    worklist.push(start);
+
+    while let Some(current) = worklist.pop() {
+        if visited.iter().any(|t| Arc::ptr_eq(t, &current)) {
             continue;
         }
-        let child_name = &fk_ref.child_table.name;
-        let has_triggers = resolver.with_schema(database_id, |s| {
-            s.get_triggers_for_table(child_name).next().is_some()
-        });
-        if has_triggers {
-            return true;
-        }
-        if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
-            let has_temp = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+        visited.push(current.clone());
+
+        let referencing_fks =
+            resolver.with_schema(database_id, |s| s.resolved_fks_referencing(&current.name))?;
+
+        for fk_ref in referencing_fks {
+            if matches!(fk_ref.fk.on_delete, RefAct::NoAction | RefAct::Restrict) {
+                continue;
+            }
+            let child_name = fk_ref.child_table.name.as_str();
+            let has_triggers = resolver.with_schema(database_id, |s| {
                 s.get_triggers_for_table(child_name).next().is_some()
             });
-            if has_temp {
-                return true;
+            if has_triggers {
+                return Ok(true);
             }
-        }
-        if table_has_fk_cascade_triggers(resolver, database_id, child_name, visited) {
-            return true;
+            if check_temp {
+                let has_temp = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+                    s.get_triggers_for_table(child_name).next().is_some()
+                });
+                if has_temp {
+                    return Ok(true);
+                }
+            }
+            worklist.push(fk_ref.child_table);
         }
     }
-    false
+    Ok(false)
 }
 
 /// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
