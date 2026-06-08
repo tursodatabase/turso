@@ -3204,6 +3204,177 @@ fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
     assert_eq!(&integrity[0][0].to_string(), "ok");
 }
 
+/// Repro candidate #4: a large transaction's commit runs `RewriteLiveVersions` in
+/// 1024-entry batches, so it yields with its table versions rewritten (TxID->Timestamp)
+/// but its index versions not yet. A concurrent reader whose snapshot is past the commit
+/// then sees the table at the new value while the index entries are still `TxID` — if the
+/// index read mishandles that, the row goes "missing from index". Drives the commit
+/// step-by-step and checks integrity on another connection at each IO yield.
+#[test]
+fn test_reader_consistent_during_large_indexed_commit_rewrite() {
+    use crate::StepResult;
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let c1 = db.connect();
+    c1.execute("CREATE TABLE t(pk INTEGER PRIMARY KEY, v INTEGER UNIQUE)")
+        .unwrap();
+    // > 1024 rows so the commit's RewriteLiveVersions spans multiple batches.
+    c1.execute("BEGIN").unwrap();
+    for i in 0..1500i64 {
+        c1.execute(&format!("INSERT INTO t VALUES ({i}, {})", i + 1_000_000))
+            .unwrap();
+    }
+    c1.execute("COMMIT").unwrap();
+    c1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let c2 = db.connect();
+
+    // Large UPDATE of the indexed column in one tx; drive its COMMIT step-by-step.
+    c1.execute("BEGIN CONCURRENT").unwrap();
+    c1.execute("UPDATE t SET v = v + 5_000_000").unwrap();
+    let mut commit = c1.prepare("COMMIT").unwrap();
+    let pager_io = c1.pager.load().io.clone();
+    let mut steps = 0;
+    loop {
+        match commit.step().unwrap() {
+            StepResult::Done => break,
+            StepResult::IO => {
+                // Concurrent reader: its fresh snapshot may be past c1's CommitEnd while
+                // c1 is mid-RewriteLiveVersions. Integrity + a couple index reads must hold.
+                let integ = get_rows(&c2, "PRAGMA integrity_check");
+                assert_eq!(
+                    &integ[0][0].to_string(),
+                    "ok",
+                    "integrity failed mid-rewrite at step {steps}: {integ:?}"
+                );
+                pager_io.step().unwrap();
+                steps += 1;
+            }
+            other => panic!("unexpected commit step: {other:?}"),
+        }
+    }
+    let integ = get_rows(&c1, "PRAGMA integrity_check");
+    assert_eq!(&integ[0][0].to_string(), "ok", "final integrity: {integ:?}");
+}
+
+/// Repro candidate: a concurrent reader must NOT observe an in-flight (uncommitted)
+/// index tombstone. conn2 updates an indexed UNIQUE column (tombstoning the old entry
+/// with end=TxID(conn2), inserting the new) but does not commit; conn1's snapshot
+/// predates conn2, so conn1 must still see the OLD indexed value via the index. A bug
+/// where the index scan applies the end=TxID tombstone without checking the deleting
+/// tx's visibility makes the row "missing from index" for conn1.
+#[test]
+fn test_reader_does_not_see_inflight_index_tombstone() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let c1 = db.connect();
+    c1.execute("CREATE TABLE t(pk NUMERIC PRIMARY KEY, v NUMERIC UNIQUE)")
+        .unwrap();
+    c1.execute("INSERT INTO t VALUES (1, 719)").unwrap();
+    c1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap(); // 719 btree-resident
+
+    let c2 = db.connect();
+    // c2 updates the indexed column but does NOT commit (in-flight tombstone of 719).
+    c2.execute("BEGIN CONCURRENT").unwrap();
+    c2.execute("UPDATE t SET v = 743 WHERE pk = 1").unwrap();
+
+    // c1 reads in its own snapshot (auto-commit) — must still see v=719 via the index.
+    let via_idx_719 = get_rows(&c1, "SELECT pk FROM t WHERE v = 719");
+    assert_eq!(
+        via_idx_719.len(),
+        1,
+        "concurrent reader must still see v=719 via the index while c2's UPDATE is in flight: {via_idx_719:?}"
+    );
+    let integ = get_rows(&c1, "PRAGMA integrity_check");
+    assert_eq!(&integ[0][0].to_string(), "ok", "integrity: {integ:?}");
+
+    // c2 aborts; 719 must remain.
+    c2.execute("ROLLBACK").unwrap();
+    let after = get_rows(&c1, "SELECT pk FROM t WHERE v = 719");
+    assert_eq!(after.len(), 1, "v=719 must survive c2 rollback: {after:?}");
+}
+
+/// An UPDATE of an indexed UNIQUE column inside a tx that cleanly ROLLs BACK must not
+/// leave the pre-update index entry tombstoned (regression guard; this path is correct).
+#[test]
+fn test_rollback_of_indexed_update_keeps_btree_resident_index_entry() {
+    // Minimal repro candidate for the turso_stress "row missing from index" bug:
+    // an UPDATE of an indexed UNIQUE column, inside a tx that ROLLS BACK, must not
+    // leave the pre-update index entry tombstoned — especially when that entry is
+    // already btree-resident (checkpointed + GC'd from the MVCC store), which is
+    // when the UPDATE creates a synthetic tombstone over the btree entry.
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(pk NUMERIC PRIMARY KEY, v NUMERIC UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 719)").unwrap();
+    // Make value 719's index entry btree-resident (and drop MVCC-store versions).
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Update the indexed column, then abort the transaction.
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("UPDATE t SET v = 743 WHERE pk = 1").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    // The row's original indexed value (719) must still be reachable via the index,
+    // and 743 (never committed) must not be.
+    let via_idx_719 = get_rows(&conn, "SELECT pk FROM t WHERE v = 719");
+    assert_eq!(
+        via_idx_719.len(),
+        1,
+        "row must remain in autoindex under v=719 after rollback: {via_idx_719:?}"
+    );
+    let via_idx_743 = get_rows(&conn, "SELECT pk FROM t WHERE v = 743");
+    assert!(
+        via_idx_743.is_empty(),
+        "aborted UPDATE's v=743 must not be in the index: {via_idx_743:?}"
+    );
+    let integ = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(&integ[0][0].to_string(), "ok", "integrity: {integ:?}");
+}
+
+/// Repro candidate matching the turso_stress trace exactly: an UPDATE of an indexed
+/// UNIQUE column inside a BEGIN CONCURRENT tx that ABORTS via write-write conflict
+/// (not a clean ROLLBACK). The pre-update index entry (719, btree-resident) must be
+/// restored when the tx aborts; a buggy abort leaves it tombstoned → the row's value
+/// goes missing from the index even though the row (unchanged) still holds it.
+#[test]
+fn test_conflict_abort_of_indexed_update_keeps_btree_resident_index_entry() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let c1 = db.connect();
+    c1.execute("CREATE TABLE t(pk NUMERIC PRIMARY KEY, v NUMERIC UNIQUE)")
+        .unwrap();
+    c1.execute("INSERT INTO t VALUES (1, 719)").unwrap();
+    c1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap(); // 719 btree-resident
+
+    let c2 = db.connect();
+
+    // c1 updates the indexed column of pk=1 to 743 (tombstones the btree-resident 719
+    // entry, stages a 743 entry) — but does not commit yet.
+    c1.execute("BEGIN CONCURRENT").unwrap();
+    c1.execute("UPDATE t SET v = 743 WHERE pk = 1").unwrap();
+
+    // c2 commits the SAME index key (743) on a different row, so c1's commit must
+    // write-write-conflict on the unique index and abort.
+    c2.execute("BEGIN CONCURRENT").unwrap();
+    c2.execute("INSERT INTO t VALUES (2, 743)").unwrap();
+    c2.execute("COMMIT").unwrap();
+
+    let c1_commit = c1.execute("COMMIT");
+    assert!(
+        c1_commit.is_err(),
+        "c1 commit should write-write conflict on index key 743, got {c1_commit:?}"
+    );
+
+    // pk=1 is unchanged (719) and must still be reachable via the index; pk=2 has 743.
+    let via_idx_719 = get_rows(&c1, "SELECT pk FROM t WHERE v = 719");
+    assert_eq!(
+        via_idx_719.len(),
+        1,
+        "pk=1 must remain in autoindex under v=719 after c1's conflict-abort: {via_idx_719:?}"
+    );
+    let integ = get_rows(&c1, "PRAGMA integrity_check");
+    assert_eq!(&integ[0][0].to_string(), "ok", "integrity: {integ:?}");
+}
+
 /// Deterministic regression for the non-blocking checkpoint vs. concurrent-CREATE bug
 /// (reproduces whopper chaos+mvcc seeds 28 / 60, which panic at the
 /// `has_pending_root_publication()` assert in `TruncateWal`).
@@ -3217,9 +3388,6 @@ fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
 /// checkpointing it. When the parked checkpoint resumes and reaches `TruncateWal`, the
 /// over-strict invariant — which flags ANY negative-root object in the LIVE schema, not just
 /// the ones this pass owns — panics.
-///
-/// Correct behavior: the checkpoint completes; the concurrently-created table survives with
-/// its negative placeholder root page (a later checkpoint resolves it); integrity holds.
 ///
 /// Fixed by making `has_unpublished_schema_changes` deferral-aware (only flag negative root
 /// pages this checkpoint actually materialized, via `table_id_to_rootpage`) while keeping
