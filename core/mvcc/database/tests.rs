@@ -3117,6 +3117,102 @@ fn test_reader_consistent_during_large_indexed_commit_rewrite() {
     assert_eq!(&integ[0][0].to_string(), "ok", "final integrity: {integ:?}");
 }
 
+#[test]
+fn test_checkpoint_two_scan_toctou_orphans_first_checkpoint_unique_index() {
+    use crate::StepResult;
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    // connV (victim writer): create + populate, but DO NOT checkpoint, so the
+    // table btree and both UNIQUE autoindexes are created fresh in the pass below.
+    let conn_v = db.connect();
+    conn_v
+        .execute("CREATE TABLE t(pk NUMERIC PRIMARY KEY, v NUMERIC UNIQUE)")
+        .unwrap();
+    conn_v.execute("INSERT INTO t VALUES (615, 329)").unwrap();
+    // A second surviving row so the table btree is non-empty regardless of the
+    // victim row's fate (keeps integrity_check scanning the table).
+    conn_v.execute("INSERT INTO t VALUES (616, 330)").unwrap();
+
+    let conn_c = db.connect();
+    conn_c
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    let injector = FixedYieldInjector::new([
+        CheckpointYieldPoint::AfterCollectTableRows.point(),
+        CheckpointYieldPoint::BeforeAcquireLock.point(),
+    ]);
+    conn_c.set_yield_injector(Some(injector.clone()));
+    // Force a checkpoint and stop before getting rows
+    let mut checkpoint = conn_c.prepare("INSERT INTO t VALUES (617, 331)").unwrap();
+    let pager_io = conn_c.pager.load().io.clone();
+
+    // Helper: step the auto-checkpoint until the NEXT injected yield fires (the
+    // injector's remaining-set shrinks). Returns when a fresh yield is observed.
+    let step_to_next_yield = |checkpoint: &mut crate::Statement, expect_remaining: usize| {
+        for _ in 0..200_000 {
+            match checkpoint.step().unwrap() {
+                StepResult::IO => {
+                    if injector.remaining_len() == expect_remaining {
+                        return true;
+                    }
+                    pager_io.step().unwrap();
+                }
+                StepResult::Done => return false,
+                other => panic!("unexpected checkpoint step: {other:?}"),
+            }
+        }
+        false
+    };
+
+    assert!(
+        step_to_next_yield(&mut checkpoint, 1),
+        "auto-checkpoint must yield after the table scan, before the index scan"
+    );
+
+    // start deleting rows so that we mark end with TxID, but not commit so that there
+    // isn't any Timestamps to use, meaning we shouldn't checkpoint that one.
+    let conn_d = db.connect();
+    conn_d.execute("BEGIN").unwrap();
+    conn_d.execute("DELETE FROM t WHERE pk = 615").unwrap();
+
+    assert!(
+        step_to_next_yield(&mut checkpoint, 0),
+        "auto-checkpoint must yield before acquiring the blocking lock"
+    );
+
+    // rollback, this signifies we should see any change from this tx
+    conn_d.execute("ROLLBACK").unwrap();
+
+    // Complete checkpoint
+    let mut checkpoint_done = false;
+    for _ in 0..200_000 {
+        match checkpoint.step().unwrap() {
+            StepResult::Done => {
+                checkpoint_done = true;
+                break;
+            }
+            StepResult::IO => pager_io.step().unwrap(),
+            other => panic!("unexpected checkpoint step after resume: {other:?}"),
+        }
+    }
+    assert!(checkpoint_done, "checkpoint did not complete");
+
+    conn_c.set_yield_injector(None);
+
+    let verifier = db.connect();
+    let integ = get_rows(&verifier, "PRAGMA integrity_check");
+    assert_eq!(
+        integ.len(),
+        1,
+        "integrity_check must be a single 'ok' row, got: {integ:?}"
+    );
+    assert_eq!(
+        &integ[0][0].to_string(),
+        "ok",
+        "checkpoint orphaned an index entry: {integ:?}"
+    );
+}
 /// Repro candidate: a concurrent reader must NOT observe an in-flight (uncommitted)
 /// index tombstone. conn2 updates an indexed UNIQUE column (tombstoning the old entry
 /// with end=TxID(conn2), inserting the new) but does not commit; conn1's snapshot
