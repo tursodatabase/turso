@@ -1733,18 +1733,13 @@ pub(crate) fn init_limit(
     Ok(())
 }
 
-/// Emits  `target_columns`, plus the stored columns needed by `target_columns`, into compact
-/// registers. This takes into account stored columns, and any stored columns required
-/// by virtual columns in `target_columns`.
+/// Emits `target_columns`, plus the stored columns needed by `target_columns`, into a
+/// DML row context. This takes into account stored columns, and any stored columns
+/// required by virtual columns in `target_columns`.
 ///
-/// Target columns are guaranteed to be in a contiguous block, in the given order, at the start of
-/// registers. The following postcondition holds:
-///
-/// ```text
-/// dml_ctx.to_column_reg(target_columns[i]) == dml_ctx.to_column_reg(target_columns[0]) + i
-/// ```
-///
-/// This way, target_columns[0] can be used as a base for opcodes that require unpacked records.
+/// Non-rowid target columns are allocated in target order. Rowid-alias columns resolve
+/// to `rowid_reg`, so callers that need an unpacked contiguous key or record must
+/// materialize one from `DmlColumnContext::to_column_reg`.
 pub(crate) fn emit_columns_and_dependencies(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
@@ -1754,15 +1749,33 @@ pub(crate) fn emit_columns_and_dependencies(
     resolver: &Resolver,
 ) -> Result<DmlColumnContext> {
     let targets: Vec<usize> = target_columns.into_iter().collect();
+    let target_mask: ColumnMask = targets.iter().copied().try_collect()?;
+    let non_rowid_targets: Vec<usize> = targets
+        .iter()
+        .copied()
+        .filter(|&idx| !table.columns()[idx].is_rowid_alias())
+        .collect();
+    let mut non_rowid_target_positions = vec![None; table.columns().len()];
+    for (pos, idx) in non_rowid_targets.iter().copied().enumerate() {
+        non_rowid_target_positions[idx] = Some(pos);
+    }
     let dependencies = table.dependencies_of_columns(targets.iter().copied())?;
 
-    let target_base = program.alloc_registers(targets.len());
+    let target_base = if non_rowid_targets.is_empty() {
+        0
+    } else {
+        program.alloc_registers(non_rowid_targets.len())
+    };
     let extra_base = {
         let mut dependencies_not_in_targets: ColumnMask = dependencies.clone();
-        let target_mask = targets.iter().copied().try_collect()?;
-        dependencies_not_in_targets.union_with(&target_mask)?;
+        dependencies_not_in_targets -= &target_mask;
 
-        let extra_count = dependencies_not_in_targets.count();
+        let extra_count = table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(idx, col)| dependencies_not_in_targets.get(*idx) && !col.is_rowid_alias())
+            .count();
 
         if extra_count > 0 {
             program.alloc_registers(extra_count)
@@ -1773,14 +1786,14 @@ pub(crate) fn emit_columns_and_dependencies(
 
     let mut extra_idx = 0;
     let pairs = table.columns().iter().enumerate().map(|(idx, col)| {
-        let reg = if col.is_rowid_alias() {
-            rowid_reg
-        } else if let Some(pos) = targets.iter().position(|&t| t == idx) {
+        let reg = if let Some(pos) = non_rowid_target_positions[idx] {
             let reg = target_base + pos;
             if !col.is_virtual_generated() {
                 program.emit_column_or_rowid(cursor_id, idx, reg);
             }
             reg
+        } else if col.is_rowid_alias() {
+            rowid_reg
         } else if dependencies.get(idx) {
             let reg = extra_base + extra_idx;
             program.emit_column_or_rowid(cursor_id, idx, reg);
@@ -1792,9 +1805,14 @@ pub(crate) fn emit_columns_and_dependencies(
         (col, reg)
     });
     let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
-    debug_assert!(targets
-        .windows(2)
-        .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));
+    if targets
+        .iter()
+        .all(|&idx| !table.columns()[idx].is_rowid_alias())
+    {
+        debug_assert!(targets
+            .windows(2)
+            .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));
+    }
 
     let table_arc = Arc::new(table.clone());
     gencol::compute_virtual_columns(
