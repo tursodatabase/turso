@@ -107,7 +107,7 @@ ongoing work to pass the full SQLite TCL test suite.
 | INSERT                    | ✅ Yes     |                                                                                   |
 | INSERT ... ON CONFLICT (UPSERT) | ✅ Yes |                                                                                   |
 | ON CONFLICT clause        | ✅ Yes     |                                                                                   |
-| REINDEX                   | ❌ No      |                                                                                   |
+| REINDEX                   | ✅ Yes      |                                                                                   |
 | RELEASE SAVEPOINT         | ✅ Yes     |                                                                                   |
 | REPLACE                   | ✅ Yes     |                                                                                   |
 | RETURNING clause          | ✅ Yes     |                                                                                   |
