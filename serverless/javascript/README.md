@@ -70,6 +70,21 @@ await conn.transaction(async () => {
 }).concurrent();
 ```
 
+### Custom Headers
+
+Requests can carry extra HTTP headers, e.g. for routing through a gateway:
+
+```javascript
+const conn = connect({
+  url: process.env.TURSO_DATABASE_URL,
+  authToken: process.env.TURSO_AUTH_TOKEN,
+  // Extra headers attached to every request. Applied after the standard
+  // headers, so they can override e.g. `Authorization`. The `Host` key has
+  // no effect — fetch forbids setting it.
+  requestHeaders: { "x-custom-header": "value" },
+});
+```
+
 ### libSQL Compatibility Layer
 
 For existing libSQL applications, use the compatibility layer:

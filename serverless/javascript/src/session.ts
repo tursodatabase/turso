@@ -14,6 +14,7 @@ import {
   type DescribeResult,
   type GetAutocommitRequest,
   type QueryOptions,
+  type HttpContext,
 } from './protocol.js';
 import { DatabaseError } from './error.js';
 import { encodeSqlArgs } from './args.js';
@@ -39,6 +40,13 @@ export interface SessionConfig {
   remoteEncryptionKey?: string;
   /** Default maximum query execution time in milliseconds before interruption. */
   defaultQueryTimeout?: number;
+  /**
+   * Extra HTTP headers attached to every request sent to the server.
+   * Applied after the standard headers, so they can override e.g.
+   * `Authorization`. Passing the `Host` key (case-insensitive) has no
+   * effect — fetch forbids setting it.
+   */
+  requestHeaders?: Record<string, string>;
 }
 
 function normalizeUrl(url: string): string {
@@ -66,6 +74,15 @@ export class Session {
   constructor(config: SessionConfig) {
     this.config = config;
     this.baseUrl = normalizeUrl(config.url);
+  }
+
+  private httpContext(): HttpContext {
+    return {
+      url: this.baseUrl,
+      authToken: this.config.authToken,
+      remoteEncryptionKey: this.config.remoteEncryptionKey,
+      requestHeaders: this.config.requestHeaders,
+    };
   }
 
   /**
@@ -126,7 +143,7 @@ export class Session {
 
     let response;
     try {
-      response = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+      response = await executePipeline(this.httpContext(), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
       this.autocommit = true;
@@ -194,7 +211,7 @@ export class Session {
 
     let result;
     try {
-      result = await executeCursor(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+      result = await executeCursor(this.httpContext(), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
       throw e;
@@ -376,7 +393,7 @@ export class Session {
 
     let batchResult;
     try {
-      batchResult = await executeCursor(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+      batchResult = await executeCursor(this.httpContext(), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
       throw e;
@@ -470,7 +487,7 @@ export class Session {
 
     let seqResponse;
     try {
-      seqResponse = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+      seqResponse = await executePipeline(this.httpContext(), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
       this.autocommit = true;
@@ -509,7 +526,7 @@ export class Session {
           } as CloseRequest]
         };
 
-        await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey);
+        await executePipeline(this.httpContext(), request);
       } catch {
         // Ignore errors during close — the connection might already be closed
         // or the baton may be stale after a timeout.
