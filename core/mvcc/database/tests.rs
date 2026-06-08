@@ -13931,11 +13931,11 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
         fn set_header(&self, h: LogHeader) {
             self.inner.set_header(h)
         }
-        fn on_checkpoint_start(&self, m: u64) -> Result<()> {
-            self.inner.on_checkpoint_start(m)
+        fn on_checkpoint_start(&self) -> Result<()> {
+            self.inner.on_checkpoint_start()
         }
-        fn on_checkpoint_end(&self, m: u64, r: Result<&CheckpointResult>) -> Result<()> {
-            self.inner.on_checkpoint_end(m, r)
+        fn on_checkpoint_end(&self, r: Result<&CheckpointResult>) -> Result<()> {
+            self.inner.on_checkpoint_end(r)
         }
         fn encryption_ctx(&self) -> Option<EncryptionContext> {
             self.inner.encryption_ctx()
