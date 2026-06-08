@@ -5971,13 +5971,11 @@ fn update_agg_payload(
                         ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
                     }
                 }
-                Value::Blob(b) => {
-                    match try_for_float(&b).1 {
-                        ParsedNumber::Integer(i) => apply_kbn_step(sum_val, i as f64, &mut sum_state),
-                        ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
-                        ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
-                    }
-                }
+                Value::Blob(b) => match try_for_float(&b).1 {
+                    ParsedNumber::Integer(i) => apply_kbn_step(sum_val, i as f64, &mut sum_state),
+                    ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
+                    ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
+                },
                 _ => unreachable!(),
             }
             *r_err_val = Value::from_f64(sum_state.r_err);
