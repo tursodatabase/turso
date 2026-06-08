@@ -23,6 +23,7 @@ use turso_core::{
 use turso_parser::ast::{ColumnConstraint, SortOrder};
 
 pub mod chaotic_elle;
+pub mod chaotic_reader_hold;
 pub mod elle;
 pub mod error_handling;
 mod io;
@@ -909,6 +910,9 @@ impl Whopper {
                         ctx.fiber.current_op = Some(Operation::Rollback);
                     }
                     crate::error_handling::ErrorAction::ClearTxn => {
+                        // Subsumes the benign "commit on already-ended txn"
+                        // (auto-rollback race): classify_op_error maps TxError
+                        // (out of tx) to ClearTxn.
                         ctx.fiber.txn_id = None;
                     }
                     // In-process whopper has no worker process to respawn,
@@ -1436,9 +1440,16 @@ impl Whopper {
         )
         .map_err(|e| anyhow::anyhow!("Database open failed: {}", e))?;
 
-        if self.disable_mvcc_auto_checkpoint {
-            if let Some(mv_store) = db.get_mv_store().as_ref() {
+        if let Some(mv_store) = db.get_mv_store().as_ref() {
+            if self.disable_mvcc_auto_checkpoint {
                 mv_store.set_checkpoint_threshold(-1);
+            } else {
+                // Force frequent Passive auto-checkpoints so the non-blocking
+                // off-lock checkpoint path is exercised constantly under the
+                // concurrent workload (the default ~4MB threshold almost never
+                // trips within a simulation run). This is what surfaces the
+                // reader-vs-checkpoint and index-vs-checkpoint races.
+                mv_store.set_checkpoint_threshold(8 * 1024);
             }
         }
 
