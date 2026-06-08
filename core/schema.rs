@@ -14,7 +14,7 @@ use crate::translate::expr::{
 };
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
-use crate::types::IOResult;
+use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
@@ -180,6 +180,33 @@ pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
+pub const SEQ_BACKING_TABLE_PREFIX: &str = "__turso_internal_seq_";
+// Prefix for the hidden sequence *name* owned by an AUTOINCREMENT table.
+// This is not itself a table name. Its physical backing table is still named
+// by applying SEQ_BACKING_TABLE_PREFIX to the full sequence name.
+pub const AUTOINCREMENT_SEQ_PREFIX: &str = "__turso_internal_autoincrement_";
+
+/// Name of the hidden sequence owned by an AUTOINCREMENT table.
+pub fn autoincrement_sequence_name(table_name: &str) -> String {
+    String::from(AUTOINCREMENT_SEQ_PREFIX) + table_name
+}
+
+struct SequenceBackingTableSource {
+    sequence_name: String,
+    root_page: i64,
+    num_columns: usize,
+}
+
+struct SequenceMetadata {
+    // is_called intentionally omitted from descriptor reconstruction —
+    // the runtime watermark (including is_called) is always read from
+    // the backing-table row at nextval time, not seeded from schema.
+    start: i64,
+    increment: i64,
+    min: i64,
+    max: i64,
+    cycle: bool,
+}
 
 use crate::util::quote_identifier as quote_ident;
 
@@ -552,6 +579,17 @@ pub enum MakeFromBtreePhase {
     Rewinding,
     FetchingRecord,
     Advancing,
+    /// After the sqlite_schema scan completes we walk each sequence's
+    /// backing table to reconstruct its descriptor (start / inc / min /
+    /// max / cycle). These two phases drive that scan via the
+    /// `sequence_cursor` field on the state, yielding `IOResult::IO` on
+    /// each cursor I/O — the previous implementation called the
+    /// synchronous `populate_sequences(pager)` helper at the EOF of
+    /// `FetchingRecord`, which blocked the pager inside an async state
+    /// machine (and inside whatever vdbe-level state machine was
+    /// driving the schema reparse).
+    PopulatingSequencesRewind,
+    PopulatingSequencesFetch,
     Done,
 }
 
@@ -561,6 +599,12 @@ pub struct MakeFromBtreeState {
     cursor: Option<BTreeCursor>,
     accumulators: Option<MakeFromBtreeAccumulators>,
     read_tx_active: bool,
+    /// Backing tables left to walk during the
+    /// `PopulatingSequencesRewind`/`PopulatingSequencesFetch` phases.
+    sequence_sources: Vec<SequenceBackingTableSource>,
+    /// Cursor for the source currently being scanned (the back of
+    /// `sequence_sources` is popped onto this when entering Rewind).
+    sequence_cursor: Option<BTreeCursor>,
 }
 
 impl Default for MakeFromBtreeState {
@@ -576,6 +620,8 @@ impl MakeFromBtreeState {
             cursor: None,
             accumulators: None,
             read_tx_active: false,
+            sequence_sources: Vec::new(),
+            sequence_cursor: None,
         }
     }
 
@@ -610,6 +656,101 @@ pub fn allow_user_dml(table_name: &str) -> bool {
     const NAMES: [&str; 2] = [SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT];
     !(NAMES.iter().any(|n| n.eq_ignore_ascii_case(table_name))
         || table_name.starts_with(TURSO_INTERNAL_PREFIX)) // internal name wouldn't be uppercase
+}
+
+// Sequence persistence design
+// ===========================
+//
+// Every sequence — user-created (CREATE SEQUENCE) and implicit
+// (AUTOINCREMENT) — is backed by a B-tree table
+// `__turso_internal_seq_<name>` with schema (value INTEGER PRIMARY KEY,
+// is_called, start, inc, min, max, cycle). The runtime watermark IS the
+// disk state: there is no in-memory counter. Every nextval/setval reads
+// the current watermark row inside the executing transaction, computes
+// the new value, and writes it back — nextval INSERTs a new row;
+// setval DELETEs every row then INSERTs one at the requested value.
+//
+// At commit time the backing table is compacted to one row at MAX(value)
+// for ascending sequences or MIN(value) for descending. AUTOINCREMENT
+// sequences additionally mirror their watermark into `sqlite_sequence` so
+// the high-water mark is readable by SQLite-compatible tools.
+//
+// Rollback semantics fall out of bundling the backing-table writes with
+// the user's transaction:
+//   * Commit → the sequence advance is on disk.
+//   * Rollback → the sequence advance is not on disk.
+// A value emitted only by rolled-back transactions may be re-emitted by a
+// later nextval — there is no allocator state retained outside the
+// committed row. This matches SQLite AUTOINCREMENT's behavior and does
+// not match PostgreSQL's "permanently burned" semantics; consumers
+// needing globally unique ids should pair nextval with an INSERT in the
+// same transaction.
+//
+// Cross-process correctness comes for free from the disk-only model:
+// under WAL the write lock serializes processes so the next holder
+// observes the latest committed watermark.
+/// Schema descriptor for a sequence. Pure data — the runtime state lives
+/// in the backing table `__turso_internal_seq_<name>` and is read from
+/// disk by `Insn::SequenceComputeNext` + surrounding cursor bytecode on
+/// every nextval/setval call. See `core/translate/sequence.rs` and the
+/// disk-only design notes above.
+///
+/// `Clone` is implemented so `Arc::make_mut` can in-place edit the `name`
+/// field during `ALTER TABLE … RENAME TO …` on an AUTOINCREMENT table —
+/// keeping the sequence's identity in sync with the parent table's new
+/// name without forcing a schema reparse.
+#[derive(Debug, Clone)]
+pub struct Sequence {
+    pub name: String,
+    pub start_value: i64,
+    pub increment_by: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+}
+
+impl Sequence {
+    pub fn new(
+        name: String,
+        start: Option<i64>,
+        increment: Option<i64>,
+        min_value: Option<i64>,
+        max_value: Option<i64>,
+        cycle: bool,
+    ) -> crate::Result<Self> {
+        let increment_by = increment.unwrap_or(1);
+        if increment_by == 0 {
+            return Err(crate::LimboError::ParseError(
+                "INCREMENT must not be zero".to_string(),
+            ));
+        }
+        let min_val = min_value.unwrap_or(if increment_by > 0 { 1 } else { i64::MIN });
+        let max_val = max_value.unwrap_or(if increment_by > 0 { i64::MAX } else { -1 });
+        if min_val >= max_val {
+            return Err(crate::LimboError::ParseError(format!(
+                "MINVALUE ({min_val}) must be less than MAXVALUE ({max_val})"
+            )));
+        }
+        let start_val = start.unwrap_or(if increment_by > 0 { min_val } else { max_val });
+        if start_val < min_val {
+            return Err(crate::LimboError::ParseError(format!(
+                "START value ({start_val}) cannot be less than MINVALUE ({min_val})"
+            )));
+        }
+        if start_val > max_val {
+            return Err(crate::LimboError::ParseError(format!(
+                "START value ({start_val}) cannot be greater than MAXVALUE ({max_val})"
+            )));
+        }
+        Ok(Self {
+            name,
+            start_value: start_val,
+            increment_by,
+            min_value: min_val,
+            max_value: max_val,
+            cycle,
+        })
+    }
 }
 
 /// Type of schema object for conflict checking
@@ -660,6 +801,8 @@ pub struct Schema {
     pub type_registry: HashMap<String, Arc<TypeDef>>,
 
     pub generated_columns_enabled: bool,
+    /// Named sequences (CREATE SEQUENCE)
+    pub sequences: HashMap<String, Arc<Sequence>>,
 }
 
 impl Default for Schema {
@@ -790,6 +933,7 @@ impl Schema {
             dropped_root_pages: HashSet::default(),
             type_registry,
             generated_columns_enabled: false,
+            sequences: HashMap::default(),
         })
     }
 
@@ -1411,29 +1555,19 @@ impl Schema {
                     let row = return_if_io!(cursor.record());
 
                     let Some(row) = row else {
-                        // EOF - finalize
-                        pager.end_read_tx();
-                        state.read_tx_active = false;
-
-                        let acc = state
-                            .accumulators
-                            .take()
-                            .expect("accumulators must be initialized in Init phase");
-                        self.populate_indices(
-                            syms,
-                            acc.from_sql_indexes,
-                            acc.automatic_indices,
-                            mv_cursor.is_some(),
-                        )?;
-                        self.populate_materialized_views(
-                            acc.materialized_view_info,
-                            acc.dbsp_state_roots,
-                            acc.dbsp_state_index_roots,
-                        )?;
-
+                        // EOF on the sqlite_schema scan. Hand off to the
+                        // async sequence-descriptor walk — pulled out of
+                        // the prior synchronous `populate_sequences(pager)`
+                        // call so the schema state machine can yield
+                        // `IOResult::IO` on each cursor read instead of
+                        // blocking the pager. The Rewind/Fetch phases
+                        // below pop the back of `state.sequence_sources`,
+                        // install the descriptor, drop the cursor, and
+                        // repeat until empty.
+                        state.sequence_sources = self.sequence_backing_tables();
                         state.cursor = None;
-                        state.phase = MakeFromBtreePhase::Done;
-                        return Ok(IOResult::Done(()));
+                        state.phase = MakeFromBtreePhase::PopulatingSequencesRewind;
+                        continue;
                     };
 
                     // Process the row (no IO - CPU only)
@@ -1496,6 +1630,87 @@ impl Schema {
                         .expect("cursor must be initialized in Init phase");
                     return_if_io!(cursor.next());
                     state.phase = MakeFromBtreePhase::FetchingRecord;
+                }
+
+                MakeFromBtreePhase::PopulatingSequencesRewind => {
+                    // Either no sources left → finalize, or pop the next
+                    // source and rewind its cursor.
+                    if state.sequence_sources.is_empty() {
+                        pager.end_read_tx();
+                        state.read_tx_active = false;
+
+                        let acc = state
+                            .accumulators
+                            .take()
+                            .expect("accumulators must be initialized in Init phase");
+                        self.populate_indices(
+                            syms,
+                            acc.from_sql_indexes,
+                            acc.automatic_indices,
+                            mv_cursor.is_some(),
+                        )?;
+                        self.populate_materialized_views(
+                            acc.materialized_view_info,
+                            acc.dbsp_state_roots,
+                            acc.dbsp_state_index_roots,
+                        )?;
+
+                        state.phase = MakeFromBtreePhase::Done;
+                        return Ok(IOResult::Done(()));
+                    }
+                    // Drop any cursor from a previous source before opening
+                    // the new one (Drop logic on the BTreeCursor releases
+                    // its page pins).
+                    state.sequence_cursor = None;
+                    let source = state
+                        .sequence_sources
+                        .last()
+                        .expect("non-empty checked above");
+                    // MVCC backing tables that haven't been checkpointed
+                    // yet carry the negative-root sentinel; the pager
+                    // can't read them directly. Skip — the SQL fallback
+                    // (`Connection::populate_sequences_via_sql`) will
+                    // load them via the MVCC row layer.
+                    if source.root_page <= 0 {
+                        state.sequence_sources.pop();
+                        continue;
+                    }
+                    let cursor =
+                        BTreeCursor::new_table(pager.clone(), source.root_page, source.num_columns);
+                    state.sequence_cursor = Some(cursor);
+                    let cursor = state.sequence_cursor.as_mut().expect("just set");
+                    return_if_io!(cursor.rewind());
+                    state.phase = MakeFromBtreePhase::PopulatingSequencesFetch;
+                }
+
+                MakeFromBtreePhase::PopulatingSequencesFetch => {
+                    let cursor = state
+                        .sequence_cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in PopulatingSequencesRewind");
+                    let record = return_if_io!(cursor.record());
+                    let source = state.sequence_sources.pop().expect("at least one source");
+                    let record = record.ok_or_else(|| {
+                        LimboError::Corrupt(format!(
+                            "internal sequence backing table for \"{}\" is empty; \
+                             the descriptor metadata row must always be present",
+                            source.sequence_name
+                        ))
+                    })?;
+                    let metadata = Self::read_sequence_metadata(record).ok_or_else(|| {
+                        LimboError::Corrupt(format!(
+                            "internal sequence backing table for \"{}\" descriptor \
+                             row is malformed (expected integers for \
+                             start/inc/min/max/cycle)",
+                            source.sequence_name
+                        ))
+                    })?;
+                    self.install_sequence_descriptor(&source.sequence_name, metadata)?;
+                    // Drop the cursor before transitioning back so we
+                    // release its page pins before the next source's
+                    // rewind starts.
+                    state.sequence_cursor = None;
+                    state.phase = MakeFromBtreePhase::PopulatingSequencesRewind;
                 }
 
                 MakeFromBtreePhase::Done => {
@@ -1735,6 +1950,80 @@ impl Schema {
         Ok(())
     }
 
+    /// Yield (backing_table_name, sequence_name) for every backing table
+    /// currently in the schema. Shared shape for the SQL-based descriptor
+    /// loader in `Connection` so the prefix-strip lives in one place.
+    pub fn sequence_backing_table_names(&self) -> Vec<(String, String)> {
+        self.tables
+            .keys()
+            .filter_map(|name| {
+                let seq_name = name.strip_prefix(SEQ_BACKING_TABLE_PREFIX)?;
+                Some((name.clone(), seq_name.to_string()))
+            })
+            .collect()
+    }
+
+    fn sequence_backing_tables(&self) -> Vec<SequenceBackingTableSource> {
+        self.tables
+            .iter()
+            .filter_map(|(name, table)| {
+                let bt = table.btree()?;
+                let sequence_name = name.strip_prefix(SEQ_BACKING_TABLE_PREFIX)?.to_string();
+                Some(SequenceBackingTableSource {
+                    sequence_name,
+                    root_page: bt.root_page,
+                    num_columns: bt.columns().len(),
+                })
+            })
+            .collect()
+    }
+
+    fn read_sequence_metadata(record: &ImmutableRecord) -> Option<SequenceMetadata> {
+        let mut values = [0i64; 6];
+        for (i, value) in values.iter_mut().enumerate() {
+            match record.get_value(i + 1) {
+                Ok(ValueRef::Numeric(crate::numeric::Numeric::Integer(v))) => {
+                    *value = v;
+                }
+                _ => return None,
+            }
+        }
+        let [_is_called, start, increment, min, max, cycle] = values;
+        Some(SequenceMetadata {
+            start,
+            increment,
+            min,
+            max,
+            cycle: cycle != 0,
+        })
+    }
+
+    fn install_sequence_descriptor(
+        &mut self,
+        sequence_name: &str,
+        metadata: SequenceMetadata,
+    ) -> crate::Result<()> {
+        let seq = Sequence::new(
+            sequence_name.to_string(),
+            Some(metadata.start),
+            Some(metadata.increment),
+            Some(metadata.min),
+            Some(metadata.max),
+            metadata.cycle,
+        )
+        .map_err(|err| {
+            LimboError::Corrupt(format!(
+                "internal sequence backing table for \"{sequence_name}\" \
+                 has invalid persisted metadata \
+                 (start={}, increment={}, min={}, max={}, cycle={}): {err}",
+                metadata.start, metadata.increment, metadata.min, metadata.max, metadata.cycle,
+            ))
+        })?;
+        self.sequences
+            .insert(normalize_ident(sequence_name), std::sync::Arc::new(seq));
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn handle_schema_row(
         &mut self,
@@ -1788,6 +2077,14 @@ impl Schema {
                         )));
                     }
 
+                    // Detect sequence-backing tables by name prefix.
+                    // Just add the table (for B-tree access); sequences are created by
+                    // AddSequence at CREATE time or initialize_sequences at open time.
+                    if table.name.starts_with(SEQ_BACKING_TABLE_PREFIX) {
+                        self.add_btree_table(Arc::new(table))?;
+                        return Ok(());
+                    }
+
                     // Check if this is a DBSP state table
                     if table.name.starts_with(DBSP_TABLE_PREFIX) {
                         // Extract version and view name from __turso_internal_dbsp_state_v<version>_<viewname>
@@ -1822,7 +2119,31 @@ impl Schema {
                     let mut table = table;
                     table.resolve_custom_type_affinities(self);
                     table.propagate_domain_constraints(self)?;
+                    let has_autoinc = table.has_autoincrement;
+                    let tbl_name = table.name.clone();
                     self.add_btree_table(Arc::new(table))?;
+
+                    // Create the hidden sequence object owned by this
+                    // AUTOINCREMENT table. The `__turso_internal_autoincrement_`
+                    // prefix is a sequence namespace marker, not a table name;
+                    // the physical table is the corresponding
+                    // `__turso_internal_seq_<sequence-name>` backing table.
+                    if has_autoinc {
+                        let seq_name = autoincrement_sequence_name(&tbl_name);
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            self.sequences.entry(normalize_ident(&seq_name))
+                        {
+                            let seq = Sequence::new(
+                                seq_name.clone(),
+                                Some(1),
+                                Some(1),
+                                None,
+                                None,
+                                false,
+                            )?;
+                            e.insert(Arc::new(seq));
+                        }
+                    }
                 }
             }
             "index" => {
@@ -2182,6 +2503,18 @@ impl Schema {
         Ok(())
     }
 
+    pub fn get_sequence(&self, name: &str) -> Option<&Arc<Sequence>> {
+        self.sequences.get(&normalize_ident(name))
+    }
+
+    /// Remove a sequence and its backing table from the in-memory schema.
+    pub fn remove_sequence(&mut self, name: &str) {
+        let normalized = normalize_ident(name);
+        self.sequences.remove(&normalized);
+        let backing_table = crate::translate::sequence::sequence_backing_table_name(&normalized);
+        self.tables.remove(&backing_table);
+    }
+
     /// Returns the type of schema object with the given name, if one exists.
     /// Checks tables, views, and indexes.
     pub fn get_object_type(&self, name: &str) -> Option<SchemaObjectType> {
@@ -2299,6 +2632,7 @@ impl Clone for Schema {
             dropped_root_pages: self.dropped_root_pages.clone(),
             type_registry: self.type_registry.clone(),
             generated_columns_enabled: self.generated_columns_enabled,
+            sequences: self.sequences.clone(),
         }
     }
 }
@@ -6313,5 +6647,37 @@ mod tests {
         let _ = t.columns_mut();
         assert!(t.peek_column_dependencies().is_none());
         Ok(())
+    }
+
+    /// `install_sequence_descriptor` must surface an error when the
+    /// persisted metadata is invalid (e.g. min > max) rather than
+    /// silently dropping the sequence. The internal backing table is
+    /// the only persistent record of the sequence; a silent drop would
+    /// manifest later as a misleading "sequence does not exist" on the
+    /// next nextval that masks real on-disk corruption.
+    #[test]
+    fn install_sequence_descriptor_rejects_invalid_metadata_with_corruption_error() {
+        let mut schema = Schema::new();
+        let bogus = SequenceMetadata {
+            // increment of zero is universally invalid; Sequence::new
+            // rejects it with a clear error.
+            start: 0,
+            increment: 0,
+            min: 0,
+            max: 100,
+            cycle: false,
+        };
+        let result = schema.install_sequence_descriptor("broken_seq", bogus);
+        let err = result.expect_err(
+            "invalid persisted descriptor must surface as an error, not be silently dropped",
+        );
+        assert!(
+            matches!(err, LimboError::Corrupt(_)),
+            "expected Corrupt error for unreadable internal backing table, got: {err:?}",
+        );
+        assert!(
+            !schema.sequences.contains_key("broken_seq"),
+            "rejected descriptor must not land in the sequences map",
+        );
     }
 }

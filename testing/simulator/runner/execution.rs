@@ -10,8 +10,32 @@ use turso_core::{Connection, LimboError, Result, Value};
 ///
 /// - WriteWriteConflict: MVCC conflict, the DB rolled back the transaction
 /// - TxError: Transaction state error (e.g., BEGIN twice, COMMIT with no transaction)
+/// - Busy / BusySnapshot: another connection holds the write lock or
+///   read snapshot. The simulator drives multiple connections against
+///   the same database; under contention the engine surfaces these the
+///   same way a real client would, with the expectation that the caller
+///   retries. The simulator's outer loop treats them as transient and
+///   moves on (no progress to undo because the engine never acquired
+///   the resource).
+/// - ParseError("sequence \"...\" does not exist"): cross-connection
+///   schema-lag artifact. Connection A's `CREATE SEQUENCE` commits;
+///   connection B picks the seq from the model and runs `nextval`
+///   before B's connection schema reparse has observed A's commit.
+///   The model is consistent and the engine is consistent; only B's
+///   per-connection schema cache is one beat behind. Treat it like
+///   any other transient retry trigger.
 fn is_recoverable_tx_error(err: &LimboError) -> bool {
-    matches!(err, LimboError::WriteWriteConflict | LimboError::TxError(_))
+    matches!(
+        err,
+        LimboError::WriteWriteConflict
+            | LimboError::TxError(_)
+            | LimboError::Busy
+            | LimboError::BusySnapshot
+    ) || matches!(
+        err,
+        LimboError::ParseError(msg)
+            if msg.starts_with("sequence \"") && msg.contains("does not exist")
+    )
 }
 
 /// Returns true if the error indicates the transaction was rolled back by the database.

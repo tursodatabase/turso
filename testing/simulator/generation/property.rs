@@ -30,8 +30,8 @@ use crate::{
     common::print_diff,
     generation::{Shadow, WeightedDistribution, query::QueryDistribution},
     model::{
-        Query, QueryCapabilities, QueryDiscriminants, ReleaseSavepoint, ResultSet,
-        RollbackToSavepoint, Savepoint, expand_with_generated_columns,
+        CreateSequence, DropSequence, Query, QueryCapabilities, QueryDiscriminants,
+        ReleaseSavepoint, ResultSet, RollbackToSavepoint, Savepoint, expand_with_generated_columns,
         interactions::{
             Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
         },
@@ -65,11 +65,17 @@ impl Property {
                     };
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
                     let table_name = insert.table();
-                    let table = ctx
-                        .tables()
-                        .iter()
-                        .find(|table| table.name == table_name)
-                        .unwrap();
+                    // Concurrent connections can drop the target table between
+                    // when this property was scheduled and when we generate its
+                    // middle query. The property's invariant (rows inserted are
+                    // visible later) can no longer be checked once the table is
+                    // gone, so emit the generated query unmodified — the
+                    // post-tx validator will see the resulting "no such table"
+                    // error and skip the assertion cleanly.
+                    let Some(table) = ctx.tables().iter().find(|table| table.name == table_name)
+                    else {
+                        return Some(query);
+                    };
 
                     let partial_rows = insert.rows();
                     let partial_row = &partial_rows[*row_index];
@@ -128,13 +134,14 @@ impl Property {
                     };
 
                     let table_name = create.table.name.clone();
-                    let table = ctx
-                        .tables()
-                        .iter()
-                        .find(|table| table.name == table_name)
-                        .unwrap();
-
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    // See InsertValuesSelect above — if the target table was
+                    // dropped between schedule and generation, fall back to
+                    // an unconstrained query.
+                    let Some(table) = ctx.tables().iter().find(|table| table.name == table_name)
+                    else {
+                        return Some(query);
+                    };
                     match &query {
                         Query::Create(Create { table: t }) if t.name == table.name => {
                             // There will be no errors in the middle interactions.
@@ -169,12 +176,14 @@ impl Property {
                     };
 
                     let table_name = table_name.clone();
-                    let table = ctx
-                        .tables()
-                        .iter()
-                        .find(|table| table.name == table_name)
-                        .unwrap();
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    // See InsertValuesSelect above — if the target table was
+                    // dropped between schedule and generation, fall back to
+                    // an unconstrained query.
+                    let Some(table) = ctx.tables().iter().find(|table| table.name == table_name)
+                    else {
+                        return Some(query);
+                    };
                     match &query {
                         Query::Insert(Insert::Values {
                             table: t, values, ..
@@ -260,6 +269,9 @@ impl Property {
             }
             Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => {
                 unreachable!("No extensional queries")
+            }
+            Property::SequenceMonotonicity { .. } => {
+                unreachable!("No extensional queries for SequenceMonotonicity")
             }
             Property::SelectLimit { .. }
             | Property::SelectSelectOptimizer { .. }
@@ -1258,6 +1270,115 @@ impl Property {
                 interactions.push(assert_integrity_check(tables, connection_index));
                 interactions
             }
+            Property::SequenceMonotonicity {
+                create,
+                num_calls,
+                drop,
+            } => {
+                let mut interactions = Vec::new();
+                // Assumption clears the stack so assertion indices are deterministic
+                let seq_name_clone = create.name.clone();
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Assumption(Assertion::new(
+                        format!("sequence {seq_name_clone} monotonicity precondition"),
+                        move |_: &Vec<ResultSet>, _: &mut SimulatorEnv| Ok(Ok(())),
+                        vec![],
+                    )),
+                ));
+                // CREATE SEQUENCE
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::CreateSequence(create.clone())),
+                ));
+                // N nextval() calls
+                for _ in 0..*num_calls {
+                    interactions.push(InteractionBuilder::with_interaction(
+                        InteractionType::Query(Query::Nextval(crate::model::Nextval {
+                            name: create.name.clone(),
+                        })),
+                    ));
+                }
+                // Assertion: collected nextval results form expected sequence
+                let expected_start = create.start;
+                let expected_increment = create.increment;
+                let expected_count = *num_calls;
+                let expected_cycle = create.cycle;
+                let expected_min = create.min_value;
+                let expected_max = create.max_value;
+                let seq_name = create.name.clone();
+                let assertion = InteractionType::Assertion(Assertion::new(
+                    format!("sequence {seq_name} should return correct values"),
+                    move |stack: &Vec<ResultSet>, _env: &mut SimulatorEnv| {
+                        let mut values = Vec::new();
+                        for (i, result) in stack.iter().enumerate().take(expected_count + 1).skip(1)
+                        {
+                            match result {
+                                Ok(rows) => {
+                                    if rows.len() != 1 || rows[0].len() != 1 {
+                                        return Ok(Err(format!(
+                                            "nextval call {i} returned unexpected shape: {rows:?}",
+                                        )));
+                                    }
+                                    if let Some(v) = rows[0][0].0.as_int() {
+                                        values.push(v);
+                                    } else {
+                                        return Ok(Err(format!(
+                                            "nextval call {i} returned non-integer: {:?}",
+                                            rows[0][0]
+                                        )));
+                                    }
+                                }
+                                Err(e) => {
+                                    return Ok(Err(format!("nextval call {i} failed: {e:?}",)));
+                                }
+                            }
+                        }
+                        if expected_cycle {
+                            let range_count =
+                                ((expected_max - expected_min) / expected_increment.abs()) + 1;
+                            for (idx, val) in values.iter().enumerate() {
+                                let expected = if expected_increment > 0 {
+                                    expected_min + ((idx as i64) % range_count) * expected_increment
+                                } else {
+                                    expected_max + ((idx as i64) % range_count) * expected_increment
+                                };
+                                if *val != expected {
+                                    return Ok(Err(format!(
+                                        "sequence {}: nextval call {} returned {} but expected {} (cycling, range_count={})",
+                                        seq_name,
+                                        idx + 1,
+                                        val,
+                                        expected,
+                                        range_count
+                                    )));
+                                }
+                            }
+                        } else {
+                            for (idx, val) in values.iter().enumerate() {
+                                let expected = expected_start + (idx as i64) * expected_increment;
+                                if *val != expected {
+                                    return Ok(Err(format!(
+                                        "sequence {}: nextval call {} returned {} but expected {} (start={}, increment={})",
+                                        seq_name,
+                                        idx + 1,
+                                        val,
+                                        expected,
+                                        expected_start,
+                                        expected_increment
+                                    )));
+                                }
+                            }
+                        }
+                        Ok(Ok(()))
+                    },
+                    vec![],
+                ));
+                interactions.push(InteractionBuilder::with_interaction(assertion));
+                // DROP SEQUENCE cleanup
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::DropSequence(drop.clone())),
+                ));
+                interactions
+            }
         };
 
         assert!(!interactions.is_empty());
@@ -2001,6 +2122,64 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_sequence_monotonicity<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    _ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    use rand::seq::IndexedRandom;
+
+    // Distinct namespace from `random_create_sequence` so this property's
+    // CREATE / nextval / DROP cannot collide with sequences the regular
+    // workload creates and advances on other connections — without the
+    // separation the assertion observes an engine state already moved
+    // by an interleaved nextval from another connection.
+    let name = format!("seq_mono_{}", rng.random_range(0..10000u32));
+    let increment = *[1i64, 2, 5, 10, -1, -2, -5].choose(rng).unwrap();
+
+    let arm = rng.random_range(0..3u32);
+    let (start, min_value, max_value, cycle, num_calls) = if arm == 0 && increment.abs() <= 5 {
+        // Bounded cycling: small range, enough calls to force wrap-around
+        let range_count = rng.random_range(3..6i64);
+        let num_calls = (range_count as usize) * 2 + rng.random_range(1..4usize);
+        if increment > 0 {
+            let min = 1i64;
+            let max = min + (range_count - 1) * increment;
+            (min, min, max, true, num_calls)
+        } else {
+            let max = -1i64;
+            let min = max + (range_count - 1) * increment;
+            (max, min, max, true, num_calls)
+        }
+    } else {
+        // Unbounded (original behavior, now with negative increments too)
+        let num_calls = rng.random_range(3..8usize);
+        if increment > 0 {
+            let start = rng.random_range(1..100i64);
+            (start, 1, i64::MAX, false, num_calls)
+        } else {
+            let start = rng.random_range(-100..-1i64);
+            (start, i64::MIN + 1, -1, false, num_calls)
+        }
+    };
+
+    let create = CreateSequence {
+        name: name.clone(),
+        start,
+        increment,
+        min_value,
+        max_value,
+        cycle,
+    };
+    let drop = DropSequence { name };
+    Property::SequenceMonotonicity {
+        create,
+        num_calls,
+        drop,
+    }
+}
+
 type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
@@ -2028,6 +2207,7 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
+            PropertyDiscriminants::SequenceMonotonicity => property_sequence_monotonicity,
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
             }
@@ -2147,6 +2327,13 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::SequenceMonotonicity => {
+                if !env.profile.mvcc && remaining.create_sequence > 0 {
+                    5
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
@@ -2188,6 +2375,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
+            PropertyDiscriminants::SequenceMonotonicity => QueryCapabilities::SEQUENCE,
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
         }
     }

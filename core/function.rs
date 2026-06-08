@@ -835,6 +835,10 @@ pub enum ScalarFunc {
     UnionValueFunc,
     UnionTagFunc,
     UnionExtractFunc,
+    // Sequence functions
+    NextVal,
+    CurrVal,
+    SetVal,
 }
 
 impl Deterministic for ScalarFunc {
@@ -948,6 +952,7 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::UnionValueFunc
             | ScalarFunc::UnionTagFunc
             | ScalarFunc::UnionExtractFunc => true,
+            ScalarFunc::NextVal | ScalarFunc::CurrVal | ScalarFunc::SetVal => false,
         }
     }
 }
@@ -1086,6 +1091,9 @@ impl Display for ScalarFunc {
             Self::UnionValueFunc => "union_value",
             Self::UnionTagFunc => "union_tag",
             Self::UnionExtractFunc => "union_extract",
+            Self::NextVal => "nextval",
+            Self::CurrVal => "currval",
+            Self::SetVal => "setval",
         };
         write!(f, "{str}")
     }
@@ -1232,6 +1240,9 @@ impl ScalarFunc {
             Self::UnionValueFunc => &[2],    // union_value('tag', value)
             Self::UnionTagFunc => &[1],      // union_tag(col)
             Self::UnionExtractFunc => &[2],  // union_extract(col, 'tag')
+            // Sequence functions
+            Self::NextVal | Self::CurrVal => &[1],
+            Self::SetVal => &[2, 3],
         }
     }
 
@@ -1801,6 +1812,10 @@ impl Func {
             "union_value" => Ok(Some(Self::Scalar(ScalarFunc::UnionValueFunc))),
             "union_tag" => Ok(Some(Self::Scalar(ScalarFunc::UnionTagFunc))),
             "union_extract" => Ok(Some(Self::Scalar(ScalarFunc::UnionExtractFunc))),
+            // Sequence functions
+            "nextval" => Ok(Some(Self::Scalar(ScalarFunc::NextVal))),
+            "currval" => Ok(Some(Self::Scalar(ScalarFunc::CurrVal))),
+            "setval" => Ok(Some(Self::Scalar(ScalarFunc::SetVal))),
             _ => Ok(None),
         }
     }

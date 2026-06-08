@@ -148,8 +148,18 @@ pub(crate) fn set_insert_stmt_journal_flags(
         index_modes.iter().map(|(oc, _)| *oc),
     );
     let has_check = !table.check_constraints.is_empty();
+    // Multi-row AUTOINCREMENT inserts taint `may_abort` even when no
+    // constraint clause is declared on the table: `op_sequence_compute_next`
+    // returns `LimboError::DatabaseFull` on i64 exhaustion, and a second
+    // row that exhausts mid-statement must not leak the first row's
+    // table write past the next COMMIT — that breaks SQLite's
+    // per-statement atomicity contract. Single-row AUTOINCREMENT
+    // inserts do not need this because there is no prior row in the
+    // outer-tx write_set to roll back.
+    let autoinc_may_abort_multi_row = has_autoincrement && inserting_multiple_rows;
     let may_abort = has_triggers
         || has_fks
+        || autoinc_may_abort_multi_row
         || constraint_may_abort(
             has_statement_conflict,
             statement_conflict,

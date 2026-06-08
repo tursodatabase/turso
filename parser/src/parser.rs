@@ -989,6 +989,9 @@ impl<'a> Parser<'a> {
             TK_ID if first_tok.to_utf8().eq_ignore_ascii_case("DOMAIN") => {
                 self.parse_create_domain()
             }
+            TK_ID if first_tok.to_utf8().eq_ignore_ascii_case("SEQUENCE") => {
+                self.parse_create_sequence()
+            }
             _ => Err(Error::ParseError(format!(
                 "unexpected token: {}",
                 first_tok.to_utf8()
@@ -4788,6 +4791,101 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn parse_create_sequence(&mut self) -> Result<Stmt> {
+        eat_assert!(self, TK_ID); // eat SEQUENCE
+        let if_not_exists = self.parse_if_not_exists()?;
+        let seq_name = self.parse_fullname(false)?;
+
+        let mut start = None;
+        let mut increment = None;
+        let mut min_value = None;
+        let mut max_value = None;
+        let mut cycle = false;
+
+        loop {
+            match self.peek()? {
+                Some(tok) if tok.token_type == TK_ID => {
+                    let kw = tok.to_utf8().to_uppercase();
+                    match kw.as_str() {
+                        "START" => {
+                            eat_assert!(self, TK_ID);
+                            // Optional WITH keyword
+                            if matches!(self.peek()?, Some(t) if t.token_type == TK_WITH) {
+                                eat_assert!(self, TK_WITH);
+                            }
+                            start = Some(self.parse_sequence_i64()?);
+                        }
+                        "INCREMENT" => {
+                            eat_assert!(self, TK_ID);
+                            // Optional BY keyword
+                            if matches!(self.peek()?, Some(t) if t.token_type == TK_BY) {
+                                eat_assert!(self, TK_BY);
+                            }
+                            increment = Some(self.parse_sequence_i64()?);
+                        }
+                        "MINVALUE" => {
+                            eat_assert!(self, TK_ID);
+                            min_value = Some(self.parse_sequence_i64()?);
+                        }
+                        "MAXVALUE" => {
+                            eat_assert!(self, TK_ID);
+                            max_value = Some(self.parse_sequence_i64()?);
+                        }
+                        "CYCLE" => {
+                            eat_assert!(self, TK_ID);
+                            cycle = true;
+                        }
+                        _ => break,
+                    }
+                }
+                Some(tok) if tok.token_type == TK_NO => {
+                    eat_assert!(self, TK_NO);
+                    let next = self.peek()?;
+                    match next {
+                        Some(t)
+                            if t.token_type == TK_ID
+                                && t.to_utf8().eq_ignore_ascii_case("CYCLE") =>
+                        {
+                            eat_assert!(self, TK_ID);
+                            cycle = false;
+                        }
+                        _ => return Err(Error::ParseError("expected CYCLE after NO".to_owned())),
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        Ok(Stmt::CreateSequence {
+            if_not_exists,
+            seq_name,
+            start,
+            increment,
+            min_value,
+            max_value,
+            cycle,
+        })
+    }
+
+    fn parse_sequence_i64(&mut self) -> Result<i64> {
+        let tok = self.peek_no_eof()?;
+        let sign: i64 = if tok.token_type == TK_MINUS {
+            eat_assert!(self, TK_MINUS);
+            -1
+        } else if tok.token_type == TK_PLUS {
+            eat_assert!(self, TK_PLUS);
+            1
+        } else {
+            1
+        };
+        let num_tok = eat_expect!(self, TK_INTEGER);
+        let s = from_bytes(num_tok.as_bytes());
+        let val: i64 = s.parse().map_err(|e| {
+            Error::ParseError(format!("invalid integer in sequence definition: {e}"))
+        })?;
+        Ok(sign * val)
+    }
+
     fn parse_drop_stmt(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_DROP);
         let tok = peek_expect!(self, TK_TABLE, TK_INDEX, TK_TRIGGER, TK_VIEW, TK_TYPE, TK_ID);
@@ -4853,6 +4951,15 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::DropDomain {
                     if_exists,
                     domain_name,
+                })
+            }
+            TK_ID if tok.to_utf8().eq_ignore_ascii_case("SEQUENCE") => {
+                eat_assert!(self, TK_ID);
+                let if_exists = self.parse_if_exists()?;
+                let seq_name = self.parse_fullname(false)?;
+                Ok(Stmt::DropSequence {
+                    if_exists,
+                    seq_name,
                 })
             }
             _ => Err(Error::ParseError(format!(
@@ -12705,6 +12812,153 @@ mod tests {
                     if let Expr::FunctionCall { name, args, .. } = expr.as_ref() {
                         assert_eq!(name.to_string(), "union_value");
                         assert_eq!(args.len(), 2);
+                    } else {
+                        panic!("expected FunctionCall");
+                    }
+                } else {
+                    panic!("expected Expr");
+                }
+            } else {
+                panic!("expected Select");
+            }
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_parse_create_sequence_defaults() {
+        let sql = b"CREATE SEQUENCE foo";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        match cmd {
+            Cmd::Stmt(Stmt::CreateSequence {
+                if_not_exists,
+                seq_name,
+                start,
+                increment,
+                min_value,
+                max_value,
+                cycle,
+            }) => {
+                assert!(!if_not_exists);
+                assert_eq!(seq_name.name.to_string(), "foo");
+                assert_eq!(start, None);
+                assert_eq!(increment, None);
+                assert_eq!(min_value, None);
+                assert_eq!(max_value, None);
+                assert!(!cycle);
+            }
+            _ => panic!("expected CreateSequence"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_sequence_full() {
+        let sql = b"CREATE SEQUENCE foo START WITH 10 INCREMENT BY 5 MINVALUE 0 MAXVALUE 100 CYCLE";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        match cmd {
+            Cmd::Stmt(Stmt::CreateSequence {
+                if_not_exists,
+                start,
+                increment,
+                min_value,
+                max_value,
+                cycle,
+                ..
+            }) => {
+                assert!(!if_not_exists);
+                assert_eq!(start, Some(10));
+                assert_eq!(increment, Some(5));
+                assert_eq!(min_value, Some(0));
+                assert_eq!(max_value, Some(100));
+                assert!(cycle);
+            }
+            _ => panic!("expected CreateSequence"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_sequence_if_not_exists() {
+        let sql = b"CREATE SEQUENCE IF NOT EXISTS foo";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        match cmd {
+            Cmd::Stmt(Stmt::CreateSequence { if_not_exists, .. }) => {
+                assert!(if_not_exists);
+            }
+            _ => panic!("expected CreateSequence"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_sequence_negative_values() {
+        let sql = b"CREATE SEQUENCE foo INCREMENT BY -1 START WITH -1 MINVALUE -100 MAXVALUE -1";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        match cmd {
+            Cmd::Stmt(Stmt::CreateSequence {
+                start,
+                increment,
+                min_value,
+                max_value,
+                ..
+            }) => {
+                assert_eq!(start, Some(-1));
+                assert_eq!(increment, Some(-1));
+                assert_eq!(min_value, Some(-100));
+                assert_eq!(max_value, Some(-1));
+            }
+            _ => panic!("expected CreateSequence"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_sequence_no_cycle() {
+        let sql = b"CREATE SEQUENCE foo NO CYCLE";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        match cmd {
+            Cmd::Stmt(Stmt::CreateSequence { cycle, .. }) => {
+                assert!(!cycle);
+            }
+            _ => panic!("expected CreateSequence"),
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_sequence() {
+        let sql = b"DROP SEQUENCE foo";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        match cmd {
+            Cmd::Stmt(Stmt::DropSequence {
+                if_exists,
+                seq_name,
+            }) => {
+                assert!(!if_exists);
+                assert_eq!(seq_name.name.to_string(), "foo");
+            }
+            _ => panic!("expected DropSequence"),
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_sequence_if_exists() {
+        let sql = b"DROP SEQUENCE IF EXISTS foo";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        match cmd {
+            Cmd::Stmt(Stmt::DropSequence { if_exists, .. }) => {
+                assert!(if_exists);
+            }
+            _ => panic!("expected DropSequence"),
+        }
+    }
+
+    #[test]
+    fn test_parse_nextval() {
+        let sql = b"SELECT nextval('foo')";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::Select(sel)) = cmd {
+            if let OneSelect::Select { columns, .. } = &sel.body.select {
+                if let ResultColumn::Expr(expr, _) = &columns[0] {
+                    if let Expr::FunctionCall { name, .. } = expr.as_ref() {
+                        assert_eq!(name.to_string(), "nextval");
                     } else {
                         panic!("expected FunctionCall");
                     }

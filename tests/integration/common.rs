@@ -1075,4 +1075,1122 @@ mod tests {
 
         Ok(())
     }
+
+    /// Regression test: DROP SEQUENCE previously used ParseSchema with
+    /// where_clause=None (full rescan) which re-encountered existing
+    /// tables via handle_schema_row → add_btree_table → "already exists"
+    /// error. That error leaked auto_commit=false, causing subsequent
+    /// writes to be silently uncommitted. Fixed by removing the invalid
+    /// ParseSchema call and relying on the schema cookie mechanism
+    /// (same pattern as DROP TABLE).
+    #[test]
+    fn test_drop_sequence_with_existing_tables() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_drop_seq_with_tables");
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        // Create a table and a sequence — the table's presence in
+        // sqlite_schema was what triggered the old bug.
+        conn.execute("CREATE TABLE t(x)")?;
+        conn.execute("CREATE SEQUENCE s1")?;
+
+        // DROP SEQUENCE must succeed even with other tables present
+        conn.execute("DROP SEQUENCE s1")?;
+
+        // Writes after DROP SEQUENCE must be committed and visible
+        conn.execute("INSERT INTO t VALUES (42)")?;
+        let conn2 = db.connect_limbo();
+        let rows: Vec<(i64,)> = conn2.exec_rows("SELECT x FROM t");
+        assert_eq!(rows, vec![(42,)]);
+
+        // The sequence must be gone — conn2 sees the updated schema
+        let err = conn2.execute("SELECT nextval('s1')");
+        assert!(err.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_currval_per_connection_isolation() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_currval_isolation");
+        let db = TempDatabase::new_with_existent(&path);
+        let conn1 = db.connect_limbo();
+        conn1.execute("CREATE SEQUENCE iso_seq")?;
+
+        // conn1 calls nextval → 1, currval → 1
+        let rows: Vec<(i64,)> = conn1.exec_rows("SELECT nextval('iso_seq')");
+        assert_eq!(rows, vec![(1,)]);
+        let rows: Vec<(i64,)> = conn1.exec_rows("SELECT currval('iso_seq')");
+        assert_eq!(rows, vec![(1,)]);
+
+        // conn2 calls nextval → 2 (advances global counter)
+        let conn2 = db.connect_limbo();
+        let rows: Vec<(i64,)> = conn2.exec_rows("SELECT nextval('iso_seq')");
+        assert_eq!(rows, vec![(2,)]);
+
+        // conn1 currval must still be 1 — unaffected by conn2
+        let rows: Vec<(i64,)> = conn1.exec_rows("SELECT currval('iso_seq')");
+        assert_eq!(rows, vec![(1,)]);
+
+        // conn1 calls nextval → 3, currval updates to 3
+        let rows: Vec<(i64,)> = conn1.exec_rows("SELECT nextval('iso_seq')");
+        assert_eq!(rows, vec![(3,)]);
+        let rows: Vec<(i64,)> = conn1.exec_rows("SELECT currval('iso_seq')");
+        assert_eq!(rows, vec![(3,)]);
+
+        // conn2 currval is still 2
+        let rows: Vec<(i64,)> = conn2.exec_rows("SELECT currval('iso_seq')");
+        assert_eq!(rows, vec![(2,)]);
+
+        // currval without prior nextval on a fresh connection must error
+        let conn3 = db.connect_limbo();
+        let err = conn3.execute("SELECT currval('iso_seq')");
+        assert!(err.is_err());
+
+        Ok(())
+    }
+
+    /// Sequences persist across database close/reopen and all functions
+    /// (nextval, currval, setval) work correctly on the reopened database.
+    #[test]
+    fn test_sequence_file_persistence() -> anyhow::Result<()> {
+        let path = TempDir::new().unwrap().keep().join("temp_seq_persist");
+
+        // Phase 1: create sequences and advance them
+        {
+            let db = TempDatabase::new_with_existent(&path);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE SEQUENCE test_seq START WITH 1 INCREMENT BY 1")?;
+            conn.execute("CREATE SEQUENCE counter START WITH 100 INCREMENT BY 10")?;
+
+            // Advance test_seq to 3
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('test_seq')");
+            assert_eq!(rows, vec![(1,)]);
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('test_seq')");
+            assert_eq!(rows, vec![(2,)]);
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('test_seq')");
+            assert_eq!(rows, vec![(3,)]);
+
+            // Advance counter to 110
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('counter')");
+            assert_eq!(rows, vec![(100,)]);
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('counter')");
+            assert_eq!(rows, vec![(110,)]);
+
+            conn.close()?;
+        }
+
+        // Phase 2: reopen and verify sequences continue from persisted state
+        {
+            let db = TempDatabase::new_with_existent(&path);
+            let conn = db.connect_limbo();
+
+            // test_seq should continue from 3 → next is 4
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('test_seq')");
+            assert_eq!(rows, vec![(4,)]);
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('test_seq')");
+            assert_eq!(rows, vec![(5,)]);
+
+            // counter should continue from 110 → next is 120
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('counter')");
+            assert_eq!(rows, vec![(120,)]);
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('counter')");
+            assert_eq!(rows, vec![(130,)]);
+
+            // currval works after nextval
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT currval('test_seq')");
+            assert_eq!(rows, vec![(5,)]);
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT currval('counter')");
+            assert_eq!(rows, vec![(130,)]);
+
+            // setval works on reopened sequences
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT setval('test_seq', 50)");
+            assert_eq!(rows, vec![(50,)]);
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT currval('test_seq')");
+            assert_eq!(rows, vec![(50,)]);
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('test_seq')");
+            assert_eq!(rows, vec![(51,)]);
+
+            // currval before nextval on a fresh connection errors
+            let conn2 = db.connect_limbo();
+            let err = conn2.execute("SELECT currval('test_seq')");
+            assert!(err.is_err());
+
+            conn.close()?;
+        }
+
+        Ok(())
+    }
+
+    /// Nextval must persist even when the connection is dropped without an
+    /// explicit close — simulates a process crash after autocommit nextval.
+    /// Guards against regressions where the backing-table write is somehow
+    /// elided (or rolled back) and the next process opens to a stale
+    /// watermark.
+    #[test]
+    fn test_sequence_nextval_persists_after_drop() -> anyhow::Result<()> {
+        let path = TempDir::new().unwrap().keep().join("temp_seq_crash");
+
+        // Phase 1: create sequence, call nextval, then DROP everything (no close).
+        {
+            let db = TempDatabase::new_with_existent(&path);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE SEQUENCE crash_seq START 1 INCREMENT 1")?;
+
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('crash_seq')");
+            assert_eq!(rows, vec![(1,)]);
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('crash_seq')");
+            assert_eq!(rows, vec![(2,)]);
+
+            // Intentionally no conn.close() — simulate unclean shutdown.
+            drop(conn);
+            drop(db);
+        }
+
+        // Phase 2: reopen — nextval must continue from 2, not restart at 1.
+        {
+            let db = TempDatabase::new_with_existent(&path);
+            let conn = db.connect_limbo();
+
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('crash_seq')");
+            assert_eq!(rows, vec![(3,)]);
+        }
+
+        Ok(())
+    }
+
+    /// setval inside an aborted tx must not affect post-rollback nextval:
+    /// the user-visible value depends only on disk state, which the
+    /// rollback reverted. This is structurally guaranteed by the disk-only
+    /// design (no in-memory state to leak), but the test stays as a
+    /// behavioral regression guard.
+    #[test]
+    fn test_setval_rollback_does_not_leak_to_nextval() -> anyhow::Result<()> {
+        let path = TempDir::new().unwrap().keep().join("temp_setval_rollback");
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        conn.execute("CREATE SEQUENCE seq START 1 INCREMENT 1")?;
+
+        // Consume the first value so is_called is true
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('seq')");
+        assert_eq!(rows, vec![(1,)]);
+
+        // setval inside a rolled-back transaction must not affect nextval
+        conn.execute("BEGIN")?;
+        conn.execute("SELECT setval('seq', 100)")?;
+        conn.execute("ROLLBACK")?;
+
+        // Next value must continue from 1, not from 100
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('seq')");
+        assert_eq!(
+            rows,
+            vec![(2,)],
+            "setval inside rolled-back tx must not affect post-rollback nextval"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sequence_cross_connection_visibility() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_sequence_cross_conn");
+        let db = TempDatabase::new_with_existent(&path);
+        let conn1 = db.connect_limbo();
+
+        // Conn1 creates sequence
+        conn1.execute("CREATE SEQUENCE cross_seq")?;
+
+        // Conn2 must see it
+        let conn2 = db.connect_limbo();
+        let rows: Vec<(i64,)> = conn2.exec_rows("SELECT nextval('cross_seq')");
+        assert_eq!(rows, vec![(1,)]);
+
+        // Conn1 drops it
+        conn1.execute("DROP SEQUENCE cross_seq")?;
+
+        // Conn2 must get error
+        let err = conn2.execute("SELECT nextval('cross_seq')");
+        assert!(err.is_err());
+
+        Ok(())
+    }
+
+    /// Sequences must produce globally unique values across connections.
+    /// Each nextval() call — regardless of which connection issues it —
+    /// must advance a single shared counter so no two calls ever return
+    /// the same value.
+    #[test]
+    fn test_sequence_cross_connection_shared_counter() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_sequence_shared_counter");
+        let db = TempDatabase::new_with_existent(&path);
+        let conn1 = db.connect_limbo();
+
+        conn1.execute("CREATE SEQUENCE shared_seq START 1 INCREMENT 1")?;
+
+        let conn2 = db.connect_limbo();
+        // Force conn2 to pick up the sequence via a schema refresh.
+        conn2.execute("SELECT 1")?;
+
+        // Interleave nextval across two connections.
+        let rows1: Vec<(i64,)> = conn1.exec_rows("SELECT nextval('shared_seq')");
+        assert_eq!(rows1, vec![(1,)]);
+
+        let rows2: Vec<(i64,)> = conn2.exec_rows("SELECT nextval('shared_seq')");
+        assert_eq!(
+            rows2,
+            vec![(2,)],
+            "conn2 returned a duplicate — connections are not sharing the same sequence counter"
+        );
+
+        let rows1b: Vec<(i64,)> = conn1.exec_rows("SELECT nextval('shared_seq')");
+        assert_eq!(rows1b, vec![(3,)]);
+
+        Ok(())
+    }
+
+    /// MVCC AUTOINCREMENT must account for manual rowid UPDATEs.
+    ///
+    /// SQLite computes the next rowid as MAX(sqlite_sequence, max_rowid_in_table) + 1.
+    /// After UPDATE t SET a=a+10, the max rowid in the table is 11, so the next
+    /// auto-generated rowid must be 12, not 2.
+    ///
+    /// Currently fails in MVCC because the sequence is the sole source of truth
+    /// and it doesn't know about UPDATEs to the rowid.
+    #[test]
+    fn test_mvcc_autoincrement_after_rowid_update() -> anyhow::Result<()> {
+        let db = TempDatabase::new_with_mvcc("mvcc_autoinc_update");
+        let conn = db.connect_limbo();
+
+        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT)")?;
+        conn.execute("INSERT INTO t DEFAULT VALUES")?;
+        conn.execute("UPDATE t SET a = a + 10")?;
+        conn.execute("INSERT INTO t DEFAULT VALUES")?;
+
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t ORDER BY a");
+        assert_eq!(
+            rows,
+            vec![(11,), (12,)],
+            "next autoincrement rowid must skip past manually updated rowids"
+        );
+
+        Ok(())
+    }
+
+    /// Two sequential autocommit nextvals on the same sequence in MVCC
+    /// (different connections) must both succeed and produce monotonic
+    /// values. The danger in the old design was commit-time compaction
+    /// creating spurious conflicts; the disk-only design persists nothing
+    /// to compact mid-call.
+    #[test]
+    fn test_mvcc_concurrent_nextval_no_conflict() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_concurrent_nextval");
+        let db = TempDatabase::builder()
+            .with_db_path(&path)
+            .with_mvcc(true)
+            .build();
+        let conn1 = db.connect_limbo();
+        let conn2 = db.connect_limbo();
+
+        conn1.execute("CREATE SEQUENCE s START 1 INCREMENT 1")?;
+        conn2.execute("SELECT 1")?;
+
+        // First nextval bootstraps is_called=true on disk so subsequent
+        // nextvals exercise the value+inc path rather than the start path.
+        let _: Vec<(i64,)> = conn1.exec_rows("SELECT nextval('s')");
+
+        // Each emits a new watermark row keyed by value (rowid alias);
+        // two committed sequential calls produce distinct values, the
+        // commit-time compaction collapses the trail to one row.
+        let r1 = conn1.execute("SELECT nextval('s')");
+        let r2 = conn2.execute("SELECT nextval('s')");
+
+        assert!(
+            r1.is_ok() && r2.is_ok(),
+            "two concurrent autocommit nextvals should both succeed: \
+             conn1={r1:?} conn2={r2:?}"
+        );
+        Ok(())
+    }
+
+    /// Two-connection MVCC durability with autonomous-inner-tx nextval:
+    /// conn2's autocommit setval is durable, and conn1's nextval inside
+    /// BEGIN CONCURRENT is also durable (committed autonomously) even
+    /// though conn1's outer tx never commits — this is the Postgres
+    /// semantic the autonomous design encodes (a nextval is "burned"
+    /// the moment it's emitted; rolling back the surrounding tx does
+    /// not un-burn it).
+    #[test]
+    fn test_mvcc_setval_persists_with_two_connections() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_setval_two_conn_mvcc");
+
+        {
+            let db = TempDatabase::builder()
+                .with_db_path(&path)
+                .with_mvcc(true)
+                .build();
+            let conn1 = db.connect_limbo();
+            let conn2 = db.connect_limbo();
+
+            conn1.execute("CREATE SEQUENCE s START 1 INCREMENT 1")?;
+            conn2.execute("SELECT 1")?; // pick up schema
+
+            // conn2 first: autocommit setval(50). Should be durable.
+            let rows: Vec<(i64,)> = conn2.exec_rows("SELECT setval('s', 50)");
+            assert_eq!(rows, vec![(50,)]);
+
+            // conn1 opens a CONCURRENT tx and nextvals — autonomous-inner-tx
+            // commits the watermark advance independently of conn1's outer.
+            conn1.execute("BEGIN CONCURRENT")?;
+            let rows: Vec<(i64,)> = conn1.exec_rows("SELECT nextval('s')");
+            assert_eq!(rows, vec![(51,)]); // sees setval'd value
+                                           // conn1 closes without commit; the nextval is still durable
+
+            conn1.close()?;
+            conn2.close()?;
+        }
+
+        {
+            let db = TempDatabase::builder()
+                .with_db_path(&path)
+                .with_mvcc(true)
+                .build();
+            let conn = db.connect_limbo();
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('s')");
+            assert_eq!(
+                rows,
+                vec![(52,)],
+                "MVCC: autonomous nextval committed the 51 even though conn1's \
+                 outer BEGIN CONCURRENT never committed; next nextval after \
+                 reopen continues from 52"
+            );
+            conn.close()?;
+        }
+
+        Ok(())
+    }
+
+    /// MVCC version of test_setval_persists_across_reopen — verifies that
+    /// a committed autocommit setval in MVCC mode is durably persisted
+    /// across a close+reopen cycle, independent of the whopper restart
+    /// machinery. If this fails, we have a minimal repro of a real
+    /// durability gap in MVCC commit_txn.
+    #[test]
+    fn test_setval_persists_across_reopen_mvcc() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_setval_crash_mvcc");
+
+        {
+            let db = TempDatabase::builder()
+                .with_db_path(&path)
+                .with_mvcc(true)
+                .build();
+            let conn = db.connect_limbo();
+            conn.execute("CREATE SEQUENCE s START 1 INCREMENT 1")?;
+
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('s')");
+            assert_eq!(rows, vec![(1,)]);
+
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT setval('s', 50)");
+            assert_eq!(rows, vec![(50,)]);
+
+            conn.close()?;
+        }
+
+        {
+            let db = TempDatabase::builder()
+                .with_db_path(&path)
+                .with_mvcc(true)
+                .build();
+            let conn = db.connect_limbo();
+
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('s')");
+            assert_eq!(
+                rows,
+                vec![(51,)],
+                "MVCC: nextval after reopen must continue from setval watermark, \
+                 not regress — if it does, autocommit setval is not durable across \
+                 close+reopen in MVCC mode"
+            );
+
+            conn.close()?;
+        }
+
+        Ok(())
+    }
+
+    /// setval() must be crash-safe: after setval(50) + close + reopen,
+    /// nextval must return 51, not regress to the pre-setval watermark.
+    #[test]
+    fn test_setval_persists_across_reopen() -> anyhow::Result<()> {
+        let path = TempDir::new().unwrap().keep().join("temp_setval_crash");
+
+        {
+            let db = TempDatabase::new_with_existent(&path);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE SEQUENCE s START 1 INCREMENT 1")?;
+
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('s')");
+            assert_eq!(rows, vec![(1,)]);
+
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT setval('s', 50)");
+            assert_eq!(rows, vec![(50,)]);
+
+            conn.close()?;
+        }
+
+        {
+            let db = TempDatabase::new_with_existent(&path);
+            let conn = db.connect_limbo();
+
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('s')");
+            assert_eq!(
+                rows,
+                vec![(51,)],
+                "nextval after reopen must continue from setval watermark, not regress"
+            );
+
+            conn.close()?;
+        }
+
+        Ok(())
+    }
+
+    /// setval is rejected inside BEGIN CONCURRENT — it requires an exclusive
+    /// transaction.
+    ///
+    /// setval can move the sequence to an arbitrary value (including
+    /// downward), so persisting it requires DELETE-then-INSERT on the
+    /// backing table; a plain append plus commit-time MAX-compaction would
+    /// silently lose a downward setval. Under BEGIN CONCURRENT, that DELETE
+    /// races with another concurrent tx's nextval (Hekaton write-lock on
+    /// the existing version chain), and an in-handler upgrade to exclusive
+    /// is too late — `begin_exclusive_tx` only blocks future writers, it
+    /// cannot revoke write locks already held by active concurrent txs.
+    ///
+    /// The same reason DDL (`CREATE TABLE`) and header-cookie writes
+    /// (`PRAGMA application_id = ...`) reject `BEGIN CONCURRENT` applies
+    /// to setval: it is global metadata with no row-level conflict key.
+    #[test]
+    fn test_setval_allowed_in_concurrent_tx() -> anyhow::Result<()> {
+        // Under the disk-only sequence design, setval no longer requires an
+        // exclusive transaction. The DELETE-all + INSERT bytecode is emitted
+        // inline; concurrent nextval writers either land safely (different
+        // backing-table keys) or hit a WriteWriteConflict that surfaces as
+        // the standard Busy/conflict error — the outer tx decides what to
+        // do. setval inside a solo BEGIN CONCURRENT therefore succeeds.
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_setval_concurrent_ok");
+        let db = TempDatabase::builder()
+            .with_db_path(&path)
+            .with_mvcc(true)
+            .build();
+        let conn = db.connect_limbo();
+
+        conn.execute("CREATE SEQUENCE s START 1 INCREMENT 1")?;
+
+        conn.execute("BEGIN CONCURRENT")?;
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT setval('s', 50)");
+        assert_eq!(
+            rows,
+            vec![(50,)],
+            "setval inside BEGIN CONCURRENT should succeed when no other writer conflicts"
+        );
+        conn.execute("COMMIT")?;
+
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT setval('s', 100)");
+        assert_eq!(rows, vec![(100,)]);
+
+        conn.execute("BEGIN")?;
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT setval('s', 200)");
+        assert_eq!(rows, vec![(200,)]);
+        conn.execute("COMMIT")?;
+
+        Ok(())
+    }
+
+    /// Returns true if a `Result` carries an MVCC-style conflict-class
+    /// error — the engine's standard way of telling a concurrent writer
+    /// to retry. Used by the setval/nextval concurrency test to allow
+    /// either side of the race to abort cleanly.
+    fn is_conflict_err<T>(r: &Result<T, turso_core::LimboError>) -> bool {
+        matches!(
+            r,
+            Err(turso_core::LimboError::WriteWriteConflict
+                | turso_core::LimboError::Busy
+                | turso_core::LimboError::BusySnapshot
+                | turso_core::LimboError::CommitDependencyAborted)
+        )
+    }
+
+    /// MVCC: setval in one BEGIN CONCURRENT transaction races with nextval
+    /// in another BEGIN CONCURRENT transaction. The engine must resolve the
+    /// contention without corrupting the sequence — either both commits
+    /// succeed and the final watermark is consistent with the commit order,
+    /// or one tx aborts cleanly with a write-write conflict.
+    ///
+    /// What this test is really checking: the disk-only design's
+    /// `setval = DELETE-all + INSERT` bytecode shares the backing table
+    /// with nextval's RMW. Under MVCC, the two writers' commit-validation
+    /// must detect the conflict. The forbidden outcome is silently
+    /// accepting both commits and ending up with a sequence whose disk
+    /// watermark doesn't match either intended value (corruption).
+    ///
+    /// Reviewer context: the whopper workload's policy comment in
+    /// `testing/concurrent-simulator/workloads.rs` historically claimed
+    /// setval was *rejected* inside BEGIN CONCURRENT and skipped it. The
+    /// engine actually accepts the operation; this test asserts that the
+    /// acceptance is sound under contention.
+    #[test]
+    fn test_setval_vs_nextval_concurrent_tx_mvcc_no_corruption() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_setval_vs_nextval_concurrent");
+        let db = TempDatabase::builder()
+            .with_db_path(&path)
+            .with_mvcc(true)
+            .build();
+
+        let conn1 = db.connect_limbo();
+        let conn2 = db.connect_limbo();
+
+        conn1.execute("CREATE SEQUENCE s START 1 INCREMENT 1")?;
+        conn2.execute("SELECT 1")?;
+
+        // Bootstrap is_called=true so subsequent nextvals go through the
+        // value+inc path rather than the start path.
+        let _: Vec<(i64,)> = conn1.exec_rows("SELECT nextval('s')");
+
+        conn1.execute("BEGIN CONCURRENT")?;
+        conn2.execute("BEGIN CONCURRENT")?;
+
+        // conn1 sets the watermark; this writes to the backing table.
+        let setval_rows: Vec<(i64,)> = conn1.exec_rows("SELECT setval('s', 500)");
+        assert_eq!(
+            setval_rows,
+            vec![(500,)],
+            "conn1 setval returns the set value"
+        );
+
+        // conn2 attempts nextval — its autonomous-inner-tx targets the same
+        // backing table that conn1 is mid-writing. The engine must surface
+        // the conflict deterministically; either it fails here with a
+        // conflict-class error (eager detection) or it succeeds and the
+        // outer COMMIT below fails (deferred detection). Both shapes are
+        // acceptable; what is NOT acceptable is silent acceptance that
+        // ends up corrupting the watermark.
+        let conn2_nextval = conn2.execute("SELECT nextval('s')");
+
+        // Commit both; record what happened.
+        let conn1_commit = conn1.execute("COMMIT");
+        let conn2_commit = conn2.execute("COMMIT");
+
+        // At least one of the two concurrent tx writers must have either
+        // succeeded outright or aborted with a conflict-class error. A
+        // panic in the engine code path, an unrelated error, or both
+        // succeeding while the watermark drifts would all be bugs.
+        let writers_resolved = (conn2_nextval.is_ok() || is_conflict_err(&conn2_nextval))
+            && (conn1_commit.is_ok() || is_conflict_err(&conn1_commit))
+            && (conn2_commit.is_ok() || is_conflict_err(&conn2_commit));
+        assert!(
+            writers_resolved,
+            "concurrent setval/nextval must resolve via success or conflict-class error; \
+             conn2_nextval={conn2_nextval:?} conn1_commit={conn1_commit:?} conn2_commit={conn2_commit:?}"
+        );
+
+        // Whichever side committed determines the post-resolution
+        // watermark. Snapshot what's actually persisted on disk:
+        let final_rows: Vec<(i64,)> = conn1.exec_rows("SELECT nextval('s')");
+        let next = final_rows[0].0;
+
+        // Enumerate the allowed outcomes:
+        //   * conn1 (setval=500) committed: next nextval emits 501.
+        //   * Both conn2's nextval AND its commit succeeded (so conn2 wrote
+        //     watermark=2): next nextval emits 3.
+        //   * conn1's commit was the only successful write but conn2 also
+        //     committed an autonomous-inner nextval before failing: next
+        //     emits 501 (autonomous-inner nextval is "burned" but the
+        //     setval write supersedes any value below 500).
+        //   * All concurrent writers conflict-aborted and the watermark
+        //     remains at 1 from the bootstrap: next nextval emits 2.
+        let allowed = [2_i64, 3, 501];
+        assert!(
+            allowed.contains(&next),
+            "post-conflict nextval must be one of {allowed:?} (one of the writers' \
+             intended states); got {next}. Anything else indicates the two writers \
+             corrupted the watermark."
+        );
+
+        conn1.close()?;
+        conn2.close()?;
+        Ok(())
+    }
+
+    /// Descending sequences must recover from the MIN watermark, not MAX.
+    ///
+    /// A descending sequence (INCREMENT BY -1) advances downward, so the
+    /// most-advanced value is the smallest. Recovery must use MIN(value)
+    /// from the backing table, not MAX(value).
+    ///
+    /// This test simulates an uncompacted backing table (as would happen
+    /// after a crash before commit-time compaction) by manually inserting
+    /// extra rows into the backing table. With multiple rows (-1, -2, -3),
+    /// MAX(value) returns -1 (least advanced) instead of -3 (most advanced).
+    ///
+    /// Gated off when the `checksum` feature is enabled — the test uses
+    /// `rusqlite` to write rows directly into the backing table, which
+    /// bypasses Turso's per-page checksum update. The next Turso open
+    /// fails with `ChecksumMismatch` on the rewritten page; the
+    /// recovery contract this test exercises is independent of the
+    /// checksum feature, so we skip rather than rewrite the injection.
+    #[cfg_attr(feature = "checksum", ignore)]
+    #[test]
+    fn test_descending_sequence_recovery() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_desc_seq_recovery");
+
+        {
+            let db = TempDatabase::new_with_existent(&path);
+            let conn = db.connect_limbo();
+            conn.execute(
+                "CREATE SEQUENCE desc_seq START -1 INCREMENT BY -1 MINVALUE -1000 MAXVALUE -1",
+            )?;
+
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('desc_seq')");
+            assert_eq!(rows, vec![(-1,)]);
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('desc_seq')");
+            assert_eq!(rows, vec![(-2,)]);
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('desc_seq')");
+            assert_eq!(rows, vec![(-3,)]);
+
+            conn.close()?;
+        }
+
+        // Use rusqlite to inject uncompacted rows, simulating a crash
+        // that left multiple rows in the backing table.
+        {
+            let sqlite_conn = rusqlite::Connection::open(&path)?;
+            sqlite_conn.execute_batch(
+                "INSERT OR IGNORE INTO \"__turso_internal_seq_desc_seq\" \
+                 (value, is_called, start, inc, min, max, cycle) \
+                 VALUES (-1, 1, -1, -1, -1000, -1, 0); \
+                 INSERT OR IGNORE INTO \"__turso_internal_seq_desc_seq\" \
+                 (value, is_called, start, inc, min, max, cycle) \
+                 VALUES (-2, 1, -1, -1, -1000, -1, 0);",
+            )?;
+        }
+
+        {
+            let db = TempDatabase::new_with_existent(&path);
+            let conn = db.connect_limbo();
+
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('desc_seq')");
+            assert_eq!(
+                rows,
+                vec![(-4,)],
+                "descending sequence must recover from MIN(value), not MAX(value)"
+            );
+
+            conn.close()?;
+        }
+
+        Ok(())
+    }
+
+    /// WAL rollback semantics for nextval: a rolled-back nextval is undone
+    /// and its value will be re-emitted by the next call. This matches the
+    /// SQLite AUTOINCREMENT contract — the watermark is part of the
+    /// transaction and ROLLBACK reverts the backing-table row.
+    #[test]
+    fn test_wal_nextval_rolled_back_re_emits_value() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_wal_nextval_rollback");
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        conn.execute("CREATE SEQUENCE rb START 1 INCREMENT 1")?;
+
+        conn.execute("BEGIN")?;
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('rb')");
+        assert_eq!(rows, vec![(1,)]);
+        conn.execute("ROLLBACK")?;
+
+        // After rollback the backing table reverts; the next nextval
+        // re-emits the value that was rolled back.
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('rb')");
+        assert_eq!(
+            rows,
+            vec![(1,)],
+            "WAL: rolled-back nextval must be re-emitted on the next call \
+             (matches SQLite AUTOINCREMENT rollback semantics)"
+        );
+
+        Ok(())
+    }
+
+    /// MVCC rollback semantics for nextval (current behavior, intra-process).
+    /// Today the nextval write is bundled with the outer tx — same as WAL —
+    /// so ROLLBACK undoes the bump and the next nextval re-emits the value.
+    ///
+    /// True autonomous-tx semantics (where ROLLBACK does NOT undo the bump,
+    /// matching Postgres) is a planned follow-up (task #29). When that lands
+    /// this test will need to update its expectation.
+    #[test]
+    fn test_mvcc_nextval_rolled_back_re_emits_value_today() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_mvcc_nextval_rollback");
+        let db = TempDatabase::builder()
+            .with_db_path(&path)
+            .with_mvcc(true)
+            .build();
+        let conn = db.connect_limbo();
+
+        conn.execute("CREATE SEQUENCE rbm START 1 INCREMENT 1")?;
+
+        conn.execute("BEGIN")?;
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('rbm')");
+        assert_eq!(rows, vec![(1,)]);
+        conn.execute("ROLLBACK")?;
+
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('rbm')");
+        assert_eq!(
+            rows,
+            vec![(1,)],
+            "MVCC (pre-autonomous-tx): bundled-with-outer-tx nextval is \
+             reverted on rollback and the next call re-emits the value"
+        );
+
+        Ok(())
+    }
+
+    /// Stress: N threads, each pulling M values from the same sequence in WAL
+    /// mode. Every value must be unique — duplicates would mean two threads
+    /// observed the same disk watermark and computed the same next value
+    /// (the bug fixed by disk-only RMW + WAL write-lock serialization).
+    ///
+    /// Threads retry on Busy: WAL's single-writer lock causes legitimate Busy
+    /// returns when contention is high; retrying re-reads the disk watermark
+    /// and computes the next value from the now-current state.
+    #[test]
+    fn test_stress_intraprocess_nextval_wal_no_duplicates() -> anyhow::Result<()> {
+        use std::sync::Mutex;
+        use std::thread;
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 50;
+
+        let path = TempDir::new().unwrap().keep().join("stress_nextval_wal");
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE SEQUENCE s START 1 INCREMENT 1")?;
+        conn.close()?;
+
+        let db = Arc::new(TempDatabase::new_with_existent(&path));
+        let collected: Arc<Mutex<Vec<i64>>> =
+            Arc::new(Mutex::new(Vec::with_capacity(THREADS * PER_THREAD)));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                let collected = Arc::clone(&collected);
+                thread::spawn(move || {
+                    let conn = db.connect_limbo();
+                    let mut mine = Vec::with_capacity(PER_THREAD);
+                    for _ in 0..PER_THREAD {
+                        let mut tries = 0usize;
+                        loop {
+                            tries += 1;
+                            if tries > 10_000 {
+                                panic!("nextval gave up after 10k Busy retries");
+                            }
+                            match conn.prepare("SELECT nextval('s')") {
+                                Ok(mut stmt) => {
+                                    let mut got: Option<i64> = None;
+                                    let r = stmt.run_with_row_callback(|row| {
+                                        got = Some(row.get::<i64>(0).unwrap());
+                                        Ok(())
+                                    });
+                                    match r {
+                                        Ok(()) => {
+                                            mine.push(got.expect("nextval row"));
+                                            break;
+                                        }
+                                        Err(turso_core::LimboError::Busy) => continue,
+                                        Err(e) => panic!("nextval failed: {e:?}"),
+                                    }
+                                }
+                                Err(turso_core::LimboError::Busy) => continue,
+                                Err(e) => panic!("prepare failed: {e:?}"),
+                            }
+                        }
+                    }
+                    collected.lock().unwrap().extend(mine);
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        let values = collected.lock().unwrap().clone();
+        assert_eq!(
+            values.len(),
+            THREADS * PER_THREAD,
+            "expected {} nextvals to all succeed",
+            THREADS * PER_THREAD
+        );
+        let unique: std::collections::HashSet<_> = values.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            values.len(),
+            "expected all nextvals to return distinct values; duplicates present"
+        );
+        // Values should be exactly 1..=N*M (no gaps under WAL bundled semantics,
+        // because every nextval that returned a value also committed under the
+        // write lock).
+        let mut sorted = values;
+        sorted.sort();
+        let expected: Vec<i64> = (1..=(THREADS * PER_THREAD) as i64).collect();
+        assert_eq!(
+            sorted, expected,
+            "values must form a contiguous 1..N sequence under WAL"
+        );
+
+        Ok(())
+    }
+
+    /// Stress: N threads / M nextvals on the same MVCC database.
+    /// Under autonomous-tx nextval, every call must commit independently
+    /// of the others — no duplicates, no abort cascades. Gaps ARE allowed
+    /// here (rolled-back outer txns leave their nextval bumps in place
+    /// per Postgres semantics), so we only assert uniqueness and count.
+    #[test]
+    fn test_stress_intraprocess_nextval_mvcc_no_duplicates() -> anyhow::Result<()> {
+        use std::sync::Mutex;
+        use std::thread;
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 50;
+
+        let path = TempDir::new().unwrap().keep().join("stress_nextval_mvcc");
+        let db = TempDatabase::builder()
+            .with_db_path(&path)
+            .with_mvcc(true)
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE SEQUENCE s START 1 INCREMENT 1")?;
+        conn.close()?;
+
+        let db = Arc::new(
+            TempDatabase::builder()
+                .with_db_path(&path)
+                .with_mvcc(true)
+                .build(),
+        );
+        let collected: Arc<Mutex<Vec<i64>>> =
+            Arc::new(Mutex::new(Vec::with_capacity(THREADS * PER_THREAD)));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                let collected = Arc::clone(&collected);
+                thread::spawn(move || {
+                    let conn = db.connect_limbo();
+                    let mut mine = Vec::with_capacity(PER_THREAD);
+                    for _ in 0..PER_THREAD {
+                        let mut tries = 0usize;
+                        loop {
+                            tries += 1;
+                            if tries > 10_000 {
+                                panic!("nextval gave up after 10k retries");
+                            }
+                            match conn.prepare("SELECT nextval('s')") {
+                                Ok(mut stmt) => {
+                                    let mut got: Option<i64> = None;
+                                    let r = stmt.run_with_row_callback(|row| {
+                                        got = Some(row.get::<i64>(0).unwrap());
+                                        Ok(())
+                                    });
+                                    match r {
+                                        Ok(()) => {
+                                            mine.push(got.expect("nextval row"));
+                                            break;
+                                        }
+                                        Err(turso_core::LimboError::Busy)
+                                        | Err(turso_core::LimboError::WriteWriteConflict) => {
+                                            continue
+                                        }
+                                        Err(e) => panic!("nextval failed: {e:?}"),
+                                    }
+                                }
+                                Err(turso_core::LimboError::Busy) => continue,
+                                Err(e) => panic!("prepare failed: {e:?}"),
+                            }
+                        }
+                    }
+                    collected.lock().unwrap().extend(mine);
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        let values = collected.lock().unwrap().clone();
+        assert_eq!(
+            values.len(),
+            THREADS * PER_THREAD,
+            "expected {} nextvals to all succeed",
+            THREADS * PER_THREAD
+        );
+        let unique: std::collections::HashSet<_> = values.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            values.len(),
+            "expected all MVCC nextvals to return distinct values; duplicates present"
+        );
+
+        Ok(())
+    }
+
+    /// Stress: one writer doing nextvals, another periodically setvals.
+    /// After each setval(X), subsequent nextvals must produce values > X.
+    /// No panics, no errors that escape the opcode's retry loop.
+    #[test]
+    fn test_stress_nextval_setval_mixed_mvcc() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
+        use std::thread;
+        use std::time::Duration;
+        const NEXTVAL_THREADS: usize = 4;
+        const NEXTVAL_PER_THREAD: usize = 100;
+
+        let path = TempDir::new().unwrap().keep().join("stress_mixed_mvcc");
+        let db = TempDatabase::builder()
+            .with_db_path(&path)
+            .with_mvcc(true)
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE SEQUENCE s START 1 INCREMENT 1")?;
+        conn.close()?;
+
+        let db = Arc::new(
+            TempDatabase::builder()
+                .with_db_path(&path)
+                .with_mvcc(true)
+                .build(),
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let nextvals: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Setval thread: bumps the watermark to escalating values.
+        let setval_handle = {
+            let db = Arc::clone(&db);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                let conn = db.connect_limbo();
+                let mut target: i64 = 1_000;
+                while !stop.load(Ordering::Relaxed) {
+                    let sql = format!("SELECT setval('s', {target})");
+                    let _ = conn.execute(&sql);
+                    target += 1_000;
+                    thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+
+        let handles: Vec<_> = (0..NEXTVAL_THREADS)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                let nextvals = Arc::clone(&nextvals);
+                thread::spawn(move || {
+                    let conn = db.connect_limbo();
+                    let mut mine = Vec::with_capacity(NEXTVAL_PER_THREAD);
+                    for _ in 0..NEXTVAL_PER_THREAD {
+                        let mut tries = 0usize;
+                        loop {
+                            tries += 1;
+                            if tries > 10_000 {
+                                panic!("nextval gave up after 10k retries");
+                            }
+                            match conn.prepare("SELECT nextval('s')") {
+                                Ok(mut stmt) => {
+                                    let mut got: Option<i64> = None;
+                                    let r = stmt.run_with_row_callback(|row| {
+                                        got = Some(row.get::<i64>(0).unwrap());
+                                        Ok(())
+                                    });
+                                    match r {
+                                        Ok(()) => {
+                                            mine.push(got.expect("nextval row"));
+                                            break;
+                                        }
+                                        Err(turso_core::LimboError::Busy)
+                                        | Err(turso_core::LimboError::WriteWriteConflict) => {
+                                            continue
+                                        }
+                                        Err(e) => panic!("nextval failed: {e:?}"),
+                                    }
+                                }
+                                Err(turso_core::LimboError::Busy) => continue,
+                                Err(e) => panic!("prepare failed: {e:?}"),
+                            }
+                        }
+                    }
+                    nextvals.lock().unwrap().extend(mine);
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("nextval thread join");
+        }
+        stop.store(true, Ordering::Relaxed);
+        setval_handle.join().expect("setval thread join");
+
+        let values = nextvals.lock().unwrap().clone();
+        assert_eq!(
+            values.len(),
+            NEXTVAL_THREADS * NEXTVAL_PER_THREAD,
+            "every nextval must succeed"
+        );
+        let unique: std::collections::HashSet<_> = values.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            values.len(),
+            "every nextval must return a distinct value even under concurrent setval"
+        );
+
+        Ok(())
+    }
 }

@@ -34,6 +34,7 @@ pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
 pub(crate) mod select;
+pub(crate) mod sequence;
 pub(crate) mod stmt_journal;
 pub(crate) mod subquery;
 pub(crate) mod transaction;
@@ -158,6 +159,8 @@ pub fn translate_inner(
             | ast::Stmt::Optimize { .. }
             | ast::Stmt::Update { .. }
             | ast::Stmt::Insert { .. }
+            | ast::Stmt::CreateSequence { .. }
+            | ast::Stmt::DropSequence { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -403,6 +406,33 @@ pub fn translate_inner(
             program,
             connection,
         )?,
+        ast::Stmt::CreateSequence {
+            if_not_exists,
+            seq_name,
+            start,
+            increment,
+            min_value,
+            max_value,
+            cycle,
+        } => {
+            sequence::translate_create_sequence(
+                &seq_name,
+                if_not_exists,
+                &start,
+                &increment,
+                &min_value,
+                &max_value,
+                cycle,
+                resolver,
+                program,
+            )?;
+        }
+        ast::Stmt::DropSequence {
+            if_exists,
+            seq_name,
+        } => {
+            sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
+        }
     };
 
     // Indicate write operations so that in the epilogue we can emit the correct type of transaction
@@ -451,6 +481,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::Update { .. } => "update",
         ast::Stmt::Vacuum { .. } => "vacuum",
         ast::Stmt::Optimize { .. } => "optimize",
+        ast::Stmt::CreateSequence { .. } => "create_sequence",
+        ast::Stmt::DropSequence { .. } => "drop_sequence",
     }
 }
 

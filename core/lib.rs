@@ -123,7 +123,6 @@ use storage::{page_cache::PageCache, sqlite3_ondisk::PageSize};
 use tracing::{instrument, Level};
 use turso_macros::{match_ignore_ascii_case, AtomicEnum};
 use turso_parser::{ast, ast::Cmd, parser::Parser};
-use util::parse_schema_rows;
 
 pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
@@ -1973,6 +1972,7 @@ impl Database {
             vdbe_trace: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
             dqs_dml: AtomicBool::new(true),
+            sequence_inner_retries: AtomicU64::new(0),
             mv_tx: RwLock::new(None),
             attached_mv_txs: RwLock::new(HashMap::default()),
             #[cfg(any(test, injected_yields))]
@@ -2008,6 +2008,7 @@ impl Database {
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
+            sequence_currvals: RwLock::new(HashMap::default()),
         });
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
