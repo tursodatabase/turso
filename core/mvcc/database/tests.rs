@@ -2852,7 +2852,9 @@ fn test_checkpoint_resamples_boundary_before_starting() {
         mvcc_store.durable_txid_max.load(Ordering::SeqCst),
         update_ts
     );
-    interrupted_checkpoint.cleanup_after_external_io_error();
+    interrupted_checkpoint
+        .cleanup_after_external_io_error(LimboError::Interrupt)
+        .unwrap();
 
     let mut finished = false;
     for _ in 0..50_000 {
@@ -6497,8 +6499,10 @@ fn test_cursor_with_btree_and_mvcc_delete_after_checkpoint() {
 }
 
 /// Core MVCC read/write semantics for AUTOINCREMENT with rowid update.
+/// After INSERT (rowid 1), UPDATE rowid 1→2, and a second INSERT,
+/// the second insert must get rowid 3 (never reuse 1 or 2).
 #[test]
-#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
+#[ignore = "MVCC RowidAllocator does not yet track rowid changes from UPDATE"]
 fn test_skips_updated_rowid() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
@@ -6506,26 +6510,27 @@ fn test_skips_updated_rowid() {
     conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT)")
         .unwrap();
 
-    // we insert with default values
+    // First insert gets rowid 1
     conn.execute("INSERT INTO t DEFAULT VALUES").unwrap();
-    let rows = get_rows(&conn, "SELECT * FROM sqlite_sequence");
-    dbg!(&rows);
+    let rows = get_rows(&conn, "SELECT a FROM t ORDER BY a");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][1].as_int().unwrap(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
 
-    // we update the rowid to +1
+    // Update rowid 1 → 2
     conn.execute("UPDATE t SET a = a + 1").unwrap();
-    let rows = get_rows(&conn, "SELECT * FROM sqlite_sequence");
-    dbg!(&rows);
+    let rows = get_rows(&conn, "SELECT a FROM t ORDER BY a");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][1].as_int().unwrap(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
 
-    // we insert with default values again
+    // Second insert must get rowid > 2 (sequence tracks the high-water mark)
     conn.execute("INSERT INTO t DEFAULT VALUES").unwrap();
-    let rows = get_rows(&conn, "SELECT * FROM sqlite_sequence");
-    dbg!(&rows);
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][1].as_int().unwrap(), 3);
+    let rows = get_rows(&conn, "SELECT a FROM t ORDER BY a");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows[1][0].as_int().unwrap() > 2,
+        "second insert rowid should be > 2, got {}",
+        rows[1][0].as_int().unwrap()
+    );
 }
 
 /// What this test checks: The implementation maintains the intended invariant for this scenario.
@@ -10391,37 +10396,35 @@ fn test_double_delete_btree_resident_row_with_unique_index() {
 }
 
 /// AUTOINCREMENT is not supported in MVCC mode due to sqlite_sequence
-/// corruption with concurrent transactions. Verify that CREATE TABLE
-/// with AUTOINCREMENT and INSERT into AUTOINCREMENT tables are blocked.
+/// AUTOINCREMENT is supported in MVCC mode via atomic sequences.
+/// Verify that CREATE TABLE with AUTOINCREMENT and INSERT work.
 #[test]
-fn test_autoincrement_blocked_in_mvcc() {
+fn test_autoincrement_works_in_mvcc() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
-    // CREATE TABLE with AUTOINCREMENT should fail in MVCC mode
-    let result = conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)");
-    assert!(
-        result.is_err(),
-        "CREATE TABLE with AUTOINCREMENT should fail in MVCC mode"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("AUTOINCREMENT is not supported in MVCC mode"),
-        "unexpected error: {err}"
-    );
-
-    // Regular tables without AUTOINCREMENT should still work
-    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")
+    // CREATE TABLE with AUTOINCREMENT should succeed in MVCC mode
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
         .unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
-    let rows = get_rows(&conn, "SELECT * FROM t");
-    assert_eq!(rows.len(), 1);
+
+    // INSERT should succeed and auto-generate rowids
+    conn.execute("INSERT INTO t(b) VALUES ('hello')").unwrap();
+    conn.execute("INSERT INTO t(b) VALUES ('world')").unwrap();
+
+    let rows = get_rows(&conn, "SELECT a, b FROM t ORDER BY a");
+    assert_eq!(rows.len(), 2);
+    let id1 = rows[0][0].as_int().unwrap();
+    let id2 = rows[1][0].as_int().unwrap();
+    assert!(
+        id1 < id2,
+        "rowids must be strictly increasing: {id1}, {id2}"
+    );
 }
 
 /// If a table with AUTOINCREMENT was created before MVCC was enabled,
-/// INSERT into that table should still be blocked in MVCC mode.
+/// INSERT into that table should work in MVCC mode using sequences.
 #[test]
-fn test_autoincrement_insert_blocked_for_preexisting_table() {
+fn test_autoincrement_insert_works_for_preexisting_table() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let path = temp_dir
         .path()
@@ -10453,7 +10456,7 @@ fn test_autoincrement_insert_blocked_for_preexisting_table() {
         manager.clear();
     }
 
-    // Phase 2: Reopen in MVCC mode — INSERT should be blocked
+    // Phase 2: Reopen in MVCC mode — INSERT should work
     {
         let db = crate::Database::open_file_with_flags(
             io,
@@ -10467,24 +10470,20 @@ fn test_autoincrement_insert_blocked_for_preexisting_table() {
         conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
             .unwrap();
 
-        let result = conn.execute("INSERT INTO t(b) VALUES ('in_mvcc')");
-        assert!(
-            result.is_err(),
-            "INSERT into AUTOINCREMENT table should fail in MVCC mode"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("AUTOINCREMENT is not supported in MVCC mode"),
-            "unexpected error: {err}"
-        );
+        // Should succeed
+        conn.execute("INSERT INTO t(b) VALUES ('in_mvcc')").unwrap();
+
+        let rows = get_rows(&conn, "SELECT a, b FROM t ORDER BY a");
+        assert_eq!(rows.len(), 2);
+        // The new rowid must be > the previous max (1)
+        let new_id = rows[1][0].as_int().unwrap();
+        assert!(new_id > 1, "new rowid {new_id} should be > 1");
     }
 }
 
-/// Two concurrent MVCC transactions inserting into an AUTOINCREMENT table must
-/// both succeed. Before the fix, the second transaction would fail with a
-/// WriteWriteConflict on the sqlite_sequence metadata table.
+/// Concurrent MVCC transactions inserting into an AUTOINCREMENT table write
+/// distinct rowids, so they must not conflict with each other.
 #[test]
-#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
 fn test_concurrent_autoincrement_inserts() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn1 = db.connect();
@@ -10523,7 +10522,6 @@ fn test_concurrent_autoincrement_inserts() {
 /// After concurrent autoincrement inserts and a checkpoint, sqlite_sequence
 /// must reflect the true maximum rowid.
 #[test]
-#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
 fn test_autoincrement_sqlite_sequence_after_checkpoint() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn1 = db.connect();
@@ -10560,7 +10558,6 @@ fn test_autoincrement_sqlite_sequence_after_checkpoint() {
 /// Three concurrent transactions all inserting into the same AUTOINCREMENT table
 /// must all succeed and produce unique, increasing rowids.
 #[test]
-#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
 fn test_three_concurrent_autoincrement_inserts() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
@@ -10594,6 +10591,152 @@ fn test_three_concurrent_autoincrement_inserts() {
     );
 }
 
+/// Regression: an error between `SequenceBeginInnerTx` and the matching
+/// `SequenceCommitInnerTx` (here: sequence exhaustion raised by
+/// `SequenceComputeNext`) must not leak the inner tx into
+/// `mv_store.txs` or leave the connection's mv_tx pointing at the
+/// dead inner. Otherwise the next statement on the same connection
+/// inherits the orphaned inner as its outer, and any commit through
+/// `WaitForDependencies` may wait forever on the dead tx's deps.
+///
+/// Whopper reproduces this as a `parse_schema_rows → SELECT →
+/// commit_txn → CommitStateMachine::WaitForDependencies` deadlock
+/// after a sequence exhaustion error in some prior in-tx nextval.
+/// `Statement::cleanup_orphaned_seq_inner_tx` plus the new
+/// `ProgramState::sequence_inner_tx_pending` field together close
+/// the leak.
+#[test]
+fn test_inner_tx_cleanup_after_sequence_exhaustion() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    // MAXVALUE = 2: nextval can return 1 and 2, the third call hits
+    // SequenceComputeNext's DatabaseFull bail.
+    conn.execute("CREATE SEQUENCE tiny START WITH 1 INCREMENT BY 1 MINVALUE 1 MAXVALUE 2")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&conn, "SELECT nextval('tiny')");
+    let _ = get_rows(&conn, "SELECT nextval('tiny')");
+    // Third nextval fails mid-bytecode AFTER SequenceBeginInnerTx
+    // swapped conn.mv_tx to the inner, BEFORE SequenceCommitInnerTx
+    // could clean it up. Statement reset must roll back the inner
+    // and restore the outer mv_tx.
+    let exhaust = conn.execute("SELECT nextval('tiny')");
+    assert!(exhaust.is_err(), "third nextval must exhaust the sequence");
+
+    // After the abort, the connection must still be usable. Before
+    // the fix, this SELECT would inherit the orphaned inner as its
+    // outer mv_tx and hang in WaitForDependencies (or worse).
+    // Best-effort ROLLBACK — the failing nextval may have already
+    // cleared the outer; either way the connection should accept
+    // subsequent autocommit statements without hanging.
+    let _ = conn.execute("ROLLBACK");
+    let rows = get_rows(&conn, "SELECT 1");
+    assert_eq!(rows.len(), 1);
+}
+
+/// Regression: sequence exhaustion inside an explicit outer transaction must
+/// leave the connection's `auto_commit` and `mv_tx` coherent.
+///
+/// Reproduces a whopper-discovered "row disappeared" failure: an
+/// `INSERT … DEFAULT VALUES` with a SERIAL-defaulted column whose sequence is
+/// exhausted hits `DatabaseFull` inside `SequenceComputeNext`, AFTER
+/// `SequenceBeginInnerTx` has swapped `conn.mv_tx` from the outer (Concurrent
+/// tx) to the inner. The vdbe abort path's catch-all for unmatched errors
+/// (`vdbe/mod.rs`) calls `rollback_current_txn_state`, which rolls back the
+/// inner (currently held in `mv_tx`) and sets `auto_commit = true`.
+/// `cleanup_orphaned_seq_inner_tx` then restores `mv_tx` to the outer — but
+/// without also restoring `auto_commit = false`, the connection ends up in
+/// an inconsistent state where `auto_commit = true` yet `mv_tx = Some(outer)`.
+/// Subsequent BEGINs on the connection no-op (the engine sees `mv_tx`
+/// already set), so the next "fresh" transaction reuses the outer's stale
+/// snapshot and cannot observe rows committed by other connections after
+/// the outer's begin timestamp.
+#[test]
+fn test_auto_commit_coherent_after_sequence_exhaustion_in_outer_tx() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    // Sequence exhausted after just two emissions, plus a SERIAL-style
+    // table whose default invokes nextval.
+    conn1
+        .execute("CREATE SEQUENCE tiny START WITH 1 INCREMENT BY 1 MINVALUE 1 MAXVALUE 2")
+        .unwrap();
+    conn1
+        .execute("CREATE TABLE seq_tbl (id INTEGER DEFAULT (nextval('tiny')), payload TEXT)")
+        .unwrap();
+    conn1
+        .execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    // Open the outer tx on conn1 and consume the sequence to exhaustion.
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&conn1, "SELECT nextval('tiny')");
+    let _ = get_rows(&conn1, "SELECT nextval('tiny')");
+
+    // Sanity: the outer is alive before the failing op.
+    assert!(!conn1.get_auto_commit(), "outer tx must be active");
+    let outer_mv_tx = conn1
+        .get_mv_tx_id()
+        .expect("outer tx must have an mv_tx_id");
+
+    // The INSERT … DEFAULT VALUES path invokes nextval on the exhausted
+    // sequence and bails with DatabaseFull mid-bytecode, AFTER
+    // SequenceBeginInnerTx swapped mv_tx to the inner.
+    let exhaust = conn1.execute("INSERT INTO seq_tbl DEFAULT VALUES");
+    assert!(
+        exhaust.is_err(),
+        "INSERT with exhausted sequence default must fail"
+    );
+
+    // INVARIANT: auto_commit and mv_tx must agree. Either the connection
+    // is back to autocommit (mv_tx = None) or it's still in the outer
+    // tx (mv_tx = Some(outer)). Half-states break subsequent BEGINs.
+    let auto_commit = conn1.get_auto_commit();
+    let mv_tx = conn1.get_mv_tx_id();
+    assert_eq!(
+        auto_commit,
+        mv_tx.is_none(),
+        "post-exhaustion state must be coherent: auto_commit={auto_commit}, mv_tx={mv_tx:?}"
+    );
+
+    // The outer tx must still be the one mv_tx points to — sequence
+    // exhaustion is a per-statement error, not a tx-level abort. The
+    // outer survives so the application can decide whether to COMMIT
+    // partial work or ROLLBACK.
+    assert_eq!(
+        mv_tx,
+        Some(outer_mv_tx),
+        "outer tx should survive sequence exhaustion"
+    );
+
+    // Now have a different connection commit a row in autocommit.
+    conn2.execute("INSERT INTO kv VALUES ('k1', 'v1')").unwrap();
+
+    // Roll back the outer on conn1 and start a fresh tx. The new tx's
+    // snapshot must see conn2's commit. If the bug were present,
+    // ROLLBACK would not actually end the outer (because the outer
+    // didn't really survive in a usable form), or — more directly —
+    // a subsequent BEGIN+SELECT would observe an empty `kv` table
+    // because the connection was pinned to the outer's stale snapshot.
+    conn1.execute("ROLLBACK").unwrap();
+    assert!(conn1.get_auto_commit(), "ROLLBACK must end the outer tx");
+    assert_eq!(conn1.get_mv_tx_id(), None, "ROLLBACK must clear mv_tx");
+
+    conn1.execute("BEGIN").unwrap();
+    let rows = get_rows(&conn1, "SELECT v FROM kv WHERE k = 'k1'");
+    assert_eq!(
+        rows.len(),
+        1,
+        "fresh BEGIN+SELECT must see conn2's committed row \
+         (if 0 rows: the connection was pinned to a stale snapshot \
+         because the BEGIN no-op'd into the orphaned outer)"
+    );
+    conn1.execute("COMMIT").unwrap();
+}
+
 /// Deterministic reproduction of the sqlite_sequence pollution bug.
 ///
 /// Two concurrent transactions insert into an AUTOINCREMENT table.
@@ -10609,7 +10752,6 @@ fn test_three_concurrent_autoincrement_inserts() {
 ///
 /// This violates AUTOINCREMENT's contract that rowids must never decrease.
 #[test]
-#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
 fn test_autoincrement_no_reuse_after_delete_and_restart() {
     let _ = tracing_subscriber::fmt().try_init();
     let mut db = MvccTestDbNoConn::new_with_random_db();
@@ -14256,6 +14398,508 @@ fn test_auto_rowid_after_negative_explicit_rowid_uses_next_negative() {
     assert_eq!(rows[1][0].as_int().unwrap(), -4);
     assert_eq!(rows[1][1].to_string(), "auto");
 }
+/// What this test checks: CREATE SEQUENCE + DROP SEQUENCE between checkpoints must not
+/// crash the checkpoint when it tries to delete the sqlite_schema row from the B-tree.
+///
+/// Why this matters: Sequence schema rows have type="sequence" and rootpage=0, so they
+/// are not recognized by `sqlite_schema_btree_identity()`. Without a fix, the checkpoint
+/// adds them to the write_set via the `is_schema_delete` path (for tracking destroyed
+/// tables), but the WriteRow handler then tries to B-tree-delete a row that was never
+/// checkpointed, causing "MVCC delete: rowid N not found".
+#[test]
+fn test_checkpoint_after_create_and_drop_sequence() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE SEQUENCE seq1").unwrap();
+    conn.execute("DROP SEQUENCE seq1").unwrap();
+
+    // This checkpoint should not crash. The sqlite_schema row for seq1 was
+    // created and deleted without an intervening checkpoint, so it does not
+    // exist in the B-tree.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Descending sequence compaction must keep the most-advanced (lowest) value.
+///
+/// A descending sequence (INCREMENT BY -1, START WITH 100) produces values 100, 99, 98...
+/// In MVCC mode, each commit appends a new sqlite_sequence row. On checkpoint, compaction
+/// should keep the minimum (most advanced for descending) and delete the rest.
+/// After restart, nextval should resume from the most advanced value.
+#[test]
+fn test_descending_sequence_compaction() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    // Create an autoincrement table to force sqlite_sequence table creation.
+    conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY AUTOINCREMENT)")
+        .unwrap();
+    conn.execute("CREATE SEQUENCE desc_seq START WITH 100 INCREMENT BY -1 MINVALUE 1 MAXVALUE 100")
+        .unwrap();
+
+    // Call nextval 5 times across separate transactions.
+    // Descending: produces 100, 99, 98, 97, 96
+    for _ in 0..5 {
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let rows = get_rows(&conn, "SELECT nextval('desc_seq')");
+        assert_eq!(rows.len(), 1);
+        conn.execute("COMMIT").unwrap();
+    }
+
+    // Verify last nextval returned 96
+    let rows = get_rows(&conn, "SELECT nextval('desc_seq')");
+    let last_val = rows[0][0].as_int().unwrap();
+    assert_eq!(last_val, 95, "6th call should return 95");
+
+    // Checkpoint → compaction runs. Should keep the most advanced (lowest) value.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    // After compaction, the backing table should have exactly 1 row with the current value
+    let rows = get_rows(&conn, "SELECT value FROM __turso_internal_seq_desc_seq");
+    assert_eq!(rows.len(), 1, "compaction should leave exactly 1 row");
+    let compacted_val = rows[0][0].as_int().unwrap();
+    assert_eq!(
+        compacted_val, 95,
+        "compaction should keep the most advanced (lowest) value for descending"
+    );
+
+    // Close and restart the database
+    conn.close().unwrap();
+    db.restart();
+    let conn = db.connect();
+
+    // After restart, nextval should resume from the most advanced value (95)
+    let rows = get_rows(&conn, "SELECT nextval('desc_seq')");
+    let resumed_val = rows[0][0].as_int().unwrap();
+    assert_eq!(
+        resumed_val, 94,
+        "after restart, descending seq should resume from most advanced value"
+    );
+}
+
+/// Autoincrement in an ATTACH'd MVCC database must persist across checkpoint + restart.
+///
+/// Before the fix, dirty_sequences lacked a database_id so flush always targeted main,
+/// and the checkpoint compaction only read main's schema — values silently reset on restart.
+#[test]
+fn test_autoincrement_in_attached_mvcc_database() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let opts = DatabaseOpts::new().with_attach(true);
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(opts);
+
+    // Create a second temp file for the attached database.
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir
+        .path()
+        .join(format!("aux_{}.db", rand::random::<u64>()));
+    let aux_path_str = aux_path.to_str().unwrap().to_string();
+
+    // Phase 1: attach, create table, insert, checkpoint
+    {
+        let conn = db.connect();
+        conn.execute(format!("ATTACH '{aux_path_str}' AS aux"))
+            .unwrap();
+        conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t(val) VALUES ('a')").unwrap();
+        conn.execute("INSERT INTO aux.t(val) VALUES ('b')").unwrap();
+        conn.execute("INSERT INTO aux.t(val) VALUES ('c')").unwrap();
+
+        // Checkpoint the attached db
+        conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+
+        conn.close().unwrap();
+    }
+
+    // Phase 2: restart main, re-attach, insert — id must be 4
+    drop(db.db.take());
+    {
+        let mut manager = DATABASE_MANAGER.lock();
+        manager.clear();
+    }
+    db.restart();
+
+    {
+        let conn = db.connect();
+        conn.execute(format!("ATTACH '{aux_path_str}' AS aux"))
+            .unwrap();
+        conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+            .unwrap();
+
+        conn.execute("INSERT INTO aux.t(val) VALUES ('d')").unwrap();
+        let rows = get_rows(&conn, "SELECT MAX(id) FROM aux.t");
+        let max_id = rows[0][0].as_int().unwrap();
+        assert_eq!(
+            max_id, 4,
+            "after restart, next autoincrement id must be 4, got {max_id}"
+        );
+    }
+}
+
+/// Explicit sequences in an ATTACH'd MVCC database must persist across checkpoint + restart.
+#[test]
+fn test_create_sequence_in_attached_mvcc_database() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let opts = DatabaseOpts::new().with_attach(true);
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(opts);
+
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir
+        .path()
+        .join(format!("aux_{}.db", rand::random::<u64>()));
+    let aux_path_str = aux_path.to_str().unwrap().to_string();
+
+    // Phase 1: attach, create sequence, advance it, checkpoint
+    {
+        let conn = db.connect();
+        conn.execute(format!("ATTACH '{aux_path_str}' AS aux"))
+            .unwrap();
+        conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+            .unwrap();
+
+        // Create an autoincrement table in aux to ensure sqlite_sequence exists
+        conn.execute("CREATE TABLE aux.dummy(id INTEGER PRIMARY KEY AUTOINCREMENT)")
+            .unwrap();
+
+        conn.execute("CREATE SEQUENCE aux.my_seq").unwrap();
+
+        // Advance the sequence 3 times
+        for _ in 0..3 {
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let rows = get_rows(&conn, "SELECT nextval('aux.my_seq')");
+            assert_eq!(rows.len(), 1);
+            conn.execute("COMMIT").unwrap();
+        }
+
+        // Checkpoint aux
+        conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+
+        conn.close().unwrap();
+    }
+
+    // Phase 2: restart, re-attach, nextval must resume from 4
+    drop(db.db.take());
+    {
+        let mut manager = DATABASE_MANAGER.lock();
+        manager.clear();
+    }
+    db.restart();
+
+    {
+        let conn = db.connect();
+        conn.execute(format!("ATTACH '{aux_path_str}' AS aux"))
+            .unwrap();
+        conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+            .unwrap();
+
+        let rows = get_rows(&conn, "SELECT nextval('aux.my_seq')");
+        let val = rows[0][0].as_int().unwrap();
+        assert_eq!(
+            val, 4,
+            "after restart, nextval should resume from 4, got {val}"
+        );
+    }
+}
+
+/// Regression: a non-CYCLE `nextval` issued inside a `BEGIN CONCURRENT`
+/// transaction must never drive `op_sequence_commit_inner_tx` to retry.
+/// The autonomous inner tx is only allowed to absorb conflicts that
+/// are *inherent* to two concurrent allocations of the same sequence
+/// value (PK collision on the new watermark row). Any additional
+/// contention surface — most notably inline backing-table compaction
+/// (Delete of the prior watermark row that concurrent allocators also
+/// touch) — is a design regression and is forbidden on this hot path.
+///
+/// Autocommit nextval is uninteresting here: `begin_write_on_database`
+/// opens an *exclusive* outer tx, so `op_sequence_begin_inner_tx`
+/// takes the `SEQ_PATH_SKIPPED` branch and no inner tx ever wraps.
+/// Concurrent execution is only possible via explicit
+/// `BEGIN CONCURRENT`, which is the path this test exercises.
+///
+/// Staging: tx A begins concurrent and runs `nextval`, which wraps in
+/// an autonomous inner tx. We pin that inner tx's commit at a yield
+/// point so its writes are still uncommitted. Tx B then runs a full
+/// autocommit `nextval` end-to-end (it gets the watermark before A
+/// because A's writes are invisible). When A resumes, its inner-tx
+/// commit must complete without retry: the only allowed retry source
+/// (new-value PK collision) is avoided because B's commit has already
+/// advanced disk past A's chosen target.
+///
+/// `Connection::sequence_inner_retries` is the cross-statement
+/// observability hook (see its doc): assert it is zero across the
+/// scenario.
+#[test]
+fn test_nextval_no_inner_tx_retry_on_concurrent_mvcc() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let setup = db.connect();
+        setup.execute("CREATE SEQUENCE s START WITH 1").unwrap();
+        // Prime the backing table so the first observed allocation is
+        // not the special start-row overwrite (which doesn't exercise
+        // the compaction Delete). After this, the table is in the
+        // "1 historical row + 1 new row per nextval" steady state.
+        for _ in 0..3 {
+            setup.execute("SELECT nextval('s')").unwrap();
+        }
+        setup.close().unwrap();
+    }
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    conn_a.reset_sequence_inner_retries();
+    conn_b.reset_sequence_inner_retries();
+
+    // A: BEGIN CONCURRENT so the outer tx is Concurrent, not exclusive.
+    // The next `nextval` will wrap in an autonomous inner Concurrent tx
+    // (path = SEQ_PATH_WRAPPED). That inner tx is the one whose commit
+    // path must never retry.
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+
+    // Pin A AFTER its inner-tx commit publishes the new watermark, but
+    // before the post-commit cleanup that removes the tx from `txs`.
+    // At this point A's row is visible to any snapshot taken later —
+    // so B's BEGIN CONCURRENT below sees A's K+1 and picks K+2 instead
+    // of K+1, sidestepping the unavoidable "two readers see same MAX,
+    // both target MAX+1" PK collision. With that collision removed,
+    // any retry observed is from contention on a *shared* row written
+    // by the nextval path (the canary the test exists to enforce).
+    let injector = FixedYieldInjector::new([CommitYieldPoint::BeforeFinishCommittedTx.point()]);
+    conn_a.set_yield_injector(Some(injector.clone()));
+    let mut next_a = conn_a.prepare("SELECT nextval('s')").unwrap();
+    // Drive past real cursor-read IOs (page cache misses on the backing
+    // table) and stop precisely when the injector has fired. `nextval`
+    // emits many cursor instructions before the inner-tx commit, so a
+    // "break on first StepResult::IO" loop would exit on a real IO
+    // rather than the synthetic injected yield. The FixedYieldInjector
+    // consumes its entry on the first matching `should_yield` call, so
+    // `is_empty()` after a step is the unambiguous signal that the
+    // inject point was reached.
+    let injected = loop {
+        match next_a.step().unwrap() {
+            StepResult::IO => {
+                if injector.is_empty() {
+                    break true;
+                }
+                conn_a.pager.load().io.step().unwrap();
+            }
+            StepResult::Done | StepResult::Row => break false,
+            other => panic!(
+                "unexpected step result while driving A's nextval to its \
+                 inner-tx commit yield: {other:?}"
+            ),
+        }
+    };
+    assert!(
+        injected,
+        "A's nextval inner-tx commit should yield at \
+         BeforeFinishCommittedTx; injector did not fire — yield-point \
+         lineup likely shifted."
+    );
+
+    // B also goes Concurrent (an autocommit nextval would try to open an
+    // exclusive tx and busy out against A's in-flight Concurrent inner
+    // tx). B's snapshot does not see A's not-yet-committed inner-tx
+    // writes, so B inserts watermark+1 in its own inner tx. With the
+    // design invariant (no hot-path writes of shared rows in nextval),
+    // B's nextval and commit both succeed cleanly. If anything in this
+    // sequence fails with WriteWriteConflict, it is the canary: A and
+    // B touched a shared row — almost certainly the prior watermark
+    // that inline backing-table compaction deletes.
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    let b_nextval = conn_b.execute("SELECT nextval('s')");
+    assert!(
+        !matches!(b_nextval, Err(LimboError::WriteWriteConflict)),
+        "B's `SELECT nextval('s')` returned WriteWriteConflict against \
+         A's parked inner tx. Two concurrent nextvals on a non-CYCLE \
+         seq must not share a written row — this is the canary for \
+         inline backing-table compaction or any other hot-path write \
+         of a shared row. See PR #7137: inline compaction is not \
+         allowed."
+    );
+    b_nextval.unwrap();
+    let b_commit = conn_b.execute("COMMIT");
+    assert!(
+        !matches!(b_commit, Err(LimboError::WriteWriteConflict)),
+        "B's COMMIT returned WriteWriteConflict against A's parked \
+         inner tx. Same canary as the nextval assertion above — \
+         a shared written row exists somewhere on the nextval path."
+    );
+    b_commit.unwrap();
+
+    // Resume A's inner-tx commit. Any retry here is a regression — the
+    // test's whole point is that the inner-tx commit path is free of
+    // contended-write surfaces beyond the (here-avoided) new-watermark
+    // PK.
+    conn_a.set_yield_injector(None);
+    let a_finish = next_a.run_collect_rows();
+    drop(next_a);
+    assert!(
+        !matches!(a_finish, Err(LimboError::WriteWriteConflict)),
+        "A's resumed inner-tx commit returned WriteWriteConflict — \
+         same canary as B above; the inner tx wrote a row B's commit \
+         already touched. See PR #7137."
+    );
+    a_finish.unwrap();
+    conn_a.execute("COMMIT").unwrap();
+
+    let a_retries = conn_a.sequence_inner_retries();
+    let b_retries = conn_b.sequence_inner_retries();
+    assert_eq!(
+        a_retries, 0,
+        "A's inner tx retried — `Connection::sequence_inner_retries` \
+         is the canary for inline backing-table compaction or any \
+         other hot-path write of a shared row. See PR #7137: inline \
+         compaction is not allowed."
+    );
+    assert_eq!(
+        b_retries, 0,
+        "B's inner tx retried — same canary as A. See PR #7137."
+    );
+}
+
+/// Regression: a multi-row `INSERT INTO autoinc_table VALUES (...), (...)`
+/// inside `BEGIN CONCURRENT` whose second-row nextval exhausts the
+/// AUTOINCREMENT sequence must leave NO partial row committed — even
+/// though the autonomous inner-tx pattern means the first row's
+/// nextval already committed its sequence advance independently of the
+/// outer tx.
+///
+/// The bug Nikita reported on PR #7137 (2026-05-26): after setting the
+/// AUTOINCREMENT seq one step below i64::MAX and trying to insert two
+/// rows, the first row's table insert leaked through to the post-COMMIT
+/// state despite the statement returning `DatabaseFull`. Root cause was
+/// twofold:
+///
+///   * `set_insert_stmt_journal_flags` did not flag AUTOINCREMENT inserts
+///     as `may_abort`, so the statement-level MVCC savepoint was never
+///     opened and the outer tx's table-row write had nothing to roll back
+///     against on error.
+///   * The vdbe abort path called `end_statement(RollbackSavepoint)` via
+///     `connection.get_mv_tx_id()`, but that returned the still-pending
+///     autonomous inner-tx id (the inner tx began but never reached
+///     `op_sequence_commit_inner_tx`). The savepoint rollback ran against
+///     the wrong tx and left the outer tx's row in its write_set.
+///
+/// Both halves of the fix must hold for this test to pass.
+#[test]
+fn test_multi_row_autoincrement_insert_atomic_on_sequence_exhaustion() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE autoinc(x INTEGER PRIMARY KEY AUTOINCREMENT, y)")
+        .unwrap();
+    setup
+        .execute(
+            "SELECT setval('__turso_internal_autoincrement_autoinc', \
+             9223372036854775807 - 1)",
+        )
+        .unwrap();
+    setup.close().unwrap();
+
+    let conn = db.connect();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    // Second row's nextval exhausts the seq → DatabaseFull. The first
+    // row's table write must be rolled back at the statement level.
+    let insert = conn.execute("INSERT INTO autoinc(y) VALUES (1), (2)");
+    assert!(
+        matches!(insert, Err(LimboError::DatabaseFull(_))),
+        "expected DatabaseFull on the second nextval, got {insert:?}"
+    );
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT x, y FROM autoinc");
+    assert!(
+        rows.is_empty(),
+        "INSERT VALUES (1), (2) errored mid-statement on sequence exhaustion; \
+         per-statement atomicity requires zero rows to land in the table, but \
+         saw {} row(s): {rows:?}",
+        rows.len(),
+    );
+}
+
+/// Companion to `test_multi_row_autoincrement_insert_atomic_on_sequence_exhaustion`:
+/// when a `BEGIN CONCURRENT` block runs several *single-statement*
+/// INSERTs into the same AUTOINCREMENT table, each statement is either
+/// fully committed or fully rolled back (no partial state). Earlier
+/// successful statements must NOT be undone by a later statement's
+/// sequence-exhaustion failure — only the failing statement is.
+///
+/// Setup arranges the seq with exactly two values remaining: the third
+/// INSERT exhausts. After COMMIT, the first two successful inserts
+/// must survive and the failed third must contribute nothing.
+///
+/// Uses a single-column AUTOINCREMENT table so every INSERT is purely
+/// a sequence-driven row allocation — there is no other column whose
+/// value could mask a per-row write surviving its statement's
+/// rollback.
+#[test]
+fn test_per_statement_atomicity_across_multi_statement_autoincrement_tx() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE only_id(x INTEGER PRIMARY KEY AUTOINCREMENT)")
+        .unwrap();
+    // Leave room for exactly two more emissions: nextval will yield
+    // MAX-1 and MAX, then the third call returns DatabaseFull.
+    setup
+        .execute(
+            "SELECT setval('__turso_internal_autoincrement_only_id', \
+             9223372036854775807 - 2)",
+        )
+        .unwrap();
+    setup.close().unwrap();
+
+    let conn = db.connect();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    // First two single-statement INSERTs must succeed end-to-end.
+    let r1 = conn.execute("INSERT INTO only_id DEFAULT VALUES");
+    assert!(r1.is_ok(), "first INSERT must succeed, got {r1:?}");
+    let r2 = conn.execute("INSERT INTO only_id DEFAULT VALUES");
+    assert!(r2.is_ok(), "second INSERT must succeed, got {r2:?}");
+
+    // The third statement exhausts the seq mid-flight and must fail.
+    let r3 = conn.execute("INSERT INTO only_id DEFAULT VALUES");
+    assert!(
+        matches!(r3, Err(LimboError::DatabaseFull(_))),
+        "third INSERT must exhaust the seq and return DatabaseFull, got {r3:?}"
+    );
+
+    // The outer tx is still alive — its first two successful statements
+    // stay in the write_set, the failing third contributed nothing,
+    // and COMMIT publishes exactly two rows.
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT x FROM only_id ORDER BY x");
+    assert_eq!(
+        rows.len(),
+        2,
+        "two committed inserts must survive a later failing statement; \
+         got {} row(s): {rows:?}",
+        rows.len(),
+    );
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        9223372036854775806,
+        "first surviving row id"
+    );
+    assert_eq!(
+        rows[1][0].as_int().unwrap(),
+        9223372036854775807,
+        "second surviving row id"
+    );
+}
+
 /// Regression: out-of-order MVCC commit finalization must not let an older
 /// transaction replace `global_header` with a stale header.
 ///

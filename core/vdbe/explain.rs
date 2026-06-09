@@ -1711,6 +1711,85 @@ pub fn insn_to_row(
                 0,
                 format!("DROP TYPE {type_name}"),
             ),
+            Insn::AddSequence { db, name, .. } => (
+                "AddSequence",
+                *db as i64,
+                0,
+                0,
+                Value::build_text(name.clone()),
+                0,
+                format!("ADD SEQUENCE {name}"),
+            ),
+            Insn::DropSequence { db, seq_name } => (
+                "DropSequence",
+                *db as i64,
+                0,
+                0,
+                Value::build_text(seq_name.clone()),
+                0,
+                format!("DROP SEQUENCE {seq_name}"),
+            ),
+            Insn::SequenceComputeNext {
+                db,
+                seq_name_reg,
+                in_value_reg,
+                in_is_called_reg,
+                was_empty_reg,
+                out_value_reg,
+            } => (
+                "SequenceComputeNext",
+                *db as i64,
+                *seq_name_reg as i64,
+                *out_value_reg as i64,
+                Value::Null,
+                0,
+                format!(
+                    "r[{out_value_reg}] = next(r[{in_value_reg}], is_called=r[{in_is_called_reg}], empty=r[{was_empty_reg}])"
+                ),
+            ),
+            Insn::SetSequenceCurrval {
+                seq_name_reg,
+                value_reg,
+            } => (
+                "SetSequenceCurrval",
+                0,
+                *seq_name_reg as i64,
+                *value_reg as i64,
+                Value::Null,
+                0,
+                format!("currval(r[{seq_name_reg}]) = r[{value_reg}]"),
+            ),
+            Insn::SequenceBeginInnerTx {
+                db,
+                path_kind_reg,
+                saved_outer_reg,
+            } => (
+                "SequenceBeginInnerTx",
+                *db as i64,
+                *path_kind_reg as i64,
+                *saved_outer_reg as i64,
+                Value::Null,
+                0,
+                format!(
+                    "r[{path_kind_reg}] = path; r[{saved_outer_reg}] = saved outer mv_tx"
+                ),
+            ),
+            Insn::SequenceCommitInnerTx {
+                db,
+                path_kind_reg,
+                saved_outer_reg,
+                status_reg,
+            } => (
+                "SequenceCommitInnerTx",
+                *db as i64,
+                *path_kind_reg as i64,
+                *saved_outer_reg as i64,
+                Value::from_i64(*status_reg as i64),
+                0,
+                format!(
+                    "commit inner tx; r[{status_reg}] = 0=Ok | 1=ConflictRetry"
+                ),
+            ),
             Insn::AddType { db, sql } => (
                 "AddType",
                 *db as i64,

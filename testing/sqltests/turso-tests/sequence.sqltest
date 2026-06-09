@@ -1,0 +1,289 @@
+@database :memory:
+
+# --- Sequence as column DEFAULT ---
+
+test sequence-as-column-default {
+    CREATE SEQUENCE invoice_seq START WITH 1000 INCREMENT BY 1;
+    CREATE TABLE invoices(id INTEGER PRIMARY KEY, invoice_num INTEGER DEFAULT (nextval('invoice_seq')), note TEXT);
+    INSERT INTO invoices(note) VALUES ('first');
+    INSERT INTO invoices(note) VALUES ('second');
+    INSERT INTO invoices(note) VALUES ('third');
+    SELECT invoice_num, note FROM invoices ORDER BY id;
+}
+expect {
+    1000|first
+    1001|second
+    1002|third
+}
+
+test sequence-default-multi-row-insert {
+    CREATE SEQUENCE mri_seq;
+    CREATE TABLE mri(id INTEGER PRIMARY KEY, s INTEGER DEFAULT (nextval('mri_seq')), v TEXT);
+    INSERT INTO mri(v) VALUES ('a'), ('b'), ('c');
+    SELECT s, v FROM mri ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+# --- Index on sequence-populated column ---
+
+test sequence-with-indexed-column {
+    CREATE SEQUENCE idx_seq;
+    CREATE TABLE t_idx(id INTEGER PRIMARY KEY, seq_id INTEGER DEFAULT (nextval('idx_seq')), data TEXT);
+    CREATE INDEX idx_seq_id ON t_idx(seq_id);
+    INSERT INTO t_idx(data) VALUES ('a');
+    INSERT INTO t_idx(data) VALUES ('b');
+    INSERT INTO t_idx(data) VALUES ('c');
+    INSERT INTO t_idx(data) VALUES ('d');
+    INSERT INTO t_idx(data) VALUES ('e');
+    -- Point lookup via index
+    SELECT data FROM t_idx WHERE seq_id = 3;
+    -- Range scan via index
+    SELECT seq_id FROM t_idx WHERE seq_id BETWEEN 2 AND 4 ORDER BY seq_id;
+}
+expect {
+    c
+    2
+    3
+    4
+}
+
+# --- Bounded non-cycling: overflow error ---
+
+test sequence-start-above-max-errors {
+    CREATE SEQUENCE bad_start_high START WITH 10 MINVALUE 1 MAXVALUE 5;
+}
+expect error {
+    START value \(10\) cannot be greater than MAXVALUE \(5\)
+}
+
+test sequence-start-below-min-descending-errors {
+    CREATE SEQUENCE bad_start_low START WITH 0 INCREMENT BY -1 MINVALUE 1 MAXVALUE 10;
+}
+expect error {
+    START value \(0\) cannot be less than MINVALUE \(1\)
+}
+
+test sequence-bounded-ascending-overflow {
+    CREATE SEQUENCE bounded_asc MINVALUE 1 MAXVALUE 3;
+    SELECT nextval('bounded_asc');
+    SELECT nextval('bounded_asc');
+    SELECT nextval('bounded_asc');
+}
+expect {
+    1
+    2
+    3
+}
+
+test sequence-bounded-ascending-overflow-error {
+    CREATE SEQUENCE bounded_asc2 MINVALUE 1 MAXVALUE 2;
+    SELECT nextval('bounded_asc2');
+    SELECT nextval('bounded_asc2');
+    SELECT nextval('bounded_asc2');
+}
+expect error {
+    nextval: reached maximum value of sequence "bounded_asc2"
+}
+
+test sequence-bounded-descending-underflow-error {
+    CREATE SEQUENCE bounded_desc START WITH 10 INCREMENT BY -1 MINVALUE 8 MAXVALUE 10;
+    SELECT nextval('bounded_desc');
+    SELECT nextval('bounded_desc');
+    SELECT nextval('bounded_desc');
+    SELECT nextval('bounded_desc');
+}
+expect error {
+    nextval: reached minimum value of sequence "bounded_desc"
+}
+
+# --- setval out of bounds ---
+
+test setval-above-max-errors {
+    CREATE SEQUENCE bounded_sv MINVALUE 1 MAXVALUE 100;
+    SELECT setval('bounded_sv', 101);
+}
+expect error {
+    setval: value 101 is out of bounds
+}
+
+test setval-below-min-errors {
+    CREATE SEQUENCE bounded_sv2 MINVALUE 1 MAXVALUE 100;
+    SELECT setval('bounded_sv2', 0);
+}
+expect error {
+    setval: value 0 is out of bounds
+}
+
+test setval-at-boundaries-works {
+    CREATE SEQUENCE bounded_sv3 MINVALUE 1 MAXVALUE 100;
+    SELECT setval('bounded_sv3', 1);
+    SELECT nextval('bounded_sv3');
+    SELECT setval('bounded_sv3', 100);
+    SELECT currval('bounded_sv3');
+}
+expect {
+    1
+    2
+    100
+    100
+}
+
+test setval-non-integer-value-errors {
+    CREATE SEQUENCE sv_nonint_value MINVALUE 0 MAXVALUE 100;
+    SELECT setval('sv_nonint_value', 'not an integer');
+}
+expect error {
+    setval\(\) requires an integer value
+}
+
+test setval-non-integer-is-called-errors {
+    CREATE SEQUENCE sv_nonint_called MINVALUE 0 MAXVALUE 100;
+    SELECT setval('sv_nonint_called', 5, 'not a boolean');
+}
+expect error {
+    setval\(\) requires an integer is_called argument
+}
+
+# --- Descending sequences ---
+
+test descending-sequence-step-3 {
+    CREATE SEQUENCE by_minus3 START WITH 30 INCREMENT BY -3 MINVALUE 0 MAXVALUE 30;
+    SELECT nextval('by_minus3');
+    SELECT nextval('by_minus3');
+    SELECT nextval('by_minus3');
+    SELECT nextval('by_minus3');
+}
+expect {
+    30
+    27
+    24
+    21
+}
+
+test descending-cycle {
+    CREATE SEQUENCE cycle_desc START WITH 5 INCREMENT BY -2 MINVALUE 1 MAXVALUE 5 CYCLE;
+    SELECT nextval('cycle_desc');
+    SELECT nextval('cycle_desc');
+    SELECT nextval('cycle_desc');
+    SELECT nextval('cycle_desc');
+    SELECT nextval('cycle_desc');
+    SELECT nextval('cycle_desc');
+}
+expect {
+    5
+    3
+    1
+    5
+    3
+    1
+}
+
+test ascending-cycle {
+    CREATE SEQUENCE cycle_asc START WITH 1 INCREMENT BY 1 MINVALUE 1 MAXVALUE 3 CYCLE;
+    SELECT nextval('cycle_asc');
+    SELECT nextval('cycle_asc');
+    SELECT nextval('cycle_asc');
+    SELECT nextval('cycle_asc');
+    SELECT nextval('cycle_asc');
+}
+expect {
+    1
+    2
+    3
+    1
+    2
+}
+
+# --- currval ---
+
+test currval-after-nextval {
+    CREATE SEQUENCE cv_seq;
+    SELECT nextval('cv_seq');
+    SELECT currval('cv_seq');
+    SELECT nextval('cv_seq');
+    SELECT currval('cv_seq');
+}
+expect {
+    1
+    1
+    2
+    2
+}
+
+test currval-without-nextval-errors {
+    CREATE SEQUENCE cv_seq2;
+    SELECT currval('cv_seq2');
+}
+expect error {
+    currval of sequence "cv_seq2" is not yet defined in this session
+}
+
+test currval-after-drop-sequence-errors {
+    CREATE SEQUENCE cv_drop_seq;
+    SELECT nextval('cv_drop_seq');
+    DROP SEQUENCE cv_drop_seq;
+    SELECT currval('cv_drop_seq');
+}
+expect error {
+    sequence "cv_drop_seq" does not exist
+}
+
+# --- setval with is_called ---
+
+test setval-is-called-true {
+    CREATE SEQUENCE sv_seq;
+    SELECT setval('sv_seq', 50, true);
+    SELECT nextval('sv_seq');
+}
+expect {
+    50
+    51
+}
+
+test setval-is-called-false {
+    CREATE SEQUENCE sv_seq2;
+    SELECT setval('sv_seq2', 50, false);
+    SELECT nextval('sv_seq2');
+    SELECT nextval('sv_seq2');
+}
+expect {
+    50
+    50
+    51
+}
+
+# --- Sequence in expressions ---
+
+test sequence-in-insert-values {
+    CREATE SEQUENCE expr_seq START WITH 100;
+    CREATE TABLE t_expr(id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t_expr VALUES (1, nextval('expr_seq'));
+    INSERT INTO t_expr VALUES (2, nextval('expr_seq') * 10);
+    SELECT id, val FROM t_expr ORDER BY id;
+}
+expect {
+    1|100
+    2|1010
+}
+
+# --- Reserved namespace ---
+
+# `__turso_internal_autoincrement_<table>` is the implicit sequence
+# name CREATE TABLE … AUTOINCREMENT installs internally. The nextval/
+# advance_past/setval translators detect this prefix to mirror the
+# watermark into `sqlite_sequence` for the underlying table. A user
+# who creates a sequence in this namespace would otherwise be able
+# to write arbitrary rows into `sqlite_sequence` keyed on an attacker-
+# chosen table name — persistent SQLite-compatibility metadata
+# corruption, even if no page-level corruption results. CREATE
+# SEQUENCE must reject the prefix outright.
+test create-sequence-rejects-autoincrement-internal-prefix {
+    CREATE SEQUENCE __turso_internal_autoincrement_pwned START WITH 100;
+}
+expect error {
+    sequence name "__turso_internal_autoincrement_pwned" is reserved for internal AUTOINCREMENT use
+}

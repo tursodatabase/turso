@@ -44,7 +44,7 @@ mod columns;
 mod condition;
 mod custom_types;
 mod emission;
-mod functions;
+pub(crate) mod functions;
 mod translator;
 mod utils;
 mod vectors;

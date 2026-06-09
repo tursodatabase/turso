@@ -831,6 +831,59 @@ impl ToTokens for Stmt {
                 s.append(TK_ID, Some(type_name))?;
                 Ok(())
             }
+            Self::CreateSequence {
+                if_not_exists,
+                seq_name,
+                start,
+                increment,
+                min_value,
+                max_value,
+                cycle,
+            } => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_ID, Some("SEQUENCE"))?;
+                if *if_not_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_NOT, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                seq_name.to_tokens(s, context)?;
+                if let Some(v) = start {
+                    s.append(TK_ID, Some("START"))?;
+                    s.append(TK_ID, Some("WITH"))?;
+                    s.append(TK_ID, Some(&v.to_string()))?;
+                }
+                if let Some(v) = increment {
+                    s.append(TK_ID, Some("INCREMENT"))?;
+                    s.append(TK_ID, Some("BY"))?;
+                    s.append(TK_ID, Some(&v.to_string()))?;
+                }
+                if let Some(v) = min_value {
+                    s.append(TK_ID, Some("MINVALUE"))?;
+                    s.append(TK_ID, Some(&v.to_string()))?;
+                }
+                if let Some(v) = max_value {
+                    s.append(TK_ID, Some("MAXVALUE"))?;
+                    s.append(TK_ID, Some(&v.to_string()))?;
+                }
+                if *cycle {
+                    s.append(TK_ID, Some("CYCLE"))?;
+                }
+                Ok(())
+            }
+            Self::DropSequence {
+                if_exists,
+                seq_name,
+            } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("SEQUENCE"))?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                seq_name.to_tokens(s, context)?;
+                Ok(())
+            }
             Self::DropDomain {
                 if_exists,
                 domain_name,

@@ -1,0 +1,211 @@
+@database :memory:
+
+# MVCC autoincrement: sqlite_sequence has correct high-water mark after checkpoint
+test mvcc-autoincrement-sqlite-sequence-after-checkpoint {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT);
+    INSERT INTO t1 (val) VALUES ('a');
+    INSERT INTO t1 (val) VALUES ('b');
+    INSERT INTO t1 (val) VALUES ('c');
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    mvcc
+    0|0|0
+    t1|3
+}
+
+# MVCC autoincrement: high-water mark survives checkpoint + more inserts
+test mvcc-autoincrement-survives-checkpoint {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT);
+    INSERT INTO t2 (val) VALUES ('a');
+    INSERT INTO t2 (val) VALUES ('b');
+    PRAGMA wal_checkpoint(TRUNCATE);
+    INSERT INTO t2 (val) VALUES ('c');
+    INSERT INTO t2 (val) VALUES ('d');
+    SELECT id, val FROM t2 ORDER BY id;
+}
+expect {
+    mvcc
+    0|0|0
+    1|a
+    2|b
+    3|c
+    4|d
+}
+
+# MVCC autoincrement: delete does not reset high-water mark after checkpoint
+test mvcc-autoincrement-delete-preserves-hwm {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t3 (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT);
+    INSERT INTO t3 (val) VALUES ('a');
+    INSERT INTO t3 (val) VALUES ('b');
+    INSERT INTO t3 (val) VALUES ('c');
+    DELETE FROM t3;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    INSERT INTO t3 (val) VALUES ('d');
+    SELECT id, val FROM t3;
+}
+expect {
+    mvcc
+    0|0|0
+    4|d
+}
+
+# MVCC autoincrement: implicit allocation fails once the largest-ever rowid is max
+test mvcc-autoincrement-fails-after-max-rowid {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t_max (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT);
+    INSERT INTO t_max (id, val) VALUES (9223372036854775807, 'max');
+    INSERT INTO t_max (val) VALUES ('overflow');
+}
+expect error {
+    database or disk is full
+}
+
+# MVCC autoincrement: deleting the max row does not reset the largest-ever rowid
+test mvcc-autoincrement-delete-does-not-reset-full {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t_max_delete (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT);
+    INSERT INTO t_max_delete (id, val) VALUES (9223372036854775807, 'max');
+    DELETE FROM t_max_delete;
+    INSERT INTO t_max_delete (val) VALUES ('overflow');
+}
+expect error {
+    database or disk is full
+}
+
+# MVCC user sequence: works correctly with checkpoint
+test mvcc-user-sequence-checkpoint {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE SEQUENCE my_seq;
+    SELECT nextval('my_seq');
+    SELECT nextval('my_seq');
+    SELECT nextval('my_seq');
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT nextval('my_seq');
+}
+expect {
+    mvcc
+    1
+    2
+    3
+    0|0|0
+    4
+}
+
+# MVCC user sequence: checkpoint must keep the last emitted value after CYCLE wrap
+test mvcc-cycling-sequence-checkpoint-keeps-wrapped-watermark {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE SEQUENCE cycle_ckpt START WITH 1 MINVALUE 1 MAXVALUE 3 CYCLE;
+    SELECT nextval('cycle_ckpt');
+    SELECT nextval('cycle_ckpt');
+    SELECT nextval('cycle_ckpt');
+    SELECT nextval('cycle_ckpt');
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT value, is_called FROM "__turso_internal_seq_cycle_ckpt" ORDER BY value;
+    SELECT nextval('cycle_ckpt');
+}
+expect {
+    mvcc
+    1
+    2
+    3
+    1
+    0|0|0
+    1|1
+    2
+}
+
+# Regression: explicit-rowid INSERT below the current AUTOINCREMENT
+# watermark must NOT regress `sqlite_sequence`. The implicit
+# advance_past helper's no-op branch (when the explicit value is
+# at-or-below current) used to fall through to an unconditional
+# `sqlite_sequence` sync, clobbering the row with the *lower* value
+# while leaving the engine's actual autoinc watermark untouched. The
+# next AUTOINCREMENT INSERT would then see a divergence between
+# `sqlite_sequence` and the backing-table state.
+test mvcc-autoinc-explicit-low-rowid-preserves-sqlite-sequence {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t6 (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO t6(v) VALUES ('a'), ('b'), ('c');
+    SELECT seq FROM sqlite_sequence WHERE name='t6';
+    DELETE FROM t6 WHERE id IN (1, 2);
+    INSERT INTO t6(id, v) VALUES (1, 'explicit-low');
+    SELECT seq FROM sqlite_sequence WHERE name='t6';
+    INSERT INTO t6(v) VALUES ('next');
+    SELECT id FROM t6 WHERE v = 'next';
+}
+expect {
+    mvcc
+    3
+    3
+    4
+}
+
+# MVCC -> WAL mode switch: autoincrement ids continue correctly
+test mvcc-to-wal-autoincrement-continues {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t4 (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT);
+    INSERT INTO t4 (val) VALUES ('a');
+    INSERT INTO t4 (val) VALUES ('b');
+    INSERT INTO t4 (val) VALUES ('c');
+    PRAGMA journal_mode = 'wal';
+    SELECT name, seq FROM sqlite_sequence;
+    INSERT INTO t4 (val) VALUES ('d');
+    SELECT id, val FROM t4 ORDER BY id;
+}
+expect {
+    mvcc
+    wal
+    t4|3
+    1|a
+    2|b
+    3|c
+    4|d
+}
+
+# MVCC -> WAL mode switch: user sequence continues correctly
+test mvcc-to-wal-user-sequence-continues {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE SEQUENCE s1;
+    SELECT nextval('s1');
+    SELECT nextval('s1');
+    SELECT nextval('s1');
+    PRAGMA journal_mode = 'wal';
+    SELECT nextval('s1');
+    SELECT nextval('s1');
+}
+expect {
+    mvcc
+    1
+    2
+    3
+    wal
+    4
+    5
+}
+
+# MVCC -> WAL -> MVCC roundtrip preserves autoincrement
+test mvcc-wal-mvcc-roundtrip-autoincrement {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t5 (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT);
+    INSERT INTO t5 (val) VALUES ('a');
+    INSERT INTO t5 (val) VALUES ('b');
+    PRAGMA journal_mode = 'wal';
+    INSERT INTO t5 (val) VALUES ('c');
+    PRAGMA journal_mode = 'mvcc';
+    INSERT INTO t5 (val) VALUES ('d');
+    SELECT id, val FROM t5 ORDER BY id;
+}
+expect {
+    mvcc
+    wal
+    mvcc
+    1|a
+    2|b
+    3|c
+    4|d
+}

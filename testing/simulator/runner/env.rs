@@ -322,6 +322,7 @@ pub struct ShadowTables<'a> {
 pub struct ShadowTablesMut<'a> {
     commited_tables: &'a mut Vec<Table>,
     transaction_tables: &'a mut Option<TransactionTables>,
+    sequences: &'a mut Vec<ShadowSequence>,
 }
 
 impl<'a> ShadowTables<'a> {
@@ -459,6 +460,114 @@ where
         }
     }
 
+    /// Create a new sequence. Sequences are global and transaction-independent.
+    pub fn create_sequence(
+        &mut self,
+        name: String,
+        start: i64,
+        increment: i64,
+        min_value: i64,
+        max_value: i64,
+        cycle: bool,
+    ) -> anyhow::Result<Vec<Vec<SimValue>>> {
+        // The generator may pick the same `seq_<n>` twice (small name
+        // space) and `CreateSequence`'s SQL emission uses
+        // `CREATE SEQUENCE IF NOT EXISTS`, so the engine treats a
+        // duplicate as a no-op rather than an error. Match that here:
+        // a second create on the same name is a no-op (params from
+        // the original creation stay authoritative).
+        if self.sequences.iter().any(|s| s.name == name) {
+            return Ok(vec![]);
+        }
+        self.sequences.push(ShadowSequence {
+            name,
+            current_value: start,
+            increment_by: increment,
+            min_value,
+            max_value,
+            is_called: false,
+            cycle,
+        });
+        Ok(vec![])
+    }
+
+    /// Drop a sequence.
+    pub fn drop_sequence(&mut self, name: &str) -> anyhow::Result<Vec<Vec<SimValue>>> {
+        let pos = self
+            .sequences
+            .iter()
+            .position(|s| s.name == name)
+            .ok_or_else(|| anyhow::anyhow!("sequence \"{}\" does not exist", name))?;
+        self.sequences.remove(pos);
+        Ok(vec![])
+    }
+
+    /// Advance a sequence and return its next value. Mirrors core/schema.rs Sequence::nextval.
+    pub fn nextval(&mut self, name: &str) -> anyhow::Result<i64> {
+        let seq = self
+            .sequences
+            .iter_mut()
+            .find(|s| s.name == name)
+            .ok_or_else(|| anyhow::anyhow!("sequence \"{}\" does not exist", name))?;
+
+        let value = if !seq.is_called {
+            // First call: return current_value (which is start_value)
+            seq.is_called = true;
+            seq.current_value
+        } else {
+            let next = seq.current_value + seq.increment_by;
+            if seq.increment_by > 0 && next > seq.max_value {
+                if seq.cycle {
+                    seq.current_value = seq.min_value;
+                    seq.min_value
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "nextval: reached maximum value of sequence \"{}\"",
+                        name
+                    ));
+                }
+            } else if seq.increment_by < 0 && next < seq.min_value {
+                if seq.cycle {
+                    seq.current_value = seq.max_value;
+                    seq.max_value
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "nextval: reached minimum value of sequence \"{}\"",
+                        name
+                    ));
+                }
+            } else {
+                seq.current_value = next;
+                next
+            }
+        };
+
+        Ok(value)
+    }
+
+    /// Set a sequence's current value.
+    pub fn setval(&mut self, name: &str, value: i64, is_called: bool) -> anyhow::Result<i64> {
+        let seq = self
+            .sequences
+            .iter_mut()
+            .find(|s| s.name == name)
+            .ok_or_else(|| anyhow::anyhow!("sequence \"{}\" does not exist", name))?;
+
+        if value < seq.min_value || value > seq.max_value {
+            return Err(anyhow::anyhow!(
+                "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
+                value,
+                name,
+                seq.min_value,
+                seq.max_value
+            ));
+        }
+
+        seq.current_value = value;
+        seq.is_called = is_called;
+        Ok(value)
+    }
+
     pub fn savepoint(&mut self, name: String) {
         let starts_transaction = self.transaction_tables.is_none();
         if starts_transaction
@@ -541,8 +650,13 @@ where
                             snapshot.set_transaction_mode(transaction_mode)
                         }
                         (TransactionMode::Concurrent, TransactionMode::Write) => {
-                            if query.is_ddl() {
-                                // Only upgrade on DDL for MVCC as MVCC requires exclusive TX for DDL statements
+                            if query.requires_exclusive_tx() {
+                                // MVCC requires an exclusive write tx for DDL
+                                // (see Query::requires_exclusive_tx). The plan
+                                // generator forces a commit before these
+                                // statements, so this upgrade rarely fires —
+                                // kept for defensive correctness if a snapshot
+                                // is built directly.
                                 snapshot.set_transaction_mode(transaction_mode)
                             }
                         }
@@ -823,10 +937,12 @@ mod tests {
     fn shadow_tables_mut<'a>(
         commited_tables: &'a mut Vec<Table>,
         transaction_tables: &'a mut Option<TransactionTables>,
+        sequences: &'a mut Vec<ShadowSequence>,
     ) -> ShadowTablesMut<'a> {
         ShadowTablesMut {
             commited_tables,
             transaction_tables,
+            sequences,
         }
     }
 
@@ -834,9 +950,14 @@ mod tests {
     fn savepoint_outside_transaction_commits_on_release() {
         let mut commited_tables = Vec::new();
         let mut transaction_tables = None;
+        let mut sequences = Vec::new();
 
         {
-            let mut tables = shadow_tables_mut(&mut commited_tables, &mut transaction_tables);
+            let mut tables = shadow_tables_mut(
+                &mut commited_tables,
+                &mut transaction_tables,
+                &mut sequences,
+            );
             tables.savepoint("sp".to_string());
             let snapshot = tables
                 .transaction_tables
@@ -856,8 +977,13 @@ mod tests {
     fn rollback_to_savepoint_keeps_target_active() {
         let mut commited_tables = Vec::new();
         let mut transaction_tables = None;
+        let mut sequences = Vec::new();
 
-        let mut tables = shadow_tables_mut(&mut commited_tables, &mut transaction_tables);
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        );
         tables.create_snapshot(TransactionMode::Write);
         tables.savepoint("sp".to_string());
         tables.record_insert("table_0".to_string(), vec![]);
@@ -877,8 +1003,13 @@ mod tests {
     fn savepoint_inside_deferred_transaction_stays_open_on_release() {
         let mut commited_tables = Vec::new();
         let mut transaction_tables = Some(TransactionTables::Deferred);
+        let mut sequences = Vec::new();
 
-        let mut tables = shadow_tables_mut(&mut commited_tables, &mut transaction_tables);
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        );
         tables.savepoint("sp".to_string());
         let snapshot = tables
             .transaction_tables
@@ -897,6 +1028,19 @@ mod tests {
             .expect_snaphot();
         assert!(snapshot.savepoints.is_empty());
     }
+}
+
+/// Shadow model for a sequence. Sequences are global (not per-connection) and their
+/// advances are never rolled back, matching PostgreSQL semantics.
+#[derive(Debug, Clone)]
+pub struct ShadowSequence {
+    pub name: String,
+    pub current_value: i64,
+    pub increment_by: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub is_called: bool,
+    pub cycle: bool,
 }
 
 pub(crate) struct SimulatorEnv {
@@ -925,6 +1069,8 @@ pub(crate) struct SimulatorEnv {
     pub committed_tables: Vec<Table>,
     /// Names of attached databases (e.g. ["aux0", "aux1", "aux2"])
     pub(crate) attached_dbs: Vec<String>,
+    /// Sequences are global objects, not affected by transactions/savepoints
+    pub sequences: Vec<ShadowSequence>,
 }
 
 impl UnwindSafe for SimulatorEnv {}
@@ -950,6 +1096,7 @@ impl SimulatorEnv {
             connection_last_query: self.connection_last_query,
             committed_tables: self.committed_tables.clone(),
             attached_dbs: self.attached_dbs.clone(),
+            sequences: self.sequences.clone(),
         }
     }
 
@@ -1079,6 +1226,21 @@ impl SimulatorEnv {
         env
     }
 
+    pub fn sequence_info(&self) -> Vec<(String, i64, i64)> {
+        // Filter out sequences reserved by the SequenceMonotonicity
+        // property — that property's assertion expects a fresh seq
+        // returning `start` on the first nextval. If the regular
+        // workload picks the same name and emits nextval / setval /
+        // drop on it between the property's CREATE SEQUENCE and its
+        // first nextval, the assertion observes engine state already
+        // moved by another connection and bails.
+        self.sequences
+            .iter()
+            .filter(|s| !s.name.starts_with("seq_mono_"))
+            .map(|s| (s.name.clone(), s.min_value, s.max_value))
+            .collect()
+    }
+
     pub fn choose_conn(&self, rng: &mut impl Rng) -> usize {
         rng.random_range(0..self.connections.len())
     }
@@ -1184,6 +1346,16 @@ impl SimulatorEnv {
 
             // There is no `ALTER COLUMN` in SQLite
             profile.query.gen_opts.query.alter_table.alter_column = false;
+
+            // SQLite has no CREATE SEQUENCE / nextval / setval. Disable the
+            // sequence-related query generators and the SequenceMonotonicity
+            // property when running differentially against rusqlite —
+            // otherwise the differential run aborts on the first emitted
+            // `CREATE SEQUENCE` with `syntax error near "SEQUENCE"`.
+            profile.query.create_sequence_weight = 0;
+            profile.query.drop_sequence_weight = 0;
+            profile.query.nextval_weight = 0;
+            profile.query.setval_weight = 0;
         }
 
         profile.validate().unwrap();
@@ -1264,6 +1436,7 @@ impl SimulatorEnv {
             connection_tables: vec![None; profile.max_connections],
             connection_last_query: Bitmap::new(),
             attached_dbs,
+            sequences: Vec::new(),
         }
     }
 
@@ -1319,11 +1492,12 @@ impl SimulatorEnv {
         }
     }
 
-    /// Clears the commited tables and the connection tables
+    /// Clears the commited tables, connection tables, and sequences
     pub fn clear_tables(&mut self) {
         self.committed_tables.clear();
         self.connection_tables.iter_mut().for_each(|t| *t = None);
         self.connection_last_query = Bitmap::new();
+        self.sequences.clear();
     }
 
     // TODO: does not yet create the appropriate context to avoid WriteWriteConflitcs
@@ -1394,6 +1568,7 @@ impl SimulatorEnv {
         ShadowTablesMut {
             transaction_tables: self.connection_tables.get_mut(conn_index).unwrap(),
             commited_tables: &mut self.committed_tables,
+            sequences: &mut self.sequences,
         }
     }
 }
