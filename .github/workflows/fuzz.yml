@@ -139,6 +139,6 @@ jobs:
         prefix-key: "v1-rust-fuzz"
         cache-on-failure: true
     - name: Install cargo-fuzz
-      run: cargo install cargo-fuzz
+      run: cargo install cargo-fuzz@0.13.0
     - name: Run scalar_func fuzzer
       run: cargo +nightly fuzz run scalar_func -- -max_total_time=300
