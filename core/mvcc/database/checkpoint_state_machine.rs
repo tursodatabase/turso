@@ -601,12 +601,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         connection: Arc<Connection>,
         update_transaction_state: bool,
         sync_mode: SyncMode,
+        database_id: usize,
     ) -> Self {
         let checkpoint_lock = mvstore.blocking_checkpoint_lock.clone();
-        // Prevent stale per-connection schema during checkpoint by using the shared DB schema.
-        // Unlike in WAL mode we actually write stuff from mv store to pager in checkpoint
-        // so this is important.
-        let schema = connection.db.clone_schema();
+        // Use the shared DB schema (not the per-connection cache, which may be
+        // stale) for the database whose pager we're checkpointing. Unlike WAL
+        // mode, MVCC checkpoint writes from the mv store back to the pager —
+        // so the schema must match the pager being checkpointed.
+        let schema = connection.clone_shared_schema(database_id);
         let index_id_to_index = schema
             .indexes
             .values()
@@ -2464,6 +2466,7 @@ mod tests {
             conn.clone(),
             true,
             conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
         );
         checkpoint.durable_txid_max_old = std::num::NonZeroU64::new(10);
         checkpoint.durable_txid_max_new = 10;
@@ -2522,6 +2525,7 @@ mod tests {
             conn.clone(),
             true,
             conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
         );
 
         // More than one chunk worth of committed rows so collection must preempt.
@@ -2560,6 +2564,7 @@ mod tests {
             conn.clone(),
             true,
             conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
         );
 
         let index_id = MVTableId::from(-7);
@@ -2591,6 +2596,7 @@ mod tests {
             conn.clone(),
             true,
             conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
         );
         checkpoint.lock_states.blocking_checkpoint_lock_held = true;
         checkpoint.durable_txid_max_new = 5;
@@ -2637,6 +2643,7 @@ mod tests {
             conn.clone(),
             true,
             conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
         );
         checkpoint.lock_states.blocking_checkpoint_lock_held = true;
         checkpoint.durable_txid_max_new = 5;

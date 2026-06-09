@@ -605,6 +605,7 @@ pub fn op_checkpoint(
             program.connection.clone(),
             true,
             program.connection.get_sync_mode(),
+            *database,
         );
         let CheckpointResult {
             wal_max_frame,
@@ -15692,6 +15693,7 @@ fn op_journal_mode_inner(
                                 program.connection.clone(),
                                 true,
                                 program.connection.get_sync_mode(),
+                                *db,
                             ))));
                     }
 
