@@ -2263,8 +2263,10 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
         let res = self.step_inner(&());
         match res {
             Err(ref err) => {
-                self.mvstore.storage.on_checkpoint_end(Err(err.clone()))?;
                 tracing::debug!("Error in checkpoint state machine: {err}");
+                // `cleanup_after_external_io_error` already emits the paired
+                // `on_checkpoint_end(Err(..))`, so don't call it here too — doing both
+                // double-fires the hook for a single failure.
                 self.cleanup_after_external_io_error(err.clone())?;
                 res
             }
