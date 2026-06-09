@@ -689,6 +689,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     /// of `step()`. This mirrors `step()` error handling and also resets pager/WAL
     /// checkpoint bookkeeping.
     pub fn cleanup_after_external_io_error(&mut self, err: LimboError) -> Result<()> {
+        // run storage cleanup within proper checkpoint context (e.g. pager has pending read/write txn)
+        let result = self.mvstore.storage.on_checkpoint_end(Err(err.clone()));
+
         if self.lock_states.pager_write_tx {
             self.pager.rollback_tx(self.connection.as_ref());
             if self.update_transaction_state {
@@ -711,15 +714,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             wal.abort_checkpoint();
         }
 
-        self.mvstore.storage.on_checkpoint_end(Err(err.clone()))?;
-
         // Release the checkpoint lock only after checkpoint state has been reset.
         if self.lock_states.blocking_checkpoint_lock_held {
             self.checkpoint_lock.unlock();
             self.lock_states.blocking_checkpoint_lock_held = false;
         }
 
-        Ok(())
+        result
     }
 
     /// Returns all checkpointable [RowVersion]s for that `table_id`
