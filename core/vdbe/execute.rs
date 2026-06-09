@@ -102,11 +102,12 @@ use crate::storage::btree::{BTreeCursor, BTreeKey};
 
 use super::{
     array::{
-        array_values_from_blob, compare_arrays, compute_array_length, exec_array_append,
-        exec_array_cat, exec_array_contains, exec_array_contains_all, exec_array_overlap,
-        exec_array_position, exec_array_prepend, exec_array_remove, exec_array_slice,
-        exec_array_to_string, exec_string_to_array, make_array_from_registers, parse_text_array,
-        serialize_array_from_blob, values_to_record_blob,
+        array_values_from_blob, compare_arrays, compute_array_length,
+        compute_array_length_at_dim, exec_array_append, exec_array_cat, exec_array_contains,
+        exec_array_contains_all, exec_array_overlap, exec_array_position, exec_array_prepend,
+        exec_array_remove, exec_array_slice, exec_array_to_string, exec_string_to_array,
+        make_array_from_registers, parse_text_array, serialize_array_from_blob,
+        values_to_record_blob,
     },
     insn::{Cookie, RegisterOrLiteral, SortComparatorType},
     CommitState,
@@ -8568,9 +8569,20 @@ pub fn op_function(
                 state.registers[*dest].set_value(exec_array_position(&arr_val, &target));
             }
             ScalarFunc::ArrayLength => {
-                // Accept 1 or 2 args; dimension arg (PG compat) ignored for 1D arrays
+                // 1-arg form: equivalent to `array_length(arr, 1)`. 2-arg form
+                // honors the dimension and walks into nested arrays for dim > 1
+                // (Turso arrays are 1-indexed, so `array_upper(arr, dim)` shares
+                // this code path via its alias and produces the same result).
                 let arr_val = state.registers[*start_reg].get_value();
-                match compute_array_length(arr_val) {
+                let dim = if arg_count >= 2 {
+                    state.registers[*start_reg + 1]
+                        .get_value()
+                        .as_int()
+                        .unwrap_or(0)
+                } else {
+                    1
+                };
+                match compute_array_length_at_dim(arr_val, dim) {
                     Some(count) => state.registers[*dest].set_int(count),
                     None => state.registers[*dest].set_null(),
                 };

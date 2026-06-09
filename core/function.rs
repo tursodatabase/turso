@@ -1803,7 +1803,7 @@ impl Func {
             "array_element" => Ok(Some(Self::Scalar(ScalarFunc::ArrayElement))),
             "array_set_element" => Ok(Some(Self::Scalar(ScalarFunc::ArraySetElement))),
             // Array functions
-            "array_length" => Ok(Some(Self::Scalar(ScalarFunc::ArrayLength))),
+            "array_length" | "array_upper" => Ok(Some(Self::Scalar(ScalarFunc::ArrayLength))),
             "array_append" => Ok(Some(Self::Scalar(ScalarFunc::ArrayAppend))),
             "array_prepend" => Ok(Some(Self::Scalar(ScalarFunc::ArrayPrepend))),
             "array_cat" => Ok(Some(Self::Scalar(ScalarFunc::ArrayCat))),
