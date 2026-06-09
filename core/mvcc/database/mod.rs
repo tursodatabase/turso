@@ -1397,7 +1397,9 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             let _ = state_machine
                 .lock()
                 .inner_mut()
-                .cleanup_after_external_io_error(LimboError::InternalError("mvcc: cleanup_unfinished_commit".to_string()))
+                .cleanup_after_external_io_error(LimboError::InternalError(
+                    "mvcc: cleanup_unfinished_commit".to_string(),
+                ))
                 .inspect_err(|e| tracing::error!("cleanup_after_external_io_error failed: {e}"));
         }
     }
