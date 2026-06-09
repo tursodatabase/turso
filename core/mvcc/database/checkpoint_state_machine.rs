@@ -688,7 +688,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     /// Cleanup path for I/O errors that happen while waiting on completions outside
     /// of `step()`. This mirrors `step()` error handling and also resets pager/WAL
     /// checkpoint bookkeeping.
-    pub fn cleanup_after_external_io_error(&mut self) {
+    pub fn cleanup_after_external_io_error(&mut self, err: LimboError) -> Result<()> {
         if self.lock_states.pager_write_tx {
             self.pager.rollback_tx(self.connection.as_ref());
             if self.update_transaction_state {
@@ -711,11 +711,15 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             wal.abort_checkpoint();
         }
 
+        self.mvstore.storage.on_checkpoint_end(Err(err.clone()))?;
+
         // Release the checkpoint lock only after checkpoint state has been reset.
         if self.lock_states.blocking_checkpoint_lock_held {
             self.checkpoint_lock.unlock();
             self.lock_states.blocking_checkpoint_lock_held = false;
         }
+
+        Ok(())
     }
 
     /// Returns all checkpointable [RowVersion]s for that `table_id`
@@ -1558,6 +1562,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         *special_write,
                     )
                 };
+                tracing::debug!("WriteRow: num_columns={num_columns}, table_id={table_id:?}, special_write={special_write:?}");
 
                 // Handle CREATE TABLE / DROP TABLE / CREATE INDEX / DROP INDEX ops
                 if let Some(special_write) = special_write {
@@ -1702,6 +1707,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         )
                     })
                 };
+
+                tracing::debug!("WriteRow: resolved root page: root_page={root_page}");
 
                 // If a table was created, it now has a real root page allocated for it, but the 'root_page' field in the sqlite_schema record is still the table id.
                 // So we need to rewrite the row version to use the real root page.
@@ -2257,7 +2264,7 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
             Err(ref err) => {
                 self.mvstore.storage.on_checkpoint_end(Err(err.clone()))?;
                 tracing::debug!("Error in checkpoint state machine: {err}");
-                self.cleanup_after_external_io_error();
+                self.cleanup_after_external_io_error(err.clone())?;
                 res
             }
             Ok(TransitionResult::Done(ref result)) => {

@@ -1394,10 +1394,13 @@ pub struct DeleteRowStateMachine {
 impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     pub(crate) fn cleanup_mvcc_checkpoint_state(&mut self) {
         if let CommitState::Checkpoint { state_machine } = &mut self.state {
-            state_machine
+            let _ = state_machine
                 .lock()
                 .inner_mut()
-                .cleanup_after_external_io_error();
+                .cleanup_after_external_io_error(LimboError::InternalError(format!(
+                    "mvcc: cleanup_unfinished_commit"
+                )))
+                .inspect_err(|e| tracing::error!("cleanup_after_external_io_error failed: {e}"));
         }
     }
 
