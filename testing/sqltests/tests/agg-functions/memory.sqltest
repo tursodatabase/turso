@@ -114,6 +114,33 @@ expect {
 }
 
 @cross-check-integrity
+test grouped-having-aggregate-filter-constant-in-subquery {
+    SELECT 1 GROUP BY 1 HAVING COUNT(*) FILTER (WHERE 1 IN (SELECT 1)) = 1;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test grouped-having-aggregate-filter-empty-in-subquery {
+    SELECT 1 GROUP BY 1 HAVING COUNT(*) FILTER (WHERE 1 IN (SELECT 2)) = 1;
+}
+expect {
+}
+
+@cross-check-integrity
+test grouped-having-aggregate-filter-column-in-subquery {
+    CREATE TABLE t (x INTEGER, y INTEGER);
+    CREATE TABLE u (z INTEGER);
+    INSERT INTO t VALUES (1, 1), (2, 2);
+    INSERT INTO u VALUES (1);
+    SELECT y, SUM(x) FROM t GROUP BY y HAVING AVG(x) FILTER (WHERE y IN (SELECT z FROM u ORDER BY z LIMIT 1)) > 0;
+}
+expect {
+    1|1
+}
+
+@cross-check-integrity
 test case-when-aggregate-returns-column-value {
     CREATE TABLE t1(a INTEGER, b TEXT);
     INSERT INTO t1 VALUES (42, 'hello');
