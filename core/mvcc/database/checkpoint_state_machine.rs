@@ -690,7 +690,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     /// checkpoint bookkeeping.
     pub fn cleanup_after_external_io_error(&mut self, err: LimboError) -> Result<()> {
         // run storage cleanup within proper checkpoint context (e.g. pager has pending read/write txn)
-        let result = self.mvstore.storage.on_checkpoint_end(Err(err.clone()));
+        let result = self.mvstore.storage.on_checkpoint_end(Err(err));
 
         if self.lock_states.pager_write_tx {
             self.pager.rollback_tx(self.connection.as_ref());
