@@ -63,10 +63,9 @@ use super::FileSyncType;
 use crate::io::completions::CompletionInner;
 use crate::io::{SharedWalLockKind, SharedWalMappedRegion};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_HANDLE_EOF, ERROR_IO_PENDING,
-    ERROR_LOCK_VIOLATION, ERROR_NOT_LOCKED,
-    ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-    TRUE, WAIT_TIMEOUT,
+    CloseHandle, GetLastError, LocalFree, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_LOCK_VIOLATION,
+    ERROR_NOT_LOCKED, ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE, TRUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LockFileEx, ReadFile,
@@ -75,16 +74,16 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
     OPEN_ALWAYS, OPEN_EXISTING,
 };
-use windows_sys::Win32::System::IO::{
-    CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus, OVERLAPPED,
-    OVERLAPPED_0, OVERLAPPED_0_0,
-};
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ, FILE_MAP_WRITE,
     PAGE_READWRITE,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::CreateEventW;
+use windows_sys::Win32::System::IO::{
+    CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus, OVERLAPPED,
+    OVERLAPPED_0, OVERLAPPED_0_0,
+};
 
 // Constants
 
@@ -235,9 +234,11 @@ impl SharedWalMappedRegion for WindowsSharedWalMapping {
 impl Drop for WindowsSharedWalMapping {
     fn drop(&mut self) {
         unsafe {
-            if UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
-                Value: self.view_ptr.as_ptr().cast(),
-            }) == FALSE
+            if UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.view_ptr.as_ptr().cast(),
+                },
+            ) == FALSE
             {
                 tracing::error!(
                     "UnmapViewOfFile failed for shared WAL coordination region: {}",
@@ -741,12 +742,8 @@ impl WindowsFile {
 
             let mut bytes = 0;
             unsafe {
-                if GetOverlappedResult(
-                    self.file_handle,
-                    &raw mut overlapped,
-                    &raw mut bytes,
-                    TRUE,
-                ) == TRUE
+                if GetOverlappedResult(self.file_handle, &raw mut overlapped, &raw mut bytes, TRUE)
+                    == TRUE
                 {
                     return Ok(true);
                 }
@@ -791,12 +788,8 @@ impl WindowsFile {
 
             let mut bytes = 0;
             unsafe {
-                if GetOverlappedResult(
-                    self.file_handle,
-                    &raw mut overlapped,
-                    &raw mut bytes,
-                    TRUE,
-                ) == TRUE
+                if GetOverlappedResult(self.file_handle, &raw mut overlapped, &raw mut bytes, TRUE)
+                    == TRUE
                 {
                     return Ok(());
                 }
@@ -922,7 +915,7 @@ impl File for WindowsFile {
             get_unique_key_from_completion(&completion).addr()
         );
 
-        let buffer_ptr = buffer.as_mut_ptr();
+        let buffer_ptr = buffer.as_ptr();
         let buffer_len = buffer
             .len()
             .try_into()
@@ -1081,8 +1074,16 @@ impl File for WindowsFile {
             .checked_add(len)
             .ok_or_else(|| LimboError::InternalError("shared WAL map length overflow".into()))?;
 
-        let mapping_handle =
-            unsafe { CreateFileMappingW(self.file_handle, ptr::null(), PAGE_READWRITE, 0, 0, ptr::null()) };
+        let mapping_handle = unsafe {
+            CreateFileMappingW(
+                self.file_handle,
+                ptr::null(),
+                PAGE_READWRITE,
+                0,
+                0,
+                ptr::null(),
+            )
+        };
         if mapping_handle.is_null() {
             return Err(io_error(
                 io::Error::last_os_error(),
@@ -1105,7 +1106,10 @@ impl File for WindowsFile {
             unsafe {
                 CloseHandle(mapping_handle);
             }
-            return Err(io_error(io::Error::last_os_error(), "map shared WAL coordination file"));
+            return Err(io_error(
+                io::Error::last_os_error(),
+                "map shared WAL coordination file",
+            ));
         }
 
         let view_ptr = NonNull::new(mapped_ptr.Value.cast::<u8>())

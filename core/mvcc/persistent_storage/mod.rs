@@ -34,10 +34,10 @@ pub trait DurableStorage: Send + Sync + Debug {
 
     /// Write a transaction to the logical log without advancing the writer offset.
     ///
-    /// If `on_serialization_complete` is provided, it is called with a zero-copy
-    /// reference to the framed bytes and the running CRC after framing but
+    /// If `on_serialization_complete` is provided, it is called with shared
+    /// ownership of the framed bytes and the running CRC after framing but
     /// before the disk write. The callback runs while the internal write lock
-    /// is held, so it should be fast (e.g. memcpy to a side buffer).
+    /// is held, so it should be fast.
     fn log_tx(
         &self,
         m: LogRecord,

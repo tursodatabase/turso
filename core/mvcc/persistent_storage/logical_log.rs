@@ -231,7 +231,7 @@
 //! Frame-level atomicity only: torn tails are discarded; partially written frames are not salvaged.
 #![allow(dead_code)]
 
-use crate::io::FileSyncType;
+use crate::io::{FileSyncType, SharedBufferData};
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::turso_assert;
@@ -255,9 +255,10 @@ use crate::File;
 /// Default to the size of 1000 SQLite WAL frames; disable by setting a negative value.
 pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = 4120 * 1000;
 
-/// Optional callback invoked after serialization with a zero-copy reference to
-/// the serialized frame bytes and the running CRC, before the disk write.
-pub type OnSerializationComplete<'a> = Option<&'a dyn Fn(&[u8], u32) -> crate::Result<()>>;
+/// Optional callback invoked after serialization with shared ownership of the
+/// serialized frame bytes and the running CRC, before the disk write.
+pub type OnSerializationComplete<'a> =
+    Option<&'a dyn Fn(SharedBufferData, u32) -> crate::Result<()>>;
 
 const LOG_MAGIC: u32 = 0x4C4D4C32; // "LML2" in LE
 const LOG_VERSION_V2: u8 = 2;
@@ -818,28 +819,29 @@ impl LogicalLog {
 
         // 5. Fill the LOG_HDR slot (first-write only). Non-first-write
         // commits leave it as zeros; those bytes never reach disk because
-        // we wrap the buffer with `new_with_start(..., LOG_HDR_SIZE)` below.
+        // the shared view exposes only `data[LOG_HDR_SIZE..]` below.
         if is_first_write {
             let header_bytes = self.header.as_ref().unwrap().encode();
             tx.buf[..LOG_HDR_SIZE].copy_from_slice(&header_bytes);
         }
 
-        // 6. Observer hook: gets a zero-copy reference into the on-disk bytes.
-        let on_disk_start = if is_first_write { 0 } else { LOG_HDR_SIZE };
+        // 6. Observer hook: gets shared ownership of a zero-copy view into the
+        // on-disk bytes.
+        let raw = Arc::new(tx.buf.into_boxed_slice());
+        let shared = if is_first_write {
+            SharedBufferData::new(raw)
+        } else {
+            SharedBufferData::new_view(raw, LOG_HDR_SIZE)
+        };
         if let Some(cb) = on_serialization_complete {
-            cb(&tx.buf[on_disk_start..], crc)?;
+            cb(shared.clone(), crc)?;
         }
 
         // 7. Hand off `tx.buf` to the I/O layer without copying. For
         // non-first-write commits, the Buffer wrapper exposes only
         // `data[LOG_HDR_SIZE..]` so the unused 56-byte prefix never reaches
-        // disk — a single pwrite, no shift.
-        let raw = tx.buf;
-        let buffer = if is_first_write {
-            Arc::new(Buffer::new(raw))
-        } else {
-            Arc::new(Buffer::new_with_start(raw, LOG_HDR_SIZE))
-        };
+        // disk: a single pwrite, no shift.
+        let buffer = Arc::new(Buffer::new_shared_data(shared));
         let buffer_len = buffer.len();
         let c = Completion::new_write(move |res: Result<i32, CompletionError>| {
             let Ok(bytes_written) = res else {
@@ -902,8 +904,8 @@ impl LogicalLog {
     /// Returns `(completion, bytes_written)`. The caller must call
     /// `advance_offset_after_success(bytes)` after confirming the commit succeeded.
     ///
-    /// If `on_serialization_complete` is provided, it is called with a zero-copy
-    /// reference to the framed bytes and the running CRC after framing but
+    /// If `on_serialization_complete` is provided, it is called with shared
+    /// ownership of the framed bytes and the running CRC after framing but
     /// before the disk write.
     pub fn log_tx_deferred_offset(
         &mut self,
@@ -3900,6 +3902,7 @@ pub(crate) enum IndexOpKind {
 mod tests {
     use crate::types::IOResult;
     use crate::util::IOExt as _;
+    use std::cell::RefCell;
     use std::collections::BTreeSet;
     use std::sync::Once;
 
@@ -3922,7 +3925,7 @@ mod tests {
             read_varint, read_varint_partial, varint_len, write_varint, DatabaseHeader,
         },
         types::{ImmutableRecord, ImmutableRecordRef, IndexInfo, Text},
-        Buffer, Completion, Value, ValueRef,
+        Buffer, Completion, SharedBufferData, Value, ValueRef,
     };
 
     use super::{
@@ -4032,6 +4035,20 @@ mod tests {
             }
         }
         ops
+    }
+
+    fn read_file_range_bytes(
+        file: &Arc<dyn crate::File>,
+        io: &Arc<dyn crate::IO>,
+        pos: u64,
+        len: usize,
+    ) -> Vec<u8> {
+        let buf = Arc::new(Buffer::new_temporary(len));
+        let c = file
+            .pread(pos, Completion::new_read(buf.clone(), |_| None))
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        buf.as_slice().to_vec()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4991,6 +5008,89 @@ mod tests {
             ExpectedTableOp::Upsert { rowid, .. } => assert_eq!(*rowid, 3),
             other => panic!("unexpected op: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_on_serialization_complete_gets_shared_write_bytes() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file(
+                "serialization-callback-shared.db-log",
+                OpenFlags::Create,
+                false,
+            )
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let captured = RefCell::new(Vec::<(SharedBufferData, u32)>::new());
+        let callback = |bytes: SharedBufferData, crc: u32| {
+            captured.borrow_mut().push((bytes, crc));
+            Ok(())
+        };
+
+        let tx1 = crate::mvcc::database::LogRecord::for_test(
+            1,
+            &[crate::mvcc::database::RowVersion {
+                id: 1,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(1),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(None),
+                row: generate_simple_string_row((-2).into(), 1, "first"),
+                btree_resident: false,
+            }],
+            None,
+        );
+        let (c, first_len) = log.log_tx_deferred_offset(tx1, Some(&callback)).unwrap();
+        io.wait_for_completion(c).unwrap();
+        log.advance_offset_after_success(first_len);
+
+        let tx2 = crate::mvcc::database::LogRecord::for_test(
+            2,
+            &[crate::mvcc::database::RowVersion {
+                id: 2,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(2),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(None),
+                row: generate_simple_string_row((-2).into(), 2, "second"),
+                btree_resident: false,
+            }],
+            None,
+        );
+        let (c, second_len) = log.log_tx_deferred_offset(tx2, Some(&callback)).unwrap();
+        io.wait_for_completion(c).unwrap();
+        log.advance_offset_after_success(second_len);
+
+        let captured = captured.borrow();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].0.len(), first_len as usize);
+        assert_eq!(captured[1].0.len(), second_len as usize);
+        assert!(matches!(&captured[0].0, SharedBufferData::Full(_)));
+        assert!(matches!(&captured[1].0, SharedBufferData::View(_)));
+
+        let first_on_disk = read_file_range_bytes(&file, &io, 0, first_len as usize);
+        let second_on_disk = read_file_range_bytes(&file, &io, first_len, second_len as usize);
+        assert_eq!(captured[0].0.as_slice(), first_on_disk.as_slice());
+        assert_eq!(captured[1].0.as_slice(), second_on_disk.as_slice());
+        assert_eq!(
+            captured[0].1,
+            u32::from_le_bytes(
+                captured[0].0.as_slice()[captured[0].0.len() - TX_TRAILER_SIZE
+                    ..captured[0].0.len() - TX_TRAILER_SIZE + 4]
+                    .try_into()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            captured[1].1,
+            u32::from_le_bytes(
+                captured[1].0.as_slice()[captured[1].0.len() - TX_TRAILER_SIZE
+                    ..captured[1].0.len() - TX_TRAILER_SIZE + 4]
+                    .try_into()
+                    .unwrap()
+            )
+        );
     }
 
     /// What this test checks: A payload bit flip in a fully present tail frame is ignored as invalid tail.
