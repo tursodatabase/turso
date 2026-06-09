@@ -135,6 +135,30 @@ ongoing work to pass the full SQLite TCL test suite.
 | CREATE TRIGGER ... INSTEAD OF | ❌ No  | Triggers on views are not supported. Currently errors with misleading "no such table" message. |
 | CREATE VIEW IF NOT EXISTS | 🚧 Partial | Not idempotent — second create on an existing view errors instead of no-op. |
 
+#### Same-connection write statements
+
+SQLite allows more than one active write statement on the same connection. For
+example, an application can step one `INSERT ... RETURNING`, leave it open, and
+then start another write statement on the same connection.
+
+Turso currently returns `SQLITE_BUSY` for the second write statement. Reads may
+still run while a write statement is active.
+
+This is a deliberate compatibility gap. SQLite's built-in write opcodes do not
+return control to the application halfway through the mutation. Turso can suspend
+there for async I/O. If a second writer were allowed to start, dropping or
+resetting the first half-finished writer could not always clean up only that
+writer without risking the second writer's state. Returning `SQLITE_BUSY` keeps
+the connection state simple: finish or reset the active writer first, then start
+the next write statement.
+
+If a write statement inside `BEGIN` is reset or dropped before it finishes and
+Turso did not open a statement savepoint for it, the transaction becomes
+rollback-only. A later `COMMIT` rolls back the whole transaction and returns an
+error. `ROLLBACK` also clears that state. This prevents a half-finished statement
+from being committed after control returned to the application at an async I/O
+point.
+
 #### [PRAGMA](https://www.sqlite.org/pragma.html)
 
 

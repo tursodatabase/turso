@@ -32,6 +32,8 @@ pub mod insn;
 pub mod metrics;
 pub mod rowset;
 pub mod sorter;
+#[cfg(test)]
+mod statement_lifecycle_tests;
 pub mod vacuum;
 pub mod value;
 // for benchmarks
@@ -970,12 +972,41 @@ impl ProgramState {
         self.n_total_change.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Whether this statement owns the implicit autocommit transaction it is
-    /// about to finish, including re-entry while its commit is in progress.
+    /// Whether this statement may finish the implicit autocommit transaction
+    /// now, including re-entry while its commit is in progress.
     #[inline]
-    pub(crate) fn owns_auto_txn(&self) -> bool {
-        self.auto_txn_cleanup == TxnCleanup::RollbackTxn
-            || !matches!(self.commit_state, CommitState::Ready)
+    pub(crate) fn can_autocommit_now(&self, connection: &Connection) -> bool {
+        let is_already_committing = !matches!(self.commit_state, CommitState::Ready);
+        if is_already_committing {
+            return true;
+        }
+        if self.auto_txn_cleanup != TxnCleanup::RollbackTxn {
+            return false;
+        }
+        let active_writers = connection.n_active_writes.load(Ordering::SeqCst);
+        turso_assert!(
+            active_writers <= 1,
+            "n_active_writes must be 0 or 1, got {active_writers}"
+        );
+        if self.is_active_write {
+            turso_assert!(
+                active_writers == 1,
+                "active writer state without an active writer count"
+            );
+        }
+        if connection.mv_store().is_some() {
+            // MVCC keeps one tx id on the connection. A writer waits for
+            // sibling readers, and a reader waits for sibling readers/writers.
+            return connection.n_active_root_statements.load(Ordering::SeqCst) == 1
+                && (self.is_active_write || active_writers == 0);
+        }
+        if self.is_active_write {
+            // Pager/WAL writers can finish while sibling readers remain active.
+            // The readers keep their cursors and release them when they finish.
+            return true;
+        }
+        // Pager/WAL readers do not wait for sibling readers.
+        active_writers == 0
     }
 
     #[inline]
@@ -1101,7 +1132,11 @@ impl ProgramState {
         end_statement: EndStatement,
     ) -> Result<()> {
         if self.is_active_write {
-            connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
+            let previous = connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
+            turso_assert!(
+                previous == 1,
+                "ending a writer with {previous} active writer(s)"
+            );
             self.is_active_write = false;
         }
         // If begin_statement was never called, no savepoint/FK cleanup needed.
@@ -2440,7 +2475,41 @@ impl Program {
         }
         // Errors from nested statements are handled by the parent statement.
         if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
-            let owns_auto_txn = state.owns_auto_txn();
+            let unfinished_statement_reset_or_drop =
+                err.is_none() && state.execution_state.is_running();
+            let inside_explicit_transaction = !self.connection.get_auto_commit();
+            let unfinished_writer = state.is_active_write;
+            let can_rollback_just_this_statement =
+                state.auto_txn_cleanup == TxnCleanup::RollbackSavepoint;
+
+            let poison_tx = unfinished_statement_reset_or_drop
+                && inside_explicit_transaction
+                && unfinished_writer
+                && !can_rollback_just_this_statement;
+            if poison_tx {
+                // Example: BEGIN; UPDATE rows SET ... writes one row, then
+                // returns IO before reaching Done. If the caller drops that
+                // statement, we cannot pretend COMMIT is still safe: there is
+                // no statement savepoint to undo only the partial UPDATE.
+                self.connection.mark_tx_poisoned();
+            }
+
+            let can_autocommit_now = state.can_autocommit_now(&self.connection);
+            let is_mvcc = self.connection.mv_store().is_some();
+            let changed_shared_mvcc_auto_txn = !can_autocommit_now
+                && state.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                && state.n_change.load(Ordering::SeqCst) > 0;
+            if changed_shared_mvcc_auto_txn {
+                turso_assert!(
+                    is_mvcc,
+                    "shared autocommit transaction needed full rollback outside MVCC"
+                );
+                // A writer changed rows in an MVCC autocommit transaction, but
+                // a sibling reader is still holding that transaction open. The
+                // writer had no statement savepoint, so the only safe cleanup
+                // is rolling back the whole MVCC transaction.
+            }
+            let must_rollback_tx_if_needed = can_autocommit_now || changed_shared_mvcc_auto_txn;
             if err.is_some() && !pager.is_checkpointing() {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
@@ -2488,7 +2557,7 @@ impl Program {
                 // FK errors always behave like ABORT: rollback statement,
                 // rollback transaction in autocommit mode.
                 Some(LimboError::ForeignKeyConstraint(_)) => {
-                    if owns_auto_txn {
+                    if must_rollback_tx_if_needed {
                         self.rollback_current_txn(pager);
                     }
                     self.connection.set_changes(0);
@@ -2524,7 +2593,7 @@ impl Program {
                                     "Failed to release statement savepoint during abort",
                                 );
                             }
-                            if owns_auto_txn {
+                            if can_autocommit_now {
                                 // Autocommit FAIL: commit partial changes.
                                 // This matches halt()'s FAIL+autocommit path.
                                 let mv_store = self.connection.mv_store();
@@ -2573,7 +2642,7 @@ impl Program {
                             }
                         }
                         _ => {
-                            if owns_auto_txn {
+                            if must_rollback_tx_if_needed {
                                 self.rollback_current_txn(pager);
                             }
                         }
@@ -2595,10 +2664,12 @@ impl Program {
                 }
                 _ => match state.auto_txn_cleanup {
                     TxnCleanup::RollbackTxn => {
-                        self.rollback_current_txn(pager);
+                        if must_rollback_tx_if_needed {
+                            self.rollback_current_txn(pager);
+                        }
                     }
                     TxnCleanup::RollbackSavepoint => {
-                        if owns_auto_txn {
+                        if can_autocommit_now {
                             self.rollback_current_txn(pager);
                         } else if err.is_none() && !pager.is_checkpointing() {
                             if let Err(end_stmt_err) = state.end_statement(
@@ -2615,7 +2686,9 @@ impl Program {
                         }
                     }
                     TxnCleanup::None => {
-                        if owns_auto_txn || (!self.connection.get_auto_commit() && err.is_some()) {
+                        if can_autocommit_now
+                            || (!self.connection.get_auto_commit() && err.is_some())
+                        {
                             self.rollback_current_txn(pager);
                         }
                     }

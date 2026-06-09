@@ -181,6 +181,10 @@ pub struct Connection {
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
     pub(super) transaction_state: AtomicTransactionState,
+    /// True when an unfinished write statement inside an explicit transaction
+    /// was reset or dropped and there was no statement savepoint to undo only
+    /// that statement. COMMIT must roll back the whole transaction.
+    pub(crate) poisoned_tx: AtomicBool,
     pub(super) last_insert_rowid: AtomicI64,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
@@ -290,7 +294,10 @@ pub struct Connection {
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
-    /// Number of active write statements on this connection.
+    /// Number of active top-level write statements on this connection.
+    ///
+    /// This is currently only 0 or 1. We return Busy instead of allowing a
+    /// second same-connection writer to start.
     pub(crate) n_active_writes: AtomicI32,
     /// Number of active root statements currently executing on this connection.
     /// This is Turso's equivalent of SQLite's top-level active-VDBE count
@@ -2050,6 +2057,24 @@ impl Connection {
 
     pub fn get_auto_commit(&self) -> bool {
         self.auto_commit.load(Ordering::SeqCst)
+    }
+
+    /// Mark the active explicit transaction poisoned so COMMIT rolls it back.
+    ///
+    /// This is used when a write statement under BEGIN is abandoned before it
+    /// reaches Halt/Done and that statement did not open a statement savepoint.
+    pub(crate) fn mark_tx_poisoned(&self) {
+        self.poisoned_tx.store(true, Ordering::SeqCst);
+    }
+
+    /// Return whether the active explicit transaction must roll back at COMMIT.
+    pub(crate) fn tx_is_poisoned(&self) -> bool {
+        self.poisoned_tx.load(Ordering::SeqCst)
+    }
+
+    /// Clear the poison marker after BEGIN, COMMIT, or ROLLBACK.
+    pub(crate) fn clear_tx_poison(&self) {
+        self.poisoned_tx.store(false, Ordering::SeqCst);
     }
 
     pub fn set_load_extension_enabled(&self, enabled: bool) {
@@ -3821,6 +3846,7 @@ impl Connection {
         }
         self.rollback_attached_wal_txns();
         self.set_tx_state(TransactionState::None);
+        self.clear_tx_poison();
     }
 
     /// Roll back transaction state for helpers that start a manual `BEGIN`
@@ -3851,6 +3877,7 @@ impl Connection {
         }
 
         self.rollback_temp_schema();
+        self.clear_tx_poison();
         self.set_cdc_transaction_id(-1);
         self.clear_named_savepoints();
         self.clear_deferred_foreign_key_violations();
