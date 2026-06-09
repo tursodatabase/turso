@@ -212,6 +212,61 @@ mod tests {
     use super::*;
     use crate::vdbe::StepResult;
     use crate::{Database, OpenFlags};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct StepGuardedIO {
+        inner: MemoryYieldIO,
+        step_allowed: AtomicBool,
+    }
+
+    impl StepGuardedIO {
+        fn new() -> Self {
+            Self {
+                inner: MemoryYieldIO::new(),
+                step_allowed: AtomicBool::new(true),
+            }
+        }
+
+        fn set_step_allowed(&self, allowed: bool) {
+            self.step_allowed.store(allowed, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for StepGuardedIO {
+        fn current_time_monotonic(&self) -> MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+
+        fn current_time_wall_clock(&self) -> WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for StepGuardedIO {
+        fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+            self.inner.open_file(path, flags, direct)
+        }
+
+        fn remove_file(&self, path: &str) -> Result<()> {
+            self.inner.remove_file(path)
+        }
+
+        fn file_id(&self, path: &str) -> Result<super::super::FileId> {
+            self.inner.file_id(path)
+        }
+
+        fn supports_shared_wal_coordination(&self) -> bool {
+            self.inner.supports_shared_wal_coordination()
+        }
+
+        fn step(&self) -> Result<()> {
+            assert!(
+                self.step_allowed.load(Ordering::SeqCst),
+                "IO::step must only be called by the test driver"
+            );
+            self.inner.step()
+        }
+    }
 
     /// Every op must come back unfinished and only complete once `step()` runs.
     #[test]
@@ -322,5 +377,42 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0], crate::Value::from_i64(1));
         assert_eq!(rows[2], crate::Value::from_i64(3));
+    }
+
+    #[test]
+    fn journal_mode_mvcc_bootstrap_yields_without_internal_step() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io = Arc::new(StepGuardedIO::new());
+        let db = Database::open_file(io.clone(), "journal_mode_mvcc_yield.db").unwrap();
+        let conn = db.connect().unwrap();
+        let mut stmt = conn.prepare("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+        let mut rows = Vec::new();
+        let mut io_yields = 0usize;
+        loop {
+            io.set_step_allowed(false);
+            let step = stmt.step();
+            io.set_step_allowed(true);
+
+            match step.unwrap() {
+                StepResult::IO => {
+                    io_yields += 1;
+                    io.step().unwrap();
+                }
+                StepResult::Row => {
+                    let value = stmt.row().unwrap().get_values().next().unwrap().clone();
+                    rows.push(value);
+                }
+                StepResult::Done => break,
+                other => panic!("unexpected step result: {other:?}"),
+            }
+        }
+
+        assert!(
+            io_yields > 0,
+            "MemoryYieldIO should force PRAGMA journal_mode=mvcc through cooperative yields"
+        );
+        assert_eq!(rows, vec![crate::Value::build_text("mvcc")]);
+        assert!(conn.mvcc_enabled());
     }
 }
