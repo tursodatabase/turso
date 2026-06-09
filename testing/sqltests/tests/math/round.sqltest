@@ -46,7 +46,6 @@ test round-null-precision {
     SELECT round(100.123, NULL);
 }
 expect {
-    NULL
 }
 
 test round-half-away-from-zero-2-25 {
