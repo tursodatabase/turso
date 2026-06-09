@@ -829,8 +829,16 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
         "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
         "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
-        "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE time(value) END DECODE value OPERATOR '<'",
-        "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE datetime(value) END DECODE value OPERATOR '<'",
+        // ENCODE preserves sub-second precision through strftime + a rtrim pair
+        // that strips trailing zeros and the dangling dot, matching PostgreSQL's
+        // text format: whole seconds render as `HH:MM:SS` (no .000), trailing
+        // zeros are dropped (`.500` -> `.5`), and the dot is removed when no
+        // fractional digits remain. `time(...)` / `datetime(...)` would truncate
+        // the fraction outright, silently dropping precision on insert.
+        // Caveat: Turso's `%f` directive is millisecond resolution, so PG's
+        // microsecond inputs are clamped to 3 digits (`.123456` -> `.123`).
+        "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
+        "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
         "CREATE TYPE smallint(value integer) BASE integer ENCODE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END DECODE value OPERATOR '<'",
         "CREATE TYPE bigint(value integer) BASE integer",
         "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",
