@@ -128,6 +128,8 @@ pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable}
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use error::{io_error, CompletionError, LimboError};
 pub use function::ContextCollationFunction;
+#[cfg(feature = "io_memory_yield")]
+pub use io::MemoryYieldIO;
 #[cfg(all(feature = "fs", target_family = "unix", not(miri)))]
 pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring", not(miri)))]
@@ -2588,6 +2590,8 @@ impl Database {
             Some(vfs) => vfs,
             None => match vfs.as_ref() {
                 "memory" => Arc::new(MemoryIO::new()),
+                #[cfg(feature = "io_memory_yield")]
+                "memory_yield" => Arc::new(MemoryYieldIO::new()),
                 "syscall" => Arc::new(SyscallIO::new()?),
                 #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
                 "io_uring" => Arc::new(UringIO::new()?),

@@ -32,7 +32,7 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
-turso = { workspace = true }
+turso = { workspace = true, features = ["io_memory_yield"] }
 turso_macros = { workspace = true }
 rusqlite = { workspace = true }
 
