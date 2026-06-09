@@ -6363,6 +6363,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         }
                     };
                     self.storage.set_header(header.clone());
+                    // Enter the checkpoint lifecycle before any WAL→DB backfill so
+                    // that `DurableStorage` implementations observing the
+                    // start/end pairing (e.g. the diskless server, which arms its
+                    // next-generation metadata here) see a checkpoint in progress
+                    // when `wal.checkpoint` writes pages into the DB file. Called
+                    // exactly once at this transition (never on `DriveCheckpoint`
+                    // re-entry) since `on_checkpoint_start` is not idempotent.
+                    self.storage.on_checkpoint_start()?;
                     *st = CompleteCheckpointState::DriveCheckpoint { header };
                 }
                 CompleteCheckpointState::DriveEarlyTruncate {
@@ -6387,17 +6395,28 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         },
                     ));
                     if !checkpoint_result.everything_backfilled() {
-                        return Err(LimboError::Corrupt(
+                        let err = LimboError::Corrupt(
                             "Unable to fully backfill committed WAL frames during MVCC recovery"
                                 .to_string(),
-                        ));
+                        );
+                        // Close out the lifecycle opened in `ReadingHeader` so the
+                        // start/end pairing stays balanced on this error path.
+                        self.storage.on_checkpoint_end(Err(err.clone()))?;
+                        return Err(err);
                     }
                     let need_db_sync = connection.get_sync_mode() != SyncMode::Off
                         && checkpoint_result.wal_checkpoint_backfilled > 0;
                     if need_db_sync {
-                        let c = pager
+                        let c = match pager
                             .db_file
-                            .sync(Completion::new_sync(|_| {}), pager.get_sync_type())?;
+                            .sync(Completion::new_sync(|_| {}), pager.get_sync_type())
+                        {
+                            Ok(c) => c,
+                            Err(err) => {
+                                self.storage.on_checkpoint_end(Err(err.clone()))?;
+                                return Err(err);
+                            }
+                        };
                         *st = CompleteCheckpointState::AwaitDbFileSync {
                             completion: c,
                             checkpoint_result,
@@ -6432,7 +6451,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     phase,
                 } => match phase {
                     RetryHeaderPhase::NeedUpdateHeader => {
-                        let c = self.storage.update_header()?;
+                        let c = match self.storage.update_header() {
+                            Ok(c) => c,
+                            Err(err) => {
+                                self.storage.on_checkpoint_end(Err(err.clone()))?;
+                                return Err(err);
+                            }
+                        };
                         *phase = RetryHeaderPhase::AwaitUpdateHeader(c);
                     }
                     RetryHeaderPhase::AwaitUpdateHeader(completion) => {
@@ -6441,7 +6466,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             io_yield_one!(c);
                         }
                         if connection.get_sync_mode() != SyncMode::Off {
-                            let c = self.storage.sync(pager.get_sync_type())?;
+                            let c = match self.storage.sync(pager.get_sync_type()) {
+                                Ok(c) => c,
+                                Err(err) => {
+                                    self.storage.on_checkpoint_end(Err(err.clone()))?;
+                                    return Err(err);
+                                }
+                            };
                             *phase = RetryHeaderPhase::AwaitLogSync(c);
                         } else {
                             let file = self.get_logical_log_file();
@@ -6471,9 +6502,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             *st = CompleteCheckpointState::DriveFinalTruncate { checkpoint_result };
                         } else {
                             if *retried_crc {
-                                return Err(LimboError::Corrupt(
+                                let err = LimboError::Corrupt(
                                     "Logical log header CRC mismatch after retry".to_string(),
-                                ));
+                                );
+                                self.storage.on_checkpoint_end(Err(err.clone()))?;
+                                return Err(err);
                             }
                             *retried_crc = true;
                             *phase = RetryHeaderPhase::NeedUpdateHeader;
