@@ -412,6 +412,62 @@ const char *turso_statement_column_name(const turso_statement_t *self, size_t in
  */
 const char *turso_statement_column_decltype(const turso_statement_t *self, size_t index);
 
+/** Classification of a result column's declared type.
+ *
+ * Returned by turso_statement_column_kind. Values match the
+ * ColumnTypeKind variants in the Rust API and are kept stable: new kinds
+ * are appended.
+ */
+typedef enum
+{
+    TURSO_COLUMN_KIND_NONE = -1,
+    TURSO_COLUMN_KIND_BUILTIN = 0,
+    TURSO_COLUMN_KIND_CUSTOM = 1,
+    TURSO_COLUMN_KIND_DOMAIN = 2,
+    TURSO_COLUMN_KIND_STRUCT = 3,
+    TURSO_COLUMN_KIND_UNION = 4,
+} turso_column_kind_t;
+
+/** Get the declared type name of the column at `index`.
+ *
+ * Returns the same string as turso_statement_column_decltype, but resolved
+ * through the richer type-info path so the result is consistent with the
+ * other turso_statement_column_* getters declared below.
+ *
+ * Returns NULL when no type info is available (statement finalized, index
+ * out of bounds, or the result column is not a direct table-column ref).
+ * C string allocated by Turso must be freed with turso_str_deinit.
+ */
+const char *turso_statement_column_declared_name(const turso_statement_t *self, size_t index);
+
+/** Get the array depth of the column at `index`.
+ *
+ * Returns 0 for scalar table columns, n for n-dimensional array columns
+ * (e.g. INTEGER[][] -> 2), and 0 when no type info is available. To
+ * distinguish "scalar column" from "no info", check
+ * turso_statement_column_kind first: it returns TURSO_COLUMN_KIND_NONE in
+ * the latter case.
+ */
+uint32_t turso_statement_column_array_dimensions(const turso_statement_t *self, size_t index);
+
+/** Get the underlying primitive type name for columns whose declared type
+ * is a CREATE TYPE or CREATE DOMAIN.
+ *
+ * Returns one of "INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC". Returns NULL
+ * when the declared type is a built-in primitive directly, when no type
+ * info is available, or when the column is not a direct table-column
+ * reference. C string allocated by Turso must be freed with
+ * turso_str_deinit.
+ */
+const char *turso_statement_column_base_type(const turso_statement_t *self, size_t index);
+
+/** Classify the column's declared type as builtin / custom / domain /
+ * struct / union (see turso_column_kind_t).
+ *
+ * Returns TURSO_COLUMN_KIND_NONE when no type information is available.
+ */
+turso_column_kind_t turso_statement_column_kind(const turso_statement_t *self, size_t index);
+
 /** Get the row value at the the index for a current statement state
  * SAFETY: returned pointers will be valid only until next invocation of statement operation (step, finalize, reset, etc)
  * Caller must make sure that any non-owning memory is copied appropriated if it will be used for longer lifetime

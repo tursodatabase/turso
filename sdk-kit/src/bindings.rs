@@ -532,6 +532,42 @@ unsafe extern "C" {
         index: usize,
     ) -> *const ::std::os::raw::c_char;
 }
+pub const turso_column_kind_t_TURSO_COLUMN_KIND_NONE: turso_column_kind_t = -1;
+pub const turso_column_kind_t_TURSO_COLUMN_KIND_BUILTIN: turso_column_kind_t = 0;
+pub const turso_column_kind_t_TURSO_COLUMN_KIND_CUSTOM: turso_column_kind_t = 1;
+pub const turso_column_kind_t_TURSO_COLUMN_KIND_DOMAIN: turso_column_kind_t = 2;
+pub const turso_column_kind_t_TURSO_COLUMN_KIND_STRUCT: turso_column_kind_t = 3;
+pub const turso_column_kind_t_TURSO_COLUMN_KIND_UNION: turso_column_kind_t = 4;
+#[doc = " Classification of a result column's declared type.\n\n Returned by turso_statement_column_kind. Values match the\n ColumnTypeKind variants in the Rust API and are kept stable: new kinds\n are appended."]
+pub type turso_column_kind_t = ::std::os::raw::c_int;
+unsafe extern "C" {
+    #[doc = " Get the declared type name of the column at `index`.\n\n Returns the same string as turso_statement_column_decltype, but resolved\n through the richer type-info path so the result is consistent with the\n other turso_statement_column_* getters declared below.\n\n Returns NULL when no type info is available (statement finalized, index\n out of bounds, or the result column is not a direct table-column ref).\n C string allocated by Turso must be freed with turso_str_deinit."]
+    pub fn turso_statement_column_declared_name(
+        self_: *const turso_statement_t,
+        index: usize,
+    ) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    #[doc = " Get the array depth of the column at `index`.\n\n Returns 0 for scalar table columns, n for n-dimensional array columns\n (e.g. INTEGER[][] -> 2), and 0 when no type info is available. To\n distinguish \"scalar column\" from \"no info\", check\n turso_statement_column_kind first: it returns TURSO_COLUMN_KIND_NONE in\n the latter case."]
+    pub fn turso_statement_column_array_dimensions(
+        self_: *const turso_statement_t,
+        index: usize,
+    ) -> u32;
+}
+unsafe extern "C" {
+    #[doc = " Get the underlying primitive type name for columns whose declared type\n is a CREATE TYPE or CREATE DOMAIN.\n\n Returns one of \"INTEGER\", \"TEXT\", \"REAL\", \"BLOB\", \"NUMERIC\". Returns NULL\n when the declared type is a built-in primitive directly, when no type\n info is available, or when the column is not a direct table-column\n reference. C string allocated by Turso must be freed with\n turso_str_deinit."]
+    pub fn turso_statement_column_base_type(
+        self_: *const turso_statement_t,
+        index: usize,
+    ) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    #[doc = " Classify the column's declared type as builtin / custom / domain /\n struct / union (see turso_column_kind_t).\n\n Returns TURSO_COLUMN_KIND_NONE when no type information is available."]
+    pub fn turso_statement_column_kind(
+        self_: *const turso_statement_t,
+        index: usize,
+    ) -> turso_column_kind_t;
+}
 unsafe extern "C" {
     #[doc = " Get the row value at the the index for a current statement state\n SAFETY: returned pointers will be valid only until next invocation of statement operation (step, finalize, reset, etc)\n Caller must make sure that any non-owning memory is copied appropriated if it will be used for longer lifetime"]
     pub fn turso_statement_row_value_kind(
