@@ -1721,7 +1721,7 @@ impl Connection {
                     Ok(TransitionResult::Done(result)) => return Ok(result),
                     Ok(TransitionResult::Io(iocompletions)) => {
                         if let Err(err) = iocompletions.wait(io.as_ref()) {
-                            ckpt_sm.cleanup_after_external_io_error();
+                            ckpt_sm.cleanup_after_external_io_error(err.clone())?;
                             return Err(err);
                         }
                     }

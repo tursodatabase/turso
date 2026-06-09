@@ -616,7 +616,7 @@ pub fn op_checkpoint(
                 Ok(TransitionResult::Done(result)) => break result,
                 Ok(TransitionResult::Io(iocompletions)) => {
                     if let Err(err) = iocompletions.wait(pager.io.as_ref()) {
-                        ckpt_sm.cleanup_after_external_io_error();
+                        ckpt_sm.cleanup_after_external_io_error(err.clone())?;
                         return Err(err);
                     }
                 }
