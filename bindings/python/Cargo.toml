@@ -16,7 +16,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1.0"
-turso_sdk_kit = { workspace = true }
+turso_sdk_kit = { workspace = true, features = ["fts"] }
 turso_sync_sdk_kit = { workspace = true }
 pyo3 = { version = "0.28.2", features = ["anyhow", "abi3-py310"] }
 
