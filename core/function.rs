@@ -1598,7 +1598,7 @@ impl Func {
             "jsonb_group_object" => Ok(Some(Self::Agg(AggFunc::JsonbGroupObject))),
             #[cfg(feature = "json")]
             "json_group_object" => Ok(Some(Self::Agg(AggFunc::JsonGroupObject))),
-            "char" => Ok(Some(Self::Scalar(ScalarFunc::Char))),
+            "char" | "chr" => Ok(Some(Self::Scalar(ScalarFunc::Char))),
             "coalesce" => Ok(Some(Self::Scalar(ScalarFunc::Coalesce))),
             "concat" => {
                 if arg_count == 0 {
@@ -1617,18 +1617,20 @@ impl Func {
             "glob" => Ok(Some(Self::Scalar(ScalarFunc::Glob))),
             "ifnull" => Ok(Some(Self::Scalar(ScalarFunc::IfNull))),
             "if" | "iif" => Ok(Some(Self::Scalar(ScalarFunc::Iif))),
-            "instr" => Ok(Some(Self::Scalar(ScalarFunc::Instr))),
+            "instr" | "strpos" => Ok(Some(Self::Scalar(ScalarFunc::Instr))),
             "like" => Ok(Some(Self::Scalar(ScalarFunc::Like))),
             "abs" => Ok(Some(Self::Scalar(ScalarFunc::Abs))),
             "upper" => Ok(Some(Self::Scalar(ScalarFunc::Upper))),
             "lower" => Ok(Some(Self::Scalar(ScalarFunc::Lower))),
             "random" => Ok(Some(Self::Scalar(ScalarFunc::Random))),
             "randomblob" => Ok(Some(Self::Scalar(ScalarFunc::RandomBlob))),
-            "trim" => Ok(Some(Self::Scalar(ScalarFunc::Trim))),
+            "trim" | "btrim" => Ok(Some(Self::Scalar(ScalarFunc::Trim))),
             "ltrim" => Ok(Some(Self::Scalar(ScalarFunc::LTrim))),
             "rtrim" => Ok(Some(Self::Scalar(ScalarFunc::RTrim))),
             "round" => Ok(Some(Self::Scalar(ScalarFunc::Round))),
-            "length" => Ok(Some(Self::Scalar(ScalarFunc::Length))),
+            "length" | "char_length" | "character_length" => {
+                Ok(Some(Self::Scalar(ScalarFunc::Length)))
+            }
             "octet_length" => Ok(Some(Self::Scalar(ScalarFunc::OctetLength))),
             "sign" => Ok(Some(Self::Scalar(ScalarFunc::Sign))),
             "substr" => {
@@ -1783,7 +1785,7 @@ impl Func {
             "test_uint_eq" => Ok(Some(Self::Scalar(ScalarFunc::TestUintEq))),
             #[cfg(feature = "test_helper")]
             "test_nondet_counter" => Ok(Some(Self::Scalar(ScalarFunc::TestNondetCounter))),
-            "string_reverse" => Ok(Some(Self::Scalar(ScalarFunc::StringReverse))),
+            "string_reverse" | "reverse" => Ok(Some(Self::Scalar(ScalarFunc::StringReverse))),
             // Built-in type support functions
             "boolean_to_int" => Ok(Some(Self::Scalar(ScalarFunc::BooleanToInt))),
             "int_to_boolean" => Ok(Some(Self::Scalar(ScalarFunc::IntToBoolean))),

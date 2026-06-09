@@ -1,14 +1,21 @@
-//! Tests for Turso-specific statement result-column metadata APIs.
+//! Tests for Turso-specific statement result-column metadata APIs and
+//! function-name aliases.
 //!
-//! `Statement::get_column_type_info` is one entry point for "what is the type
-//! of this column?", covering both direct table-column references (declared
-//! name, array depth, custom-type kind, resolved primitive) and computed
-//! expressions (inferred affinity primitive). Gated behind the experimental
-//! custom-types feature.
+//! Two pieces of public surface bundled because they share the same testing
+//! pattern: prepare a statement, inspect column metadata or invoke aliased
+//! functions, assert the result.
+//!
+//! - `Statement::get_column_type_info`: one entry point for "what is the type
+//!   of this column?", covering both direct table-column references (declared
+//!   name, array depth, custom-type kind, resolved primitive) and computed
+//!   expressions (inferred affinity primitive). Gated behind the experimental
+//!   custom-types feature.
+//! - Function-name aliases: `chr` resolves to the same scalar function as
+//!   `char`, and `strpos` resolves to the same scalar function as `instr`.
 
 #[cfg(test)]
 mod tests {
-    use crate::common::TempDatabase;
+    use crate::common::{ExecRows, TempDatabase};
     use tempfile::TempDir;
     use turso_core::{ColumnTypeInfo, ColumnTypeKind, Statement};
 
@@ -361,5 +368,98 @@ mod tests {
         assert_eq!(b_info.declared_name, "INTEGER");
         assert_eq!(b_info.array_dimensions, 0);
         assert_eq!(b_info.kind, ColumnTypeKind::Builtin);
+    }
+
+    /// `chr(n)` is the SQL standard / PostgreSQL spelling of SQLite's
+    /// `char(n)`. Both must produce identical results.
+    #[test]
+    fn chr_alias_matches_char() {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+
+        let via_char: Vec<(String,)> = conn.exec_rows("SELECT char(65, 66, 67)");
+        let via_chr: Vec<(String,)> = conn.exec_rows("SELECT chr(65, 66, 67)");
+
+        assert_eq!(via_char, vec![("ABC".to_string(),)]);
+        assert_eq!(via_chr, vec![("ABC".to_string(),)]);
+    }
+
+    /// `strpos(haystack, needle)` is the PostgreSQL spelling of SQLite's
+    /// `instr(haystack, needle)`. Argument order is identical, so the alias
+    /// is unambiguous.
+    #[test]
+    fn strpos_alias_matches_instr() {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+
+        let via_instr: Vec<(i64,)> = conn.exec_rows("SELECT instr('hello world', 'world')");
+        let via_strpos: Vec<(i64,)> = conn.exec_rows("SELECT strpos('hello world', 'world')");
+        assert_eq!(via_instr, vec![(7,)]);
+        assert_eq!(via_strpos, vec![(7,)]);
+
+        // Needle not found → 0 from both spellings.
+        let miss_instr: Vec<(i64,)> = conn.exec_rows("SELECT instr('hello', 'xyz')");
+        let miss_strpos: Vec<(i64,)> = conn.exec_rows("SELECT strpos('hello', 'xyz')");
+        assert_eq!(miss_instr, vec![(0,)]);
+        assert_eq!(miss_strpos, vec![(0,)]);
+    }
+
+    /// `btrim(X[, chars])` is the PG/Oracle spelling of SQLite's
+    /// `trim(X[, chars])`. Both trim the listed characters (or whitespace by
+    /// default) from both sides of the string with identical semantics.
+    #[test]
+    fn btrim_alias_matches_trim() {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+
+        // Default: trim whitespace.
+        let trim_ws: Vec<(String,)> = conn.exec_rows("SELECT trim('  hello  ')");
+        let btrim_ws: Vec<(String,)> = conn.exec_rows("SELECT btrim('  hello  ')");
+        assert_eq!(trim_ws, vec![("hello".to_string(),)]);
+        assert_eq!(btrim_ws, vec![("hello".to_string(),)]);
+
+        // Explicit character set.
+        let trim_x: Vec<(String,)> = conn.exec_rows("SELECT trim('xxhelloxx', 'x')");
+        let btrim_x: Vec<(String,)> = conn.exec_rows("SELECT btrim('xxhelloxx', 'x')");
+        assert_eq!(trim_x, vec![("hello".to_string(),)]);
+        assert_eq!(btrim_x, vec![("hello".to_string(),)]);
+    }
+
+    /// `char_length(X)` and `character_length(X)` are the SQL standard
+    /// spellings of SQLite's `length(X)`. All three return the character
+    /// count for TEXT input.
+    #[test]
+    fn char_length_aliases_match_length() {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+
+        let via_length: Vec<(i64,)> = conn.exec_rows("SELECT length('hello world')");
+        let via_char_length: Vec<(i64,)> = conn.exec_rows("SELECT char_length('hello world')");
+        let via_character_length: Vec<(i64,)> =
+            conn.exec_rows("SELECT character_length('hello world')");
+
+        assert_eq!(via_length, vec![(11,)]);
+        assert_eq!(via_char_length, vec![(11,)]);
+        assert_eq!(via_character_length, vec![(11,)]);
+
+        // Multi-byte input: SQLite reports character count, not byte count.
+        let via_length_unicode: Vec<(i64,)> = conn.exec_rows("SELECT length('héllo')");
+        let via_char_length_unicode: Vec<(i64,)> = conn.exec_rows("SELECT char_length('héllo')");
+        assert_eq!(via_length_unicode, vec![(5,)]);
+        assert_eq!(via_char_length_unicode, vec![(5,)]);
+    }
+
+    /// `reverse(X)` is the spelling PG, MySQL, and Oracle all use; upstream
+    /// Turso registered the function under the more explicit `string_reverse`
+    /// name. Both must produce identical results.
+    #[test]
+    fn reverse_alias_matches_string_reverse() {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+
+        let via_string_reverse: Vec<(String,)> = conn.exec_rows("SELECT string_reverse('hello')");
+        let via_reverse: Vec<(String,)> = conn.exec_rows("SELECT reverse('hello')");
+        assert_eq!(via_string_reverse, vec![("olleh".to_string(),)]);
+        assert_eq!(via_reverse, vec![("olleh".to_string(),)]);
     }
 }
