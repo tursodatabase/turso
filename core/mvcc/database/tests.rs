@@ -2852,7 +2852,9 @@ fn test_checkpoint_resamples_boundary_before_starting() {
         mvcc_store.durable_txid_max.load(Ordering::SeqCst),
         update_ts
     );
-    interrupted_checkpoint.cleanup_after_external_io_error(LimboError::Interrupt);
+    interrupted_checkpoint
+        .cleanup_after_external_io_error(LimboError::Interrupt)
+        .unwrap();
 
     let mut finished = false;
     for _ in 0..50_000 {
