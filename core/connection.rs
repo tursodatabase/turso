@@ -213,6 +213,13 @@ enum ReparsePhase {
         stmt: Option<Box<Statement>>,
         /// Descriptor row `(start, inc, min, max, cycle)` captured from `stmt`.
         meta: Option<(i64, i64, i64, i64, bool)>,
+        /// Sequence reconstructed from `meta`, retained while the watermark
+        /// query yields IO.
+        seq: Option<crate::schema::Sequence>,
+        /// In-flight watermark `SELECT`, created after `seq` is known.
+        watermark_stmt: Option<Box<Statement>>,
+        /// Watermark row `(value, is_called)` captured from `watermark_stmt`.
+        watermark_row: Option<(i64, bool)>,
     },
     /// Loading custom type definitions from the internal types table.
     LoadTypes {
@@ -242,6 +249,13 @@ pub enum LoadSequenceDescriptorsState {
         stmt: Option<Box<Statement>>,
         /// Descriptor row `(start, inc, min, max, cycle)` captured from `stmt`.
         meta: Option<(i64, i64, i64, i64, bool)>,
+        /// Sequence reconstructed from `meta`, retained while the watermark
+        /// query yields IO.
+        seq: Option<crate::schema::Sequence>,
+        /// In-flight watermark `SELECT`, created after `seq` is known.
+        watermark_stmt: Option<Box<Statement>>,
+        /// Watermark row `(value, is_called)` captured from `watermark_stmt`.
+        watermark_row: Option<(i64, bool)>,
     },
 }
 
@@ -1267,6 +1281,9 @@ impl Connection {
                         idx: 0,
                         stmt: None,
                         meta: None,
+                        seq: None,
+                        watermark_stmt: None,
+                        watermark_row: None,
                     };
                 }
                 ReparsePhase::PopulateSequences {
@@ -1274,6 +1291,9 @@ impl Connection {
                     idx,
                     stmt,
                     meta,
+                    seq,
+                    watermark_stmt,
+                    watermark_row,
                 } => {
                     // Lazy init: graft the VACUUM-preserved descriptor map, or
                     // compute the worklist of backing tables to read from disk.
@@ -1312,22 +1332,49 @@ impl Connection {
                         if inner.fresh.sequences.contains_key(&normalized) {
                             *idx += 1;
                             *stmt = None;
+                            *meta = None;
+                            *seq = None;
+                            *watermark_stmt = None;
+                            *watermark_row = None;
                             continue;
                         }
-                        crate::return_if_io!(self.read_seq_descriptor_row_nonblock(
+                        if seq.is_none() {
+                            crate::return_if_io!(self.read_seq_descriptor_row_nonblock(
+                                &backing_table_name,
+                                &seq_name,
+                                stmt,
+                                meta,
+                            ));
+                            *seq = Some(Self::sequence_from_descriptor_meta(
+                                &seq_name,
+                                &backing_table_name,
+                                *meta,
+                            )?);
+                            *stmt = None;
+                            *meta = None;
+                        }
+                        let sequence = seq.as_ref().expect("sequence set above");
+                        crate::return_if_io!(self.read_sequence_watermark_row_nonblock(
                             &backing_table_name,
-                            &seq_name,
-                            stmt,
-                            meta,
+                            sequence,
+                            watermark_stmt,
+                            watermark_row,
                         ));
-                        let seq = Self::sequence_from_descriptor_meta(
-                            &seq_name,
+                        let watermark = Self::sequence_watermark_from_row(
                             &backing_table_name,
-                            *meta,
+                            sequence,
+                            *watermark_row,
                         )?;
-                        inner.fresh.sequences.insert(normalized, Arc::new(seq));
+                        if let Some(mv_store) = self.db.get_mv_store().as_ref() {
+                            mv_store.set_sequence_watermark(&normalized, watermark);
+                        }
+                        let sequence = seq.take().expect("sequence set above");
+                        inner.fresh.sequences.insert(normalized, Arc::new(sequence));
                         *idx += 1;
                         *stmt = None;
+                        *meta = None;
+                        *watermark_stmt = None;
+                        *watermark_row = None;
                     }
 
                     // Decide whether to load custom types next.
@@ -3404,6 +3451,9 @@ impl Connection {
                         idx: 0,
                         stmt: None,
                         meta: None,
+                        seq: None,
+                        watermark_stmt: None,
+                        watermark_row: None,
                     };
                 }
                 LoadSequenceDescriptorsState::Reading {
@@ -3411,6 +3461,9 @@ impl Connection {
                     idx,
                     stmt,
                     meta,
+                    seq,
+                    watermark_stmt,
+                    watermark_row,
                 } => loop {
                     let entry = {
                         if *idx >= pending.len() {
@@ -3425,21 +3478,53 @@ impl Connection {
                     if already_present {
                         *idx += 1;
                         *stmt = None;
+                        *meta = None;
+                        *seq = None;
+                        *watermark_stmt = None;
+                        *watermark_row = None;
                         continue;
                     }
-                    crate::return_if_io!(self.read_seq_descriptor_row_nonblock(
+                    if seq.is_none() {
+                        crate::return_if_io!(self.read_seq_descriptor_row_nonblock(
+                            &backing_table_name,
+                            &seq_name,
+                            stmt,
+                            meta,
+                        ));
+                        *seq = Some(Self::sequence_from_descriptor_meta(
+                            &seq_name,
+                            &backing_table_name,
+                            *meta,
+                        )?);
+                        *stmt = None;
+                        *meta = None;
+                    }
+                    let sequence = seq.as_ref().expect("sequence set above");
+                    crate::return_if_io!(self.read_sequence_watermark_row_nonblock(
                         &backing_table_name,
-                        &seq_name,
-                        stmt,
-                        meta,
+                        sequence,
+                        watermark_stmt,
+                        watermark_row,
                     ));
-                    let seq =
-                        Self::sequence_from_descriptor_meta(&seq_name, &backing_table_name, *meta)?;
+                    let watermark = Self::sequence_watermark_from_row(
+                        &backing_table_name,
+                        sequence,
+                        *watermark_row,
+                    )?;
+                    if let Some(mv_store) = self.db.get_mv_store().as_ref() {
+                        mv_store.set_sequence_watermark(&normalized, watermark);
+                    }
+                    let sequence = seq.take().expect("sequence set above");
                     self.with_database_schema_mut(MAIN_DB_ID, |schema| {
-                        schema.sequences.insert(normalized.clone(), Arc::new(seq));
+                        schema
+                            .sequences
+                            .insert(normalized.clone(), Arc::new(sequence));
                     });
                     *idx += 1;
                     *stmt = None;
+                    *meta = None;
+                    *watermark_stmt = None;
+                    *watermark_row = None;
                 },
             }
         }
@@ -3524,6 +3609,68 @@ impl Connection {
                  \"{seq_name}\" descriptor is invalid: {err}"
             ))
         })
+    }
+
+    /// Drive one backing-table watermark read to completion (re-entrant).
+    ///
+    /// The returned row is converted by [`Self::sequence_watermark_from_row`]
+    /// into the exclusive upper bound used by `sequence_watermark()`.
+    fn read_sequence_watermark_row_nonblock(
+        self: &Arc<Connection>,
+        backing_table_name: &str,
+        seq: &crate::schema::Sequence,
+        stmt: &mut Option<Box<Statement>>,
+        row: &mut Option<(i64, bool)>,
+    ) -> Result<crate::types::IOResult<()>> {
+        use crate::types::IOResult;
+        if stmt.is_none() {
+            let escaped = backing_table_name.replace('"', "\"\"");
+            let direction = if seq.increment_by >= 0 { "DESC" } else { "ASC" };
+            let sql = format!(
+                "SELECT value, is_called FROM \"{escaped}\" ORDER BY value {direction} LIMIT 1"
+            );
+            let prepared = self.prepare_internal(sql).map_err(|err| {
+                LimboError::Corrupt(format!(
+                    "internal sequence backing table \"{backing_table_name}\" for sequence \
+                     \"{}\": cannot prepare watermark SELECT: {err}",
+                    seq.name
+                ))
+            })?;
+            *stmt = Some(Box::new(prepared));
+            *row = None;
+        }
+        let s = stmt.as_mut().expect("stmt set above");
+        match s.run_with_row_callback_nonblock(|r| {
+            let value = r.get::<i64>(0)?;
+            let is_called = r.get::<i64>(1)? != 0;
+            *row = Some((value, is_called));
+            Ok(())
+        }) {
+            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+            Ok(IOResult::Done(())) => Ok(IOResult::Done(())),
+            Err(err) => Err(LimboError::Corrupt(format!(
+                "internal sequence backing table \"{backing_table_name}\" for sequence \
+                 \"{}\": watermark row read failed: {err}",
+                seq.name
+            ))),
+        }
+    }
+
+    fn sequence_watermark_from_row(
+        backing_table_name: &str,
+        seq: &crate::schema::Sequence,
+        row: Option<(i64, bool)>,
+    ) -> Result<i64> {
+        let (value, is_called) = row.ok_or_else(|| {
+            LimboError::Corrupt(format!(
+                "internal sequence backing table \"{backing_table_name}\" for sequence \
+                 \"{}\" is empty; cannot derive sequence watermark",
+                seq.name
+            ))
+        })?;
+        Ok(crate::mvcc::database::first_unsafe_sequence_watermark(
+            seq, value, is_called,
+        ))
     }
 
     /// Sync AUTOINCREMENT backing-table watermarks from `sqlite_sequence`.
@@ -3667,6 +3814,14 @@ impl Connection {
                         }
                         SyncRowStep::Upsert { stmt } => {
                             crate::return_if_io!(stmt.run_with_row_callback_nonblock(|_| Ok(())));
+                            if let Some(mv_store) = self.db.get_mv_store().as_ref() {
+                                let watermark = rows[*idx].1;
+                                let first_unsafe = watermark.checked_add(1).unwrap_or(watermark);
+                                mv_store.set_sequence_watermark(
+                                    &autoincrement_sequence_name(&rows[*idx].0),
+                                    first_unsafe,
+                                );
+                            }
                             *idx += 1;
                             *sub = SyncRowStep::Start;
                         }

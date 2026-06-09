@@ -1235,7 +1235,8 @@ pub fn translate_expr(
                         | ScalarFunc::RandomBlob
                         | ScalarFunc::Sign
                         | ScalarFunc::Soundex
-                        | ScalarFunc::ZeroBlob => {
+                        | ScalarFunc::ZeroBlob
+                        | ScalarFunc::SequenceWatermark => {
                             let args = expect_arguments_exact!(args, 1, srf);
                             let start_reg = program.alloc_register();
                             translate_expr(

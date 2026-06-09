@@ -381,6 +381,12 @@ pub fn emit_disk_read_nextval(
     });
     program.preassign_label_to_next_insn(after_retry_label);
 
+    program.emit_insn(Insn::SequenceTrackAllocation {
+        db: database_id,
+        seq_name_reg,
+        value_reg: target_register,
+    });
+
     program.emit_insn(Insn::SetSequenceCurrval {
         seq_name_reg,
         value_reg: target_register,

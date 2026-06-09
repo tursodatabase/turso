@@ -1759,6 +1759,19 @@ pub fn insn_to_row(
                 0,
                 format!("currval(r[{seq_name_reg}]) = r[{value_reg}]"),
             ),
+            Insn::SequenceTrackAllocation {
+                db,
+                seq_name_reg,
+                value_reg,
+            } => (
+                "SequenceTrackAllocation",
+                *db as i64,
+                *seq_name_reg as i64,
+                *value_reg as i64,
+                Value::Null,
+                0,
+                format!("track sequence allocation r[{seq_name_reg}] = r[{value_reg}]"),
+            ),
             Insn::SequenceBeginInnerTx {
                 db,
                 path_kind_reg,

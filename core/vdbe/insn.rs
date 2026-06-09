@@ -1455,6 +1455,13 @@ pub enum Insn {
         seq_name_reg: usize,
         value_reg: usize,
     },
+    /// Publish sequence allocation metadata for sync watermarks after a
+    /// successful sequence RMW commit.
+    SequenceTrackAllocation {
+        db: usize,
+        seq_name_reg: usize,
+        value_reg: usize,
+    },
     /// Add a custom type to the in-memory schema by parsing its CREATE TYPE SQL
     AddType {
         /// The database within which this type needs to be added
@@ -2089,6 +2096,7 @@ impl InsnVariants {
             InsnVariants::DropSequence => execute::op_drop_sequence,
             InsnVariants::SequenceComputeNext => execute::op_sequence_compute_next,
             InsnVariants::SetSequenceCurrval => execute::op_set_sequence_currval,
+            InsnVariants::SequenceTrackAllocation => execute::op_sequence_track_allocation,
             InsnVariants::SequenceBeginInnerTx => execute::op_sequence_begin_inner_tx,
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
@@ -2208,6 +2216,7 @@ impl Insn {
             | Self::DropSequence { .. }
             | Self::SequenceComputeNext { .. }
             | Self::SetSequenceCurrval { .. }
+            | Self::SequenceTrackAllocation { .. }
             | Self::SequenceBeginInnerTx { .. }
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }

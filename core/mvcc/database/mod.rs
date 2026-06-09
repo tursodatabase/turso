@@ -4,7 +4,7 @@ use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
-use crate::schema::{Schema, Table};
+use crate::schema::{Schema, Sequence, Table};
 use crate::skiplist::map::Entry;
 use crate::skiplist::SkipMap;
 use crate::state_machine::StateMachine;
@@ -46,7 +46,7 @@ use crate::{
 use crate::{Connection, Pager, SyncMode};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap as StdHashMap};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
@@ -81,6 +81,20 @@ pub mod tests;
 
 /// Sentinel value for `MvStore::exclusive_tx` indicating no exclusive transaction is active.
 const NO_EXCLUSIVE_TX: u64 = 0;
+
+/// Convert a sequence backing-table row into the exclusive upper bound used by
+/// sync scans. This is intentionally tailored to ascending non-CYCLE sequences,
+/// which is the shape used by AUTOINCREMENT CDC ids.
+pub(crate) fn first_unsafe_sequence_watermark(seq: &Sequence, value: i64, is_called: bool) -> i64 {
+    if !is_called {
+        return value;
+    }
+    if seq.increment_by > 0 && !seq.cycle {
+        value.checked_add(seq.increment_by).unwrap_or(value)
+    } else {
+        value
+    }
+}
 
 #[cfg(not(any(test, injected_yields)))]
 struct YieldContext;
@@ -3711,6 +3725,15 @@ pub struct MvStore<Clock: LogicalClock> {
     /// deadlock.
     last_global_header_ts: AtomicU64,
     table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
+    /// Per-sequence first value not guaranteed safe to read past based only on
+    /// durable/current sequence state. Active allocations can lower this.
+    sequence_watermarks: Mutex<HashMap<String, i64>>,
+    /// Per-sequence minimum allocated value for each active transaction.
+    ///
+    /// This is in-memory and therefore only correct while all MVCC writers for a
+    /// database live in one process. Multi-process MVCC will need a shared
+    /// coordination mechanism before sync can rely on this watermark.
+    sequence_allocations: Mutex<HashMap<String, StdHashMap<TxID, i64>>>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -3786,6 +3809,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             last_committed_tx_ts: AtomicU64::new(0),
             last_global_header_ts: AtomicU64::new(0),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
+            sequence_watermarks: Mutex::new(HashMap::default()),
+            sequence_allocations: Mutex::new(HashMap::default()),
         }
     }
 
@@ -5241,6 +5266,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     pub fn remove_tx(&self, tx_id: TxID) {
+        self.remove_sequence_allocations(tx_id);
         if let Some(entry) = self.txs.get(&tx_id) {
             let tx = entry.value();
             if let TransactionState::Committed(commit_ts) = tx.state.load() {
@@ -5263,6 +5289,87 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
         self.txs.remove(&tx_id);
         self.blocking_checkpoint_lock.unlock();
+    }
+
+    pub fn register_sequence_allocation(
+        &self,
+        tx_id: TxID,
+        sequence_name: &str,
+        sequence_value: i64,
+    ) -> Result<()> {
+        let Some(tx) = self.txs.get(&tx_id) else {
+            return Err(LimboError::NoSuchTransactionID(tx_id.to_string()));
+        };
+        turso_assert!(
+            matches!(
+                tx.value().state.load(),
+                TransactionState::Active | TransactionState::Preparing(_)
+            ),
+            "sequence allocation must be registered while the transaction is active or preparing"
+        );
+
+        let sequence_name = crate::util::normalize_ident(sequence_name);
+        let mut allocations = self.sequence_allocations.lock();
+        let tx_allocations = allocations.entry(sequence_name).or_default();
+        tx_allocations
+            .entry(tx_id)
+            .and_modify(|value| *value = (*value).min(sequence_value))
+            .or_insert(sequence_value);
+        Ok(())
+    }
+
+    pub fn set_sequence_watermark(&self, sequence_name: &str, watermark: i64) {
+        let sequence_name = crate::util::normalize_ident(sequence_name);
+        self.sequence_watermarks
+            .lock()
+            .insert(sequence_name, watermark);
+    }
+
+    /// Returns the first sequence value that is not safe for cursor scans to pass.
+    ///
+    /// Readers can safely consume rows with sequence values less than this
+    /// watermark. The value is the minimum of the current sequence boundary and
+    /// any lower value already allocated by an active transaction.
+    pub fn sequence_watermark(&self, sequence_name: &str) -> Option<i64> {
+        let sequence_name = crate::util::normalize_ident(sequence_name);
+        let mut allocations = self.sequence_allocations.lock();
+        let mut remove_allocations = false;
+        let active_watermark = {
+            allocations
+                .get_mut(&sequence_name)
+                .and_then(|tx_allocations| {
+                    tx_allocations.retain(|tx_id, _| {
+                        self.txs.get(tx_id).is_some_and(|tx| {
+                            matches!(
+                                tx.value().state.load(),
+                                TransactionState::Active | TransactionState::Preparing(_)
+                            )
+                        })
+                    });
+                    let watermark = tx_allocations.values().copied().min();
+                    if tx_allocations.is_empty() {
+                        remove_allocations = true;
+                    }
+                    watermark
+                })
+        };
+        if remove_allocations {
+            allocations.remove(&sequence_name);
+        }
+        let current_watermark = self.sequence_watermarks.lock().get(&sequence_name).copied();
+        match (current_watermark, active_watermark) {
+            (Some(current), Some(active)) => Some(current.min(active)),
+            (Some(current), None) => Some(current),
+            (None, active) => active,
+        }
+    }
+
+    fn remove_sequence_allocations(&self, tx_id: TxID) {
+        let mut allocations = self.sequence_allocations.lock();
+        allocations.retain(|_, tx_allocations| {
+            tx_allocations.remove(&tx_id);
+            !tx_allocations.is_empty()
+        });
     }
 
     /// Atomically retire a committed tx: clear the connection's mv_tx_id cache

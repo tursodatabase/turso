@@ -4096,6 +4096,100 @@ pub(crate) fn commit_tx_no_conn(
     Ok(())
 }
 
+#[test]
+fn test_sequence_watermark_tracks_lowest_active_allocation() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mv_store = db.get_mvcc_store();
+    let pager = conn.pager.load().clone();
+
+    mv_store.set_sequence_watermark("turso_cdc_pk_autoincrement", 13);
+    let tx1 = mv_store.begin_tx(pager.clone()).unwrap();
+    let tx2 = mv_store.begin_tx(pager.clone()).unwrap();
+    mv_store
+        .register_sequence_allocation(tx1, "turso_cdc_pk_autoincrement", 10)
+        .unwrap();
+    mv_store
+        .register_sequence_allocation(tx2, "turso_cdc_pk_autoincrement", 12)
+        .unwrap();
+    mv_store
+        .register_sequence_allocation(tx1, "turso_cdc_pk_autoincrement", 11)
+        .unwrap();
+
+    assert_eq!(
+        mv_store.sequence_watermark("turso_cdc_pk_autoincrement"),
+        Some(10)
+    );
+
+    commit_tx(mv_store.clone(), &conn, tx1).unwrap();
+    assert_eq!(
+        mv_store.sequence_watermark("turso_cdc_pk_autoincrement"),
+        Some(12)
+    );
+
+    mv_store.rollback_tx(tx2, pager, conn.as_ref(), crate::MAIN_DB_ID);
+    assert_eq!(
+        mv_store.sequence_watermark("turso_cdc_pk_autoincrement"),
+        Some(13)
+    );
+}
+
+#[test]
+fn test_sequence_watermark_function_returns_current_watermark_without_active_allocations() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mv_store = db.get_mvcc_store();
+    let pager = conn.pager.load().clone();
+
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    mv_store.set_sequence_watermark("s", 42);
+    let rows = get_rows(&conn, "SELECT sequence_watermark('s')");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 42);
+
+    let tx_id = mv_store.begin_tx(pager.clone()).unwrap();
+    mv_store
+        .register_sequence_allocation(tx_id, "s", 10)
+        .unwrap();
+    let rows = get_rows(&conn, "SELECT sequence_watermark('s')");
+
+    assert_eq!(rows[0][0].as_int().unwrap(), 10);
+
+    mv_store.rollback_tx(tx_id, pager, conn.as_ref(), crate::MAIN_DB_ID);
+    let rows = get_rows(&conn, "SELECT sequence_watermark('s')");
+
+    assert_eq!(rows[0][0].as_int().unwrap(), 42);
+}
+
+#[test]
+fn test_sequence_watermark_tracks_nextval_allocations() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup.execute("CREATE SEQUENCE s START WITH 1").unwrap();
+
+    let rows = get_rows(&setup, "SELECT sequence_watermark('s')");
+    assert!(matches!(rows[0][0], Value::Null));
+
+    let rows = get_rows(&setup, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    let rows = get_rows(&setup, "SELECT sequence_watermark('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(&writer, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT sequence_watermark('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    writer.execute("COMMIT").unwrap();
+    let rows = get_rows(&observer, "SELECT sequence_watermark('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+}
+
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
 #[test]
