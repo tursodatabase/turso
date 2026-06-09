@@ -166,11 +166,12 @@ impl Drop for SchemaReparseGuard {
     }
 }
 
-/// Re-entrant state for [`Connection::reparse_schema`] /
-/// [`Connection::reparse_schema_with_cookie`]. `Start` is the fresh state
-/// (cookie not yet read / schema build not yet begun); `Building` carries the
-/// half-built schema, captured table-valued functions, the held reparse guard,
-/// and the current sub-phase across IO yields.
+/// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the
+/// VACUUM-only [`Connection::reparse_schema_with_cookie_keeping_sequences`].
+/// `Start` is the fresh state (cookie not yet read / schema build not yet
+/// begun); `Building` carries the half-built schema, captured table-valued
+/// functions, the held reparse guard, and the current sub-phase across IO
+/// yields.
 #[derive(Default)]
 pub enum ReparseSchemaState {
     #[default]
@@ -229,7 +230,7 @@ enum ReparsePhase {
 /// `__turso_internal_seq_*` backing table and registers its descriptor,
 /// carrying the worklist and the in-flight descriptor read across IO yields.
 #[derive(Default)]
-pub(crate) enum LoadSequenceDescriptorsState {
+pub enum LoadSequenceDescriptorsState {
     #[default]
     Start,
     Reading {
@@ -247,7 +248,7 @@ pub(crate) enum LoadSequenceDescriptorsState {
 /// Re-entrant driver state for
 /// [`Connection::sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock`].
 #[derive(Default)]
-pub(crate) enum SyncAutoincrementState {
+pub enum SyncAutoincrementState {
     #[default]
     Start,
     /// Reading all `(name, seq)` rows from `sqlite_sequence`.
@@ -265,7 +266,7 @@ pub(crate) enum SyncAutoincrementState {
 
 /// Per-row sub-state of [`SyncAutoincrementState::Process`].
 #[derive(Default)]
-enum SyncRowStep {
+pub enum SyncRowStep {
     /// Resolve `rows[idx]`'s backing table and start reading `MAX(value)`.
     #[default]
     Start,
@@ -276,9 +277,7 @@ enum SyncRowStep {
         current_max: Option<i64>,
     },
     /// Running the `INSERT OR REPLACE` watermark upsert.
-    Upsert {
-        stmt: Box<Statement>,
-    },
+    Upsert { stmt: Box<Statement> },
 }
 
 /// Database connection handle.
@@ -1157,26 +1156,6 @@ impl Connection {
             // read cookie before consuming statement program - otherwise we can
             // end up reading cookie with closed transaction state
             let cookie = crate::return_if_io!(self.read_current_schema_cookie_nonblock());
-            *state =
-                ReparseSchemaState::Building(Box::new(self.init_reparse_building(cookie, None)?));
-        }
-        self.drive_reparse_building(state)
-    }
-
-    /// Blocking shim for callers that already hold the cookie.
-    pub(crate) fn reparse_schema_with_cookie(self: &Arc<Connection>, cookie: u32) -> Result<()> {
-        let io = self.pager.load().io.clone();
-        let mut state = ReparseSchemaState::default();
-        io.block(|| self.reparse_schema_with_cookie_nonblock(cookie, &mut state))
-    }
-
-    /// Non-blocking reparse starting from a known cookie.
-    pub(crate) fn reparse_schema_with_cookie_nonblock(
-        self: &Arc<Connection>,
-        cookie: u32,
-        state: &mut ReparseSchemaState,
-    ) -> Result<crate::types::IOResult<()>> {
-        if matches!(state, ReparseSchemaState::Start) {
             *state =
                 ReparseSchemaState::Building(Box::new(self.init_reparse_building(cookie, None)?));
         }
@@ -3570,8 +3549,9 @@ impl Connection {
                     if !has_seq_table {
                         return Ok(IOResult::Done(()));
                     }
-                    let stmt = self
-                        .prepare_internal(format!("SELECT name, seq FROM {SQLITE_SEQUENCE_TABLE_NAME}"))?;
+                    let stmt = self.prepare_internal(format!(
+                        "SELECT name, seq FROM {SQLITE_SEQUENCE_TABLE_NAME}"
+                    ))?;
                     *state = SyncAutoincrementState::ReadSeqRows {
                         stmt: Box::new(stmt),
                         rows: Vec::new(),
@@ -3610,8 +3590,9 @@ impl Connection {
                             // Read current backing watermark; only upsert if we'd
                             // actually advance it (avoids needless writes on boot).
                             let escaped = backing_table_name.replace('"', "\"\"");
-                            let stmt = self
-                                .prepare_internal(format!("SELECT MAX(value) FROM \"{escaped}\""))?;
+                            let stmt = self.prepare_internal(format!(
+                                "SELECT MAX(value) FROM \"{escaped}\""
+                            ))?;
                             *sub = SyncRowStep::ReadMax {
                                 backing_table_name,
                                 stmt: Box::new(stmt),

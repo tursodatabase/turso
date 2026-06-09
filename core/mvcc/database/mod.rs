@@ -4150,7 +4150,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     // backing table is on-disk corruption, surfaced as a hard
                     // bootstrap failure rather than a misleading "sequence does
                     // not exist" on the next nextval.
-                    return_if_io!(bootstrap_conn.load_sequence_descriptors_via_sql_nonblock(load_st));
+                    return_if_io!(
+                        bootstrap_conn.load_sequence_descriptors_via_sql_nonblock(load_st)
+                    );
                     *st = BootstrapState::SyncAutoincrement {
                         sync_st: crate::connection::SyncAutoincrementState::default(),
                     };
