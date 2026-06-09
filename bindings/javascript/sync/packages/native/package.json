@@ -23,7 +23,7 @@
     "@napi-rs/cli": "^3.1.5",
     "@types/node": "^24.12.2",
     "typescript": "^5.9.2",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.8"
   },
   "scripts": {
     "napi-build": "napi build --platform --profile release-official --esm --manifest-path ../../Cargo.toml --output-dir .",

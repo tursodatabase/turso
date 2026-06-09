@@ -16,7 +16,7 @@
   ],
   "devDependencies": {
     "typescript": "^5.9.2",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.8"
   },
   "scripts": {
     "tsc-build": "npm exec tsc",

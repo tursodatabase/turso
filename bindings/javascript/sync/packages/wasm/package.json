@@ -31,11 +31,11 @@
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.1.5",
-    "@vitest/browser": "^3.2.4",
+    "@vitest/browser": "^4.1.8",
     "playwright": "^1.57.0",
     "typescript": "^5.9.2",
     "vite": "^7.3.2",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.8"
   },
   "scripts": {
     "napi-build": "napi build --features browser --profile release-official --platform --target wasm32-wasip1-threads --no-js --manifest-path ../../Cargo.toml --output-dir . && rm index.d.ts sync.wasi* wasi* browser.js",
