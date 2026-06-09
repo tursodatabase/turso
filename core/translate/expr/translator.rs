@@ -1822,6 +1822,11 @@ pub fn translate_expr(
                         | ScalarFunc::TestUintLt
                         | ScalarFunc::TestUintEq
                         | ScalarFunc::StringReverse
+                        | ScalarFunc::Gcd
+                        | ScalarFunc::Lcm
+                        | ScalarFunc::Repeat
+                        | ScalarFunc::Lpad
+                        | ScalarFunc::Rpad
                         | ScalarFunc::BooleanToInt
                         | ScalarFunc::IntToBoolean
                         | ScalarFunc::ValidateIpAddr

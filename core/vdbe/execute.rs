@@ -102,12 +102,11 @@ use crate::storage::btree::{BTreeCursor, BTreeKey};
 
 use super::{
     array::{
-        array_values_from_blob, compare_arrays, compute_array_length,
-        compute_array_length_at_dim, exec_array_append, exec_array_cat, exec_array_contains,
-        exec_array_contains_all, exec_array_overlap, exec_array_position, exec_array_prepend,
-        exec_array_remove, exec_array_slice, exec_array_to_string, exec_string_to_array,
-        make_array_from_registers, parse_text_array, serialize_array_from_blob,
-        values_to_record_blob,
+        array_values_from_blob, compare_arrays, compute_array_length, compute_array_length_at_dim,
+        exec_array_append, exec_array_cat, exec_array_contains, exec_array_contains_all,
+        exec_array_overlap, exec_array_position, exec_array_prepend, exec_array_remove,
+        exec_array_slice, exec_array_to_string, exec_string_to_array, make_array_from_registers,
+        parse_text_array, serialize_array_from_blob, values_to_record_blob,
     },
     insn::{Cookie, RegisterOrLiteral, SortComparatorType},
     CommitState,
@@ -8349,6 +8348,47 @@ pub fn op_function(
                     }
                 };
                 state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::Gcd => {
+                check_arg_count!(arg_count, 2);
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(crate::functions::math::exec_gcd(a, b)?);
+            }
+            ScalarFunc::Lcm => {
+                check_arg_count!(arg_count, 2);
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(crate::functions::math::exec_lcm(a, b)?);
+            }
+            ScalarFunc::Repeat => {
+                check_arg_count!(arg_count, 2);
+                let input = state.registers[*start_reg].get_value();
+                let count = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest]
+                    .set_value(crate::functions::string::exec_repeat(input, count));
+            }
+            ScalarFunc::Lpad => {
+                let input = state.registers[*start_reg].get_value();
+                let length = state.registers[*start_reg + 1].get_value();
+                let fill = if arg_count >= 3 {
+                    Some(state.registers[*start_reg + 2].get_value())
+                } else {
+                    None
+                };
+                state.registers[*dest]
+                    .set_value(crate::functions::string::exec_lpad(input, length, fill));
+            }
+            ScalarFunc::Rpad => {
+                let input = state.registers[*start_reg].get_value();
+                let length = state.registers[*start_reg + 1].get_value();
+                let fill = if arg_count >= 3 {
+                    Some(state.registers[*start_reg + 2].get_value())
+                } else {
+                    None
+                };
+                state.registers[*dest]
+                    .set_value(crate::functions::string::exec_rpad(input, length, fill));
             }
             ScalarFunc::BooleanToInt => {
                 check_arg_count!(arg_count, 1);

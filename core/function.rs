@@ -800,6 +800,12 @@ pub enum ScalarFunc {
     #[cfg(feature = "test_helper")]
     TestNondetCounter,
     StringReverse,
+    // SQL-standard string and math extensions (PG/MySQL/Oracle compatible)
+    Gcd,
+    Lcm,
+    Repeat,
+    Lpad,
+    Rpad,
     // Built-in type support functions
     BooleanToInt,
     IntToBoolean,
@@ -921,6 +927,11 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::TestUintLt
             | ScalarFunc::TestUintEq
             | ScalarFunc::StringReverse => true,
+            ScalarFunc::Gcd
+            | ScalarFunc::Lcm
+            | ScalarFunc::Repeat
+            | ScalarFunc::Lpad
+            | ScalarFunc::Rpad => true,
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter => false,
             ScalarFunc::BooleanToInt
@@ -1063,6 +1074,11 @@ impl Display for ScalarFunc {
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => "test_nondet_counter",
             Self::StringReverse => "string_reverse",
+            Self::Gcd => "gcd",
+            Self::Lcm => "lcm",
+            Self::Repeat => "repeat",
+            Self::Lpad => "lpad",
+            Self::Rpad => "rpad",
             Self::BooleanToInt => "boolean_to_int",
             Self::IntToBoolean => "int_to_boolean",
             Self::ValidateIpAddr => "validate_ipaddr",
@@ -1198,6 +1214,9 @@ impl ScalarFunc {
             | Self::IsAutocommit => &[0],
             // Scalar max/min (multi-arg)
             Self::Max | Self::Min => &[-1],
+            // SQL-standard string and math extensions
+            Self::Gcd | Self::Lcm | Self::Repeat => &[2],
+            Self::Lpad | Self::Rpad => &[2, 3],
             // Test functions for custom types (1-arg encode/decode, 2-arg operators)
             Self::TestUintEncode | Self::TestUintDecode | Self::StringReverse => &[1],
             Self::TestUintAdd
@@ -1786,6 +1805,11 @@ impl Func {
             #[cfg(feature = "test_helper")]
             "test_nondet_counter" => Ok(Some(Self::Scalar(ScalarFunc::TestNondetCounter))),
             "string_reverse" | "reverse" => Ok(Some(Self::Scalar(ScalarFunc::StringReverse))),
+            "gcd" => Ok(Some(Self::Scalar(ScalarFunc::Gcd))),
+            "lcm" => Ok(Some(Self::Scalar(ScalarFunc::Lcm))),
+            "repeat" => Ok(Some(Self::Scalar(ScalarFunc::Repeat))),
+            "lpad" => Ok(Some(Self::Scalar(ScalarFunc::Lpad))),
+            "rpad" => Ok(Some(Self::Scalar(ScalarFunc::Rpad))),
             // Built-in type support functions
             "boolean_to_int" => Ok(Some(Self::Scalar(ScalarFunc::BooleanToInt))),
             "int_to_boolean" => Ok(Some(Self::Scalar(ScalarFunc::IntToBoolean))),
