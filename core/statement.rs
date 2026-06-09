@@ -504,6 +504,65 @@ impl Statement {
         Ok(())
     }
 
+    /// Non-blocking counterpart of [`Self::run_ignore_rows`]: drives the
+    /// statement to completion, ignoring rows, but instead of pumping IO
+    /// synchronously it yields the pending completion to the caller. Re-invoke
+    /// after the yielded completion finishes; the program resumes at the same
+    /// pc. Rows are discarded.
+    ///
+    /// Used by engine-internal callers that must stay non-blocking (MVCC
+    /// bootstrap/recovery) so they don't call `io.step()` on backends that have
+    /// no synchronous IO pump (e.g. WASM).
+    pub fn run_ignore_rows_nonblock(&mut self) -> Result<crate::IOResult<()>> {
+        loop {
+            match self.step()? {
+                vdbe::StepResult::Done => return Ok(crate::IOResult::Done(())),
+                vdbe::StepResult::Row => continue,
+                vdbe::StepResult::IO => {
+                    let io = self.take_io_completions().unwrap_or_else(|| {
+                        crate::types::IOCompletions::Single(crate::io::Completion::new_yield())
+                    });
+                    return Ok(crate::IOResult::IO(io));
+                }
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy),
+            }
+        }
+    }
+
+    /// Non-blocking counterpart of [`Self::run_with_row_callback`]: drives the
+    /// statement to completion, invoking `func` once per emitted row, but
+    /// yields the pending completion to the caller instead of pumping IO
+    /// synchronously.
+    ///
+    /// Re-entrancy: on an IO yield the program is paused mid-opcode (never
+    /// between emitting a row and this loop observing it), so on re-invocation
+    /// stepping resumes without replaying the last row — every row's `func`
+    /// runs exactly once. Because the runner restarts from the top on each
+    /// re-entry, `func` must append to caller-owned state that persists across
+    /// yields (e.g. a field in the driving state machine), not to a local.
+    pub fn run_with_row_callback_nonblock(
+        &mut self,
+        mut func: impl FnMut(&Row) -> Result<()>,
+    ) -> Result<crate::IOResult<()>> {
+        loop {
+            match self.step()? {
+                vdbe::StepResult::Done => return Ok(crate::IOResult::Done(())),
+                vdbe::StepResult::Row => {
+                    func(self.row().expect("row should be present"))?;
+                }
+                vdbe::StepResult::IO => {
+                    let io = self.take_io_completions().unwrap_or_else(|| {
+                        crate::types::IOCompletions::Single(crate::io::Completion::new_yield())
+                    });
+                    return Ok(crate::IOResult::IO(io));
+                }
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy),
+            }
+        }
+    }
+
     /// Blocks execution, advances IO, and stops at any StepResult except IO
     /// You can optionally pass a handler to run after IO is advanced
     pub fn run_one_step_blocking(
@@ -1135,6 +1194,51 @@ mod tests {
 
         stmt.reset_metrics();
         assert_eq!(stmt.metrics().rows_written, 0);
+    }
+
+    #[test]
+    fn test_run_with_row_callback_nonblock_collects_all_rows() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+            .unwrap();
+
+        let io = conn.db.io.clone();
+        let mut stmt = conn.prepare("SELECT x FROM t ORDER BY x").unwrap();
+
+        // Drive the non-blocking runner via the IOResult loop, exactly as a
+        // state-machine caller would: collect into an accumulator that persists
+        // across yields and wait on each yielded completion.
+        let mut collected: Vec<i64> = Vec::new();
+        loop {
+            let res = stmt
+                .run_with_row_callback_nonblock(|row| {
+                    collected.push(row.get::<i64>(0)?);
+                    Ok(())
+                })
+                .unwrap();
+            match res {
+                crate::IOResult::Done(()) => break,
+                crate::IOResult::IO(c) => c.wait(io.as_ref()).unwrap(),
+            }
+        }
+        assert_eq!(collected, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_run_ignore_rows_nonblock_completes() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+
+        let io = conn.db.io.clone();
+        let mut stmt = conn.prepare("INSERT INTO t VALUES (1), (2)").unwrap();
+        loop {
+            match stmt.run_ignore_rows_nonblock().unwrap() {
+                crate::IOResult::Done(()) => break,
+                crate::IOResult::IO(c) => c.wait(io.as_ref()).unwrap(),
+            }
+        }
+        assert_eq!(stmt.metrics().rows_written, 2);
     }
 
     #[test]

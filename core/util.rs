@@ -155,65 +155,111 @@ pub struct UnparsedFromSqlIndex {
     pub sql: String,
 }
 
+/// Carries the in-progress state of [`parse_schema_rows`] across IO yields:
+/// the schema-scan statement plus the accumulators that `handle_schema_row`
+/// fills row-by-row. Without this, a yield mid-scan would lose the partially
+/// accumulated indexes/materialized-view info and re-run the statement from
+/// scratch.
+#[derive(Default)]
+pub struct ParseSchemaRowsState {
+    inner: Option<ParseSchemaRowsInner>,
+}
+
+struct ParseSchemaRowsInner {
+    rows: Statement,
+    from_sql_indexes: Vec<UnparsedFromSqlIndex>,
+    automatic_indices: HashMap<String, Vec<(String, i64)>>,
+    dbsp_state_roots: HashMap<String, i64>,
+    dbsp_state_index_roots: HashMap<String, i64>,
+    materialized_view_info: HashMap<String, (String, i64)>,
+}
+
+impl ParseSchemaRowsState {
+    /// Initialize the scan state from a prepared `SELECT * FROM sqlite_schema`
+    /// statement (or equivalent) and the MVCC transaction it should read under.
+    pub fn new(mut rows: Statement, mv_tx: Option<(u64, TransactionMode)>) -> Self {
+        rows.set_mv_tx(mv_tx);
+        Self {
+            inner: Some(ParseSchemaRowsInner {
+                rows,
+                from_sql_indexes: Vec::with_capacity(10),
+                automatic_indices: HashMap::with_capacity_and_hasher(10, Default::default()),
+                dbsp_state_roots: HashMap::default(),
+                dbsp_state_index_roots: HashMap::default(),
+                materialized_view_info: HashMap::default(),
+            }),
+        }
+    }
+}
+
+/// Non-blocking schema-row parser: steps the schema-scan statement held in
+/// `state`, feeding each row to `handle_schema_row`, and yields IO instead of
+/// pumping it. Re-invoke after each yielded completion; accumulators persist in
+/// `state`. On completion, populates indices and materialized views.
 #[instrument(skip_all, level = Level::INFO)]
 pub fn parse_schema_rows(
-    mut rows: Statement,
+    state: &mut ParseSchemaRowsState,
     schema: &mut Schema,
     syms: &SymbolTable,
-    mv_tx: Option<(u64, TransactionMode)>,
     resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
-) -> Result<()> {
-    rows.set_mv_tx(mv_tx);
-    let mv_store = rows.mv_store().clone();
-    // TODO: if we IO, this unparsed indexes is lost. Will probably need some state between
-    // IO runs
-    let mut from_sql_indexes = Vec::with_capacity(10);
-    let mut automatic_indices = HashMap::with_capacity_and_hasher(10, Default::default());
+) -> Result<IOResult<()>> {
+    {
+        let inner = state
+            .inner
+            .as_mut()
+            .expect("ParseSchemaRowsState not initialized");
+        // Destructure so the statement (receiver) and the accumulators (captured
+        // by the closure) are borrowed as disjoint fields.
+        let ParseSchemaRowsInner {
+            rows,
+            from_sql_indexes,
+            automatic_indices,
+            dbsp_state_roots,
+            dbsp_state_index_roots,
+            materialized_view_info,
+        } = inner;
+        crate::return_if_io!(rows.run_with_row_callback_nonblock(|row| {
+            let ty = row.get::<&str>(0)?;
+            let name = row.get::<&str>(1)?;
+            let table_name = row.get::<&str>(2)?;
+            let root_page = row.get::<i64>(3)?;
+            let sql = row.get::<&str>(4).ok();
+            schema.handle_schema_row(
+                ty,
+                name,
+                table_name,
+                root_page,
+                sql,
+                syms,
+                from_sql_indexes,
+                automatic_indices,
+                dbsp_state_roots,
+                dbsp_state_index_roots,
+                materialized_view_info,
+                resolve_attached_db,
+            )
+        }));
+    }
 
-    // Store DBSP state table root pages: view_name -> dbsp_state_root_page
-    let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
-    // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
-    let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-    // Store materialized view info (SQL and root page) for later creation
-    let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
-
-    // TODO: How do we ensure that the I/O we submitted to
-    // read the schema is actually complete?
-    rows.run_with_row_callback(|row| {
-        let ty = row.get::<&str>(0)?;
-        let name = row.get::<&str>(1)?;
-        let table_name = row.get::<&str>(2)?;
-        let root_page = row.get::<i64>(3)?;
-        let sql = row.get::<&str>(4).ok();
-        schema.handle_schema_row(
-            ty,
-            name,
-            table_name,
-            root_page,
-            sql,
-            syms,
-            &mut from_sql_indexes,
-            &mut automatic_indices,
-            &mut dbsp_state_roots,
-            &mut dbsp_state_index_roots,
-            &mut materialized_view_info,
-            resolve_attached_db,
-        )
-    })?;
-
+    // Scan complete: finalize. Take ownership of the accumulators.
+    let inner = state
+        .inner
+        .take()
+        .expect("ParseSchemaRowsState not initialized");
+    let has_mv_store = inner.rows.mv_store().is_some();
     schema.populate_indices(
         syms,
-        from_sql_indexes,
-        automatic_indices,
-        mv_store.is_some(),
+        inner.from_sql_indexes,
+        inner.automatic_indices,
+        has_mv_store,
     )?;
     schema.populate_materialized_views(
-        materialized_view_info,
-        dbsp_state_roots,
-        dbsp_state_index_roots,
+        inner.materialized_view_info,
+        inner.dbsp_state_roots,
+        inner.dbsp_state_index_roots,
     )?;
 
-    Ok(())
+    Ok(IOResult::Done(()))
 }
 
 fn cmp_numeric_strings(num_str: &str, other: &str) -> bool {
