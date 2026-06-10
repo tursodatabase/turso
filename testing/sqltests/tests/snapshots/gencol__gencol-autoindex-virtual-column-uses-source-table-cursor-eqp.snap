@@ -1,0 +1,23 @@
+---
+source: gencol.sqltest
+expression: |-
+  SELECT DISTINCT lhs_items.marker, rhs_items.base
+      FROM lhs_items
+      INNER JOIN rhs_items ON lhs_items.marker = 'dynamic_hine'
+      WHERE rhs_items.v < 'gorgeovHrOTvcD'
+      ORDER BY 2;
+info:
+  statement_type: SELECT
+  tables:
+  - lhs_items
+  - lhs_items.marker
+  - rhs_items
+  setup_blocks:
+  - gencol_autoindex_virtual_column_setup
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN lhs_items
+|--SEARCH rhs_items USING INDEX ephemeral_rhs_items_t2 (v<?)
+|--USE HASH TABLE FOR DISTINCT
+`--USE SORTER FOR ORDER BY

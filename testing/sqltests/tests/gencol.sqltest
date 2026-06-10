@@ -4977,3 +4977,74 @@ test update-or-virtual-deferred-seek-no-panic-explicit-index {
 expect error {
     UNIQUE constraint failed
 }
+
+setup gencol_autoindex_virtual_column_setup {
+    CREATE TABLE rhs_items(base TEXT, v TEXT AS (base) VIRTUAL);
+    CREATE TABLE lhs_items(marker TEXT);
+    INSERT INTO rhs_items(base) VALUES ('gorgeous_sugar'), ('diplomatic_thwaite');
+    INSERT INTO lhs_items(marker) VALUES ('dynamic_hine');
+}
+
+@setup gencol_autoindex_virtual_column_setup
+test gencol-autoindex-virtual-column-uses-source-table-cursor {
+    SELECT DISTINCT lhs_items.marker, rhs_items.base
+    FROM lhs_items
+    INNER JOIN rhs_items ON lhs_items.marker = 'dynamic_hine'
+    WHERE rhs_items.v < 'gorgeovHrOTvcD'
+    ORDER BY 2;
+}
+expect {
+    dynamic_hine|diplomatic_thwaite
+    dynamic_hine|gorgeous_sugar
+}
+
+@setup gencol_autoindex_virtual_column_setup
+snapshot-eqp gencol-autoindex-virtual-column-uses-source-table-cursor-eqp {
+    SELECT DISTINCT lhs_items.marker, rhs_items.base
+    FROM lhs_items
+    INNER JOIN rhs_items ON lhs_items.marker = 'dynamic_hine'
+    WHERE rhs_items.v < 'gorgeovHrOTvcD'
+    ORDER BY 2;
+}
+
+@setup gencol_autoindex_virtual_column_setup
+test gencol-autoindex-base-column-control {
+    SELECT DISTINCT lhs_items.marker, rhs_items.base
+    FROM lhs_items
+    INNER JOIN rhs_items ON lhs_items.marker = 'dynamic_hine'
+    WHERE rhs_items.base < 'gorgeovHrOTvcD'
+    ORDER BY 2;
+}
+expect {
+    dynamic_hine|diplomatic_thwaite
+    dynamic_hine|gorgeous_sugar
+}
+
+setup gencol_autoindex_chained_virtual_column_setup {
+    CREATE TABLE rhs_items(base TEXT, v1 TEXT AS (base) VIRTUAL, v2 TEXT AS (v1 || '') VIRTUAL);
+    CREATE TABLE lhs_items(marker TEXT);
+    INSERT INTO rhs_items(base) VALUES ('gorgeous_sugar'), ('diplomatic_thwaite');
+    INSERT INTO lhs_items(marker) VALUES ('dynamic_hine');
+}
+
+@setup gencol_autoindex_chained_virtual_column_setup
+test gencol-autoindex-chained-virtual-column-uses-source-table-cursor {
+    SELECT DISTINCT lhs_items.marker, rhs_items.base
+    FROM lhs_items
+    INNER JOIN rhs_items ON lhs_items.marker = 'dynamic_hine'
+    WHERE rhs_items.v2 < 'gorgeovHrOTvcD'
+    ORDER BY 2;
+}
+expect {
+    dynamic_hine|diplomatic_thwaite
+    dynamic_hine|gorgeous_sugar
+}
+
+@setup gencol_autoindex_chained_virtual_column_setup
+snapshot-eqp gencol-autoindex-chained-virtual-column-uses-source-table-cursor-eqp {
+    SELECT DISTINCT lhs_items.marker, rhs_items.base
+    FROM lhs_items
+    INNER JOIN rhs_items ON lhs_items.marker = 'dynamic_hine'
+    WHERE rhs_items.v2 < 'gorgeovHrOTvcD'
+    ORDER BY 2;
+}
