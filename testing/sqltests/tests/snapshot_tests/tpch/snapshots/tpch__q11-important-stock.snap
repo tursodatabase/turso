@@ -91,9 +91,9 @@ addr  opcode                    p1  p2  p3  p4                  p5  comment
   40        Once                68   0   0                       0  goto 68
   41        BeginSubrtn         22   0   0                       0  r[22]=NULL
   42        Null                 0   1   0                       0  r[1]=NULL
-  43        Null                 0  24   0                       0  r[24]=NULL
-  44        Integer              1  25   0                       0  r[25]=1; LIMIT counter
-  45        IfNot               25  62   0                       0  if !r[25] goto 62
+  43        Null                 0  25   0                       0  r[25]=NULL
+  44        Integer              1  24   0                       0  r[24]=1; LIMIT counter
+  45        IfNot               24  62   0                       0  if !r[24] goto 62
   46        OpenRead             5   6   0  k(6,B,B,B,B,B)       0  table=partsupp, root=6, iDb=0
   47        OpenRead             6   5   0  k(7,B,B,B,B,B,B,B)   0  table=supplier, root=5, iDb=0
   48        OpenRead             7   2   0  k(4,B,B,B,B)         0  table=nation, root=2, iDb=0
@@ -108,10 +108,10 @@ addr  opcode                    p1  p2  p3  p4                  p5  comment
   57          Column             5   3  32                       0  r[32]=partsupp.PS_SUPPLYCOST
   58          Column             5   2  33                       0  r[33]=partsupp.PS_AVAILQTY
   59          Multiply          32  33  31                       0  r[31]=r[32]*r[33]
-  60          AggStep            0  31  24  sum                  0  accum=r[24] step(r[31])
+  60          AggStep            0  31  25  sum                  0  accum=r[25] step(r[31])
   61        Next                 5  50   0                       0
-  62        AggFinal             0  24   0  sum                  0  accum=r[24]
-  63        Copy                24  34   0                       0  r[34]=r[24]
+  62        AggFinal             0  25   0  sum                  0  accum=r[25]
+  63        Copy                25  34   0                       0  r[34]=r[25]
   64        Real                 0  35   0  0.0001               0  r[35]=0.0001
   65        Multiply            34  35  23                       0  r[23]=r[34]*r[35]
   66        Copy                23   1   0                       0  r[1]=r[23]

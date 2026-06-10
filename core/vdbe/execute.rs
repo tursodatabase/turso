@@ -841,6 +841,39 @@ pub fn op_if_pos(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_if_not_zero(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(IfNotZero { reg, target_pc }, insn);
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
+    let reg = *reg;
+    let target_pc = *target_pc;
+    match state.registers[reg].get_value() {
+        Value::Numeric(Numeric::Integer(n)) if *n > 0 => {
+            state.registers[reg].set_int(*n - 1);
+            state.pc = target_pc.as_offset_int();
+        }
+        Value::Numeric(Numeric::Integer(n)) if *n < 0 => {
+            state.pc = target_pc.as_offset_int();
+        }
+        Value::Numeric(Numeric::Integer(_)) => {
+            state.pc += 1;
+        }
+        _ => {
+            mark_unlikely();
+            return Err(LimboError::InternalError(
+                "IfNotZero: the value in the register is not an integer".into(),
+            ));
+        }
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_not_null(
     _program: &Program,
     state: &mut ProgramState,

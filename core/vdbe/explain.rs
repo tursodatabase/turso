@@ -245,6 +245,19 @@ pub fn insn_to_row(
                     target_pc.as_debug_int()
                 ),
             ),
+            Insn::IfNotZero { reg, target_pc } => (
+                "IfNotZero",
+                *reg as i64,
+                target_pc.as_debug_int() as i64,
+                0,
+                Value::build_text(""),
+                0,
+                format!(
+                    "if r[{}]!=0 (decr if >0) goto {}",
+                    reg,
+                    target_pc.as_debug_int()
+                ),
+            ),
             Insn::Eq {
                 lhs,
                 rhs,

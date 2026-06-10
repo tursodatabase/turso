@@ -45,9 +45,9 @@ addr  opcode             p1  p2  p3  p4      p5  comment
   14      BeginSubrtn    10   0   0           0  r[10]=NULL
   15      Null            0   1   0           0  r[1]=NULL
   16      OpenDup         2   0   0           0  new_cursor=2, original_cursor=0
-  17      Null            0  13   0           0  r[13]=NULL
-  18      Integer         1  14   0           0  r[14]=1; LIMIT counter
-  19      IfNot          14  30   0           0  if !r[14] goto 30
+  17      Null            0  14   0           0  r[14]=NULL
+  18      Integer         1  13   0           0  r[13]=1; LIMIT counter
+  19      IfNot          13  30   0           0  if !r[13] goto 30
   20      Last            2  30   0           0
   21        Column        2   0  11           0  r[11]=ephemeral().price
   22        Copy         11  16   0           0  r[16]=r[11]
@@ -55,11 +55,11 @@ addr  opcode             p1  p2  p3  p4      p5  comment
   24        Ge           16  17  29  Binary   0  if r[16]>=r[17] goto 29
   25        Copy         11  18   0           0  r[18]=r[11]
   26        CollSeq       0   0   0  Binary   0  collation=Binary
-  27        AggStep       0  18  13  max      0  accum=r[13] step(r[18])
+  27        AggStep       0  18  14  max      0  accum=r[14] step(r[18])
   28        Goto          0  30   0           0
   29      Prev            2  21   0           0
-  30      AggFinal        0  13   0  max      0  accum=r[13]
-  31      Copy           13  12   0           0  r[12]=r[13]
+  30      AggFinal        0  14   0  max      0  accum=r[14]
+  31      Copy           14  12   0           0  r[12]=r[14]
   32      Copy           12   1   0           0  r[1]=r[12]
   33    Return           10   0   1           0
   34    Copy              1   6   0           0  r[6]=r[1]
