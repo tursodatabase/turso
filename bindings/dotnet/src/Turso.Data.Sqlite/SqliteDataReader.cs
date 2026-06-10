@@ -292,12 +292,7 @@ public class SqliteDataReader : DbDataReader
     {
         EnsureOpen();
         var value = GetTypedValue(ordinal);
-        if (value.ValueType != TursoValueType.Blob)
-            return Guid.Parse(GetString(ordinal));
-
-        return value.BlobValue.Length == 16
-            ? new Guid(value.BlobValue)
-            : Guid.Parse(Encoding.UTF8.GetString(value.BlobValue));
+        return ToGuid(value);
     }
 
     public override short GetInt16(int ordinal)
@@ -485,6 +480,9 @@ public class SqliteDataReader : DbDataReader
         EnsureHasCurrentRow();
         var statement = GetStatement();
         var value = TursoBindings.GetValue(statement, ordinal);
+        if (IsGuidType(GetDeclaredTypeName(ordinal)) && value.ValueType is TursoValueType.Blob or TursoValueType.Text)
+            return ToGuid(value);
+
         return value.ValueType switch
         {
             TursoValueType.Null or TursoValueType.Empty => DBNull.Value,
@@ -903,6 +901,9 @@ public class SqliteDataReader : DbDataReader
 
     private static Type GetClrTypeFromSqliteType(string typeName, TursoValueType fallback)
     {
+        if (IsGuidType(typeName))
+            return typeof(Guid);
+
         var normalized = typeName.ToUpperInvariant();
         if (normalized.Length == 0)
             return GetClrTypeFromValueType(fallback);
@@ -926,6 +927,13 @@ public class SqliteDataReader : DbDataReader
             TursoValueType.Text => typeof(string),
             _ => typeof(byte[])
         };
+
+    private static bool IsGuidType(string typeName)
+    {
+        var normalized = StripTypeLength(typeName).Trim();
+        return normalized.Equals("GUID", StringComparison.OrdinalIgnoreCase)
+               || normalized.Equals("UNIQUEIDENTIFIER", StringComparison.OrdinalIgnoreCase);
+    }
 
     private sealed record SchemaColumnInfo(string Name, string TypeName, bool AllowNull, bool IsKey, bool IsUnique);
 
@@ -992,6 +1000,13 @@ public class SqliteDataReader : DbDataReader
             _ => throw new ArgumentOutOfRangeException()
         };
     }
+
+    private static Guid ToGuid(TursoValue value)
+        => value.ValueType == TursoValueType.Blob
+            ? value.BlobValue.Length == 16
+                ? new Guid(value.BlobValue)
+                : Guid.Parse(Encoding.UTF8.GetString(value.BlobValue))
+            : Guid.Parse(value.StringValue);
 
     private void DrainRemainingStatements()
     {

@@ -154,22 +154,21 @@ public class SqliteCommand : DbCommand
     public override void Prepare()
     {
         EnsureExecutable("Prepare");
-        if (IsEmptyCommand(CommandText))
+        var statements = SplitStatements(CommandText);
+        if (statements.Count != 1)
         {
             _statement?.Dispose();
             _statement = null;
             return;
         }
 
-        var preparedStatements = new List<TursoStatementHandle>();
+        TursoStatementHandle? preparedStatement = null;
         try
         {
-            preparedStatements = PrepareStatements();
-
+            preparedStatement = PrepareSingleStatement(statements[0]);
             _statement?.Dispose();
-            _statement = preparedStatements.Count == 1 ? preparedStatements[0] : null;
-            if (_statement is not null)
-                preparedStatements.RemoveAt(0);
+            _statement = preparedStatement;
+            preparedStatement = null;
         }
         catch (TursoException ex)
         {
@@ -177,8 +176,7 @@ public class SqliteCommand : DbCommand
         }
         finally
         {
-            foreach (var preparedStatement in preparedStatements)
-                preparedStatement.Dispose();
+            preparedStatement?.Dispose();
         }
     }
 
@@ -282,27 +280,6 @@ public class SqliteCommand : DbCommand
     {
         _hasOpenReader = false;
         Connection?.ReaderClosed();
-    }
-
-    private List<TursoStatementHandle> PrepareStatements()
-    {
-        var connection = Connection!;
-        var statements = new List<TursoStatementHandle>();
-        try
-        {
-            foreach (var sql in SplitStatements(CommandText))
-            {
-                statements.Add(PrepareSingleStatement(sql));
-            }
-
-            return statements;
-        }
-        catch
-        {
-            foreach (var statement in statements)
-                statement.Dispose();
-            throw;
-        }
     }
 
     internal TursoStatementHandle PrepareSingleStatement(string sql)

@@ -435,7 +435,7 @@ included in the project.
 
 ## Making Releases
 
-Releases are made using the `scripts/update-version.py` script, which updates version numbers across all `Cargo.toml`, `package.json`, `package-lock.json`, and `gradle.properties` files in the workspace, creates a git commit, and adds a version tag.
+Releases are made using the `scripts/update-version.py` script, which updates version numbers across all `Cargo.toml`, `package.json`, `package-lock.json`, `gradle.properties`, and `Directory.Build.props` files in the workspace, creates a git commit, and adds a version tag.
 
 The process is:
 
@@ -475,4 +475,3 @@ Use the `scripts/pypi-cleanup` script to manage this:
 ```
 
 Always run the dry run first to review what will be deleted before executing.
-
