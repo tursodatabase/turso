@@ -4227,11 +4227,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// 5. Recover the logical log
     /// 6. Make sure schema changes reflected from deserialized logical log are captured in the schema
     ///
-    /// Blocking shim retained for [`Connection::attach_database_inner`] and the
-    /// `op_journal_mode_inner` VDBE opcode — both of which are synchronous
-    /// public/VDBE entry points. The open state machine drives
-    /// [`MvStore::bootstrap_nonblock`] directly so a WAL/log header write
-    /// during open does not block.
+    /// Blocking shim retained for synchronous callers. The open, attach, and
+    /// journal-mode state machines drive
+    /// [`MvStore::bootstrap_nonblock`] directly.
     pub fn bootstrap(&self, bootstrap_conn: Arc<Connection>) -> Result<()> {
         let mut st = BootstrapState::default();
         let io = bootstrap_conn.db.io.clone();

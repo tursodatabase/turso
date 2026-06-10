@@ -8088,9 +8088,11 @@ pub fn op_function(
                     ));
                 };
 
-                program
-                    .connection
-                    .attach_database(filename_str.as_str(), dbname_str.as_str())?;
+                return_if_io!(program.connection.attach_database(
+                    filename_str.as_str(),
+                    dbname_str.as_str(),
+                    state.active_op_state.attach(),
+                ));
                 // Sequence descriptors for the attached database are
                 // loaded lazily by `maybe_reparse_schema` on the next
                 // statement (ATTACH bumps the schema cookie, so the
@@ -8099,6 +8101,7 @@ pub fn op_function(
                 // would drive `pager.io.step()` synchronously and break
                 // the vdbe async contract.
 
+                state.active_op_state.clear();
                 state.registers[*dest].set_null();
             }
             ScalarFunc::Detach => {
@@ -9534,6 +9537,8 @@ pub fn op_function(
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
+
+pub type OpAttachState = crate::connection::AttachDatabaseState;
 
 pub fn op_sequence(
     _program: &Program,
