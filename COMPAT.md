@@ -159,6 +159,18 @@ error. `ROLLBACK` also clears that state. This prevents a half-finished statemen
 from being committed after control returned to the application at an async I/O
 point.
 
+In experimental MVCC mode there is an additional known gap: all statements on a
+connection share one MVCC transaction, so a write statement that finishes while
+a sibling statement is still active defers its commit until the last sibling
+finishes. SQLite instead commits at the writer's own completion and lets the
+remaining statements continue on a read-only transaction. Until Turso does the
+same, a write that reported success is not durable while sibling statements
+remain active, and it is silently rolled back if the transaction then ends
+abnormally — for example if the last sibling reader is reset or dropped
+mid-scan, or a later write statement on the same connection fails after
+changing rows. Finish or reset sibling statements promptly after writing to
+avoid this window.
+
 #### [PRAGMA](https://www.sqlite.org/pragma.html)
 
 
