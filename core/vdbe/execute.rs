@@ -3126,6 +3126,25 @@ pub fn halt(
             // Another root statement may own the implicit autocommit
             // transaction. This statement can finish, but must not commit or
             // roll back connection-level state it did not start.
+            //
+            // FIXME: when this statement is a writer in MVCC mode, deferring
+            // its commit to the last sibling statement means the writer's
+            // caller observes success before the changes are durable. If the
+            // shared transaction then ends in a rollback — the last sibling
+            // reader is reset or dropped mid-scan, or a later joining writer
+            // errors or is abandoned after changing rows — the finished
+            // writer's changes are silently discarded
+            // (see test_mvcc_completed_writer_changes_lost_when_last_reader_abandoned).
+            // SQLite never has this window: it commits at the writer's own
+            // halt and downgrades the transaction to read-only for the
+            // remaining statements (btreeEndTransaction). The MVCC equivalent
+            // is to commit here, allocating a successor read-only
+            // transaction's begin timestamp inside the same
+            // `get_commit_timestamp` critical section as this commit's end
+            // timestamp, swapping `mv_tx` to that successor so remaining
+            // readers keep an identical snapshot. That also attributes commit
+            // errors (e.g. WriteWriteConflict) to the writer's own step
+            // instead of whichever sibling happens to finish last.
             if let Some(cdc_info) = state.pending_cdc_info.take() {
                 program.connection.set_capture_data_changes_info(cdc_info);
             }

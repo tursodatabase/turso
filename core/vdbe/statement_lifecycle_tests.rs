@@ -1073,3 +1073,80 @@ fn test_insert_is_busy_while_delete_returning_writer_is_active() {
     drop(delete);
     assert_eq!(env.observer_ids(), Vec::<i64>::new());
 }
+
+// The two tests below pin known data-loss gaps in the MVCC deferred-commit
+// model; they document current behavior, not desired behavior. A writer that
+// finishes while a sibling statement holds the shared implicit MVCC
+// transaction open defers its commit to the last sibling, so any path that
+// ends that transaction in a rollback silently discards changes whose caller
+// already observed success. The durable fix is committing at the writer's own
+// halt; see the FIXME in `halt` (core/vdbe/execute.rs).
+
+#[test]
+fn test_mvcc_completed_writer_changes_lost_when_last_reader_abandoned() {
+    let env = SameConnectionMvcc::new(":memory:completed-writer-lost-reader-abandoned");
+    env.setup_rows_table();
+    env.conn
+        .execute("INSERT INTO rows VALUES (10, 'existing')")
+        .unwrap();
+    env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mut reader = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
+    assert_eq!(step_returning_id(&mut reader), 10);
+
+    let mut returning = prepare_insert_returning(&env.conn, 1, "one");
+    assert_eq!(step_returning_id(&mut returning), 1);
+    finish_without_rows(&mut returning);
+    drop(returning);
+
+    // The reader is abandoned mid-scan instead of finishing, so the shared
+    // transaction ends through the rollback path and the completed writer's
+    // row is lost. Compare test_completed_writer_waits_for_sibling_mvcc_reader_to_commit,
+    // where the reader finishes normally and the writer's row commits.
+    drop(reader);
+
+    assert_eq!(
+        env.observer_ids(),
+        vec![10],
+        "pins the deferred-commit gap: an abandoned last reader discards the completed writer's row"
+    );
+}
+
+#[test]
+fn test_mvcc_completed_writer_changes_lost_when_joining_writer_errors() {
+    let env = SameConnectionMvcc::new(":memory:completed-writer-lost-joining-writer-error");
+    env.setup_rows_table();
+    env.conn
+        .execute("CREATE TABLE src(id INTEGER, v TEXT)")
+        .unwrap();
+    env.conn
+        .execute("INSERT INTO src VALUES (2, 'two'), (1, 'duplicate')")
+        .unwrap();
+    env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mut reader = env.conn.prepare("SELECT id FROM src ORDER BY id").unwrap();
+    assert_eq!(step_returning_id(&mut reader), 1);
+
+    env.conn
+        .execute("INSERT INTO rows VALUES (1, 'one')")
+        .unwrap();
+
+    // The joining writer changes a row (id 2) before hitting the duplicate,
+    // and has no local rollback boundary, so the whole shared transaction is
+    // rolled back — including the earlier INSERT that already reported success.
+    let err = env
+        .conn
+        .execute("INSERT INTO rows SELECT id, v FROM src")
+        .expect_err("second insert should hit duplicate primary key");
+    assert!(
+        matches!(err, LimboError::Constraint(_)),
+        "expected duplicate-key constraint error, got {err:?}"
+    );
+
+    drop(reader);
+    assert_eq!(
+        env.observer_ids(),
+        Vec::<i64>::new(),
+        "pins the deferred-commit gap: a failing joined writer discards the completed writer's row"
+    );
+}
