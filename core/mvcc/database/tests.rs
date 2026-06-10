@@ -616,6 +616,7 @@ fn advance_checkpoint_until_wal_has_commit_frame(
         conn.clone(),
         true,
         conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
     );
 
     for _ in 0..10_000 {
@@ -1625,6 +1626,7 @@ fn test_checkpoint_truncates_wal_last() {
         conn.clone(),
         true,
         conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
     );
 
     let mut saw_truncate_log_state_with_wal = false;
@@ -2355,6 +2357,7 @@ fn test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit() {
             conn.clone(),
             true,
             conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
         );
 
         for _ in 0..50_000 {
@@ -2727,6 +2730,7 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
         conn.clone(),
         true,
         conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
     );
     let mut reached_truncate = false;
     for _ in 0..50_000 {
@@ -2756,7 +2760,8 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
     );
 
     let sync_mode = conn.get_sync_mode();
-    let checkpoint_sm2 = CheckpointStateMachine::new(pager, mvcc_store, conn, true, sync_mode);
+    let checkpoint_sm2 =
+        CheckpointStateMachine::new(pager, mvcc_store, conn, true, sync_mode, crate::MAIN_DB_ID);
     let (old_boundary, _) = checkpoint_sm2.checkpoint_bounds_for_test();
     assert!(
         old_boundary.unwrap_or_default() >= ts1,
@@ -2824,6 +2829,7 @@ fn test_checkpoint_resamples_boundary_before_starting() {
         delayed_conn.clone(),
         true,
         delayed_conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
     );
     let (old_boundary, _) = delayed_checkpoint.checkpoint_bounds_for_test();
     assert_eq!(old_boundary, Some(first_boundary));
@@ -2836,6 +2842,7 @@ fn test_checkpoint_resamples_boundary_before_starting() {
         interrupted_conn.clone(),
         true,
         interrupted_conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
     );
     let mut reached_wal_checkpoint = false;
     for _ in 0..50_000 {
