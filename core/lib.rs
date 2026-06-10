@@ -2032,6 +2032,8 @@ impl Database {
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
+            // u64::MAX != any real generation, so the first prepare re-checks.
+            analyze_stats_attempt_generation: AtomicU64::new(u64::MAX),
             sequence_currvals: RwLock::new(HashMap::default()),
         });
         self.n_connections

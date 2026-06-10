@@ -103,6 +103,70 @@ pub fn gather_sqlite_stat1(
     Ok(stats)
 }
 
+pub fn maybe_lazy_load_analyze_stats(conn: &Arc<Connection>) {
+    use crate::sync::atomic::Ordering;
+
+    let generation = conn.prepare_context_generation();
+    if conn
+        .analyze_stats_attempt_generation
+        .load(Ordering::Acquire)
+        == generation
+    {
+        return;
+    }
+    // Transient states: skip without marking so a later prepare retries.
+    if !conn.is_db_initialized()
+        || conn.is_nested_stmt()
+        || conn.schema_reparse_in_progress()
+        || conn.is_mvcc_bootstrap_connection()
+        || !matches!(conn.get_tx_state(), TransactionState::None)
+        || conn.get_mv_tx().is_some()
+    {
+        return;
+    }
+    let schema = conn.schema.read().clone();
+    if !schema.analyze_stats.needs_refresh() || schema.get_btree_table(STATS_TABLE).is_none() {
+        // Nothing to load for this schema; don't re-check until it changes.
+        conn.analyze_stats_attempt_generation
+            .store(generation, Ordering::Release);
+        return;
+    }
+    // Mark before running the internal query so this prepare's nested
+    // statement cannot re-enter, and errors don't retry on every prepare.
+    conn.analyze_stats_attempt_generation
+        .store(generation, Ordering::Release);
+    let Ok(stats) = gather_sqlite_stat1(conn, &schema, None) else {
+        return;
+    };
+    if stats.tables.is_empty() {
+        return;
+    }
+    let mut with_stats = (*schema).clone();
+    with_stats.analyze_stats = stats;
+    let with_stats = Arc::new(with_stats);
+    // Publish into the shared schema so other connections adopt the stats
+    // instead of clobbering them; skip if the shared schema moved on.
+    let mut installed = false;
+    {
+        let mut shared = conn.db.schema.lock();
+        if Arc::ptr_eq(&shared, &schema) {
+            *shared = with_stats.clone();
+            installed = true;
+        }
+    }
+    {
+        let mut local = conn.schema.write();
+        if Arc::ptr_eq(&local, &schema) {
+            *local = with_stats;
+            installed = true;
+        }
+    }
+    if installed {
+        // Cached statements were planned without stats; force reprepare.
+        conn.bump_prepare_context_generation();
+    }
+}
+
 /// Best-effort refresh analyze_stats on the connection's schema.
 pub fn refresh_analyze_stats(conn: &Arc<Connection>) {
     if !conn.is_db_initialized() || conn.is_nested_stmt() {
