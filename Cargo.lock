@@ -6591,6 +6591,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso-load"
+version = "0.7.0-pre.6"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "indicatif",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "turso",
+]
+
+[[package]]
 name = "turso_cli"
 version = "0.7.0-pre.6"
 dependencies = [

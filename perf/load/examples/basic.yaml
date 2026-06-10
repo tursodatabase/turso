@@ -1,0 +1,36 @@
+name: basic
+description: Small read/update workload for smoke testing turso-load.
+
+schema:
+  tables:
+    - name: users
+      columns:
+        - { name: id, type: integer, primary_key: true }
+        - { name: name, type: text, nullable: false }
+        - { name: age, type: integer, nullable: false, default: 0 }
+
+data:
+  - table: users
+    rows: 100
+    columns:
+      id: { sequence: { start: 1 } }
+      name: { pattern: "user-{seq:04}" }
+      age: { int: { min: 18, max: 90 } }
+
+operations:
+  - name: lookup_user
+    weight: 8
+    requires: { pool: users.id }
+    bind:
+      id: { ref: users.id }
+    expect:
+      rows: 1
+    sql: "SELECT name, age FROM users WHERE id = :id"
+
+  - name: update_age
+    weight: 2
+    requires: { pool: users.id }
+    bind:
+      id: { ref: users.id }
+      age: { int: { min: 18, max: 90 } }
+    sql: "UPDATE users SET age = :age WHERE id = :id"
