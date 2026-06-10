@@ -6696,9 +6696,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Apply GC rules to a single version chain. Returns number of versions removed.
     ///
     /// Rule 1: Aborted garbage (begin=None, end=None) — always remove.
-    /// Rule 2: Superseded (end=Timestamp(e), e <= lwm) — remove unless it's a
-    ///         tombstone (no committed current version) whose deletion hasn't
-    ///         been checkpointed (e > ckpt_max).
+    /// Rule 2: Superseded (end=Timestamp(e)) — remove once no reader can see it
+    ///         (e <= lwm) AND its supersession is durable (e <= ckpt_max).
     /// Rule 3: Current checkpointed sole-survivor (end=None, b <= ckpt_max,
     ///         b < lwm, no other versions remain) — remove.
     ///
@@ -6708,24 +6707,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // Rule 1: aborted garbage
         versions.retain(|rv| !matches!((&rv.begin(), &rv.end()), (None, None)));
 
-        // Rule 2: superseded versions below LWM, with tombstone guard.
-        // A superseded version with e <= lwm is invisible to all readers and
-        // removable — UNLESS it's a tombstone (sole version, no committed
-        // current version) whose deletion hasn't been checkpointed to B-tree
-        // yet. In that case removing it would let the dual cursor fall through
-        // to a stale B-tree row.
+        // Rule 2: superseded versions are removable only when BOTH consumers of
+        // the chain are done with them:
+        //   - readers:    e <= lwm — no present or future snapshot can land
+        //     inside the version's [begin, end) interval;
+        //   - checkpoint: e <= ckpt_max — the durable boundary has passed the
+        //     supersession, so the B-tree no longer reflects this version.
         //
-        // has_current only counts committed current versions (begin=Timestamp).
-        // Pending inserts (begin=TxID) don't count — they might roll back,
-        // which would resurrect the B-tree row if the tombstone was removed.
-        let has_current = versions.iter().any(|rv| {
-            rv.end().is_none() && matches!(&rv.begin(), Some(TxTimestampOrID::Timestamp(_)))
-        });
+        // The second condition must hold even when a newer current version
+        // exists in the chain. The off-lock checkpoint can durably write a
+        // version and publish boundary < e while a concurrent UPDATE/DELETE has
+        // already superseded it in memory; until a later checkpoint catches up
+        // past e, this version's `begin <= boundary` is the chain's only proof
+        // (for exists_in_db_file) that the B-tree physically contains the row.
+        // Dropping it strands the B-tree copy forever: a later committed DELETE
+        // classifies as "row never durably existed" and is silently skipped,
+        // desyncing the table from its indexes (an UPDATE keeps the table rowid
+        // in the same chain but moves the index entry to a new key chain, so
+        // only the table side loses its anchor).
         versions.retain(|rv| match &rv.end() {
-            Some(TxTimestampOrID::Timestamp(e)) if *e <= lwm => {
-                // Retain only if this is a tombstone AND not yet checkpointed.
-                !has_current && *e > ckpt_max
-            }
+            Some(TxTimestampOrID::Timestamp(e)) if *e <= lwm => *e > ckpt_max,
             _ => true,
         });
 
