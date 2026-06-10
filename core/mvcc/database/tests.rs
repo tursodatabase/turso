@@ -74,6 +74,16 @@ impl YieldInjector for FixedYieldInjector {
     }
 }
 
+fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) {
+    let mut state = crate::connection::AttachDatabaseState::default();
+    loop {
+        match conn.attach_database(path, alias, &mut state).unwrap() {
+            crate::IOResult::Done(()) => return,
+            crate::IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
+        }
+    }
+}
+
 struct CommitWriterOnExclusiveAcquireInjector {
     point: YieldPoint,
     selection_key: u64,
@@ -13757,8 +13767,7 @@ fn dropped_main_commit_rolls_back_attached_mvcc_txs() {
     let aux_path = aux_dir.path().join("aux.db");
 
     let conn = db.connect();
-    conn.attach_database(aux_path.to_str().unwrap(), "aux")
-        .unwrap();
+    drive_attach(&conn, aux_path.to_str().unwrap(), "aux");
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
     conn.execute("CREATE TABLE aux.u (id INTEGER PRIMARY KEY, v TEXT)")
@@ -13864,8 +13873,7 @@ fn dropped_attached_commit_releases_attached_read_lock() {
     let aux_path = aux_dir.path().join("aux.db");
 
     let conn = db.connect();
-    conn.attach_database(aux_path.to_str().unwrap(), "aux")
-        .unwrap();
+    drive_attach(&conn, aux_path.to_str().unwrap(), "aux");
     conn.execute("CREATE TABLE aux.u (id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
 
@@ -13917,10 +13925,8 @@ fn dropped_attached_commit_rolls_back_remaining_attached_mvcc_txs() {
     let aux2_path = aux_dir.path().join("aux2.db");
 
     let conn = db.connect();
-    conn.attach_database(aux1_path.to_str().unwrap(), "aux1")
-        .unwrap();
-    conn.attach_database(aux2_path.to_str().unwrap(), "aux2")
-        .unwrap();
+    drive_attach(&conn, aux1_path.to_str().unwrap(), "aux1");
+    drive_attach(&conn, aux2_path.to_str().unwrap(), "aux2");
     conn.execute("CREATE TABLE aux1.u (id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
     conn.execute("CREATE TABLE aux2.v (id INTEGER PRIMARY KEY, v TEXT)")

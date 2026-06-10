@@ -407,7 +407,7 @@ pub enum OpenDbAsyncPhase {
 /// [`Database::init_pager`] to recover page size + reserved bytes without
 /// blocking on open.
 #[derive(Default)]
-enum DbHeaderReadState {
+pub(crate) enum DbHeaderReadState {
     #[default]
     Start,
     Reading {
@@ -421,7 +421,7 @@ enum DbHeaderReadState {
 /// reserved bytes from the DB header), begins a read transaction, then reads
 /// page 1 to determine the autovacuum mode — all without blocking.
 #[derive(Default)]
-enum InitState {
+pub(crate) enum InitState {
     #[default]
     Start,
     /// Driving `init_pager` (its only IO is the DB-header read).
@@ -1959,14 +1959,28 @@ impl Database {
             // before reading page 1. This is required for reopening encrypted databases.
             Arc::new(self._init(encryption_key.as_ref())?)
         };
-        let page_size = pager.get_page_size_unchecked();
-
         let default_cache_size = pager
             .io
             .block(|| pager.with_header(|header| header.default_page_cache_size))
             .unwrap_or_default()
             .get();
 
+        self._connect_with_pager_and_default_cache_size(
+            is_mvcc_bootstrap_connection,
+            pager,
+            encryption_key,
+            default_cache_size,
+        )
+    }
+
+    pub(crate) fn _connect_with_pager_and_default_cache_size(
+        self: &Arc<Database>,
+        is_mvcc_bootstrap_connection: bool,
+        pager: Arc<Pager>,
+        encryption_key: Option<EncryptionKey>,
+        default_cache_size: i32,
+    ) -> Result<Arc<Connection>> {
+        let page_size = pager.get_page_size_unchecked();
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
             db: self.clone(),
