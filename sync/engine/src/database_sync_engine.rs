@@ -684,10 +684,21 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let revert_conn = self.open_revert_db_conn(coro).await?;
 
         let mut page = [0u8; PAGE_SIZE];
-        let db_size = if revert_conn.try_wal_watermark_read_page(1, &mut page, None)? {
-            db_size_from_page(&page)
-        } else {
-            0
+        let db_size = match revert_conn.try_wal_watermark_read_page_begin(1, None)? {
+            Some((page_ref, c)) => {
+                while !c.finished() {
+                    let _ = coro.yield_(crate::types::SyncEngineIoResult::IO).await;
+                }
+                if let Some(err) = c.get_error() {
+                    return Err(turso_core::LimboError::CompletionError(err).into());
+                }
+                if revert_conn.try_wal_watermark_read_page_end(&mut page, page_ref)? {
+                    db_size_from_page(&page)
+                } else {
+                    0
+                }
+            }
+            None => 0,
         };
 
         tracing::info!(
