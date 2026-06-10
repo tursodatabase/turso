@@ -31,8 +31,8 @@ addr  opcode       p1  p2  p3  p4                                     p5  commen
    5    Lt          4   5  18  Binary                                  0  if r[4]<r[5] goto 18
    6    Column      0  10   7                                          0  r[7]=lineitem.L_SHIPDATE
    7    Ge          7   8  18  Binary                                  0  if r[7]>=r[8] goto 18
-   8    Column      0   6  11                                          0  r[11]=lineitem.L_DISCOUNT
-   9    Gt         10  11  18  Binary                                  0  if r[10]>r[11] goto 18
+   8    Column      0   6  10                                          0  r[10]=lineitem.L_DISCOUNT
+   9    Lt         10  11  18  Binary                                  0  if r[10]<r[11] goto 18
   10    Column      0   6  15                                          0  r[15]=lineitem.L_DISCOUNT
   11    Gt         15  16  18  Binary                                  0  if r[15]>r[16] goto 18
   12    Column      0   4  20                                          0  r[20]=lineitem.L_QUANTITY
@@ -51,7 +51,7 @@ addr  opcode       p1  p2  p3  p4                                     p5  commen
   25  String8       0   8   0  1995-01-01                              0  r[8]='1995-01-01'
   26  Real          0  12   0  0.08                                    0  r[12]=0.08
   27  Real          0  13   0  0.01                                    0  r[13]=0.01
-  28  Subtract     12  13  10                                          0  r[10]=r[12]-r[13]
+  28  Subtract     12  13  11                                          0  r[11]=r[12]-r[13]
   29  Real          0  17   0  0.08                                    0  r[17]=0.08
   30  Real          0  18   0  0.01                                    0  r[18]=0.01
   31  Add          17  18  16                                          0  r[16]=r[17]+r[18]
