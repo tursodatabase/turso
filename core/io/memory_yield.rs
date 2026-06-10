@@ -211,7 +211,7 @@ impl File for MemoryYieldFile {
 mod tests {
     use super::*;
     use crate::vdbe::StepResult;
-    use crate::{Database, OpenFlags};
+    use crate::{Database, IOResult, OpenFlags};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct StepGuardedIO {
@@ -265,6 +265,26 @@ mod tests {
                 "IO::step must only be called by the test driver"
             );
             self.inner.step()
+        }
+    }
+
+    fn drive_guarded_io<T>(
+        io: &StepGuardedIO,
+        mut action: impl FnMut() -> Result<IOResult<T>>,
+    ) -> (T, usize) {
+        let mut io_yields = 0usize;
+        loop {
+            io.set_step_allowed(false);
+            let step = action();
+            io.set_step_allowed(true);
+
+            match step.unwrap() {
+                IOResult::Done(result) => return (result, io_yields),
+                IOResult::IO(io_result) => {
+                    io_yields += 1;
+                    io_result.wait(io).unwrap();
+                }
+            }
         }
     }
 
@@ -462,5 +482,67 @@ mod tests {
         assert!(conn
             .mv_store_for_db(conn.get_database_id_by_name("aux").unwrap())
             .is_some());
+    }
+
+    #[test]
+    fn pager_allocate_and_free_yield_for_header_reads_without_internal_step() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io = Arc::new(StepGuardedIO::new());
+        let db = Database::open_file(io.clone(), "pager_header_yield.db").unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+
+        let pager = conn.get_pager();
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        pager.clear_page_cache(false);
+        let (_page, allocate_yields) = drive_guarded_io(io.as_ref(), || pager.allocate_page());
+        assert!(
+            allocate_yields > 0,
+            "allocate_page should yield when reading page 1 from storage"
+        );
+        conn.execute("ROLLBACK").unwrap();
+
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        pager.clear_page_cache(false);
+        let ((), free_yields) = drive_guarded_io(io.as_ref(), || pager.free_page(None, 2));
+        assert!(
+            free_yields > 0,
+            "free_page should yield when reading page 1 from storage"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn overflow_delete_yields_for_header_validation_without_internal_step() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io = Arc::new(StepGuardedIO::new());
+        let db = Database::open_file(io.clone(), "overflow_delete_yield.db").unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x BLOB)").unwrap();
+        conn.execute("INSERT INTO t VALUES (zeroblob(20000))")
+            .unwrap();
+
+        conn.get_pager().clear_page_cache(false);
+        let mut stmt = conn.prepare("DELETE FROM t").unwrap();
+        let mut io_yields = 0usize;
+        loop {
+            io.set_step_allowed(false);
+            let step = stmt.step();
+            io.set_step_allowed(true);
+
+            match step.unwrap() {
+                StepResult::IO => {
+                    io_yields += 1;
+                    io.step().unwrap();
+                }
+                StepResult::Done => break,
+                other => panic!("unexpected step result: {other:?}"),
+            }
+        }
+
+        assert!(
+            io_yields > 0,
+            "overflow DELETE should yield while clearing overflow pages"
+        );
     }
 }

@@ -4876,7 +4876,7 @@ impl Pager {
         // Number of reserved slots in trunk header (next pointer + leaf count)
         const RESERVED_SLOTS: usize = 2;
 
-        let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
+        let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
 
         let mut state = self.free_page_state.write();
@@ -5105,7 +5105,7 @@ impl Pager {
         // Ensure cache has room before allocating (we may spill dirty pages first)
         return_if_io!(self.ensure_cache_space());
 
-        let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
+        let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
 
         loop {
