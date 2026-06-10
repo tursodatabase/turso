@@ -5,7 +5,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
     fmt::Write,
-    str::{from_utf8, from_utf8_unchecked},
+    str::from_utf8,
 };
 
 use super::path::{JsonPath, PathElement};
@@ -1585,7 +1585,7 @@ impl Jsonb {
                 return Err(PError::Message {
                     msg: "Unexpected character".to_string(),
                     location: Some(pos),
-                })
+                });
             }
         }
 
@@ -2639,9 +2639,10 @@ impl Jsonb {
                         }
 
                         let key_start = pos + key_header_len;
-                        let json_key = unsafe {
-                            from_utf8_unchecked(&self.data[key_start..key_start + key_len])
-                        };
+                        let key_bytes = &self.data[key_start..key_start + key_len];
+                        let json_key = from_utf8(key_bytes).map_err(|_| {
+                            LimboError::ParseError("Invalid UTF-8 in JSONB key".to_string())
+                        })?;
 
                         if compare((json_key, key_type), (path_key, *is_raw)) {
                             if mode.allows_replace() {
@@ -2799,12 +2800,11 @@ impl Jsonb {
                         bail_parse_error!("Key should be string")
                     }
 
-                    let obj_key = unsafe {
-                        from_utf8_unchecked(
-                            &self.data[current_pos + key_header_size
-                                ..current_pos + key_header_size + key_size],
-                        )
-                    };
+                    let key_bytes = &self.data
+                        [current_pos + key_header_size..current_pos + key_header_size + key_size];
+                    let obj_key = from_utf8(key_bytes).map_err(|_| {
+                        LimboError::ParseError("Invalid UTF-8 in JSONB key".to_string())
+                    })?;
 
                     if compare((obj_key, key_type), (path_key, *is_raw)) {
                         break;
@@ -3018,9 +3018,10 @@ impl Jsonb {
                 }
 
                 let key_start = patch_key_cursor + key_header_size;
-                let key_text = unsafe {
-                    from_utf8_unchecked(&patch.data[key_start..key_start + key_header.1])
-                };
+                let key_bytes = &patch.data[key_start..key_start + key_header.1];
+                let key_text = from_utf8(key_bytes).map_err(|_| {
+                    LimboError::ParseError("Invalid UTF-8 in JSONB key".to_string())
+                })?;
 
                 // Read the value
                 let value_cursor = key_start + key_header.1;
@@ -4525,6 +4526,37 @@ mod path_operations_tests {
 
         let updated_json = jsonb.to_string().unwrap();
         assert_eq!(updated_json, r#"{"name":"John","age":31,"surname":"Doe"}"#);
+    }
+
+    #[test]
+    fn test_navigate_path_invalid_utf8_key() {
+        // Construct a JSONB object with invalid UTF-8 bytes in the key.
+        // Format: object_header | key_header | key_bytes | value_header | value_bytes
+        //
+        // Key: 3 bytes of invalid UTF-8 [0xFF, 0xFE, 0xFD]
+        // Value: "x" (1 byte)
+        // Object payload = 1 (key hdr) + 3 (key) + 1 (val hdr) + 1 (val) = 6
+        let data: Vec<u8> = vec![
+            0x6C, // OBJECT (12) | payload_size=6 << 4
+            0x37, // TEXT (7) | size=3 << 4
+            0xFF, 0xFE, 0xFD, // invalid UTF-8 key bytes
+            0x17, // TEXT (7) | size=1 << 4
+            b'x', // value bytes
+        ];
+        let mut jsonb = Jsonb { data };
+
+        let path = create_path(vec![
+            PathElement::Root(),
+            PathElement::Key(Cow::Borrowed("test"), false),
+        ]);
+
+        let result = jsonb.navigate_path(&path, PathOperationMode::ReplaceExisting);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid UTF-8"),
+            "Expected UTF-8 error, got: {err}",
+        );
     }
 
     #[test]
