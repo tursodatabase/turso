@@ -6,6 +6,9 @@ test round-basic {
 expect {
     123.0
 }
+expect @js {
+    123
+}
 
 test round-precision-2 {
     SELECT round(123.456, 2);
@@ -34,12 +37,18 @@ test round-int-input {
 expect {
     123.0
 }
+expect @js {
+    123
+}
 
 test round-no-precision {
     SELECT round(100.123);
 }
 expect {
     100.0
+}
+expect @js {
+    100
 }
 
 test round-null-precision {
@@ -89,6 +98,9 @@ test round-half-away-from-zero-0-5 {
 expect {
     1.0
 }
+expect @js {
+    1
+}
 
 test round-half-away-from-zero-2-5 {
     SELECT round(2.5, 0);
@@ -96,12 +108,18 @@ test round-half-away-from-zero-2-5 {
 expect {
     3.0
 }
+expect @js {
+    3
+}
 
 test round-half-away-from-zero-neg-2-5 {
     SELECT round(-2.5, 0);
 }
 expect {
     -3.0
+}
+expect @js {
+    -3
 }
 
 test round-half-away-from-zero-1-25 {
@@ -124,12 +142,18 @@ test round-carry-0-999 {
 expect {
     1.0
 }
+expect @js {
+    1
+}
 
 test round-carry-9-99 {
     SELECT round(9.99, 1);
 }
 expect {
     10.0
+}
+expect @js {
+    10
 }
 
 test round-half-away-from-zero-0-125 {
@@ -145,12 +169,18 @@ test round-float-repr-1-005 {
 expect {
     1.0
 }
+expect @js {
+    1
+}
 
 test round-half-away-from-zero-neg-0-5 {
     SELECT round(-0.5, 0);
 }
 expect {
     -1.0
+}
+expect @js {
+    -1
 }
 
 test round-text-precision-2 {
@@ -165,4 +195,7 @@ test round-text-precision-0 {
 }
 expect {
     1.0
+}
+expect @js {
+    1
 }
