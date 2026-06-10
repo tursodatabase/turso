@@ -109,7 +109,6 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use schema::Schema;
 #[cfg(host_shared_wal)]
 use std::path::Path;
-#[cfg(host_shared_wal)]
 use std::sync::OnceLock;
 use std::{
     fmt::{self},
