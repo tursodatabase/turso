@@ -6,11 +6,11 @@ use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
 use crate::mvcc::database::{CommitYieldPoint, ExclusiveTxYieldPoint};
+use crate::mvcc::persistent_storage::logical_log::{
+    LogicalLog, ENCRYPTED_PAYLOAD_CHUNK_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,
+};
 #[cfg(feature = "conn_raw_api")]
 use crate::mvcc::persistent_storage::logical_log::{ParsedOp, StreamingLogicalLogReader};
-use crate::mvcc::persistent_storage::logical_log::{
-    ENCRYPTED_PAYLOAD_CHUNK_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,
-};
 #[cfg(feature = "conn_raw_api")]
 use crate::mvcc::portable_logical::{PortableLogicalBuilder, PortableObjectMapEntry};
 use crate::mvcc::yield_hooks::YieldPointMarker;
@@ -1237,6 +1237,79 @@ fn test_recovery_rejects_schema_op_after_data_op_in_frame() {
     assert!(
         matches!(&result, Err(LimboError::Corrupt(msg)) if msg.contains("schema op after a data op")),
     );
+}
+
+/// What this test checks: Recovery replays a transaction frame in which data ops precede the
+/// sqlite_schema op that registers their table, and the recovered table is queryable afterwards.
+/// Why this matters: Logs written before the schema-first frame serialization fix (#7218) sorted
+/// the whole write set, so a same-transaction CREATE TABLE + INSERT could serialize the data row
+/// before the schema row. Recovery must stay tolerant to logs written by those older versions.
+#[test]
+fn test_recovery_replays_schema_op_after_data_op_in_frame() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+
+    let mvcc_store = db.get_mvcc_store();
+    let io = db.get_db().io.clone();
+    let file = mvcc_store.get_logical_log_file();
+
+    let c = file.truncate(0, Completion::new_trunc(|_| {})).unwrap();
+    io.wait_for_completion(c).unwrap();
+
+    // A CREATE TABLE t2 + INSERT INTO t2 transaction as serialized by a pre-#7218 writer:
+    // the data row comes before the sqlite_schema row that registers its table_id.
+    let table_id = MVTableId::from(-999);
+    let commit_ts = 1u64 << 40;
+    let data_version = RowVersion {
+        id: 1,
+        begin: Some(TxTimestampOrID::Timestamp(commit_ts)),
+        end: None,
+        row: generate_simple_string_row(table_id, 1, "data"),
+        btree_resident: false,
+    };
+    let schema_record = ImmutableRecord::from_values(
+        &[
+            Value::Text(Text::new("table".to_string())),
+            Value::Text(Text::new("t2".to_string())),
+            Value::Text(Text::new("t2".to_string())),
+            Value::from_i64(i64::from(table_id)),
+            Value::Text(Text::new("CREATE TABLE t2 (v TEXT)".to_string())),
+        ],
+        5,
+    )
+    .unwrap();
+    let schema_version = RowVersion {
+        id: 2,
+        begin: Some(TxTimestampOrID::Timestamp(commit_ts)),
+        end: None,
+        row: Row::new_table_row(
+            RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(2)),
+            schema_record.as_blob().to_vec(),
+            5,
+        ),
+        btree_resident: false,
+    };
+    let tx = LogRecord::for_test(commit_ts, &[data_version, schema_version], None);
+
+    let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+    let c = log.log_tx(tx).unwrap();
+    io.wait_for_completion(c).unwrap();
+    drop(log);
+    drop(file);
+    drop(mvcc_store);
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT v FROM t2");
+    assert_eq!(rows, vec![vec![Value::Text(Text::new("data".to_string()))]]);
 }
 
 /// What this test checks: Checkpoint transitions preserve DB/WAL/log ordering and watermark updates for the tested edge case.
