@@ -910,12 +910,6 @@ impl Schema {
         );
         #[cfg(feature = "conn_raw_api")]
         table_names_by_root_page.insert(1, SCHEMA_TABLE_NAME.to_string());
-        for function in VirtualTable::builtin_functions(enable_custom_types) {
-            tables.insert(
-                function.name.to_owned(),
-                Arc::new(Table::Virtual(Arc::new((*function).clone()))),
-            );
-        }
         let materialized_view_names = HashSet::default();
         let materialized_view_sql = HashMap::default();
         let incremental_views = HashMap::default();
@@ -927,7 +921,7 @@ impl Schema {
         if enable_custom_types {
             bootstrap_builtin_types(&mut type_registry)?;
         }
-        Ok(Self {
+        let mut schema = Self {
             tables,
             #[cfg(feature = "conn_raw_api")]
             table_names_by_root_page,
@@ -947,7 +941,30 @@ impl Schema {
             type_registry,
             generated_columns_enabled: false,
             sequences: HashMap::default(),
-        })
+        };
+        crate::dialect::sqlite::register_builtin_catalog(&mut schema, enable_custom_types)?;
+        Ok(schema)
+    }
+
+    /// Add an `InternalVirtualTable` to the schema's catalog. The wrapped
+    /// table appears under the name returned by its `name()` method and is
+    /// queryable like any other table. Returns the name actually inserted.
+    ///
+    /// Intended for callers that want to surface state as a queryable table
+    /// without going through `CREATE VIRTUAL TABLE` — for example, extensions
+    /// that contribute metadata tables or alternative-dialect catalogs.
+    pub fn register_internal_vtab<T>(&mut self, table: T) -> crate::Result<String>
+    where
+        T: crate::vtab::InternalVirtualTable + 'static,
+    {
+        let vtab = crate::vtab::VirtualTable::wrap_internal_table(table)?;
+        let name = vtab.name.clone();
+        let lookup_name = normalize_ident(&name);
+        self.tables.insert(
+            lookup_name,
+            Arc::new(Table::Virtual(Arc::new((*vtab).clone()))),
+        );
+        Ok(name)
     }
 
     /// Look up a custom type definition by name.

@@ -48,6 +48,7 @@ pub(crate) mod thread;
 
 mod assert;
 mod connection;
+mod dialect;
 mod error;
 mod ext;
 mod fast_lock;
@@ -182,6 +183,7 @@ pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     FromValueRow, PrepareContext, PreparedProgram, Program, Register,
 };
+pub use vtab::{InternalVirtualTable, InternalVirtualTableCursor};
 
 /// Database index for the main database (always 0 in SQLite).
 pub const MAIN_DB_ID: usize = 0;
@@ -2672,6 +2674,24 @@ impl Database {
         let mut schema_ref = self.schema.lock();
         let schema = Arc::make_mut(&mut *schema_ref);
         f(schema)
+    }
+
+    /// Register an `InternalVirtualTable` into this database's catalog. The
+    /// table is visible to connections opened after this call and is queryable
+    /// like any other table.
+    ///
+    /// Intended for callers that want to surface state as a queryable table
+    /// without going through `CREATE VIRTUAL TABLE` — for example, extensions
+    /// contributing metadata tables or alternative-dialect catalogs.
+    ///
+    /// Call before opening connections. Connections that already exist will
+    /// not pick up the new table unless they re-read the shared schema (e.g.
+    /// via the usual schema-change path).
+    pub fn register_internal_vtab<T>(&self, table: T) -> Result<String>
+    where
+        T: InternalVirtualTable + 'static,
+    {
+        self.with_schema_mut(|schema| schema.register_internal_vtab(table))
     }
     pub(crate) fn clone_schema(&self) -> Arc<Schema> {
         let schema = self.schema.lock();
