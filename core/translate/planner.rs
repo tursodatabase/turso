@@ -1553,9 +1553,9 @@ pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
             let (lower, upper, combine_op) = if *not {
                 (
                     Expr::Binary(
-                        Box::new(start_expr),
-                        ast::Operator::Greater,
                         Box::new(lhs_expr.clone()),
+                        ast::Operator::Less,
+                        Box::new(start_expr),
                     ),
                     Expr::Binary(
                         Box::new(lhs_expr),
@@ -1567,9 +1567,9 @@ pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
             } else {
                 (
                     Expr::Binary(
-                        Box::new(start_expr),
-                        ast::Operator::LessEquals,
                         Box::new(lhs_expr.clone()),
+                        ast::Operator::GreaterEquals,
+                        Box::new(start_expr),
                     ),
                     Expr::Binary(
                         Box::new(lhs_expr),
