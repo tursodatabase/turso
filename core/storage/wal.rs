@@ -598,7 +598,8 @@ trait WalCoordination: Debug + Send + Sync {
 pub trait Wal: Debug + Send + Sync {
     /// Begin a read transaction.
     /// Returns whether the database state has changed since the last read transaction.
-    fn begin_read_tx(&self) -> Result<bool>;
+    /// Yields on transient lock contention; callers must re-enter until `Done`.
+    fn begin_read_tx(&self) -> Result<IOResult<bool>>;
     /// MVCC helper: check if WAL state changed without starting a read tx.
     fn mvcc_refresh_if_db_changed(&self) -> bool;
 
@@ -2545,6 +2546,10 @@ pub struct WalFile {
     /// This is the index to the read_lock in WalFileShared that we are holding. This lock contains
     /// the max frame for this connection.
     max_frame_read_lock_index: AtomicUsize,
+    /// Number of consecutive `begin_read_tx` attempts that hit transient lock
+    /// contention. Persists across the yields `begin_read_tx` returns so that
+    /// sustained contention is bounded and surfaces as Busy.
+    begin_read_tx_attempts: AtomicU32,
     /// Max frame allowed to lookup range=(minframe..max_frame)
     max_frame: AtomicU64,
     /// Start of range to look for frames range=(minframe..max_frame)
@@ -3083,38 +3088,35 @@ impl WalFile {
 }
 
 impl Wal for WalFile {
-    fn begin_read_tx(&self) -> Result<bool> {
-        // Implement progressive backoff because transient lock contention
-        // should resolve quickly, but under heavy contention busy-spinning wastes
-        // CPU. SQLite uses quadratic backoff after 5 retries, with total delay
-        // up to ~10 seconds before giving up, so we just mirror SQLite's implementation
-        // here.
-        let mut cnt = 0u32;
+    fn begin_read_tx(&self) -> Result<IOResult<bool>> {
+        // Transient lock contention (SQLite's WAL_RETRY) usually resolves
+        // quickly, so retry a few times immediately. If contention persists,
+        // yield back to the caller instead of blocking: this runs on the
+        // non-blocking step() path, so backoff policy belongs to the upper
+        // layers. The attempt counter persists across yields so sustained
+        // contention eventually surfaces as Busy, mirroring SQLite's bounded
+        // retries.
         loop {
-            tracing::trace!("begin_read_tx: cnt={cnt}");
-            match self.try_begin_read_tx() {
-                TryBeginReadResult::Ok(changed) => return Ok(changed),
+            let result = self.try_begin_read_tx();
+            if !matches!(result, TryBeginReadResult::Retry) {
+                self.begin_read_tx_attempts.store(0, Ordering::Relaxed);
+            }
+            match result {
+                TryBeginReadResult::Ok(changed) => return Ok(IOResult::Done(changed)),
                 TryBeginReadResult::Err(err) => return Err(err),
                 TryBeginReadResult::Busy => return Err(LimboError::Busy),
                 TryBeginReadResult::Retry => {
-                    cnt += 1;
-                    if cnt > 100 {
+                    let attempts = self.begin_read_tx_attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::trace!("begin_read_tx: attempts={attempts}");
+                    if attempts > 100 {
+                        self.begin_read_tx_attempts.store(0, Ordering::Relaxed);
                         return Err(LimboError::Busy);
                     }
-                    // Progressive backoff: first 5 retries are immediate, then we
-                    // start yielding/sleeping with increasing delays.
-                    if cnt > 5 {
-                        if cnt < 10 {
-                            // Retries 6-9: yield to scheduler (minimal delay)
-                            self.io.yield_now();
-                        } else {
-                            // Retries 10+: quadratic backoff in microseconds
-                            // Formula matches SQLite: (cnt-9)^2 * 39 microseconds
-                            let delay_us = ((cnt - 9) * (cnt - 9) * 39) as u64;
-                            self.io.sleep(std::time::Duration::from_micros(delay_us));
-                        }
+                    // The first few retries are immediate; after that, yield
+                    // back to the caller between attempts.
+                    if attempts > 5 {
+                        io_yield_one!(Completion::new_yield());
                     }
-                    continue;
                 }
             }
         }
@@ -4393,6 +4395,7 @@ impl WalFile {
             min_frame: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
             max_frame_read_lock_index: AtomicUsize::new(NO_LOCK_HELD),
+            begin_read_tx_attempts: AtomicU32::new(0),
             last_checksum: RwLock::new(last_checksum),
             checkpoint_guard: RwLock::new(None),
             io_ctx: RwLock::new(IOContext::default()),
@@ -7169,7 +7172,7 @@ pub mod test {
             buffer_pool,
         );
 
-        wal.begin_read_tx().unwrap();
+        while let IOResult::IO(_) = wal.begin_read_tx().unwrap() {}
         reopened_authority.mark_frame_index_overflowed_for_tests();
 
         assert!(
@@ -7182,8 +7185,14 @@ pub mod test {
         );
 
         wal.end_read_tx();
+        let result = loop {
+            match wal.begin_read_tx() {
+                Ok(IOResult::IO(_)) => continue,
+                other => break other,
+            }
+        };
         assert!(
-            matches!(wal.begin_read_tx(), Err(LimboError::Busy)),
+            matches!(result, Err(LimboError::Busy)),
             "new readers must also refuse an uncovered overflowed frame index without blocking"
         );
     }
@@ -8747,7 +8756,7 @@ pub mod test {
         let readmark = {
             let pager = conn2.pager.load();
             let wal2 = pager.wal.as_ref().unwrap();
-            wal2.begin_read_tx().unwrap();
+            while let IOResult::IO(_) = wal2.begin_read_tx().unwrap() {}
             wal2.get_max_frame()
         };
 
@@ -8816,14 +8825,11 @@ pub mod test {
         let conn2 = db.connect().unwrap();
 
         // Start a read transaction
-        conn2
-            .pager
-            .load()
-            .wal
-            .as_ref()
-            .unwrap()
-            .begin_read_tx()
-            .unwrap();
+        {
+            let pager = conn2.pager.load();
+            let wal = pager.wal.as_ref().unwrap();
+            while let IOResult::IO(_) = wal.begin_read_tx().unwrap() {}
+        }
 
         // checkpoint should succeed here because the wal is fully checkpointed (empty)
         // so the reader is using readmark0 to read directly from the db file.
@@ -8854,7 +8860,7 @@ pub mod test {
                 .unwrap();
         }
         // now that we have some frames to checkpoint, try again
-        conn2.pager.load().begin_read_tx().unwrap();
+        while let IOResult::IO(_) = conn2.pager.load().begin_read_tx().unwrap() {}
         let p = conn1.pager.load();
         let w = p.wal.as_ref().unwrap();
         loop {
@@ -8931,7 +8937,7 @@ pub mod test {
         let r1_max_frame = {
             let pager = conn_r1.pager.load();
             let wal = pager.wal.as_ref().unwrap();
-            wal.begin_read_tx().unwrap();
+            while let IOResult::IO(_) = wal.begin_read_tx().unwrap() {}
             wal.get_max_frame()
         };
         bulk_inserts(&conn_writer, 5, 10);
@@ -8940,7 +8946,7 @@ pub mod test {
         let r2_max_frame = {
             let pager = conn_r2.pager.load();
             let wal = pager.wal.as_ref().unwrap();
-            wal.begin_read_tx().unwrap();
+            while let IOResult::IO(_) = wal.begin_read_tx().unwrap() {}
             wal.get_max_frame()
         };
 
@@ -9019,7 +9025,7 @@ pub mod test {
         {
             let pager = conn2.pager.load();
             let wal = pager.wal.as_ref().unwrap();
-            let _ = wal.begin_read_tx().unwrap();
+            while let IOResult::IO(_) = wal.begin_read_tx().unwrap() {}
             wal.begin_write_tx(WalAutoActions::all_enabled()).unwrap();
         }
 
@@ -9316,7 +9322,7 @@ pub mod test {
         {
             let pager = conn2.pager.load();
             let wal = pager.wal.as_ref().unwrap();
-            wal.begin_read_tx().unwrap();
+            while let IOResult::IO(_) = wal.begin_read_tx().unwrap() {}
         }
         // Make changes using conn1
         bulk_inserts(&conn1, 5, 5);
@@ -9334,7 +9340,7 @@ pub mod test {
             let pager = conn2.pager.load();
             let wal = pager.wal.as_ref().unwrap();
             wal.end_read_tx();
-            wal.begin_read_tx().unwrap();
+            while let IOResult::IO(_) = wal.begin_read_tx().unwrap() {}
         }
         // Now write transaction should work
         let result = {
@@ -9370,7 +9376,7 @@ pub mod test {
         {
             let pager = conn2.pager.load();
             let wal = pager.wal.as_ref().unwrap();
-            wal.begin_read_tx().unwrap();
+            while let IOResult::IO(_) = wal.begin_read_tx().unwrap() {}
         }
         // should use slot 0, as everything is backfilled
         assert!(check_read_lock_slot(&conn2, 0));
@@ -9464,7 +9470,7 @@ pub mod test {
         {
             let pager = reader.pager.load();
             let wal = pager.wal.as_ref().unwrap();
-            wal.begin_read_tx().unwrap();
+            while let IOResult::IO(_) = wal.begin_read_tx().unwrap() {}
         }
         let r_snapshot = {
             let pager = reader.pager.load();

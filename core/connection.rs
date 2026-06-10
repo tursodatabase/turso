@@ -9,6 +9,7 @@ use crate::sync::{
     },
     Arc, RwLock,
 };
+use crate::types::IOResult;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -1057,7 +1058,12 @@ impl Connection {
             })?
         } else {
             // first, quickly read schema_version from the root page in order to check if schema changed
-            pager.begin_read_tx()?;
+            //
+            // This is a synchronous entry point that cannot yield, so persistent
+            // lock contention surfaces as Busy and the caller decides how to back off.
+            if let IOResult::IO(_) = pager.begin_read_tx()? {
+                return Err(LimboError::Busy);
+            }
             let on_disk_schema_version = pager
                 .io
                 .block(|| pager.with_header(|header| header.schema_cookie));
@@ -1094,7 +1100,9 @@ impl Connection {
         //
         // from now on we must be very careful with errors propagation
         // in order to not accidentally keep read transaction opened
-        pager.begin_read_tx()?;
+        if let IOResult::IO(_) = pager.begin_read_tx()? {
+            return Err(LimboError::Busy);
+        }
         self.set_tx_state(TransactionState::Read);
 
         let reparse_result = self.reparse_schema();
@@ -1934,7 +1942,11 @@ impl Connection {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_begin(&self) -> Result<()> {
         let pager = self.pager.load();
-        pager.begin_read_tx()?;
+        // Synchronous raw-WAL entry point: persistent lock contention surfaces
+        // as Busy and the caller decides how to back off.
+        if let IOResult::IO(_) = pager.begin_read_tx()? {
+            return Err(LimboError::Busy);
+        }
         // Sync-engine drives WAL maintenance explicitly: any auto-restart of
         // the WAL header here would invalidate the watermarks the caller has
         // already published (see `wal_changed_pages_after`), so opt out of

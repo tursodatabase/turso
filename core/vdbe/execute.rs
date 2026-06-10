@@ -3562,7 +3562,7 @@ pub fn op_transaction_inner(
                         // for them. We need it here to pin a consistent WAL snapshot
                         // for the attached pager's B-tree page reads.
                         if !pager.holds_read_lock() {
-                            pager.begin_read_tx()?;
+                            return_if_io!(pager.begin_read_tx());
                         }
                         pager.mvcc_refresh_if_db_changed();
 
@@ -3623,7 +3623,7 @@ pub fn op_transaction_inner(
                                 !conn.is_nested_stmt(),
                                 "nested stmt should not begin a new read transaction"
                             );
-                            pager.begin_read_tx()?;
+                            return_if_io!(pager.begin_read_tx());
                             if conn.get_auto_commit() {
                                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                             }
@@ -3739,7 +3739,7 @@ pub fn op_transaction_inner(
                                 OpTransactionState::CheckSchemaCookie;
                             continue;
                         }
-                        pager.begin_read_tx()?;
+                        return_if_io!(pager.begin_read_tx());
                         started_secondary_tx = true;
                         if matches!(tx_mode, TransactionMode::Write) {
                             // Transition to AttachedBeginWriteTx to handle begin_write_tx
@@ -3759,7 +3759,7 @@ pub fn op_transaction_inner(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new read transaction"
                         );
-                        pager.begin_read_tx()?;
+                        return_if_io!(pager.begin_read_tx());
                         // https://github.com/tursodatabase/turso/issues/7106 : If auto-commit is turned off,
                         // then we shouldn't be setting the auto_txn_cleanup, this will cause errors in case the client explicitly calls commit post a drop of the statement struct
                         if conn.get_auto_commit() {
@@ -4165,7 +4165,7 @@ pub fn op_savepoint(
                         );
                     } else {
                         if !pager.holds_read_lock() {
-                            pager.begin_read_tx()?;
+                            return_if_io!(pager.begin_read_tx());
                         }
                         if matches!(conn.get_tx_state(), TransactionState::None) {
                             conn.set_tx_state(TransactionState::Read);
@@ -13302,9 +13302,10 @@ pub fn op_open_ephemeral(
         }
         OpOpenEphemeralState::StartingTxn { pager, temp_file } => {
             tracing::trace!("StartingTxn");
-            pager
-                .begin_read_tx() // we have to begin a read tx before beginning a write
-                .expect("Failed to start read transaction");
+            // we have to begin a read tx before beginning a write
+            if !pager.holds_read_lock() {
+                return_if_io!(pager.begin_read_tx());
+            }
             return_if_io!(pager.begin_write_tx(WalAutoActions::all_enabled()));
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::CreateBtree {
                 pager: pager.clone(),
@@ -16707,7 +16708,7 @@ mod tests {
         conn.execute("BEGIN").unwrap();
         let attached_db_id = conn.get_database_id_by_name("att").unwrap();
         let attached_pager = conn.get_pager_from_database_index(&attached_db_id).unwrap();
-        attached_pager.begin_read_tx().unwrap();
+        while let IOResult::IO(_) = attached_pager.begin_read_tx().unwrap() {}
 
         assert!(
             !conn.pager.load().holds_read_lock(),

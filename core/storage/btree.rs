@@ -9342,7 +9342,7 @@ mod tests {
         // FIXME: handle page cache is full
 
         // force allocate page1 with a transaction
-        pager.begin_read_tx().unwrap();
+        while let IOResult::IO(_) = pager.begin_read_tx().unwrap() {}
         run_until_done(
             || pager.begin_write_tx(WalAutoActions::all_enabled()),
             &pager,
@@ -9623,7 +9623,7 @@ mod tests {
             tracing::info!("seed: {seed}");
             for insert_id in 0..inserts {
                 let do_validate = do_validate_btree || (insert_id % VALIDATE_INTERVAL == 0);
-                pager.begin_read_tx().unwrap();
+                while let IOResult::IO(_) = pager.begin_read_tx().unwrap() {}
                 run_until_done(
                     || pager.begin_write_tx(WalAutoActions::all_enabled()),
                     &pager,
@@ -9672,7 +9672,7 @@ mod tests {
                 )
                 .unwrap();
                 pager.io.block(|| pager.commit_tx(&conn, true)).unwrap();
-                pager.begin_read_tx().unwrap();
+                while let IOResult::IO(_) = pager.begin_read_tx().unwrap() {}
                 // FIXME: add sorted vector instead, should be okay for small amounts of keys for now :P, too lazy to fix right now
                 let _c = cursor.move_to_root().unwrap();
                 let mut valid = true;
@@ -9702,7 +9702,7 @@ mod tests {
                 }
                 pager.end_read_tx();
             }
-            pager.begin_read_tx().unwrap();
+            while let IOResult::IO(_) = pager.begin_read_tx().unwrap() {}
             tracing::info!(
                 "=========== btree ===========\n{}\n\n",
                 format_btree(pager.clone(), root_page, 0)
@@ -9774,7 +9774,7 @@ mod tests {
             let mut keys = SortedVec::new();
             tracing::info!("seed: {seed}");
             for i in 0..inserts {
-                pager.begin_read_tx().unwrap();
+                while let IOResult::IO(_) = pager.begin_read_tx().unwrap() {}
                 pager
                     .io
                     .block(|| pager.begin_write_tx(WalAutoActions::all_enabled()))
@@ -9824,7 +9824,7 @@ mod tests {
             }
 
             // Check that all keys can be found by seeking
-            pager.begin_read_tx().unwrap();
+            while let IOResult::IO(_) = pager.begin_read_tx().unwrap() {}
             let _c = cursor.move_to_root().unwrap();
             for (i, key) in keys.iter().enumerate() {
                 tracing::info!("seeking key {}/{}: {:?}", i + 1, keys.len(), key);
@@ -9954,7 +9954,7 @@ mod tests {
             tracing::info!("seed: {seed}");
             for i in 0..operations {
                 let print_progress = i % 100 == 0;
-                pager.begin_read_tx().unwrap();
+                while let IOResult::IO(_) = pager.begin_read_tx().unwrap() {}
 
                 pager
                     .io
@@ -10070,7 +10070,7 @@ mod tests {
         seed: u64,
     ) {
         // Check that all expected keys can be found by seeking
-        pager.begin_read_tx().unwrap();
+        while let IOResult::IO(_) = pager.begin_read_tx().unwrap() {}
         let _c = cursor.move_to_root().unwrap();
         for (i, key) in expected_keys.iter().enumerate() {
             tracing::info!(

@@ -426,6 +426,8 @@ enum InitState {
     Start,
     /// Driving `init_pager` (its only IO is the DB-header read).
     InitPager(DbHeaderReadState),
+    /// Pager built; opening the read transaction (may yield on contention).
+    BeginReadTx { pager: Box<Pager> },
     /// Pager built and read-tx open; reading page 1 for the autovacuum mode.
     ReadPage1 { pager: Box<Pager> },
 }
@@ -1529,29 +1531,22 @@ impl Database {
                         pager.set_encryption_context(cipher_mode, key)?;
                     }
 
+                    *st = InitState::BeginReadTx {
+                        pager: Box::new(pager),
+                    };
+                }
+                InitState::BeginReadTx { pager } => {
                     // Start a read transaction before reading page 1 to prevent a concurrent
                     // checkpoint from truncating the WAL underneath bootstrap. Under heavy
                     // same-process connection churn, the shared WAL bootstrap path can
-                    // briefly contend on short-lived in-process locks, so treat Busy here as
-                    // a transient and retry rather than failing `connect()`.
-                    let mut read_tx_attempts = 0u32;
-                    loop {
-                        match pager.begin_read_tx() {
-                            Ok(()) => break,
-                            Err(LimboError::Busy) => {
-                                read_tx_attempts += 1;
-                                if read_tx_attempts > 1 {
-                                    return Err(LimboError::Busy);
-                                }
-                                pager.io.yield_now();
-                            }
-                            Err(err) => return Err(err),
-                        }
-                    }
+                    // briefly contend on short-lived in-process locks; begin_read_tx yields
+                    // on contention and we re-enter here until it resolves.
+                    return_if_io!(pager.begin_read_tx());
 
-                    *st = InitState::ReadPage1 {
-                        pager: Box::new(pager),
+                    let InitState::BeginReadTx { pager } = std::mem::take(st) else {
+                        unreachable!("state is BeginReadTx");
                     };
+                    *st = InitState::ReadPage1 { pager };
                 }
                 InitState::ReadPage1 { pager } => {
                     // Read page 1 within the read transaction to determine the

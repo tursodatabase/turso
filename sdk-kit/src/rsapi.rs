@@ -1124,6 +1124,11 @@ fn step_inner(
     async_io: bool,
     waker: Option<&Waker>,
 ) -> Result<TursoStatusCode, TursoError> {
+    // Consecutive lock-contention yields seen in this sync loop. turso_core no
+    // longer sleeps internally on contention (it killed IO::sleep/yield_now and
+    // surfaces a Yield instead, leaving backoff policy to the embedder), so we
+    // reproduce its old progressive backoff here, mirroring SQLite's WAL_RETRY.
+    let mut contention_yields = 0u32;
     loop {
         let result = if let Some(waker) = waker {
             stmt.step_with_waker(waker)
@@ -1135,11 +1140,35 @@ fn step_inner(
             StepResult::Row => Ok(TursoStatusCode::Row),
             StepResult::Busy => Err(TursoError::Busy("database is locked".to_string())),
             StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO => {
                 if async_io {
                     Ok(TursoStatusCode::Io)
                 } else {
+                    contention_yields = 0;
                     stmt._io().step()?;
+                    continue;
+                }
+            }
+            StepResult::Yield => {
+                if async_io {
+                    // Event-loop embedders re-poll on Io and own their own
+                    // pacing between polls, so just hand control back.
+                    Ok(TursoStatusCode::Io)
+                } else {
+                    // A Yield means another connection holds a contended lock;
+                    // there is no pending I/O to drive, so stepping I/O would
+                    // busy-spin. Back off progressively instead. turso_core has
+                    // already burned its immediate retries before yielding, so
+                    // the first few yields just relinquish the scheduler and the
+                    // rest sleep with the same quadratic curve core used to.
+                    contention_yields += 1;
+                    if contention_yields <= 4 {
+                        std::thread::yield_now();
+                    } else {
+                        let steps = (contention_yields - 4) as u64;
+                        let delay_us = steps * steps * 39;
+                        std::thread::sleep(Duration::from_micros(delay_us));
+                    }
                     continue;
                 }
             }
