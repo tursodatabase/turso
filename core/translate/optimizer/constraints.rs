@@ -6,13 +6,17 @@ use crate::{
         expr::{as_binary_components, comparison_affinity, walk_expr_mut, WalkControl},
         expression_index::normalize_expr_for_index_matching,
         plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences, WhereTerm},
-        planner::{break_predicate_at_and_boundaries, table_mask_from_expr, TableMask, ROWID_STRS},
+        planner::{
+            break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
+            TableMask, ROWID_STRS,
+        },
     },
     util::exprs_are_equivalent,
     vdbe::affinity::Affinity,
     Result,
 };
 use crate::{turso_assert, turso_debug_assert};
+use smallvec::SmallVec;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
@@ -866,7 +870,8 @@ pub fn constraints_from_where_clause(
                     if let Some(index_candidate) = cs.candidates.iter_mut().find_map(|candidate| {
                         if candidate.index.as_ref().is_some_and(|i| {
                             Arc::ptr_eq(index, i)
-                                && can_use_partial_index(index, table_reference, where_clause)
+                                && (index.where_clause.is_none()
+                                    || can_use_partial_index(index, table_reference, where_clause))
                         }) {
                             Some(candidate)
                         } else {
@@ -1191,14 +1196,26 @@ pub fn ordered_materialized_key_columns(constraints: &[&Constraint]) -> Vec<usiz
     ordered
 }
 
-fn can_use_partial_index(
+pub(super) fn partial_index_predicate_terms(
     index: &Index,
     table_reference: &JoinedTable,
     query_where_clause: &[WhereTerm],
-) -> bool {
-    let Some(index_where) = &index.where_clause else {
-        // Full index, always usable
-        return true;
+) -> Option<SmallVec<[usize; 4]>> {
+    let index_where = index
+        .where_clause
+        .as_ref()
+        .expect("partial_index_predicate_terms requires a partial index");
+    let can_use_query_term = |term: &WhereTerm| -> bool {
+        let Some(join_info) = &table_reference.join_info else {
+            return true;
+        };
+        if join_info.is_full_outer() {
+            return false;
+        }
+        if join_info.is_outer() {
+            return term.from_outer_join == Some(table_reference.internal_id);
+        }
+        true
     };
     // Bind the index WHERE expression's column references to this query's
     // table reference so it can be compared symmetrically against bound query
@@ -1206,15 +1223,39 @@ fn can_use_partial_index(
     // WHERE term for the partial index to be safe to use.
     let mut bound = (**index_where).clone();
     bind_partial_index_columns(&mut bound, table_reference);
+    rewrite_between_exprs(&mut bound).ok()?;
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
-    index_conjuncts.iter().all(|ic| {
-        query_where_clause
-            .iter()
-            .any(|t| exprs_are_equivalent(ic, &t.expr))
-    })
+    let mut matched_terms = SmallVec::<[usize; 4]>::new();
+    for index_conjunct in index_conjuncts.iter() {
+        let (term_idx, _) = query_where_clause.iter().enumerate().find(|(_, term)| {
+            can_use_query_term(term) && exprs_are_equivalent(index_conjunct, &term.expr)
+        })?;
+        if !matched_terms.contains(&term_idx) {
+            matched_terms.push(term_idx);
+        }
+    }
+    Some(matched_terms)
     // TODO: recognize implication beyond syntactic equivalence (e.g. `x = 5` implies
     // `x IS NOT NULL`, `x > 10` implies `x > 5`).
+}
+
+pub(super) fn partial_index(index: Option<&Arc<Index>>) -> Option<&Index> {
+    let index = index?;
+    index.where_clause.as_ref()?;
+    Some(index.as_ref())
+}
+
+pub(super) fn can_use_partial_index(
+    index: &Index,
+    table_reference: &JoinedTable,
+    query_where_clause: &[WhereTerm],
+) -> bool {
+    assert!(
+        index.where_clause.is_some(),
+        "can_use_partial_index requires a partial index"
+    );
+    partial_index_predicate_terms(index, table_reference, query_where_clause).is_some()
 }
 
 /// Rewrite identifier nodes in a partial-index WHERE expression to bound
@@ -1592,6 +1633,8 @@ fn analyze_binary_term_index_info<'a>(
 pub(crate) fn summarize_binary_term_for_index(
     expr: &ast::Expr,
     table_id: TableInternalId,
+    table_reference: &JoinedTable,
+    query_where_clause: &[WhereTerm],
     indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
     table_references: &TableReferences,
@@ -1611,6 +1654,8 @@ pub(crate) fn summarize_binary_term_for_index(
         indexes,
         rowid_alias_column,
         is_rowid,
+        table_reference,
+        query_where_clause,
     );
     if constraint_refs.is_empty() {
         return None;
@@ -1646,6 +1691,7 @@ pub(crate) fn analyze_binary_term_for_index(
     where_term_idx: usize,
     table_id: TableInternalId,
     table_reference: &JoinedTable,
+    query_where_clause: &[WhereTerm],
     indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
     table_references: &TableReferences,
@@ -1670,6 +1716,8 @@ pub(crate) fn analyze_binary_term_for_index(
         indexes,
         rowid_alias_column,
         is_rowid,
+        table_reference,
+        query_where_clause,
     );
 
     // If no index can be used, this term is not indexable
@@ -1747,6 +1795,8 @@ fn find_best_index_for_constraint(
     indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
     is_rowid: bool,
+    table_reference: &JoinedTable,
+    query_where_clause: &[WhereTerm],
 ) -> (Option<Arc<Index>>, Vec<RangeConstraintRef>) {
     // Handle implicit rowid (no alias column, table_col_pos is None)
     if is_rowid && table_col_pos.is_none() {
@@ -1807,6 +1857,11 @@ fn find_best_index_for_constraint(
     // Find the best index that has this column as its first column
     if let Some(indexes) = indexes {
         for index in indexes.iter().filter(|idx| idx.index_method.is_none()) {
+            if index.where_clause.is_some()
+                && !can_use_partial_index(index.as_ref(), table_reference, query_where_clause)
+            {
+                continue;
+            }
             if let Some(idx_col_pos) = index.column_table_pos_to_index_pos(col_pos) {
                 // For multi-index OR, we prefer indexes where the constraint column
                 // is the first column (leftmost prefix)

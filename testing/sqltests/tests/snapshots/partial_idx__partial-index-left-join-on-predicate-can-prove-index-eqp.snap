@@ -1,0 +1,21 @@
+---
+source: partial_idx.sqltest
+expression: |-
+  SELECT left_items.id, right_items.id, right_items.marker
+      FROM left_items
+      LEFT JOIN right_items ON right_items.marker IS NULL
+      ORDER BY left_items.id, right_items.id;
+info:
+  statement_type: SELECT
+  tables:
+  - left_items
+  - right_items
+  - right_items.marker
+  setup_blocks:
+  - partial_index_left_join_on_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN left_items
+|--SCAN right_items USING INDEX right_marker_null_idx
+`--USE SORTER FOR ORDER BY

@@ -1490,51 +1490,7 @@ pub fn parse_where(
                 resolver,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
-            let _ = walk_expr_mut(&mut expr.expr, &mut |e: &mut Expr| -> Result<WalkControl> {
-                if let Expr::Between {
-                    lhs,
-                    not,
-                    start,
-                    end,
-                } = e
-                {
-                    let lhs_expr = std::mem::take(lhs.as_mut());
-                    let start_expr = std::mem::take(start.as_mut());
-                    let end_expr = std::mem::take(end.as_mut());
-
-                    let (lower, upper, combine_op) = if *not {
-                        (
-                            Expr::Binary(
-                                Box::new(start_expr),
-                                ast::Operator::Greater,
-                                Box::new(lhs_expr.clone()),
-                            ),
-                            Expr::Binary(
-                                Box::new(lhs_expr),
-                                ast::Operator::Greater,
-                                Box::new(end_expr),
-                            ),
-                            ast::Operator::Or,
-                        )
-                    } else {
-                        (
-                            Expr::Binary(
-                                Box::new(start_expr),
-                                ast::Operator::LessEquals,
-                                Box::new(lhs_expr.clone()),
-                            ),
-                            Expr::Binary(
-                                Box::new(lhs_expr),
-                                ast::Operator::LessEquals,
-                                Box::new(end_expr),
-                            ),
-                            ast::Operator::And,
-                        )
-                    };
-                    *e = Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
-                }
-                Ok(WalkControl::Continue)
-            });
+            rewrite_between_exprs(&mut expr.expr)?;
         }
         // BETWEEN in WHERE is rewritten to binary terms here so each side can be
         // considered independently by constraint extraction and range planning.
@@ -1566,6 +1522,55 @@ pub fn parse_where(
     } else {
         Ok(())
     }
+}
+
+pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
+    walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
+        if let Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } = e
+        {
+            let lhs_expr = std::mem::take(lhs.as_mut());
+            let start_expr = std::mem::take(start.as_mut());
+            let end_expr = std::mem::take(end.as_mut());
+
+            let (lower, upper, combine_op) = if *not {
+                (
+                    Expr::Binary(
+                        Box::new(start_expr),
+                        ast::Operator::Greater,
+                        Box::new(lhs_expr.clone()),
+                    ),
+                    Expr::Binary(
+                        Box::new(lhs_expr),
+                        ast::Operator::Greater,
+                        Box::new(end_expr),
+                    ),
+                    ast::Operator::Or,
+                )
+            } else {
+                (
+                    Expr::Binary(
+                        Box::new(start_expr),
+                        ast::Operator::LessEquals,
+                        Box::new(lhs_expr.clone()),
+                    ),
+                    Expr::Binary(
+                        Box::new(lhs_expr),
+                        ast::Operator::LessEquals,
+                        Box::new(end_expr),
+                    ),
+                    ast::Operator::And,
+                )
+            };
+            *e = Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
 }
 
 /**
