@@ -27,28 +27,38 @@ Scalar functions accept one or more arguments and return a single value. They ca
 | Function | Description |
 |----------|-------------|
 | `char(X1, X2, ..., XN)` | Returns a string composed of characters with Unicode code points X1 through XN |
+| `chr(X)` | Alias for `char(X)`. PostgreSQL/SQL-standard spelling |
 | `concat(X, ...)` | Concatenates all arguments as strings. NULL arguments are skipped |
 | `concat_ws(SEP, X, ...)` | Concatenates arguments with separator SEP. NULL arguments are skipped |
 | `format(FORMAT, ...)` | Returns a formatted string using printf-style format specifiers |
 | `hex(X)` | Returns the uppercase hexadecimal representation of X |
 | `instr(X, Y)` | Returns the 1-based position of the first occurrence of Y in X, or 0 if not found |
+| `strpos(X, Y)` | Alias for `instr(X, Y)`. PostgreSQL spelling, identical argument order |
 | `length(X)` | Returns the string length in characters, or blob length in bytes |
+| `char_length(X)` | Alias for `length(X)`. SQL-standard short form |
+| `character_length(X)` | Alias for `length(X)`. SQL-standard long form |
 | `lower(X)` | Returns a lowercase copy of string X |
+| `lpad(X, N)` / `lpad(X, N, F)` | Pads X on the left to length N using F (defaults to a single space) |
 | `ltrim(X)` | Removes leading whitespace from X |
 | `ltrim(X, Y)` | Removes leading characters found in Y from X |
 | `octet_length(X)` | Returns the length of X in bytes |
 | `printf(FORMAT, ...)` | Alias for `format()`. Returns a formatted string |
 | `quote(X)` | Returns the SQL literal representation of X |
+| `repeat(X, N)` | Returns X concatenated N times. `N <= 0` produces an empty string |
 | `replace(X, Y, Z)` | Returns X with every occurrence of Y replaced by Z |
+| `reverse(X)` | Returns the characters of string X in reverse order. Alias for `string_reverse(X)` |
+| `rpad(X, N)` / `rpad(X, N, F)` | Pads X on the right to length N using F (defaults to a single space) |
 | `rtrim(X)` | Removes trailing whitespace from X |
 | `rtrim(X, Y)` | Removes trailing characters found in Y from X |
 | `soundex(X)` | Returns the Soundex encoding of string X |
+| `string_reverse(X)` | Returns the characters of string X in reverse order |
 | `substr(X, Y)` | Returns the substring of X starting at position Y (1-based) |
 | `substr(X, Y, Z)` | Returns Z characters from X starting at position Y |
 | `substring(X, Y)` | Alias for `substr(X, Y)` |
 | `substring(X, Y, Z)` | Alias for `substr(X, Y, Z)` |
 | `trim(X)` | Removes leading and trailing whitespace from X |
 | `trim(X, Y)` | Removes leading and trailing characters found in Y from X |
+| `btrim(X)` / `btrim(X, Y)` | Alias for `trim(X)` / `trim(X, Y)`. PostgreSQL/Oracle spelling |
 | `unhex(X)` | Converts hexadecimal string X to a blob. Returns NULL if X contains non-hex characters |
 | `unhex(X, Y)` | Like `unhex(X)`, but characters in Y are silently ignored in X |
 | `unicode(X)` | Returns the Unicode code point of the first character of string X |
@@ -120,14 +130,17 @@ SELECT abs(0);         -- 0
 SELECT abs(NULL);      -- NULL
 ```
 
-### char(X1, X2, ..., XN)
+### char(X1, X2, ..., XN) and chr(X)
 
-Returns a string composed of characters having the Unicode code points X1 through XN. Arguments that are not valid code points are replaced with the Unicode replacement character (U+FFFD).
+`char` returns a string composed of characters having the Unicode code points X1 through XN. Arguments that are not valid code points are replaced with the Unicode replacement character (U+FFFD).
+
+`chr` is a single-argument alias provided for PostgreSQL and SQL-standard compatibility. It is identical to `char(X)`.
 
 ```sql
 SELECT char(72, 101, 108, 108, 111);   -- 'Hello'
 SELECT char(9731);                       -- snowman character
 SELECT hex(char(0));                     -- '00'
+SELECT chr(65);                          -- 'A'
 ```
 
 ### coalesce(X, Y, ...)
@@ -218,27 +231,35 @@ SELECT iif(NULL, 'yes', 'no');         -- 'no'
 SELECT if(10 > 5, 'big', 'small');     -- 'big'
 ```
 
-### instr(X, Y)
+### instr(X, Y) and strpos(X, Y)
 
 Returns the 1-based position of the first occurrence of string Y in string X. Returns 0 if Y is not found in X. If either argument is NULL, returns NULL.
+
+`strpos` is a PostgreSQL-compatible alias with the same argument order.
 
 ```sql
 SELECT instr('Hello World', 'World');   -- 7
 SELECT instr('Hello World', 'xyz');     -- 0
 SELECT instr('abcabc', 'bc');           -- 2
+SELECT strpos('Hello World', 'World');  -- 7
 ```
 
-### length(X) and octet_length(X)
+### length(X), char_length(X), character_length(X), and octet_length(X)
 
 `length` returns the number of characters in a text value, or the number of bytes in a blob value. For NULL, returns NULL. For numeric values, returns the length of the text representation.
+
+`char_length` and `character_length` are SQL-standard aliases for `length`, accepted for compatibility with PostgreSQL and other engines.
 
 `octet_length` always returns the length in bytes, regardless of type.
 
 ```sql
-SELECT length('Hello');          -- 5
-SELECT length(x'AABBCC');        -- 3 (bytes for blob)
-SELECT length(12345);            -- 5 (text representation)
-SELECT octet_length('Hello');    -- 5 (ASCII, 1 byte per char)
+SELECT length('Hello');             -- 5
+SELECT length(x'AABBCC');           -- 3 (bytes for blob)
+SELECT length(12345);               -- 5 (text representation)
+SELECT char_length('café');         -- 4 (counts characters, not bytes)
+SELECT character_length('café');    -- 4
+SELECT octet_length('Hello');       -- 5 (ASCII, 1 byte per char)
+SELECT octet_length('café');        -- 5 (é is 2 bytes in UTF-8)
 ```
 
 ### like(X, Y) and like(X, Y, Z)
@@ -264,21 +285,25 @@ SELECT lower('Hello World');   -- 'hello world'
 SELECT upper('Hello World');   -- 'HELLO WORLD'
 ```
 
-### ltrim(X), rtrim(X), trim(X)
+### ltrim(X), rtrim(X), trim(X), btrim(X)
 
 These functions remove characters from the ends of a string. Without a second argument, they remove whitespace. With a second argument Y, they remove any characters present in the string Y.
+
+`btrim` is a PostgreSQL/Oracle-compatible alias for `trim` (both the one- and two-argument forms).
 
 ```sql
 -- Whitespace trimming
 SELECT ltrim('   Hello');          -- 'Hello'
 SELECT rtrim('Hello   ');          -- 'Hello'
 SELECT trim('   Hello   ');        -- 'Hello'
+SELECT btrim('   Hello   ');       -- 'Hello'
 
 -- Character trimming
-SELECT ltrim('xxxHello', 'x');     -- 'Hello'
-SELECT rtrim('Helloyyy', 'y');     -- 'Hello'
-SELECT trim('***Hello***', '*');   -- 'Hello'
-SELECT trim('abcHelloabc', 'abc'); -- 'Hello' (removes any of a, b, or c)
+SELECT ltrim('xxxHello', 'x');       -- 'Hello'
+SELECT rtrim('Helloyyy', 'y');       -- 'Hello'
+SELECT trim('***Hello***', '*');     -- 'Hello'
+SELECT trim('abcHelloabc', 'abc');   -- 'Hello' (removes any of a, b, or c)
+SELECT btrim('xyzHelloxyz', 'xyz');  -- 'Hello'
 ```
 
 ### max(X, Y, ...) and min(X, Y, ...)
@@ -328,6 +353,44 @@ SELECT hex(randomblob(4)); -- e.g., 'A1B2C3D4' (4 random bytes)
 SELECT abs(random()) % 100; -- random number between 0 and 99
 ```
 
+### lpad(X, N) and lpad(X, N, F)
+
+Left-pads the string X with the fill string F until the result has exactly N characters. F defaults to a single space. If X is already at least N characters long, it is truncated from the right to length N. F is cycled when it is more than one character long. Returns NULL if any argument is NULL. If F is an empty string, the input is returned unchanged.
+
+Lengths are counted in Unicode characters, not bytes, so multi-byte input is padded correctly.
+
+```sql
+SELECT lpad('abc', 6);              -- '   abc'
+SELECT lpad('abc', 6, 'xy');        -- 'xyxabc'
+SELECT lpad('abcdef', 3);           -- 'abc'   (truncated from the right)
+SELECT lpad('aéc', 4);              -- ' aéc'  (character count, not bytes)
+SELECT lpad('abc', 10, '');         -- 'abc'   (empty fill)
+SELECT lpad(NULL, 5);               -- NULL
+```
+
+### rpad(X, N) and rpad(X, N, F)
+
+Right-pads the string X with the fill string F until the result has exactly N characters. F defaults to a single space. Truncation, fill cycling, NULL propagation, and empty-fill handling are identical to `lpad` (see the section above).
+
+```sql
+SELECT rpad('abc', 6);              -- 'abc   '
+SELECT rpad('abc', 6, 'xy');        -- 'abcxyx'
+SELECT rpad('abcdef', 3);           -- 'abc'   (truncated from the right)
+SELECT rpad('aéc', 4);              -- 'aéc '
+```
+
+### repeat(X, N)
+
+Returns the string X concatenated with itself N times. Returns an empty string when `N <= 0`. Returns NULL if either argument is NULL. Non-text inputs are converted to their text representation first.
+
+```sql
+SELECT repeat('ab', 3);      -- 'ababab'
+SELECT repeat('x', 0);       -- ''
+SELECT repeat('x', -1);      -- ''
+SELECT repeat('', 5);        -- ''
+SELECT repeat(NULL, 3);      -- NULL
+```
+
 ### replace(X, Y, Z)
 
 Returns a copy of string X with every occurrence of string Y replaced by string Z. If Y is empty, X is returned unchanged.
@@ -336,6 +399,20 @@ Returns a copy of string X with every occurrence of string Y replaced by string 
 SELECT replace('Hello World', 'World', 'Turso');   -- 'Hello Turso'
 SELECT replace('aabbcc', 'bb', 'XX');               -- 'aaXXcc'
 SELECT replace('2024-01-15', '-', '/');              -- '2024/01/15'
+```
+
+### reverse(X) and string_reverse(X)
+
+Returns string X with its characters in reverse order. Reversal is done on Unicode characters, so multi-byte characters are preserved intact. Returns NULL if X is NULL. Non-text inputs are converted to their text representation first.
+
+`reverse` is the PostgreSQL (since version 17), MySQL, and Oracle spelling; `string_reverse` is the canonical Turso name. The two are interchangeable.
+
+```sql
+SELECT reverse('hello');         -- 'olleh'
+SELECT reverse('');              -- ''
+SELECT reverse('café');          -- 'éfac'
+SELECT string_reverse('abc');    -- 'cba'
+SELECT reverse(NULL);            -- NULL
 ```
 
 ### round(X) and round(X, Y)
