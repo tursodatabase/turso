@@ -67,6 +67,10 @@ impl FixedYieldInjector {
     fn is_empty(&self) -> bool {
         self.remaining.lock().is_empty()
     }
+
+    fn remaining_len(&self) -> usize {
+        self.remaining.lock().len()
+    }
 }
 
 impl YieldInjector for FixedYieldInjector {
@@ -3219,7 +3223,7 @@ fn test_reader_consistent_during_large_indexed_commit_rewrite() {
     // > 1024 rows so the commit's RewriteLiveVersions spans multiple batches.
     c1.execute("BEGIN").unwrap();
     for i in 0..1500i64 {
-        c1.execute(&format!("INSERT INTO t VALUES ({i}, {})", i + 1_000_000))
+        c1.execute(format!("INSERT INTO t VALUES ({i}, {})", i + 1_000_000))
             .unwrap();
     }
     c1.execute("COMMIT").unwrap();
@@ -3351,6 +3355,303 @@ fn test_checkpoint_two_scan_toctou_orphans_first_checkpoint_unique_index() {
         "checkpoint orphaned an index entry: {integ:?}"
     );
 }
+
+#[test]
+fn test_checkpoint_gc_anchor_loss_update_then_delete_strands_stale_row() {
+    use crate::StepResult;
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let conn_v = db.connect();
+    conn_v
+        .execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, u NUMERIC UNIQUE)")
+        .unwrap();
+    conn_v.execute("INSERT INTO t VALUES (1, 724)").unwrap();
+
+    let conn_c = db.connect();
+    conn_c
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforeAcquireLock.point()]);
+    conn_c.set_yield_injector(Some(injector.clone()));
+    let mut checkpoint = conn_c.prepare("INSERT INTO t VALUES (2, 999)").unwrap();
+    let pager_io = conn_c.pager.load().io.clone();
+
+    let step_to_next_yield = |checkpoint: &mut crate::Statement, expect_remaining: usize| {
+        for _ in 0..200_000 {
+            match checkpoint.step().unwrap() {
+                StepResult::IO => {
+                    if injector.remaining_len() == expect_remaining {
+                        return true;
+                    }
+                    pager_io.step().unwrap();
+                }
+                StepResult::Done => return false,
+                other => panic!("unexpected checkpoint step: {other:?}"),
+            }
+        }
+        false
+    };
+
+    // Pause AFTER both off-lock collection scans (row 1 collected live at T_snap) and
+    // BEFORE the blocking lock.
+    assert!(
+        step_to_next_yield(&mut checkpoint, 0),
+        "auto-checkpoint must yield before acquiring the blocking lock"
+    );
+
+    // UPDATER: autocommits at T_upd > T_snap while the checkpoint is paused. Same rowid =>
+    // the table chain gains a current version; the index moves to a NEW {943} chain.
+    let conn_u = db.connect();
+    conn_u.execute("UPDATE t SET u = 943 WHERE pk = 1").unwrap();
+
+    // Resume: the checkpoint writes its stale snapshot (u=724 + index {724}), publishes
+    // boundary T_snap, and its GC drops OLD from the table chain (the anchor loss).
+    let mut checkpoint_done = false;
+    for _ in 0..200_000 {
+        match checkpoint.step().unwrap() {
+            StepResult::Done => {
+                checkpoint_done = true;
+                break;
+            }
+            StepResult::IO => pager_io.step().unwrap(),
+            other => panic!("unexpected checkpoint step after resume: {other:?}"),
+        }
+    }
+    assert!(checkpoint_done, "first checkpoint did not complete");
+    conn_c.set_yield_injector(None);
+
+    // DELETER: autocommits at T_del. Table chain is now [NEW: T_upd -> T_del], whose
+    // begin exceeds the published boundary.
+    let conn_d = db.connect();
+    conn_d.execute("DELETE FROM t WHERE pk = 1").unwrap();
+
+    // Second checkpoint (threshold=0 commit on conn_c; no injected yields remain). The
+    // table tombstone is unclassifiable (exists_in_db_file=false => skipped), while the
+    // index {724} tombstone IS applied — leaving the durable table/index desynced.
+    conn_c.execute("INSERT INTO t VALUES (3, 555)").unwrap();
+
+    let verifier = db.connect();
+    let integ = get_rows(&verifier, "PRAGMA integrity_check");
+    assert_eq!(
+        integ.len(),
+        1,
+        "integrity_check must be a single 'ok' row, got: {integ:?}"
+    );
+    assert_eq!(
+        &integ[0][0].to_string(),
+        "ok",
+        "GC anchor loss stranded a stale table row: {integ:?}"
+    );
+}
+
+/// Concurrent stress for the non-blocking MVCC checkpoint: a write-write-conflict abort path
+/// (with a SAVEPOINT/ROLLBACK TO in the middle) racing a conflicting committer that fires a
+/// Passive auto-checkpoint per commit, with a reader continuously validating.
+///
+/// The ONLY failure signal here is `PRAGMA integrity_check != "ok"` — a single consistent
+/// snapshot, the real table/index oracle. Earlier versions of this test also asserted
+/// value-specific invariants (e.g. "pk must still map to u=700+pk", assuming conn1 always
+/// aborts) and a cross-query table-vs-index compare; BOTH were false-positive-prone and were
+/// removed:
+///   - conn1's COMMIT only aborts when conn2 actually commits a conflicting write first; when
+///     conn2's UPDATE hits a WriteWriteConflict and skips, conn1 LEGITIMATELY commits its own
+///     `90000+round` value, so "u must be 700+pk" is simply a stale expectation, not a bug.
+///   - reading `WHERE u=?` (index) and `WHERE pk=?` (table) as two separate auto-commit
+///     statements observes two different snapshots, so a commit landing between them looks like
+///     a divergence that never existed in any single snapshot.
+///
+/// The genuine "row missing from index" inconsistency is reproduced deterministically by the
+/// whopper seeds (testing/concurrent-simulator/mvcc_checkpoint_regression.rs, seeds 1/32) where
+/// integrity_check itself fails. This unit test is a lighter-weight concurrent guard against the
+/// same class of bug; it currently PASSES (integrity_check stays "ok").
+#[test]
+fn test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    // NUMERIC UNIQUE column => autoindex, mirroring empty_leaf_594 in the trace.
+    conn.execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, u NUMERIC UNIQUE)")
+        .unwrap();
+    for i in 0..120 {
+        conn.execute(format!("INSERT INTO t VALUES ({}, {})", i, 700 + i))
+            .unwrap();
+    }
+    // Checkpoint so the seeded index/table values are btree-resident.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    // Force a Passive auto-checkpoint on every commit (off-lock path interleaves below).
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+
+    // Busy-tolerant read so transient lock contention isn't mistaken for a repro.
+    fn read_retry(conn: &Arc<Connection>, query: &str) -> Option<Vec<Vec<Value>>> {
+        for _ in 0..100_000 {
+            let mut stmt = match conn.prepare(query) {
+                Ok(s) => s,
+                Err(LimboError::Busy) => {
+                    std::thread::yield_now();
+                    continue;
+                }
+                Err(e) => panic!("prepare failed: {e:?}"),
+            };
+            let mut rows = Vec::new();
+            let res = stmt.run_with_row_callback(|row| {
+                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                Ok(())
+            });
+            match res {
+                Ok(()) => return Some(rows),
+                Err(LimboError::Busy) => {
+                    std::thread::yield_now();
+                    continue;
+                }
+                Err(e) => panic!("read query {query:?} failed: {e:?}"),
+            }
+        }
+        None
+    }
+
+    let db_arc = db.get_db();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let reader_stop = stop.clone();
+    let reader_db = db_arc.clone();
+    let reader_handle = std::thread::spawn(move || {
+        let reader = reader_db.connect().unwrap();
+        reader
+            .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        let mut iters = 0u64;
+        while !reader_stop.load(Ordering::Acquire) {
+            // The only sound concurrent oracle: a single-snapshot integrity_check. It validates
+            // every table row against its index entries within one consistent read, so it flags a
+            // genuine table/index desync without assuming any particular value or comparing across
+            // two separate snapshots.
+            if let Some(ic) = read_retry(&reader, "PRAGMA integrity_check") {
+                assert_eq!(
+                    ic.len(),
+                    1,
+                    "reader iter {iters}: integrity_check rows: {ic:?}"
+                );
+                assert_eq!(
+                    &ic[0][0].to_string(),
+                    "ok",
+                    "reader iter {iters}: integrity_check failed: {:?}",
+                    ic[0][0].to_string()
+                );
+            }
+            iters += 1;
+        }
+    });
+
+    let writer_db = db_arc;
+    let writer_handle = std::thread::spawn(move || {
+        let conn1 = writer_db.connect().unwrap();
+        conn1
+            .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        let conn2 = writer_db.connect().unwrap();
+        conn2
+            .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        let exec_retry = |c: &Arc<Connection>, sql: &str| -> Result<(), LimboError> {
+            for _ in 0..1000 {
+                match c.execute(sql) {
+                    Ok(_) => return Ok(()),
+                    Err(LimboError::Busy) => std::thread::yield_now(),
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(LimboError::Busy)
+        };
+        for round in 0..400i64 {
+            let survivor_pk = round % 120;
+            let survivor_u = 700 + survivor_pk;
+
+            conn1.execute("BEGIN CONCURRENT").unwrap();
+            if exec_retry(
+                &conn1,
+                &format!(
+                    "UPDATE t SET u = {} WHERE pk = {survivor_pk}",
+                    90000 + round
+                ),
+            )
+            .is_err()
+                || exec_retry(&conn1, "SAVEPOINT sp").is_err()
+                || exec_retry(
+                    &conn1,
+                    &format!(
+                        "UPDATE t SET u = {} WHERE pk = {survivor_pk}",
+                        91000 + round
+                    ),
+                )
+                .is_err()
+                || exec_retry(&conn1, "ROLLBACK TO sp").is_err()
+            {
+                let _ = conn1.execute("ROLLBACK");
+                continue;
+            }
+
+            conn2.execute("BEGIN CONCURRENT").unwrap();
+            let mut update_ok = false;
+            for _ in 0..1000 {
+                match conn2.execute(format!(
+                    "UPDATE t SET u = {survivor_u} WHERE pk = {survivor_pk}"
+                )) {
+                    Ok(_) => {
+                        update_ok = true;
+                        break;
+                    }
+                    Err(LimboError::Busy) => std::thread::yield_now(),
+                    Err(LimboError::WriteWriteConflict) | Err(LimboError::TxError(_)) => break,
+                    Err(e) => panic!("conn2 update failed: {e:?}"),
+                }
+            }
+            if !update_ok {
+                let _ = conn2.execute("ROLLBACK");
+                let _ = conn1.execute("COMMIT");
+                let _ = conn1.execute("ROLLBACK");
+                continue;
+            }
+            for _ in 0..1000 {
+                match conn2.execute("COMMIT") {
+                    Ok(_) => break,
+                    Err(LimboError::Busy) => std::thread::yield_now(),
+                    Err(_) => {
+                        let _ = conn2.execute("ROLLBACK");
+                        break;
+                    }
+                }
+            }
+            let _ = conn1.execute("COMMIT");
+            let _ = conn1.execute("ROLLBACK");
+        }
+    });
+
+    writer_handle.join().unwrap();
+    stop.store(true, Ordering::Release);
+    reader_handle.join().unwrap();
+
+    let mut swept = false;
+    for _ in 0..1000 {
+        match conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
+            Ok(_) => {
+                swept = true;
+                break;
+            }
+            Err(LimboError::Busy) => std::thread::yield_now(),
+            Err(e) => panic!("final checkpoint failed: {e:?}"),
+        }
+    }
+    assert!(swept, "final checkpoint never succeeded");
+    let ic2 = read_retry(&conn, "PRAGMA integrity_check").expect("final integrity_check");
+    assert_eq!(ic2.len(), 1);
+    assert_eq!(
+        &ic2[0][0].to_string(),
+        "ok",
+        "post-checkpoint integrity_check: {ic2:?}"
+    );
+}
+
 /// Repro candidate: a concurrent reader must NOT observe an in-flight (uncommitted)
 /// index tombstone. conn2 updates an indexed UNIQUE column (tombstoning the old entry
 /// with end=TxID(conn2), inserting the new) but does not commit; conn1's snapshot
