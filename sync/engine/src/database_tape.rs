@@ -349,11 +349,27 @@ impl DatabaseWalSession {
         Ok(pages_cnt)
     }
 
-    pub fn db_size(&self) -> Result<u32> {
+    pub async fn db_size<Ctx>(&self, coro: &Coro<Ctx>) -> Result<u32> {
         let frames_count = self.frames_count()?;
         let conn = self.wal_session.conn();
         let mut page = vec![0u8; self.page_size];
-        assert!(conn.try_wal_watermark_read_page(1, &mut page, Some(frames_count))?);
+        let Some((page_ref, c)) = conn.try_wal_watermark_read_page_begin(1, Some(frames_count))?
+        else {
+            return Err(Error::DatabaseTapeError(
+                "database header page is missing at WAL watermark".to_string(),
+            ));
+        };
+        while !c.finished() {
+            coro.yield_(SyncEngineIoResult::IO).await?;
+        }
+        if let Some(err) = c.get_error() {
+            return Err(LimboError::CompletionError(err).into());
+        }
+        if !conn.try_wal_watermark_read_page_end(&mut page, page_ref)? {
+            return Err(Error::DatabaseTapeError(
+                "database header page is empty at WAL watermark".to_string(),
+            ));
+        }
         let db_size = u32::from_be_bytes(page[28..32].try_into().unwrap());
         Ok(db_size)
     }

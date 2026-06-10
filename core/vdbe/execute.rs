@@ -9446,7 +9446,7 @@ pub fn op_function(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub type OpAttachState = crate::connection::AttachDatabaseState;
+pub(crate) type OpAttachState = crate::connection::AttachDatabaseState;
 
 pub fn op_sequence(
     _program: &Program,
