@@ -2244,7 +2244,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             CheckpointState::Finalize => {
                 tracing::debug!("Releasing blocking checkpoint lock");
-                self.mvstore.drop_unused_row_versions();
+                // The blocking checkpoint lock is still held here, so the
+                // slot-removing GC variant is safe: no concurrent writer can
+                // race the empty-slot removal. This bounds the skip-map entry
+                // counts — the lazy (non-removing) GC otherwise leaves empty
+                // chain slots behind forever for rows never written again.
+                assert!(
+                    self.lock_states.blocking_checkpoint_lock_held,
+                    "finalize GC requires the blocking checkpoint lock"
+                );
+                self.mvstore.drop_unused_row_versions_and_slots();
                 self.checkpoint_lock.unlock();
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(

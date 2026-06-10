@@ -349,16 +349,22 @@ fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
     db.conn.execute("DELETE FROM t WHERE id = 2").unwrap();
     db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
-    // Normal MVCC checkpoint GC removes versions but can leave empty map
-    // buckets behind; VACUUM reset must not preserve those stale keys.
-    let checkpointed_row_ids = db
+    // Checkpoint-time GC removes the buckets it empties (it runs under the
+    // blocking lock), so recreate the condition VACUUM reset must handle:
+    // lazy background GC empties chains but leaves the buckets in the maps.
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("INSERT INTO t VALUES (4, 'd')").unwrap();
+    db.conn.execute("ROLLBACK").unwrap();
+    db.mvcc_store.drop_unused_row_versions();
+
+    let empty_row_ids = db
         .mvcc_store
         .rows
         .iter()
         .filter(|entry| entry.value().read().is_empty())
         .map(|entry| entry.key().clone())
         .collect::<Vec<_>>();
-    let checkpointed_index_ids = db
+    let empty_index_ids = db
         .mvcc_store
         .index_rows
         .iter()
@@ -371,12 +377,12 @@ fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
         .map(|entry| *entry.key())
         .collect::<Vec<_>>();
     assert!(
-        !checkpointed_row_ids.is_empty(),
-        "checkpoint GC should leave empty table row buckets before VACUUM reset"
+        !empty_row_ids.is_empty(),
+        "lazy GC should leave empty table row buckets before VACUUM reset"
     );
     assert!(
-        !checkpointed_index_ids.is_empty(),
-        "checkpoint GC should leave empty index buckets before VACUUM reset"
+        !empty_index_ids.is_empty(),
+        "lazy GC should leave empty index buckets before VACUUM reset"
     );
 
     db.conn.demote_to_mvcc_connection();
@@ -389,16 +395,16 @@ fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
         .reset_after_vacuum(DatabaseHeader::default(), schema.as_ref());
     db.mvcc_store.release_vacuum_gate();
 
-    for row_id in checkpointed_row_ids {
+    for row_id in empty_row_ids {
         assert!(
             db.mvcc_store.rows.get(&row_id).is_none(),
-            "checkpointed empty table row buckets must be cleared across VACUUM reset"
+            "empty table row buckets must be cleared across VACUUM reset"
         );
     }
-    for index_id in checkpointed_index_ids {
+    for index_id in empty_index_ids {
         assert!(
             db.mvcc_store.index_rows.get(&index_id).is_none(),
-            "checkpointed empty index buckets must be cleared across VACUUM reset"
+            "empty index buckets must be cleared across VACUUM reset"
         );
     }
 }
@@ -7543,6 +7549,95 @@ fn test_gc_integration_rollback_creates_aborted_garbage() {
     assert!(
         entry.unwrap().value().read().is_empty(),
         "but versions should be empty"
+    );
+}
+
+/// GC trims chains with retain()/clear(), which keeps the Vec's allocation.
+/// After a burst of versions is collected, the chain's capacity must be
+/// released down to a quarter of its previous value (deliberately not to fit)
+/// so a hot row doesn't pin its peak allocation forever.
+#[test]
+fn test_gc_shrinks_version_chain_capacity() {
+    let make_version = |begin, end| RowVersion {
+        id: 0,
+        begin,
+        end,
+        row: generate_simple_string_row((-2).into(), 1, "shrink"),
+        btree_resident: false,
+    };
+
+    // One committed current version that survives GC (b=1 > ckpt_max=0, so
+    // rule 3 doesn't fire), plus a burst of aborted garbage (always removed).
+    let mut versions: Vec<RowVersion> = Vec::new();
+    versions.push(make_version(Some(TxTimestampOrID::Timestamp(1)), None));
+    for _ in 0..1023 {
+        versions.push(make_version(None, None));
+    }
+    let capacity_before = versions.capacity();
+    assert!(capacity_before >= 1024);
+
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 0, 0);
+    assert_eq!(dropped, 1023);
+    assert_eq!(versions.len(), 1);
+    assert!(
+        versions.capacity() <= capacity_before / 4,
+        "chain capacity should shrink to a quarter of {capacity_before}, got {}",
+        versions.capacity()
+    );
+
+    // A chain emptied entirely also releases its allocation.
+    let mut versions: Vec<RowVersion> = (0..1024).map(|_| make_version(None, None)).collect();
+    let capacity_before = versions.capacity();
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 0, 0);
+    assert_eq!(dropped, 1024);
+    assert!(versions.is_empty());
+    assert!(
+        versions.capacity() <= capacity_before / 4,
+        "empty chain capacity should shrink to a quarter of {capacity_before}, got {}",
+        versions.capacity()
+    );
+
+    // Small chains are not worth a realloc: capacity at or below the minimum
+    // threshold is left untouched even when fully emptied.
+    let mut small: Vec<RowVersion> = Vec::with_capacity(16);
+    small.push(make_version(None, None));
+    let capacity_before = small.capacity();
+    MvStore::<MvccClock>::gc_version_chain(&mut small, 0, 0);
+    assert!(small.is_empty());
+    assert_eq!(small.capacity(), capacity_before);
+}
+
+/// `drop_unused_row_versions_and_slots` (used at checkpoint Finalize while the
+/// blocking checkpoint lock is held) must remove chain slots that GC emptied,
+/// unlike the lazy background variant which leaves them in the SkipMap.
+#[test]
+fn test_gc_with_slot_removal_drops_empty_skipmap_entries() {
+    let db = MvccTestDb::new();
+
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let row = generate_simple_string_row((-2).into(), 1, "will_rollback");
+    db.mvcc_store.insert(tx1, row).unwrap();
+    db.mvcc_store.rollback_tx(
+        tx1,
+        db.conn.pager.load().clone(),
+        &db.conn,
+        crate::MAIN_DB_ID,
+    );
+
+    // Rollback leaves aborted garbage behind in the chain.
+    let row_id = RowID::new((-2).into(), RowKey::Int(1));
+    assert!(db.mvcc_store.rows.get(&row_id).is_some());
+
+    // The slot-removing GC variant collects the garbage AND drops the slot.
+    // No concurrent writers exist in this test, satisfying the caller contract.
+    let dropped = db.mvcc_store.drop_unused_row_versions_and_slots();
+    assert_eq!(dropped, 1);
+    assert!(
+        db.mvcc_store.rows.get(&row_id).is_none(),
+        "empty chain slot should be removed from the SkipMap"
     );
 }
 
