@@ -1,7 +1,7 @@
 use super::{
     TryClone, TursoAllocExt, TursoFromIterator, TursoTryWithCapacityExt, TursoVecDequeExt,
 };
-use crate::alloc::{TryReserveError, VecDeque};
+use crate::{TryReserveError, VecDeque};
 
 #[cfg(not(nightly))]
 const fn vec_deque<T>() -> VecDeque<T> {
@@ -10,7 +10,7 @@ const fn vec_deque<T>() -> VecDeque<T> {
 
 #[cfg(nightly)]
 const fn vec_deque<T>() -> VecDeque<T> {
-    std::collections::VecDeque::new_in(crate::alloc::TursoAllocator)
+    std::collections::VecDeque::new_in(crate::TursoAllocator)
 }
 
 #[cfg(not(nightly))]
@@ -20,7 +20,7 @@ fn vec_deque_with_capacity<T>(capacity: usize) -> VecDeque<T> {
 
 #[cfg(nightly)]
 fn vec_deque_with_capacity<T>(capacity: usize) -> VecDeque<T> {
-    std::collections::VecDeque::with_capacity_in(capacity, crate::alloc::TursoAllocator)
+    std::collections::VecDeque::with_capacity_in(capacity, crate::TursoAllocator)
 }
 
 #[cfg(not(nightly))]

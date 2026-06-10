@@ -1,5 +1,5 @@
 use super::TursoAllocExt;
-use crate::alloc::BTreeMap;
+use crate::BTreeMap;
 
 #[cfg(not(nightly))]
 fn btree_map<K, V>() -> BTreeMap<K, V> {
@@ -8,7 +8,7 @@ fn btree_map<K, V>() -> BTreeMap<K, V> {
 
 #[cfg(nightly)]
 fn btree_map<K, V>() -> BTreeMap<K, V> {
-    std::collections::BTreeMap::new_in(crate::alloc::TursoAllocator)
+    std::collections::BTreeMap::new_in(crate::TursoAllocator)
 }
 
 #[cfg(not(nightly))]

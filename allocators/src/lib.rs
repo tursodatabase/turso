@@ -3,6 +3,10 @@
 //! Stable builds use `std` collections where allocator parameters are not
 //! available. Builds compiled with `--cfg nightly` use Rust's unstable
 //! `allocator_api` collection parameters.
+#![cfg_attr(
+    nightly,
+    feature(allocator_api, btreemap_alloc, clone_from_ref, try_with_capacity)
+)]
 
 use std::fmt;
 
@@ -75,18 +79,18 @@ macro_rules! __turso_alloc_vec_count {
 #[macro_export]
 macro_rules! __turso_alloc_vec {
     () => {
-        <$crate::alloc::Vec<_> as $crate::alloc::TursoAllocExt>::new()
+        <$crate::Vec<_> as $crate::TursoAllocExt>::new()
     };
     ($element:expr; $count:expr) => {{
         let count = $count;
         let mut values =
-            <$crate::alloc::Vec<_> as $crate::alloc::TursoVecExt<_>>::with_capacity(count);
+            <$crate::Vec<_> as $crate::TursoVecExt<_>>::with_capacity(count);
         values.resize(count, $element);
         values
     }};
     ($($element:expr),+ $(,)?) => {{
         let mut values =
-            <$crate::alloc::Vec<_> as $crate::alloc::TursoVecExt<_>>::with_capacity(
+            <$crate::Vec<_> as $crate::TursoVecExt<_>>::with_capacity(
                 $crate::__turso_alloc_vec_count!($($element),+),
             );
         $(values.push($element);)+
@@ -98,29 +102,29 @@ macro_rules! __turso_alloc_vec {
 #[macro_export]
 macro_rules! __turso_alloc_try_vec {
     () => {
-        Ok::<_, $crate::alloc::TryReserveError>(
-            <$crate::alloc::Vec<_> as $crate::alloc::TursoAllocExt>::new(),
+        Ok::<_, $crate::TryReserveError>(
+            <$crate::Vec<_> as $crate::TursoAllocExt>::new(),
         )
     };
     ($element:expr; $count:expr) => {{
         (|| {
             let count = $count;
             let mut values =
-                <$crate::alloc::Vec<_> as $crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
+                <$crate::Vec<_> as $crate::TursoTryWithCapacityExt>::try_with_capacity_ext(
                     count,
                 )?;
             values.resize(count, $element);
-            Ok::<_, $crate::alloc::TryReserveError>(values)
+            Ok::<_, $crate::TryReserveError>(values)
         })()
     }};
     ($($element:expr),+ $(,)?) => {{
         (|| {
             let mut values =
-                <$crate::alloc::Vec<_> as $crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
+                <$crate::Vec<_> as $crate::TursoTryWithCapacityExt>::try_with_capacity_ext(
                     $crate::__turso_alloc_vec_count!($($element),+),
                 )?;
             $(values.try_push($element)?;)+
-            Ok::<_, $crate::alloc::TryReserveError>(values)
+            Ok::<_, $crate::TryReserveError>(values)
         })()
     }};
 }
@@ -158,8 +162,17 @@ pub type LinkedList<T> = std::collections::LinkedList<T, TursoAllocator>;
 
 // TODO: design allocator-aware shared-pointer support that still preserves
 // shuttle's deterministic sync behavior.
-pub type Arc<T> = crate::sync::Arc<T>;
-pub type Weak<T> = crate::sync::Weak<T>;
+//
+// These aliases must stay in sync with `turso_core::sync` so that
+// `crate::alloc::Arc` and `crate::sync::Arc` remain the same type there.
+#[cfg(shuttle)]
+pub type Arc<T> = shuttle::sync::Arc<T>;
+#[cfg(shuttle)]
+pub type Weak<T> = shuttle::sync::Weak<T>;
+#[cfg(not(shuttle))]
+pub type Arc<T> = std::sync::Arc<T>;
+#[cfg(not(shuttle))]
+pub type Weak<T> = std::sync::Weak<T>;
 
 #[cfg(not(nightly))]
 pub type Rc<T> = std::rc::Rc<T>;

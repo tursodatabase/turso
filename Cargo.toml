@@ -3,6 +3,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "allocators",
     "bindings/java",
     "bindings/javascript",
     "bindings/javascript/sync",
@@ -45,6 +46,7 @@ members = [
 exclude = ["perf/latency/limbo"]
 
 default-members = [
+    "allocators",
     "bindings/java",
     "bindings/javascript",
     "bindings/javascript/sync",
@@ -98,6 +100,7 @@ turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.7.0-pre.6" }
 turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.7.0-pre.6" }
 limbo_completion = { path = "extensions/completion", version = "0.7.0-pre.6" }
 turso_core = { path = "core", version = "0.7.0-pre.6" }
+turso-allocators = { path = "allocators", version = "0.7.0-pre.6" }
 turso_sync_engine = { path = "sync/engine", version = "0.7.0-pre.6" }
 turso_ext = { path = "extensions/core", version = "0.7.0-pre.6" }
 turso_macros = { path = "macros", version = "0.7.0-pre.6" }

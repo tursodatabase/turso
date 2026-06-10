@@ -3,7 +3,7 @@ use std::hash::{BuildHasher, Hash};
 use rustc_hash::FxBuildHasher;
 
 use super::{TryClone, TursoFromIterator, TursoHashMapExt, TursoTryWithCapacityExt};
-use crate::alloc::{HashMap, TryReserveError};
+use crate::{HashMap, TryReserveError};
 
 impl<K, V, S> TursoHashMapExt<K, V> for HashMap<K, V, S>
 where

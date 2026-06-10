@@ -75,6 +75,7 @@ turso_ext = { workspace = true, features = ["core_only"] }
 cfg_block = "0.1.1"
 fallible-iterator = { workspace = true }
 allocator-api2 = { workspace = true }
+turso-allocators = { workspace = true }
 hex = { workspace = true }
 icu_collator = "2.2.0"
 icu_locale = "2.2.0"

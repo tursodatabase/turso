@@ -1,8 +1,8 @@
 use super::TursoNewExt;
-use crate::alloc::Arc;
+use crate::Arc;
 
 fn arc<T>(value: T) -> Arc<T> {
-    crate::sync::Arc::new(value)
+    crate::Arc::new(value)
 }
 
 impl<T> TursoNewExt<T> for Arc<T> {
@@ -13,7 +13,7 @@ impl<T> TursoNewExt<T> for Arc<T> {
 
 #[cfg(all(nightly, not(shuttle)))]
 impl<T: Clone> super::TryClone for Arc<T> {
-    type Error = crate::alloc::AllocError;
+    type Error = crate::AllocError;
 
     fn try_clone(&self) -> Result<Self, Self::Error> {
         let alloc = Self::allocator(self).clone();

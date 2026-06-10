@@ -1,0 +1,23 @@
+# Copyright 2023-2025 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso-allocators"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Allocator-aware collections and allocation backend for the Turso database"
+
+[lints]
+workspace = true
+
+[lib]
+name = "turso_allocators"
+
+[dependencies]
+allocator-api2 = { workspace = true }
+rustc-hash = "2.0"
+
+[target.'cfg(shuttle)'.dependencies]
+shuttle = { workspace = true }

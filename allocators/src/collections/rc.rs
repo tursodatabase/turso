@@ -1,5 +1,5 @@
 use super::TursoNewExt;
-use crate::alloc::Rc;
+use crate::Rc;
 
 #[cfg(not(nightly))]
 fn rc<T>(value: T) -> Rc<T> {
@@ -8,7 +8,7 @@ fn rc<T>(value: T) -> Rc<T> {
 
 #[cfg(nightly)]
 fn rc<T>(value: T) -> Rc<T> {
-    Rc::new_in(value, crate::alloc::TursoAllocator)
+    Rc::new_in(value, crate::TursoAllocator)
 }
 
 #[cfg(not(nightly))]
@@ -20,7 +20,7 @@ impl<T> TursoNewExt<T> for Rc<T> {
 
 #[cfg(nightly)]
 impl<T: Clone> super::TryClone for Rc<T> {
-    type Error = crate::alloc::AllocError;
+    type Error = crate::AllocError;
 
     fn try_clone(&self) -> Result<Self, Self::Error> {
         let alloc = Self::allocator(self).clone();

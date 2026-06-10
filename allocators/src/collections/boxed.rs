@@ -1,7 +1,7 @@
 use super::{TryClone, TursoBoxExt, TursoFromIterator, TursoNewExt, TursoTryNewExt};
 #[cfg(nightly)]
-use crate::alloc::TursoAllocator;
-use crate::alloc::{AllocError, Box, TryReserveError, Vec};
+use crate::TursoAllocator;
+use crate::{AllocError, Box, TryReserveError, Vec};
 
 #[cfg(not(nightly))]
 fn boxed<T>(value: T) -> Box<T> {

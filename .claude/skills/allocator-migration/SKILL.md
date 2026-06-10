@@ -7,6 +7,8 @@ description: Use when migrating Turso core code to crate::alloc, allocator-api2,
 
 Use this skill for Turso allocator migration work in `core`, especially when replacing standard heap collections with `crate::alloc` aliases or adding fallible allocation paths.
 
+The allocator foundation (aliases, extension traits, macros, backend) lives in the `turso-allocators` crate at `allocators/`. `turso_core` re-exports it as `turso_core::alloc`, so `crate::alloc::*` keeps working inside core.
+
 ## Core Rules
 
 - Use `crate::alloc::*` in migrated modules.
@@ -137,7 +139,7 @@ Keep foundation allocator work separate from migrations.
 
 Foundation commits include:
 
-- aliases in `core::alloc`
+- aliases in the `turso-allocators` crate (`allocators/`)
 - extension traits
 - `try_vec!`
 - `try_collect`
@@ -165,10 +167,16 @@ cargo fmt
 cargo check -p turso_core
 ```
 
+When touching the foundation crate, also check and test it directly:
+
+```bash
+cargo test -p turso-allocators
+```
+
 Before allocator-sensitive commits, also check the nightly cfg build:
 
 ```bash
-RUSTFLAGS="--cfg nightly" cargo +nightly check -p turso_core
+RUSTFLAGS="--cfg nightly" cargo +nightly check -p turso-allocators -p turso_core
 ```
 
 For allocator collection performance work, use the Divan comparison script. It

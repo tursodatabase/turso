@@ -4,7 +4,7 @@
 )]
 #![recursion_limit = "256"]
 
-pub mod alloc;
+pub use turso_allocators as alloc;
 pub mod busy;
 #[cfg(feature = "cli_only")]
 pub mod dbpage;

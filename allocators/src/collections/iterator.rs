@@ -1,5 +1,5 @@
 use super::{TursoFromIterator, TursoIteratorExt};
-use crate::alloc::TryReserveError;
+use crate::TryReserveError;
 
 impl<T, C> TursoFromIterator<Option<T>> for Option<C>
 where

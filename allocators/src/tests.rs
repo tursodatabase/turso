@@ -204,10 +204,10 @@ fn iterator_try_collect_converts_result_error() {
 
 #[test]
 fn iterator_try_collect_accepts_try_vec_results() {
-    let values: crate::Result<Vec<_>> = [1usize, 2]
+    let values: Result<Vec<_>, TryReserveError> = [1usize, 2]
         .into_iter()
         .map(|count| try_vec![false; count])
-        .try_collect::<crate::Result<Vec<_>>>()
+        .try_collect::<Result<Vec<_>, TryReserveError>>()
         .unwrap();
     let values = values.unwrap();
 

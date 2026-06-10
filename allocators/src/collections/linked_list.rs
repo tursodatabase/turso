@@ -1,5 +1,5 @@
 use super::TursoAllocExt;
-use crate::alloc::LinkedList;
+use crate::LinkedList;
 
 #[cfg(not(nightly))]
 fn linked_list<T>() -> LinkedList<T> {
@@ -8,7 +8,7 @@ fn linked_list<T>() -> LinkedList<T> {
 
 #[cfg(nightly)]
 fn linked_list<T>() -> LinkedList<T> {
-    std::collections::LinkedList::new_in(crate::alloc::TursoAllocator)
+    std::collections::LinkedList::new_in(crate::TursoAllocator)
 }
 
 #[cfg(not(nightly))]

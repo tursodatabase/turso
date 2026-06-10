@@ -6571,6 +6571,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso-allocators"
+version = "0.7.0-pre.6"
+dependencies = [
+ "allocator-api2 0.4.0",
+ "rustc-hash 2.1.1",
+ "shuttle",
+]
+
+[[package]]
 name = "turso-dbhash"
 version = "0.7.0-pre.6"
 dependencies = [
@@ -6705,6 +6714,7 @@ dependencies = [
  "thiserror 2.0.16",
  "tracing",
  "tracing-subscriber",
+ "turso-allocators",
  "turso_ext",
  "turso_macros",
  "turso_parser",

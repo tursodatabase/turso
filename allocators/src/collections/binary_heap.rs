@@ -1,41 +1,33 @@
-use super::{TryClone, TursoAllocExt, TursoFromIterator, TursoTryWithCapacityExt, TursoVecExt};
-#[cfg(nightly)]
-use crate::alloc::TursoAllocator;
-use crate::alloc::{TryReserveError, Vec};
+use super::*;
+use crate::*;
 
 #[cfg(not(nightly))]
-pub(super) const fn vec<T>() -> Vec<T> {
-    Vec::new()
+const fn binary_heap<T: Ord>() -> BinaryHeap<T> {
+    BinaryHeap::new()
 }
 
 #[cfg(nightly)]
-pub(super) const fn vec<T>() -> Vec<T> {
-    Vec::new_in(TursoAllocator)
+const fn binary_heap<T: Ord>() -> BinaryHeap<T> {
+    BinaryHeap::new_in(crate::TursoAllocator)
 }
 
 #[cfg(not(nightly))]
-fn vec_with_capacity<T>(capacity: usize) -> Vec<T> {
-    Vec::with_capacity(capacity)
-}
-
-#[cfg(nightly)]
-fn vec_with_capacity<T>(capacity: usize) -> Vec<T> {
-    Vec::with_capacity_in(capacity, TursoAllocator)
-}
-
-impl<T> TursoAllocExt for Vec<T> {
+impl<T: Ord> TursoAllocExt for BinaryHeap<T> {
     #[inline(always)]
     fn new() -> Self {
-        vec()
+        binary_heap()
     }
 }
 
-impl<T> TursoVecExt<T> for Vec<T> {
+#[cfg(nightly)]
+impl<T: Ord> TursoAllocExt for BinaryHeap<T> {
     #[inline(always)]
-    fn with_capacity(capacity: usize) -> Self {
-        vec_with_capacity(capacity)
+    fn new() -> Self {
+        binary_heap()
     }
+}
 
+impl<T: Ord> TursoBinaryHeapExt<T> for BinaryHeap<T> {
     #[inline(always)]
     fn try_push(&mut self, value: T) -> Result<(), TryReserveError> {
         self.push(value);
@@ -43,14 +35,25 @@ impl<T> TursoVecExt<T> for Vec<T> {
     }
 }
 
-impl<T> TursoTryWithCapacityExt for Vec<T> {
+impl<T: Ord> TursoTryWithCapacityExt for BinaryHeap<T> {
     #[inline(always)]
     fn try_with_capacity_ext(capacity: usize) -> Result<Self, TryReserveError> {
-        Ok(vec_with_capacity(capacity))
+        #[cfg(not(nightly))]
+        {
+            Ok(BinaryHeap::with_capacity(capacity))
+        }
+        #[cfg(nightly)]
+        {
+            Ok(BinaryHeap::with_capacity_in(
+                capacity,
+                crate::TursoAllocator,
+            ))
+        }
     }
 }
 
-impl<T> TursoFromIterator<T> for Vec<T> {
+// For these 2 impls we use std::vec because on `stable` we can't use allocator on BinaryHeap, but on nightly we can
+impl<T: Ord> TursoFromIterator<T> for BinaryHeap<T> {
     #[inline(always)]
     fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
     where
@@ -62,9 +65,10 @@ impl<T> TursoFromIterator<T> for Vec<T> {
         }
         #[cfg(nightly)]
         {
-            let mut values = vec();
+            // We use std::vec here because on stable we dont have allocators for BinaryHeap. On Nightly, we create a Vec with the TursoAllocator
+            let mut values = super::vec::vec();
             values.extend(iter);
-            Ok(values)
+            Ok(BinaryHeap::from(values))
         }
     }
 
@@ -78,7 +82,7 @@ impl<T> TursoFromIterator<T> for Vec<T> {
     }
 }
 
-impl<T: Clone> TryClone for Vec<T> {
+impl<T: Clone + Ord> TryClone for BinaryHeap<T> {
     type Error = TryReserveError;
 
     #[inline(always)]
@@ -88,8 +92,9 @@ impl<T: Clone> TryClone for Vec<T> {
         #[cfg(nightly)]
         let mut cloned = {
             let alloc = self.allocator().clone();
-            Self::try_with_capacity_in(self.len(), alloc).map_err(TryReserveError::from)?
+            Self::new_in(alloc)
         };
+        cloned.try_reserve(self.len())?;
         cloned.extend(self.iter().cloned());
         Ok(cloned)
     }

@@ -1,5 +1,5 @@
 use super::TursoAllocExt;
-use crate::alloc::BTreeSet;
+use crate::BTreeSet;
 
 #[cfg(not(nightly))]
 fn btree_set<T>() -> BTreeSet<T> {
@@ -8,7 +8,7 @@ fn btree_set<T>() -> BTreeSet<T> {
 
 #[cfg(nightly)]
 fn btree_set<T>() -> BTreeSet<T> {
-    BTreeSet::new_in(crate::alloc::TursoAllocator)
+    BTreeSet::new_in(crate::TursoAllocator)
 }
 
 impl<T> TursoAllocExt for BTreeSet<T> {
