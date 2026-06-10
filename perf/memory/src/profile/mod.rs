@@ -1,4 +1,5 @@
 pub mod checkpoint;
+pub mod create_index;
 pub mod insert;
 pub mod mixed;
 pub mod read;

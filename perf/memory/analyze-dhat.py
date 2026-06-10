@@ -21,6 +21,7 @@ Examples:
 import argparse
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 METRICS = {
@@ -30,6 +31,11 @@ METRICS = {
     "gb": ("Bytes live at global peak", "gb", "gbk"),
     "eb": ("Bytes live at exit", "eb", "ebk"),
 }
+
+TRACE_OVERHEAD_PATTERNS = (
+    "memory_benchmark::trace",
+    "memory/src/trace.rs",
+)
 
 
 def format_bytes(b: int) -> str:
@@ -90,6 +96,33 @@ def build_callstack(pp: dict, ftbl: list[str], max_depth: int = 8) -> list[str]:
     return frames
 
 
+def is_trace_overhead_pp(pp: dict, ftbl: list[str]) -> bool:
+    frames = [ftbl[i] for i in pp["fs"] if i < len(ftbl)]
+    return any(any(pattern in frame for pattern in TRACE_OVERHEAD_PATTERNS) for frame in frames)
+
+
+def split_trace_overhead(pps: list[dict], ftbl: list[str]) -> tuple[list[dict], list[dict]]:
+    kept = []
+    ignored = []
+    for pp in pps:
+        if is_trace_overhead_pp(pp, ftbl):
+            ignored.append(pp)
+        else:
+            kept.append(pp)
+    return kept, ignored
+
+
+def sum_pps(pps: list[dict]) -> dict:
+    return {
+        "tb": sum(pp["tb"] for pp in pps),
+        "tbk": sum(pp["tbk"] for pp in pps),
+        "gb": sum(pp["gb"] for pp in pps),
+        "gbk": sum(pp["gbk"] for pp in pps),
+        "eb": sum(pp["eb"] for pp in pps),
+        "ebk": sum(pp["ebk"] for pp in pps),
+    }
+
+
 def aggregate_by_source(pps: list[dict], ftbl: list[str]) -> dict:
     """Aggregate allocation stats by source location (first relevant frame)."""
     agg = {}
@@ -104,30 +137,140 @@ def aggregate_by_source(pps: list[dict], ftbl: list[str]) -> dict:
     return agg
 
 
-def print_summary(data: dict):
+def print_summary(data: dict, pps: list[dict], ignored_trace_pps: list[dict]):
     """Print the global summary from the dhat file."""
     te = data.get("te", 0)
     tg = data.get("tg", 0)
-    pps = data["pps"]
-
-    total_bytes = sum(pp["tb"] for pp in pps)
-    total_blocks = sum(pp["tbk"] for pp in pps)
-    peak_bytes = sum(pp["gb"] for pp in pps)
-    peak_blocks = sum(pp["gbk"] for pp in pps)
-    end_bytes = sum(pp["eb"] for pp in pps)
-    end_blocks = sum(pp["ebk"] for pp in pps)
+    totals = sum_pps(pps)
 
     print("=" * 70)
     print("DHAT HEAP ANALYSIS REPORT")
     print("=" * 70)
     print(f"Command:         {data.get('cmd', 'N/A')}")
     print(f"Allocation sites: {len(pps)}")
+    if ignored_trace_pps:
+        ignored = sum_pps(ignored_trace_pps)
+        print(
+            f"Trace overhead:   ignored {len(ignored_trace_pps)} sites "
+            f"({format_bytes(ignored['tb'])} total, {format_bytes(ignored['gb'])} at t-gmax)"
+        )
     print(f"Total runtime:   {te / 1_000_000:.2f}s")
     print(f"Global peak at:  {tg / 1_000_000:.2f}s")
     print()
-    print(f"Total allocated:        {format_bytes(total_bytes)} in {total_blocks:,} blocks")
-    print(f"At global peak (t-gmax): {format_bytes(peak_bytes)} in {peak_blocks:,} blocks")
-    print(f"At exit (t-end):         {format_bytes(end_bytes)} in {end_blocks:,} blocks")
+    print(f"Total allocated:        {format_bytes(totals['tb'])} in {totals['tbk']:,} blocks")
+    print(f"At global peak (t-gmax): {format_bytes(totals['gb'])} in {totals['gbk']:,} blocks")
+    print(f"At exit (t-end):         {format_bytes(totals['eb'])} in {totals['ebk']:,} blocks")
+    print()
+
+
+def format_time_us(us: int) -> str:
+    return f"{us / 1_000_000:.6f}s"
+
+
+def event_start_us(event: dict) -> int:
+    return event.get("at_us", event.get("begin_us", 0))
+
+
+def event_end_us(event: dict) -> int:
+    return event.get("at_us", event.get("end_us", event_start_us(event)))
+
+
+def overlaps_time(event: dict, target_us: int, window_us: int) -> bool:
+    return event_start_us(event) - window_us <= target_us <= event_end_us(event) + window_us
+
+
+def summarize_sql_templates(event: dict, limit: int = 5) -> list[tuple[str, int]]:
+    if "sql_summary" in event:
+        items = [(row["sql"], row["count"]) for row in event["sql_summary"]]
+        items.sort(key=lambda item: item[1], reverse=True)
+        return items[:limit]
+    return Counter(event.get("sql", [])).most_common(limit)
+
+
+def print_trace_correlation(trace: dict, target_us: int, window_us: int):  # noqa: C901
+    events = trace.get("events", [])
+    phase_markers = sorted(
+        (event for event in events if event.get("kind") == "phase_marker"),
+        key=event_start_us,
+    )
+    current_phase = None
+    for event in phase_markers:
+        if event["at_us"] <= target_us:
+            current_phase = event
+        else:
+            break
+
+    active_batches = [
+        event for event in events if event.get("kind") == "batch" and overlaps_time(event, target_us, window_us)
+    ]
+    active_statements = [
+        event for event in events if event.get("kind") == "statement" and overlaps_time(event, target_us, window_us)
+    ]
+    active_batches.sort(key=lambda event: (event.get("connection", 0), event.get("batch", 0)))
+    active_statements.sort(
+        key=lambda event: (event.get("connection", 0), event.get("batch", 0), event.get("statement", 0))
+    )
+
+    print("-" * 70)
+    print(f"WORKLOAD TRACE AT DHAT GLOBAL PEAK ({format_time_us(target_us)})")
+    if window_us:
+        print(f"Window: +/- {window_us}us")
+    print("-" * 70)
+
+    if current_phase:
+        print(f"Phase: {current_phase['phase']} (entered at {format_time_us(current_phase['at_us'])})")
+    else:
+        print("Phase: <no phase marker before peak>")
+
+    if active_batches:
+        print()
+        print(f"Active batches: {len(active_batches)}")
+        for event in active_batches[:10]:
+            print(
+                f"  conn={event['connection']} batch={event['batch']} phase={event['phase']} "
+                f"statements={event['statement_count']} "
+                f"[{format_time_us(event['begin_us'])}, {format_time_us(event['end_us'])}]"
+            )
+            for sql, count in summarize_sql_templates(event):
+                print(f"    {count:>5}x {sql}")
+        if len(active_batches) > 10:
+            print(f"  ... {len(active_batches) - 10} more active batches")
+    else:
+        print()
+        print("Active batches: none")
+
+    if active_statements:
+        print()
+        print(f"Active statements: {len(active_statements)}")
+        for event in active_statements[:20]:
+            print(
+                f"  conn={event['connection']} batch={event['batch']} stmt={event['statement']} "
+                f"phase={event['phase']} [{format_time_us(event['begin_us'])}, {format_time_us(event['end_us'])}]"
+            )
+            print(f"    {event['sql']}")
+        if len(active_statements) > 20:
+            print(f"  ... {len(active_statements) - 20} more active statements")
+    else:
+        print()
+        print("Active statements: none")
+
+    if not active_batches and not active_statements:
+        nearby = sorted(
+            (event for event in events if event.get("kind") in ("batch", "statement")),
+            key=lambda event: min(
+                abs(target_us - event_start_us(event)),
+                abs(target_us - event_end_us(event)),
+            ),
+        )[:5]
+        if nearby:
+            print()
+            print("Nearest workload events:")
+            for event in nearby:
+                print(
+                    f"  {event['kind']} conn={event.get('connection')} batch={event.get('batch')} "
+                    f"phase={event.get('phase')} "
+                    f"[{format_time_us(event_start_us(event))}, {format_time_us(event_end_us(event))}]"
+                )
     print()
 
 
@@ -246,6 +389,23 @@ def main():
     parser.add_argument("--stacks", action="store_true", help="Show full callstacks for top allocation sites")
     parser.add_argument("--modules", action="store_true", help="Show per-module/crate summary")
     parser.add_argument(
+        "--trace",
+        type=str,
+        default=None,
+        help="Path to memory-benchmark workload trace JSON for t-gmax correlation",
+    )
+    parser.add_argument(
+        "--trace-window-us",
+        type=int,
+        default=0,
+        help="Include trace events within this many microseconds of t-gmax (default: 0)",
+    )
+    parser.add_argument(
+        "--include-trace-overhead",
+        action="store_true",
+        help="Keep memory-benchmark trace bookkeeping allocation sites in allocation reports",
+    )
+    parser.add_argument(
         "--json", action="store_true", help="Output aggregated data as JSON (for programmatic consumption)"
     )
     args = parser.parse_args()
@@ -260,6 +420,10 @@ def main():
 
     pps = data["pps"]
     ftbl = data["ftbl"]
+    ignored_trace_pps = []
+
+    if args.trace and not args.include_trace_overhead:
+        pps, ignored_trace_pps = split_trace_overhead(pps, ftbl)
 
     if args.json:
         agg = aggregate_by_source(pps, ftbl)
@@ -271,7 +435,19 @@ def main():
         print()
         return
 
-    print_summary(data)
+    print_summary(data, pps, ignored_trace_pps)
+    if args.trace:
+        trace_path = Path(args.trace)
+        if not trace_path.exists():
+            print(f"Error: {trace_path} not found.", file=sys.stderr)
+            sys.exit(1)
+        if "tg" not in data:
+            print("Error: dhat file does not contain a global peak timestamp.", file=sys.stderr)
+            sys.exit(1)
+        with open(trace_path) as f:
+            trace = json.load(f)
+        print_trace_correlation(trace, int(data["tg"]), args.trace_window_us)
+
     agg = aggregate_by_source(pps, ftbl)
     print_top_sites(agg, args.sort_by, args.top, args.filter)
 

@@ -95,17 +95,29 @@ cargo run --release -p memory-benchmark -- --mode wal --workload read-heavy --ch
 # All CLI options
 cargo run --release -p memory-benchmark -- \
   --mode wal|mvcc \
-  --workload insert-heavy|read-heavy|mixed|scan-heavy|series-blob \
+  --workload insert-heavy|read-heavy|mixed|scan-heavy|series-blob|create-index \
   -i <iterations> \
   -b <batch-size> \
   --connections <N> \
   --checkpoint \
   --timeout <ms> \
   --cache-size <pages> \
+  --trace-workload \
+  --trace-output memory-benchmark-trace.json \
   --format human|json|csv
 ```
 
 Every run produces a `dhat-heap.json` in the current directory. This file contains per-allocation-site data for the entire run.
+
+Use `--trace-workload` when you need to correlate the DHAT heap profile with
+the workload phase and SQL running at a given time. It writes a JSON sidecar
+(`memory-benchmark-trace.json` by default, configurable with `--trace-output`)
+with phase markers, batch intervals, and per-statement intervals. Timestamps are
+microseconds from the same monotonic clock as the DHAT profile, captured
+immediately after profiler initialization. The trace records SQL templates, not
+parameter values. Batch events store compact SQL template counts; setup batches
+are traced as batches only, so large seed phases do not create one trace event
+per inserted row.
 
 ## Built-in Workload Profiles
 
@@ -116,6 +128,7 @@ Every run produces a `dhat-heap.json` in the current directory. This file contai
 | `mixed` | 50% SELECT / 50% INSERT | Seeds 10k rows |
 | `scan-heavy` | Full table scans with LIKE | Seeds 10k rows |
 | `series-blob` | `INSERT INTO bench(data) SELECT zeroblob(2048) FROM generate_series(1, ?)` | Creates `bench`; `batch-size` is the series length |
+| `create-index` | `CREATE INDEX idx_bench_data_value ON bench(data, value)` over a populated table | Seeds `iterations * batch-size` rows, then creates one index in the run phase |
 
 Profiles implement the `Profile` trait in `perf/memory/src/profile/`. To add a new workload, create a new file implementing the trait and wire it into the `WorkloadProfile` enum in `main.rs`.
 
@@ -164,6 +177,9 @@ python3 perf/memory/analyze-dhat.py dhat-heap.json --sort-by mb  # max live byte
 
 # JSON output for programmatic use
 python3 perf/memory/analyze-dhat.py dhat-heap.json --json
+
+# Correlate DHAT global heap peak with workload phase and active SQL
+python3 perf/memory/analyze-dhat.py dhat-heap.json --trace memory-benchmark-trace.json
 ```
 
 ### Sort Metrics
@@ -182,6 +198,14 @@ python3 perf/memory/analyze-dhat.py dhat-heap.json --json
 - `--filter PATTERN` — Filter to sites/stacks containing substring (e.g. `mvcc`, `btree`, `wal`, `pager`)
 - `--stacks` — Show full callstacks for top allocation sites
 - `--modules` — Aggregate by crate/module for a high-level breakdown
+- `--trace FILE` — Load a `--trace-workload` sidecar and print the phase,
+  active batches, and active statements overlapping DHAT's global heap peak.
+  Allocation summaries automatically ignore benchmark trace bookkeeping sites
+  when this flag is present.
+- `--trace-window-us N` — Include trace events within N microseconds of the
+  global peak when exact overlap is too narrow
+- `--include-trace-overhead` — Keep trace bookkeeping allocation sites in the
+  DHAT allocation summary when comparing raw profiler output
 - `--json` — Machine-readable aggregated output
 
 ## Typical Workflow
