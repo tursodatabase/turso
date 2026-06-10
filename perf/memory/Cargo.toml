@@ -3,6 +3,7 @@ name = "memory-benchmark"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
+default-run = "memory-benchmark"
 
 [[bin]]
 name = "memory-benchmark"

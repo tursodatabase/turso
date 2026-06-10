@@ -15,8 +15,16 @@ instead of parsing stderr log text.
 ## Location
 
 - Benchmark crate: `perf/memory/`
+- CodSpeed bench crate: `perf/memory/codspeed/` (CI allocation regression tracking)
 - Analysis script: `perf/memory/analyze-dhat.py`
 - dhat output: `dhat-heap.json` (written to CWD after each run)
+
+The crate is split into a library and binaries. The workload engine lives in
+`memory_benchmark::workload` (`run_workload`, `WorkloadConfig`,
+`WorkloadObserver`, the `JournalMode`/`WorkloadProfile` enums and
+`create_profile`); the `memory-benchmark` bin is a thin CLI over it that adds
+dhat/RSS measurement. Randomized profiles (`read-heavy`, `mixed`) use a fixed
+RNG seed (`profile::WORKLOAD_RNG_SEED`) so workloads are identical across runs.
 
 ## Running Stack Reports
 
@@ -220,12 +228,48 @@ When `--connections > 1`:
 - WAL mode uses `BEGIN`, MVCC uses `BEGIN CONCURRENT`
 - The `Profile` trait's `next_batch(connections)` returns one batch per connection with non-overlapping row IDs
 
+## CodSpeed Allocation Tracking in CI
+
+`.github/workflows/codspeed-memory.yml` runs every workload profile under both
+journal modes with CodSpeed's memory instrument (eBPF-based malloc tracking:
+peak memory, total allocated, allocation count) so allocation regressions show
+up on PRs. The bench harness is the separate crate `perf/memory/codspeed/`
+(criterion benchmarks named `<mode>/<workload>`, e.g. `mvcc/insert-heavy`,
+with much smaller iteration counts than the CLI defaults). The workflow builds
+the bench binary once, then fans out one CI job per workload profile, each
+filtering benchmarks by name — the sharding pattern from CodSpeed's
+sharded-benchmarks docs.
+
+The bench crate must stay free of `[[bin]]` targets: cargo builds a package's
+bins (panic=abort under the release profile) alongside its benches
+(panic=unwind), and the duplicated `turso_sdk_kit` cdylib/staticlib units then
+collide on unhashed output filenames and break the build. That is why the
+bench does not live in `perf/memory` itself.
+
+Run locally:
+
+```bash
+# Quick correctness pass (runs each benchmark once)
+cargo bench -p memory-benchmark-codspeed --bench memory_profiles -- --test
+
+# What CI runs (requires cargo-codspeed; uninstrumented outside the CodSpeed runner)
+cargo codspeed build -m memory -p memory-benchmark-codspeed --features codspeed
+cargo codspeed run -m memory -p memory-benchmark-codspeed --bench memory_profiles "insert-heavy"
+```
+
+Do NOT run plain `cargo bench -p memory-benchmark-codspeed` without `-- --test`
+unless you want full criterion sampling — each sample executes an entire
+workload.
+
 ## Adding a New Profile
 
 1. Create `perf/memory/src/profile/your_profile.rs` implementing the `Profile` trait
 2. Add `pub mod your_profile;` to `perf/memory/src/profile/mod.rs`
-3. Add a variant to `WorkloadProfile` enum in `main.rs`
-4. Wire it into `create_profile()` in `main.rs`
+3. Add a variant to `WorkloadProfile` enum in `src/workload.rs`
+4. Wire it into `create_profile()` in `src/workload.rs`
+5. Add it to `WORKLOADS` (and `workload_size`) in
+   `perf/memory/codspeed/benches/memory_profiles.rs` and to the `workload`
+   matrix in `.github/workflows/codspeed-memory.yml` so CI tracks it
 
 The `Profile` trait:
 ```rust
