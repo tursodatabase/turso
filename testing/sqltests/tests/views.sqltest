@@ -308,3 +308,51 @@ test view-reserved-prefix-sqlite {
 expect error {
     object name reserved for internal use: sqlite_view
 }
+
+# CREATE VIEW IF NOT EXISTS on an existing view is a no-op in SQLite
+# (the second definition is silently ignored).
+@cross-check-integrity
+test view-if-not-exists-idempotent {
+    CREATE TABLE t_ine(a INTEGER);
+    INSERT INTO t_ine VALUES (7);
+    CREATE VIEW IF NOT EXISTS v_ine AS SELECT a FROM t_ine;
+    CREATE VIEW IF NOT EXISTS v_ine AS SELECT a + 1 AS a FROM t_ine;
+    SELECT a FROM v_ine;
+}
+expect {
+    7
+}
+
+@cross-check-integrity
+test view-duplicate-without-if-not-exists-errors {
+    CREATE TABLE t_dup(a INTEGER);
+    CREATE VIEW v_dup AS SELECT a FROM t_dup;
+    CREATE VIEW v_dup AS SELECT a FROM t_dup;
+}
+expect error {
+    already exists
+}
+
+# Column names in the view column list must survive re-serialization into
+# sqlite_schema with proper quoting.
+@cross-check-integrity
+test view-bracket-column-list {
+    CREATE TABLE t_vb(a INTEGER);
+    INSERT INTO t_vb VALUES (3);
+    CREATE VIEW v_vb([col one]) AS SELECT a FROM t_vb;
+    SELECT [col one] FROM v_vb;
+}
+expect {
+    3
+}
+
+@cross-check-integrity
+test view-quoted-column-list {
+    CREATE TABLE t_vq(a INTEGER);
+    INSERT INTO t_vq VALUES (4);
+    CREATE VIEW v_vq("col two") AS SELECT a FROM t_vq;
+    SELECT "col two" FROM v_vq;
+}
+expect {
+    4
+}

@@ -2908,3 +2908,26 @@ expect {
     table|purchases|purchases
     trigger|tr|purchases
 }
+
+# SQLite allows ALTER TABLE ADD COLUMN with a non-constant default as long
+# as the table is empty; new inserts evaluate the default expression.
+@cross-check-integrity
+test alter-table-add-column-nonconstant-default-empty-table {
+    CREATE TABLE t_ncd(x INTEGER);
+    ALTER TABLE t_ncd ADD COLUMN b DEFAULT (abs(-7));
+    INSERT INTO t_ncd(x) VALUES (1);
+    SELECT x, b FROM t_ncd;
+}
+expect {
+    1|7
+}
+
+@cross-check-integrity
+test alter-table-add-column-nonconstant-default-nonempty-table-errors {
+    CREATE TABLE t_ncd2(x INTEGER);
+    INSERT INTO t_ncd2 VALUES (1);
+    ALTER TABLE t_ncd2 ADD COLUMN b DEFAULT (abs(-7));
+}
+expect error {
+    Cannot add a column with non-constant default
+}

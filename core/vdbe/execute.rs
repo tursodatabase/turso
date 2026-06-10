@@ -11451,6 +11451,7 @@ pub fn op_drop_view(
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_view(view_name).ok();
+        schema.broken_views.remove(view_name);
     });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
