@@ -100,6 +100,10 @@ cargo run --release -p memory-benchmark -- --mode mvcc --workload mixed -i 100 -
 # Run a final checkpoint after the workload
 cargo run --release -p memory-benchmark -- --mode wal --workload read-heavy --checkpoint
 
+# Guarantee automatic MVCC checkpoints during the run by lowering the
+# logical-log threshold (default is ~4 MB, more than small workloads write)
+cargo run --release -p memory-benchmark -- --mode mvcc --workload insert-heavy --mvcc-checkpoint-threshold 16384
+
 # All CLI options
 cargo run --release -p memory-benchmark -- \
   --mode wal|mvcc \
@@ -108,6 +112,7 @@ cargo run --release -p memory-benchmark -- \
   -b <batch-size> \
   --connections <N> \
   --checkpoint \
+  --mvcc-checkpoint-threshold <bytes> \
   --timeout <ms> \
   --cache-size <pages> \
   --format human|json|csv
@@ -238,7 +243,11 @@ up on PRs. The bench harness is the separate crate `perf/memory/codspeed/`
 `mvcc/insert-heavy/2000`, with much smaller iteration counts than the CLI
 defaults). Each (mode, workload) pair runs at 1x/2x/4x scale — same batch
 size, more iterations — so comparing the sizes shows how memory grows with
-workload volume. The workflow builds
+workload volume, plus an 8x `<ops>-checkpoint` variant that guarantees
+checkpointing is part of the measurement: it lowers
+`mvcc_checkpoint_threshold` to 16 KiB so MVCC auto-checkpoints fire mid-run
+(WAL's 1000-frame threshold is hardcoded in `core/storage/wal.rs`) and ends
+with an explicit `PRAGMA wal_checkpoint(TRUNCATE)`. The workflow builds
 the bench binary once, then fans out one CI job per workload profile, each
 filtering benchmarks by name — the sharding pattern from CodSpeed's
 sharded-benchmarks docs.

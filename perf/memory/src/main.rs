@@ -61,6 +61,11 @@ struct Args {
     /// Run a final checkpoint after the workload completes
     #[arg(long)]
     checkpoint: bool,
+
+    /// MVCC logical-log auto-checkpoint threshold in bytes
+    /// (PRAGMA mvcc_checkpoint_threshold); -1 disables. MVCC mode only
+    #[arg(long = "mvcc-checkpoint-threshold")]
+    mvcc_checkpoint_threshold: Option<i64>,
 }
 
 /// Takes RSS snapshots at phase transitions and tracks the RSS peak after
@@ -120,6 +125,7 @@ async fn async_main(args: Args) -> Result<()> {
         timeout: Duration::from_millis(args.timeout),
         cache_size: args.cache_size,
         checkpoint: args.checkpoint,
+        mvcc_checkpoint_threshold: args.mvcc_checkpoint_threshold,
     };
 
     let start = Instant::now();

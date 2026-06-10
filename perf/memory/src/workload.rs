@@ -56,6 +56,12 @@ pub struct WorkloadConfig {
     pub timeout: Duration,
     pub cache_size: Option<i64>,
     pub checkpoint: bool,
+    /// MVCC logical-log auto-checkpoint threshold in bytes (`PRAGMA
+    /// mvcc_checkpoint_threshold`). Lowering it below the amount of log the
+    /// workload writes guarantees automatic checkpoints fire during the run.
+    /// Only meaningful in MVCC mode; WAL's 1000-frame threshold is not
+    /// configurable.
+    pub mvcc_checkpoint_threshold: Option<i64>,
 }
 
 /// Hooks invoked at workload milestones so callers can take measurements.
@@ -115,6 +121,12 @@ pub async fn run_workload(
     if let Some(cache_size) = cfg.cache_size {
         setup_conn
             .pragma_update("cache_size", &cache_size.to_string())
+            .await?;
+    }
+
+    if let Some(threshold) = cfg.mvcc_checkpoint_threshold {
+        setup_conn
+            .pragma_update("mvcc_checkpoint_threshold", &threshold.to_string())
             .await?;
     }
 
