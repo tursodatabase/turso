@@ -1,5 +1,5 @@
 use crate::sync::Arc;
-use crate::{schema::BTreeTable, turso_assert_eq, turso_assert_ne};
+use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_ne};
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,
@@ -1219,6 +1219,11 @@ pub fn translate_alter_table(
                 return Err(LimboError::ParseError(
                     "cannot add a STORED column".to_string(),
                 ));
+            }
+            if is_generated && !connection.experimental_generated_columns_enabled() {
+                bail_parse_error!(
+                    "Generated columns require --experimental-generated-columns flag"
+                );
             }
             if is_generated {
                 for c in &col_def.constraints {
