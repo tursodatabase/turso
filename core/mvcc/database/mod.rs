@@ -4,6 +4,8 @@ use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::{Schema, Table};
+use crate::skiplist::map::Entry;
+use crate::skiplist::SkipMap;
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
 use crate::state_machine::TransitionResult;
@@ -41,8 +43,6 @@ use crate::{
     turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable, Numeric,
 };
 use crate::{Connection, Pager, SyncMode};
-use crossbeam_skiplist::map::Entry;
-use crossbeam_skiplist::SkipMap;
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
 use std::collections::BTreeSet;
@@ -4886,7 +4886,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn find_next_visible_index_row<'a, I>(&self, tx: &Transaction, mut rows: I) -> Option<RowID>
     where
         I: Iterator<
-            Item = crossbeam_skiplist::map::Entry<
+            Item = crate::skiplist::map::Entry<
                 'a,
                 Arc<SortableIndexKey>,
                 Arc<RwLock<Vec<RowVersion>>>,

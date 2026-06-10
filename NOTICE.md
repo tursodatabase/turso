@@ -41,6 +41,12 @@ This project depends on libm, distributed by the rust-lang project:
 * License: licenses/extensions/libm-mit-license.md (MIT License)
 * Homepage: https://github.com/rust-lang/libm
 
+This project includes a vendored copy of crossbeam-skiplist (in `core/skiplist`), distributed by the Crossbeam project developers:
+
+* License: licenses/core/crossbeam-skiplist-apache-license.md (Apache License v2.0)
+* License: licenses/core/crossbeam-skiplist-mit-license.md (MIT License)
+* Homepage: https://github.com/crossbeam-rs/crossbeam
+
 This project depends on pastey, distributed by the pastey authors:
 
 * License: licenses/core/pastey-apache-license.md (Apache License v2.0)

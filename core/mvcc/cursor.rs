@@ -1,6 +1,6 @@
+use crate::skiplist::map::Entry;
+use crate::skiplist::SkipMap;
 use crate::turso_assert;
-use crossbeam_skiplist::map::Entry;
-use crossbeam_skiplist::SkipMap;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
@@ -308,7 +308,7 @@ pub(crate) type MvccIterator<'l, T> =
 ///
 /// # Why a macro instead of a function?
 ///
-/// Rust's `crossbeam_skiplist::map::Entry<'a, K, V>` is *invariant* over `K`, meaning
+/// Rust's `crate::skiplist::map::Entry<'a, K, V>` is *invariant* over `K`, meaning
 /// the lifetime `'a` cannot be coerced through a function boundary. When we try to pass
 /// `Box<dyn Iterator<Item = Entry<'_, K, V>>>` to a function expecting a generic lifetime,
 /// the compiler cannot unify the lifetimes across the function call.
