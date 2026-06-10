@@ -234,8 +234,11 @@ When `--connections > 1`:
 journal modes with CodSpeed's memory instrument (eBPF-based malloc tracking:
 peak memory, total allocated, allocation count) so allocation regressions show
 up on PRs. The bench harness is the separate crate `perf/memory/codspeed/`
-(criterion benchmarks named `<mode>/<workload>`, e.g. `mvcc/insert-heavy`,
-with much smaller iteration counts than the CLI defaults). The workflow builds
+(criterion benchmarks named `<mode>/<workload>/<total-ops>`, e.g.
+`mvcc/insert-heavy/2000`, with much smaller iteration counts than the CLI
+defaults). Each (mode, workload) pair runs at 1x/2x/4x scale — same batch
+size, more iterations — so comparing the sizes shows how memory grows with
+workload volume. The workflow builds
 the bench binary once, then fans out one CI job per workload profile, each
 filtering benchmarks by name — the sharding pattern from CodSpeed's
 sharded-benchmarks docs.
@@ -267,7 +270,7 @@ workload.
 2. Add `pub mod your_profile;` to `perf/memory/src/profile/mod.rs`
 3. Add a variant to `WorkloadProfile` enum in `src/workload.rs`
 4. Wire it into `create_profile()` in `src/workload.rs`
-5. Add it to `WORKLOADS` (and `workload_size`) in
+5. Add it to `WORKLOADS` (and `base_workload_size`) in
    `perf/memory/codspeed/benches/memory_profiles.rs` and to the `workload`
    matrix in `.github/workflows/codspeed-memory.yml` so CI tracks it
 

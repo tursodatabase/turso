@@ -1,11 +1,18 @@
 //! CodSpeed-instrumented benchmarks over the memory-benchmark workload
-//! profiles. Each benchmark runs one (journal mode, workload) combination
-//! against a fresh database so CodSpeed's memory instrument can track the
-//! allocations of the whole workload.
+//! profiles. Each benchmark runs one (journal mode, workload, size)
+//! combination against a fresh database so CodSpeed's memory instrument can
+//! track the allocations of the whole workload.
+//!
+//! Every (mode, workload) pair runs at 1x/2x/4x scale (more iterations, same
+//! batch size) and the benchmark name carries the total operation count, e.g.
+//! `mvcc/insert-heavy/2000`. Comparing the sizes shows how memory scales with
+//! workload volume: total allocated bytes should grow roughly linearly, while
+//! peak memory staying flat-ish indicates memory is being reclaimed rather
+//! than accumulated.
 //!
 //! Workload sizes are deliberately much smaller than the CLI defaults: under
-//! CodSpeed instrumentation every run executes roughly 30-50x slower than
-//! native, and each benchmark in the suite runs in its own CI shard.
+//! CodSpeed instrumentation every run executes slower than native, and each
+//! workload's size series runs in its own CI shard.
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -29,12 +36,18 @@ const WORKLOADS: [WorkloadProfile; 5] = [
     WorkloadProfile::SeriesBlob,
 ];
 
-/// Per-workload sizing. Scans are quadratic in practice (each query walks the
-/// whole 10k-row seed table), so scan-heavy gets far fewer operations.
-fn workload_size(workload: WorkloadProfile) -> (usize, usize) {
+/// Workload scale series: the base iteration count is multiplied by each of
+/// these, holding the batch (transaction) size constant, so the benchmarks
+/// expose how memory grows with the amount of work done.
+const SIZE_MULTIPLIERS: [usize; 3] = [1, 2, 4];
+
+/// Per-workload base sizing as (iterations, batch_size). Scans are quadratic
+/// in practice (each query walks the whole 10k-row seed table), so scan-heavy
+/// gets far fewer operations.
+fn base_workload_size(workload: WorkloadProfile) -> (usize, usize) {
     match workload {
-        WorkloadProfile::ScanHeavy => (5, 4),
-        _ => (20, 50),
+        WorkloadProfile::ScanHeavy => (5, 2),
+        _ => (10, 50),
     }
 }
 
@@ -44,36 +57,40 @@ fn bench_memory_profiles(c: &mut Criterion) {
 
     for mode in MODES {
         for workload in WORKLOADS {
-            let (iterations, batch_size) = workload_size(workload);
-            let cfg = WorkloadConfig {
-                mode,
-                workload,
-                iterations,
-                batch_size,
-                connections: 1,
-                timeout: Duration::from_millis(30_000),
-                cache_size: None,
-                checkpoint: false,
-            };
-            let db_path = work_dir
-                .join(format!("{mode}_{workload}.db"))
-                .to_string_lossy()
-                .into_owned();
+            for multiplier in SIZE_MULTIPLIERS {
+                let (base_iterations, batch_size) = base_workload_size(workload);
+                let iterations = base_iterations * multiplier;
+                let total_ops = iterations * batch_size;
+                let cfg = WorkloadConfig {
+                    mode,
+                    workload,
+                    iterations,
+                    batch_size,
+                    connections: 1,
+                    timeout: Duration::from_millis(30_000),
+                    cache_size: None,
+                    checkpoint: false,
+                };
+                let db_path = work_dir
+                    .join(format!("{mode}_{workload}_{total_ops}.db"))
+                    .to_string_lossy()
+                    .into_owned();
 
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .build()
-                .expect("failed to build tokio runtime");
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .build()
+                    .expect("failed to build tokio runtime");
 
-            c.bench_function(&format!("{mode}/{workload}"), |b| {
-                b.iter(|| {
-                    clean_db_files(&db_path);
-                    rt.block_on(run_workload(&db_path, &cfg, &mut ()))
-                        .expect("workload failed");
+                c.bench_function(&format!("{mode}/{workload}/{total_ops}"), |b| {
+                    b.iter(|| {
+                        clean_db_files(&db_path);
+                        rt.block_on(run_workload(&db_path, &cfg, &mut ()))
+                            .expect("workload failed");
+                    });
                 });
-            });
 
-            clean_db_files(&db_path);
+                clean_db_files(&db_path);
+            }
         }
     }
 }
