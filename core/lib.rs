@@ -570,6 +570,42 @@ enum DatabaseKey {
 static DATABASE_MANAGER: LazyLock<Arc<parking_lot::Mutex<HashMap<DatabaseKey, RegistryEntry>>>> =
     LazyLock::new(|| Arc::new(parking_lot::Mutex::new(HashMap::default())));
 
+/// Drop registry entries whose database has been deallocated. A dead entry
+/// is not just a stale `Weak`: it pins the `Database`'s backing allocation
+/// until the `Weak` itself is dropped, so a process that opens many
+/// short-lived databases would otherwise grow without bound.
+fn sweep_dead_registry_entries(registry: &mut HashMap<DatabaseKey, RegistryEntry>) {
+    registry.retain(|_, entry| match entry {
+        RegistryEntry::Opening => true,
+        RegistryEntry::Ready(weak) => weak.strong_count() > 0,
+    });
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        // Remove this database's now-dead registry entry. `try_lock` because
+        // the last `Arc<Database>` can be dropped by a thread that already
+        // holds the registry lock (e.g. a registry lookup that upgrades the
+        // `Weak` and then bails out); blocking there would deadlock. If the
+        // lock is contended the stale entry is reaped by
+        // `sweep_dead_registry_entries` on a later open instead.
+        let Some(key) = self.registry_key.get() else {
+            return;
+        };
+        let Some(mut registry) = DATABASE_MANAGER.try_lock() else {
+            return;
+        };
+        if let Some(RegistryEntry::Ready(weak)) = registry.get(key) {
+            // Only remove the entry if it still refers to a dead database:
+            // the key may have been re-registered for a new, live `Database`
+            // (same file identity reopened while this object lingered).
+            if weak.strong_count() == 0 {
+                registry.remove(key);
+            }
+        }
+    }
+}
+
 #[cfg(feature = "simulator")]
 pub fn clear_database_registry() {
     DATABASE_MANAGER.lock().clear();
@@ -613,6 +649,12 @@ pub struct Database {
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
+
+    /// The key under which this database is registered in [DATABASE_MANAGER],
+    /// if any. Used by [Drop] to remove the (then dead) registry entry so the
+    /// process-wide registry does not accumulate an entry — and pin the
+    /// `Weak`'s backing allocation — for every database ever opened.
+    registry_key: OnceLock<DatabaseKey>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -745,6 +787,7 @@ impl Database {
             ),
 
             durable_storage: None,
+            registry_key: OnceLock::new(),
         };
 
         db.register_global_builtin_extensions()
@@ -782,6 +825,9 @@ impl Database {
                 return Ok(existing);
             }
         }
+        db.registry_key
+            .set(key.clone())
+            .expect("freshly opened database cannot already be registered");
         registry.insert(key, RegistryEntry::Ready(Arc::downgrade(&db)));
         Ok(db)
     }
@@ -1113,6 +1159,8 @@ impl Database {
         if matches!(state.phase, OpenDbAsyncPhase::Init) && !is_memory_like(path) {
             // Briefly lock the registry to check/reserve — never hold across I/O yields.
             let mut registry = DATABASE_MANAGER.lock();
+            // Reap entries whose `Database` drop lost the `try_lock` race.
+            sweep_dead_registry_entries(&mut registry);
 
             // Look up by file identity (dev, ino). If file doesn't exist
             // yet (CREATE mode), skip lookup — no cached entry is possible.
@@ -1170,6 +1218,9 @@ impl Database {
         if let IOResult::Done(ref db) = result {
             // Register the opened database and remove the Opening sentinel.
             if let Some(registry_key) = state.registry_key.take() {
+                db.registry_key
+                    .set(registry_key.clone())
+                    .expect("freshly opened database cannot already be registered");
                 let mut registry = DATABASE_MANAGER.lock();
                 registry.insert(registry_key, RegistryEntry::Ready(Arc::downgrade(db)));
             }
@@ -3054,5 +3105,42 @@ mod database_tests {
 
         assert!(io.file_id(&path).is_ok());
         assert!(std::fs::metadata(&path).is_err());
+    }
+
+    /// Dropping the last handle to a database must remove its entry from
+    /// the process-wide registry; otherwise a process that opens many
+    /// short-lived databases accumulates dead entries (and the `Weak`s pin
+    /// each `Database`'s backing allocation) without bound.
+    #[cfg(feature = "fs")]
+    #[test]
+    fn registry_entry_removed_when_database_dropped() {
+        use super::{RegistryEntry, DATABASE_MANAGER};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry-drop.db");
+        let db = Database::open_file(
+            Database::io_for_path(path.to_str().unwrap()).unwrap(),
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let key = db
+            .registry_key
+            .get()
+            .cloned()
+            .expect("file-backed database must be registered");
+        assert!(
+            matches!(
+                DATABASE_MANAGER.lock().get(&key),
+                Some(RegistryEntry::Ready(_))
+            ),
+            "open database must have a Ready registry entry"
+        );
+
+        drop(db);
+        assert!(
+            DATABASE_MANAGER.lock().get(&key).is_none(),
+            "dropping the last Arc<Database> must remove the registry entry"
+        );
     }
 }

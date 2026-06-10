@@ -7,10 +7,14 @@
 //! groups, MVCC skiplist garbage).
 //!
 //! It models a server that serves many databases over its lifetime,
-//! creating and dropping them one at a time. Regression caught here in
+//! creating and dropping them one at a time. Regressions caught here in
 //! the past: the `CompletionGroup` self-reference `Arc` cycle leaking
 //! every completion group ever built (one per WAL checkpoint / commit
-//! batch / sorter spill).
+//! batch / sorter spill), and dead `DATABASE_MANAGER` entries pinning
+//! each dropped `Database`'s backing allocation. Note the latter only
+//! shows up on filesystems that do not promptly reuse inode numbers
+//! (e.g. APFS): with inode reuse (ext4), each cycle's registry entry
+//! replaces the previous one, masking the growth.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -81,7 +85,15 @@ fn drain_epoch_garbage() {
 }
 
 /// One full database lifecycle: open at `path`, run a small workload,
-/// close and drop every handle, delete the files.
+/// close and drop every handle.
+///
+/// The files are deliberately NOT deleted here (the TempDir removes them
+/// when the test ends): deleting and recreating files lets filesystems
+/// like ext4 hand the next database the same inode number, and since the
+/// registry is keyed by (dev, ino) that would mask per-database registry
+/// growth on Linux while it still manifests on e.g. APFS. Keeping every
+/// cycle's file alive guarantees a distinct file identity per cycle on
+/// every platform.
 fn database_lifecycle(io: &Arc<dyn turso_core::IO + Send>, path: &std::path::Path, mvcc: bool) {
     let db = Database::open_file_with_flags(
         io.clone(),
@@ -122,17 +134,6 @@ fn database_lifecycle(io: &Arc<dyn turso_core::IO + Send>, path: &std::path::Pat
     conn.close().unwrap();
     drop(conn);
     drop(db);
-
-    for ext in ["", "-wal", "-log", "-shm"] {
-        let f = path.with_file_name(format!(
-            "{}{}",
-            path.file_name().unwrap().to_str().unwrap(),
-            ext
-        ));
-        if f.exists() {
-            std::fs::remove_file(f).unwrap();
-        }
-    }
 }
 
 const WARMUP_CYCLES: usize = 20;
