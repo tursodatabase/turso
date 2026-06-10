@@ -6,7 +6,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::compute_virtual_columns;
 use crate::alloc::TursoIteratorExt;
-use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
+use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE};
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
@@ -934,8 +934,24 @@ pub fn emit_upsert(
         }
     }
 
-    // Index rebuild (DELETE old, INSERT new), honoring partial-index WHEREs
+    // Index rebuild, honoring partial-index WHEREs. Build and validate all new
+    // keys before deleting old entries so any late constraint or expression
+    // failure leaves existing indexes intact.
     if let Some(before) = before_start {
+        struct UpsertIndexPhaseCtx {
+            idx_cursor_id: usize,
+            delete_start_reg: usize,
+            insert_start_reg: usize,
+            record_reg: usize,
+            num_cols: usize,
+            before_pred_reg: Option<usize>,
+            new_pred_reg: Option<usize>,
+        }
+
+        let mut idx_phase_ctxs = Vec::with_capacity(ctx.idx_cursors.len());
+        let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+
+        // Phase 1: evaluate predicates/keys and check UNIQUE constraints.
         for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
             let idx_meta = resolver
                 .with_schema(ctx.database_id, |s| {
@@ -957,13 +973,12 @@ pub fn emit_upsert(
                 resolver,
                 &layout,
             );
-            let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
             let new_pred_reg = eval_partial_pred_for_row_image(
                 program, table, &idx_meta, new_start, new_rowid, resolver, &layout,
             );
 
-            // Skip delete if BEFORE predicate false/NULL
-            let maybe_skip_del = before_pred_reg.map(|r| {
+            let del = program.alloc_registers(k + 1);
+            let maybe_skip_del_key = before_pred_reg.map(|r| {
                 let lbl = program.allocate_label();
                 program.emit_insn(Insn::IfNot {
                     reg: r,
@@ -972,9 +987,6 @@ pub fn emit_upsert(
                 });
                 lbl
             });
-
-            // DELETE old key
-            let del = program.alloc_registers(k + 1);
             for (i, ic) in idx_meta.columns.iter().enumerate() {
                 if ic.expr.is_some() {
                     emit_upsert_expr_index_value(
@@ -1001,18 +1013,12 @@ pub fn emit_upsert(
                 dst_reg: del + k,
                 extra_amount: 0,
             });
-            program.emit_insn(Insn::IdxDelete {
-                start_reg: del,
-                num_regs: k + 1,
-                cursor_id: *idx_cid,
-                raise_error_if_no_matching_entry: false,
-            });
-            if let Some(label) = maybe_skip_del {
+            if let Some(label) = maybe_skip_del_key {
                 program.preassign_label_to_next_insn(label);
             }
 
-            // Skip insert if NEW predicate false/NULL
-            let maybe_skip_ins = new_pred_reg.map(|r| {
+            let ins = program.alloc_registers(k + 1);
+            let maybe_skip_new_key = new_pred_reg.map(|r| {
                 let lbl = program.allocate_label();
                 program.emit_insn(Insn::IfNot {
                     reg: r,
@@ -1021,9 +1027,6 @@ pub fn emit_upsert(
                 });
                 lbl
             });
-
-            // INSERT new key (use NEW rowid if present)
-            let ins = program.alloc_registers(k + 1);
             for (i, ic) in idx_meta.columns.iter().enumerate() {
                 if ic.expr.is_some() {
                     emit_upsert_expr_index_value(
@@ -1051,6 +1054,31 @@ pub fn emit_upsert(
                 extra_amount: 0,
             });
 
+            let aff: String = idx_meta
+                .columns
+                .iter()
+                .map(|c| {
+                    c.expr.as_ref().map_or_else(
+                        || {
+                            table
+                                .get_column_by_name(&c.name)
+                                .map(|(_, col)| {
+                                    let is_strict =
+                                        table.btree().is_some_and(|btree| btree.is_strict);
+                                    col.affinity_with_strict(is_strict).aff_mask()
+                                })
+                                .unwrap_or('B')
+                        },
+                        |_| Affinity::Blob.aff_mask(),
+                    )
+                })
+                .collect();
+            program.emit_insn(Insn::Affinity {
+                start_reg: ins,
+                count: NonZeroUsize::new(k).unwrap(),
+                affinities: aff,
+            });
+
             let rec = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
                 start_reg: to_u16(ins),
@@ -1061,33 +1089,7 @@ pub fn emit_upsert(
             });
 
             if idx_meta.unique {
-                // Affinity on the key columns for the NoConflict probe
                 let ok = program.allocate_label();
-                let aff: String = idx_meta
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        c.expr.as_ref().map_or_else(
-                            || {
-                                table
-                                    .get_column_by_name(&c.name)
-                                    .map(|(_, col)| {
-                                        let is_strict =
-                                            table.btree().is_some_and(|btree| btree.is_strict);
-                                        col.affinity_with_strict(is_strict).aff_mask()
-                                    })
-                                    .unwrap_or('B')
-                            },
-                            |_| crate::vdbe::affinity::Affinity::Blob.aff_mask(),
-                        )
-                    })
-                    .collect();
-
-                program.emit_insn(Insn::Affinity {
-                    start_reg: ins,
-                    count: NonZeroUsize::new(k).unwrap(),
-                    affinities: aff,
-                });
                 program.emit_insn(Insn::NoConflict {
                     cursor_id: *idx_cid,
                     target_pc: ok,
@@ -1100,7 +1102,7 @@ pub fn emit_upsert(
                     dest: hit,
                 });
                 program.emit_insn(Insn::Eq {
-                    lhs: new_rowid,
+                    lhs: ctx.conflict_rowid_reg,
                     rhs: hit,
                     target_pc: ok,
                     flags: CmpInsFlags::default(),
@@ -1108,7 +1110,7 @@ pub fn emit_upsert(
                 });
                 let description = format_unique_violation_desc(table.get_name(), &idx_meta);
                 program.emit_insn(Insn::Halt {
-                    err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                    err_code: SQLITE_CONSTRAINT_UNIQUE,
                     description,
                     on_error: None,
                     description_reg: None,
@@ -1116,14 +1118,62 @@ pub fn emit_upsert(
                 program.preassign_label_to_next_insn(ok);
             }
 
-            program.emit_insn(Insn::IdxInsert {
-                cursor_id: *idx_cid,
+            if let Some(label) = maybe_skip_new_key {
+                program.preassign_label_to_next_insn(label);
+            }
+
+            idx_phase_ctxs.push(UpsertIndexPhaseCtx {
+                idx_cursor_id: *idx_cid,
+                delete_start_reg: del,
+                insert_start_reg: ins,
                 record_reg: rec,
-                unpacked_start: Some(ins),
-                unpacked_count: Some((k + 1) as u16),
+                num_cols: k,
+                before_pred_reg,
+                new_pred_reg,
+            });
+        }
+
+        // Phase 2: delete old index entries after every new key and UNIQUE
+        // check that can fail has already run.
+        for phase_ctx in &idx_phase_ctxs {
+            let maybe_skip_del = phase_ctx.before_pred_reg.map(|r| {
+                let lbl = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: r,
+                    target_pc: lbl,
+                    jump_if_null: true,
+                });
+                lbl
+            });
+            program.emit_insn(Insn::IdxDelete {
+                start_reg: phase_ctx.delete_start_reg,
+                num_regs: phase_ctx.num_cols + 1,
+                cursor_id: phase_ctx.idx_cursor_id,
+                raise_error_if_no_matching_entry: false,
+            });
+            if let Some(label) = maybe_skip_del {
+                program.preassign_label_to_next_insn(label);
+            }
+        }
+
+        // Phase 3: insert new index entries.
+        for phase_ctx in &idx_phase_ctxs {
+            let maybe_skip_ins = phase_ctx.new_pred_reg.map(|r| {
+                let lbl = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: r,
+                    target_pc: lbl,
+                    jump_if_null: true,
+                });
+                lbl
+            });
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id: phase_ctx.idx_cursor_id,
+                record_reg: phase_ctx.record_reg,
+                unpacked_start: Some(phase_ctx.insert_start_reg),
+                unpacked_count: Some((phase_ctx.num_cols + 1) as u16),
                 flags: IdxInsertFlags::new().nchange(true),
             });
-
             if let Some(lbl) = maybe_skip_ins {
                 program.preassign_label_to_next_insn(lbl);
             }
