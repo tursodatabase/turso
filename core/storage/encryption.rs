@@ -553,10 +553,9 @@ impl EncryptionContext {
         self.cipher_mode
     }
 
-    /// Update the page size this context expects. The cipher and key material are
-    /// page-size independent; page size only governs buffer length assertions and
-    /// reserved-tail slicing, so it can be retargeted in place when the pager's
-    /// initial page size changes before the database is initialized.
+    /// Set the database page size used when encrypting and decrypting pages.
+    ///
+    /// This does not change the selected cipher or key material.
     pub(crate) fn set_page_size(&mut self, page_size: PageSize) {
         self.page_size = page_size.get() as usize;
     }

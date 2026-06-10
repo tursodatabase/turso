@@ -42,13 +42,11 @@ impl IOContext {
         self.encryption_or_checksum = EncryptionOrChecksum::Encryption(encryption_ctx);
     }
 
-    /// Retarget the installed encryption context's expected page size to match a
-    /// pre-initialization layout change (e.g. `PRAGMA page_size`, fresh encrypted
-    /// `ATTACH`, in-place `VACUUM` temp DB). This is layout repair, not normal
-    /// configuration: it must only be called while the pager is uninitialized,
-    /// and never to change cipher or key. Returns true when a context was
-    /// present and updated; false when no encryption context is installed.
-    pub(crate) fn retarget_encryption_page_size(&mut self, page_size: PageSize) -> bool {
+    /// Set the page size stored in the encryption context, if one is installed.
+    ///
+    /// Returns true when the context was updated. The cipher mode and key are
+    /// unchanged.
+    pub(crate) fn reset_page_size_in_encryption_ctx(&mut self, page_size: PageSize) -> bool {
         match &mut self.encryption_or_checksum {
             EncryptionOrChecksum::Encryption(ctx) => {
                 ctx.set_page_size(page_size);

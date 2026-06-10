@@ -2762,25 +2762,24 @@ impl Pager {
         // Rebuilding init_page_1 must not leak any stale 4 KiB page-1 image into the first write.
         self.dirty_pages.write().clear();
 
-        // Invariant: this is the sole pre-initialization page-size retargeting
-        // hook for the fresh DB / fresh ATTACH / in-place VACUUM temp DB paths.
-        // Any encryption context installed before this point (PRAGMA
-        // cipher/hexkey, URI-supplied cipher/hexkey, fresh-attach `_init`) was
-        // built against the prior page size and would panic on the first
-        // encrypted write with a stale buffer-length assertion. Retarget it in
-        // place and propagate to the WAL IOContext when one is installed.
-        let retargeted = {
-            let mut io_ctx = self.io_ctx.write();
-            io_ctx.retarget_encryption_page_size(size)
-        };
-        if !retargeted {
-            return Ok(());
-        }
-        let Some(wal) = self.wal.as_ref() else {
-            return Ok(());
-        };
-        wal.set_io_context(self.io_ctx.read().clone());
+        // Encryption can be configured before a fresh database chooses its page
+        // size, so keep the IO context aligned with the pager before the first
+        // page write.
+        self.reset_page_size_in_encryption_ctx(size);
         Ok(())
+    }
+
+    /// Update the encryption page size in the pager IO context and its WAL copy.
+    ///
+    /// This is a no-op when encryption is not configured.
+    fn reset_page_size_in_encryption_ctx(&self, size: PageSize) {
+        let updated = self.io_ctx.write().reset_page_size_in_encryption_ctx(size);
+        if !updated {
+            return;
+        }
+        if let Some(wal) = self.wal.as_ref() {
+            wal.set_io_context(self.io_ctx.read().clone());
+        }
     }
 
     /// Set the initial journal version in page 1 before the database is initialized.

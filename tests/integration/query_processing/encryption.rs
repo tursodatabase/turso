@@ -1353,11 +1353,6 @@ fn test_non_4k_page_size_encryption_enable_mvcc_after_encryption(
 }
 
 // Regression coverage for https://github.com/tursodatabase/turso/issues/7375.
-// PRAGMA cipher/hexkey before PRAGMA page_size used to leave EncryptionContext
-// pinned to the default 4096-byte page size; the first write then panicked.
-
-const ISSUE_7375_KEY_256: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-const ISSUE_7375_KEY_128: &str = "000102030405060708090a0b0c0d0e0f";
 
 fn assert_encrypted_page_size_after_key_and_cipher(
     page_size: i64,
@@ -1401,14 +1396,11 @@ fn assert_encrypted_page_size_after_key_and_cipher(
 fn test_encrypted_page_size_after_key_and_cipher(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     for page_size in [512, 4096, 65536] {
-        assert_encrypted_page_size_after_key_and_cipher(
-            page_size,
-            "aegis256x4",
-            ISSUE_7375_KEY_256,
-        )?;
+        assert_encrypted_page_size_after_key_and_cipher(page_size, CIPHER_A, KEY_A)?;
     }
-    // Different key size / metadata path.
-    assert_encrypted_page_size_after_key_and_cipher(512, "aes128gcm", ISSUE_7375_KEY_128)?;
+    // Exercise a cipher that uses a 16-byte key and different metadata size.
+    let aes128_key = &KEY_A[..32];
+    assert_encrypted_page_size_after_key_and_cipher(512, "aes128gcm", aes128_key)?;
     Ok(())
 }
 
@@ -1420,7 +1412,7 @@ fn test_uri_encryption_then_page_size(_tmp_db: TempDatabase) -> anyhow::Result<(
         .build();
 
     let uri = format!(
-        "file:{}?cipher=aegis256x4&hexkey={ISSUE_7375_KEY_256}",
+        "file:{}?cipher={CIPHER_A}&hexkey={KEY_A}",
         tmp_db.path.to_str().unwrap()
     );
 
@@ -1457,7 +1449,7 @@ fn test_fresh_attach_encrypted_non_4k_page_size(_tmp_db: TempDatabase) -> anyhow
     let aux_dir = tempfile::tempdir()?;
     let aux_path = aux_dir.path().join("aux.db");
     let aux_uri = format!(
-        "file:{}?cipher=aegis256x4&hexkey={ISSUE_7375_KEY_256}",
+        "file:{}?cipher={CIPHER_A}&hexkey={KEY_A}",
         aux_path.to_str().unwrap()
     );
 
@@ -1473,8 +1465,7 @@ fn test_fresh_attach_encrypted_non_4k_page_size(_tmp_db: TempDatabase) -> anyhow
 
         let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM aux.t");
         assert_eq!(rows[0].0, 1);
-        // Layout inheritance: the attached pager must adopt the main
-        // connection's page size, not the fresh-DB 4096 default.
+        // Attached pager must inherit main's page size, not the 4096 default.
         let aux_ps: Vec<(i64,)> = conn.exec_rows("PRAGMA aux.page_size");
         assert_eq!(aux_ps[0].0, 512);
 
@@ -1501,10 +1492,11 @@ fn test_inplace_vacuum_non_4k_encryption(_tmp_db: TempDatabase) -> anyhow::Resul
         .build();
 
     let conn = tmp_db.connect_limbo();
-    // Safe creation order so setup itself does not trigger the issue path.
+    // This test covers VACUUM, so create the source DB without using the issue
+    // #7375 PRAGMA order.
     conn.execute("PRAGMA page_size = 512")?;
-    conn.execute("PRAGMA cipher = 'aegis256x4'")?;
-    conn.execute(format!("PRAGMA hexkey = '{ISSUE_7375_KEY_256}'"))?;
+    conn.execute(format!("PRAGMA cipher = '{CIPHER_A}'"))?;
+    conn.execute(format!("PRAGMA hexkey = '{KEY_A}'"))?;
 
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)")?;
     for i in 0..100i64 {
@@ -1522,7 +1514,7 @@ fn test_inplace_vacuum_non_4k_encryption(_tmp_db: TempDatabase) -> anyhow::Resul
     do_flush(&conn, &tmp_db)?;
 
     let uri = format!(
-        "file:{}?cipher=aegis256x4&hexkey={ISSUE_7375_KEY_256}",
+        "file:{}?cipher={CIPHER_A}&hexkey={KEY_A}",
         tmp_db.path.to_str().unwrap()
     );
     let (_io, reopened) =
