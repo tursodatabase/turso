@@ -5,10 +5,12 @@ test alter-column-rename-and-type {
     CREATE INDEX i ON t (a);
     ALTER TABLE t ALTER COLUMN a TO b BLOB;
     SELECT sql FROM sqlite_schema;
+    PRAGMA integrity_check;
 }
 expect {
     CREATE TABLE t (b BLOB)
     CREATE INDEX i ON t (b)
+    ok
 }
 
 test fail-alter-column-primary-key {
@@ -23,6 +25,88 @@ test fail-alter-column-unique {
     ALTER TABLE t ALTER COLUMN a TO a UNIQUE;
 }
 expect error {
+}
+
+test alter-column-inline-primary-key-drops-autoindex {
+    CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT);
+    INSERT INTO t VALUES ('1', 'one');
+    ALTER TABLE t ALTER COLUMN a TO a2 INTEGER;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND tbl_name = 't';
+    PRAGMA integrity_check;
+    SELECT a2, b FROM t;
+}
+expect {
+    0
+    ok
+    1|one
+}
+
+test alter-column-inline-unique-drops-autoindex {
+    CREATE TABLE t (a TEXT UNIQUE, b TEXT);
+    INSERT INTO t VALUES ('1', 'one');
+    ALTER TABLE t ALTER COLUMN a TO a2 INTEGER;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND tbl_name = 't';
+    PRAGMA integrity_check;
+    SELECT a2, b FROM t;
+}
+expect {
+    0
+    ok
+    1|one
+}
+
+test alter-column-table-unique-rebuilds-autoindex {
+    CREATE TABLE t (a TEXT, b TEXT, UNIQUE(a));
+    INSERT INTO t VALUES ('1', 'one');
+    ALTER TABLE t ALTER COLUMN a TO a2 INTEGER;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND tbl_name = 't';
+    PRAGMA integrity_check;
+    SELECT a2, b FROM t;
+}
+expect {
+    1
+    ok
+    1|one
+}
+
+test fail-alter-column-table-unique-duplicate-after-affinity {
+    CREATE TABLE t (a TEXT, b TEXT, UNIQUE(a));
+    INSERT INTO t VALUES ('1', 'one'), ('01', 'zero-one');
+    ALTER TABLE t ALTER COLUMN a TO a2 INTEGER;
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+test alter-column-expression-index-rebuilds {
+    CREATE TABLE t (a TEXT, b TEXT);
+    CREATE INDEX i ON t(a || b);
+    INSERT INTO t VALUES ('1', 'x');
+    ALTER TABLE t ALTER COLUMN a TO a2 INTEGER;
+    SELECT sql FROM sqlite_schema WHERE name = 'i';
+    PRAGMA integrity_check;
+    SELECT a2, b FROM t;
+}
+expect {
+    CREATE INDEX i ON t (a2 || b)
+    ok
+    1|x
+}
+
+test alter-column-partial-index-rebuilds {
+    CREATE TABLE t (a TEXT, b TEXT);
+    CREATE INDEX i ON t(a) WHERE b = 'x';
+    INSERT INTO t VALUES ('1', 'x'), ('2', 'y');
+    ALTER TABLE t ALTER COLUMN a TO a2 INTEGER;
+    SELECT sql FROM sqlite_schema WHERE name = 'i';
+    PRAGMA integrity_check;
+    SELECT a2, b FROM t ORDER BY b;
+}
+expect {
+    CREATE INDEX i ON t (a2) WHERE b = 'x'
+    ok
+    1|x
+    2|y
 }
 
 test alter-table-rename-pk-column {

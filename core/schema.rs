@@ -4260,6 +4260,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let mut order = SortOrder::Asc;
                 let mut unique = false;
                 let mut collation = None;
+                let mut primary_key_is_inline = false;
                 for c_def in constraints {
                     match &c_def.constraint {
                         ast::ColumnConstraint::Check(expr) => {
@@ -4292,6 +4293,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 );
                             }
                             primary_key = true;
+                            primary_key_is_inline = true;
                             if *auto_increment {
                                 has_autoincrement = true;
                             }
@@ -4444,6 +4446,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     collation,
                     ColDef {
                         primary_key,
+                        primary_key_is_inline,
                         rowid_alias: typename_exactly_integer
                             && primary_key
                             && !primary_key_desc_columns_constraint,
@@ -4759,6 +4762,7 @@ pub struct Column {
     pub default: Option<Box<Expr>>,
     generated_type: GeneratedType,
     raw: u32,
+    primary_key_is_inline: bool,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -4767,6 +4771,7 @@ pub struct Column {
 #[derive(Default)]
 pub struct ColDef {
     pub primary_key: bool,
+    pub primary_key_is_inline: bool,
     pub rowid_alias: bool,
     pub notnull: bool,
     pub explicit_notnull: bool,
@@ -4921,6 +4926,7 @@ impl Column {
             default,
             generated_type,
             raw,
+            primary_key_is_inline: coldef.primary_key_is_inline,
             explicit_notnull: coldef.explicit_notnull,
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
@@ -4971,6 +4977,10 @@ impl Column {
     #[inline]
     pub fn primary_key(&self) -> bool {
         self.raw & F_PRIMARY_KEY != 0
+    }
+    #[inline]
+    pub const fn primary_key_is_inline(&self) -> bool {
+        self.primary_key_is_inline
     }
     #[inline]
     pub const fn is_rowid_alias(&self) -> bool {
@@ -5047,6 +5057,10 @@ impl Column {
     #[inline]
     pub const fn set_primary_key(&mut self, v: bool) {
         self.set_flag(F_PRIMARY_KEY, v);
+    }
+    #[inline]
+    pub const fn set_primary_key_is_inline(&mut self, v: bool) {
+        self.primary_key_is_inline = v;
     }
     #[inline]
     pub const fn set_rowid_alias(&mut self, v: bool) {
@@ -5172,6 +5186,7 @@ impl TryFrom<&ColumnDefinition> for Column {
             collation,
             ColDef {
                 primary_key,
+                primary_key_is_inline: primary_key,
                 rowid_alias: primary_key && matches!(ty, Type::Integer),
                 notnull,
                 explicit_notnull: notnull,

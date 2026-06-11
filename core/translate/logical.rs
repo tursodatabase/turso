@@ -2423,6 +2423,7 @@ mod tests {
                 None,
                 ColDef {
                     primary_key: true,
+                    primary_key_is_inline: true,
                     rowid_alias: true,
                     notnull: true,
                     ..Default::default()
@@ -2458,6 +2459,7 @@ mod tests {
                 None,
                 ColDef {
                     primary_key: true,
+                    primary_key_is_inline: true,
                     rowid_alias: true,
                     notnull: true,
                     ..Default::default()
@@ -2505,6 +2507,7 @@ mod tests {
                 None,
                 ColDef {
                     primary_key: true,
+                    primary_key_is_inline: true,
                     rowid_alias: true,
                     notnull: true,
                     ..Default::default()

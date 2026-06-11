@@ -102,6 +102,14 @@ enum CountState {
     NextBtree { count: usize },
     CheckBtreeKey { count: usize },
 }
+
+#[derive(Debug, Clone, Copy)]
+enum ClearBtreeState {
+    Rewind,
+    DeleteCurrent { deleted: usize },
+    Next { deleted: usize },
+}
+
 #[derive(Debug, Clone)]
 enum MvccLazyCursorState {
     Next(NextState),
@@ -122,6 +130,7 @@ pub(crate) enum CursorYieldPoint {
     SeekBtreeProgress,
     ExistsBtreeFallback,
     CountProgress,
+    ClearBtreeProgress,
     AdvanceBtreeForwardProgress,
     AdvanceBtreeBackwardProgress,
 }
@@ -360,6 +369,8 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
     state: Option<MvccLazyCursorState>,
     // we keep count_state separate to be able to call other public functions like rewind and next
     count_state: Option<CountState>,
+    // clear_btree is allowed to call other cursor methods, so its progress is tracked separately
+    clear_state: Option<ClearBtreeState>,
     btree_advance_state: Option<AdvanceBtreeState>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: DualCursorPeek,
@@ -411,6 +422,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             creating_new_rowid: false,
             state: None,
             count_state: None,
+            clear_state: None,
             btree_advance_state: None,
             dual_peek: DualCursorPeek::default(),
         })
@@ -1730,11 +1742,46 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn clear_btree(&mut self) -> Result<IOResult<Option<usize>>> {
-        todo!()
+        self.set_null_flag(false);
+        loop {
+            match self.clear_state {
+                None => {
+                    self.clear_state = Some(ClearBtreeState::Rewind);
+                    inject_io_yield!(self, CursorYieldPoint::ClearBtreeProgress);
+                }
+                Some(ClearBtreeState::Rewind) => {
+                    return_if_io!(self.rewind());
+                    self.clear_state = Some(ClearBtreeState::DeleteCurrent { deleted: 0 });
+                    inject_io_yield!(self, CursorYieldPoint::ClearBtreeProgress);
+                }
+                Some(ClearBtreeState::DeleteCurrent { deleted }) => {
+                    if !self.has_record() {
+                        self.clear_state = None;
+                        self.table_iterator = None;
+                        self.index_iterator = None;
+                        self.btree_advance_state = None;
+                        self.reset_dual_peek();
+                        self.current_pos = CursorPosition::BeforeFirst;
+                        self.invalidate_record();
+                        return Ok(IOResult::Done(Some(deleted)));
+                    }
+                    return_if_io!(self.delete());
+                    self.clear_state = Some(ClearBtreeState::Next {
+                        deleted: deleted + 1,
+                    });
+                    inject_io_yield!(self, CursorYieldPoint::ClearBtreeProgress);
+                }
+                Some(ClearBtreeState::Next { deleted }) => {
+                    return_if_io!(self.next());
+                    self.clear_state = Some(ClearBtreeState::DeleteCurrent { deleted });
+                    inject_io_yield!(self, CursorYieldPoint::ClearBtreeProgress);
+                }
+            }
+        }
     }
 
     fn btree_destroy(&mut self) -> Result<IOResult<Option<usize>>> {
-        todo!()
+        self.clear_btree()
     }
 
     fn count(&mut self) -> Result<IOResult<usize>> {

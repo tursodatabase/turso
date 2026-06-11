@@ -970,6 +970,7 @@ mod tests {
             collation,
             ColDef {
                 primary_key: true,
+                primary_key_is_inline: true,
                 rowid_alias: true,
                 notnull: false,
                 explicit_notnull: false,

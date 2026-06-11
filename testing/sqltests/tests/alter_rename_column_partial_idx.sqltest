@@ -97,6 +97,19 @@ expect pattern {
 }
 
 @cross-check-integrity
+test rename-column-expression-index-insert-after-is-not-null {
+    CREATE TABLE t (a TEXT);
+    CREATE INDEX idx ON t ((a IS NOT NULL));
+    ALTER TABLE t RENAME COLUMN a TO b;
+    INSERT INTO t(b) VALUES (NULL), ('x');
+    SELECT b IS NOT NULL FROM t ORDER BY rowid;
+}
+expect {
+    0
+    1
+}
+
+@cross-check-integrity
 test rename-column-updates-expression-index-multi-column {
     CREATE TABLE t (a, b, c);
     CREATE INDEX idx ON t (a + b * 2);
