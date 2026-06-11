@@ -1,6 +1,11 @@
+use std::{
+    iter,
+    ops::Bound,
+    sync::{Arc, Barrier},
+};
+
 use crate::skiplist::SkipSet;
 use crossbeam_utils::thread;
-use std::{iter, ops::Bound, sync::Barrier};
 
 #[test]
 fn smoke() {
@@ -691,4 +696,123 @@ fn clear() {
     s.clear();
     assert!(s.is_empty());
     assert_eq!(s.len(), 0);
+}
+
+// https://github.com/crossbeam-rs/crossbeam/issues/1023
+#[test]
+fn concurrent_insert_get_same_key() {
+    let set: Arc<SkipSet<u32>> = Arc::new(SkipSet::new());
+    let len = if cfg!(miri) { 100 } else { 10_000 };
+    let key = 0;
+    set.insert(0);
+
+    let getter = set.clone();
+    let handle = std::thread::spawn(move || {
+        for _ in 0..len {
+            set.insert(0);
+        }
+    });
+    for _ in 0..len {
+        assert!(getter.get(&key).is_some());
+    }
+    handle.join().unwrap()
+}
+
+#[test]
+fn comparator() {
+    use std::cmp::Ordering;
+
+    use crate::skiplist::comparator::{Comparator, Equivalator};
+
+    struct DynComparator {
+        #[allow(clippy::type_complexity)]
+        inner: Box<dyn Fn(&[u8], &[u8]) -> Ordering>,
+    }
+
+    impl<L: ?Sized, R: ?Sized> Equivalator<L, R> for DynComparator
+    where
+        L: std::borrow::Borrow<[u8]>,
+        R: std::borrow::Borrow<[u8]>,
+    {
+        fn equivalent(&self, lhs: &L, rhs: &R) -> bool {
+            (self.inner)(lhs.borrow(), rhs.borrow()).is_eq()
+        }
+    }
+
+    impl<L: ?Sized, R: ?Sized> Comparator<L, R> for DynComparator
+    where
+        L: std::borrow::Borrow<[u8]>,
+        R: std::borrow::Borrow<[u8]>,
+    {
+        fn compare(&self, lhs: &L, rhs: &R) -> Ordering {
+            (self.inner)(lhs.borrow(), rhs.borrow())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct OrderedF32(f32);
+
+    impl PartialEq for OrderedF32 {
+        fn eq(&self, other: &Self) -> bool {
+            self.cmp(other).is_eq()
+        }
+    }
+
+    impl Eq for OrderedF32 {}
+
+    impl PartialOrd for OrderedF32 {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for OrderedF32 {
+        fn cmp(&self, other: &Self) -> Ordering {
+            match self.0.partial_cmp(&other.0) {
+                Some(o) => o,
+                None => Ordering::Equal,
+            }
+        }
+    }
+
+    fn encode(slice: &[f32]) -> Vec<u8> {
+        let mut bytes = vec![];
+        for &f in slice {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn decode(slice: &[u8]) -> impl Iterator<Item = OrderedF32> + '_ {
+        slice
+            .chunks_exact(4)
+            .map(|b| OrderedF32(f32::from_le_bytes(b.try_into().unwrap())))
+    }
+
+    fn compare(lhs: &[u8], rhs: &[u8]) -> Ordering {
+        decode(lhs).cmp(decode(rhs))
+    }
+
+    let s = SkipSet::with_comparator(DynComparator {
+        inner: Box::new(compare),
+    });
+    s.insert(encode(&[0f32]));
+    s.insert(encode(&[1f32]));
+    s.insert(encode(&[0f32, 1f32]));
+    s.insert(encode(&[-0f32]));
+
+    assert_eq!(s.len(), 3);
+    assert!(s.contains(&encode(&[0f32])));
+    assert!(s.contains(&encode(&[-0f32])));
+    assert!(s.contains(&encode(&[1f32])));
+    assert!(s.contains(&encode(&[0f32, 1f32])));
+
+    let elems: Vec<_> = s.iter().map(|x| &x.value()[..]).collect();
+    assert_eq!(
+        elems,
+        [&encode(&[-0f32]), &encode(&[0f32, 1f32]), &encode(&[1f32])],
+    );
+
+    s.remove(&encode(&[0f32]));
+    assert!(!s.contains(&encode(&[-0f32])));
 }

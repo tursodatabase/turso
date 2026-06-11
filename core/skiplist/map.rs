@@ -1,26 +1,36 @@
 //! An ordered map based on a lock-free skip list. See [`SkipMap`].
 
-use std::borrow::Borrow;
-use std::fmt;
-use std::mem::ManuallyDrop;
-use std::ops::{Bound, RangeBounds};
-use std::ptr;
+use core::{
+    fmt,
+    mem::ManuallyDrop,
+    ops::{Bound, RangeBounds},
+    ptr,
+};
 
-use super::base::{self, try_pin_loop};
 use crossbeam_epoch as epoch;
+
+use super::{
+    base::{self, try_pin_loop},
+    comparator::{BasicComparator, Comparator},
+};
 
 /// An ordered map based on a lock-free skip list.
 ///
 /// This is an alternative to [`BTreeMap`] which supports
 /// concurrent access across multiple threads.
 ///
+/// A custom comparator may be provided, causing all keys
+/// to be ordered by the comparison function used instead
+/// of the standard `Ord` impl. See [`Comparator`].
+///
 /// [`BTreeMap`]: std::collections::BTreeMap
-pub struct SkipMap<K, V> {
-    inner: base::SkipList<K, V>,
+/// [`Comparator`]: crate::skiplist::comparator::Comparator
+pub struct SkipMap<K, V, C = BasicComparator> {
+    inner: base::SkipList<K, V, C>,
 }
 
 impl<K, V> SkipMap<K, V> {
-    /// Returns a new, empty map.
+    /// Returns a new, empty map with the default comparator.
     ///
     /// # Example
     ///
@@ -32,6 +42,23 @@ impl<K, V> SkipMap<K, V> {
     pub fn new() -> Self {
         Self {
             inner: base::SkipList::new(epoch::default_collector().clone()),
+        }
+    }
+}
+
+impl<K, V, C> SkipMap<K, V, C> {
+    /// Returns a new, empty map with the given comparator.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use turso_core::skiplist::{SkipMap, comparator::BasicComparator};
+    ///
+    /// let map: SkipMap<i32, &str> = SkipMap::with_comparator(BasicComparator);
+    /// ```
+    pub fn with_comparator(comparator: C) -> Self {
+        Self {
+            inner: base::SkipList::with_comparator(epoch::default_collector().clone(), comparator),
         }
     }
 
@@ -75,9 +102,9 @@ impl<K, V> SkipMap<K, V> {
     }
 }
 
-impl<K, V> SkipMap<K, V>
+impl<K, V, C> SkipMap<K, V, C>
 where
-    K: Ord,
+    C: Comparator<K>,
 {
     /// Returns the entry with the smallest key.
     ///
@@ -94,7 +121,7 @@ where
     /// numbers.insert(6, "six");
     /// assert_eq!(*numbers.front().unwrap().value(), "five");
     /// ```
-    pub fn front(&self) -> Option<Entry<'_, K, V>> {
+    pub fn front(&self) -> Option<Entry<'_, K, V, C>> {
         let guard = &epoch::pin();
         try_pin_loop(|| self.inner.front(guard)).map(Entry::new)
     }
@@ -114,11 +141,97 @@ where
     /// numbers.insert(6, "six");
     /// assert_eq!(*numbers.back().unwrap().value(), "six");
     /// ```
-    pub fn back(&self) -> Option<Entry<'_, K, V>> {
+    pub fn back(&self) -> Option<Entry<'_, K, V, C>> {
         let guard = &epoch::pin();
         try_pin_loop(|| self.inner.back(guard)).map(Entry::new)
     }
 
+    /// Finds an entry with the specified key, or inserts a new `key`-`value` pair if none exist.
+    ///
+    /// This function returns an [`Entry`] which
+    /// can be used to access the key's associated value.
+    ///
+    /// # Example
+    /// ```
+    /// use turso_core::skiplist::SkipMap;
+    ///
+    /// let ages = SkipMap::new();
+    /// let gates_age = ages.get_or_insert("Bill Gates", 64);
+    /// assert_eq!(*gates_age.value(), 64);
+    ///
+    /// ages.insert("Steve Jobs", 65);
+    /// let jobs_age = ages.get_or_insert("Steve Jobs", -1);
+    /// assert_eq!(*jobs_age.value(), 65);
+    /// ```
+    pub fn get_or_insert(&self, key: K, value: V) -> Entry<'_, K, V, C> {
+        let guard = &epoch::pin();
+        Entry::new(self.inner.get_or_insert(key, value, guard))
+    }
+
+    /// Finds an entry with the specified key, or inserts a new `key`-`value` pair if none exist,
+    /// where value is calculated with a function.
+    ///
+    /// <b>Note:</b> Another thread may write key value first, leading to the result of this closure
+    /// discarded. If closure is modifying some other state (such as shared counters or shared
+    /// objects), it may lead to <u>undesired behaviour</u> such as counters being changed without
+    /// result of closure inserted
+    ///
+    /// This function returns an [`Entry`] which
+    /// can be used to access the key's associated value.
+    ///
+    /// # Example
+    /// ```
+    /// use turso_core::skiplist::SkipMap;
+    ///
+    /// let ages = SkipMap::new();
+    /// let gates_age = ages.get_or_insert_with("Bill Gates", || 64);
+    /// assert_eq!(*gates_age.value(), 64);
+    ///
+    /// ages.insert("Steve Jobs", 65);
+    /// let jobs_age = ages.get_or_insert_with("Steve Jobs", || -1);
+    /// assert_eq!(*jobs_age.value(), 65);
+    /// ```
+    pub fn get_or_insert_with<F>(&self, key: K, value_fn: F) -> Entry<'_, K, V, C>
+    where
+        F: FnOnce() -> V,
+    {
+        let guard = &epoch::pin();
+        Entry::new(self.inner.get_or_insert_with(key, value_fn, guard))
+    }
+
+    /// Returns an iterator over all entries in the map,
+    /// sorted by key.
+    ///
+    /// This iterator returns [`Entry`]s which
+    /// can be used to access keys and their associated values.
+    ///
+    /// # Examples
+    /// ```
+    /// use turso_core::skiplist::SkipMap;
+    ///
+    /// let numbers = SkipMap::new();
+    /// numbers.insert(6, "six");
+    /// numbers.insert(7, "seven");
+    /// numbers.insert(12, "twelve");
+    ///
+    /// // Print then numbers from least to greatest
+    /// for entry in numbers.iter() {
+    ///     let number = entry.key();
+    ///     let number_str = entry.value();
+    ///     println!("{} is {}", number, number_str);
+    /// }
+    /// ```
+    pub fn iter(&self) -> Iter<'_, K, V, C> {
+        Iter {
+            inner: self.inner.ref_iter(),
+        }
+    }
+}
+
+impl<K, V, C> SkipMap<K, V, C>
+where
+    C: Comparator<K>,
+{
     /// Returns `true` if the map contains a value for the specified key.
     ///
     /// # Example
@@ -133,8 +246,8 @@ where
     /// ```
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        C: Comparator<K, Q>,
+        Q: ?Sized,
     {
         let guard = &epoch::pin();
         self.inner.contains_key(key, guard)
@@ -155,10 +268,10 @@ where
     /// numbers.insert("six", 6);
     /// assert_eq!(*numbers.get("six").unwrap().value(), 6);
     /// ```
-    pub fn get<Q>(&self, key: &Q) -> Option<Entry<'_, K, V>>
+    pub fn get<Q>(&self, key: &Q) -> Option<Entry<'_, K, V, C>>
     where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        C: Comparator<K, Q>,
+        Q: ?Sized,
     {
         let guard = &epoch::pin();
         try_pin_loop(|| self.inner.get(key, guard)).map(Entry::new)
@@ -190,10 +303,10 @@ where
     /// let greater_than_thirteen = numbers.lower_bound(Excluded(&13));
     /// assert!(greater_than_thirteen.is_none());
     /// ```
-    pub fn lower_bound<'a, Q>(&'a self, bound: Bound<&Q>) -> Option<Entry<'a, K, V>>
+    pub fn lower_bound<'a, Q>(&'a self, bound: Bound<&Q>) -> Option<Entry<'a, K, V, C>>
     where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        C: Comparator<K, Q>,
+        Q: ?Sized,
     {
         let guard = &epoch::pin();
         try_pin_loop(|| self.inner.lower_bound(bound, guard)).map(Entry::new)
@@ -222,96 +335,13 @@ where
     /// let less_than_six = numbers.upper_bound(Excluded(&6));
     /// assert!(less_than_six.is_none());
     /// ```
-    pub fn upper_bound<'a, Q>(&'a self, bound: Bound<&Q>) -> Option<Entry<'a, K, V>>
+    pub fn upper_bound<'a, Q>(&'a self, bound: Bound<&Q>) -> Option<Entry<'a, K, V, C>>
     where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        C: Comparator<K, Q>,
+        Q: ?Sized,
     {
         let guard = &epoch::pin();
         try_pin_loop(|| self.inner.upper_bound(bound, guard)).map(Entry::new)
-    }
-
-    /// Finds an entry with the specified key, or inserts a new `key`-`value` pair if none exist.
-    ////
-    /// This function returns an [`Entry`] which
-    /// can be used to access the key's associated value.
-    ///
-    /// # Example
-    /// ```
-    /// use turso_core::skiplist::SkipMap;
-    ///
-    /// let ages = SkipMap::new();
-    /// let gates_age = ages.get_or_insert("Bill Gates", 64);
-    /// assert_eq!(*gates_age.value(), 64);
-    ///
-    /// ages.insert("Steve Jobs", 65);
-    /// let jobs_age = ages.get_or_insert("Steve Jobs", -1);
-    /// assert_eq!(*jobs_age.value(), 65);
-    /// ```
-    pub fn get_or_insert(&self, key: K, value: V) -> Entry<'_, K, V> {
-        let guard = &epoch::pin();
-        Entry::new(self.inner.get_or_insert(key, value, guard))
-    }
-
-    /// Finds an entry with the specified key, or inserts a new `key`-`value` pair if none exist,
-    /// where value is calculated with a function.
-    ///
-    ///
-    /// <b>Note:</b> Another thread may write key value first, leading to the result of this closure
-    /// discarded. If closure is modifying some other state (such as shared counters or shared
-    /// objects), it may lead to <u>undesired behaviour</u> such as counters being changed without
-    /// result of closure inserted
-    ////
-    /// This function returns an [`Entry`] which
-    /// can be used to access the key's associated value.
-    ///
-    ///
-    /// # Example
-    /// ```
-    /// use turso_core::skiplist::SkipMap;
-    ///
-    /// let ages = SkipMap::new();
-    /// let gates_age = ages.get_or_insert_with("Bill Gates", || 64);
-    /// assert_eq!(*gates_age.value(), 64);
-    ///
-    /// ages.insert("Steve Jobs", 65);
-    /// let jobs_age = ages.get_or_insert_with("Steve Jobs", || -1);
-    /// assert_eq!(*jobs_age.value(), 65);
-    /// ```
-    pub fn get_or_insert_with<F>(&self, key: K, value_fn: F) -> Entry<'_, K, V>
-    where
-        F: FnOnce() -> V,
-    {
-        let guard = &epoch::pin();
-        Entry::new(self.inner.get_or_insert_with(key, value_fn, guard))
-    }
-
-    /// Returns an iterator over all entries in the map,
-    /// sorted by key.
-    ///
-    /// This iterator returns [`Entry`]s which
-    /// can be used to access keys and their associated values.
-    ///
-    /// # Examples
-    /// ```
-    /// use turso_core::skiplist::SkipMap;
-    ///
-    /// let numbers = SkipMap::new();
-    /// numbers.insert(6, "six");
-    /// numbers.insert(7, "seven");
-    /// numbers.insert(12, "twelve");
-    ///
-    /// // Print then numbers from least to greatest
-    /// for entry in numbers.iter() {
-    ///     let number = entry.key();
-    ///     let number_str = entry.value();
-    ///     println!("{} is {}", number, number_str);
-    /// }
-    /// ```
-    pub fn iter(&self) -> Iter<'_, K, V> {
-        Iter {
-            inner: self.inner.ref_iter(),
-        }
     }
 
     /// Returns an iterator over a subset of entries in the map.
@@ -335,11 +365,11 @@ where
     ///     println!("{} is {}", number, number_str);
     /// }
     /// ```
-    pub fn range<Q, R>(&self, range: R) -> Range<'_, Q, R, K, V>
+    pub fn range<Q, R>(&self, range: R) -> Range<'_, Q, R, K, V, C>
     where
-        K: Borrow<Q>,
         R: RangeBounds<Q>,
-        Q: Ord + ?Sized,
+        C: Comparator<K, Q>,
+        Q: ?Sized,
     {
         Range {
             inner: self.inner.ref_range(range),
@@ -347,9 +377,10 @@ where
     }
 }
 
-impl<K, V> SkipMap<K, V>
+impl<K, V, C> SkipMap<K, V, C>
 where
-    K: Ord + Send + 'static,
+    C: Comparator<K>,
+    K: Send + 'static,
     V: Send + 'static,
 {
     /// Inserts a `key`-`value` pair into the map and returns the new entry.
@@ -369,7 +400,7 @@ where
     ///
     /// assert_eq!(*map.get("key").unwrap().value(), "value");
     /// ```
-    pub fn insert(&self, key: K, value: V) -> Entry<'_, K, V> {
+    pub fn insert(&self, key: K, value: V) -> Entry<'_, K, V, C> {
         let guard = &epoch::pin();
         Entry::new(self.inner.insert(key, value, guard))
     }
@@ -396,7 +427,7 @@ where
     /// map.compare_insert("absent_key", 0, |_| false);
     /// assert_eq!(*map.get("absent_key").unwrap().value(), 0);
     /// ```
-    pub fn compare_insert<F>(&self, key: K, value: V, compare_fn: F) -> Entry<'_, K, V>
+    pub fn compare_insert<F>(&self, key: K, value: V, compare_fn: F) -> Entry<'_, K, V, C>
     where
         F: Fn(&V) -> bool,
     {
@@ -422,10 +453,10 @@ where
     /// map.insert("key", "value");
     /// assert_eq!(*map.remove("key").unwrap().value(), "value");
     /// ```
-    pub fn remove<Q>(&self, key: &Q) -> Option<Entry<'_, K, V>>
+    pub fn remove<Q>(&self, key: &Q) -> Option<Entry<'_, K, V, C>>
     where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        C: Comparator<K, Q>,
+        Q: ?Sized,
     {
         let guard = &epoch::pin();
         self.inner.remove(key, guard).map(Entry::new)
@@ -453,7 +484,7 @@ where
     /// // All entries have been removed now.
     /// assert!(numbers.is_empty());
     /// ```
-    pub fn pop_front(&self) -> Option<Entry<'_, K, V>> {
+    pub fn pop_front(&self) -> Option<Entry<'_, K, V, C>> {
         let guard = &epoch::pin();
         self.inner.pop_front(guard).map(Entry::new)
     }
@@ -480,7 +511,7 @@ where
     /// // All entries have been removed now.
     /// assert!(numbers.is_empty());
     /// ```
-    pub fn pop_back(&self) -> Option<Entry<'_, K, V>> {
+    pub fn pop_back(&self) -> Option<Entry<'_, K, V, C>> {
         let guard = &epoch::pin();
         self.inner.pop_back(guard).map(Entry::new)
     }
@@ -504,15 +535,18 @@ where
     }
 }
 
-impl<K, V> Default for SkipMap<K, V> {
+impl<K, V, C> Default for SkipMap<K, V, C>
+where
+    C: Default,
+{
     fn default() -> Self {
-        Self::new()
+        Self::with_comparator(Default::default())
     }
 }
 
-impl<K, V> fmt::Debug for SkipMap<K, V>
+impl<K, V, C> fmt::Debug for SkipMap<K, V, C>
 where
-    K: Ord + fmt::Debug,
+    K: fmt::Debug,
     V: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -520,38 +554,38 @@ where
     }
 }
 
-impl<K, V> IntoIterator for SkipMap<K, V> {
+impl<K, V, C> IntoIterator for SkipMap<K, V, C> {
     type Item = (K, V);
     type IntoIter = IntoIter<K, V>;
 
-    fn into_iter(self) -> IntoIter<K, V> {
+    fn into_iter(self) -> Self::IntoIter {
         IntoIter {
             inner: self.inner.into_iter(),
         }
     }
 }
 
-impl<'a, K, V> IntoIterator for &'a SkipMap<K, V>
+impl<'a, K, V, C> IntoIterator for &'a SkipMap<K, V, C>
 where
-    K: Ord,
+    C: Comparator<K>,
 {
-    type Item = Entry<'a, K, V>;
-    type IntoIter = Iter<'a, K, V>;
+    type Item = Entry<'a, K, V, C>;
+    type IntoIter = Iter<'a, K, V, C>;
 
-    fn into_iter(self) -> Iter<'a, K, V> {
+    fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
 
-impl<K, V> FromIterator<(K, V)> for SkipMap<K, V>
+impl<K, V, C> FromIterator<(K, V)> for SkipMap<K, V, C>
 where
-    K: Ord,
+    C: Comparator<K> + Default,
 {
     fn from_iter<I>(iter: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
     {
-        let s = Self::new();
+        let s = Self::default();
         for (k, v) in iter {
             s.get_or_insert(k, v);
         }
@@ -560,24 +594,24 @@ where
 }
 
 /// A reference-counted entry in a map.
-pub struct Entry<'a, K, V> {
-    inner: ManuallyDrop<base::RefEntry<'a, K, V>>,
+pub struct Entry<'a, K, V, C = BasicComparator> {
+    inner: ManuallyDrop<base::RefEntry<'a, K, V, C>>,
 }
 
-impl<'a, K, V> Entry<'a, K, V> {
-    fn new(inner: base::RefEntry<'a, K, V>) -> Self {
+impl<'a, K, V, C> Entry<'a, K, V, C> {
+    fn new(inner: base::RefEntry<'a, K, V, C>) -> Self {
         Self {
             inner: ManuallyDrop::new(inner),
         }
     }
 
     /// Returns a reference to the key.
-    pub fn key(&self) -> &K {
+    pub fn key(&self) -> &'a K {
         self.inner.key()
     }
 
     /// Returns a reference to the value.
-    pub fn value(&self) -> &V {
+    pub fn value(&self) -> &'a V {
         self.inner.value()
     }
 
@@ -587,7 +621,7 @@ impl<'a, K, V> Entry<'a, K, V> {
     }
 }
 
-impl<K, V> Drop for Entry<'_, K, V> {
+impl<K, V, C> Drop for Entry<'_, K, V, C> {
     fn drop(&mut self) {
         unsafe {
             ManuallyDrop::into_inner(ptr::read(&self.inner)).release_with_pin(epoch::pin);
@@ -595,9 +629,9 @@ impl<K, V> Drop for Entry<'_, K, V> {
     }
 }
 
-impl<'a, K, V> Entry<'a, K, V>
+impl<K, V, C> Entry<'_, K, V, C>
 where
-    K: Ord,
+    C: Comparator<K>,
 {
     /// Moves to the next entry in the map.
     pub fn move_next(&mut self) -> bool {
@@ -612,21 +646,22 @@ where
     }
 
     /// Returns the next entry in the map.
-    pub fn next(&self) -> Option<Entry<'a, K, V>> {
+    pub fn next(&self) -> Option<Self> {
         let guard = &epoch::pin();
         self.inner.next(guard).map(Entry::new)
     }
 
     /// Returns the previous entry in the map.
-    pub fn prev(&self) -> Option<Entry<'a, K, V>> {
+    pub fn prev(&self) -> Option<Self> {
         let guard = &epoch::pin();
         self.inner.prev(guard).map(Entry::new)
     }
 }
 
-impl<K, V> Entry<'_, K, V>
+impl<K, V, C> Entry<'_, K, V, C>
 where
-    K: Ord + Send + 'static,
+    C: Comparator<K>,
+    K: Send + 'static,
     V: Send + 'static,
 {
     /// Removes the entry from the map.
@@ -638,7 +673,7 @@ where
     }
 }
 
-impl<K, V> Clone for Entry<'_, K, V> {
+impl<K, V, C> Clone for Entry<'_, K, V, C> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -646,7 +681,7 @@ impl<K, V> Clone for Entry<'_, K, V> {
     }
 }
 
-impl<K, V> fmt::Debug for Entry<'_, K, V>
+impl<K, V, C> fmt::Debug for Entry<'_, K, V, C>
 where
     K: fmt::Debug,
     V: fmt::Debug,
@@ -667,7 +702,7 @@ pub struct IntoIter<K, V> {
 impl<K, V> Iterator for IntoIter<K, V> {
     type Item = (K, V);
 
-    fn next(&mut self) -> Option<(K, V)> {
+    fn next(&mut self) -> Option<Self::Item> {
         self.inner.next()
     }
 }
@@ -679,39 +714,39 @@ impl<K, V> fmt::Debug for IntoIter<K, V> {
 }
 
 /// An iterator over the entries of a `SkipMap`.
-pub struct Iter<'a, K, V> {
-    inner: base::RefIter<'a, K, V>,
+pub struct Iter<'a, K, V, C = BasicComparator> {
+    inner: base::RefIter<'a, K, V, C>,
 }
 
-impl<'a, K, V> Iterator for Iter<'a, K, V>
+impl<'a, K, V, C> Iterator for Iter<'a, K, V, C>
 where
-    K: Ord,
+    C: Comparator<K>,
 {
-    type Item = Entry<'a, K, V>;
+    type Item = Entry<'a, K, V, C>;
 
-    fn next(&mut self) -> Option<Entry<'a, K, V>> {
+    fn next(&mut self) -> Option<Entry<'a, K, V, C>> {
         let guard = &epoch::pin();
         self.inner.next(guard).map(Entry::new)
     }
 }
 
-impl<'a, K, V> DoubleEndedIterator for Iter<'a, K, V>
+impl<'a, K, V, C> DoubleEndedIterator for Iter<'a, K, V, C>
 where
-    K: Ord,
+    C: Comparator<K>,
 {
-    fn next_back(&mut self) -> Option<Entry<'a, K, V>> {
+    fn next_back(&mut self) -> Option<Entry<'a, K, V, C>> {
         let guard = &epoch::pin();
         self.inner.next_back(guard).map(Entry::new)
     }
 }
 
-impl<K, V> fmt::Debug for Iter<'_, K, V> {
+impl<K, V, C> fmt::Debug for Iter<'_, K, V, C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad("Iter { .. }")
     }
 }
 
-impl<K, V> Drop for Iter<'_, K, V> {
+impl<K, V, C> Drop for Iter<'_, K, V, C> {
     fn drop(&mut self) {
         let guard = &epoch::pin();
         self.inner.drop_impl(guard);
@@ -719,47 +754,48 @@ impl<K, V> Drop for Iter<'_, K, V> {
 }
 
 /// An iterator over a subset of entries of a `SkipMap`.
-pub struct Range<'a, Q, R, K, V>
+pub struct Range<'a, Q, R, K, V, C = BasicComparator>
 where
-    K: Ord + Borrow<Q>,
+    C: Comparator<K> + Comparator<K, Q>,
     R: RangeBounds<Q>,
-    Q: Ord + ?Sized,
+    Q: ?Sized,
 {
-    pub(crate) inner: base::RefRange<'a, Q, R, K, V>,
+    pub(crate) inner: base::RefRange<'a, Q, R, K, V, C>,
 }
 
-impl<'a, Q, R, K, V> Iterator for Range<'a, Q, R, K, V>
+impl<'a, Q, R, K, V, C> Iterator for Range<'a, Q, R, K, V, C>
 where
-    K: Ord + Borrow<Q>,
+    C: Comparator<K> + Comparator<K, Q>,
     R: RangeBounds<Q>,
-    Q: Ord + ?Sized,
+    Q: ?Sized,
 {
-    type Item = Entry<'a, K, V>;
+    type Item = Entry<'a, K, V, C>;
 
-    fn next(&mut self) -> Option<Entry<'a, K, V>> {
+    fn next(&mut self) -> Option<Entry<'a, K, V, C>> {
         let guard = &epoch::pin();
         self.inner.next(guard).map(Entry::new)
     }
 }
 
-impl<'a, Q, R, K, V> DoubleEndedIterator for Range<'a, Q, R, K, V>
+impl<'a, Q, R, K, V, C> DoubleEndedIterator for Range<'a, Q, R, K, V, C>
 where
-    K: Ord + Borrow<Q>,
+    C: Comparator<K> + Comparator<K, Q>,
     R: RangeBounds<Q>,
-    Q: Ord + ?Sized,
+    Q: ?Sized,
 {
-    fn next_back(&mut self) -> Option<Entry<'a, K, V>> {
+    fn next_back(&mut self) -> Option<Entry<'a, K, V, C>> {
         let guard = &epoch::pin();
         self.inner.next_back(guard).map(Entry::new)
     }
 }
 
-impl<Q, R, K, V> fmt::Debug for Range<'_, Q, R, K, V>
+impl<Q, R, K, V, C> fmt::Debug for Range<'_, Q, R, K, V, C>
 where
-    K: Ord + Borrow<Q> + fmt::Debug,
+    C: Comparator<K> + Comparator<K, Q>,
+    K: fmt::Debug,
     V: fmt::Debug,
     R: RangeBounds<Q> + fmt::Debug,
-    Q: Ord + ?Sized,
+    Q: ?Sized,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Range")
@@ -770,11 +806,11 @@ where
     }
 }
 
-impl<Q, R, K, V> Drop for Range<'_, Q, R, K, V>
+impl<Q, R, K, V, C> Drop for Range<'_, Q, R, K, V, C>
 where
-    K: Ord + Borrow<Q>,
+    C: Comparator<K> + Comparator<K, Q>,
     R: RangeBounds<Q>,
-    Q: Ord + ?Sized,
+    Q: ?Sized,
 {
     fn drop(&mut self) {
         let guard = &epoch::pin();
