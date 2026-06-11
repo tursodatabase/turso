@@ -49,6 +49,17 @@ pub type Allocator = TursoAllocator;
 
 pub type Box<T> = std::boxed::Box<T>;
 
+/// Boxed slice that keeps the allocator parameter on nightly.
+///
+/// `Box<T>` stays allocator-free so `Box::new` keeps working, but
+/// `Vec::into_boxed_slice` on an allocator-aware `Vec` produces
+/// `Box<[T], TursoAllocator>` on nightly — fields holding such slices must
+/// use this alias instead of `Box<[T]>`.
+#[cfg(not(nightly))]
+pub type BoxedSlice<T> = std::boxed::Box<[T]>;
+#[cfg(nightly)]
+pub type BoxedSlice<T> = std::boxed::Box<[T], TursoAllocator>;
+
 #[cfg(not(nightly))]
 pub type Vec<T> = std::vec::Vec<T>;
 #[cfg(nightly)]

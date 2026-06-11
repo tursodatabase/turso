@@ -209,6 +209,15 @@ fn iterator_try_unzip_builds_turso_collections() {
 }
 
 #[test]
+fn into_boxed_slice_builds_boxed_slice_alias() {
+    let values: Vec<u32> = self::vec![1, 2, 3];
+
+    let boxed: BoxedSlice<u32> = values.into_boxed_slice();
+
+    assert_eq!(&*boxed, &[1, 2, 3]);
+}
+
+#[test]
 fn slice_try_to_vec_builds_turso_vec() {
     let slice: &[u8] = &[1, 2, 3];
 
