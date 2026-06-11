@@ -4752,8 +4752,8 @@ pub struct ResolvedFkRef {
     /// empty, the parent table's PRIMARY KEY columns. Always non-empty.
     pub parent_cols: Box<[String]>,
     /// Column positions in the child/parent tables (pos_in_table)
-    pub child_pos: Box<[usize]>,
-    pub parent_pos: Box<[usize]>,
+    pub child_pos: BoxedSlice<usize>,
+    pub parent_pos: BoxedSlice<usize>,
 
     /// If the parent key is rowid or a rowid-alias (single-column only)
     pub parent_uses_rowid: bool,

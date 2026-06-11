@@ -14620,7 +14620,7 @@ pub fn op_hash_build(
                 && s.num_keys == data.num_keys
         })
         .unwrap_or_else(|| OpHashBuildState {
-            key_values: crate::alloc::Vectry_with_capacity_ext(data.num_keys)
+            key_values: crate::alloc::Vec::try_with_capacity_ext(data.num_keys)
                 .expect("TODO: fallible allocations"),
             key_idx: 0,
             payload_values: crate::alloc::Vec::try_with_capacity_ext(data.num_payload)
