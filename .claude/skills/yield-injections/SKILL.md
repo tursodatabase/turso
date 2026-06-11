@@ -41,7 +41,7 @@ Each yield-capable live object has:
 
 There is no `inject_io_failure!` today; failure injection only works for `TransitionResult` state machines.
 
-Injected yields return `Completion::new_yield()`. It is already finished, but `is_explicit_yield()` is true, so the VDBE surfaces it as `StepResult::Yield` (via `InsnFunctionStepResult::Yield`) instead of continuing immediately.
+Injected yields return `Completion::new_yield()`. It is already finished, but `is_explicit_yield()` is true, so the VDBE surfaces it as `StepResult::Yield` instead of continuing immediately.
 
 ## New Yield-Capable Type
 

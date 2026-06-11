@@ -459,9 +459,6 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
-                // Pump the event loop on Yield too: the yielding operation may be
-                // waiting on another thread whose I/O completes through the shared
-                // event loop, and a tight re-step loop would starve it.
                 vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
@@ -1033,8 +1030,7 @@ impl Statement {
                             halt_completed = true;
                             break;
                         }
-                        Ok(vdbe::execute::InsnFunctionStepResult::IO(_))
-                        | Ok(vdbe::execute::InsnFunctionStepResult::Yield) => {
+                        Ok(vdbe::execute::InsnFunctionStepResult::IO(_)) => {
                             if let Err(e) = self.pager.io.step() {
                                 capture_reset_error(
                                     &mut reset_error,

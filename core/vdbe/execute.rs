@@ -63,9 +63,9 @@ use crate::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
-    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Connection, Database, DatabaseStorage,
-    IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState, ValueRef,
-    WalAutoActions, MAIN_DB_ID, TEMP_DB_ID,
+    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, Connection, Database,
+    DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState,
+    ValueRef, WalAutoActions, MAIN_DB_ID, TEMP_DB_ID,
 };
 use crate::{
     error::{
@@ -158,7 +158,7 @@ macro_rules! return_if_io {
     ($expr:expr) => {
         match $expr {
             Ok(IOResult::Done(v)) => v,
-            Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::from_io(io)),
+            Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
             Err(err) => {
                 mark_unlikely();
                 return Err(err);
@@ -363,34 +363,16 @@ fn comparison_matches_order(op: ComparisonOp, order: std::cmp::Ordering) -> bool
 
 pub enum InsnFunctionStepResult {
     Done,
-    /// The instruction is waiting for pending I/O and will resume at the same pc.
-    /// Must never carry an explicit-yield completion — yields are not pending I/O
-    /// and surface as [`InsnFunctionStepResult::Yield`] instead.
     IO(IOCompletions),
     Row,
     Step,
-    /// The instruction explicitly yielded control with no pending I/O; it will
-    /// simply re-execute at the same pc on the next step.
-    Yield,
-}
-
-impl InsnFunctionStepResult {
-    /// Wrap pending completions, surfacing explicit yields as [`Self::Yield`]
-    /// so the [`Self::IO`] variant never carries a yield completion.
-    pub fn from_io(io: IOCompletions) -> Self {
-        if io.is_explicit_yield() {
-            InsnFunctionStepResult::Yield
-        } else {
-            InsnFunctionStepResult::IO(io)
-        }
-    }
 }
 
 impl<T> From<IOResult<T>> for InsnFunctionStepResult {
     fn from(value: IOResult<T>) -> Self {
         match value {
             IOResult::Done(_) => InsnFunctionStepResult::Done,
-            IOResult::IO(io) => InsnFunctionStepResult::from_io(io),
+            IOResult::IO(io) => InsnFunctionStepResult::IO(io),
         }
     }
 }
@@ -671,7 +653,7 @@ pub fn op_checkpoint(
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
-        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::from_io(io)),
+        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Err(err) => {
             tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
             pager.clear_checkpoint_state();
@@ -2947,7 +2929,7 @@ pub fn halt(
             IOResult::Done(_) => return Err(pending_error),
             IOResult::IO(io) => {
                 state.pending_fail_error = Some(pending_error); // put it back and wait
-                return Ok(InsnFunctionStepResult::from_io(io));
+                return Ok(InsnFunctionStepResult::IO(io));
             }
         }
     }
@@ -3035,7 +3017,7 @@ pub fn halt(
                 IOResult::IO(io) => {
                     // store the error for reentrancy
                     state.pending_fail_error = Some(error);
-                    return Ok(InsnFunctionStepResult::from_io(io));
+                    return Ok(InsnFunctionStepResult::IO(io));
                 }
             }
         }
@@ -3517,7 +3499,7 @@ pub fn op_transaction_inner(
                             TransactionYieldPoint::BeforeStart,
                         )
                     {
-                        return Ok(InsnFunctionStepResult::from_io(io));
+                        return Ok(InsnFunctionStepResult::IO(io));
                     }
                 }
 
@@ -3825,7 +3807,7 @@ pub fn op_transaction_inner(
                             conn.set_tx_state(TransactionState::PendingUpgrade {
                                 has_read_txn: matches!(current_state, TransactionState::Read),
                             });
-                            return Ok(InsnFunctionStepResult::from_io(io));
+                            return Ok(InsnFunctionStepResult::IO(io));
                         }
                     }
                 }
@@ -3850,7 +3832,7 @@ pub fn op_transaction_inner(
                 let conn = program.connection.clone();
                 let res = pager.begin_write_tx(conn.wal_auto_actions())?;
                 if let IOResult::IO(io) = res {
-                    return Ok(InsnFunctionStepResult::from_io(io));
+                    return Ok(InsnFunctionStepResult::IO(io));
                 }
                 *state.active_op_state.transaction() = OpTransactionState::CheckSchemaCookie;
                 continue;
@@ -3871,7 +3853,7 @@ pub fn op_transaction_inner(
                         }
                         continue;
                     }
-                    IOResult::IO(io) => return Ok(InsnFunctionStepResult::from_io(io)),
+                    IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
                 }
             }
             // 4. Check whether schema has changed if we are actually going to access the database.
@@ -3890,7 +3872,7 @@ pub fn op_transaction_inner(
                             return Err(LimboError::SchemaUpdated);
                         }
                     }
-                    Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::from_io(io)),
+                    Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
                     // This means we are starting a read_tx and we do not have a page 1 yet, so we just continue execution
                     Err(LimboError::Page1NotAlloc) => {}
                     Err(err) => {
@@ -3907,7 +3889,7 @@ pub fn op_transaction_inner(
                     let write = matches!(tx_mode, TransactionMode::Write);
                     let res = state.begin_statement(&program.connection, &pager, write)?;
                     if let IOResult::IO(io) = res {
-                        return Ok(InsnFunctionStepResult::from_io(io));
+                        return Ok(InsnFunctionStepResult::IO(io));
                     }
                 } else if *db != crate::MAIN_DB_ID
                     && matches!(tx_mode, TransactionMode::Write)
@@ -4115,9 +4097,7 @@ pub fn op_auto_commit(
         .map(Into::<InsnFunctionStepResult>::into)?
     {
         res @ (InsnFunctionStepResult::Done | InsnFunctionStepResult::Step) => res,
-        res @ (InsnFunctionStepResult::IO(_)
-        | InsnFunctionStepResult::Row
-        | InsnFunctionStepResult::Yield) => return Ok(res),
+        res @ (InsnFunctionStepResult::IO(_) | InsnFunctionStepResult::Row) => return Ok(res),
     };
 
     if mv_store.is_none() {
@@ -4597,19 +4577,16 @@ pub fn op_program(
                         Ok(step_result) => match step_result {
                             StepResult::Done => break,
                             StepResult::IO | StepResult::Yield => {
-                                let io = statement.take_io_completions();
+                                let io = statement.take_io_completions().unwrap_or_else(|| {
+                                    IOCompletions::Single(Completion::new_yield())
+                                });
                                 *state.active_op_state.program() = OpProgramState::Step {
                                     is_trigger,
                                     statement,
                                     saved_last_insert_rowid,
                                     saved_changes_value: saved_last_changes_value,
                                 };
-                                return Ok(match io {
-                                    Some(io) => InsnFunctionStepResult::from_io(io),
-                                    // Explicit yield or statement-level wait with
-                                    // no pending I/O (e.g. busy-handler timeout).
-                                    None => InsnFunctionStepResult::Yield,
-                                });
+                                return Ok(InsnFunctionStepResult::IO(io));
                             }
                             StepResult::Row => continue,
                             StepResult::Interrupt | StepResult::Busy => {
@@ -5163,7 +5140,7 @@ pub fn op_seek(
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
-        Ok(SeekInternalResult::IO(io)) => Ok(InsnFunctionStepResult::from_io(io)),
+        Ok(SeekInternalResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Err(e) => Err(e),
     }
 }
@@ -6789,7 +6766,7 @@ pub fn op_sorter_open(
     let page_size = match pager.with_header(|header| header.page_size) {
         Ok(IOResult::Done(page_size)) => page_size,
         Err(_) => PageSize::default(),
-        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::from_io(io)),
+        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
     };
     let page_size = page_size.get() as usize;
 
@@ -9719,7 +9696,7 @@ pub fn op_insert(
                     is_without_rowid,
                     SeekOp::GE { eq_only: true },
                 )? {
-                    return Ok(InsnFunctionStepResult::from_io(io));
+                    return Ok(InsnFunctionStepResult::IO(io));
                 }
                 let has_dependent_views = {
                     let schema = program.connection.schema.read();
@@ -10182,9 +10159,7 @@ pub fn op_idx_delete(
                 ) {
                     Ok(SeekInternalResult::Found) => true,
                     Ok(SeekInternalResult::NotFound) => false,
-                    Ok(SeekInternalResult::IO(io)) => {
-                        return Ok(InsnFunctionStepResult::from_io(io))
-                    }
+                    Ok(SeekInternalResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
                     Err(e) => return Err(e),
                 };
 
@@ -10335,7 +10310,7 @@ pub fn op_idx_insert(
                     *state.active_op_state.idx_insert() = OpIdxInsertState::Insert;
                     Ok(InsnFunctionStepResult::Step)
                 }
-                SeekInternalResult::IO(io) => Ok(InsnFunctionStepResult::from_io(io)),
+                SeekInternalResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
             }
         }
         OpIdxInsertState::UniqueConstraintCheck => {
@@ -10814,7 +10789,7 @@ pub fn op_no_conflict(
                         state.active_op_state.clear();
                         Ok(InsnFunctionStepResult::Step)
                     }
-                    SeekInternalResult::IO(io) => Ok(InsnFunctionStepResult::from_io(io)),
+                    SeekInternalResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
                 };
             }
         }
@@ -11953,7 +11928,7 @@ pub fn op_sequence_commit_inner_tx(
     let commit_sm = state.sequence_inner_commit.as_mut().expect("just set");
 
     match commit_sm.step(&mv_store) {
-        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::from_io(io)),
+        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Ok(IOResult::Done(())) => {
             state.sequence_inner_commit = None;
             state.sequence_inner_tx_pending = None;
@@ -12108,7 +12083,7 @@ pub fn op_page_count(
     }) {
         Err(_) => 0.into(),
         Ok(IOResult::Done(v)) => v.into(),
-        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::from_io(io)),
+        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
     };
     state.registers[*dest].set_int(count);
     state.pc += 1;
@@ -12242,10 +12217,11 @@ fn op_parse_schema_step(
         let inner = state.active_op_state.parse_schema().as_mut().unwrap();
         match inner.stmt.step()? {
             StepResult::IO | StepResult::Yield => {
-                return Ok(match inner.stmt.take_io_completions() {
-                    Some(io) => InsnFunctionStepResult::from_io(io),
-                    None => InsnFunctionStepResult::Yield,
-                });
+                let io = inner
+                    .stmt
+                    .take_io_completions()
+                    .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
+                return Ok(InsnFunctionStepResult::IO(io));
             }
             StepResult::Row => {
                 let inner = state
@@ -12500,10 +12476,11 @@ fn drive_init_cdc_version(
         let inner = state.active_op_state.init_cdc_version().as_mut().unwrap();
         match inner.stmt.step()? {
             StepResult::IO | StepResult::Yield => {
-                return Ok(match inner.stmt.take_io_completions() {
-                    Some(io) => InsnFunctionStepResult::from_io(io),
-                    None => InsnFunctionStepResult::Yield,
-                });
+                let io = inner
+                    .stmt
+                    .take_io_completions()
+                    .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
+                return Ok(InsnFunctionStepResult::IO(io));
             }
             StepResult::Row => match &inner.phase {
                 OpInitCdcVersionPhase::CheckTable => {
@@ -12707,7 +12684,7 @@ pub fn op_read_cookie(
         ) {
             Err(_) => 0.into(),
             Ok(IOResult::Done(v)) => v,
-            Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::from_io(io)),
+            Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
         };
 
     state.registers[*dest].set_int(cookie_value);
@@ -12807,7 +12784,7 @@ pub fn op_set_cookie(
         Ok(())
     })? {
         IOResult::Done(result) => result?,
-        IOResult::IO(io) => return Ok(InsnFunctionStepResult::from_io(io)),
+        IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
     }
 
     state.pc += 1;
@@ -13410,7 +13387,7 @@ pub fn op_found(
     ) {
         Ok(SeekInternalResult::Found) => SeekResult::Found,
         Ok(SeekInternalResult::NotFound) => SeekResult::NotFound,
-        Ok(SeekInternalResult::IO(io)) => return Ok(InsnFunctionStepResult::from_io(io)),
+        Ok(SeekInternalResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
         Err(e) => return Err(e),
     };
 
@@ -14703,7 +14680,7 @@ pub fn op_hash_build(
                     Ok(IOResult::Done(v)) => v,
                     Ok(IOResult::IO(io)) => {
                         *state.active_op_state.hash_build() = Some(op_state);
-                        return Ok(InsnFunctionStepResult::from_io(io));
+                        return Ok(InsnFunctionStepResult::IO(io));
                     }
                     Err(e) => {
                         *state.active_op_state.hash_build() = Some(op_state);
@@ -14737,7 +14714,7 @@ pub fn op_hash_build(
                 op_state.key_values = pending.key_values;
                 op_state.payload_values = pending.payload_values;
                 *state.active_op_state.hash_build() = Some(op_state);
-                return Ok(InsnFunctionStepResult::from_io(io));
+                return Ok(InsnFunctionStepResult::IO(io));
             }
         }
     }
@@ -14800,7 +14777,7 @@ pub fn op_hash_distinct(
             };
             Ok(InsnFunctionStepResult::Step)
         }
-        IOResult::IO(io) => Ok(InsnFunctionStepResult::from_io(io)),
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
     }
 }
 
@@ -14816,7 +14793,7 @@ pub fn op_hash_build_finalize(
         match ht.finalize_build(Some(&mut state.metrics.hash_join))? {
             crate::types::IOResult::Done(()) => {}
             crate::types::IOResult::IO(io) => {
-                return Ok(InsnFunctionStepResult::from_io(io));
+                return Ok(InsnFunctionStepResult::IO(io));
             }
         }
     }
@@ -14933,7 +14910,7 @@ pub fn op_hash_probe(
                             partition_idx,
                             probe_buffered: true,
                         });
-                        return Ok(InsnFunctionStepResult::from_io(io));
+                        return Ok(InsnFunctionStepResult::IO(io));
                     }
                 }
                 // Jump to target_pc: this row is deferred to grace processing.
@@ -15184,7 +15161,7 @@ fn advance_unmatched_scan(
                 match hash_table.load_spilled_partition(partition_idx, Some(metrics))? {
                     crate::types::IOResult::Done(()) => {}
                     crate::types::IOResult::IO(io) => {
-                        return Ok(InsnFunctionStepResult::from_io(io));
+                        return Ok(InsnFunctionStepResult::IO(io));
                     }
                 }
             }
@@ -15206,7 +15183,7 @@ fn advance_unmatched_scan(
                             match hash_table.load_spilled_partition(partition_idx, Some(metrics))? {
                                 crate::types::IOResult::Done(()) => continue,
                                 crate::types::IOResult::IO(io) => {
-                                    return Ok(InsnFunctionStepResult::from_io(io));
+                                    return Ok(InsnFunctionStepResult::IO(io));
                                 }
                             }
                         }
@@ -15249,7 +15226,7 @@ pub fn op_hash_grace_init(
     match hash_table.finalize_probe_spill(Some(&mut state.metrics.hash_join))? {
         IOResult::Done(()) => {}
         IOResult::IO(io) => {
-            return Ok(InsnFunctionStepResult::from_io(io));
+            return Ok(InsnFunctionStepResult::IO(io));
         }
     }
 
@@ -15291,7 +15268,7 @@ pub fn op_hash_grace_load_partition(
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
-        IOResult::IO(io) => Ok(InsnFunctionStepResult::from_io(io)),
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
     }
 }
 
@@ -15338,7 +15315,7 @@ pub fn op_hash_grace_next_probe(
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
-        IOResult::IO(io) => Ok(InsnFunctionStepResult::from_io(io)),
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
     }
 }
 
@@ -15615,10 +15592,7 @@ pub fn op_journal_mode(
 ) -> Result<InsnFunctionStepResult> {
     match op_journal_mode_inner(program, state, insn, pager) {
         Ok(result) => {
-            if !matches!(
-                result,
-                InsnFunctionStepResult::IO(_) | InsnFunctionStepResult::Yield
-            ) {
+            if !matches!(result, InsnFunctionStepResult::IO(_)) {
                 // Reset state if we are done with this instruction
                 state.active_op_state.clear();
             }
@@ -15994,10 +15968,6 @@ pub fn op_vacuum_into(
             // Waiting for I/O, keep state for resumption
             Ok(InsnFunctionStepResult::IO(io))
         }
-        Ok(InsnFunctionStepResult::Yield) => {
-            // Explicit yield, keep state for resumption
-            Ok(InsnFunctionStepResult::Yield)
-        }
         Ok(InsnFunctionStepResult::Done | InsnFunctionStepResult::Row) => {
             unreachable!("op_vacuum_into_inner only returns Step or IO")
         }
@@ -16234,7 +16204,7 @@ fn op_vacuum_into_inner(
                     }
                     crate::IOResult::IO(io) => {
                         vacuum_state.phase = VacuumIntoOpPhase::Build;
-                        return Ok(InsnFunctionStepResult::from_io(io));
+                        return Ok(InsnFunctionStepResult::IO(io));
                     }
                 }
             }
@@ -16287,7 +16257,7 @@ pub fn op_vacuum(
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
-        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::from_io(io)),
+        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Err(err) => {
             let VacuumOpState::InPlace(vacuum_state) = std::mem::take(&mut state.op_vacuum_state)
             else {
