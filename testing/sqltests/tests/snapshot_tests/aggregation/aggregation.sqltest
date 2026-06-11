@@ -232,6 +232,29 @@ snapshot simple-count-star {
     SELECT count(*) FROM t1;
 }
 
+setup partial_index_count_table {
+    CREATE TABLE t2(
+        id INTEGER PRIMARY KEY,
+        marker,
+        key_col INTEGER NOT NULL,
+        aux_col INTEGER
+    );
+    CREATE UNIQUE INDEX t2_partial_key_idx
+        ON t2(key_col)
+        WHERE marker IS NULL;
+    CREATE INDEX t2_partial_aux_idx
+        ON t2(aux_col)
+        WHERE marker IS NULL;
+}
+
+@setup partial_index_count_table
+# This should count from the partial index without rechecking the predicate:
+# SQLite may still emit a lazy DeferredSeek, but it does not read t2.marker
+# from the table or emit a NotNull filter because the index predicate proves it.
+snapshot partial-index-count-star {
+    SELECT count(*) FROM t2 WHERE marker IS NULL;
+}
+
 @setup simple_table
 snapshot simple-count-no-args {
     SELECT count() FROM t1;
