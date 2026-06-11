@@ -1444,7 +1444,7 @@ pub fn collect_set_clauses_for_upsert(
         .columns()
         .iter()
         .enumerate()
-        .filter_map(|(i, c)| c.name.as_ref().map(|n| (n.to_lowercase(), i)))
+        .filter_map(|(i, c)| c.name.as_ref().map(|n| (normalize_ident(n), i)))
         .collect();
 
     let mut out: Vec<(usize, Box<ast::Expr>)> = vec![];

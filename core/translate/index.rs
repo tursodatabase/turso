@@ -109,6 +109,9 @@ pub fn translate_create_index(
         resolver.resolve_existing_table_database_id(tbl_name.as_str())?
     };
     let idx_name = normalize_ident(original_idx_name.name.as_str());
+    // Original-case names persisted into sqlite_schema; normalized forms drive lookups/conflicts.
+    let display_idx_name = original_idx_name.name.as_str().to_string();
+    let display_tbl_name = tbl_name.as_str().to_string();
     let tbl_name = normalize_ident(tbl_name.as_str());
 
     validate(
@@ -201,7 +204,7 @@ pub fn translate_create_index(
         }
     }
     let idx = Arc::new(Index {
-        name: idx_name.clone(),
+        name: idx_name,
         table_name: tbl.name.clone(),
         root_page: 0, //  we dont have access till its created, after we parse the schema table
         columns,
@@ -254,14 +257,24 @@ pub fn translate_create_index(
         db: database_id,
     });
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
+    // Persist tbl_name to match the table row's own tbl_name in sqlite_schema so subsequent
+    // DROP TABLE / lookup comparisons (NOCASE, ASCII-only) succeed. For tables loaded from a
+    // pre-fix(#5730) database the persisted name is the Unicode-lowercased `tbl.name`, not the
+    // user-typed `display_tbl_name`; emitting the latter would leave an orphan index row that
+    // corrupts the schema on reopen.
+    let persisted_tbl_name = if normalize_ident(&display_tbl_name) == tbl.name {
+        display_tbl_name.as_str()
+    } else {
+        tbl.name.as_str()
+    };
     emit_schema_entry(
         program,
         resolver,
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
         SchemaEntryType::Index,
-        &idx_name,
-        &tbl_name,
+        &display_idx_name,
+        persisted_tbl_name,
         root_page_reg,
         Some(sql),
     )?;
@@ -284,8 +297,10 @@ pub fn translate_create_index(
         value: current_schema_version as i32 + 1,
         p5: 0,
     });
-    // Parse the schema table to get the index root page and add new index to Schema
-    let escaped_idx_name = escape_sql_string_literal(&idx_name);
+    // Parse the schema table to get the index root page and add new index to Schema.
+    // Case-sensitive equality is enough: the row we are looking up was inserted by this same
+    // CREATE INDEX statement with `display_idx_name` as the literal `name` value.
+    let escaped_idx_name = escape_sql_string_literal(&display_idx_name);
     let parse_schema_where_clause = format!("name = '{escaped_idx_name}' AND type = 'index'");
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
@@ -1324,12 +1339,13 @@ pub fn translate_drop_index(
     // if current column is not index_name then jump to Next
     // skip if sqlite_schema.name != index_name_reg
     let next_label = program.allocate_label();
+    // Match the index row by name case-insensitively (ASCII): names are stored with original case.
     program.emit_insn(Insn::Ne {
         lhs: index_name_reg,
         rhs: dest_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: Some(CollationSeq::NoCase),
     });
 
     // read type of table

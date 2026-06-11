@@ -14,6 +14,7 @@ use crate::{
     function::{AlterTableFunc, Func},
     schema::{CheckConstraint, Column, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
     translate::{
+        collate::CollationSeq,
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
         plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
@@ -278,8 +279,8 @@ fn emit_rename_sqlite_sequence_entry(
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
     database_id: usize,
-    old_table_name_norm: &str,
-    new_table_name_norm: &str,
+    old_table_name_display: &str,
+    new_table_name_display: &str,
 ) {
     let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
         s.get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
@@ -290,9 +291,9 @@ fn emit_rename_sqlite_sequence_entry(
     let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_sequence.clone()));
     let sequence_name_reg = program.alloc_register();
     let sequence_value_reg = program.alloc_register();
-    let row_name_to_replace_reg = program.emit_string8_new_reg(old_table_name_norm.to_string());
+    let row_name_to_replace_reg = program.emit_string8_new_reg(old_table_name_display.to_string());
     program.mark_last_insn_constant();
-    let replacement_row_name_reg = program.emit_string8_new_reg(new_table_name_norm.to_string());
+    let replacement_row_name_reg = program.emit_string8_new_reg(new_table_name_display.to_string());
     program.mark_last_insn_constant();
 
     let affinity_str = sqlite_sequence
@@ -311,12 +312,13 @@ fn emit_rename_sqlite_sequence_entry(
         program.emit_column_or_rowid(seq_cursor_id, 0, sequence_name_reg);
 
         let continue_loop_label = program.allocate_label();
+        // NOCASE matches both new original-case rows and legacy lowercased ones.
         program.emit_insn(Insn::Ne {
             lhs: sequence_name_reg,
             rhs: row_name_to_replace_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: Some(CollationSeq::NoCase),
         });
 
         program.emit_column_or_rowid(seq_cursor_id, 1, sequence_value_reg);
@@ -1531,7 +1533,6 @@ pub fn translate_alter_table(
         ast::AlterTableBody::RenameTo(new_name) => {
             let new_name = new_name.as_str();
             let normalized_old_name = normalize_ident(table_name);
-            let normalized_new_name = normalize_ident(new_name);
             let mut temp_triggers_to_rewrite: Vec<(String, String)> = Vec::new();
 
             if resolver.with_schema(database_id, |s| {
@@ -1661,13 +1662,16 @@ pub fn translate_alter_table(
                 });
             });
 
+            // sqlite_sequence rows are persisted in original case; pass the user-typed names so
+            // the new row keeps the case the user wrote, and rely on NOCASE matching inside the
+            // helper to find rows that a pre-fix Turso version had lowercased.
             emit_rename_sqlite_sequence_entry(
                 program,
                 resolver,
                 connection,
                 database_id,
-                &normalized_old_name,
-                &normalized_new_name,
+                table_name,
+                new_name,
             );
 
             // For AUTOINCREMENT tables, also rewrite the persistent

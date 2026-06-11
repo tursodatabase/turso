@@ -5,6 +5,7 @@ use crate::schema::{
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::{
+    collate::CollationSeq,
     emitter::Resolver,
     schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
 };
@@ -299,6 +300,8 @@ pub fn translate_create_view(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
+    // Original-case name persisted into sqlite_schema; normalized form is for lookups/conflicts.
+    let display_view_name = view_name.name.as_str().to_string();
 
     validate_create_view(resolver, database_id, &normalized_view_name)?;
 
@@ -337,14 +340,15 @@ pub fn translate_create_view(
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for views
         SchemaEntryType::View,
-        &normalized_view_name,
-        &normalized_view_name,
+        &display_view_name,
+        &display_view_name,
         0, // Regular views don't have a btree
         Some(sql),
     )?;
 
-    // Parse schema to load the new view
-    let escaped_view_name = escape_sql_string_literal(&normalized_view_name);
+    // Parse schema to load the new view. Case-sensitive equality is enough: the row whose
+    // `name` we look up was inserted by this CREATE VIEW with `display_view_name` as the literal.
+    let escaped_view_name = escape_sql_string_literal(&display_view_name);
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!("name = '{escaped_view_name}'")),
@@ -523,7 +527,7 @@ pub fn translate_drop_view(
         rhs: view_name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: Some(CollationSeq::NoCase),
     });
     // Matches view - delete it
     program.emit_insn(Insn::RowId {

@@ -467,7 +467,7 @@ fn collect_update_set_clauses(
         .columns()
         .iter()
         .enumerate()
-        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+        .filter_map(|(i, col)| col.name.as_ref().map(|name| (normalize_ident(name), i)))
         .collect();
     let mut set_clauses: Vec<UpdateSetClause> = Vec::with_capacity(sets.len());
 

@@ -1,0 +1,150 @@
+@database :memory:
+
+# https://github.com/tursodatabase/turso/issues/5781
+# Table/view/index names must keep their original case in sqlite_schema (like SQLite),
+# while name resolution stays case-insensitive (ASCII-only folding).
+
+@cross-check-integrity
+test table_name_case_in_sqlite_schema {
+    CREATE TABLE tTt(aAa);
+    SELECT name, tbl_name FROM sqlite_schema WHERE type = 'table';
+}
+expect {
+    tTt|tTt
+}
+
+@cross-check-integrity
+test view_name_case_in_sqlite_schema {
+    CREATE TABLE t(x);
+    CREATE VIEW vVv AS SELECT * FROM t;
+    SELECT name, tbl_name FROM sqlite_schema WHERE type = 'view';
+}
+expect {
+    vVv|vVv
+}
+
+@cross-check-integrity
+test index_name_case_in_sqlite_schema {
+    CREATE TABLE MyTbl(Col1);
+    CREATE INDEX MyIdx ON MyTbl(Col1);
+    SELECT name, tbl_name FROM sqlite_schema WHERE type = 'index';
+}
+expect {
+    MyIdx|MyTbl
+}
+
+@cross-check-integrity
+test autoindex_name_uses_table_case {
+    CREATE TABLE MyTbl(x, y, UNIQUE(x));
+    SELECT name, tbl_name FROM sqlite_schema WHERE type = 'index';
+}
+expect {
+    sqlite_autoindex_MyTbl_1|MyTbl
+}
+
+@cross-check-integrity
+test quoted_table_name_case {
+    CREATE TABLE "Mixed Case"(x);
+    SELECT name FROM sqlite_schema WHERE type = 'table';
+}
+expect {
+    Mixed Case
+}
+
+# Identifier folding is ASCII-only: cœur and CŒUR differ only by the non-ASCII
+# ligature œ/Œ, so SQLite (and Turso) treat them as two distinct tables.
+@cross-check-integrity
+test non_ascii_case_distinct_tables {
+    CREATE TABLE cœur(x);
+    CREATE TABLE CŒUR(y);
+    SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name;
+}
+expect {
+    CŒUR
+    cœur
+}
+
+# https://github.com/tursodatabase/turso/issues/5730 — the same ASCII-only folding applies to
+# views: é and É differ only by a non-ASCII letter, so they are two distinct views.
+@cross-check-integrity
+test non_ascii_case_distinct_views {
+    CREATE TABLE t(x);
+    CREATE VIEW é AS SELECT 1;
+    CREATE VIEW É AS SELECT 1;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'view';
+}
+expect {
+    2
+}
+
+# A purely-ASCII case variant is the SAME identifier and must be rejected.
+@cross-check-integrity
+test ascii_case_only_duplicate_rejected {
+    CREATE TABLE café(x);
+    CREATE TABLE CAFé(y);
+}
+expect error {
+}
+
+@cross-check-integrity
+test case_insensitive_lookup_of_mixed_case_table {
+    CREATE TABLE Accounts(Id);
+    INSERT INTO ACCOUNTS VALUES (7);
+    SELECT id FROM accounts;
+}
+expect {
+    7
+}
+
+@cross-check-integrity
+test drop_table_case_insensitive {
+    CREATE TABLE Foo(x);
+    CREATE INDEX Bar ON Foo(x);
+    DROP TABLE fOO;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test drop_index_case_insensitive {
+    CREATE TABLE Foo(x);
+    CREATE INDEX Bar ON Foo(x);
+    DROP INDEX bAr;
+    SELECT name, tbl_name FROM sqlite_schema WHERE type = 'index';
+}
+expect {
+}
+
+@cross-check-integrity
+test drop_view_case_insensitive {
+    CREATE TABLE t(x);
+    CREATE VIEW Vv AS SELECT * FROM t;
+    DROP VIEW vV;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'view';
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test alter_rename_table_preserves_case {
+    CREATE TABLE Old(x);
+    ALTER TABLE oLd RENAME TO NewName;
+    SELECT name, tbl_name FROM sqlite_schema WHERE type = 'table';
+}
+expect {
+    NewName|NewName
+}
+
+@cross-check-integrity
+test alter_rename_table_resolvable_case_insensitively {
+    CREATE TABLE Old(x);
+    ALTER TABLE oLd RENAME TO NewName;
+    INSERT INTO newname VALUES (3);
+    SELECT x FROM NEWNAME;
+}
+expect {
+    3
+}
