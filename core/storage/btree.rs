@@ -11,6 +11,7 @@ use super::{
         write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
     },
 };
+use crate::alloc::TursoIteratorExt;
 use crate::{
     io::CompletionGroup,
     io_yield_one,
@@ -882,7 +883,8 @@ impl BTreeCursor {
                     nulls_order: None,
                 }
             })
-            .collect::<Vec<_>>();
+            .try_collect::<crate::alloc::Vec<_>>()
+            .expect("TODO: fallible allocations");
         cursor.index_info = Some(Arc::new(IndexInfo {
             key_info,
             has_rowid: false,
@@ -9544,7 +9546,7 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                let regs = &[Register::Value(Value::Blob(vec![0; *size]))];
+                let regs = &[Register::Value(Value::Blob(crate::alloc::vec![0; *size]))];
                 let value = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
                 tracing::info!("insert key:{}", key);
                 run_until_done(
@@ -9641,7 +9643,7 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                let regs = &[Register::Value(Value::Blob(vec![0; size]))];
+                let regs = &[Register::Value(Value::Blob(crate::alloc::vec![0; size]))];
                 let value = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
                 let btree_before = if do_validate {
                     format_btree(pager.clone(), root_page, 0)
@@ -9910,7 +9912,7 @@ mod tests {
             let index_def = Index {
                 name: "testindex".to_string(),
                 where_clause: None,
-                columns: vec![IndexColumn {
+                columns: crate::alloc::vec![IndexColumn {
                     name: "testcol".to_string(),
                     order: SortOrder::Asc,
                     collation: None,

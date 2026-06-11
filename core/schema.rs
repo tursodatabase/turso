@@ -1971,7 +1971,8 @@ impl Schema {
                 let seq_name = name.strip_prefix(SEQ_BACKING_TABLE_PREFIX)?;
                 Some((name.clone(), seq_name.to_string()))
             })
-            .collect()
+            .try_collect()
+            .expect("TODO: fallible allocations")
     }
 
     fn sequence_backing_tables(&self) -> Vec<SequenceBackingTableSource> {
@@ -1986,7 +1987,8 @@ impl Schema {
                     num_columns: bt.columns().len(),
                 })
             })
-            .collect()
+            .try_collect()
+            .expect("TODO: fallible allocations")
     }
 
     fn read_sequence_metadata(record: &ImmutableRecord) -> Option<SequenceMetadata> {

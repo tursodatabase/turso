@@ -1201,12 +1201,12 @@ fn parse_table(
         let btree_table = Arc::new(crate::schema::BTreeTable::new(
             root_page,
             view_guard.name().to_string(),
-            Vec::new(),
+            crate::alloc::vec![],
             columns,
             crate::schema::BTreeCharacteristics::HAS_ROWID,
-            vec![],
-            vec![],
-            vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         ));
         drop(view_guard);

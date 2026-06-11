@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::alloc::TursoSliceExt;
+
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType};
 
@@ -1686,12 +1688,12 @@ fn emit_materialized_subquery_table(
     let ephemeral_table = Arc::new(BTreeTable::new(
         0,
         String::new(),
-        vec![],
-        columns.to_vec(),
+        crate::alloc::vec![],
+        columns.try_to_vec().expect("TODO: fallible allocations"),
         BTreeCharacteristics::HAS_ROWID,
-        vec![],
-        vec![],
-        vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
     ));
 

@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::index_method::IndexMethodConfiguration;
@@ -874,7 +875,7 @@ fn index_matches_collation(index: &Index, collation: CollationSeq) -> bool {
 pub fn resolve_sorted_columns(
     table: &BTreeTable,
     cols: &[SortedColumn],
-) -> crate::Result<Vec<IndexColumn>> {
+) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
     resolve_sorted_columns_with_resolver(table, cols, None)
 }
 
@@ -882,8 +883,12 @@ fn resolve_sorted_columns_with_resolver(
     table: &BTreeTable,
     cols: &[SortedColumn],
     resolver: Option<&Resolver>,
-) -> crate::Result<Vec<IndexColumn>> {
-    let mut resolved = Vec::with_capacity(cols.len());
+) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
+    let mut resolved =
+        <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
+            cols.len(),
+        )
+        .expect("TODO: fallible allocations");
     for sc in cols {
         let order = sc.order.unwrap_or(SortOrder::Asc);
         let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref(), resolver)?;
@@ -1217,7 +1222,8 @@ pub fn resolve_index_method_parameters(
                             let hex_byte = std::str::from_utf8(pair).unwrap();
                             u8::from_str_radix(hex_byte, 16).unwrap()
                         })
-                        .collect(),
+                        .try_collect()
+                        .expect("TODO: fallible allocations"),
                 ),
                 _ => bail_parse_error!("parameters must be constant literals"),
             },

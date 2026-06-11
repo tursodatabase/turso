@@ -1654,7 +1654,7 @@ fn materialized_subquery_ephemeral_index(
     subquery: &FromClauseSubquery,
     key_col_positions: &[usize],
 ) -> Arc<Index> {
-    let mut index_columns: Vec<IndexColumn> = Vec::new();
+    let mut index_columns: crate::alloc::Vec<IndexColumn> = crate::alloc::vec![];
     let mut seen_col_positions = std::collections::HashSet::new();
 
     for &col_pos in key_col_positions {

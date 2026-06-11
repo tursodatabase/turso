@@ -1,3 +1,4 @@
+use crate::alloc::{TursoIteratorExt, TursoSliceExt};
 use crate::sync::Arc;
 use crate::{schema::BTreeTable, turso_assert_eq, turso_assert_ne};
 use turso_parser::{
@@ -420,7 +421,8 @@ pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
                     let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
                     u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
                 })
-                .collect(),
+                .try_collect()
+                .expect("TODO: fallible allocations"),
         )),
         ast::Literal::Null => Ok(Value::Null),
         ast::Literal::True => Ok(Value::from_i64(1)),
@@ -1518,8 +1520,8 @@ pub fn translate_alter_table(
                         db: database_id,
                         table: table_name.to_owned(),
                         column: Box::new(column),
-                        check_constraints: btree.check_constraints.clone(),
-                        foreign_keys: btree.foreign_keys.clone(),
+                        check_constraints: btree.check_constraints.to_vec(),
+                        foreign_keys: btree.foreign_keys.to_vec(),
                     });
                 },
             )?
@@ -2744,7 +2746,9 @@ fn rewrite_trigger_sql_for_column_rename(
             new_event,
             for_each_row,
             new_when_clause.as_deref().cloned(),
-            new_commands.clone(),
+            new_commands
+                .try_to_vec()
+                .expect("TODO: fallible allocations"),
             temporary,
             Some(target_database_id),
         );

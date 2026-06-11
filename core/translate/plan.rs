@@ -1758,7 +1758,7 @@ where
         } else {
             let overflow_idx = (index - Self::INLINE_BITS) / 64;
             let bit = (index - Self::INLINE_BITS) % 64;
-            let overflow = self.overflow.get_or_insert_with(alloc::Vec::new);
+            let overflow = self.overflow.get_or_insert_with(|| alloc::vec![]);
             if overflow_idx >= overflow.len() {
                 overflow.try_reserve(overflow_idx + 1 - overflow.len())?;
                 overflow.resize(overflow_idx + 1, 0);
@@ -1865,7 +1865,7 @@ where
     pub fn union_with(&mut self, other: &Self) -> Result<(), alloc::TryReserveError> {
         self.inline |= other.inline;
         if let Some(other_ov) = &other.overflow {
-            let self_ov = self.overflow.get_or_insert_with(alloc::Vec::new);
+            let self_ov = self.overflow.get_or_insert_with(|| alloc::vec![]);
             if self_ov.len() < other_ov.len() {
                 self_ov.try_reserve(other_ov.len() - self_ov.len())?;
                 self_ov.resize(other_ov.len(), 0);
@@ -2288,7 +2288,8 @@ impl JoinedTable {
                     ColDef::default(),
                 )
             })
-            .collect::<Vec<_>>();
+            .try_collect::<alloc::Vec<_>>()
+            .expect("TODO: fallible allocations");
 
         for (i, column) in columns.iter_mut().enumerate() {
             if super::expr::expr_is_array(
@@ -2401,7 +2402,8 @@ impl JoinedTable {
                     ColDef::default(),
                 )
             })
-            .collect::<Vec<_>>();
+            .try_collect::<alloc::Vec<_>>()
+            .expect("TODO: fallible allocations");
 
         for (i, column) in columns.iter_mut().enumerate() {
             if super::expr::expr_is_array(&result_columns[i].expr, Some(table_references)) {

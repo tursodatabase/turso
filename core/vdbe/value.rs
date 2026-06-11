@@ -867,7 +867,7 @@ impl Value {
             return Err(LimboError::TooBig);
         }
 
-        Ok(Value::Blob(vec![0; length as usize]))
+        Ok(Value::Blob(crate::alloc::vec![0; length as usize]))
     }
 
     // exec_if returns whether you should jump

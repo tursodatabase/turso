@@ -5854,11 +5854,11 @@ fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-            payload.push(Value::Blob(vec![]));
+            payload.push(Value::Blob(crate::alloc::vec![]));
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
-            payload.push(Value::Blob(vec![]));
+            payload.push(Value::Blob(crate::alloc::vec![]));
         }
     };
     Ok(())
@@ -6401,8 +6401,9 @@ fn op_window_step(
     match func {
         WindowFunc::RowNumber => {
             if let Register::Value(Value::Null) = state.registers[acc_reg] {
-                state.registers[acc_reg] =
-                    Register::Aggregate(AggContext::Builtin(vec![Value::from_i64(0)]));
+                state.registers[acc_reg] = Register::Aggregate(AggContext::Builtin(
+                    crate::alloc::vec![Value::from_i64(0)],
+                ));
             }
             let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
             else {
@@ -11734,12 +11735,14 @@ const SEQ_COMMIT_STATUS_CONFLICT_RETRY: i64 = 1;
 /// "no prior mv_tx for this db" (must be restored to `None`).
 fn encode_saved_outer_mv_tx(
     outer: Option<(TxID, crate::translate::emitter::TransactionMode)>,
-) -> Vec<u8> {
+) -> crate::alloc::Vec<u8> {
     use crate::translate::emitter::TransactionMode;
     let Some((tx_id, mode)) = outer else {
-        return Vec::new();
+        return crate::alloc::vec![];
     };
-    let mut buf = Vec::with_capacity(9);
+    let mut buf =
+        <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(9)
+            .expect("TODO: fallible allocations");
     buf.extend_from_slice(&tx_id.to_le_bytes());
     let mode_tag: u8 = match mode {
         TransactionMode::None => 0,
@@ -11813,7 +11816,7 @@ pub fn op_sequence_begin_inner_tx(
         // WAL mode: no inner tx needed. The WAL single-writer lock
         // already serializes writes across processes.
         state.registers[*path_kind_reg].set_value(Value::from_i64(SEQ_PATH_SKIPPED));
-        state.registers[*saved_outer_reg].set_value(Value::Blob(Vec::new()));
+        state.registers[*saved_outer_reg].set_value(Value::Blob(crate::alloc::vec![]));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     };
@@ -11822,7 +11825,7 @@ pub fn op_sequence_begin_inner_tx(
     if let Some((outer_id, _)) = outer_tx {
         if mv_store.is_exclusive_tx(&outer_id) {
             state.registers[*path_kind_reg].set_value(Value::from_i64(SEQ_PATH_SKIPPED));
-            state.registers[*saved_outer_reg].set_value(Value::Blob(Vec::new()));
+            state.registers[*saved_outer_reg].set_value(Value::Blob(crate::alloc::vec![]));
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
@@ -12104,8 +12107,8 @@ pub fn op_page_count(
 pub struct OpParseSchemaInner {
     stmt: crate::Statement,
     schema_arc: Arc<Schema>,
-    from_sql_indexes: Vec<crate::util::UnparsedFromSqlIndex>,
-    automatic_indices: crate::HashMap<String, Vec<(String, i64)>>,
+    from_sql_indexes: crate::alloc::Vec<crate::util::UnparsedFromSqlIndex>,
+    automatic_indices: crate::HashMap<String, crate::alloc::Vec<(String, i64)>>,
     dbsp_state_roots: crate::HashMap<String, i64>,
     dbsp_state_index_roots: crate::HashMap<String, i64>,
     materialized_view_info: crate::HashMap<String, (String, i64)>,
@@ -12200,7 +12203,11 @@ pub fn op_parse_schema(
     *state.active_op_state.parse_schema() = Some(Box::new(OpParseSchemaInner {
         stmt,
         schema_arc,
-        from_sql_indexes: Vec::with_capacity(10),
+        from_sql_indexes:
+            <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
+                10,
+            )
+            .expect("TODO: fallible allocations"),
         automatic_indices: Default::default(),
         dbsp_state_roots: Default::default(),
         dbsp_state_index_roots: Default::default(),

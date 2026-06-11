@@ -36,7 +36,7 @@ pub struct IndexMethodConfiguration {
     /// index name
     pub index_name: String,
     /// columns c1, c2, c3, ... provided to the index method (e.g. create index t_idx on t using method (c1, c2, c3, ...))
-    pub columns: Vec<IndexColumn>,
+    pub columns: crate::alloc::Vec<IndexColumn>,
     /// optional parameters provided to the index method through WITH clause
     pub parameters: HashMap<String, Value>,
 }
@@ -193,7 +193,7 @@ pub(crate) fn open_index_cursor(
     database_id: usize,
     table: &str,
     index: &str,
-    keys: Vec<KeyInfo>,
+    keys: crate::alloc::Vec<KeyInfo>,
 ) -> Result<BTreeCursor> {
     let pager = connection.get_pager_from_database_index(&database_id)?;
     let Some(scratch) = connection.with_schema(database_id, |schema| {

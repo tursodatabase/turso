@@ -117,12 +117,12 @@ pub fn translate_create_materialized_view(
     let view_table = Arc::new(BTreeTable::new(
         0, // root_page, will be set to actual root page after creation
         normalized_view_name.clone(),
-        vec![], // primary_key_columns — materialized views use implicit rowid
+        crate::alloc::vec![], // primary_key_columns — materialized views use implicit rowid
         view_columns,
         BTreeCharacteristics::HAS_ROWID,
-        vec![],
-        vec![],
-        vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
     ));
 

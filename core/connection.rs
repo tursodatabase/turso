@@ -2365,7 +2365,7 @@ impl Connection {
             // tables/indices/views from initial parse. We only need to pick up
             // entries that previously failed (e.g. virtual tables whose module
             // wasn't loaded yet). "Already exists" errors are expected and skipped.
-            let mut from_sql_indexes = Vec::new();
+            let mut from_sql_indexes = crate::alloc::vec![];
             let mut automatic_indices = HashMap::default();
             let mut dbsp_state_roots = HashMap::default();
             let mut dbsp_state_index_roots = HashMap::default();

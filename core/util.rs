@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
 use crate::translate::emitter::TransactionMode;
@@ -167,8 +168,8 @@ pub struct ParseSchemaRowsState {
 
 struct ParseSchemaRowsInner {
     rows: Statement,
-    from_sql_indexes: Vec<UnparsedFromSqlIndex>,
-    automatic_indices: HashMap<String, Vec<(String, i64)>>,
+    from_sql_indexes: crate::alloc::Vec<UnparsedFromSqlIndex>,
+    automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>>,
     dbsp_state_roots: HashMap<String, i64>,
     dbsp_state_index_roots: HashMap<String, i64>,
     materialized_view_info: HashMap<String, (String, i64)>,
@@ -182,7 +183,7 @@ impl ParseSchemaRowsState {
         Self {
             inner: Some(ParseSchemaRowsInner {
                 rows,
-                from_sql_indexes: Vec::with_capacity(10),
+                from_sql_indexes: <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(10).expect("TODO: fallible allocations"),
                 automatic_indices: HashMap::with_capacity_and_hasher(10, Default::default()),
                 dbsp_state_roots: HashMap::default(),
                 dbsp_state_index_roots: HashMap::default(),
@@ -1515,8 +1516,12 @@ pub struct ViewColumnSchema {
 
 impl ViewColumnSchema {
     /// Get all columns as a flat vector (without table association info)
-    pub fn flat_columns(&self) -> Vec<Column> {
-        self.columns.iter().map(|vc| vc.column.clone()).collect()
+    pub fn flat_columns(&self) -> crate::alloc::Vec<Column> {
+        self.columns
+            .iter()
+            .map(|vc| vc.column.clone())
+            .try_collect()
+            .expect("TODO: fallible allocations")
     }
 
     /// Get columns that belong to a specific table
@@ -2346,7 +2351,7 @@ mod rename_column_view {
         select: &ast::Select,
         schema: &Schema,
         explicit: &[ast::IndexedColumn],
-    ) -> Result<Vec<Column>> {
+    ) -> Result<crate::alloc::Vec<Column>> {
         let view_column_schema = extract_view_columns(select, schema)?;
         let mut columns = view_column_schema.flat_columns();
         for (i, indexed_col) in explicit.iter().enumerate() {
