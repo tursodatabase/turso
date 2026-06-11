@@ -3631,6 +3631,15 @@ pub struct MvStore<Clock: LogicalClock> {
     /// - Immediately TRUNCATE checkpoint the WAL into the database file.
     /// - Release the blocking_checkpoint_lock.
     blocking_checkpoint_lock: Arc<TursoRwLock>,
+    /// Set when a checkpoint failed to acquire `blocking_checkpoint_lock`
+    /// because transactions were active. While set (and readers remain),
+    /// `begin_tx`/`begin_exclusive_tx` return Busy so in-flight transactions
+    /// drain and the next commit-tail auto-checkpoint can acquire the lock.
+    /// Cleared when a checkpoint acquires the lock. Without this gate,
+    /// sustained concurrent traffic starves checkpoints indefinitely: every
+    /// attempt finds another active transaction holding a read guard, so the
+    /// logical log and the in-memory version chains grow without bound.
+    pub(crate) checkpoint_pending: AtomicBool,
     /// The highest transaction ID that has been made durable in the WAL.
     /// Used to skip checkpointing transactions from mv store to WAL that have already been processed.
     durable_txid_max: AtomicU64,
@@ -3721,6 +3730,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             commit_coordinator: Arc::new(CommitCoordinator::new()),
             global_header: Arc::new(RwLock::new(None)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
+            checkpoint_pending: AtomicBool::new(false),
             durable_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
@@ -5030,6 +5040,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // Existing transactions already hold one blocking-checkpoint read guard
         // from begin_tx(). When upgrading read->write, do not acquire another one.
         let acquires_checkpoint_guard = maybe_existing_tx_id.is_none();
+        if acquires_checkpoint_guard && self.checkpoint_gate_busy() {
+            // A checkpoint lost the lock race to active transactions; refuse
+            // new transactions until the existing ones drain so it can run.
+            return Err(LimboError::Busy);
+        }
         if acquires_checkpoint_guard && !self.blocking_checkpoint_lock.read() {
             // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
             return Err(LimboError::Busy);
@@ -5141,12 +5156,28 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(tx_id)
     }
 
+    /// Returns `true` while new transactions must be refused so that active
+    /// ones drain and a pending checkpoint can acquire the blocking lock.
+    /// The gate disengages once no read guards remain: at that point the next
+    /// commit-tail checkpoint attempt (which runs after the committing
+    /// transaction releases its own guard) acquires the lock and clears
+    /// `checkpoint_pending`, so the gate cannot wedge an idle database.
+    fn checkpoint_gate_busy(&self) -> bool {
+        self.checkpoint_pending.load(Ordering::Acquire)
+            && self.blocking_checkpoint_lock.has_active_readers()
+    }
+
     /// Begins a new transaction in the database.
     ///
     /// This function starts a new transaction in the database and returns a `TxID` value
     /// that you can use to perform operations within the transaction. All changes made within the
     /// transaction are isolated from other transactions until you commit the transaction.
     pub fn begin_tx(&self, pager: Arc<Pager>) -> Result<TxID> {
+        if self.checkpoint_gate_busy() {
+            // A checkpoint lost the lock race to active transactions; refuse
+            // new transactions until the existing ones drain so it can run.
+            return Err(LimboError::Busy);
+        }
         if !self.blocking_checkpoint_lock.read() {
             // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
             return Err(LimboError::Busy);

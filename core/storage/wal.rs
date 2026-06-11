@@ -338,6 +338,12 @@ impl TursoRwLock {
         false
     }
 
+    /// Returns `true` if any shared read locks are currently held.
+    #[inline]
+    pub fn has_active_readers(&self) -> bool {
+        Self::has_readers(self.0.load(Ordering::Acquire))
+    }
+
     /// Try to take an exclusive lock. Succeeds if no readers and no writer.
     #[inline]
     pub fn write(&self) -> bool {

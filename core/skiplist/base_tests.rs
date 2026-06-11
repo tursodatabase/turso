@@ -900,3 +900,68 @@ fn drops() {
     assert_eq!(KEYS.load(Ordering::SeqCst), 8);
     assert_eq!(VALUES.load(Ordering::SeqCst), 7);
 }
+
+// Regression test: `RefRange::next`/`next_back` used to overwrite `head`/
+// `tail` without releasing the old reference (`RefEntry` has no `Drop`),
+// leaking one node reference per yielded entry. Nodes removed afterwards
+// could then never be finalized, so their keys and values leaked.
+#[test]
+fn drops_after_range_iteration() {
+    static KEYS: AtomicUsize = AtomicUsize::new(0);
+    static VALUES: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Eq, PartialEq, Ord, PartialOrd)]
+    struct Key(i32);
+
+    impl Drop for Key {
+        fn drop(&mut self) {
+            KEYS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct Value;
+
+    impl Drop for Value {
+        fn drop(&mut self) {
+            VALUES.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    const N: i32 = 16;
+    let collector = epoch::Collector::new();
+    let handle = collector.register();
+    {
+        let guard = &handle.pin();
+
+        let s = SkipList::new(collector.clone());
+        for x in 0..N {
+            s.insert(Key(x), Value, guard).release(guard);
+        }
+
+        // Drain a full range forwards, then another one backwards.
+        let mut range = s.ref_range::<Key, _>(..);
+        while let Some(e) = range.next(guard) {
+            e.release(guard);
+        }
+        range.drop_impl(guard);
+
+        let mut range = s.ref_range::<Key, _>(..);
+        while let Some(e) = range.next_back(guard) {
+            e.release(guard);
+        }
+        range.drop_impl(guard);
+
+        // Remove every entry. With balanced reference counts, every node is
+        // queued for destruction here.
+        for x in 0..N {
+            s.remove(&Key(x), guard).unwrap().release(guard);
+        }
+        drop(s);
+    }
+
+    handle.pin().flush();
+    handle.pin().flush();
+    // N node keys + N probe keys passed to remove().
+    assert_eq!(KEYS.load(Ordering::SeqCst), 2 * N as usize);
+    assert_eq!(VALUES.load(Ordering::SeqCst), N as usize);
+}
