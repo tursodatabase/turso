@@ -719,8 +719,7 @@ pub fn constraints_from_where_clause(
                 if !subquery.correlated {
                     let estimated_values = params.in_subquery_rows;
                     let analyze_stats = schema.analyze_stats.snapshot();
-                    let table_stats =
-                        analyze_stats.table_stats(table_reference.table.get_name());
+                    let table_stats = analyze_stats.table_stats(table_reference.table.get_name());
                     let row_count = table_stats
                         .and_then(|s| s.row_count)
                         .unwrap_or(params.rows_per_table_fallback as u64)
