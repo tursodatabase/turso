@@ -351,6 +351,41 @@ pub enum RowVersionState {
     NotFound,
     Deleted,
 }
+
+/// A point-in-time snapshot of what is resident in the in-memory MVCC store.
+///
+/// Produced by [`MvStore::resident_version_stats`]. The entry counts include
+/// version chains that are currently empty, so comparing snapshots taken
+/// before and after a checkpoint reveals both unreclaimed row versions and
+/// leftover chain containers that garbage collection failed to remove.
+#[derive(Debug, Default)]
+pub struct ResidentVersionStats {
+    /// Number of row entries in the table version map, including entries
+    /// whose version chains are empty.
+    pub table_entries: usize,
+    /// Total number of row versions across all table version chains.
+    pub table_versions: usize,
+    /// Number of key entries across all index version maps, including entries
+    /// whose version chains are empty.
+    pub index_entries: usize,
+    /// Total number of row versions across all index version chains.
+    pub index_versions: usize,
+}
+
+impl ResidentVersionStats {
+    /// Returns the total number of resident row versions, across both table
+    /// and index version chains.
+    pub fn total_versions(&self) -> usize {
+        self.table_versions + self.index_versions
+    }
+
+    /// Returns the total number of version-chain entries, across both the
+    /// table and index version maps.
+    pub fn total_entries(&self) -> usize {
+        self.table_entries + self.index_entries
+    }
+}
+
 pub type TxID = u64;
 
 /// A log record contains all durable effects of a committed transaction,
@@ -5880,6 +5915,29 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.rows.len()
         );
         dropped
+    }
+
+    /// Takes a snapshot of how many version-chain entries and row versions
+    /// are currently resident in the in-memory store.
+    ///
+    /// This is an observability helper for tests and diagnostics: after a
+    /// quiescent checkpoint the store is expected to be fully drained, so any
+    /// counts that scale with the workload indicate a memory leak. The
+    /// snapshot is not atomic with respect to concurrent writers; each version
+    /// chain is read under its own lock.
+    pub fn resident_version_stats(&self) -> ResidentVersionStats {
+        let mut stats = ResidentVersionStats::default();
+        for entry in self.rows.iter() {
+            stats.table_entries += 1;
+            stats.table_versions += entry.value().read().len();
+        }
+        for index in self.index_rows.iter() {
+            for entry in index.value().iter() {
+                stats.index_entries += 1;
+                stats.index_versions += entry.value().read().len();
+            }
+        }
+        stats
     }
 
     fn gc_table_row_versions(

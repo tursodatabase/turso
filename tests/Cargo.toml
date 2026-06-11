@@ -40,6 +40,9 @@ turso_parser = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing = { workspace = true }
 turso-dbhash.workspace = true
+# Same version as turso_core's vendored skiplist uses, so tests can drive the
+# shared global epoch collector when probing deferred reclamation.
+crossbeam-epoch = "0.9.18"
 
 [dev-dependencies]
 similar-asserts.workspace = true

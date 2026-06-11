@@ -1335,6 +1335,141 @@ fn test_multiple_create_drop_cycles_recover(db: TempDatabase) -> anyhow::Result<
     Ok(())
 }
 
+/// Count the row versions (and version-chain entries) still resident in the
+/// in-memory MVCC store, for both table rows and index rows.
+fn mvcc_resident_versions(db: &Arc<Database>) -> turso_core::mvcc::database::ResidentVersionStats {
+    db.get_mv_store()
+        .as_ref()
+        .expect("MVCC must be enabled")
+        .resident_version_stats()
+}
+
+/// MVCC garbage collection runs at checkpoint time, and a checkpoint with no
+/// concurrent transactions must drain the in-memory version store completely:
+/// every version it wrote to the B-tree is invisible to all possible future
+/// readers, so nothing may stay resident. If superseded versions of a
+/// frequently-updated ("hot") row survive the checkpoint, the version chain
+/// leaks memory proportional to the number of updates.
+#[turso_macros::test]
+fn test_mvcc_hot_row_version_chain_drained_after_checkpoint(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    const UPDATES: usize = 300;
+
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1, 0)")?;
+
+    for _ in 0..UPDATES {
+        conn.execute("UPDATE t SET v = v + 1 WHERE id = 1")?;
+    }
+
+    // Sanity-check the measurement itself: before the checkpoint the
+    // superseded versions of the hot row must still be resident (GC is
+    // checkpoint-driven), so the counter has to see them.
+    let before = mvcc_resident_versions(&tmp_db.db);
+    assert!(
+        before.total_versions() >= UPDATES,
+        "expected at least {UPDATES} resident versions before checkpoint, found {before:?}"
+    );
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    let after = mvcc_resident_versions(&tmp_db.db);
+    assert!(
+        after.total_versions() <= 4,
+        "MVCC version chains leaked after quiescent checkpoint: \
+         {UPDATES} updates of a single row left {after:?} resident \
+         (expected the checkpoint to drain the in-memory store)"
+    );
+
+    Ok(())
+}
+
+/// Reproducer for the MVCC version-store node leak: version chains that
+/// checkpoint GC removes from the rows skip map via `SkipMap::remove()` are
+/// never actually destroyed. The removed node owns the chain
+/// `Arc<RwLock<Vec<RowVersion>>>`, and its deferred destructor never runs —
+/// not through epoch reclamation (even when forced via repeated
+/// `pin().flush()`), and not when the connection and database are dropped.
+///
+/// The probe works on heap liveness, not map contents: it takes a `Weak`
+/// handle to every resident chain before the checkpoint, verifies the
+/// checkpoint really did remove the entries from the map (so a map-content
+/// counter like `resident_version_stats` sees nothing), drops every engine
+/// handle, gives the global epoch collector ample opportunity to run deferred
+/// destructors, and then counts how many chains are still upgradeable. Every
+/// surviving `Weak` is a chain that nothing reachable owns anymore.
+#[turso_macros::test]
+fn test_mvcc_removed_chain_nodes_released_after_drop(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    const ROWS: usize = 1000;
+
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+    for i in 0..ROWS {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'value_{i}')"))?;
+    }
+
+    // Take a weak handle to every version chain resident before the checkpoint.
+    let weak_chains: Vec<_> = {
+        let mv_store = tmp_db
+            .db
+            .get_mv_store()
+            .as_ref()
+            .cloned()
+            .expect("MVCC must be enabled");
+        mv_store
+            .rows
+            .iter()
+            .map(|entry| Arc::downgrade(entry.value()))
+            .collect()
+    };
+    assert!(
+        weak_chains.len() >= ROWS,
+        "expected at least {ROWS} resident chains before checkpoint, found {}",
+        weak_chains.len()
+    );
+
+    // The checkpoint writes the rows to the B-tree, empties every chain, and
+    // removes the now-empty entries from the skip map with SkipMap::remove().
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    let stats = mvcc_resident_versions(&tmp_db.db);
+    assert!(
+        stats.total_entries() <= 4,
+        "precondition: checkpoint GC should have removed the chain entries from the map, \
+         found {stats:?}"
+    );
+
+    // Drop every engine handle that could legitimately keep a chain alive.
+    conn.close()?;
+    drop(conn);
+    drop(tmp_db);
+
+    // Give epoch-based reclamation every opportunity to run the deferred
+    // destructors of the removed skiplist nodes. The vendored skiplist uses
+    // the global default collector, so these pins advance the same epoch.
+    for _ in 0..1024 {
+        crossbeam_epoch::pin().flush();
+    }
+
+    let leaked = weak_chains
+        .iter()
+        .filter(|weak| weak.upgrade().is_some())
+        .count();
+    assert_eq!(
+        leaked,
+        0,
+        "{leaked} of {} version chains removed from the MVCC store are still heap-resident \
+         after dropping the connection and database and forcing epoch reclamation; \
+         the removed skiplist nodes that own them were never destroyed",
+        weak_chains.len()
+    );
+
+    Ok(())
+}
+
 /// Regression test for tursodatabase/turso#5790:
 /// "Btree cursor should have a record when deleting a row that only exists in the btree".
 ///
