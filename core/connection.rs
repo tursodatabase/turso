@@ -886,7 +886,7 @@ impl Connection {
         self.prepare_with_origin(sql, StatementOrigin::InternalHelper)
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn _prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self.prepare_with_origin(sql, StatementOrigin::Root)
     }
