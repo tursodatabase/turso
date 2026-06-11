@@ -194,3 +194,37 @@ test('Session.batch encodes named arguments for statement objects', async t => {
     { name: 'age', value: { type: 'integer', value: '30' } },
   ]);
 });
+
+// --- requestHeaders ---
+
+test('Session attaches requestHeaders, lets them override Authorization, and drops Host', async t => {
+  const session = new Session({
+    url: 'http://fake-host',
+    authToken: 'standard-token',
+    requestHeaders: {
+      'x-custom-header': 'custom-value',
+      'Authorization': 'Bearer override-token',
+      'Host': 'evil-host',
+    },
+  });
+  const capturedHeaders = [];
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (url, opts) => {
+    capturedHeaders.push(opts.headers);
+    return new Response(
+      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_begin', cols: [] })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 0 })}\n`,
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  };
+
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  await session.execute('SELECT 1');
+
+  const headers = capturedHeaders[0];
+  t.is(headers['x-custom-header'], 'custom-value');
+  t.is(headers['Authorization'], 'Bearer override-token',
+    'requestHeaders are applied after standard headers, so they override Authorization');
+  t.false('Host' in headers, 'Host is a forbidden fetch header and must be dropped');
+});
