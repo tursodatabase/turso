@@ -15162,3 +15162,99 @@ fn test_create_index_exclusive_acquire_rechecks_timestamp_after_cas() {
     assert_eq!(integrity.len(), 1);
     assert_eq!(integrity[0][0].to_string(), "ok");
 }
+
+/// What this test checks: When an auto-checkpoint loses the blocking-lock race
+/// to an active transaction, the drain gate arms: new transactions get Busy
+/// until the active ones finish, after which the next commit-tail checkpoint
+/// acquires the lock, truncates the log, and disarms the gate.
+/// Why this matters: Without the gate, sustained concurrent traffic starves
+/// checkpoints indefinitely — every attempt finds another active transaction
+/// holding a read guard — so the logical log and the in-memory version chains
+/// grow without bound.
+#[test]
+fn test_checkpoint_starvation_drain_gate() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mv_store = db.get_mvcc_store();
+    let writer = db.connect();
+    writer.execute("CREATE TABLE t(x)").unwrap();
+
+    // Force should_checkpoint() at every commit tail.
+    mv_store.set_checkpoint_threshold(0);
+
+    // Hold a transaction open so the auto-checkpoint cannot take the lock.
+    let holder = db.connect();
+    holder.execute("BEGIN CONCURRENT").unwrap();
+    holder.execute("INSERT INTO t VALUES (0)").unwrap();
+
+    // This commit's auto-checkpoint attempt fails (holder is active) and must
+    // arm the drain gate.
+    writer.execute("INSERT INTO t VALUES (1)").unwrap();
+    assert!(
+        mv_store.checkpoint_pending.load(Ordering::Acquire),
+        "failed auto-checkpoint should arm the drain gate"
+    );
+
+    // While the gate is armed and a reader is active, new transactions are
+    // refused so the system drains.
+    let late = db.connect();
+    let err = late.execute("BEGIN CONCURRENT").unwrap_err();
+    assert!(
+        matches!(err, LimboError::Busy),
+        "begin while draining should be Busy, got {err:?}"
+    );
+
+    // The holder finishing drains the last read guard; its commit-tail
+    // checkpoint acquires the lock, checkpoints, and disarms the gate.
+    holder.execute("COMMIT").unwrap();
+    assert!(
+        !mv_store.checkpoint_pending.load(Ordering::Acquire),
+        "successful checkpoint should disarm the drain gate"
+    );
+    assert!(
+        !mv_store.has_uncheckpointed_log().unwrap(),
+        "log should be truncated by the drained checkpoint"
+    );
+
+    // New transactions proceed normally again.
+    late.execute("BEGIN CONCURRENT").unwrap();
+    late.execute("INSERT INTO t VALUES (2)").unwrap();
+    late.execute("COMMIT").unwrap();
+    assert_eq!(get_rows(&late, "SELECT count(*) FROM t").len(), 1);
+}
+
+/// What this test checks: The drain gate cannot wedge the database if the
+/// last active transaction rolls back (rollback runs no checkpoint): with no
+/// readers left the gate stops refusing transactions, and the next commit
+/// checkpoints and disarms it.
+/// Why this matters: A gate keyed only on the pending flag would deadlock
+/// here — no transaction could ever run again to perform the checkpoint.
+#[test]
+fn test_checkpoint_drain_gate_rollback_does_not_wedge() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mv_store = db.get_mvcc_store();
+    let writer = db.connect();
+    writer.execute("CREATE TABLE t(x)").unwrap();
+    mv_store.set_checkpoint_threshold(0);
+
+    let holder = db.connect();
+    holder.execute("BEGIN CONCURRENT").unwrap();
+    holder.execute("INSERT INTO t VALUES (0)").unwrap();
+    writer.execute("INSERT INTO t VALUES (1)").unwrap();
+    assert!(mv_store.checkpoint_pending.load(Ordering::Acquire));
+
+    // Rollback releases the read guard without attempting a checkpoint.
+    holder.execute("ROLLBACK").unwrap();
+    assert!(
+        mv_store.checkpoint_pending.load(Ordering::Acquire),
+        "rollback alone does not checkpoint, gate stays armed"
+    );
+
+    // No readers remain, so the gate must let new transactions through; the
+    // commit tail then checkpoints and disarms the gate.
+    writer.execute("INSERT INTO t VALUES (2)").unwrap();
+    assert!(
+        !mv_store.checkpoint_pending.load(Ordering::Acquire),
+        "commit after drain should checkpoint and disarm the gate"
+    );
+    assert!(!mv_store.has_uncheckpointed_log().unwrap());
+}

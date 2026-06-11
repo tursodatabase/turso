@@ -7,7 +7,10 @@ description: How to benchmark and analyze memory usage in Turso using the memory
 
 The `perf/memory` crate benchmarks memory usage of SQL workloads under WAL and MVCC journal modes. It uses `dhat` as the global allocator to track every heap allocation, and `memory-stats` for process-level RSS snapshots.
 
-It also contains a `stack-report` helper binary for stack-usage investigations.
+It also contains a `stack-report` helper binary for stack-usage investigations,
+and an `mvcc-starvation-probe` binary for measuring MVCC memory behavior under
+barrier-free concurrent load (heap + logical-log size over time, auto-checkpoint
+failure visibility).
 That binary runs a SQL payload with the `stacker` feature enabled and captures
 `turso_stack` tracing events in-process, aggregating structured tracing fields
 instead of parsing stderr log text.
@@ -77,6 +80,29 @@ The runner currently uses a fixed in-memory database and enables generated
 columns, custom types, and materialized views internally. There are no stack
 report CLI flags for selecting the database path or toggling those experimental
 features.
+
+## Running the MVCC Starvation Probe
+
+`mvcc-starvation-probe` runs N tasks in continuous BEGIN CONCURRENT / INSERT
+2KB blobs / COMMIT loops (no round barriers, unlike the main benchmark's run
+phase) until a shared row budget is exhausted, sampling dhat heap and
+`.db-log` size every 500ms. Auto-checkpoint failures appear on stderr as
+"MVCC auto-checkpoint failed" tracing lines (INFO level).
+
+```bash
+cargo run --release -p memory-benchmark --bin mvcc-starvation-probe -- <connections> <total-rows>
+# e.g. compare:
+cargo run --release -p memory-benchmark --bin mvcc-starvation-probe -- 1 30000 2>/dev/null
+cargo run --release -p memory-benchmark --bin mvcc-starvation-probe -- 4 30000 2>err.log
+grep -c 'auto-checkpoint failed' err.log
+```
+
+Healthy output shows a sawtooth: heap and log rise to the auto-checkpoint
+threshold (~4.1 MB log) and drop at each successful checkpoint. Monotonic
+growth with a large failure count means checkpoints are being starved by
+concurrent transactions. The main `memory-benchmark` run phase cannot show
+starvation because it awaits all connection tasks between batches, giving
+every round-final commit a contention-free checkpoint window.
 
 ## Running Benchmarks
 

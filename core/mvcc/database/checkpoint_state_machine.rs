@@ -1447,8 +1447,17 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 tracing::debug!("Acquiring blocking checkpoint lock");
                 let locked = self.checkpoint_lock.write();
                 if !locked {
+                    // Arm the drain gate: begin_tx refuses new transactions
+                    // until the active ones (whose read guards just beat us)
+                    // finish, so a subsequent checkpoint attempt can win.
+                    self.mvstore
+                        .checkpoint_pending
+                        .store(true, Ordering::Release);
                     return Err(crate::LimboError::Busy);
                 }
+                self.mvstore
+                    .checkpoint_pending
+                    .store(false, Ordering::Release);
                 self.lock_states.blocking_checkpoint_lock_held = true;
 
                 // Checkpoint state machines can be created before they are run.
