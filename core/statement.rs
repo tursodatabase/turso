@@ -460,7 +460,7 @@ impl Statement {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
                 vdbe::StepResult::IO => self.pager.io.step()?,
-                vdbe::StepResult::Row => continue,
+                vdbe::StepResult::Row | vdbe::StepResult::Yield => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
                     return Err(LimboError::Busy)
                 }
@@ -474,6 +474,7 @@ impl Statement {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(values),
                 vdbe::StepResult::IO => self.pager.io.step()?,
+                vdbe::StepResult::Yield => continue,
                 vdbe::StepResult::Row => {
                     values.push(self.row().unwrap().get_values().cloned().collect());
                     continue;
@@ -494,6 +495,7 @@ impl Statement {
             match self.step()? {
                 vdbe::StepResult::Done => break,
                 vdbe::StepResult::IO => self.pager.io.step()?,
+                vdbe::StepResult::Yield => continue,
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
                 }
@@ -518,7 +520,7 @@ impl Statement {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(crate::IOResult::Done(())),
                 vdbe::StepResult::Row => continue,
-                vdbe::StepResult::IO => {
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     let io = self.take_io_completions().unwrap_or_else(|| {
                         crate::types::IOCompletions::Single(crate::io::Completion::new_yield())
                     });
@@ -551,7 +553,7 @@ impl Statement {
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
                 }
-                vdbe::StepResult::IO => {
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     let io = self.take_io_completions().unwrap_or_else(|| {
                         crate::types::IOCompletions::Single(crate::io::Completion::new_yield())
                     });
@@ -578,6 +580,7 @@ impl Statement {
                     self.pager.io.step()?;
                     post_io_func()?;
                 }
+                vdbe::StepResult::Yield => continue,
                 vdbe::StepResult::Row => break Some(self.row().expect("row should be present")),
                 vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
                 vdbe::StepResult::Busy => return Err(LimboError::Busy),

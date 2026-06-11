@@ -1327,7 +1327,7 @@ impl IncrementalView {
                                 return Err(LimboError::Busy);
                             }
 
-                            crate::vdbe::StepResult::IO => {
+                            crate::vdbe::StepResult::IO | crate::vdbe::StepResult::Yield => {
                                 // Statement needs I/O - save state and return
                                 self.populate_state = PopulateState::ProcessingOneTable {
                                     queries,
