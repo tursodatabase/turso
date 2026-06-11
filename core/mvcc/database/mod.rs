@@ -3235,7 +3235,7 @@ impl StateTransition for DeleteRowStateMachine {
     type Context = ();
     type SMResult = ();
 
-    #[tracing::instrument(fields(state = ?self.state), skip(self, _context))]
+    #[tracing::instrument(fields(state = ?self.state), skip(self, _context), level = Level::TRACE)]
     fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
         use crate::types::{IOResult, SeekKey, SeekOp};
 
