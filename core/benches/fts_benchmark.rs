@@ -47,7 +47,7 @@ fn run_to_completion(
 ) -> turso_core::Result<()> {
     loop {
         match stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 db.io.step()?;
             }
             StepResult::Done => break,
@@ -68,7 +68,7 @@ fn run_and_count_rows(
     let mut count = 0;
     loop {
         match stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 db.io.step()?;
             }
             StepResult::Done => break,
