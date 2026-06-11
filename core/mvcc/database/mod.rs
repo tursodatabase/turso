@@ -252,7 +252,7 @@ impl Ord for SortableIndexKey {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RowKey {
     Int(i64),
-    Record(SortableIndexKey),
+    Record(Arc<SortableIndexKey>),
 }
 
 impl RowKey {
@@ -4324,8 +4324,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 // returns the canonical Arc (ours on miss, an existing one
                 // on hit), which we hand to savepoint tracking.
                 let (canonical_key, row_versions) =
-                    self.insert_index_version(index_id, Arc::new(sortable_key), row_version);
-                tx.insert_to_write_set(id, row_versions);
+                    self.insert_index_version(index_id, sortable_key, row_version);
+                tx.insert_to_write_set(
+                    RowID::new(id.table_id, RowKey::Record(canonical_key.clone())),
+                    row_versions,
+                );
                 tx.record_created_index_version((index_id, canonical_key), version_id);
             }
             None => {
@@ -4382,8 +4385,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     panic!("Index writes must be to a record");
                 };
                 let (canonical_key, row_versions) =
-                    self.insert_index_version(index_id, Arc::new(sortable_key), row_version);
-                tx.insert_to_write_set(id, row_versions);
+                    self.insert_index_version(index_id, sortable_key, row_version);
+                tx.insert_to_write_set(
+                    RowID::new(id.table_id, RowKey::Record(canonical_key.clone())),
+                    row_versions,
+                );
                 tx.record_created_index_version((index_id, canonical_key), version_id);
             }
             None => {
@@ -4431,8 +4437,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     panic!("Index writes must be to a record");
                 };
                 let (canonical_key, row_versions) =
-                    self.insert_index_version(index_id, Arc::new(sortable_key), row_version);
-                tx.insert_to_write_set(id, row_versions);
+                    self.insert_index_version(index_id, sortable_key, row_version);
+                tx.insert_to_write_set(
+                    RowID::new(id.table_id, RowKey::Record(canonical_key.clone())),
+                    row_versions,
+                );
                 tx.record_created_index_version((index_id, canonical_key), version_id);
             }
             None => {
@@ -6108,13 +6117,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn get_or_create_index_key_arc(
         &self,
         index_id: MVTableId,
-        key: SortableIndexKey,
+        key: Arc<SortableIndexKey>,
     ) -> Arc<SortableIndexKey> {
         let index = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
         let index = index.value();
-        // Check if key exists and get the Arc if so
-        let existing = index.get(&key).map(|entry| entry.key().clone());
-        existing.unwrap_or_else(|| Arc::new(key))
+        let existing = index.get(&*key).map(|entry| entry.key().clone());
+        existing.unwrap_or(key)
     }
 
     /// Inserts (or appends to) the version chain for an index entry and returns
@@ -6123,7 +6131,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         &self,
         index_id: MVTableId,
         key: Arc<SortableIndexKey>,
-        row_version: RowVersion,
+        mut row_version: RowVersion,
     ) -> (Arc<SortableIndexKey>, RowVersions) {
         let index = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
         let index = index.value();
@@ -6132,6 +6140,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // passed in (on miss) or a pre-existing one (on hit). Return that
         // canonical Arc so savepoint tracking and the SkipMap stay in sync.
         let canonical_key = entry.key().clone();
+        row_version.row.id.row_id = RowKey::Record(canonical_key.clone());
         let row_versions = entry.value().clone();
         self.insert_version_raw(&mut row_versions.write(), row_version);
         (canonical_key, row_versions)
@@ -7205,11 +7214,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
                             panic!("Index writes must be to a record");
                         };
-                        self.insert_index_version(
-                            rowid.table_id,
-                            Arc::new(sortable_key),
-                            row_version,
-                        );
+                        self.insert_index_version(rowid.table_id, sortable_key, row_version);
                     }
                     StreamingResult::DeleteIndexRow {
                         row,

@@ -6695,7 +6695,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
     .unwrap();
     let row_key = SortableIndexKey::new_from_record(record, index_info);
     let row = Row::new_index_row(
-        RowID::new(MVTableId::new(-42), RowKey::Record(row_key)),
+        RowID::new(MVTableId::new(-42), RowKey::Record(Arc::new(row_key))),
         index.columns.len(),
     );
     let mut write_row_sm = db
