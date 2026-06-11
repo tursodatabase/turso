@@ -436,6 +436,12 @@ pub struct Connection {
     /// loaded nothing. Comparing against the generation lets prepare lazily
     /// load stats exactly once per adopted schema instead of on every call.
     pub(crate) analyze_stats_attempt_generation: AtomicU64,
+    /// Last [`SharedAnalyzeStats`](crate::stats::SharedAnalyzeStats) epoch this
+    /// connection planned against. When the shared stats are refreshed (by this
+    /// or another connection) the epoch moves ahead of this value, and the next
+    /// statement compilation bumps `prepare_context_generation` so cached
+    /// statements recompile with the new statistics.
+    pub(crate) analyze_stats_seen_epoch: AtomicU64,
     /// Per-connection last-returned value for each sequence (for currval()).
     pub(crate) sequence_currvals: RwLock<HashMap<String, i64>>,
 }

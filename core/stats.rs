@@ -1,4 +1,6 @@
+use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Arc;
+use arc_swap::ArcSwap;
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::schema::Schema;
@@ -56,9 +58,6 @@ pub struct AnalyzeStats {
 }
 
 impl AnalyzeStats {
-    pub fn needs_refresh(&self) -> bool {
-        self.tables.is_empty()
-    }
     /// Get the statistics for a table, if present.
     pub fn table_stats(&self, table_name: &str) -> Option<&TableStat> {
         let table_name = normalize_ident(table_name);
@@ -87,6 +86,68 @@ impl AnalyzeStats {
     }
 }
 
+/// Atomically swappable ANALYZE statistics shared across every clone of a schema.
+///
+/// `epoch` advances on every change. A connection records the epoch it last
+/// planned against and bumps its `prepare_context_generation` when the epoch
+/// moves, forcing cached statements with stale or empty stats to recompile.
+#[derive(Debug)]
+pub struct SharedAnalyzeStats {
+    stats: ArcSwap<AnalyzeStats>,
+    epoch: AtomicU64,
+}
+
+impl Default for SharedAnalyzeStats {
+    fn default() -> Self {
+        Self {
+            stats: ArcSwap::from_pointee(AnalyzeStats::default()),
+            epoch: AtomicU64::new(0),
+        }
+    }
+}
+
+impl SharedAnalyzeStats {
+    /// Load a cheap, point-in-time snapshot of the current statistics. Hold the
+    /// returned `Arc` for the duration of a planning pass so the view is stable.
+    pub fn snapshot(&self) -> Arc<AnalyzeStats> {
+        self.stats.load_full()
+    }
+
+    /// Current change epoch. See the struct docs for how it drives replanning.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Whether no statistics have been loaded yet.
+    pub fn is_empty(&self) -> bool {
+        self.stats.load().tables.is_empty()
+    }
+
+    /// Replace the statistics wholesale and advance the epoch.
+    pub fn store(&self, stats: AnalyzeStats) {
+        self.stats.store(Arc::new(stats));
+        self.epoch.fetch_add(1, Ordering::Release);
+    }
+
+    /// Drop all statistics for a table (e.g. on DROP TABLE). Copy-on-write: the
+    /// statistics map is small relative to the schema, and DDL is rare.
+    pub fn remove_table(&self, table_name: &str) {
+        let mut next = (**self.stats.load()).clone();
+        let before = next.tables.len();
+        next.remove_table(table_name);
+        if next.tables.len() != before {
+            self.store(next);
+        }
+    }
+
+    /// Drop statistics for a single index (e.g. on DROP INDEX).
+    pub fn remove_index(&self, table_name: &str, index_name: &str) {
+        let mut next = (**self.stats.load()).clone();
+        next.remove_index(table_name, index_name);
+        self.store(next);
+    }
+}
+
 /// Read sqlite_stat1 contents into an AnalyzeStats map without mutating schema.
 ///
 /// Only regular B-tree tables and indexes are considered. Virtual and ephemeral
@@ -103,9 +164,39 @@ pub fn gather_sqlite_stat1(
     Ok(stats)
 }
 
+/// Called at the start of statement compilation. Does two things:
+///
+/// 1. Detects when the shared ANALYZE stats have been refreshed (by any
+///    connection) since this connection last planned, and bumps the prepare
+///    context generation so cached statements recompile against the new stats.
+/// 2. Lazily loads stats from `sqlite_stat1` into the shared cell when they are
+///    missing — needed under MVCC, where the user tables (including
+///    `sqlite_stat1`) only reach this connection's schema after the
+///    connect()-time refresh has already run and loaded nothing.
+///
+/// Both steps mutate the stats via the [`SharedAnalyzeStats`] cell, so neither
+/// deep-clones the (potentially huge) schema.
 pub fn maybe_lazy_load_analyze_stats(conn: &Arc<Connection>) {
-    use crate::sync::atomic::Ordering;
+    // Nested sub-programs (e.g. trigger bodies, the internal stats query below)
+    // must never touch the prepare context; the parent compilation owns it.
+    if conn.is_nested_stmt() || !conn.is_db_initialized() {
+        return;
+    }
 
+    // Adopt any stats refresh published by ourselves or another
+    // connection. `swap` records the epoch we are now planning against.
+    let cell_epoch = conn.schema.read().analyze_stats.epoch();
+    if conn
+        .analyze_stats_seen_epoch
+        .swap(cell_epoch, Ordering::AcqRel)
+        != cell_epoch
+    {
+        conn.bump_prepare_context_generation();
+    }
+
+    // Load stats from sqlite_stat1 if we have not already tried for this
+    // generation. Guarding on the generation also stops the internal
+    // STATS_QUERY prepare below from re-entering this load.
     let generation = conn.prepare_context_generation();
     if conn
         .analyze_stats_attempt_generation
@@ -115,9 +206,7 @@ pub fn maybe_lazy_load_analyze_stats(conn: &Arc<Connection>) {
         return;
     }
     // Transient states: skip without marking so a later prepare retries.
-    if !conn.is_db_initialized()
-        || conn.is_nested_stmt()
-        || conn.schema_reparse_in_progress()
+    if conn.schema_reparse_in_progress()
         || conn.is_mvcc_bootstrap_connection()
         || !matches!(conn.get_tx_state(), TransactionState::None)
         || conn.get_mv_tx().is_some()
@@ -125,7 +214,7 @@ pub fn maybe_lazy_load_analyze_stats(conn: &Arc<Connection>) {
         return;
     }
     let schema = conn.schema.read().clone();
-    if !schema.analyze_stats.needs_refresh() || schema.get_btree_table(STATS_TABLE).is_none() {
+    if !schema.analyze_stats.is_empty() || schema.get_btree_table(STATS_TABLE).is_none() {
         // Nothing to load for this schema; don't re-check until it changes.
         conn.analyze_stats_attempt_generation
             .store(generation, Ordering::Release);
@@ -141,30 +230,13 @@ pub fn maybe_lazy_load_analyze_stats(conn: &Arc<Connection>) {
     if stats.tables.is_empty() {
         return;
     }
-    let mut with_stats = (*schema).clone();
-    with_stats.analyze_stats = stats;
-    let with_stats = Arc::new(with_stats);
-    // Publish into the shared schema so other connections adopt the stats
-    // instead of clobbering them; skip if the shared schema moved on.
-    let mut installed = false;
-    {
-        let mut shared = conn.db.schema.lock();
-        if Arc::ptr_eq(&shared, &schema) {
-            *shared = with_stats.clone();
-            installed = true;
-        }
-    }
-    {
-        let mut local = conn.schema.write();
-        if Arc::ptr_eq(&local, &schema) {
-            *local = with_stats;
-            installed = true;
-        }
-    }
-    if installed {
-        // Cached statements were planned without stats; force reprepare.
-        conn.bump_prepare_context_generation();
-    }
+    // Publish into the shared cell. Every connection holding any clone of this
+    // schema lineage observes the stats; the epoch bump (and our own generation
+    // bump) forces statements planned without stats to recompile.
+    schema.analyze_stats.store(stats);
+    conn.analyze_stats_seen_epoch
+        .store(schema.analyze_stats.epoch(), Ordering::Release);
+    conn.bump_prepare_context_generation();
 }
 
 /// Best-effort refresh analyze_stats on the connection's schema.
@@ -184,9 +256,7 @@ pub fn refresh_analyze_stats(conn: &Arc<Connection>) {
 
     let mv_tx = conn.get_mv_tx();
     if let Ok(stats) = gather_sqlite_stat1(conn, &schema_snapshot, mv_tx) {
-        conn.with_schema_mut(|schema| {
-            schema.analyze_stats = stats;
-        });
+        schema_snapshot.analyze_stats.store(stats);
     }
 }
 
@@ -243,9 +313,11 @@ pub fn refresh_analyze_stats_nonblock(
                     Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                     Ok(IOResult::Done(())) => {
                         let stats = std::mem::take(stats);
-                        conn.with_schema_mut(|schema| {
-                            schema.analyze_stats = stats;
-                        });
+                        // Store into the shared cell captured at Start. During
+                        // schema reparse this snapshot shares its stats cell with
+                        // the schema about to be installed; otherwise the lazy
+                        // loader will reload on the next prepare.
+                        schema_snapshot.analyze_stats.store(stats);
                         *st = RefreshAnalyzeStatsState::Start;
                         return Ok(IOResult::Done(()));
                     }

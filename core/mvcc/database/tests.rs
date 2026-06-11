@@ -1186,7 +1186,8 @@ fn test_analyze_stats_lazily_loaded_after_mvcc_reopen() {
     conn.prepare("SELECT * FROM t WHERE a = 1 AND b = 'const'")
         .unwrap();
     let schema = conn.schema.read().clone();
-    let table_stats = schema.analyze_stats.table_stats("t");
+    let analyze_stats = schema.analyze_stats.snapshot();
+    let table_stats = analyze_stats.table_stats("t");
     assert!(
         table_stats.is_some_and(|stats| !stats.index_stats.is_empty()),
         "ANALYZE stats must be loaded after reopening an MVCC database"

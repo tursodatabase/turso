@@ -1582,7 +1582,8 @@ fn base_row_estimate(
 ) -> RowCountEstimate {
     match &table.table {
         Table::BTree(btree) => {
-            if let Some(stats) = schema.analyze_stats.table_stats(&btree.name) {
+            let analyze_stats = schema.analyze_stats.snapshot();
+            if let Some(stats) = analyze_stats.table_stats(&btree.name) {
                 if let Some(rows) = stats.row_count.or_else(|| {
                     stats
                         .index_stats
@@ -2030,6 +2031,7 @@ fn optimize_table_access(
         maybe_order_target: maybe_order_target.as_ref(),
     };
 
+    let analyze_stats = schema.analyze_stats.snapshot();
     let Some(best_join_order_result) = compute_best_join_order_with_context(
         table_references.joined_tables(),
         initial_input_cardinality,
@@ -2041,7 +2043,7 @@ fn optimize_table_access(
         subqueries,
         &index_method_candidates,
         params,
-        &schema.analyze_stats,
+        &analyze_stats,
         available_indexes,
         table_references,
         schema,
