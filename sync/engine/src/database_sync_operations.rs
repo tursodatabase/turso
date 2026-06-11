@@ -1253,6 +1253,7 @@ pub async fn checkpoint_wal_file<Ctx>(
     loop {
         match checkpoint_stmt.step()? {
             turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                // todo(sivukhin): introduce Yield result in the sync engine
                 coro.yield_(SyncEngineIoResult::IO).await?
             }
             turso_core::StepResult::Done => break,
