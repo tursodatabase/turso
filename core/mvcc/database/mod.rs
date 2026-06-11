@@ -5865,12 +5865,34 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Covers both table rows (`self.rows`) and index rows (`self.index_rows`).
     /// Returns the number of removed versions.
     pub fn drop_unused_row_versions(&self) -> usize {
+        self.drop_unused_row_versions_inner(false)
+    }
+
+    /// Like [`Self::drop_unused_row_versions`], but additionally removes chain
+    /// slots that end up empty from the skip maps, bounding their entry counts.
+    ///
+    /// The caller must hold the blocking checkpoint lock (or otherwise guarantee
+    /// no concurrent writers): slot removal happens after the chain write lock
+    /// is dropped, so without that guarantee it races a concurrent
+    /// `get_or_insert_with` on the same key — see the TOCTOU note in
+    /// `gc_table_row_versions`.
+    pub fn drop_unused_row_versions_and_slots(&self) -> usize {
+        self.drop_unused_row_versions_inner(true)
+    }
+
+    fn drop_unused_row_versions_inner(&self, remove_empty_slots: bool) -> usize {
         let lwm = self.compute_lwm();
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
         let mut referenced_tx_ids = HashSet::default();
 
-        let dropped = self.gc_table_row_versions(lwm, ckpt_max, &mut referenced_tx_ids)
-            + self.gc_index_row_versions(lwm, ckpt_max, &mut referenced_tx_ids);
+        let dropped =
+            self.gc_table_row_versions(lwm, ckpt_max, &mut referenced_tx_ids, remove_empty_slots)
+                + self.gc_index_row_versions(
+                    lwm,
+                    ckpt_max,
+                    &mut referenced_tx_ids,
+                    remove_empty_slots,
+                );
         let pruned_finalized = self.prune_finalized_tx_states(&referenced_tx_ids);
 
         tracing::trace!(
@@ -5887,18 +5909,27 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         lwm: u64,
         ckpt_max: u64,
         referenced_tx_ids: &mut HashSet<TxID>,
+        remove_empty_slots: bool,
     ) -> usize {
         let mut dropped = 0;
 
         for entry in self.rows.iter() {
-            let mut versions = entry.value().write();
-            dropped += Self::gc_version_chain(&mut versions, lwm, ckpt_max);
-            Self::collect_referenced_txids(&versions, referenced_tx_ids);
-            // Empty entries are left in the SkipMap (lazy removal). This avoids
-            // a TOCTOU race where a concurrent writer inserts a version between
-            // the emptiness check and SkipMap::remove(). Empty entries are reused
-            // by get_or_insert_with on subsequent inserts and cleaned up by
+            let is_now_empty = {
+                let mut versions = entry.value().write();
+                dropped += Self::gc_version_chain(&mut versions, lwm, ckpt_max);
+                Self::collect_referenced_txids(&versions, referenced_tx_ids);
+                versions.is_empty()
+            };
+            // Unless the caller holds the blocking checkpoint lock
+            // (`remove_empty_slots`), empty entries are left in the SkipMap
+            // (lazy removal). This avoids a TOCTOU race where a concurrent
+            // writer inserts a version between the emptiness check and
+            // SkipMap::remove(). Empty entries are reused by
+            // get_or_insert_with on subsequent inserts and cleaned up by
             // checkpoint-time GC which runs under the blocking lock.
+            if remove_empty_slots && is_now_empty {
+                entry.remove();
+            }
         }
         dropped
     }
@@ -5908,6 +5939,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         lwm: u64,
         ckpt_max: u64,
         referenced_tx_ids: &mut HashSet<TxID>,
+        remove_empty_slots: bool,
     ) -> usize {
         let mut dropped = 0;
 
@@ -5915,11 +5947,18 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let inner_map = outer_entry.value();
 
             for inner_entry in inner_map.iter() {
-                let mut versions = inner_entry.value().write();
-                dropped += Self::gc_version_chain(&mut versions, lwm, ckpt_max);
-                Self::collect_referenced_txids(&versions, referenced_tx_ids);
+                let is_now_empty = {
+                    let mut versions = inner_entry.value().write();
+                    dropped += Self::gc_version_chain(&mut versions, lwm, ckpt_max);
+                    Self::collect_referenced_txids(&versions, referenced_tx_ids);
+                    versions.is_empty()
+                };
+                // Same TOCTOU rationale as table rows. The outer per-index map
+                // is kept even when emptied — it is bounded by index count.
+                if remove_empty_slots && is_now_empty {
+                    inner_entry.remove();
+                }
             }
-            // Empty entries left in place — same TOCTOU rationale as table rows.
         }
         dropped
     }
@@ -6006,7 +6045,26 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         }
 
+        Self::shrink_version_chain_allocation(versions);
+
         before - versions.len()
+    }
+
+    /// Chains with capacity at or below this are never shrunk — the
+    /// allocation is too small to be worth a realloc.
+    const CHAIN_SHRINK_MIN_CAPACITY: usize = 16;
+
+    /// Release excess version-chain capacity after GC trimmed the chain.
+    /// `retain`/`clear` keep the Vec's allocation, so a one-off burst of
+    /// versions (e.g. a hot row between checkpoints) would otherwise pin its
+    /// peak allocation forever. Capacity drops to a quarter of its current
+    /// value — deliberately not to fit — when the survivors occupy less than
+    /// a quarter of it, so steady-state chains keep slack for new versions.
+    fn shrink_version_chain_allocation(versions: &mut Vec<RowVersion>) {
+        let capacity = versions.capacity();
+        if capacity > Self::CHAIN_SHRINK_MIN_CAPACITY && versions.len() < capacity / 4 {
+            versions.shrink_to(capacity / 4);
+        }
     }
 
     // Extracts the begin timestamp from a transaction
@@ -6168,7 +6226,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// write to the same key.
     pub fn purge_row_versions_during_checkpoint(&self, rowid: RowID) {
         if let Some(entry) = self.rows.get(&rowid) {
-            entry.value().write().clear();
+            let mut versions = entry.value().write();
+            versions.clear();
+            Self::shrink_version_chain_allocation(&mut versions);
         }
     }
 
