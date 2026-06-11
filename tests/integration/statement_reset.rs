@@ -12,6 +12,7 @@ fn step_blocking(stmt: &mut turso_core::Statement) -> turso_core::Result<StepRes
     loop {
         match stmt.step()? {
             StepResult::IO => stmt._io().step()?,
+            StepResult::Yield => continue,
             other => return Ok(other),
         }
     }
