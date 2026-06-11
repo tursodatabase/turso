@@ -624,14 +624,16 @@ impl Property {
                 let table_name = create.table.name.clone();
 
                 let assertion = InteractionType::Assertion(Assertion::new("creating two tables with the name should result in a failure for the second query"
-                                    .to_string(), move |stack: &Vec<ResultSet>, env| {
+                                    .to_string(), move |stack: &Vec<ResultSet>, _env: &mut SimulatorEnv| {
                                 let last = stack.last().unwrap();
                                 match last {
                                     Ok(success) => Ok(Err(format!("expected table creation to fail but it succeeded: {success:?}"))),
                                     Err(e) => {
+                                        // A failed CREATE TABLE (table already exists) is a statement-level
+                                        // error in SQLite/Turso; it does NOT roll back an active transaction.
+                                        // The shadow model must mirror that and leave the connection's
+                                        // transaction state (and its uncommitted rows) untouched.
                                         if e.to_string().to_lowercase().contains(&format!("table {table_name} already exists")) {
-                                             // On error we rollback the transaction if there is any active here
-                                            env.rollback_conn(connection_index);
                                             Ok(Ok(()))
                                         } else {
                                             Ok(Err(format!("expected table already exists error, got: {e}")))
