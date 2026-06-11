@@ -220,8 +220,8 @@ export interface HttpContext {
   remoteEncryptionKey?: string;
   /**
    * Extra HTTP headers attached to the request. Applied after the standard
-   * headers, so they can override e.g. `Authorization`. The `Host` key
-   * (case-insensitive) is ignored — fetch forbids setting it.
+   * headers, so they can override e.g. `Authorization`. Passing the `Host`
+   * key (case-insensitive) throws — fetch forbids setting it.
    */
   requestHeaders?: Record<string, string>;
 }
@@ -238,9 +238,9 @@ function buildHeaders(ctx: HttpContext): Record<string, string> {
   }
   for (const [name, value] of Object.entries(ctx.requestHeaders ?? {})) {
     // `Host` is a forbidden fetch header and would be silently dropped —
-    // skip it explicitly so the behavior is documented rather than accidental.
+    // throw instead so the caller learns the override never takes effect.
     if (name.toLowerCase() === 'host') {
-      continue;
+      throw new DatabaseError("overwriting the 'Host' header is not supported");
     }
     headers[name] = value;
   }

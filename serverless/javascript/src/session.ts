@@ -43,8 +43,8 @@ export interface SessionConfig {
   /**
    * Extra HTTP headers attached to every request sent to the server.
    * Applied after the standard headers, so they can override e.g.
-   * `Authorization`. Passing the `Host` key (case-insensitive) has no
-   * effect — fetch forbids setting it.
+   * `Authorization`. Passing the `Host` key (case-insensitive) throws —
+   * fetch forbids setting it.
    */
   requestHeaders?: Record<string, string>;
 }
@@ -72,6 +72,13 @@ export class Session {
   private autocommit: boolean = true;
 
   constructor(config: SessionConfig) {
+    for (const name of Object.keys(config.requestHeaders ?? {})) {
+      // `Host` is a forbidden fetch header and would be silently dropped —
+      // reject it up front so the caller learns the override never takes effect.
+      if (name.toLowerCase() === 'host') {
+        throw new DatabaseError("overwriting the 'Host' header is not supported");
+      }
+    }
     this.config = config;
     this.baseUrl = normalizeUrl(config.url);
   }

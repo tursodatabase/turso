@@ -79,8 +79,8 @@ const conn = connect({
   url: process.env.TURSO_DATABASE_URL,
   authToken: process.env.TURSO_AUTH_TOKEN,
   // Extra headers attached to every request. Applied after the standard
-  // headers, so they can override e.g. `Authorization`. The `Host` key has
-  // no effect — fetch forbids setting it.
+  // headers, so they can override e.g. `Authorization`. Setting the `Host`
+  // key throws — fetch forbids it.
   requestHeaders: { "x-custom-header": "value" },
 });
 ```

@@ -1,6 +1,7 @@
 import test from 'ava';
 import { decodeValue, encodeValue } from '../dist/protocol.js';
 import { Session } from '../dist/session.js';
+import { DatabaseError } from '../dist/error.js';
 
 // Unit tests for serverless protocol encoding/decoding.
 // These test the serverless driver directly — no server needed.
@@ -197,14 +198,13 @@ test('Session.batch encodes named arguments for statement objects', async t => {
 
 // --- requestHeaders ---
 
-test('Session attaches requestHeaders, lets them override Authorization, and drops Host', async t => {
+test('Session attaches requestHeaders and lets them override Authorization', async t => {
   const session = new Session({
     url: 'http://fake-host',
     authToken: 'standard-token',
     requestHeaders: {
       'x-custom-header': 'custom-value',
       'Authorization': 'Bearer override-token',
-      'Host': 'evil-host',
     },
   });
   const capturedHeaders = [];
@@ -226,5 +226,33 @@ test('Session attaches requestHeaders, lets them override Authorization, and dro
   t.is(headers['x-custom-header'], 'custom-value');
   t.is(headers['Authorization'], 'Bearer override-token',
     'requestHeaders are applied after standard headers, so they override Authorization');
-  t.false('Host' in headers, 'Host is a forbidden fetch header and must be dropped');
+});
+
+test('Session construction rejects a Host requestHeader instead of silently dropping it', t => {
+  // Mixed case to prove the check is case-insensitive.
+  for (const hostKey of ['Host', 'host', 'hOsT']) {
+    const error = t.throws(
+      () => new Session({
+        url: 'http://fake-host',
+        requestHeaders: { [hostKey]: 'evil-host' },
+      }),
+      {
+        instanceOf: DatabaseError,
+        message: "overwriting the 'Host' header is not supported",
+      }
+    );
+    t.is(error.name, 'DatabaseError');
+  }
+});
+
+test('request building rejects a Host requestHeader added after construction', async t => {
+  // Defense in depth: even if a Host header sneaks past construction-time
+  // validation (the config object is mutable), the request must not be sent.
+  const session = new Session({ url: 'http://fake-host' });
+  session['config'].requestHeaders = { Host: 'evil-host' };
+
+  await t.throwsAsync(() => session.execute('SELECT 1'), {
+    instanceOf: DatabaseError,
+    message: "overwriting the 'Host' header is not supported",
+  });
 });
