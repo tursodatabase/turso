@@ -296,7 +296,7 @@ impl RowID {
 pub struct Row {
     pub id: RowID,
     /// Data is None for index rows because the key holds all the data.
-    pub data: Option<Vec<u8>>,
+    pub data: Option<Arc<[u8]>>,
     pub column_count: usize,
 }
 
@@ -304,7 +304,7 @@ impl Row {
     pub fn new_table_row(id: RowID, data: Vec<u8>, column_count: usize) -> Self {
         Self {
             id,
-            data: Some(data),
+            data: Some(Arc::from(data)),
             column_count,
         }
     }
@@ -323,7 +323,7 @@ impl Row {
 
     pub fn payload(&self) -> &[u8] {
         match self.id.row_id {
-            RowKey::Int(_) => self.data.as_ref().expect("table rows should have data"),
+            RowKey::Int(_) => self.data.as_deref().expect("table rows should have data"),
             RowKey::Record(ref sortable_key) => sortable_key.key.as_blob(),
         }
     }
@@ -4851,7 +4851,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             RowKey::Record(record) => {
                 let index_rows = self.index_rows.get_or_insert_with(table_id, SkipMap::new);
                 let index_rows = index_rows.value();
-                let Some(versions) = index_rows.get(record) else {
+                let Some(versions) = index_rows.get(record.as_ref()) else {
                     // No MVCC version -> B-tree is valid
                     return true;
                 };
@@ -5686,7 +5686,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let Some(index) = self.index_rows.get(&rowid.table_id) else {
             return false;
         };
-        let Some(entry) = index.value().get(record) else {
+        let Some(entry) = index.value().get(record.as_ref()) else {
             return false;
         };
         let versions = entry.value().read();
