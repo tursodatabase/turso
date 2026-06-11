@@ -459,8 +459,11 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
-                vdbe::StepResult::IO => self.pager.io.step()?,
-                vdbe::StepResult::Row | vdbe::StepResult::Yield => continue,
+                // Pump the event loop on Yield too: the yielding operation may be
+                // waiting on another thread whose I/O completes through the shared
+                // event loop, and a tight re-step loop would starve it.
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
                     return Err(LimboError::Busy)
                 }
@@ -473,8 +476,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(values),
-                vdbe::StepResult::IO => self.pager.io.step()?,
-                vdbe::StepResult::Yield => continue,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
                 vdbe::StepResult::Row => {
                     values.push(self.row().unwrap().get_values().cloned().collect());
                     continue;
@@ -494,8 +496,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => break,
-                vdbe::StepResult::IO => self.pager.io.step()?,
-                vdbe::StepResult::Yield => continue,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
                 }
@@ -575,12 +576,11 @@ impl Statement {
         let result = loop {
             match self.step()? {
                 vdbe::StepResult::Done => break None,
-                vdbe::StepResult::IO => {
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     pre_io_func()?;
                     self.pager.io.step()?;
                     post_io_func()?;
                 }
-                vdbe::StepResult::Yield => continue,
                 vdbe::StepResult::Row => break Some(self.row().expect("row should be present")),
                 vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
                 vdbe::StepResult::Busy => return Err(LimboError::Busy),
@@ -1033,7 +1033,8 @@ impl Statement {
                             halt_completed = true;
                             break;
                         }
-                        Ok(vdbe::execute::InsnFunctionStepResult::IO(_)) => {
+                        Ok(vdbe::execute::InsnFunctionStepResult::IO(_))
+                        | Ok(vdbe::execute::InsnFunctionStepResult::Yield) => {
                             if let Err(e) = self.pager.io.step() {
                                 capture_reset_error(
                                     &mut reset_error,

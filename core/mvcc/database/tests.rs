@@ -1337,7 +1337,7 @@ fn test_concurrent_update_then_delete_serializes_correctly_across_restart() {
         let mut yielded = false;
         for _ in 0..100 {
             match commit_stmt.step().unwrap() {
-                StepResult::IO => {
+                StepResult::Yield => {
                     yielded = true;
                     break;
                 }
@@ -2499,11 +2499,11 @@ fn test_integrity_check_after_checkpoint_io_yield_then_post_durable_failure_uses
     let mut yielded_before_checkpoint_lock = false;
     for _ in 0..10_000 {
         match insert_stmt.step().unwrap() {
-            crate::StepResult::IO if injector.is_empty() => {
+            crate::StepResult::Yield if injector.is_empty() => {
                 yielded_before_checkpoint_lock = true;
                 break;
             }
-            crate::StepResult::IO => {}
+            crate::StepResult::IO | crate::StepResult::Yield => {}
             crate::StepResult::Done => {
                 panic!("INSERT completed before checkpoint acquire-lock yield fired")
             }
@@ -2526,7 +2526,7 @@ fn test_integrity_check_after_checkpoint_io_yield_then_post_durable_failure_uses
                 panic!("INSERT completed before checkpoint durable-boundary failure fired")
             }
             Err(err) => panic!("unexpected INSERT error after yield: {err:?}"),
-            Ok(crate::StepResult::IO) => {}
+            Ok(crate::StepResult::IO | crate::StepResult::Yield) => {}
             Ok(other) => panic!("unexpected INSERT step result after yield: {other:?}"),
         }
     }
@@ -2586,8 +2586,10 @@ fn test_running_integrity_check_reprepares_after_checkpoint_root_publish() {
     stale_conn.set_yield_injector(Some(injector.clone()));
     let mut stale_integrity_check = stale_conn.prepare("PRAGMA integrity_check").unwrap();
     assert!(
-        matches!(stale_integrity_check.step().unwrap(), crate::StepResult::IO)
-            && injector.is_empty(),
+        matches!(
+            stale_integrity_check.step().unwrap(),
+            crate::StepResult::Yield
+        ) && injector.is_empty(),
         "integrity_check should yield before opening its read transaction"
     );
 
@@ -2632,8 +2634,10 @@ fn test_deferred_begin_integrity_check_reprepares_after_checkpoint_root_publish(
     stale_conn.set_yield_injector(Some(injector.clone()));
     let mut stale_integrity_check = stale_conn.prepare("PRAGMA integrity_check").unwrap();
     assert!(
-        matches!(stale_integrity_check.step().unwrap(), crate::StepResult::IO)
-            && injector.is_empty(),
+        matches!(
+            stale_integrity_check.step().unwrap(),
+            crate::StepResult::Yield
+        ) && injector.is_empty(),
         "integrity_check should yield before opening its read transaction"
     );
 
@@ -2682,8 +2686,10 @@ fn test_running_integrity_check_reprepares_without_schema_cookie_bump() {
         .as_int()
         .unwrap();
     assert!(
-        matches!(stale_integrity_check.step().unwrap(), crate::StepResult::IO)
-            && injector.is_empty(),
+        matches!(
+            stale_integrity_check.step().unwrap(),
+            crate::StepResult::Yield
+        ) && injector.is_empty(),
         "integrity_check should yield before opening its read transaction"
     );
 
@@ -2956,7 +2962,7 @@ fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
     ])));
     let mut delayed_checkpoint = delayed_conn.prepare("PRAGMA journal_mode = 'wal'").unwrap();
     assert!(
-        matches!(delayed_checkpoint.step().unwrap(), StepResult::IO),
+        matches!(delayed_checkpoint.step().unwrap(), StepResult::Yield),
         "first checkpoint should yield before acquiring the checkpoint lock"
     );
 
@@ -3127,7 +3133,7 @@ fn test_checkpoint_stale_unique_index_delete_with_out_of_order_commit_yield() {
     ])));
     let mut older_commit = older.prepare("COMMIT").unwrap();
     assert!(
-        matches!(older_commit.step().unwrap(), StepResult::IO),
+        matches!(older_commit.step().unwrap(), StepResult::Yield),
         "older commit should yield after taking its commit timestamp"
     );
 
@@ -3187,7 +3193,7 @@ fn test_checkpoint_stale_boundary_does_not_replay_checkpointed_create_table_afte
         ])));
         let mut older_commit = older.prepare("COMMIT").unwrap();
         assert!(
-            matches!(older_commit.step().unwrap(), StepResult::IO),
+            matches!(older_commit.step().unwrap(), StepResult::Yield),
             "older commit should yield before updating the committed timestamp watermark"
         );
 
@@ -5367,7 +5373,7 @@ fn test_last_committed_timestamp_is_monotonic_for_out_of_order_commits() {
 
     let mut commit_a = conn_a.prepare("COMMIT").unwrap();
     assert!(
-        matches!(commit_a.step().unwrap(), StepResult::IO),
+        matches!(commit_a.step().unwrap(), StepResult::Yield),
         "tx_a should yield after getting its commit timestamp"
     );
     let tx_a_end_ts = match mvcc_store
@@ -5521,7 +5527,7 @@ fn test_exclusive_tx_does_not_deadlock_behind_preparing_concurrent_commit() {
 
     let mut commit_a = conn_a.prepare("COMMIT").unwrap();
     assert!(
-        matches!(commit_a.step().unwrap(), StepResult::IO),
+        matches!(commit_a.step().unwrap(), StepResult::Yield),
         "first commit must pause after publishing Preparing and before taking the log lock",
     );
 
@@ -5532,7 +5538,7 @@ fn test_exclusive_tx_does_not_deadlock_behind_preparing_concurrent_commit() {
     let mut saw_busy = false;
     for _ in 0..64 {
         match insert_b.step() {
-            Ok(StepResult::IO) => continue,
+            Ok(StepResult::IO | StepResult::Yield) => continue,
             Ok(StepResult::Busy) | Err(LimboError::Busy) => {
                 saw_busy = true;
                 break;
@@ -5557,7 +5563,7 @@ fn test_exclusive_tx_does_not_deadlock_behind_preparing_concurrent_commit() {
                 committed = true;
                 break;
             }
-            StepResult::IO => {}
+            StepResult::IO | StepResult::Yield => {}
             other => panic!("unexpected commit step result: {other:?}"),
         }
     }
@@ -5810,7 +5816,7 @@ fn test_insert_in_middle_commit_of_create_index_returns_err() {
     let mut yielded = false;
     for _ in 0..200 {
         match create_idx.step().unwrap() {
-            StepResult::IO => {
+            StepResult::Yield => {
                 yielded = true;
                 break;
             }
@@ -5921,7 +5927,7 @@ fn test_concurrent_writes() {
                     println!("connection {conn_id} done");
                     conn.current_statement = None;
                 }
-                StepResult::IO => {
+                StepResult::IO | StepResult::Yield => {
                     // let's skip doing I/O here, we want to perform io only after all the statements are stepped
                 }
                 StepResult::Busy => {
@@ -7011,8 +7017,8 @@ fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
 
     let mut drop_stmt = conn.prepare("DROP TABLE repro_target").unwrap();
     match drop_stmt.step().unwrap() {
-        crate::StepResult::IO => {}
-        other => panic!("expected injected IO yield while dropping repro_target; got {other:?}"),
+        crate::StepResult::Yield => {}
+        other => panic!("expected injected yield while dropping repro_target; got {other:?}"),
     }
     conn.set_yield_injector(None);
 
@@ -8880,12 +8886,12 @@ fn test_mvcc_unique_constraint() {
 /// Regression test for MVCC concurrent commit yield-spin deadlock.
 ///
 /// When the VDBE encounters a yield completion (pager_commit_lock contention),
-/// it must return StepResult::IO to yield control. Previously, it checked
+/// it must return StepResult::Yield to yield control. Previously, it checked
 /// `finished()` which is always true for yield completions, causing an infinite
 /// spin inside a single step() call — deadlocking cooperative schedulers.
 ///
 /// We simulate lock contention by pre-acquiring pager_commit_lock before
-/// calling COMMIT, then verify step() returns IO instead of hanging.
+/// calling COMMIT, then verify step() returns Yield instead of hanging.
 #[test]
 fn test_concurrent_commit_yield_spin() {
     let db = MvccTestDbNoConn::new();
@@ -8908,7 +8914,7 @@ fn test_concurrent_commit_yield_spin() {
     let mut returned_io = false;
     for _ in 0..100 {
         match stmt.step().unwrap() {
-            crate::StepResult::IO => {
+            crate::StepResult::Yield => {
                 returned_io = true;
                 break;
             }
@@ -8942,7 +8948,7 @@ fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<MvStore<
 
     let mut stmt = conn.prepare("COMMIT").unwrap();
     assert!(
-        matches!(stmt.step().unwrap(), crate::StepResult::IO),
+        matches!(stmt.step().unwrap(), crate::StepResult::Yield),
         "COMMIT should yield while the commit lock is held",
     );
 
@@ -8966,7 +8972,7 @@ fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
 
     let mut stmt = conn.prepare("COMMIT").unwrap();
     assert!(
-        matches!(stmt.step().unwrap(), crate::StepResult::IO),
+        matches!(stmt.step().unwrap(), crate::StepResult::Yield),
         "MVCC commit should yield before completion",
     );
 
@@ -9050,7 +9056,7 @@ fn test_build_log_record_yields_for_large_write_set() {
     let mut saw_start = false;
     loop {
         match stmt.step().unwrap() {
-            crate::StepResult::IO => {
+            crate::StepResult::Yield => {
                 if !saw_start {
                     // Wait for the BuildLogRecordStart yield to open the bracket.
                     // IOs before this came from earlier states (Initial → Commit
@@ -9069,6 +9075,7 @@ fn test_build_log_record_yields_for_large_write_set() {
                 // `Completion::new_yield()` in step_build_log_record's loop.
                 chunked_io_yields += 1;
             }
+            crate::StepResult::IO => continue,
             crate::StepResult::Done => break,
             other => panic!("unexpected step result: {other:?}"),
         }
@@ -10085,8 +10092,8 @@ fn test_abandoned_drop() {
     conn.execute("BEGIN").unwrap();
     let mut drop_stmt = conn.prepare("DROP TABLE t").unwrap();
     match drop_stmt.step().unwrap() {
-        crate::StepResult::IO => {}
-        other => panic!("expected injected IO yield mid-DROP TABLE; got {other:?}"),
+        crate::StepResult::Yield => {}
+        other => panic!("expected injected yield mid-DROP TABLE; got {other:?}"),
     }
     conn.set_yield_injector(None);
 
@@ -13560,8 +13567,8 @@ fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
         .prepare("INSERT INTO t VALUES (NULL, 'leaker')")
         .unwrap();
     match leak_stmt.step().unwrap() {
-        crate::StepResult::IO => {}
-        other => panic!("expected IO yield from injected seek_start; got {other:?}"),
+        crate::StepResult::Yield => {}
+        other => panic!("expected yield from injected seek_start; got {other:?}"),
     }
 
     // Drop the statement without advancing past the yield. The Drop impl
@@ -13581,7 +13588,7 @@ fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
         }
         match victim_stmt.step().unwrap() {
             crate::StepResult::Done => break,
-            crate::StepResult::IO => continue,
+            crate::StepResult::IO | crate::StepResult::Yield => continue,
             other => panic!("unexpected step result on victim INSERT: {other:?}"),
         }
     }
@@ -13616,7 +13623,7 @@ fn exclusive_commit_failure_at_after_remove_tx_strands_exclusive_atom() {
     let mut commit_b = conn_b.prepare("COMMIT").unwrap();
     let step_result = loop {
         match commit_b.step() {
-            Ok(StepResult::IO) => continue,
+            Ok(StepResult::IO | StepResult::Yield) => continue,
             other => break other,
         }
     };
@@ -13658,8 +13665,8 @@ fn dropped_concurrent_commit_does_not_strand_connection() {
     {
         let mut commit = conn.prepare("COMMIT").unwrap();
         match commit.step().unwrap() {
-            crate::StepResult::IO => {}
-            other => panic!("expected IO yield at LogRecordPrepared; got {other:?}"),
+            crate::StepResult::Yield => {}
+            other => panic!("expected yield at LogRecordPrepared; got {other:?}"),
         }
     }
     conn.set_yield_injector(None);
@@ -13725,8 +13732,8 @@ fn dropped_exclusive_commit_releases_locks() {
     {
         let mut commit = conn_a.prepare("COMMIT").unwrap();
         match commit.step().unwrap() {
-            crate::StepResult::IO => {}
-            other => panic!("expected IO yield at LogRecordPrepared; got {other:?}"),
+            crate::StepResult::Yield => {}
+            other => panic!("expected yield at LogRecordPrepared; got {other:?}"),
         }
     }
     conn_a.set_yield_injector(None);
@@ -13783,8 +13790,8 @@ fn dropped_main_commit_rolls_back_attached_mvcc_txs() {
     {
         let mut commit = conn.prepare("COMMIT").unwrap();
         match commit.step().unwrap() {
-            crate::StepResult::IO => {}
-            other => panic!("expected IO yield at LogRecordPrepared; got {other:?}"),
+            crate::StepResult::Yield => {}
+            other => panic!("expected yield at LogRecordPrepared; got {other:?}"),
         }
     }
     conn.set_yield_injector(None);
@@ -13829,8 +13836,8 @@ fn dropped_main_commit_rolls_back_temp_schema_changes() {
     {
         let mut commit = conn.prepare("COMMIT").unwrap();
         match commit.step().unwrap() {
-            crate::StepResult::IO => {}
-            other => panic!("expected IO yield at LogRecordPrepared; got {other:?}"),
+            crate::StepResult::Yield => {}
+            other => panic!("expected yield at LogRecordPrepared; got {other:?}"),
         }
     }
     conn.set_yield_injector(None);
@@ -13887,8 +13894,8 @@ fn dropped_attached_commit_releases_attached_read_lock() {
     {
         let mut commit = conn.prepare("COMMIT").unwrap();
         match commit.step().unwrap() {
-            crate::StepResult::IO => {}
-            other => panic!("expected IO yield at attached LogRecordPrepared; got {other:?}"),
+            crate::StepResult::Yield => {}
+            other => panic!("expected yield at attached LogRecordPrepared; got {other:?}"),
         }
     }
     conn.set_yield_injector(None);
@@ -13955,8 +13962,8 @@ fn dropped_attached_commit_rolls_back_remaining_attached_mvcc_txs() {
     {
         let mut commit = conn.prepare("COMMIT").unwrap();
         match commit.step().unwrap() {
-            crate::StepResult::IO => {}
-            other => panic!("expected IO yield at attached LogRecordPrepared; got {other:?}"),
+            crate::StepResult::Yield => {}
+            other => panic!("expected yield at attached LogRecordPrepared; got {other:?}"),
         }
     }
     conn.set_yield_injector(None);
@@ -14102,7 +14109,9 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
         for _ in 0..budget {
             match stmt.step() {
                 Ok(StepResult::Done) => return,
-                Ok(StepResult::IO) => std::thread::sleep(Duration::from_millis(10)),
+                Ok(StepResult::IO | StepResult::Yield) => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
                 Ok(other) => panic!("unexpected step: {other:?}"),
                 Err(error) => panic!("received error: {error}"),
             }
@@ -14205,7 +14214,7 @@ fn test_dropped_commit_corrupts_subsequent_insert() {
     {
         let mut commit = conn.prepare("COMMIT").unwrap();
         match commit.step().unwrap() {
-            StepResult::IO | StepResult::Done => {}
+            StepResult::IO | StepResult::Yield | StepResult::Done => {}
             other => panic!("unexpected step result: {other:?}"),
         };
     }
@@ -14232,7 +14241,7 @@ fn abandoned_exclusive_commit_should_not_block_subsequent_concurrent_writer() {
     ])));
 
     match conn_a.prepare("COMMIT").unwrap().step().unwrap() {
-        StepResult::IO => {} // tx will immediately hit injected yield point
+        StepResult::Yield => {} // tx will immediately hit injected yield point
         other => panic!("tx should yield, got: {other:?}"),
     }
 
@@ -14269,7 +14278,7 @@ fn abandoned_commit_in_committed_state_should_not_block_subsequent_checkpoint() 
     ])));
 
     match conn_a.prepare("COMMIT").unwrap().step().unwrap() {
-        StepResult::IO => {}
+        StepResult::Yield => {}
         other => panic!("tx should yield, got: {other:?}"),
     }
 
@@ -14700,7 +14709,7 @@ fn test_nextval_no_inner_tx_retry_on_concurrent_mvcc() {
     // inject point was reached.
     let injected = loop {
         match next_a.step().unwrap() {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 if injector.is_empty() {
                     break true;
                 }
@@ -14960,7 +14969,7 @@ fn test_global_header_cookie_no_regression_on_out_of_order_finalize() {
     let mut yielded = false;
     for _ in 0..200 {
         match commit_a.step().unwrap() {
-            StepResult::IO => {
+            StepResult::Yield => {
                 yielded = true;
                 break;
             }
@@ -15055,7 +15064,7 @@ fn test_global_header_regression_would_lose_committed_user_version() {
     let mut yielded_older = false;
     for _ in 0..200 {
         match older_commit.step().unwrap() {
-            StepResult::IO => {
+            StepResult::Yield => {
                 yielded_older = true;
                 break;
             }
@@ -15161,4 +15170,36 @@ fn test_create_index_exclusive_acquire_rechecks_timestamp_after_cas() {
     let integrity = get_rows(&observer, "PRAGMA integrity_check");
     assert_eq!(integrity.len(), 1);
     assert_eq!(integrity[0][0].to_string(), "ok");
+}
+
+/// Contract test for [`crate::StepResult::Yield`]: an explicit yield (here an
+/// injected one) must surface as `Yield`, not as `IO` — there are no pending
+/// completions to drive, so the caller can simply step the statement again,
+/// possibly after doing other work first.
+#[test]
+fn injected_yield_surfaces_as_step_result_yield() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    let first = commit.step().unwrap();
+    assert!(
+        matches!(first, crate::StepResult::Yield),
+        "injected yield must surface as StepResult::Yield, got {first:?}"
+    );
+    conn.set_yield_injector(None);
+
+    // After a yield the statement just resumes at the same point.
+    commit.run_ignore_rows().unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(rows.len(), 1);
 }
