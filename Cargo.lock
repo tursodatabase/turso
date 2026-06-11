@@ -6810,12 +6810,15 @@ name = "turso_stress"
 version = "0.7.0-pre.6"
 dependencies = [
  "antithesis_sdk",
+ "chrono",
  "clap",
  "hex",
  "indicatif",
  "rand 0.9.4",
  "rusqlite",
+ "serde",
  "serde_json",
+ "serde_yaml",
  "shuttle",
  "tempfile",
  "tokio",
