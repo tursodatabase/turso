@@ -47,11 +47,7 @@ pub struct TursoAllocator;
 
 pub type Allocator = TursoAllocator;
 
-// TODO: change this to use allocator_api2 Box when we finish migrating callsites
-#[cfg(not(nightly))]
 pub type Box<T> = std::boxed::Box<T>;
-#[cfg(nightly)]
-pub type Box<T> = std::boxed::Box<T, TursoAllocator>;
 
 #[cfg(not(nightly))]
 pub type Vec<T> = std::vec::Vec<T>;
@@ -131,45 +127,24 @@ pub type HashMap<K, V, S = rustc_hash::FxBuildHasher> = std::collections::HashMa
 
 pub type HashSet<T, S = rustc_hash::FxBuildHasher> = std::collections::HashSet<T, S>;
 
-#[cfg(not(nightly))]
 pub type BTreeMap<K, V> = std::collections::BTreeMap<K, V>;
-#[cfg(nightly)]
-pub type BTreeMap<K, V> = std::collections::BTreeMap<K, V, TursoAllocator>;
 
-#[cfg(not(nightly))]
 pub type BTreeSet<T> = std::collections::BTreeSet<T>;
-#[cfg(nightly)]
-pub type BTreeSet<T> = std::collections::BTreeSet<T, TursoAllocator>;
 
-#[cfg(not(nightly))]
 pub type VecDeque<T> = std::collections::VecDeque<T>;
-#[cfg(nightly)]
-pub type VecDeque<T> = std::collections::VecDeque<T, TursoAllocator>;
 
-#[cfg(not(nightly))]
 pub type BinaryHeap<T> = std::collections::BinaryHeap<T>;
-#[cfg(nightly)]
-pub type BinaryHeap<T> = std::collections::BinaryHeap<T, TursoAllocator>;
 
-#[cfg(not(nightly))]
 pub type LinkedList<T> = std::collections::LinkedList<T>;
-#[cfg(nightly)]
-pub type LinkedList<T> = std::collections::LinkedList<T, TursoAllocator>;
 
 // TODO: design allocator-aware shared-pointer support that still preserves
 // shuttle's deterministic sync behavior.
 pub type Arc<T> = crate::sync::Arc<T>;
 pub type Weak<T> = crate::sync::Weak<T>;
 
-#[cfg(not(nightly))]
 pub type Rc<T> = std::rc::Rc<T>;
-#[cfg(nightly)]
-pub type Rc<T> = std::rc::Rc<T, TursoAllocator>;
 
-#[cfg(not(nightly))]
 pub type RcWeak<T> = std::rc::Weak<T>;
-#[cfg(nightly)]
-pub type RcWeak<T> = std::rc::Weak<T, TursoAllocator>;
 
 #[cfg(test)]
 mod tests;
