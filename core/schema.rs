@@ -1203,7 +1203,7 @@ impl Schema {
 
         self.table_to_materialized_views
             .entry(table_name)
-            .or_default()
+            .or_insert_with(|| vec![])
             .push(view_name);
     }
 
@@ -1216,7 +1216,7 @@ impl Schema {
         self.table_to_materialized_views
             .get(&table_name)
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_else(|| vec![])
     }
 
     /// Add a regular (non-materialized) view

@@ -1768,7 +1768,7 @@ impl HashTable {
             return Ok(());
         }
 
-        let entries = std::mem::take(&mut partition_buffer.entries);
+        let entries = std::mem::replace(&mut partition_buffer.entries, vec![]);
         // we don't change self.mem_used here, as these entries
         // were always in memory. we’re just changing their layout
         partition_buffer.mem_used = 0;

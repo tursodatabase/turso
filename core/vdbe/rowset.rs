@@ -27,6 +27,7 @@
 
 use branches::mark_unlikely;
 
+use crate::alloc::vec;
 use crate::alloc::*;
 use crate::turso_assert;
 use crate::Result;
@@ -143,7 +144,7 @@ impl RowSet {
             "cannot call smallest() after test() has been used"
         );
         if matches!(self.mode, RowSetMode::Unset) {
-            let mut v = std::mem::take(&mut self.fresh);
+            let mut v = std::mem::replace(&mut self.fresh, vec![]);
             v.sort_unstable();
             v.dedup();
             v.reverse();

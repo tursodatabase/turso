@@ -415,11 +415,11 @@ impl ProgramExecutionState {
 
 /// Re-entrant state for [Insn::HashBuild].
 /// Allows HashBuild to resume cleanly after async I/O without re-reading the row.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OpHashBuildState {
-    pub key_values: Vec<Value>,
+    pub key_values: crate::alloc::Vec<Value>,
     pub key_idx: usize,
-    pub payload_values: Vec<Value>,
+    pub payload_values: crate::alloc::Vec<Value>,
     pub payload_idx: usize,
     pub rowid: Option<i64>,
     pub cursor_id: CursorID,
@@ -430,10 +430,10 @@ pub struct OpHashBuildState {
 
 /// Re-entrant state for [Insn::HashProbe].
 /// Allows HashProbe to resume cleanly after async probe-row buffering I/O.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OpHashProbeState {
     /// Cached probe key values to avoid re-reading from registers
-    pub probe_keys: Vec<Value>,
+    pub probe_keys: crate::alloc::Vec<Value>,
     /// Hash table register being probed
     pub hash_table_id: usize,
     /// Partition index being loaded (if any)

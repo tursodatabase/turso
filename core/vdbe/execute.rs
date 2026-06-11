@@ -1,3 +1,4 @@
+use crate::alloc::{TursoSliceExt, TursoTryWithCapacityExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
@@ -12195,10 +12196,7 @@ pub fn op_parse_schema(
     *state.active_op_state.parse_schema() = Some(Box::new(OpParseSchemaInner {
         stmt,
         schema_arc,
-        from_sql_indexes:
-            <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
-                10,
-            )
+        from_sql_indexes: crate::alloc::Vec::try_with_capacity_ext(10)
             .expect("TODO: fallible allocations"),
         automatic_indices: Default::default(),
         dbsp_state_roots: Default::default(),
@@ -14622,9 +14620,11 @@ pub fn op_hash_build(
                 && s.num_keys == data.num_keys
         })
         .unwrap_or_else(|| OpHashBuildState {
-            key_values: Vec::with_capacity(data.num_keys),
+            key_values: crate::alloc::Vectry_with_capacity_ext(data.num_keys)
+                .expect("TODO: fallible allocations"),
             key_idx: 0,
-            payload_values: Vec::with_capacity(data.num_payload),
+            payload_values: crate::alloc::Vec::try_with_capacity_ext(data.num_payload)
+                .expect("TODO: fallible allocations"),
             payload_idx: 0,
             rowid: None,
             cursor_id: data.cursor_id,
@@ -14649,7 +14649,10 @@ pub fn op_hash_build(
             initial_buckets: 1024,
             mem_budget,
             num_keys: data.num_keys,
-            collations: data.collations.clone(),
+            collations: data
+                .collations
+                .try_to_vec()
+                .expect("TODO: fallible allocations"),
             temp_store,
             track_matched: data.track_matched,
             partition_count: None,
@@ -14710,9 +14713,9 @@ pub fn op_hash_build(
     if let Some(ht) = state.hash_tables.get_mut(&data.hash_table_id) {
         let rowid = op_state.rowid.expect("rowid set");
         let pending = PendingHashInsert {
-            key_values: std::mem::take(&mut op_state.key_values),
+            key_values: std::mem::replace(&mut op_state.key_values, crate::alloc::vec![]),
             rowid,
-            payload_values: std::mem::take(&mut op_state.payload_values),
+            payload_values: std::mem::replace(&mut op_state.payload_values, crate::alloc::vec![]),
         };
         match ht.insert_pending(pending, Some(&mut state.metrics.hash_join))? {
             HashInsertResult::Done => {}
@@ -14753,7 +14756,10 @@ pub fn op_hash_distinct(
             initial_buckets: 1024,
             mem_budget,
             num_keys: data.num_keys,
-            collations: data.collations.clone(),
+            collations: data
+                .collations
+                .try_to_vec()
+                .expect("TODO: fallible allocations"),
             temp_store,
             track_matched: false,
             partition_count: None,
@@ -14858,7 +14864,8 @@ pub fn op_hash_probe(
                 )
             } else {
                 // Different hash table, read fresh keys
-                let mut keys = Vec::with_capacity(num_keys);
+                let mut keys = crate::alloc::Vec::try_with_capacity_ext(num_keys)
+                    .expect("TODO: fallible allocations");
                 for i in 0..num_keys {
                     let reg = &state.registers[key_start_reg + i];
                     keys.push(reg.get_value().clone());
@@ -14867,7 +14874,8 @@ pub fn op_hash_probe(
             }
         } else {
             // First entry, read probe keys from registers
-            let mut keys = Vec::with_capacity(num_keys);
+            let mut keys = crate::alloc::Vec::try_with_capacity_ext(num_keys)
+                .expect("TODO: fallible allocations");
             for i in 0..num_keys {
                 let reg = &state.registers[key_start_reg + i];
                 keys.push(reg.get_value().clone());
@@ -14911,7 +14919,7 @@ pub fn op_hash_probe(
                     IOResult::Done(()) => {}
                     IOResult::IO(io) => {
                         *state.active_op_state.hash_probe() = Some(OpHashProbeState {
-                            probe_keys: Vec::new(), // keys consumed
+                            probe_keys: crate::alloc::vec![], // keys consumed
                             hash_table_id,
                             partition_idx,
                             probe_buffered: true,
