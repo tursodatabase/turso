@@ -3129,7 +3129,22 @@ impl StateTransition for WriteRowStateMachine {
                     record.start_serialization(row_data)?;
                     Some(record)
                 };
-                if self.requires_seek {
+                // `requires_seek == false` is a write_set-level *candidate* for the
+                // sequential-write optimization (this row's key is exactly previous
+                // row's key + 1, so the cursor — left on the previous row and advanced
+                // by WriteRowState::Next — is usually already at the insert position).
+                // It is only sound if the cursor is still PAST the start of its leaf:
+                // if the previous row was the last cell of its leaf, next() crossed
+                // into the following leaf (cell 0), and this row may belong on the
+                // other side of the parent divider. Dividers keep their key when the
+                // checkpoint deletes their row, so the divider can
+                // be >= this row's key, meaning the row MUST go into the left leaf
+                // even though the cursor is in the right one. Writing it at the
+                // cursor would keep the leaf locally sorted but break the interior
+                // ordering invariant, making the row invisible to point lookups
+                // ("Rowid N out of order" under sqlite3 integrity_check). Fall back
+                // to a real seek, which resolves the divider comparison correctly.
+                if self.requires_seek || !self.cursor.read().is_positioned_past_page_start() {
                     self.state = WriteRowState::Seek;
                 } else {
                     self.state = WriteRowState::Insert;
