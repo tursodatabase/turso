@@ -66,7 +66,7 @@ fn bench_graph_queries(criterion: &mut Criterion) {
                         turso_core::StepResult::Row => {
                             black_box(stmt.row());
                         }
-                        turso_core::StepResult::IO => {
+                        turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                             db.io.step().unwrap();
                         }
                         turso_core::StepResult::Done => {
@@ -92,7 +92,7 @@ fn bench_graph_queries(criterion: &mut Criterion) {
                             turso_core::StepResult::Row => {
                                 black_box(stmt.row());
                             }
-                            turso_core::StepResult::IO => {
+                            turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                                 db_analyzed.io.step().unwrap();
                             }
                             turso_core::StepResult::Done => {

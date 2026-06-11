@@ -4576,7 +4576,7 @@ pub fn op_program(
                     match res {
                         Ok(step_result) => match step_result {
                             StepResult::Done => break,
-                            StepResult::IO => {
+                            StepResult::IO | StepResult::Yield => {
                                 let io = statement.take_io_completions().unwrap_or_else(|| {
                                     IOCompletions::Single(Completion::new_yield())
                                 });
@@ -12216,7 +12216,7 @@ fn op_parse_schema_step(
     loop {
         let inner = state.active_op_state.parse_schema().as_mut().unwrap();
         match inner.stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 let io = inner
                     .stmt
                     .take_io_completions()
@@ -12475,7 +12475,7 @@ fn drive_init_cdc_version(
     loop {
         let inner = state.active_op_state.init_cdc_version().as_mut().unwrap();
         match inner.stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 let io = inner
                     .stmt
                     .take_io_completions()

@@ -125,7 +125,7 @@ fn reindex_reset_during_pending_io_preserves_original_indexes() -> anyhow::Resul
             StepResult::Busy | StepResult::Interrupt => {
                 anyhow::bail!("unexpected REINDEX step result before reset")
             }
-            StepResult::IO => break,
+            StepResult::IO | StepResult::Yield => break,
         }
     }
 

@@ -237,7 +237,7 @@ fn test_newrowid_mvcc_concurrent(tmp_db: TempDatabase) -> anyhow::Result<()> {
                 'retry: loop {
                     loop {
                         match stmt.step()? {
-                            StepResult::IO => {
+                            StepResult::IO | StepResult::Yield => {
                                 stmt._io().step()?;
                             }
                             StepResult::Done => {

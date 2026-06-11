@@ -166,6 +166,11 @@ pub enum StepResult {
     Row,
     Interrupt,
     Busy,
+    /// The statement explicitly yielded control back to the caller without any pending I/O.
+    /// Stepping again immediately (even in a tight loop) is fine; blocking callers should
+    /// still drive the event loop (`io.step()`) between steps so progress that depends on
+    /// other threads' I/O is not starved.
+    Yield,
 }
 
 #[derive(Debug)]
@@ -1766,7 +1771,7 @@ impl Program {
                         // contended lock). Don't store in io_completions —
                         // yields aren't pending I/O, so the instruction will
                         // simply re-execute on the next step.
-                        return Ok(StepResult::IO);
+                        return Ok(StepResult::Yield);
                     }
                     let finished = io.finished();
                     state.io_completions = Some(io);

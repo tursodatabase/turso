@@ -747,7 +747,7 @@ impl InteractionType {
                         }
                         out.push(r);
                     }
-                    StepResult::IO => {
+                    StepResult::IO | StepResult::Yield => {
                         let syncing = env.io.syncing();
                         if syncing {
                             reopen_database(env);

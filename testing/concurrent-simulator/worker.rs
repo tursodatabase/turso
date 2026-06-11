@@ -362,7 +362,7 @@ fn execute_sql_inner(conn: &Arc<Connection>, sql: &str) -> WorkerResponse {
                         message: "Interrupted".to_string(),
                     };
                 }
-                Ok(StepResult::IO) => {
+                Ok(StepResult::IO | StepResult::Yield) => {
                     io_count += 1;
                     stmt.get_pager()
                         .io

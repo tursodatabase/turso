@@ -634,7 +634,9 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
                     }
                     turso_core::StepResult::Done => break,
                     turso_core::StepResult::Interrupt => break,
-                    turso_core::StepResult::Busy | turso_core::StepResult::IO => continue,
+                    turso_core::StepResult::Busy
+                    | turso_core::StepResult::IO
+                    | turso_core::StepResult::Yield => continue,
                 }
             }
         }
@@ -670,7 +672,9 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
                     Ok(turso_core::StepResult::Done) => break false, // Completed without error
                     Ok(turso_core::StepResult::Interrupt) => break false,
                     Ok(turso_core::StepResult::Row) => break false, // Got data - unexpected!!
-                    Ok(turso_core::StepResult::Busy) | Ok(turso_core::StepResult::IO) => continue,
+                    Ok(turso_core::StepResult::Busy)
+                    | Ok(turso_core::StepResult::IO)
+                    | Ok(turso_core::StepResult::Yield) => continue,
                 }
             },
             Ok(None) => false,
@@ -732,7 +736,9 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
                     }
                     turso_core::StepResult::Done => break,
                     turso_core::StepResult::Interrupt => break,
-                    turso_core::StepResult::Busy | turso_core::StepResult::IO => continue,
+                    turso_core::StepResult::Busy
+                    | turso_core::StepResult::IO
+                    | turso_core::StepResult::Yield => continue,
                 }
             }
         }

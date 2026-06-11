@@ -1252,7 +1252,10 @@ pub async fn checkpoint_wal_file<Ctx>(
     let mut checkpoint_stmt = conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?;
     loop {
         match checkpoint_stmt.step()? {
-            turso_core::StepResult::IO => coro.yield_(SyncEngineIoResult::IO).await?,
+            turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                // todo(sivukhin): introduce Yield result in the sync engine
+                coro.yield_(SyncEngineIoResult::IO).await?
+            }
             turso_core::StepResult::Done => break,
             turso_core::StepResult::Row => continue,
             r => {

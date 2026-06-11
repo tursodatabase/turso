@@ -45,7 +45,7 @@ pub(crate) async fn run_stmt_once<'a, Ctx>(
 ) -> Result<Option<&'a turso_core::Row>> {
     loop {
         match stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 coro.yield_(SyncEngineIoResult::IO).await?;
             }
             StepResult::Done => {
@@ -92,7 +92,7 @@ pub(crate) async fn exec_stmt<Ctx>(
 ) -> Result<()> {
     loop {
         match stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 coro.yield_(SyncEngineIoResult::IO).await?;
             }
             StepResult::Done => {

@@ -644,7 +644,7 @@ pub(crate) fn vacuum_target_build_step(
                         state.phase = VacuumTargetBuildPhase::PrepareCreateTable { idx: 0 };
                         continue;
                     }
-                    crate::StepResult::IO => {
+                    crate::StepResult::IO | crate::StepResult::Yield => {
                         let io = schema_stmt
                             .take_io_completions()
                             .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
@@ -705,7 +705,7 @@ pub(crate) fn vacuum_target_build_step(
                     state.phase = VacuumTargetBuildPhase::PrepareCreateTable { idx: idx + 1 };
                     continue;
                 }
-                crate::StepResult::IO => {
+                crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_schema_stmt
                         .take_io_completions()
                         .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
@@ -839,7 +839,7 @@ pub(crate) fn vacuum_target_build_step(
                     };
                     continue;
                 }
-                crate::StepResult::IO => {
+                crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = select_stmt
                         .take_io_completions()
                         .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
@@ -872,7 +872,7 @@ pub(crate) fn vacuum_target_build_step(
                     };
                     continue;
                 }
-                crate::StepResult::IO => {
+                crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_insert_stmt
                         .take_io_completions()
                         .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
@@ -921,7 +921,7 @@ pub(crate) fn vacuum_target_build_step(
                     state.phase = VacuumTargetBuildPhase::PrepareCreateIndex { idx: idx + 1 };
                     continue;
                 }
-                crate::StepResult::IO => {
+                crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_schema_stmt
                         .take_io_completions()
                         .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
@@ -965,7 +965,7 @@ pub(crate) fn vacuum_target_build_step(
                     state.phase = VacuumTargetBuildPhase::PreparePostData { idx: idx + 1 };
                     continue;
                 }
-                crate::StepResult::IO => {
+                crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_schema_stmt
                         .take_io_completions()
                         .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
