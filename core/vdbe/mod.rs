@@ -166,6 +166,10 @@ pub enum StepResult {
     Row,
     Interrupt,
     Busy,
+    /// The statement explicitly yielded control back to the caller without any pending I/O.
+    /// Stepping again immediately (even in a tight loop) is fine; the yield is a fairness
+    /// point that gives the caller an opportunity to do other work first if it wants to.
+    Yield,
 }
 
 #[derive(Debug)]
