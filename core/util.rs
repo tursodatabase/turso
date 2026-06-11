@@ -196,7 +196,7 @@ impl ParseSchemaRowsState {
 /// `state`, feeding each row to `handle_schema_row`, and yields IO instead of
 /// pumping it. Re-invoke after each yielded completion; accumulators persist in
 /// `state`. On completion, populates indices and materialized views.
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn parse_schema_rows(
     state: &mut ParseSchemaRowsState,
     schema: &mut Schema,

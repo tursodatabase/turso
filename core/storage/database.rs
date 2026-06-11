@@ -272,7 +272,7 @@ impl DatabaseStorage for DatabaseFile {
         self.file.size()
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
         let c = self.file.truncate(len as u64, c)?;
         Ok(c)

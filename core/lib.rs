@@ -1930,14 +1930,14 @@ impl Database {
         }
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
         self._connect(false, None, None)
     }
 
     /// Connect with an encryption key.
     /// Use this when opening an encrypted database where the key is known at connect time.
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect_with_encryption(
         self: &Arc<Database>,
         encryption_key: Option<EncryptionKey>,
@@ -1945,7 +1945,7 @@ impl Database {
         self._connect(false, None, encryption_key)
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn _connect(
         self: &Arc<Database>,
         is_mvcc_bootstrap_connection: bool,

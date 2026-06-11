@@ -3367,7 +3367,7 @@ impl Pager {
 
     /// Flush all dirty pages to disk (async/re-entrant).
     /// Unlike commit_dirty_pages, this function does not commit, checkpoint nor sync the WAL/Database.
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn cacheflush(&self) -> Result<IOResult<Vec<Completion>>> {
         let wal = self
             .wal
