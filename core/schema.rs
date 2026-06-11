@@ -6477,13 +6477,13 @@ mod tests {
     }
 
     fn indices(mask: &ColumnMask) -> Vec<usize> {
-        let mut v: Vec<usize> = mask.iter().collect();
+        let mut v: Vec<usize> = mask.iter().try_collect().unwrap();
         v.sort_unstable();
         v
     }
 
     fn stored(bits: &ColumnMask) -> Vec<usize> {
-        let mut v: Vec<usize> = bits.iter().collect();
+        let mut v: Vec<usize> = bits.iter().try_collect().unwrap();
         v.sort_unstable();
         v
     }

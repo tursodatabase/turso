@@ -16367,6 +16367,7 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::BranchOffset;
     use crate::{Database, DatabaseOpts, MemoryIO, IO};
@@ -16385,7 +16386,7 @@ mod tests {
         conn.prepare("SELECT 1;").unwrap()
     }
 
-    fn make_spilled_hash_table() -> (HashTable, Vec<Value>, usize) {
+    fn make_spilled_hash_table() -> (HashTable, crate::alloc::Vec<Value>, usize) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let config = HashTableConfig {
             initial_buckets: 4,

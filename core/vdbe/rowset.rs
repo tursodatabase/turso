@@ -458,7 +458,7 @@ mod tests {
             assert_eq!(extracted.len(), inserted.len());
 
             // Verify they're in sorted order
-            let mut sorted_inserted: Vec<i64> = inserted.iter().copied().collect();
+            let mut sorted_inserted: Vec<i64> = inserted.iter().copied().try_collect().unwrap();
             sorted_inserted.sort_unstable();
             assert_eq!(extracted, sorted_inserted);
         }
@@ -548,7 +548,8 @@ mod tests {
                         // Test a previously inserted value with a new batch number
                         // This triggers consolidation of all fresh values
                         if !all_values.is_empty() {
-                            let values_vec: Vec<i64> = all_values.iter().copied().collect();
+                            let values_vec: Vec<i64> =
+                                all_values.iter().copied().try_collect().unwrap();
                             let idx = (rng.next_u64() % values_vec.len() as u64) as usize;
                             let value = values_vec[idx];
 

@@ -9546,7 +9546,7 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                let regs = &[Register::Value(Value::Blob(crate::alloc::vec![0; *size]))];
+                let regs = &[Register::Value(Value::Blob(vec![0; *size]))];
                 let value = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
                 tracing::info!("insert key:{}", key);
                 run_until_done(
@@ -9643,7 +9643,7 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                let regs = &[Register::Value(Value::Blob(crate::alloc::vec![0; size]))];
+                let regs = &[Register::Value(Value::Blob(vec![0; size]))];
                 let value = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
                 let btree_before = if do_validate {
                     format_btree(pager.clone(), root_page, 0)
@@ -9741,7 +9741,8 @@ mod tests {
                         default: None,
                         expr: None,
                     })
-                    .collect(),
+                    .try_collect()
+                    .unwrap(),
                 table_name: "test".to_string(),
                 root_page: index_root_page,
                 unique: false,

@@ -331,7 +331,7 @@ mod tests {
             .unwrap()
             .to_owned();
 
-            let values: Vec<Value> = record.get_values_owned().unwrap();
+            let values = record.get_values_owned().unwrap();
 
             // Parse the 5-column structure: operator_id, zset_id, element_id, value, weight
             if let Some(Value::Numeric(Numeric::Integer(op_id))) = values.first() {

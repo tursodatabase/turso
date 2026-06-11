@@ -3545,7 +3545,7 @@ mod hashtests {
                 Value::from_f64(std::f64::consts::PI),
             ],
             100,
-            vec![Value::Blob(vec![1, 2, 3, 4, 5]), Value::from_i64(-999)],
+            vec![Value::Blob(std::vec![1, 2, 3, 4, 5]), Value::from_i64(-999)],
         );
 
         // Serialize using the Vec-based method
@@ -3748,7 +3748,8 @@ mod hashtests {
         let spill_state = SpillState {
             partition_buffers: (0..partitioning.count)
                 .map(|_| PartitionBuffer::new())
-                .collect(),
+                .try_collect()
+                .unwrap(),
             partitions: vec![partition],
             next_spill_offset: 0,
             temp_file,
@@ -3797,7 +3798,8 @@ mod hashtests {
         let spill_state = SpillState {
             partition_buffers: (0..partitioning.count)
                 .map(|_| PartitionBuffer::new())
-                .collect(),
+                .try_collect()
+                .unwrap(),
             partitions: vec![partition],
             next_spill_offset: truncated.len() as u64,
             temp_file,
@@ -4250,7 +4252,7 @@ mod hashtests {
 
         // Insert entry with blob payload
         let key = vec![Value::from_i64(1)];
-        let blob_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let blob_data = std::vec![0xDE, 0xAD, 0xBE, 0xEF];
         let payload = vec![Value::Blob(blob_data.clone()), Value::from_i64(42)];
         let _ = ht.insert(key.clone(), 100, payload, None).unwrap();
 
@@ -4342,7 +4344,7 @@ mod hashtests {
                 Value::from_i64(999),
                 Value::from_f64(std::f64::consts::PI),
                 Value::Null,
-                Value::Blob(vec![1, 2, 3, 4]),
+                Value::Blob(std::vec![1, 2, 3, 4]),
             ],
         );
 
@@ -4373,7 +4375,7 @@ mod hashtests {
         assert_eq!(deserialized.payload_values[3], Value::Null);
         assert_eq!(
             deserialized.payload_values[4],
-            Value::Blob(vec![1, 2, 3, 4])
+            Value::Blob(std::vec![1, 2, 3, 4])
         );
     }
 
@@ -4506,8 +4508,10 @@ mod hashtests {
     #[test]
     fn test_grace_basic() {
         let io = Arc::new(MemoryIO::new());
-        let build_keys: Vec<(i64, Vec<Value>)> =
-            (0..200).map(|i| (i, vec![Value::from_i64(i)])).collect();
+        let build_keys: Vec<(i64, Vec<Value>)> = (0..200)
+            .map(|i| (i, vec![Value::from_i64(i)]))
+            .try_collect()
+            .unwrap();
         let mut ht = make_spilled_ht_with_payload(io, &build_keys, true);
         assert!(ht.has_spilled(), "should have spilled");
 
@@ -4607,8 +4611,10 @@ mod hashtests {
     fn test_grace_empty_partitions() {
         let io = Arc::new(MemoryIO::new());
         // Build with keys 0..100, probe with keys 200..300 (no overlap)
-        let build_keys: Vec<(i64, Vec<Value>)> =
-            (0..200).map(|i| (i, vec![Value::from_i64(i)])).collect();
+        let build_keys: Vec<(i64, Vec<Value>)> = (0..200)
+            .map(|i| (i, vec![Value::from_i64(i)]))
+            .try_collect()
+            .unwrap();
         let mut ht = make_spilled_ht_with_payload(io, &build_keys, false);
         assert!(ht.has_spilled());
 
@@ -4632,8 +4638,10 @@ mod hashtests {
     #[test]
     fn test_grace_null_keys() {
         let io = Arc::new(MemoryIO::new());
-        let build_keys: Vec<(i64, Vec<Value>)> =
-            (0..200).map(|i| (i, vec![Value::from_i64(i)])).collect();
+        let build_keys: Vec<(i64, Vec<Value>)> = (0..200)
+            .map(|i| (i, vec![Value::from_i64(i)]))
+            .try_collect()
+            .unwrap();
         let mut ht = make_spilled_ht_with_payload(io, &build_keys, false);
         assert!(ht.has_spilled());
 
@@ -4682,8 +4690,10 @@ mod hashtests {
     #[test]
     fn test_grace_with_payload() {
         let io = Arc::new(MemoryIO::new());
-        let build_keys: Vec<(i64, Vec<Value>)> =
-            (0..200).map(|i| (i, vec![Value::from_i64(i)])).collect();
+        let build_keys: Vec<(i64, Vec<Value>)> = (0..200)
+            .map(|i| (i, vec![Value::from_i64(i)]))
+            .try_collect()
+            .unwrap();
         let mut ht = make_spilled_ht_with_payload(io, &build_keys, true);
         assert!(ht.has_spilled());
 
@@ -4766,7 +4776,10 @@ mod hashtests {
         let mut keys_by_partition = std::collections::BTreeMap::<usize, Vec<i64>>::new();
         for i in 0..400 {
             let partition_idx = ht.partition_for_keys(&[Value::from_i64(i)]).unwrap();
-            keys_by_partition.entry(partition_idx).or_default().push(i);
+            keys_by_partition
+                .entry(partition_idx)
+                .or_insert_with(|| vec![])
+                .push(i);
         }
 
         let partitions_to_process: Vec<usize> = ht
@@ -4777,7 +4790,8 @@ mod hashtests {
             .iter()
             .filter(|partition| !partition.chunks.is_empty())
             .map(|partition| partition.partition_idx)
-            .collect();
+            .try_collect()
+            .unwrap();
         assert!(
             partitions_to_process.len() >= 2,
             "test requires at least two spilled partitions"
@@ -4911,7 +4925,7 @@ mod hashtests {
             .fold(
                 std::collections::BTreeMap::new(),
                 |mut acc, (partition, key)| {
-                    acc.entry(partition).or_default().push(key);
+                    acc.entry(partition).or_insert_with(|| vec![]).push(key);
                     acc
                 },
             );
@@ -4980,7 +4994,8 @@ mod hashtests {
                         .iter()
                         .flat_map(|bucket| bucket.entries.iter().map(|entry| entry.rowid))
                 })
-                .collect();
+                .try_collect()
+                .unwrap();
             (spilled_partition, expected_unmatched)
         };
         assert!(

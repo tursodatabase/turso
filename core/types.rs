@@ -3226,7 +3226,7 @@ mod tests {
 
     #[test]
     fn test_value_iterator_simple() {
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         let record = Record::new(vec![Value::from_i64(42), Value::Text(Text::new("hello"))]);
         record.serialize(&mut buf);
 
@@ -3250,7 +3250,7 @@ mod tests {
 
     #[test]
     fn test_value_iterator_nulls() {
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         let record = Record::new(vec![Value::Null, Value::Null, Value::Null]);
         record.serialize(&mut buf);
 
@@ -3263,20 +3263,20 @@ mod tests {
 
     #[test]
     fn test_value_iterator_mixed_types() {
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         let record = Record::new(vec![
             Value::Null,
             Value::from_i64(100),
             Value::from_f64(std::f64::consts::PI),
             Value::Text(Text::new("test")),
-            Value::Blob(vec![1, 2, 3]),
+            Value::Blob(std::vec![1, 2, 3]),
             Value::from_i64(0),
             Value::from_i64(1),
         ]);
         record.serialize(&mut buf);
 
         let iter = ValueIterator::new(&buf).unwrap();
-        let values: Vec<_> = iter.collect::<Result<Vec<_>>>().unwrap();
+        let values: Vec<_> = iter.try_collect::<Result<Vec<_>>>().unwrap().unwrap();
 
         assert_eq!(values[0], ValueRef::Null);
         assert_eq!(values[1], ValueRef::from_i64(100));
@@ -3292,8 +3292,11 @@ mod tests {
 
     #[test]
     fn test_value_iterator_large_record() {
-        let mut buf = Vec::new();
-        let values: Vec<Value> = (0..20).map(|i| Value::from_i64(i as i64)).collect();
+        let mut buf = std::vec::Vec::new();
+        let values: Vec<Value> = (0..20)
+            .map(|i| Value::from_i64(i as i64))
+            .try_collect()
+            .unwrap();
         let record = Record::new(values);
         record.serialize(&mut buf);
 
@@ -3308,8 +3311,11 @@ mod tests {
 
     #[test]
     fn test_value_iterator_zero_allocation() {
-        let mut buf = Vec::new();
-        let values: Vec<Value> = (0..5).map(|i| Value::from_i64(i as i64)).collect();
+        let mut buf = std::vec::Vec::new();
+        let values: Vec<Value> = (0..5)
+            .map(|i| Value::from_i64(i as i64))
+            .try_collect()
+            .unwrap();
         let record = Record::new(values);
         record.serialize(&mut buf);
 
@@ -3349,7 +3355,11 @@ mod tests {
     }
 
     fn create_record(values: Vec<Value>) -> ImmutableRecord {
-        let registers: Vec<Register> = values.into_iter().map(Register::Value).collect();
+        let registers: Vec<Register> = values
+            .into_iter()
+            .map(Register::Value)
+            .try_collect()
+            .unwrap();
         ImmutableRecord::from_registers(&registers, registers.len()).unwrap()
     }
 
@@ -3380,7 +3390,8 @@ mod tests {
                     collation,
                     nulls_order: None,
                 })
-                .collect(),
+                .try_collect()
+                .unwrap(),
             has_rowid: false,
             num_cols,
             is_unique: false,
@@ -3395,8 +3406,11 @@ mod tests {
     ) {
         let serialized = create_record(serialized_values.clone());
 
-        let serialized_ref_values: Vec<ValueRef> =
-            serialized_values.iter().map(Value::as_ref).collect();
+        let serialized_ref_values: Vec<ValueRef> = serialized_values
+            .iter()
+            .map(Value::as_ref)
+            .try_collect()
+            .unwrap();
 
         let tie_breaker = std::cmp::Ordering::Equal;
 
@@ -3772,12 +3786,12 @@ mod tests {
             (vec![], vec![], "both_empty"),
             (vec![], vec![ValueRef::from_i64(42)], "empty_serialized"),
             (
-                (0..15).map(Value::from_i64).collect(),
-                (0..15).map(ValueRef::from_i64).collect(),
+                (0..15).map(Value::from_i64).try_collect().unwrap(),
+                (0..15).map(ValueRef::from_i64).try_collect().unwrap(),
                 "large_field_count",
             ),
             (
-                vec![Value::Blob(vec![1, 2, 3])],
+                vec![Value::Blob(std::vec![1, 2, 3])],
                 vec![ValueRef::Blob(&[1, 2, 3])],
                 "blob_first_field",
             ),
@@ -3867,7 +3881,7 @@ mod tests {
             RecordCompare::String
         ));
 
-        let large_values: Vec<ValueRef> = (0..15).map(ValueRef::from_i64).collect();
+        let large_values: Vec<ValueRef> = (0..15).map(ValueRef::from_i64).try_collect().unwrap();
         assert!(matches!(
             find_compare(large_values.iter().peekable(), &index_info_large),
             RecordCompare::Generic
@@ -3883,7 +3897,7 @@ mod tests {
     #[test]
     fn test_serialize_null() {
         let record = Record::new(vec![Value::Null]);
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
         let header_length = record.values.len() + 1;
@@ -3908,7 +3922,7 @@ mod tests {
             Value::from_i64(1_000_000_000_000), // Should use SERIAL_TYPE_I48
             Value::from_i64(i64::MAX),          // Should use SERIAL_TYPE_I64
         ]);
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
         let header_length = record.values.len() + 1;
@@ -3995,7 +4009,7 @@ mod tests {
     #[test]
     fn test_serialize_const_integers() {
         let record = Record::new(vec![Value::from_i64(0), Value::from_i64(1)]);
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
         // [header_size, serial_type_0, serial_type_1] + no payload bytes
@@ -4016,7 +4030,7 @@ mod tests {
     #[test]
     fn test_serialize_single_const_int0() {
         let record = Record::new(vec![Value::from_i64(0)]);
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
         // Expected: [header_size=2, serial_type=8]
@@ -4029,7 +4043,7 @@ mod tests {
     fn test_serialize_float() {
         #[warn(clippy::approx_constant)]
         let record = Record::new(vec![Value::from_f64(3.15555)]);
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
         let header_length = record.values.len() + 1;
@@ -4049,7 +4063,7 @@ mod tests {
     fn test_serialize_text() {
         let text = "hello";
         let record = Record::new(vec![Value::Text(Text::new(text))]);
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
         let header_length = record.values.len() + 1;
@@ -4066,9 +4080,9 @@ mod tests {
 
     #[test]
     fn test_serialize_blob() {
-        let blob = vec![1, 2, 3, 4, 5];
+        let blob = std::vec![1, 2, 3, 4, 5];
         let record = Record::new(vec![Value::Blob(blob.clone())]);
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
         let header_length = record.values.len() + 1;
@@ -4092,7 +4106,7 @@ mod tests {
             Value::from_f64(3.15),
             Value::Text(Text::new(text)),
         ]);
-        let mut buf = Vec::new();
+        let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 
         let header_length = record.values.len() + 1;
@@ -4209,7 +4223,10 @@ mod tests {
     fn test_column_count_matches_values_written() {
         // Test with different numbers of values
         for num_values in 1..=10 {
-            let values: Vec<Value> = (0..num_values).map(|i| Value::from_i64(i as i64)).collect();
+            let values: Vec<Value> = (0..num_values)
+                .map(|i| Value::from_i64(i as i64))
+                .try_collect()
+                .unwrap();
 
             let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
             let cnt = record.column_count();
