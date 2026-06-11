@@ -1,4 +1,3 @@
-use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::index_method::IndexMethodConfiguration;
@@ -1222,8 +1221,7 @@ pub fn resolve_index_method_parameters(
                             let hex_byte = std::str::from_utf8(pair).unwrap();
                             u8::from_str_radix(hex_byte, 16).unwrap()
                         })
-                        .try_collect()
-                        .expect("TODO: fallible allocations"),
+                        .collect(),
                 ),
                 _ => bail_parse_error!("parameters must be constant literals"),
             },

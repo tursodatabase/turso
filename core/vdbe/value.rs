@@ -1,4 +1,3 @@
-use crate::alloc::TursoSliceExt;
 use crate::turso_assert;
 use crate::{
     function::MathFunc,
@@ -550,11 +549,7 @@ impl Value {
         match (value, start_value) {
             (Value::Blob(b), Value::Numeric(Numeric::Integer(start))) => {
                 let (start, end) = calculate_postions(start, b.len(), length_value.as_ref());
-                Value::from_blob(
-                    b[start..end]
-                        .try_to_vec()
-                        .expect("TODO: fallible allocations"),
-                )
+                Value::from_blob(b[start..end].to_vec())
             }
             (value, Value::Numeric(Numeric::Integer(start))) => {
                 if let Some(text) = value.cast_text() {
@@ -867,7 +862,7 @@ impl Value {
             return Err(LimboError::TooBig);
         }
 
-        Ok(Value::Blob(crate::alloc::vec![0; length as usize]))
+        Ok(Value::Blob(vec![0; length as usize]))
     }
 
     // exec_if returns whether you should jump
@@ -1151,12 +1146,7 @@ impl Value {
 
     pub fn exec_concat(&self, rhs: &Value) -> Value {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
-            return Value::Blob(
-                [lhs.as_slice(), rhs.as_slice()]
-                    .concat()
-                    .try_to_vec()
-                    .expect("TODO: fallible allocations"),
-            );
+            return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat());
         }
 
         let Some(lhs) = self.cast_text() else {

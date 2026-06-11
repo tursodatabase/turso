@@ -168,7 +168,7 @@ impl<T: AnyText> Extendable<T> for Text {
     }
 }
 
-impl<T: AnyBlob> Extendable<T> for Vec<u8> {
+impl<T: AnyBlob> Extendable<T> for std::vec::Vec<u8> {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) -> Result<()> {
         let other_slice = other.as_slice();
@@ -214,7 +214,7 @@ pub trait AnyBlob {
     fn as_slice(&self) -> &[u8];
 }
 
-impl AnyBlob for Vec<u8> {
+impl AnyBlob for std::vec::Vec<u8> {
     fn as_slice(&self) -> &[u8] {
         self.as_slice()
     }
@@ -268,7 +268,7 @@ pub enum Value {
     Null,
     Numeric(Numeric),
     Text(Text),
-    Blob(Vec<u8>),
+    Blob(std::vec::Vec<u8>),
 }
 
 #[derive(Clone, Copy)]
@@ -392,7 +392,7 @@ impl Value {
         }
     }
 
-    pub fn from_blob(data: Vec<u8>) -> Self {
+    pub fn from_blob(data: std::vec::Vec<u8>) -> Self {
         Value::Blob(data)
     }
 
@@ -403,14 +403,14 @@ impl Value {
         }
     }
 
-    pub const fn as_blob(&self) -> &Vec<u8> {
+    pub const fn as_blob(&self) -> &std::vec::Vec<u8> {
         match self {
             Value::Blob(b) => b,
             _ => panic!("as_blob must be called only for Value::Blob"),
         }
     }
 
-    pub const fn as_blob_mut(&mut self) -> &mut Vec<u8> {
+    pub const fn as_blob_mut(&mut self) -> &mut std::vec::Vec<u8> {
         match self {
             Value::Blob(b) => b,
             _ => panic!("as_blob must be called only for Value::Blob"),
@@ -459,7 +459,7 @@ impl Value {
             Value::Blob(_) => ValueType::Blob,
         }
     }
-    pub fn serialize_serial(&self, out: &mut Vec<u8>) {
+    pub fn serialize_serial(&self, out: &mut std::vec::Vec<u8>) {
         match self {
             Value::Null => {}
             Value::Numeric(Numeric::Integer(i)) => {
@@ -632,7 +632,7 @@ impl FromValue for f64 {
 }
 impl Sealed for f64 {}
 
-impl FromValue for Vec<u8> {
+impl FromValue for std::vec::Vec<u8> {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
             Value::Null => Err(LimboError::NullValue),
@@ -641,7 +641,7 @@ impl FromValue for Vec<u8> {
         }
     }
 }
-impl Sealed for Vec<u8> {}
+impl Sealed for std::vec::Vec<u8> {}
 
 impl<const N: usize> FromValue for [u8; N] {
     fn from_sql(val: Value) -> Result<Self> {
@@ -970,7 +970,7 @@ mod immutable_record {
         // happen in a controlled manner. If we realocate with values that should be correct, they will now point to undefined data.
         // We don't use pin here because it would make it imposible to reuse the buffer if we need to push a new record in the same struct.
         //
-        // payload is the Vec<u8> but in order to use Register which holds ImmutableRecord as a Value - we store Vec<u8> as Value::Blob
+        // payload is the std::vec::Vec<u8> but in order to use Register which holds ImmutableRecord as a Value - we store std::vec::Vec<u8> as Value::Blob
         payload: Value,
     }
 
@@ -1050,14 +1050,14 @@ mod immutable_record {
     }
 
     struct AppendWriter<'a> {
-        buf: &'a mut Vec<u8>,
+        buf: &'a mut std::vec::Vec<u8>,
         pos: usize,
         buf_capacity_start: usize,
         buf_ptr_start: *const u8,
     }
 
     impl<'a> AppendWriter<'a> {
-        fn new(buf: &'a mut Vec<u8>, pos: usize) -> Self {
+        fn new(buf: &'a mut std::vec::Vec<u8>, pos: usize) -> Self {
             let buf_ptr_start = buf.as_ptr();
             let buf_capacity_start = buf.capacity();
             Self {
@@ -1384,12 +1384,14 @@ mod immutable_record {
 
     impl ImmutableRecord {
         pub fn new(payload_capacity: usize) -> Result<Self> {
+            let mut payload = std::vec::Vec::new();
+            payload.try_reserve_exact(payload_capacity)?;
             Ok(Self {
-                payload: Value::Blob(Vec::try_with_capacity_ext(payload_capacity)?),
+                payload: Value::Blob(payload),
             })
         }
 
-        pub const fn from_bin_record(payload: Vec<u8>) -> Self {
+        pub const fn from_bin_record(payload: std::vec::Vec<u8>) -> Self {
             Self {
                 payload: Value::Blob(payload),
             }
@@ -1434,7 +1436,8 @@ mod immutable_record {
             let header_size = Record::calc_header_size(size_header);
 
             // 1. write header size
-            let mut buf = Vec::try_with_capacity_ext(header_size + size_values)?;
+            let mut buf = std::vec::Vec::new();
+            buf.try_reserve_exact(header_size + size_values)?;
             assert_eq!(buf.capacity(), header_size + size_values);
             let n = write_varint(&mut serial_type_buf, header_size as u64);
 
@@ -1493,7 +1496,7 @@ mod immutable_record {
         }
 
         #[inline]
-        pub fn into_payload(self) -> Vec<u8> {
+        pub fn into_payload(self) -> std::vec::Vec<u8> {
             match self.payload {
                 Value::Blob(b) => b,
                 _ => panic!("payload must be a blob"),
@@ -1501,7 +1504,7 @@ mod immutable_record {
         }
 
         #[inline]
-        pub const fn as_blob(&self) -> &Vec<u8> {
+        pub const fn as_blob(&self) -> &std::vec::Vec<u8> {
             match &self.payload {
                 Value::Blob(b) => b,
                 _ => panic!("payload must be a blob"),
@@ -1509,7 +1512,7 @@ mod immutable_record {
         }
 
         #[inline]
-        pub const fn as_blob_mut(&mut self) -> &mut Vec<u8> {
+        pub const fn as_blob_mut(&mut self) -> &mut std::vec::Vec<u8> {
             match &mut self.payload {
                 Value::Blob(b) => b,
                 _ => panic!("payload must be a blob"),
@@ -1899,7 +1902,7 @@ impl<'a> ValueRef<'a> {
                 value: text.value.to_string().into(),
                 subtype: text.subtype,
             }),
-            ValueRef::Blob(b) => Value::Blob(b.try_to_vec().expect("TODO: fallible allocations")),
+            ValueRef::Blob(b) => Value::Blob(b.to_vec()),
         }
     }
 
@@ -2784,7 +2787,7 @@ impl Record {
         header_size
     }
 
-    pub fn serialize(&self, buf: &mut Vec<u8>) {
+    pub fn serialize(&self, buf: &mut std::vec::Vec<u8>) {
         let initial_i = buf.len();
 
         // write serial types
@@ -2827,7 +2830,7 @@ impl Record {
             };
         }
 
-        let mut header_bytes_buf: Vec<u8> = Vec::new();
+        let mut header_bytes_buf = std::vec::Vec::new();
         header_size = Record::calc_header_size(header_size);
         header_bytes_buf.extend(std::iter::repeat_n(0, 9));
         let n = write_varint(header_bytes_buf.as_mut_slice(), header_size as u64);
@@ -3175,8 +3178,8 @@ pub enum SeekKey<'a> {
 #[derive(Debug)]
 pub enum DatabaseChangeType {
     Delete,
-    Update { bin_record: Vec<u8> },
-    Insert { bin_record: Vec<u8> },
+    Update { bin_record: std::vec::Vec<u8> },
+    Insert { bin_record: std::vec::Vec<u8> },
 }
 
 #[derive(Debug)]

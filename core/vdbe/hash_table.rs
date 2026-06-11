@@ -527,10 +527,7 @@ impl HashEntry {
                 // SAFETY: We serialized this data ourselves, so it should be valid UTF-8.
                 // Skipping validation here for performance in the spill/reload path.
                 // Doing checked utf8 construction here is a massive performance hit.
-                let bytes: Vec<_> = buf[offset..offset + str_len as usize]
-                    .iter()
-                    .copied()
-                    .try_collect()?;
+                let bytes = buf[offset..offset + str_len as usize].to_vec();
                 let s = unsafe { String::from_utf8_unchecked(bytes) };
                 offset += str_len as usize;
                 Value::Text(s.into())
@@ -543,10 +540,7 @@ impl HashEntry {
                         "HashEntry: buffer too small for blob".to_string(),
                     ));
                 }
-                let b: Vec<_> = buf[offset..offset + blob_len as usize]
-                    .iter()
-                    .copied()
-                    .try_collect()?;
+                let b = buf[offset..offset + blob_len as usize].to_vec();
                 offset += blob_len as usize;
                 Value::Blob(b)
             }

@@ -1,4 +1,3 @@
-use crate::alloc::TursoSliceExt;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
@@ -2267,12 +2266,7 @@ pub fn op_array_element(
                         if t.value.as_bytes().iter().any(|&b| b > 0x7F)
                             && std::str::from_utf8(t.value.as_bytes()).is_err()
                         {
-                            return Value::Blob(
-                                t.value
-                                    .as_bytes()
-                                    .try_to_vec()
-                                    .expect("TODO: fallible allocations"),
-                            );
+                            return Value::Blob(t.value.as_bytes().to_vec());
                         }
                     }
                     vref.to_owned()
@@ -5854,11 +5848,11 @@ fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-            payload.push(Value::Blob(crate::alloc::vec![]));
+            payload.push(Value::Blob(vec![]));
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
-            payload.push(Value::Blob(crate::alloc::vec![]));
+            payload.push(Value::Blob(vec![]));
         }
     };
     Ok(())
@@ -11735,14 +11729,12 @@ const SEQ_COMMIT_STATUS_CONFLICT_RETRY: i64 = 1;
 /// "no prior mv_tx for this db" (must be restored to `None`).
 fn encode_saved_outer_mv_tx(
     outer: Option<(TxID, crate::translate::emitter::TransactionMode)>,
-) -> crate::alloc::Vec<u8> {
+) -> Vec<u8> {
     use crate::translate::emitter::TransactionMode;
     let Some((tx_id, mode)) = outer else {
-        return crate::alloc::vec![];
+        return Vec::new();
     };
-    let mut buf =
-        <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(9)
-            .expect("TODO: fallible allocations");
+    let mut buf = Vec::with_capacity(9);
     buf.extend_from_slice(&tx_id.to_le_bytes());
     let mode_tag: u8 = match mode {
         TransactionMode::None => 0,
@@ -11816,7 +11808,7 @@ pub fn op_sequence_begin_inner_tx(
         // WAL mode: no inner tx needed. The WAL single-writer lock
         // already serializes writes across processes.
         state.registers[*path_kind_reg].set_value(Value::from_i64(SEQ_PATH_SKIPPED));
-        state.registers[*saved_outer_reg].set_value(Value::Blob(crate::alloc::vec![]));
+        state.registers[*saved_outer_reg].set_value(Value::Blob(Vec::new()));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     };
@@ -11825,7 +11817,7 @@ pub fn op_sequence_begin_inner_tx(
     if let Some((outer_id, _)) = outer_tx {
         if mv_store.is_exclusive_tx(&outer_id) {
             state.registers[*path_kind_reg].set_value(Value::from_i64(SEQ_PATH_SKIPPED));
-            state.registers[*saved_outer_reg].set_value(Value::Blob(crate::alloc::vec![]));
+            state.registers[*saved_outer_reg].set_value(Value::Blob(Vec::new()));
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }

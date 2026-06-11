@@ -1,4 +1,4 @@
-use crate::alloc::{TursoIteratorExt, TursoSliceExt};
+use crate::alloc::TursoSliceExt;
 use crate::sync::Arc;
 use crate::{schema::BTreeTable, turso_assert_eq, turso_assert_ne};
 use turso_parser::{
@@ -421,8 +421,7 @@ pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
                     let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
                     u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
                 })
-                .try_collect()
-                .expect("TODO: fallible allocations"),
+                .collect(),
         )),
         ast::Literal::Null => Ok(Value::Null),
         ast::Literal::True => Ok(Value::from_i64(1)),
