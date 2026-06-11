@@ -1,7 +1,7 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
-    TxTimestampOrID, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
+    DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion,
+    SortableIndexKey, TxTimestampOrID, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
     MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 #[cfg(any(test, injected_yields))]
@@ -386,7 +386,7 @@ fn sqlite_schema_versions_refer_to_btree(lhs: &RowVersion, rhs: &RowVersion) -> 
 /// `ALTER TABLE ... RENAME COLUMN`, must collapse to the latest version; otherwise checkpoint
 /// treats one schema row chain as a DROP+CREATE pair and emits duplicate work for the same rowid.
 fn is_schema_metadata_only_rewrite(current: &RowVersion, next: Option<&RowVersion>) -> bool {
-    if current.end.is_none() {
+    if current.end().is_none() {
         return false;
     }
 
@@ -740,11 +740,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
             // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
             let mut begin_ts = None;
-            if let Some(TxTimestampOrID::Timestamp(b)) = version.begin {
+            if let Some(TxTimestampOrID::Timestamp(b)) = version.begin() {
                 begin_ts = Some(b);
             }
             let mut end_ts = None;
-            if let Some(TxTimestampOrID::Timestamp(e)) = version.end {
+            if let Some(TxTimestampOrID::Timestamp(e)) = version.end() {
                 end_ts = Some(e);
             }
             if begin_ts.is_none() && end_ts.is_none() {
@@ -809,7 +809,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
 
                 if let Some(previous_version) = versions_to_checkpoint.last() {
-                    let should_drop_previous = previous_version.end.is_some()
+                    let should_drop_previous = previous_version.end().is_some()
                         && !is_schema_metadata_only_rewrite(previous_version, Some(version));
                     if should_drop_previous {
                         versions_to_checkpoint.pop();
@@ -857,7 +857,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             let row_versions = entry.value().read();
 
             for version in self.maybe_get_checkpointable_versions(&row_versions, key.table_id) {
-                let is_delete = version.end.is_some();
+                let is_delete = version.end().is_some();
 
                 let mut special_write = None;
                 // Set to true for schema deletes of never-checkpointed tables/indexes.
@@ -977,7 +977,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     // Schema row without a B-tree identity (e.g. sequence, trigger, view).
                     // If it was never checkpointed to the B-tree, skip the delete — there
                     // is nothing to remove from the pager.
-                    let begin_ts = match &version.begin {
+                    let begin_ts = match &version.begin() {
                         Some(TxTimestampOrID::Timestamp(ts)) => Some(*ts),
                         _ => None,
                     };
@@ -1050,7 +1050,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.collect_index_key_cursor = Some(entry.key().clone());
 
                 for version in self.maybe_get_checkpointable_versions(&versions, index_id) {
-                    let is_delete = version.end.is_some();
+                    let is_delete = version.end().is_some();
 
                     // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
                     // the database file.
@@ -1070,7 +1070,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     #[cfg(any(test, debug_assertions))]
     fn max_collected_version_timestamp(&self) -> u64 {
         fn max_version_timestamp(version: &RowVersion) -> u64 {
-            [version.begin.as_ref(), version.end.as_ref()]
+            [version.begin().as_ref(), version.end().as_ref()]
                 .into_iter()
                 .filter_map(|ts| match ts {
                     Some(TxTimestampOrID::Timestamp(ts)) => Some(*ts),
@@ -1429,8 +1429,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         self.write_set.push((
             RowVersion {
                 id: 0,
-                begin: Some(TxTimestampOrID::Timestamp(new)),
-                end: None,
+                begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(new))),
+                end: crate::mvcc::database::PackedTs::pack(None),
                 row,
                 btree_resident: true,
             },
@@ -1804,7 +1804,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         })?;
 
                 // Check if this is an insert or delete
-                if row_version.end.is_some() {
+                if row_version.end().is_some() {
                     // This is a delete operation.
                     // Don't write the deletion record to the b-tree if the b-tree was just created; we can no-op in this case,
                     // since there is no existing row to delete.
@@ -2330,8 +2330,8 @@ mod tests {
         .unwrap();
         RowVersion {
             id: 1,
-            begin: begin.map(TxTimestampOrID::Timestamp),
-            end: end.map(TxTimestampOrID::Timestamp),
+            begin: crate::mvcc::database::PackedTs::pack(begin.map(TxTimestampOrID::Timestamp)),
+            end: crate::mvcc::database::PackedTs::pack(end.map(TxTimestampOrID::Timestamp)),
             row: Row::new_table_row(
                 RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(rowid)),
                 record.as_blob().to_vec(),
@@ -2403,8 +2403,8 @@ mod tests {
     fn sqlite_schema_identity_ignores_payloadless_tombstones() {
         let tombstone = RowVersion {
             id: 1,
-            begin: None,
-            end: Some(TxTimestampOrID::Timestamp(2)),
+            begin: crate::mvcc::database::PackedTs::pack(None),
+            end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(2))),
             row: Row::new_table_row(
                 RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(9)),
                 Vec::new(),
@@ -2459,8 +2459,8 @@ mod tests {
         );
         let row_version = RowVersion {
             id: version_id,
-            begin: begin.map(TxTimestampOrID::Timestamp),
-            end: end.map(TxTimestampOrID::Timestamp),
+            begin: crate::mvcc::database::PackedTs::pack(begin.map(TxTimestampOrID::Timestamp)),
+            end: crate::mvcc::database::PackedTs::pack(end.map(TxTimestampOrID::Timestamp)),
             row,
             btree_resident,
         };
@@ -2515,8 +2515,8 @@ mod tests {
         let record = ImmutableRecord::from_values(&[Value::from_i64(rowid)], 1).unwrap();
         RowVersion {
             id: 1,
-            begin: Some(TxTimestampOrID::Timestamp(5)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(5))),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row: Row::new_table_row(
                 RowID::new(table_id, RowKey::Int(rowid)),
                 record.as_blob().to_vec(),
