@@ -1,4 +1,5 @@
 mod opts;
+mod workload;
 
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -24,14 +25,16 @@ struct SqlRun {
     log_sql: String,
 }
 
-// Failed execution plus the SQL text that actually ran or failed.
+// Failed execution plus the SQL text that actually ran or failed. For
+// transactions this may be only a prefix of the planned statement list.
 #[derive(Debug)]
 struct SqlRunError {
     error: SqlRunFailure,
     log_sql: String,
 }
 
-// Database failure paired with the SQL text that should be written to the replay log.
+// Database failure paired with the SQL text that should be written to the
+// replay log.
 #[derive(Debug)]
 enum SqlRunFailure {
     Database(turso::Error),
@@ -757,17 +760,28 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         seed
     };
 
+    if opts.workload.is_some() && (opts.db_ref.is_some() || opts.tables.is_some()) {
+        return Err("--workload cannot be combined with --db-ref or --tables".into());
+    }
+
+    let workload_enabled = opts.workload.is_some();
     let mvcc_enabled = opts.tx_mode == TxMode::Concurrent;
 
-    // Generate schema upfront on main thread with seed
+    // Generate schema upfront on main thread with seed.
     let mut main_rng = ThreadRng::new(global_seed);
-    let schema = if let Some(ref db_ref) = opts.db_ref {
+    let schema = if workload_enabled {
+        ArbitrarySchema { tables: Vec::new() }
+    } else if let Some(ref db_ref) = opts.db_ref {
         load_schema(db_ref)?
     } else {
         gen_schema(&mut main_rng, opts.tables)
     };
 
-    let ddl_statements = schema.to_sql();
+    let ddl_statements = if workload_enabled {
+        Vec::new()
+    } else {
+        schema.to_sql()
+    };
     let schema = Arc::new(schema);
 
     let mut handles = Vec::with_capacity(opts.nr_threads);
@@ -808,10 +822,32 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     let vfs_option = opts.vfs.clone();
 
     let mut builder = Builder::new_local(&db_file);
+    if workload_enabled {
+        builder = builder.experimental_generated_columns(true);
+    }
     if let Some(ref vfs) = vfs_option {
         builder = builder.with_io(vfs.clone());
     }
     let db = Arc::new(Mutex::new(builder.build().await?));
+
+    if workload_enabled {
+        let args = workload::RunArgs {
+            db,
+            sql_log: sql_log.clone(),
+            global_seed,
+            multi_progress,
+            progress_style,
+        };
+        let mvcc_enabled = workload::run(&opts, args).await?;
+        return finalize_database(
+            &db_file,
+            vfs_option.as_ref(),
+            workload_enabled,
+            mvcc_enabled,
+            &sql_log,
+        )
+        .await;
+    }
 
     for thread in 0..opts.nr_threads {
         if stop {
@@ -1090,7 +1126,14 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     for handle in handles {
         handle.await??;
     }
-    finalize_database(&db_file, vfs_option.as_ref(), false, mvcc_enabled, &sql_log).await
+    finalize_database(
+        &db_file,
+        vfs_option.as_ref(),
+        workload_enabled,
+        mvcc_enabled,
+        &sql_log,
+    )
+    .await
 }
 
 async fn finalize_database(
