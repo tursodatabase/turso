@@ -1111,7 +1111,7 @@ impl BTreeCursor {
                     payload_size
                         .checked_sub(payload.len() as u64)
                         .ok_or_else(|| {
-                            LimboError::Corrupt(
+                            LimboError::InternalError(
                                 "payload size is smaller than local payload bytes".to_string(),
                             )
                         })? as usize;
@@ -1194,7 +1194,7 @@ impl BTreeCursor {
                     remaining,
                     "inconsistent overflow chain observed during payload read"
                 );
-                return Err(LimboError::Corrupt(
+                return Err(LimboError::InternalError(
                     "inconsistent overflow chain observed during payload read".to_string(),
                 ));
             }
@@ -2832,7 +2832,7 @@ impl BTreeCursor {
                             let parent_rightmost =
                                 parent_contents.rightmost_pointer()?.ok_or_else(|| {
                                     mark_unlikely();
-                                    LimboError::Corrupt(format!(
+                                    LimboError::InternalError(format!(
                                         "parent page {} is a leaf page, expected interior page",
                                         parent.get().id
                                     ))
@@ -4852,7 +4852,9 @@ impl BTreeCursor {
                                         .get(),
                         ) {
                             self.overflow_state = OverflowState::Start;
-                            return Err(LimboError::Corrupt("Invalid overflow page number".into()));
+                            return Err(LimboError::InternalError(
+                                "Invalid overflow page number".into(),
+                            ));
                         }
                         // No mutations precede this read in the Start branch,
                         // so a spill yield safely re-enters here.
@@ -4892,7 +4894,9 @@ impl BTreeCursor {
                                         .get(),
                         ) {
                             self.overflow_state = OverflowState::Start;
-                            return Err(LimboError::Corrupt("Invalid overflow page number".into()));
+                            return Err(LimboError::InternalError(
+                                "Invalid overflow page number".into(),
+                            ));
                         }
                         self.overflow_state = OverflowState::ReadNext { next };
                     } else {
@@ -7869,7 +7873,7 @@ fn page_insert_array(
     // Total space needed includes cell pointers
     let total_ptr_space = count.checked_mul(CELL_PTR_SIZE_BYTES).ok_or_else(|| {
         mark_unlikely();
-        LimboError::Corrupt("page_insert_array: ptr space overflow".into())
+        LimboError::InternalError("page_insert_array: ptr space overflow".into())
     })?;
 
     // After defragmentation, all free space is in the unallocated region
@@ -7894,13 +7898,13 @@ fn page_insert_array(
             .checked_add(total_ptr_space)
             .ok_or_else(|| {
                 mark_unlikely();
-                LimboError::Corrupt("page_insert_array: unalloc start overflow".into())
+                LimboError::InternalError("page_insert_array: unalloc start overflow".into())
             })?;
     let new_cell_content_area = cell_content_area
         .checked_sub(total_payload_size)
         .ok_or_else(|| {
             mark_unlikely();
-            LimboError::Corrupt("page_insert_array: payload underflow".to_string())
+            LimboError::InternalError("page_insert_array: payload underflow".to_string())
         })?;
 
     turso_assert!(
@@ -7936,7 +7940,7 @@ fn page_insert_array(
         // Allocate space for this cell (grow content area downward)
         cell_content_area = cell_content_area.checked_sub(cell_size).ok_or_else(|| {
             mark_unlikely();
-            LimboError::Corrupt("page_insert_array: cell allocation underflow".to_string())
+            LimboError::InternalError("page_insert_array: cell allocation underflow".to_string())
         })?;
 
         // Copy cell payload
@@ -10467,7 +10471,7 @@ mod tests {
             &cursor_pager,
         )
         .expect_err("inconsistent overflow chain should fail with Corrupt");
-        assert!(matches!(err, LimboError::Corrupt(_)));
+        assert!(matches!(err, LimboError::InternalError(_)));
         assert!(cursor.read_overflow_state.is_none());
         Ok(())
     }

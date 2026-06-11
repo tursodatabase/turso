@@ -425,20 +425,20 @@ impl SharedWalCoordinationHeader {
     /// Decode and validate the durable header payload read from the `.tshm` file.
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != Self::BYTE_LEN {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "shared WAL coordination header must be {} bytes, got {}",
                 Self::BYTE_LEN,
                 bytes.len()
             )));
         }
         if bytes[0..8] != SHARED_WAL_COORDINATION_MAGIC {
-            return Err(LimboError::Corrupt(
+            return Err(LimboError::InternalError(
                 "shared WAL coordination header magic mismatch".into(),
             ));
         }
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         if version != SHARED_WAL_COORDINATION_VERSION {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "unsupported shared WAL coordination header version: {version}"
             )));
         }
@@ -933,7 +933,7 @@ impl MappedSharedWalCoordination {
             || (open_mode == SharedWalCoordinationOpenMode::Exclusive && metadata_len < base_len);
         if open_mode == SharedWalCoordinationOpenMode::MultiProcess && metadata_len < base_len {
             file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "shared WAL coordination file is smaller than the coordination header: got {metadata_len}, minimum {base_len}"
             )));
         }
@@ -1013,7 +1013,7 @@ impl MappedSharedWalCoordination {
         let metadata_len = file.size()? as usize;
         if metadata_len < base_len {
             file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "shared WAL coordination file is smaller than the coordination header: got {metadata_len}, minimum {base_len}"
             )));
         }
@@ -2855,54 +2855,54 @@ impl MappedSharedWalCoordination {
     ) -> Result<()> {
         let header = self.header();
         if header.magic != SHARED_WAL_COORDINATION_MAGIC {
-            return Err(LimboError::Corrupt(
+            return Err(LimboError::InternalError(
                 "shared WAL coordination map magic mismatch".into(),
             ));
         }
         if header.version != SHARED_WAL_COORDINATION_VERSION {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "unsupported shared WAL coordination map version: {}",
                 header.version
             )));
         }
         if header.reader_slot_count != expected_reader_slot_count {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "shared WAL coordination map slot count mismatch: got {}, expected {}",
                 header.reader_slot_count, expected_reader_slot_count
             )));
         }
         if header.frame_index_block_capacity != FRAME_INDEX_BLOCK_CAPACITY {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "shared WAL coordination map frame index block capacity mismatch: got {}, expected {}",
                 header.frame_index_block_capacity, FRAME_INDEX_BLOCK_CAPACITY
             )));
         }
         if header.frame_index_block_hash_slots != FRAME_INDEX_BLOCK_HASH_SLOTS {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "shared WAL coordination map frame index hash slot count mismatch: got {}, expected {}",
                 header.frame_index_block_hash_slots, FRAME_INDEX_BLOCK_HASH_SLOTS
             )));
         }
         if header.frame_index_max_blocks != MAX_FRAME_INDEX_BLOCKS {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "shared WAL coordination map frame index max blocks mismatch: got {}, expected {}",
                 header.frame_index_max_blocks, MAX_FRAME_INDEX_BLOCKS
             )));
         }
         let blocks = header.frame_index_blocks.load(Ordering::Acquire);
         if !(INITIAL_FRAME_INDEX_BLOCKS..=MAX_FRAME_INDEX_BLOCKS).contains(&blocks) {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "shared WAL coordination map frame index block count out of range: {blocks}"
             )));
         }
         if header.frame_index_capacity != MAX_FRAME_INDEX_CAPACITY {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "shared WAL coordination map frame index capacity mismatch: got {}, expected {}",
                 header.frame_index_capacity, MAX_FRAME_INDEX_CAPACITY
             )));
         }
         if header.frame_index_len.load(Ordering::Acquire) > header.frame_index_capacity {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "shared WAL coordination map frame index length exceeds capacity: len={}, capacity={}",
                 header.frame_index_len.load(Ordering::Acquire),
                 header.frame_index_capacity
@@ -2912,7 +2912,7 @@ impl MappedSharedWalCoordination {
             .checked_mul(header.frame_index_block_capacity)
             .expect("shared WAL frame index capacity overflow");
         if header.frame_index_len.load(Ordering::Acquire) > current_capacity {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "shared WAL coordination map frame index length exceeds active block capacity: len={}, capacity={}",
                 header.frame_index_len.load(Ordering::Acquire),
                 current_capacity
@@ -2920,7 +2920,7 @@ impl MappedSharedWalCoordination {
         }
         let expected_file_len = Self::file_len_for_blocks(expected_reader_slot_count, blocks);
         if metadata_len != expected_file_len {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "shared WAL coordination file has unexpected size: got {metadata_len}, expected {expected_file_len}"
             )));
         }
@@ -3043,7 +3043,7 @@ mod tests {
         encoded[0..8].copy_from_slice(b"badmagic");
 
         let err = SharedWalCoordinationHeader::decode(&encoded).unwrap_err();
-        assert!(matches!(err, LimboError::Corrupt(_)));
+        assert!(matches!(err, LimboError::InternalError(_)));
     }
 
     #[test]

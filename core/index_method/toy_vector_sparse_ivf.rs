@@ -161,27 +161,27 @@ struct ComponentStat {
 
 fn parse_stat_row(record: Option<&ImmutableRecord>) -> Result<ComponentStat> {
     let Some(record) = record else {
-        return Err(LimboError::Corrupt(
+        return Err(LimboError::InternalError(
             "stats index corrupted: expected row".to_string(),
         ));
     };
     let ValueRef::Numeric(Numeric::Integer(position)) = record.get_value(0)? else {
-        return Err(LimboError::Corrupt(
+        return Err(LimboError::InternalError(
             "stats index corrupted: expected integer".to_string(),
         ));
     };
     let ValueRef::Numeric(Numeric::Integer(cnt)) = record.get_value(1)? else {
-        return Err(LimboError::Corrupt(
+        return Err(LimboError::InternalError(
             "stats index corrupted: expected integer".to_string(),
         ));
     };
     let ValueRef::Numeric(Numeric::Float(min)) = record.get_value(2)? else {
-        return Err(LimboError::Corrupt(
+        return Err(LimboError::InternalError(
             "stats index corrupted: expected float".to_string(),
         ));
     };
     let ValueRef::Numeric(Numeric::Float(max)) = record.get_value(3)? else {
-        return Err(LimboError::Corrupt(
+        return Err(LimboError::InternalError(
             "stats index corrupted: expected float".to_string(),
         ));
     };
@@ -201,22 +201,22 @@ struct ComponentRow {
 
 fn parse_inverted_index_row(record: Option<&ImmutableRecord>) -> Result<ComponentRow> {
     let Some(record) = record else {
-        return Err(LimboError::Corrupt(
+        return Err(LimboError::InternalError(
             "inverted index corrupted: expected row".to_string(),
         ));
     };
     let ValueRef::Numeric(Numeric::Integer(position)) = record.get_value(0)? else {
-        return Err(LimboError::Corrupt(
+        return Err(LimboError::InternalError(
             "inverted index corrupted: expected integer".to_string(),
         ));
     };
     let ValueRef::Numeric(Numeric::Float(sum)) = record.get_value(1)? else {
-        return Err(LimboError::Corrupt(
+        return Err(LimboError::InternalError(
             "inverted index corrupted: expected float".to_string(),
         ));
     };
     let ValueRef::Numeric(Numeric::Integer(rowid)) = record.get_value(2)? else {
-        return Err(LimboError::Corrupt(
+        return Err(LimboError::InternalError(
             "inverted index corrupted: expected integer".to_string(),
         ));
     };
@@ -900,7 +900,9 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 };
                         }
                         SeekResult::NotFound => {
-                            return Err(LimboError::Corrupt("inverted index corrupted".to_string()))
+                            return Err(LimboError::InternalError(
+                                "inverted index corrupted".to_string(),
+                            ))
                         }
                     }
                 }
@@ -912,7 +914,9 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                 } => {
                     return_if_io!(cursor.next());
                     if !cursor.has_record() {
-                        return Err(LimboError::Corrupt("inverted index corrupted".to_string()));
+                        return Err(LimboError::InternalError(
+                            "inverted index corrupted".to_string(),
+                        ));
                     }
                     self.delete_state = VectorSparseInvertedIndexDeleteState::DeleteInverted {
                         vector: vector.take(),
@@ -968,7 +972,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             };
                         }
                         SeekResult::NotFound | SeekResult::TryAdvance => {
-                            return Err(LimboError::Corrupt(
+                            return Err(LimboError::InternalError(
                                 "stats index corrupted: can't find component row".to_string(),
                             ))
                         }
@@ -1500,7 +1504,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     let k = SeekKey::TableRowId(rowid);
                     let result = return_if_io!(main.seek(k, SeekOp::GE { eq_only: true }));
                     if !matches!(result, SeekResult::Found) {
-                        return Err(LimboError::Corrupt(
+                        return Err(LimboError::InternalError(
                             "vector_sparse_ivf corrupted: unable to find rowid in main table"
                                 .to_string(),
                         ));

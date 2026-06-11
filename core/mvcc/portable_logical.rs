@@ -74,7 +74,7 @@ pub(crate) struct PortableSchemaRow {
 pub(crate) fn portable_schema_row_from_record(record_bytes: &[u8]) -> Result<PortableSchemaRow> {
     let values = ImmutableRecord::from_bin_record(record_bytes.to_vec()).get_values_owned()?;
     if values.len() < 5 {
-        return Err(LimboError::Corrupt(format!(
+        return Err(LimboError::InternalError(format!(
             "sqlite_schema record must have at least 5 columns, got {}",
             values.len()
         )));
@@ -82,7 +82,7 @@ pub(crate) fn portable_schema_row_from_record(record_bytes: &[u8]) -> Result<Por
     let text = |value: &Value, field: &str| -> Result<String> {
         match value {
             Value::Text(text) => Ok(text.as_str().to_string()),
-            other => Err(LimboError::Corrupt(format!(
+            other => Err(LimboError::InternalError(format!(
                 "{field} must be text in sqlite_schema record, got {other:?}"
             ))),
         }
@@ -90,7 +90,7 @@ pub(crate) fn portable_schema_row_from_record(record_bytes: &[u8]) -> Result<Por
     let integer = |value: &Value, field: &str| -> Result<i64> {
         match value {
             Value::Numeric(Numeric::Integer(value)) => Ok(*value),
-            other => Err(LimboError::Corrupt(format!(
+            other => Err(LimboError::InternalError(format!(
                 "{field} must be integer in sqlite_schema record, got {other:?}"
             ))),
         }

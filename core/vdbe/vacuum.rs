@@ -48,7 +48,7 @@ impl SchemaEntryType {
             "index" => Ok(Self::Index),
             "trigger" => Ok(Self::Trigger),
             "view" => Ok(Self::View),
-            other => Err(crate::error::LimboError::Corrupt(format!(
+            other => Err(crate::error::LimboError::InternalError(format!(
                 "unexpected sqlite_schema type: {other}"
             ))),
         }
@@ -1029,7 +1029,7 @@ pub(crate) fn build_copy_sql(
     let Some(btree) = source_btree_table else {
         // Storage-backed tables must have schema metadata. If we get here,
         // the schema is inconsistent - somewhere it has gone terribly wrong
-        return Err(LimboError::Corrupt(format!(
+        return Err(LimboError::InternalError(format!(
             "no schema metadata for storage-backed table \"{escaped_table_name}\""
         )));
     };
@@ -1045,7 +1045,7 @@ pub(crate) fn build_copy_sql(
             rowid_alias_col_idx = Some(i);
         }
         let Some(name) = col.name.as_deref() else {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "missing column name for table \"{escaped_table_name}\""
             )));
         };
@@ -1054,7 +1054,7 @@ pub(crate) fn build_copy_sql(
     }
 
     if data_columns.is_empty() {
-        return Err(LimboError::Corrupt(
+        return Err(LimboError::InternalError(
             "found a table without any columns".to_string(),
         ));
     }

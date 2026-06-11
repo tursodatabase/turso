@@ -4,8 +4,6 @@ use crate::storage::page_cache::CacheError;
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
 pub enum LimboError {
-    #[error("Corrupt database: {0}")]
-    Corrupt(String),
     #[error("File is not a database")]
     NotADB,
     #[error("Internal error: {0}")]
@@ -220,18 +218,18 @@ macro_rules! bail_parse_error {
 #[macro_export]
 macro_rules! bail_corrupt_error {
     ($($arg:tt)*) => {
-        return $crate::error::cold_return(Err($crate::error::LimboError::Corrupt(format!($($arg)*))))
+        return $crate::error::cold_return(Err($crate::error::LimboError::InternalError(format!($($arg)*))))
     };
 }
 
-/// Bounds-checked buffer slicing that returns `LimboError::Corrupt` on out-of-bounds.
+/// Bounds-checked buffer slicing that returns `LimboError::InternalError` on out-of-bounds.
 ///
 /// Accepts any range expression: `buf, pos..`, `buf, start..end`, etc.
 #[macro_export]
 macro_rules! slice_in_bounds_or_corrupt {
     ($buf:expr, $range:expr) => {
         $buf.get($range).ok_or_else(|| {
-            $crate::error::cold_return($crate::error::LimboError::Corrupt(format!(
+            $crate::error::cold_return($crate::error::LimboError::InternalError(format!(
                 "range {:?} out of bounds for buffer size {}",
                 $range,
                 $buf.len()
@@ -240,7 +238,7 @@ macro_rules! slice_in_bounds_or_corrupt {
     };
 }
 
-/// Asserts a condition or bails with `LimboError::Corrupt`.
+/// Asserts a condition or bails with `LimboError::InternalError`.
 ///
 /// Usage:
 ///   `assert_or_bail_corrupt!(condition, "message {}", arg)`

@@ -75,7 +75,7 @@ pub fn classify_op_error(err: &LimboError, in_tx: bool) -> ErrorAction {
                 ErrorAction::ClearTxn
             }
         }
-        LimboError::Corrupt(_) | LimboError::CheckpointFailed(_) => ErrorAction::Respawn,
+        LimboError::InternalError(_) | LimboError::CheckpointFailed(_) => ErrorAction::Respawn,
         _ => ErrorAction::Fatal,
     }
 }
@@ -112,7 +112,7 @@ mod tests {
 
     #[test]
     fn corrupt_respawns() {
-        let err = LimboError::Corrupt("bad page".into());
+        let err = LimboError::InternalError("bad page".into());
         assert_eq!(classify_op_error(&err, true), ErrorAction::Respawn);
     }
 

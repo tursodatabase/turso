@@ -5090,14 +5090,16 @@ fn wal_header_matches_authority_snapshot(
 
 pub(crate) fn database_identity_from_header_bytes(header_bytes: &[u8]) -> Result<(u32, u32)> {
     if header_bytes.len() < DatabaseHeader::SIZE {
-        return Err(LimboError::Corrupt(format!(
+        return Err(LimboError::InternalError(format!(
             "database header must be at least {} bytes, got {}",
             DatabaseHeader::SIZE,
             header_bytes.len()
         )));
     }
     if header_bytes[0..16] != *b"SQLite format 3\0" {
-        return Err(LimboError::Corrupt("database header magic mismatch".into()));
+        return Err(LimboError::InternalError(
+            "database header magic mismatch".into(),
+        ));
     }
     let db_size_pages = u32::from_be_bytes(header_bytes[28..32].try_into().unwrap());
     let header_crc32c = crc32c::crc32c(&header_bytes[..DatabaseHeader::SIZE]);

@@ -2410,7 +2410,7 @@ impl Pager {
                     // Ptrmap pages are not page 1, so their internal offset within their buffer should be 0.
                     // The actual page data starts at page_content.offset() within the full_buffer_slice.
                     if ptrmap_pg_no != 1 && page_content.offset() != 0 {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(LimboError::InternalError(format!(
                             "Ptrmap page {} has unexpected internal offset {}",
                             ptrmap_pg_no,
                             page_content.offset()
@@ -2431,7 +2431,7 @@ impl Pager {
                     self.vacuum_state.write().ptrmap_get_state = PtrMapGetState::Start;
                     break match PtrmapEntry::deserialize(entry_slice) {
                         Some(entry) => Ok(IOResult::Done(Some(entry))),
-                        None => Err(LimboError::Corrupt(format!(
+                        None => Err(LimboError::InternalError(format!(
                             "Failed to deserialize ptrmap entry for page {target_page_num} from ptrmap page {ptrmap_pg_no}"
                         ))),
                     };
@@ -4646,7 +4646,7 @@ impl Pager {
 
                     let bytes_read = read.bytes_read.load(Ordering::Acquire);
                     if bytes_read < DatabaseHeader::SIZE {
-                        return Err(LimboError::Corrupt(
+                        return Err(LimboError::InternalError(
                             "database header unreadable after checkpoint sync".into(),
                         ));
                     }
@@ -4885,7 +4885,7 @@ impl Pager {
             match &mut *state {
                 FreePageState::Start => {
                     if page_id < 2 || page_id > header.database_size.get() as usize {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(LimboError::InternalError(format!(
                             "Invalid page number {page_id} for free operation"
                         )));
                     }

@@ -1235,7 +1235,7 @@ fn test_recovery_rejects_schema_op_after_data_op_in_frame() {
     let mut st = RecoverLogicalLogState::default();
     let result = io.block(|| mvcc_store.maybe_recover_logical_log(&conn, &mut st));
     assert!(
-        matches!(&result, Err(LimboError::Corrupt(msg)) if msg.contains("schema op after a data op")),
+        matches!(&result, Err(LimboError::InternalError(msg)) if msg.contains("schema op after a data op")),
     );
 }
 
@@ -1732,9 +1732,9 @@ fn test_bootstrap_rejects_committed_wal_without_log_file() {
     match Database::open_file(io, &db_path) {
         Ok(db) => match db.connect() {
             Ok(_) => panic!("expected connect to fail with Corrupt"),
-            Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+            Err(err) => assert!(matches!(err, LimboError::InternalError(_))),
         },
-        Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+        Err(err) => assert!(matches!(err, LimboError::InternalError(_))),
     }
 }
 
@@ -1766,9 +1766,9 @@ fn test_bootstrap_rejects_torn_log_header_with_committed_wal() {
     match Database::open_file(io, &db_path) {
         Ok(db) => match db.connect() {
             Ok(_) => panic!("expected connect to fail with Corrupt"),
-            Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+            Err(err) => assert!(matches!(err, LimboError::InternalError(_))),
         },
-        Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+        Err(err) => assert!(matches!(err, LimboError::InternalError(_))),
     }
     let wal_len = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
     assert!(
@@ -1807,9 +1807,9 @@ fn test_bootstrap_rejects_corrupt_log_header_without_wal() {
     match Database::open_file(io, &db_path) {
         Ok(db) => match db.connect() {
             Ok(_) => panic!("expected connect to fail with Corrupt"),
-            Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+            Err(err) => assert!(matches!(err, LimboError::InternalError(_))),
         },
-        Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+        Err(err) => assert!(matches!(err, LimboError::InternalError(_))),
     }
 }
 
@@ -2145,12 +2145,12 @@ fn test_meta_recovery_case_3_no_wal_log_frames_without_valid_metadata_fails_clos
         Ok(db2) => match db2.connect() {
             Ok(_) => panic!("expected connect to fail with Corrupt"),
             Err(err) => assert!(
-                matches!(err, LimboError::Corrupt(_)),
+                matches!(err, LimboError::InternalError(_)),
                 "unexpected connect error: {err:?}"
             ),
         },
         Err(err) => assert!(
-            matches!(err, LimboError::Corrupt(_)),
+            matches!(err, LimboError::InternalError(_)),
             "unexpected open error: {err:?}"
         ),
     }
@@ -2230,9 +2230,9 @@ fn test_meta_recovery_case_5_committed_wal_missing_metadata_fails_closed() {
     match Database::open_file(io, &db_path) {
         Ok(db2) => match db2.connect() {
             Ok(_) => panic!("expected connect to fail closed"),
-            Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+            Err(err) => assert!(matches!(err, LimboError::InternalError(_))),
         },
-        Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+        Err(err) => assert!(matches!(err, LimboError::InternalError(_))),
     }
 }
 
@@ -2336,9 +2336,9 @@ fn test_meta_recovery_case_9_metadata_row_deleted_fails_closed() {
     match Database::open_file(io, &db_path) {
         Ok(db2) => match db2.connect() {
             Ok(_) => panic!("expected connect to fail closed"),
-            Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+            Err(err) => assert!(matches!(err, LimboError::InternalError(_))),
         },
-        Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+        Err(err) => assert!(matches!(err, LimboError::InternalError(_))),
     }
 }
 

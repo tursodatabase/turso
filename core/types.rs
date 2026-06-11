@@ -1189,7 +1189,7 @@ mod immutable_record {
         let header_size = header_size as usize;
 
         if header_size > payload.len() || header_varint_len > payload.len() {
-            return Err(LimboError::Corrupt(
+            return Err(LimboError::InternalError(
                 "Payload too small for indicated header size".into(),
             ));
         }
@@ -1644,7 +1644,7 @@ impl<'a> ValueIterator<'a> {
             || header_varint_len > payload.len()
             || header_varint_len > header_size
         {
-            return Err(LimboError::Corrupt(
+            return Err(LimboError::InternalError(
                 "Payload too small for indicated header size".into(),
             ));
         }
@@ -1765,7 +1765,7 @@ impl<'a> Iterator for ValueIterator<'a> {
         }
 
         if unlikely(data_sum > data.len()) {
-            return Some(Err(LimboError::Corrupt(
+            return Some(Err(LimboError::InternalError(
                 "Data section too small for indicated serial type size".into(),
             )));
         }
@@ -2261,7 +2261,7 @@ where
     let header_size = header_size as usize;
 
     if payload.len() < header_size {
-        return Err(LimboError::Corrupt(format!(
+        return Err(LimboError::InternalError(format!(
             "Record payload too short: claimed header size {} but payload only {} bytes",
             header_size,
             payload.len()
@@ -2357,7 +2357,7 @@ where
     let header_size = header_size as usize;
 
     if payload.len() < header_size {
-        return Err(LimboError::Corrupt(format!(
+        return Err(LimboError::InternalError(format!(
             "Record payload too short: claimed header size {} but payload only {} bytes",
             header_size,
             payload.len()
@@ -2701,7 +2701,7 @@ pub fn get_serial_type_size(serial: u64) -> Result<usize> {
         },
         _ => {
             mark_unlikely();
-            Err(LimboError::Corrupt(format!(
+            Err(LimboError::InternalError(format!(
                 "Invalid serial type: {serial}"
             )))
         }
@@ -2742,7 +2742,9 @@ impl TryFrom<u64> for SerialType {
     #[inline(always)]
     fn try_from(uint: u64) -> Result<Self> {
         if unlikely(uint == 10 || uint == 11) {
-            return Err(LimboError::Corrupt(format!("Invalid serial type: {uint}")));
+            return Err(LimboError::InternalError(format!(
+                "Invalid serial type: {uint}"
+            )));
         }
         Ok(SerialType(uint))
     }

@@ -565,7 +565,7 @@ fn portable_delete_op_extension_for_row_version<Clock: LogicalClock>(
         };
         let physical_column = table.logical_to_physical_column(logical_column);
         let Some(value) = values.get(physical_column).cloned() else {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "DELETE_TABLE record for {table_name} missing primary key column {pk_name}"
             )));
         };
@@ -2226,7 +2226,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                         ..
                     } if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID => {
                         if record_bytes.is_empty() {
-                            return Err(LimboError::Corrupt(
+                            return Err(LimboError::InternalError(
                                 "sqlite_schema DELETE_TABLE missing old record".to_string(),
                             ));
                         }
@@ -3917,13 +3917,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// value used by both the blocking and non-blocking readers.
     fn validate_persistent_tx_ts_max(value: Option<i64>) -> Result<Option<u64>> {
         let value = value.ok_or_else(|| {
-            LimboError::Corrupt(format!(
+            LimboError::InternalError(format!(
                 "Missing MVCC metadata row for key {MVCC_META_KEY_PERSISTENT_TX_TS_MAX}"
             ))
         })?;
 
         if value < 0 {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "Invalid MVCC metadata value for {MVCC_META_KEY_PERSISTENT_TX_TS_MAX}: {value}"
             )));
         }
@@ -3952,7 +3952,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             return Ok(IOResult::Done(None))
                         }
                         Err(err) => {
-                            return Err(LimboError::Corrupt(format!(
+                            return Err(LimboError::InternalError(format!(
                                 "Failed to read MVCC metadata table: {err}"
                             )))
                         }
@@ -4192,12 +4192,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let log_size = self.get_logical_log_file().size()?;
         let pager = bootstrap_conn.pager.load().clone();
         if bootstrap_conn.db.is_readonly() {
-            return Err(LimboError::Corrupt(
+            return Err(LimboError::InternalError(
                 "Missing MVCC metadata table in read-only mode".to_string(),
             ));
         }
         if log_size > LOG_HDR_SIZE as u64 {
-            return Err(LimboError::Corrupt(
+            return Err(LimboError::InternalError(
                 "Missing MVCC metadata table while logical log state exists".to_string(),
             ));
         }
@@ -6403,7 +6403,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         continue;
                     }
                     if is_readonly {
-                        return Err(LimboError::Corrupt(
+                        return Err(LimboError::InternalError(
                             "Cannot reconcile interrupted MVCC checkpoint in read-only mode"
                                 .to_string(),
                         ));
@@ -6411,13 +6411,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     let header = match header_result {
                         HeaderReadResult::Valid(header) => header,
                         HeaderReadResult::NoLog => {
-                            return Err(LimboError::Corrupt(
+                            return Err(LimboError::InternalError(
                                 "WAL has committed frames but logical log header is missing"
                                     .to_string(),
                             ))
                         }
                         HeaderReadResult::Invalid => {
-                            return Err(LimboError::Corrupt(
+                            return Err(LimboError::InternalError(
                                 "WAL has committed frames but logical log header is invalid"
                                     .to_string(),
                             ))
@@ -6456,7 +6456,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         },
                     ));
                     if !checkpoint_result.everything_backfilled() {
-                        let err = LimboError::Corrupt(
+                        let err = LimboError::InternalError(
                             "Unable to fully backfill committed WAL frames during MVCC recovery"
                                 .to_string(),
                         );
@@ -6563,7 +6563,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             *st = CompleteCheckpointState::DriveFinalTruncate { checkpoint_result };
                         } else {
                             if *retried_crc {
-                                let err = LimboError::Corrupt(
+                                let err = LimboError::InternalError(
                                     "Logical log header CRC mismatch after retry".to_string(),
                                 );
                                 self.storage.on_checkpoint_end(Err(err.clone()))?;
@@ -6623,7 +6623,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         HeaderReadResult::Valid(header) => Some(header),
                         HeaderReadResult::NoLog => None,
                         HeaderReadResult::Invalid => {
-                            return Err(LimboError::Corrupt(
+                            return Err(LimboError::InternalError(
                                 "Logical log header corrupt and no WAL recovery available"
                                     .to_string(),
                             ));
@@ -6660,7 +6660,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             Some(ts) => ts,
                             None if !header_present => 0,
                             None => {
-                                return Err(LimboError::Corrupt(
+                                return Err(LimboError::InternalError(
                                     "Missing MVCC metadata table".to_string(),
                                 ));
                             }
@@ -6895,7 +6895,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 );
                 if touches_schema {
                     if seen_data_op {
-                        return Err(LimboError::Corrupt(
+                        return Err(LimboError::InternalError(
                             "log frame has a schema op after a data op".into(),
                         ));
                     }
@@ -6997,13 +6997,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             let row_data = row.payload().to_vec();
                             let record = ImmutableRecord::from_bin_record(row_data);
                             if record.column_count() < 5 {
-                                return Err(LimboError::Corrupt(format!(
+                                return Err(LimboError::InternalError(format!(
                                     "sqlite_schema row must have at least 5 columns, got {}",
                                     record.column_count()
                                 )));
                             }
                             let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
-                                return Err(LimboError::Corrupt(
+                                return Err(LimboError::InternalError(
                                     "sqlite_schema type must be text".to_string(),
                                 ));
                             };
@@ -7036,7 +7036,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             };
                             if has_btree {
                                 if root_page == 0 {
-                                    return Err(LimboError::Corrupt(format!(
+                                    return Err(LimboError::InternalError(format!(
                                         "sqlite_schema root_page=0 for btree {row_type}"
                                     )));
                                 }
@@ -7061,7 +7061,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                     turso_assert_eq!(value, root_page as u64, "logical log root page does not match table_id_to_rootpage map", { "root_page": root_page, "map_value": value });
                                 }
                             } else if root_page != 0 {
-                                return Err(LimboError::Corrupt(format!(
+                                return Err(LimboError::InternalError(format!(
                             "sqlite_schema root_page must be 0 for {row_type}, got {root_page}"
                         )));
                             }
@@ -7162,7 +7162,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 continue;
                             };
                             if record.column_count() < 5 {
-                                return Err(LimboError::Corrupt(format!(
+                                return Err(LimboError::InternalError(format!(
                                     "sqlite_schema row must have at least 5 columns, got {}",
                                     record.column_count()
                                 )));
@@ -7172,7 +7172,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 ValueRef::Numeric(Numeric::Integer(root_page)),
                             ) = record.get_two_values(0, 3)?
                             else {
-                                return Err(LimboError::Corrupt(
+                                return Err(LimboError::InternalError(
                                     "sqlite_schema type and root_page must be text and integer"
                                         .to_string(),
                                 ));
@@ -7333,7 +7333,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let ty = match record.get_value_opt(0) {
                 Some(ValueRef::Text(v)) => v.as_str(),
                 _ => {
-                    return Err(LimboError::Corrupt(
+                    return Err(LimboError::InternalError(
                         "sqlite_schema type must be text".to_string(),
                     ));
                 }
@@ -7341,7 +7341,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let name = match record.get_value_opt(1) {
                 Some(ValueRef::Text(v)) => v.as_str(),
                 _ => {
-                    return Err(LimboError::Corrupt(
+                    return Err(LimboError::InternalError(
                         "sqlite_schema name must be text".to_string(),
                     ));
                 }
@@ -7349,7 +7349,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let table_name = match record.get_value_opt(2) {
                 Some(ValueRef::Text(v)) => v.as_str(),
                 _ => {
-                    return Err(LimboError::Corrupt(
+                    return Err(LimboError::InternalError(
                         "sqlite_schema tbl_name must be text".to_string(),
                     ));
                 }
@@ -7357,7 +7357,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let root_page = match record.get_value_opt(3) {
                 Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
                 _ => {
-                    return Err(LimboError::Corrupt(
+                    return Err(LimboError::InternalError(
                         "sqlite_schema root_page must be integer".to_string(),
                     ));
                 }

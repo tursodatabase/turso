@@ -3450,7 +3450,7 @@ impl Connection {
     /// stashing the captured row in `*meta`. The backing table is internal
     /// (`__turso_internal_seq_*`); a prepare/read failure is on-disk
     /// corruption, not "the sequence doesn't exist", so it surfaces
-    /// `LimboError::Corrupt` — silently dropping the sequence would manifest
+    /// `LimboError::InternalError` — silently dropping the sequence would manifest
     /// as a misleading "sequence does not exist" error on the next nextval
     /// that masks the real problem.
     fn read_seq_descriptor_row_nonblock(
@@ -3465,7 +3465,7 @@ impl Connection {
             let escaped = backing_table_name.replace('"', "\"\"");
             let sql = format!("SELECT start, inc, min, max, cycle FROM \"{escaped}\" LIMIT 1");
             let prepared = self.prepare_internal(sql).map_err(|err| {
-                LimboError::Corrupt(format!(
+                LimboError::InternalError(format!(
                     "internal sequence backing table \"{backing_table_name}\" for sequence \
                      \"{seq_name}\": cannot prepare descriptor SELECT: {err}"
                 ))
@@ -3489,7 +3489,7 @@ impl Connection {
         }) {
             Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
             Ok(IOResult::Done(())) => Ok(IOResult::Done(())),
-            Err(err) => Err(LimboError::Corrupt(format!(
+            Err(err) => Err(LimboError::InternalError(format!(
                 "internal sequence backing table \"{backing_table_name}\" for sequence \
                  \"{seq_name}\": descriptor row read failed: {err}"
             ))),
@@ -3505,7 +3505,7 @@ impl Connection {
         meta: Option<(i64, i64, i64, i64, bool)>,
     ) -> Result<crate::schema::Sequence> {
         let (start, inc, min, max, cycle) = meta.ok_or_else(|| {
-            LimboError::Corrupt(format!(
+            LimboError::InternalError(format!(
                 "internal sequence backing table \"{backing_table_name}\" for sequence \
                  \"{seq_name}\" is empty; the descriptor metadata row must always be present"
             ))
@@ -3519,7 +3519,7 @@ impl Connection {
             cycle,
         )
         .map_err(|err| {
-            LimboError::Corrupt(format!(
+            LimboError::InternalError(format!(
                 "internal sequence backing table \"{backing_table_name}\" for sequence \
                  \"{seq_name}\" descriptor is invalid: {err}"
             ))

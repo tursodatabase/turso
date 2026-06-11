@@ -1127,7 +1127,7 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
         );
         let err_msg = result.err().unwrap().to_string();
         assert!(
-            err_msg.contains("Corrupt database"),
+            err_msg.contains("Internal error"),
             "Error message should indicate that the encrypted database cannot be read: '{err_msg}'"
         );
 
@@ -1141,7 +1141,7 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
         );
         let err_msg = result.err().unwrap().to_string();
         assert!(
-            err_msg.contains("Corrupt database"),
+            err_msg.contains("Internal error"),
             "Error message should indicate that the encrypted database cannot be read: '{err_msg}'"
         );
     }

@@ -1677,35 +1677,35 @@ impl Database {
                     // TODO: right now we don't support READ ONLY and no READ or WRITE in the Version header
                     // https://www.sqlite.org/fileformat.html#file_format_version_numbers
                     if read_version != write_version {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(LimboError::InternalError(format!(
                             "Read version `{read_version:?}` is not equal to Write version `{write_version:?} in database header`"
                         )));
                     }
 
                     let (read_version, _write_version) = (
                         read_version.to_version().map_err(|val| {
-                            LimboError::Corrupt(format!("Invalid read_version: {val}"))
+                            LimboError::InternalError(format!("Invalid read_version: {val}"))
                         })?,
                         write_version.to_version().map_err(|val| {
-                            LimboError::Corrupt(format!("Invalid write_version: {val}"))
+                            LimboError::InternalError(format!("Invalid write_version: {val}"))
                         })?,
                     );
 
                     // Validate fixed header fields per SQLite spec
                     if header_mut.max_embed_frac != 64 {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(LimboError::InternalError(format!(
                             "Invalid max_embed_frac: expected 64, got {}",
                             header_mut.max_embed_frac
                         )));
                     }
                     if header_mut.min_embed_frac != 32 {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(LimboError::InternalError(format!(
                             "Invalid min_embed_frac: expected 32, got {}",
                             header_mut.min_embed_frac
                         )));
                     }
                     if header_mut.leaf_frac != 32 {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(LimboError::InternalError(format!(
                             "Invalid leaf_frac: expected 32, got {}",
                             header_mut.leaf_frac
                         )));
@@ -1713,7 +1713,7 @@ impl Database {
                     let schema_format = header_mut.schema_format.get();
                     // If the database is completely empty, if it has no schema, then the schema format number can be zero.
                     if !(0..=4).contains(&schema_format) {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(LimboError::InternalError(format!(
                             "Invalid schema_format: expected 1-4, got {schema_format}"
                         )));
                     }
@@ -1724,7 +1724,7 @@ impl Database {
                             | TextEncoding::Utf16Le
                             | TextEncoding::Utf16Be
                     ) {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(LimboError::InternalError(format!(
                             "Invalid text_encoding: {}",
                             header_mut.text_encoding
                         )));
@@ -1733,7 +1733,7 @@ impl Database {
                         header_mut.text_encoding,
                         TextEncoding::Unset | TextEncoding::Utf8
                     ) {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(LimboError::InternalError(format!(
                             "Only utf8 text_encoding is supported by tursodb: got={}",
                             header_mut.text_encoding
                         )));
@@ -1768,7 +1768,7 @@ impl Database {
                     // In MVCC mode, WAL and logical-log coexistence can happen across interrupted checkpoint
                     // recovery and is reconciled in MvStore::bootstrap().
                     if !open_mv_store && log_exists {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(LimboError::InternalError(format!(
                             "MVCC logical log file exists for database {}, but database header indicates WAL mode. The database may be corrupted.",
                             self.path
                         )));

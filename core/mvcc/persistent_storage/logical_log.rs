@@ -333,12 +333,12 @@ fn encrypted_chunk_plaintext_len(
     chunk_size: usize,
 ) -> Result<usize> {
     let chunk_start = chunk_index.checked_mul(chunk_size).ok_or_else(|| {
-        LimboError::Corrupt(format!(
+        LimboError::InternalError(format!(
             "encrypted chunk offset overflow: chunk_index={chunk_index}, chunk_size={chunk_size}"
         ))
     })?;
     if chunk_start >= payload_size {
-        return Err(LimboError::Corrupt(format!(
+        return Err(LimboError::InternalError(format!(
             "encrypted chunk index {chunk_index} out of range for payload_size={payload_size}"
         )));
     }
@@ -355,7 +355,7 @@ fn encrypted_chunk_blob_size(
         .checked_add(tag_size)
         .and_then(|size| size.checked_add(nonce_size))
         .ok_or_else(|| {
-            LimboError::Corrupt(format!(
+            LimboError::InternalError(format!(
                 "encrypted chunk size overflow: plaintext={plaintext_len}, tag={tag_size}, nonce={nonce_size}"
             ))
         })
@@ -377,13 +377,17 @@ fn encrypted_payload_blob_size(
     let full_chunk_on_disk = encrypted_chunk_blob_size(chunk_size, tag_size, nonce_size)?;
     let full_chunks_total = full_chunk_on_disk
         .checked_mul(chunk_count.saturating_sub(1))
-        .ok_or_else(|| LimboError::Corrupt("encrypted payload total size overflow".to_string()))?;
+        .ok_or_else(|| {
+            LimboError::InternalError("encrypted payload total size overflow".to_string())
+        })?;
     let last_plaintext_len =
         encrypted_chunk_plaintext_len(payload_size, chunk_count - 1, chunk_size)?;
     let last_chunk_on_disk = encrypted_chunk_blob_size(last_plaintext_len, tag_size, nonce_size)?;
     full_chunks_total
         .checked_add(last_chunk_on_disk)
-        .ok_or_else(|| LimboError::Corrupt("encrypted payload total size overflow".to_string()))
+        .ok_or_else(|| {
+            LimboError::InternalError("encrypted payload total size overflow".to_string())
+        })
 }
 
 fn build_encrypted_chunk_aad(
@@ -452,34 +456,36 @@ impl LogHeader {
 
     fn decode(buf: &[u8]) -> Result<Self> {
         if buf.len() < LOG_HDR_SIZE {
-            return Err(LimboError::Corrupt(
+            return Err(LimboError::InternalError(
                 "Logical log header too small".to_string(),
             ));
         }
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic != LOG_MAGIC {
-            return Err(LimboError::Corrupt("Invalid logical log magic".to_string()));
+            return Err(LimboError::InternalError(
+                "Invalid logical log magic".to_string(),
+            ));
         }
         let version = buf[4];
         if version != LOG_VERSION && version != LOG_VERSION_V2 {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "Unsupported logical log version {version}"
             )));
         }
         let flags = buf[5];
         if flags & 0b1111_1110 != 0 {
-            return Err(LimboError::Corrupt(
+            return Err(LimboError::InternalError(
                 "Invalid logical log header flags".to_string(),
             ));
         }
         let hdr_len = u16::from_le_bytes([buf[6], buf[7]]);
         if hdr_len as usize != LOG_HDR_SIZE {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "Invalid logical log header length {hdr_len}"
             )));
         }
         if buf.len() < hdr_len as usize {
-            return Err(LimboError::Corrupt(
+            return Err(LimboError::InternalError(
                 "Logical log header shorter than hdr_len".to_string(),
             ));
         }
@@ -494,7 +500,7 @@ impl LogHeader {
         crc_buf[LOG_HDR_CRC_START..LOG_HDR_SIZE].fill(0);
         let expected_crc = crc32c::crc32c(&crc_buf);
         if expected_crc != hdr_crc32c {
-            return Err(LimboError::Corrupt(
+            return Err(LimboError::InternalError(
                 "Logical log header checksum mismatch".to_string(),
             ));
         }
@@ -513,7 +519,7 @@ impl LogHeader {
         let mut reserved = [0u8; LOG_HDR_RESERVED_SIZE];
         reserved.copy_from_slice(&buf[LOG_HDR_RESERVED_START..LOG_HDR_CRC_START]);
         if reserved.iter().any(|b| *b != 0) {
-            return Err(LimboError::Corrupt(
+            return Err(LimboError::InternalError(
                 "Logical log header reserved bytes must be zero".to_string(),
             ));
         }
@@ -1173,10 +1179,14 @@ fn read_proto_varint_from_buf(bytes: &[u8], offset: &mut usize) -> Result<u64> {
         }
         shift += 7;
         if shift >= 64 {
-            return Err(LimboError::Corrupt("protobuf varint overflows u64".into()));
+            return Err(LimboError::InternalError(
+                "protobuf varint overflows u64".into(),
+            ));
         }
     }
-    Err(LimboError::Corrupt("truncated protobuf varint".into()))
+    Err(LimboError::InternalError(
+        "truncated protobuf varint".into(),
+    ))
 }
 
 fn skip_proto_field(bytes: &[u8], offset: &mut usize, wire_type: u64) -> Result<()> {
@@ -1186,20 +1196,21 @@ fn skip_proto_field(bytes: &[u8], offset: &mut usize, wire_type: u64) -> Result<
         }
         2 => {
             let len = read_proto_varint_from_buf(bytes, offset)?;
-            let len = usize::try_from(len)
-                .map_err(|_| LimboError::Corrupt("protobuf field length overflows usize".into()))?;
-            let end = offset
-                .checked_add(len)
-                .ok_or_else(|| LimboError::Corrupt("protobuf field length overflow".into()))?;
+            let len = usize::try_from(len).map_err(|_| {
+                LimboError::InternalError("protobuf field length overflows usize".into())
+            })?;
+            let end = offset.checked_add(len).ok_or_else(|| {
+                LimboError::InternalError("protobuf field length overflow".into())
+            })?;
             if end > bytes.len() {
-                return Err(LimboError::Corrupt(
+                return Err(LimboError::InternalError(
                     "protobuf length-delimited field exceeds extension".into(),
                 ));
             }
             *offset = end;
         }
         other => {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "unsupported protobuf wire type in op extension: {other}"
             )));
         }
@@ -1223,13 +1234,15 @@ fn decode_delete_portable_extension(extension: &[u8]) -> Result<DeletePortableEx
             (OP_EXT_FIELD_DELETE_IDENTITY_RECORD, 2) => {
                 let len = read_proto_varint_from_buf(extension, &mut offset)?;
                 let len = usize::try_from(len).map_err(|_| {
-                    LimboError::Corrupt("delete identity record length overflows usize".into())
+                    LimboError::InternalError(
+                        "delete identity record length overflows usize".into(),
+                    )
                 })?;
                 let end = offset.checked_add(len).ok_or_else(|| {
-                    LimboError::Corrupt("delete identity record length overflow".into())
+                    LimboError::InternalError("delete identity record length overflow".into())
                 })?;
                 if end > extension.len() {
-                    return Err(LimboError::Corrupt(
+                    return Err(LimboError::InternalError(
                         "delete identity record exceeds op extension".into(),
                     ));
                 }
@@ -1239,13 +1252,13 @@ fn decode_delete_portable_extension(extension: &[u8]) -> Result<DeletePortableEx
             (OP_EXT_FIELD_DELETE_PK_RECORD, 2) => {
                 let len = read_proto_varint_from_buf(extension, &mut offset)?;
                 let len = usize::try_from(len).map_err(|_| {
-                    LimboError::Corrupt("delete PK record length overflows usize".into())
+                    LimboError::InternalError("delete PK record length overflows usize".into())
                 })?;
                 let end = offset.checked_add(len).ok_or_else(|| {
-                    LimboError::Corrupt("delete PK record length overflow".into())
+                    LimboError::InternalError("delete PK record length overflow".into())
                 })?;
                 if end > extension.len() {
-                    return Err(LimboError::Corrupt(
+                    return Err(LimboError::InternalError(
                         "delete PK record exceeds op extension".into(),
                     ));
                 }
@@ -1387,12 +1400,12 @@ fn find_extension_payload(
     let mut payload = Vec::new();
     for _ in 0..extension_record_count {
         let Some(header_end) = offset.checked_add(EXTENSION_RECORD_HEADER_SIZE) else {
-            return Err(LimboError::Corrupt(
+            return Err(LimboError::InternalError(
                 "extension record header offset overflow".to_string(),
             ));
         };
         if header_end > extension_block.len() {
-            return Err(LimboError::Corrupt(
+            return Err(LimboError::InternalError(
                 "extension record header is truncated".to_string(),
             ));
         }
@@ -1401,7 +1414,7 @@ fn find_extension_payload(
         let extension_flags =
             u16::from_le_bytes(extension_block[offset + 2..offset + 4].try_into().unwrap());
         if extension_flags != 0 {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "unsupported extension flags for type {extension_type}: {extension_flags:#x}"
             )));
         }
@@ -1412,12 +1425,12 @@ fn find_extension_payload(
         ) as usize;
         let payload_start = header_end;
         let Some(payload_end) = payload_start.checked_add(extension_len) else {
-            return Err(LimboError::Corrupt(
+            return Err(LimboError::InternalError(
                 "extension record payload offset overflow".to_string(),
             ));
         };
         if payload_end > extension_block.len() {
-            return Err(LimboError::Corrupt(
+            return Err(LimboError::InternalError(
                 "extension record payload is truncated".to_string(),
             ));
         }
@@ -1427,7 +1440,7 @@ fn find_extension_payload(
         offset = payload_end;
     }
     if offset != extension_block.len() {
-        return Err(LimboError::Corrupt(
+        return Err(LimboError::InternalError(
             "extension block has trailing bytes".to_string(),
         ));
     }
@@ -1443,7 +1456,7 @@ pub(crate) fn parse_ops_from_plaintext(
     commit_ts: u64,
 ) -> Result<Vec<ParsedOp>> {
     if plaintext.len() != payload_size {
-        return Err(LimboError::Corrupt(format!(
+        return Err(LimboError::InternalError(format!(
             "decrypted size ({}) != payload_size ({payload_size})",
             plaintext.len()
         )));
@@ -1457,14 +1470,14 @@ pub(crate) fn parse_ops_from_plaintext(
                 ops.push(op);
             }
             None => {
-                return Err(LimboError::Corrupt(
+                return Err(LimboError::InternalError(
                     "incomplete op in decrypted payload".into(),
                 ));
             }
         }
     }
     if cursor != plaintext.len() {
-        return Err(LimboError::Corrupt(format!(
+        return Err(LimboError::InternalError(format!(
             "trailing bytes after ops: consumed {cursor}, total {}",
             plaintext.len()
         )));
@@ -1489,7 +1502,7 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
     let table_id: Option<MVTableId> = match tag {
         OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX => {
             if flags & !OP_ALLOWED_FLAGS != 0 || table_id_i32 >= 0 {
-                return Err(LimboError::Corrupt(
+                return Err(LimboError::InternalError(
                     "Invalid op flags or non-negative table_id".into(),
                 ));
             }
@@ -1497,13 +1510,13 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
         }
         OP_UPDATE_HEADER => {
             if flags != 0 || table_id_i32 != 0 {
-                return Err(LimboError::Corrupt(
+                return Err(LimboError::InternalError(
                     "Invalid UPDATE_HEADER flags/table_id".into(),
                 ));
             }
             None
         }
-        _ => return Err(LimboError::Corrupt(format!("Unknown op tag: {tag}"))),
+        _ => return Err(LimboError::InternalError(format!("Unknown op tag: {tag}"))),
     };
     let btree_resident = (flags & OP_FLAG_BTREE_RESIDENT) != 0;
 
@@ -1512,7 +1525,11 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
     };
     let payload_len = match usize::try_from(payload_len_u64) {
         Ok(v) => v,
-        Err(_) => return Err(LimboError::Corrupt("payload_len overflows usize".into())),
+        Err(_) => {
+            return Err(LimboError::InternalError(
+                "payload_len overflows usize".into(),
+            ))
+        }
     };
 
     let fixed = 6 + varint_bytes;
@@ -1530,11 +1547,11 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
             return Ok(None);
         };
         let extension_len = usize::try_from(extension_len_u64)
-            .map_err(|_| LimboError::Corrupt("op extension length overflows usize".into()))?;
+            .map_err(|_| LimboError::InternalError("op extension length overflows usize".into()))?;
         let extension_start = total + extension_len_bytes;
         let extension_end = extension_start
             .checked_add(extension_len)
-            .ok_or_else(|| LimboError::Corrupt("op extension length overflow".into()))?;
+            .ok_or_else(|| LimboError::InternalError("op extension length overflow".into()))?;
         if buf.len() < extension_end {
             return Ok(None);
         }
@@ -1544,10 +1561,11 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
     let parsed_op = match tag {
         OP_UPSERT_TABLE => {
             let table_id = table_id.expect("table op must have table_id");
-            let (rowid_u64, rowid_len) = read_varint(payload)
-                .map_err(|_| LimboError::Corrupt("Bad rowid varint in UPSERT_TABLE".into()))?;
+            let (rowid_u64, rowid_len) = read_varint(payload).map_err(|_| {
+                LimboError::InternalError("Bad rowid varint in UPSERT_TABLE".into())
+            })?;
             if rowid_len > payload.len() {
-                return Err(LimboError::Corrupt("rowid_len > payload".into()));
+                return Err(LimboError::InternalError("rowid_len > payload".into()));
             }
             let record_bytes = payload[rowid_len..].to_vec();
             let rowid = RowID::new(table_id, RowKey::Int(rowid_u64 as i64));
@@ -1561,10 +1579,11 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
         }
         OP_DELETE_TABLE => {
             let table_id = table_id.expect("table op must have table_id");
-            let (rowid_u64, rowid_len) = read_varint(payload)
-                .map_err(|_| LimboError::Corrupt("Bad rowid varint in DELETE_TABLE".into()))?;
+            let (rowid_u64, rowid_len) = read_varint(payload).map_err(|_| {
+                LimboError::InternalError("Bad rowid varint in DELETE_TABLE".into())
+            })?;
             if rowid_len > payload.len() {
-                return Err(LimboError::Corrupt(
+                return Err(LimboError::InternalError(
                     "DELETE_TABLE payload size mismatch".into(),
                 ));
             }
@@ -1600,7 +1619,7 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
         },
         OP_UPDATE_HEADER => {
             if payload.len() != DatabaseHeader::SIZE {
-                return Err(LimboError::Corrupt(
+                return Err(LimboError::InternalError(
                     "UPDATE_HEADER wrong payload size".into(),
                 ));
             }
@@ -1608,7 +1627,9 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
             bytes.copy_from_slice(payload);
             let header = *bytemuck::from_bytes::<DatabaseHeader>(&bytes);
             if header.magic != *b"SQLite format 3\0" {
-                return Err(LimboError::Corrupt("UPDATE_HEADER bad SQLite magic".into()));
+                return Err(LimboError::InternalError(
+                    "UPDATE_HEADER bad SQLite magic".into(),
+                ));
             }
             ParsedOp::UpdateHeader { header, commit_ts }
         }
@@ -1749,7 +1770,7 @@ enum HeaderParseOutcome {
 }
 
 /// Outcome of parsing a payload phase. Corruption is signalled via
-/// `Err(LimboError::Corrupt(..))` and translated to `Invalid` by the caller,
+/// `Err(LimboError::InternalError(..))` and translated to `Invalid` by the caller,
 /// mirroring the previous control flow.
 enum PayloadOutcome {
     Ok,
@@ -1913,10 +1934,10 @@ impl StreamingLogicalLogReader {
     pub fn read_header(&mut self, io: &Arc<dyn crate::IO>) -> Result<()> {
         match self.try_read_header(io)? {
             HeaderReadResult::Valid(_) => Ok(()),
-            HeaderReadResult::NoLog => Err(LimboError::Corrupt(
+            HeaderReadResult::NoLog => Err(LimboError::InternalError(
                 "Logical log header incomplete".to_string(),
             )),
-            HeaderReadResult::Invalid => Err(LimboError::Corrupt(
+            HeaderReadResult::Invalid => Err(LimboError::InternalError(
                 "Logical log header corrupt".to_string(),
             )),
         }
@@ -1957,7 +1978,7 @@ impl StreamingLogicalLogReader {
                 self.last_valid_offset = hdr_len;
                 Ok(IOResult::Done(HeaderReadResult::Valid(header)))
             }
-            Err(LimboError::Corrupt(_)) => {
+            Err(LimboError::InternalError(_)) => {
                 self.set_invalid_header_state();
                 Ok(IOResult::Done(HeaderReadResult::Invalid))
             }
@@ -2141,7 +2162,7 @@ impl StreamingLogicalLogReader {
         match buf[0] {
             OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX
             | OP_UPDATE_HEADER => {}
-            tag => return Err(LimboError::Corrupt(format!("Unknown op tag: {tag}"))),
+            tag => return Err(LimboError::InternalError(format!("Unknown op tag: {tag}"))),
         }
 
         let Some((payload_len_u64, varint_bytes)) = read_varint_partial(&buf[6..])? else {
@@ -2149,13 +2170,13 @@ impl StreamingLogicalLogReader {
             return Ok(None);
         };
         let payload_len = usize::try_from(payload_len_u64)
-            .map_err(|_| LimboError::Corrupt("payload_len overflows usize".into()))?;
+            .map_err(|_| LimboError::InternalError("payload_len overflows usize".into()))?;
         let fixed = 6usize
             .checked_add(varint_bytes)
-            .ok_or_else(|| LimboError::Corrupt("op header length overflow".into()))?;
+            .ok_or_else(|| LimboError::InternalError("op header length overflow".into()))?;
         let total = fixed
             .checked_add(payload_len)
-            .ok_or_else(|| LimboError::Corrupt("op payload length overflow".into()))?;
+            .ok_or_else(|| LimboError::InternalError("op payload length overflow".into()))?;
         Ok(Some(total))
     }
 
@@ -2192,7 +2213,7 @@ impl StreamingLogicalLogReader {
             payload_ctx.op_count,
             payload_ctx.commit_ts,
             u32::try_from(chunk_index).map_err(|_| {
-                LimboError::Corrupt("encrypted payload chunk index exceeds u32".to_string())
+                LimboError::InternalError("encrypted payload chunk index exceeds u32".to_string())
             })?,
         );
 
@@ -2217,7 +2238,7 @@ impl StreamingLogicalLogReader {
             encryption_ctx
                 .decrypt_chunk_into(ciphertext, nonce, &aad, decrypt_scratch)
                 .map_err(|e| {
-                    LimboError::Corrupt(format!(
+                    LimboError::InternalError(format!(
                         "decrypt_chunk failed for chunk {chunk_index}: {e}"
                     ))
                 })?;
@@ -2226,7 +2247,7 @@ impl StreamingLogicalLogReader {
 
         self.buffer_offset = end;
         if decrypted_plaintext_len != plaintext_len {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "decrypted chunk length mismatch: expected {plaintext_len}, got {decrypted_plaintext_len}"
             )));
         }
@@ -2256,7 +2277,7 @@ impl StreamingLogicalLogReader {
             }
 
             if carry.len() >= Self::MAX_SERIALIZED_OP_PREFIX_LEN {
-                return Err(LimboError::Corrupt(
+                return Err(LimboError::InternalError(
                     "carried encrypted op prefix could not resolve total length".into(),
                 ));
             }
@@ -2291,7 +2312,7 @@ impl StreamingLogicalLogReader {
         // carry buffer must never have more than the op total length. it carries bytes from a
         // previous chunk which is incomplete.
         if carry.len() > carried_op_total_len {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "carried encrypted op exceeded computed length: len={} total={carried_op_total_len}",
                 carry.len()
             )));
@@ -2321,11 +2342,11 @@ impl StreamingLogicalLogReader {
                 carry.clear();
                 Ok(true)
             }
-            Some((_, bytes_consumed)) => Err(LimboError::Corrupt(format!(
+            Some((_, bytes_consumed)) => Err(LimboError::InternalError(format!(
                 "carried encrypted op consumed {bytes_consumed} bytes but carry holds {}",
                 carry.len()
             ))),
-            None => Err(LimboError::Corrupt(
+            None => Err(LimboError::InternalError(
                 "carried encrypted op remained incomplete after reaching computed length".into(),
             )),
         }
@@ -2396,7 +2417,7 @@ impl StreamingLogicalLogReader {
             );
             if !carry.is_empty() {
                 if parsed_ops.len() == op_count as usize {
-                    return Err(LimboError::Corrupt(format!(
+                    return Err(LimboError::InternalError(format!(
                         "encrypted payload has trailing carried bytes after parsing all {op_count} ops"
                     )));
                 }
@@ -2415,7 +2436,7 @@ impl StreamingLogicalLogReader {
                     Ok(true) => {}
                     Ok(false) => continue,
                     Err(e) => {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(LimboError::InternalError(format!(
                             "encrypted carried-op parse error: {e}"
                         )));
                     }
@@ -2447,7 +2468,7 @@ impl StreamingLogicalLogReader {
 
         // at this point, we must have parsed the full payload
         if parsed_ops.len() != op_count as usize {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "encrypted payload ended after {} parsed ops, expected {op_count}",
                 parsed_ops.len()
             )));
@@ -2455,7 +2476,7 @@ impl StreamingLogicalLogReader {
 
         // once we have parsed the full payload, carry must be empty
         if !carry.is_empty() {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "encrypted payload has {} trailing plaintext bytes after parsing all ops",
                 carry.len()
             )));
@@ -2510,7 +2531,7 @@ impl StreamingLogicalLogReader {
             plaintext.extend_from_slice(&self.decrypt_scratch);
         }
         if plaintext.len() != plaintext_size {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::InternalError(format!(
                 "encrypted plaintext size mismatch: expected {plaintext_size}, got {}",
                 plaintext.len()
             )));
@@ -2525,7 +2546,7 @@ impl StreamingLogicalLogReader {
     /// there and the consume cursor is checkpointed (`advance_checkpoint`), so a
     /// mid-op IO yield re-parses only the in-flight op on re-entry and the buffer
     /// compacts as ops are consumed. Corruption is reported as
-    /// `Err(LimboError::Corrupt(..))`; the caller maps it to an invalid frame.
+    /// `Err(LimboError::InternalError(..))`; the caller maps it to an invalid frame.
     fn parse_streaming_payload(&mut self) -> Result<IOResult<PayloadOutcome>> {
         loop {
             let (op_index, op_count, commit_ts) = {
@@ -2545,7 +2566,7 @@ impl StreamingLogicalLogReader {
                     (fip.payload_size, fip.payload_bytes_read)
                 };
                 if payload_size as u64 != payload_bytes_read {
-                    return Err(LimboError::Corrupt(format!(
+                    return Err(LimboError::InternalError(format!(
                         "payload_size ({payload_size}) != payload_bytes_read ({payload_bytes_read})"
                     )));
                 }
@@ -2578,7 +2599,7 @@ impl StreamingLogicalLogReader {
             let table_id = match tag {
                 OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX => {
                     if flags & !OP_ALLOWED_FLAGS != 0 || table_id_i32 >= 0 {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(LimboError::InternalError(format!(
                             "invalid op flags={flags:#x} or table_id={table_id_i32} for tag={tag}"
                         )));
                     }
@@ -2586,14 +2607,14 @@ impl StreamingLogicalLogReader {
                 }
                 OP_UPDATE_HEADER => {
                     if flags != 0 || table_id_i32 != 0 {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(LimboError::InternalError(format!(
                             "OP_UPDATE_HEADER has non-zero flags={flags:#x} or table_id={table_id_i32}"
                         )));
                     }
                     None
                 }
                 _ => {
-                    return Err(LimboError::Corrupt(format!("unknown op tag {tag}")));
+                    return Err(LimboError::InternalError(format!("unknown op tag {tag}")));
                 }
             };
             let btree_resident = (flags & OP_FLAG_BTREE_RESIDENT) != 0;
@@ -2606,8 +2627,9 @@ impl StreamingLogicalLogReader {
                 };
             running_crc =
                 crc32c::crc32c_append(running_crc, &payload_len_bytes[..payload_len_bytes_len]);
-            let payload_len = usize::try_from(payload_len)
-                .map_err(|e| LimboError::Corrupt(format!("payload_len overflows usize: {e}")))?;
+            let payload_len = usize::try_from(payload_len).map_err(|e| {
+                LimboError::InternalError(format!("payload_len overflows usize: {e}"))
+            })?;
 
             let payload = match return_if_io!(self.try_consume_bytes(payload_len)) {
                 Some(bytes) => bytes,
@@ -2626,7 +2648,7 @@ impl StreamingLogicalLogReader {
                     &extension_len_bytes[..extension_len_bytes_len],
                 );
                 let extension_len = usize::try_from(extension_len).map_err(|e| {
-                    LimboError::Corrupt(format!("op extension length overflows usize: {e}"))
+                    LimboError::InternalError(format!("op extension length overflows usize: {e}"))
                 })?;
                 let extension = match return_if_io!(self.try_consume_bytes(extension_len)) {
                     Some(bytes) => bytes,
@@ -2642,19 +2664,21 @@ impl StreamingLogicalLogReader {
             payload_bytes_read = u64::try_from(op_total_bytes)
                 .ok()
                 .and_then(|op_size| payload_bytes_read.checked_add(op_size))
-                .ok_or_else(|| LimboError::Corrupt("payload_bytes_read overflow".to_string()))?;
+                .ok_or_else(|| {
+                    LimboError::InternalError("payload_bytes_read overflow".to_string())
+                })?;
 
             let parsed_op = match tag {
                 OP_UPSERT_TABLE => {
                     let table_id = table_id.expect("table op must carry table id");
                     let (rowid_u64, rowid_len) = read_varint(&payload).map_err(|e| {
-                        LimboError::Corrupt(format!(
+                        LimboError::InternalError(format!(
                             "failed to read rowid varint in upsert op: {e}"
                         ))
                     })?;
                     let rowid_i64 = rowid_u64 as i64;
                     if rowid_len > payload.len() {
-                        return Err(LimboError::Corrupt(
+                        return Err(LimboError::InternalError(
                             "upsert op rowid varint extends beyond payload".to_string(),
                         ));
                     }
@@ -2672,12 +2696,12 @@ impl StreamingLogicalLogReader {
                 OP_DELETE_TABLE => {
                     let table_id = table_id.expect("table op must carry table id");
                     let (rowid_u64, rowid_len) = read_varint(&payload).map_err(|e| {
-                        LimboError::Corrupt(format!(
+                        LimboError::InternalError(format!(
                             "failed to read rowid varint in delete op: {e}"
                         ))
                     })?;
                     if rowid_len > payload.len() {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(LimboError::InternalError(format!(
                             "delete op rowid varint len {rowid_len} > payload len {}",
                             payload.len()
                         )));
@@ -2722,7 +2746,7 @@ impl StreamingLogicalLogReader {
                 }
                 OP_UPDATE_HEADER => {
                     if payload.len() != DatabaseHeader::SIZE {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(LimboError::InternalError(format!(
                             "OP_UPDATE_HEADER payload len {} != DatabaseHeader::SIZE {}",
                             payload.len(),
                             DatabaseHeader::SIZE
@@ -2732,14 +2756,14 @@ impl StreamingLogicalLogReader {
                     bytes.copy_from_slice(&payload);
                     let header = *bytemuck::from_bytes::<DatabaseHeader>(&bytes);
                     if header.magic != *b"SQLite format 3\0" {
-                        return Err(LimboError::Corrupt(
+                        return Err(LimboError::InternalError(
                             "OP_UPDATE_HEADER has invalid SQLite magic".to_string(),
                         ));
                     }
                     ParsedOp::UpdateHeader { header, commit_ts }
                 }
                 _ => {
-                    return Err(LimboError::Corrupt(format!(
+                    return Err(LimboError::InternalError(format!(
                         "unknown op tag {tag} in payload"
                     )));
                 }
@@ -2841,7 +2865,7 @@ impl StreamingLogicalLogReader {
                         EXTENSION_TYPE_PORTABLE_CHANGES,
                     ) {
                         Ok(payload) => payload,
-                        Err(LimboError::Corrupt(msg)) => {
+                        Err(LimboError::InternalError(msg)) => {
                             tracing::warn!("corrupt extension block: {msg}");
                             return self.invalidate_frame();
                         }
@@ -2865,7 +2889,7 @@ impl StreamingLogicalLogReader {
                     }
                     Ok(IOResult::Done(PayloadOutcome::Eof)) => return self.abort_frame_eof(),
                     Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
-                    Err(LimboError::Corrupt(msg)) => {
+                    Err(LimboError::InternalError(msg)) => {
                         tracing::warn!("corrupt payload: {msg}");
                         return self.invalidate_frame();
                     }
@@ -3046,7 +3070,7 @@ impl StreamingLogicalLogReader {
     /// checkpoints into `frame_in_progress`; the encrypted paths are parsed
     /// wholesale from the payload start (rewind-and-rebuild from `frame_anchor`)
     /// and store their result into `frame_in_progress` once complete. Corruption
-    /// propagates as `Err(LimboError::Corrupt(..))` for the caller to map to an
+    /// propagates as `Err(LimboError::InternalError(..))` for the caller to map to an
     /// invalid frame.
     fn parse_payload_phase(&mut self) -> Result<IOResult<PayloadOutcome>> {
         let (payload_size, op_count, commit_ts, extension_size, extension_record_count, header_crc) = {
@@ -3070,7 +3094,7 @@ impl StreamingLogicalLogReader {
             let plaintext_size = payload_size
                 .checked_add(encrypted_extension_size)
                 .ok_or_else(|| {
-                    LimboError::Corrupt("encrypted plaintext size overflows usize".into())
+                    LimboError::InternalError("encrypted plaintext size overflows usize".into())
                 })?;
             let Some((plaintext, running_crc)) = return_if_io!(self.read_encrypted_plaintext(
                 plaintext_size,
@@ -3081,9 +3105,9 @@ impl StreamingLogicalLogReader {
                 return Ok(IOResult::Done(PayloadOutcome::Eof));
             };
             let recovery_start = extension_size;
-            let recovery_end = recovery_start
-                .checked_add(payload_size)
-                .ok_or_else(|| LimboError::Corrupt("recovery payload offset overflow".into()))?;
+            let recovery_end = recovery_start.checked_add(payload_size).ok_or_else(|| {
+                LimboError::InternalError("recovery payload offset overflow".into())
+            })?;
             let portable_changes = find_extension_payload(
                 &plaintext[..extension_size],
                 extension_record_count,
@@ -3213,7 +3237,7 @@ impl StreamingLogicalLogReader {
                     encryption_ctx.nonce_size(),
                 )?)
                 .ok_or_else(|| {
-                    LimboError::Corrupt("encrypted payload size overflows usize".to_string())
+                    LimboError::InternalError("encrypted payload size overflows usize".to_string())
                 })?;
         }
         Ok(on_disk_size)
@@ -3352,13 +3376,13 @@ impl StreamingLogicalLogReader {
             payload_size
                 .checked_add(encrypted_extension_size)
                 .ok_or_else(|| {
-                    LimboError::Corrupt(
+                    LimboError::InternalError(
                         "payload plus encrypted extension size overflows usize".to_string(),
                     )
                 })?,
         ) {
             Ok(size) => size,
-            Err(LimboError::Corrupt(msg)) => {
+            Err(LimboError::InternalError(msg)) => {
                 tracing::warn!("corrupt payload size: {msg}");
                 self.last_valid_offset = frame_start;
                 return Ok(IOResult::Done(ParseResult::InvalidFrame));
@@ -3369,7 +3393,7 @@ impl StreamingLogicalLogReader {
             let plaintext_size = payload_size
                 .checked_add(encrypted_extension_size)
                 .ok_or_else(|| {
-                    LimboError::Corrupt("encrypted plaintext size overflows usize".into())
+                    LimboError::InternalError("encrypted plaintext size overflows usize".into())
                 })?;
             let Some((plaintext, running_crc)) = return_if_io!(self.read_encrypted_plaintext(
                 plaintext_size,
@@ -3385,7 +3409,7 @@ impl StreamingLogicalLogReader {
                 EXTENSION_TYPE_PORTABLE_CHANGES,
             ) {
                 Ok(payload) => payload,
-                Err(LimboError::Corrupt(msg)) => {
+                Err(LimboError::InternalError(msg)) => {
                     tracing::warn!("corrupt extension block: {msg}");
                     self.last_valid_offset = frame_start;
                     return Ok(IOResult::Done(ParseResult::InvalidFrame));
@@ -3404,7 +3428,7 @@ impl StreamingLogicalLogReader {
                             EXTENSION_TYPE_PORTABLE_CHANGES,
                         ) {
                             Ok(payload) => payload,
-                            Err(LimboError::Corrupt(msg)) => {
+                            Err(LimboError::InternalError(msg)) => {
                                 tracing::warn!("corrupt extension block: {msg}");
                                 self.last_valid_offset = frame_start;
                                 return Ok(IOResult::Done(ParseResult::InvalidFrame));
@@ -3619,7 +3643,7 @@ impl StreamingLogicalLogReader {
         bytes[len] = c;
         len += 1;
         if (v >> 48) == 0 {
-            return Err(LimboError::Corrupt("Invalid varint".to_string()));
+            return Err(LimboError::InternalError("Invalid varint".to_string()));
         }
         v = (v << 8) + c as u64;
         Ok(IOResult::Done(Some((v, bytes, len))))
@@ -3647,7 +3671,7 @@ impl StreamingLogicalLogReader {
                 };
                 let result = out.read().clone();
                 if result.len() != expected_len {
-                    return Err(LimboError::Corrupt(format!(
+                    return Err(LimboError::InternalError(format!(
                         "Logical log short read: expected {expected_len}, got {}",
                         result.len()
                     )));
@@ -3708,7 +3732,7 @@ impl StreamingLogicalLogReader {
                 let buffer_size_after_read = self.buffer.read().len();
                 let bytes_read = buffer_size_after_read - pre_size;
                 if bytes_read == 0 {
-                    return Err(LimboError::Corrupt(format!(
+                    return Err(LimboError::InternalError(format!(
                         "Expected to read more bytes but read 0 bytes at offset {}",
                         self.offset
                     )));
@@ -3766,7 +3790,7 @@ impl StreamingLogicalLogReader {
 
             if to_read == 0 {
                 // No more data available in file even though we need more -> corrupt
-                return Err(LimboError::Corrupt(format!(
+                return Err(LimboError::InternalError(format!(
                     "Expected to read {still_need} bytes more but reached end of file at offset {}",
                     self.offset
                 )));
@@ -3815,7 +3839,7 @@ struct EncryptedPayloadReadContext {
 /// Used by `parse_encrypted_payload` and `parse_streaming_payload` to communicate
 /// back to `parse_next_transaction` without duplicating control flow.
 ///
-/// Corruption is signalled via `Err(LimboError::Corrupt(...))`, not a variant here.
+/// Corruption is signalled via `Err(LimboError::InternalError(...))`, not a variant here.
 /// The caller (`parse_next_transaction`) catches those errors and converts them to
 /// `ParseResult::InvalidFrame` to preserve the WAL-prefix "stop scanning" semantics.
 enum PayloadParseResult {
@@ -3827,7 +3851,7 @@ enum PayloadParseResult {
 
 /// Result of reading and decrypting one encrypted chunk into `decrypt_scratch`.
 /// Corruption (decryption failure, length mismatch) is returned as
-/// `Err(LimboError::Corrupt(...))`.
+/// `Err(LimboError::InternalError(...))`.
 enum EncryptedChunkReadResult {
     Ok { running_crc: u32 },
     Eof,

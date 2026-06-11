@@ -1698,14 +1698,14 @@ impl Schema {
                     let record = return_if_io!(cursor.record());
                     let source = state.sequence_sources.pop().expect("at least one source");
                     let record = record.ok_or_else(|| {
-                        LimboError::Corrupt(format!(
+                        LimboError::InternalError(format!(
                             "internal sequence backing table for \"{}\" is empty; \
                              the descriptor metadata row must always be present",
                             source.sequence_name
                         ))
                     })?;
                     let metadata = Self::read_sequence_metadata(record).ok_or_else(|| {
-                        LimboError::Corrupt(format!(
+                        LimboError::InternalError(format!(
                             "internal sequence backing table for \"{}\" descriptor \
                              row is malformed (expected integers for \
                              start/inc/min/max/cycle)",
@@ -1741,7 +1741,7 @@ impl Schema {
             let table = self
                 .get_btree_table(&unparsed_sql_from_index.table_name)
                 .ok_or_else(|| {
-                    LimboError::Corrupt(format!(
+                    LimboError::InternalError(format!(
                         "sqlite_schema contains index for missing table '{}': rootpage={} sql={}",
                         unparsed_sql_from_index.table_name,
                         unparsed_sql_from_index.root_page,
@@ -1766,7 +1766,7 @@ impl Schema {
             // e.g. CREATE TABLE t (a, b, UNIQUE(a, b)), and you can't do something like CREATE TABLE t (a, b, UNIQUE(a, b), c);
             // Hence, we can process the singles first (unique_set.columns.len() == 1), and then the compounds (unique_set.columns.len() > 1).
             let table = self.get_btree_table(&automatic_index.0).ok_or_else(|| {
-                LimboError::Corrupt(format!(
+                LimboError::InternalError(format!(
                     "sqlite_schema contains automatic index for missing table '{}': indexes={:?}",
                     automatic_index.0, automatic_index.1
                 ))
@@ -2021,7 +2021,7 @@ impl Schema {
             metadata.cycle,
         )
         .map_err(|err| {
-            LimboError::Corrupt(format!(
+            LimboError::InternalError(format!(
                 "internal sequence backing table for \"{sequence_name}\" \
                  has invalid persisted metadata \
                  (start={}, increment={}, min={}, max={}, cycle={}): {err}",
@@ -6752,7 +6752,7 @@ mod tests {
             "invalid persisted descriptor must surface as an error, not be silently dropped",
         );
         assert!(
-            matches!(err, LimboError::Corrupt(_)),
+            matches!(err, LimboError::InternalError(_)),
             "expected Corrupt error for unreadable internal backing table, got: {err:?}",
         );
         assert!(

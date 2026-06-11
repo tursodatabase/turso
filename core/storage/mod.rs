@@ -33,6 +33,6 @@ pub(crate) mod wal;
 #[macro_export]
 macro_rules! return_corrupt {
     ($($arg:tt)*) => {
-        return Err(LimboError::Corrupt(format!($($arg)*)));
+        return Err(LimboError::InternalError(format!($($arg)*)));
     };
 }

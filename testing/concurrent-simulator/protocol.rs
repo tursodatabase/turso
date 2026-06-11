@@ -113,7 +113,7 @@ impl WorkerResponse {
 pub fn limbo_error_to_message(err: &LimboError) -> String {
     match err {
         LimboError::DatabaseFull(s)
-        | LimboError::Corrupt(s)
+        | LimboError::InternalError(s)
         | LimboError::InternalError(s)
         | LimboError::ParseError(s)
         | LimboError::TxError(s)
@@ -137,7 +137,7 @@ pub fn limbo_error_to_kind(err: &LimboError) -> &'static str {
         LimboError::TableLocked => "TableLocked",
         LimboError::InvalidArgument(_) => "InvalidArgument",
         LimboError::Constraint(_) => "Constraint",
-        LimboError::Corrupt(_) => "Corrupt",
+        LimboError::InternalError(_) => "Corrupt",
         LimboError::ReadOnly => "ReadOnly",
         LimboError::Interrupt => "Interrupt",
         LimboError::InternalError(_) => "InternalError",
@@ -162,7 +162,7 @@ fn error_kind_to_limbo_error(kind: &str, message: &str) -> LimboError {
         "TableLocked" => LimboError::TableLocked,
         "InvalidArgument" => LimboError::InvalidArgument(message.to_string()),
         "Constraint" => LimboError::Constraint(message.to_string()),
-        "Corrupt" => LimboError::Corrupt(message.to_string()),
+        "Corrupt" => LimboError::InternalError(message.to_string()),
         "ReadOnly" => LimboError::ReadOnly,
         "Interrupt" => LimboError::Interrupt,
         "InternalError" => LimboError::InternalError(message.to_string()),
@@ -209,8 +209,8 @@ mod tests {
                 matches!(e, LimboError::WriteWriteConflict)
             }),
             (
-                LimboError::Corrupt("c".into()),
-                |e| matches!(e, LimboError::Corrupt(m) if m == "c"),
+                LimboError::InternalError("c".into()),
+                |e| matches!(e, LimboError::InternalError(m) if m == "c"),
             ),
         ];
         for (orig, predicate) in cases {
@@ -219,7 +219,7 @@ mod tests {
                 LimboError::ParseError(s)
                 | LimboError::TxError(s)
                 | LimboError::DatabaseFull(s)
-                | LimboError::Corrupt(s) => s.clone(),
+                | LimboError::InternalError(s) => s.clone(),
                 _ => String::new(),
             };
             let reconstructed = error_kind_to_limbo_error(kind, &msg);

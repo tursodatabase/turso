@@ -577,7 +577,7 @@ impl SortedChunk {
                                     Ok((record_size, bytes_read)) => {
                                         (record_size as usize, bytes_read)
                                     }
-                                    Err(LimboError::Corrupt(_))
+                                    Err(LimboError::InternalError(_))
                                         if *self.io_state.read() != SortedChunkIOState::ReadEOF =>
                                     {
                                         // Failed to decode a partial varint.
@@ -914,7 +914,7 @@ impl BoxedSortableRecord {
                 }
                 None => {
                     mark_unlikely();
-                    deserialization_error = Some(LimboError::Corrupt(
+                    deserialization_error = Some(LimboError::InternalError(
                         "Not enough columns in record".to_string(),
                     ));
                     break;

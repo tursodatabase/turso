@@ -2835,7 +2835,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
         }
 
         if data_sum > data.len() {
-            return Some(Err(LimboError::Corrupt(
+            return Some(Err(LimboError::InternalError(
                 "Data section too small for indicated serial type size".into(),
             )));
         }
@@ -2864,7 +2864,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
             // I8
             1 => {
                 if unlikely(data.is_empty()) {
-                    return Some(Err(LimboError::Corrupt("Invalid 1-byte int".into())));
+                    return Some(Err(LimboError::InternalError("Invalid 1-byte int".into())));
                 }
                 self.set_data_section(&data[1..]);
                 dest.set_int(data[0] as i8 as i64);
@@ -2872,7 +2872,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
             // I16
             2 => {
                 if unlikely(data.len() < 2) {
-                    return Some(Err(LimboError::Corrupt("Invalid 2-byte int".into())));
+                    return Some(Err(LimboError::InternalError("Invalid 2-byte int".into())));
                 }
                 self.set_data_section(&data[2..]);
                 dest.set_int(i16::from_be_bytes([data[0], data[1]]) as i64);
@@ -2880,7 +2880,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
             // I24
             3 => {
                 if unlikely(data.len() < 3) {
-                    return Some(Err(LimboError::Corrupt("Invalid 3-byte int".into())));
+                    return Some(Err(LimboError::InternalError("Invalid 3-byte int".into())));
                 }
                 self.set_data_section(&data[3..]);
                 let sign_extension = if data[0] <= 0x7F { 0 } else { 0xFF };
@@ -2891,7 +2891,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
             // I32
             4 => {
                 if unlikely(data.len() < 4) {
-                    return Some(Err(LimboError::Corrupt("Invalid 4-byte int".into())));
+                    return Some(Err(LimboError::InternalError("Invalid 4-byte int".into())));
                 }
                 self.set_data_section(&data[4..]);
                 dest.set_int(i32::from_be_bytes([data[0], data[1], data[2], data[3]]) as i64);
@@ -2899,7 +2899,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
             // I48
             5 => {
                 if unlikely(data.len() < 6) {
-                    return Some(Err(LimboError::Corrupt("Invalid 6-byte int".into())));
+                    return Some(Err(LimboError::InternalError("Invalid 6-byte int".into())));
                 }
                 self.set_data_section(&data[6..]);
                 let sign_extension = if data[0] <= 0x7F { 0 } else { 0xFF };
@@ -2917,7 +2917,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
             // I64
             6 => {
                 if unlikely(data.len() < 8) {
-                    return Some(Err(LimboError::Corrupt("Invalid 8-byte int".into())));
+                    return Some(Err(LimboError::InternalError("Invalid 8-byte int".into())));
                 }
                 self.set_data_section(&data[8..]);
                 dest.set_int(i64::from_be_bytes([
@@ -2927,7 +2927,9 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
             // F64
             7 => {
                 if unlikely(data.len() < 8) {
-                    return Some(Err(LimboError::Corrupt("Invalid 8-byte float".into())));
+                    return Some(Err(LimboError::InternalError(
+                        "Invalid 8-byte float".into(),
+                    )));
                 }
                 self.set_data_section(&data[8..]);
                 let val = f64::from_be_bytes([
@@ -2952,7 +2954,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
             // Reserved
             10 | 11 => {
                 mark_unlikely();
-                return Some(Err(LimboError::Corrupt(format!(
+                return Some(Err(LimboError::InternalError(format!(
                     "Reserved serial type: {serial_type}"
                 ))));
             }
@@ -2960,7 +2962,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
             n if n >= 12 && n & 1 == 0 => {
                 let content_size = ((n - 12) / 2) as usize;
                 if unlikely(data.len() < content_size) {
-                    return Some(Err(LimboError::Corrupt("Invalid Blob value".into())));
+                    return Some(Err(LimboError::InternalError("Invalid Blob value".into())));
                 }
                 self.set_data_section(&data[content_size..]);
                 let blob_data = &data[..content_size];
@@ -2981,7 +2983,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
             n if n >= 13 && n & 1 == 1 => {
                 let content_size = ((n - 13) / 2) as usize;
                 if unlikely(data.len() < content_size) {
-                    return Some(Err(LimboError::Corrupt("Invalid Text value".into())));
+                    return Some(Err(LimboError::InternalError("Invalid Text value".into())));
                 }
                 self.set_data_section(&data[content_size..]);
                 let text_data = &data[..content_size];
@@ -3013,7 +3015,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
             }
             _ => {
                 mark_unlikely();
-                return Some(Err(LimboError::Corrupt(format!(
+                return Some(Err(LimboError::InternalError(format!(
                     "Invalid serial type: {serial_type}"
                 ))));
             }

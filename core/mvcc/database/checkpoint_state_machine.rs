@@ -1407,12 +1407,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         }
 
         let (table_id, num_columns) = self.mvcc_meta_table.ok_or_else(|| {
-            LimboError::Corrupt(format!(
+            LimboError::InternalError(format!(
                 "Missing required internal metadata table {MVCC_META_TABLE_NAME}"
             ))
         })?;
         let new_i64 = i64::try_from(new).map_err(|_| {
-            LimboError::Corrupt(format!("MVCC checkpoint timestamp does not fit i64: {new}"))
+            LimboError::InternalError(format!("MVCC checkpoint timestamp does not fit i64: {new}"))
         })?;
         let record = ImmutableRecord::from_values(
             &[

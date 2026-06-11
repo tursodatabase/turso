@@ -10170,7 +10170,7 @@ pub fn op_idx_delete(
                         let reg_values = (*start_reg..*start_reg + *num_regs)
                             .map(|i| &state.registers[i])
                             .collect::<Vec<_>>();
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(LimboError::InternalError(format!(
                             "IdxDelete: no matching index entry found for key {reg_values:?} while seeking"
                         )));
                     }
@@ -10191,7 +10191,7 @@ pub fn op_idx_delete(
                     let reg_values = (*start_reg..*start_reg + *num_regs)
                         .map(|i| &state.registers[i])
                         .collect::<Vec<_>>();
-                    return Err(LimboError::Corrupt(format!(
+                    return Err(LimboError::InternalError(format!(
                         "IdxDelete: no matching index entry found for key while verifying: {reg_values:?}"
                     )));
                 }
@@ -15630,9 +15630,9 @@ fn op_journal_mode_inner(
 
                 let prev_mode_raw = return_if_io!(header_result);
 
-                let prev_mode_version = prev_mode_raw
-                    .to_version()
-                    .map_err(|val| LimboError::Corrupt(format!("Invalid read_version: {val}")))?;
+                let prev_mode_version = prev_mode_raw.to_version().map_err(|val| {
+                    LimboError::InternalError(format!("Invalid read_version: {val}"))
+                })?;
 
                 let prev_mode = journal_mode::JournalMode::from(prev_mode_version);
                 state.active_op_state.journal_mode().prev_mode = Some(prev_mode);

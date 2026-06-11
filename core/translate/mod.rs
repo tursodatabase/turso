@@ -573,13 +573,13 @@ mod tests {
         let err = translate(&schema, stmt, pager, conn, &syms, QueryMode::Normal, "")
             .expect_err("translation should fail with malformed sqlite_sequence");
         match err {
-            crate::LimboError::Corrupt(msg) => {
+            crate::LimboError::InternalError(msg) => {
                 assert!(
                     msg.contains("sqlite_sequence"),
                     "expected sqlite_sequence corruption error, got: {msg}"
                 );
             }
-            other => panic!("expected LimboError::Corrupt, got: {other}"),
+            other => panic!("expected LimboError::InternalError, got: {other}"),
         }
     }
 
@@ -607,13 +607,13 @@ mod tests {
         let err = translate(&schema, stmt, pager, conn, &syms, QueryMode::Normal, "")
             .expect_err("translation should fail with missing sqlite_sequence");
         match err {
-            crate::LimboError::Corrupt(msg) => {
+            crate::LimboError::InternalError(msg) => {
                 assert!(
                     msg.contains("missing sqlite_sequence"),
                     "expected missing sqlite_sequence error, got: {msg}"
                 );
             }
-            other => panic!("expected LimboError::Corrupt, got: {other}"),
+            other => panic!("expected LimboError::InternalError, got: {other}"),
         }
     }
 

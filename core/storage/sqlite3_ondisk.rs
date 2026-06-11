@@ -530,7 +530,9 @@ impl TryFrom<u8> for PageType {
             13 => Ok(Self::TableLeaf),
             _ => {
                 mark_unlikely();
-                Err(LimboError::Corrupt(format!("Invalid page type: {value}")))
+                Err(LimboError::InternalError(format!(
+                    "Invalid page type: {value}"
+                )))
             }
         }
     }
@@ -976,7 +978,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
         SerialTypeKind::I8 => {
             let val = *buf.first().ok_or_else(|| {
                 mark_unlikely();
-                LimboError::Corrupt("Invalid UInt8 value".into())
+                LimboError::InternalError("Invalid UInt8 value".into())
             })?;
             Ok((ValueRef::Numeric(Numeric::Integer(val as i8 as i64)), 1))
         }
@@ -986,7 +988,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     .and_then(|s| s.try_into().ok())
                     .ok_or_else(|| {
                         mark_unlikely();
-                        LimboError::Corrupt("Invalid BEInt16 value".into())
+                        LimboError::InternalError("Invalid BEInt16 value".into())
                     })?;
             Ok((
                 ValueRef::Numeric(Numeric::Integer(i16::from_be_bytes(*bytes) as i64)),
@@ -999,7 +1001,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     .and_then(|s| s.try_into().ok())
                     .ok_or_else(|| {
                         mark_unlikely();
-                        LimboError::Corrupt("Invalid BEInt24 value".into())
+                        LimboError::InternalError("Invalid BEInt24 value".into())
                     })?;
             let sign_extension = (bytes[0] as i8 >> 7) as u8;
             Ok((
@@ -1018,7 +1020,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     .and_then(|s| s.try_into().ok())
                     .ok_or_else(|| {
                         mark_unlikely();
-                        LimboError::Corrupt("Invalid BEInt32 value".into())
+                        LimboError::InternalError("Invalid BEInt32 value".into())
                     })?;
             Ok((
                 ValueRef::Numeric(Numeric::Integer(i32::from_be_bytes(*bytes) as i64)),
@@ -1031,7 +1033,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     .and_then(|s| s.try_into().ok())
                     .ok_or_else(|| {
                         mark_unlikely();
-                        LimboError::Corrupt("Invalid BEInt48 value".into())
+                        LimboError::InternalError("Invalid BEInt48 value".into())
                     })?;
             let sign_extension = (bytes[0] as i8 >> 7) as u8;
             Ok((
@@ -1054,7 +1056,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     .and_then(|s| s.try_into().ok())
                     .ok_or_else(|| {
                         mark_unlikely();
-                        LimboError::Corrupt("Invalid BEInt64 value".into())
+                        LimboError::InternalError("Invalid BEInt64 value".into())
                     })?;
             Ok((
                 ValueRef::Numeric(Numeric::Integer(i64::from_be_bytes(*bytes))),
@@ -1065,7 +1067,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
             let bytes: &[u8; 8] = buf
                 .get(..8)
                 .and_then(|s| s.try_into().ok())
-                .ok_or_else(|| LimboError::Corrupt("Invalid BEFloat64 value".into()))?;
+                .ok_or_else(|| LimboError::InternalError("Invalid BEFloat64 value".into()))?;
             Ok((ValueRef::from_f64(f64::from_be_bytes(*bytes)), 8))
         }
         SerialTypeKind::ConstInt0 => Ok((ValueRef::Numeric(Numeric::Integer(0)), 0)),
@@ -1074,7 +1076,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
             let content_size = serial_type.size();
             let data = buf.get(..content_size).ok_or_else(|| {
                 mark_unlikely();
-                LimboError::Corrupt("Invalid Blob value".into())
+                LimboError::InternalError("Invalid Blob value".into())
             })?;
             Ok((ValueRef::Blob(data), content_size))
         }
@@ -1082,7 +1084,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
             let content_size = serial_type.size();
             let data = buf.get(..content_size).ok_or_else(|| {
                 mark_unlikely();
-                LimboError::Corrupt(format!(
+                LimboError::InternalError(format!(
                     "Invalid String value, length {} < expected length {}",
                     buf.len(),
                     content_size
@@ -1201,7 +1203,7 @@ pub fn read_value_serial_type<'a>(
                 let content_size = ((n - 12) / 2) as usize;
                 let data = buf.get(..content_size).ok_or_else(|| {
                     mark_unlikely();
-                    LimboError::Corrupt("Invalid Blob value".into())
+                    LimboError::InternalError("Invalid Blob value".into())
                 })?;
                 Ok((ValueRef::Blob(data), content_size))
             }
@@ -1210,7 +1212,7 @@ pub fn read_value_serial_type<'a>(
                 let content_size = ((n - 13) / 2) as usize;
                 let data = buf.get(..content_size).ok_or_else(|| {
                     mark_unlikely();
-                    LimboError::Corrupt(format!(
+                    LimboError::InternalError(format!(
                         "Invalid String value, length {} < expected length {}",
                         buf.len(),
                         content_size
