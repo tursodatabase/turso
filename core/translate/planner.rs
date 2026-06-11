@@ -1276,6 +1276,19 @@ fn parse_table(
         );
     }
 
+    // A view row whose stored SQL failed to parse at schema load
+    let is_broken_view = resolver.with_schema(database_id, |schema| {
+        schema.broken_views.contains(&normalized_qualified_name)
+    });
+
+    if is_broken_view {
+        crate::bail_parse_error!(
+            "view '{}' could not be loaded: its SQL in sqlite_schema does not parse. \n\
+             Use DROP VIEW to remove it, then recreate it.",
+            normalized_qualified_name
+        );
+    }
+
     crate::bail_parse_error!("no such table: {}", normalized_qualified_name);
 }
 

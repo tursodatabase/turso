@@ -481,6 +481,12 @@ fn strict_default_type_mismatch(column: &Column) -> Result<bool> {
         return Ok(false);
     };
 
+    // Non-constant defaults cannot be evaluated here; they are only legal on
+    // an empty table (enforced at runtime), where no backfill value is needed.
+    if !is_strict_constant_default(default_expr) {
+        return Ok(false);
+    }
+
     let mut value = eval_constant_default_value(default_expr)?;
     if matches!(value, Value::Null) {
         return Ok(false);
@@ -1230,20 +1236,6 @@ pub fn translate_alter_table(
             let constraints = col_def.constraints.clone();
             let mut column = Column::try_from(&col_def)?;
 
-            // SQLite is very strict about what constitutes a "constant" default for
-            // ALTER TABLE ADD COLUMN. It only allows literals and signed literals,
-            // not arbitrary constant expressions like (5 + 3) or COALESCE(NULL, 5).
-            if !is_generated
-                && column
-                    .default
-                    .as_ref()
-                    .is_some_and(|default| !is_strict_constant_default(default))
-            {
-                return Err(LimboError::ParseError(
-                    "Cannot add a column with non-constant default".to_string(),
-                ));
-            }
-
             let new_column_name = column.name.clone().ok_or_else(|| {
                 LimboError::ParseError(
                     "column name is missing in ALTER TABLE ADD COLUMN".to_string(),
@@ -1451,10 +1443,14 @@ pub fn translate_alter_table(
                 let needs_notnull_check = column.notnull()
                     && effective_default.is_none_or(crate::util::expr_contains_null);
 
-                let needs_nondeterministic_check = column
-                    .default
-                    .as_ref()
-                    .is_some_and(|default| default_requires_empty_table(default));
+                // SQLite is very strict about what constitutes a "constant" default
+                // for ALTER TABLE ADD COLUMN: only literals, signed literals, and
+                // bare identifiers qualify. Anything else — (5 + 3), random(),
+                // CURRENT_TIMESTAMP — is permitted only if the table is empty,
+                // checked at runtime (mirroring SQLite's sqlite3ErrorIfNotEmpty).
+                let needs_nondeterministic_check = column.default.as_ref().is_some_and(|default| {
+                    default_requires_empty_table(default) || !is_strict_constant_default(default)
+                });
 
                 let (needs_empty_table_check, error_message) = if needs_notnull_check {
                     (true, "Cannot add a NOT NULL column with default value NULL")

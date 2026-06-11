@@ -2280,7 +2280,7 @@ mod rename_column_view {
 
             for (i, indexed_col) in view_columns.iter().enumerate() {
                 if let Some(col) = final_columns.get_mut(i) {
-                    col.name = Some(indexed_col.col_name.to_string());
+                    col.name = Some(indexed_col.col_name.as_str().to_string());
                 }
             }
 
@@ -2351,7 +2351,7 @@ mod rename_column_view {
         let mut columns = view_column_schema.flat_columns();
         for (i, indexed_col) in explicit.iter().enumerate() {
             if let Some(col) = columns.get_mut(i) {
-                col.name = Some(indexed_col.col_name.to_string());
+                col.name = Some(indexed_col.col_name.as_str().to_string());
             }
         }
         Ok(columns)
@@ -3136,7 +3136,7 @@ mod rename_column_view {
     fn apply_explicit_column_names(columns: &mut [String], explicit: &[ast::IndexedColumn]) {
         for (i, indexed_col) in explicit.iter().enumerate() {
             if let Some(col) = columns.get_mut(i) {
-                *col = indexed_col.col_name.to_string();
+                *col = indexed_col.col_name.as_str().to_string();
             }
         }
     }

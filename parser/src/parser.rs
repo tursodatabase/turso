@@ -707,6 +707,14 @@ impl<'a> Parser<'a> {
         Ok(Name::from_bytes(tok.as_bytes()))
     }
 
+    /// After `peek()` returned `TK_LBRACKET`, report whether the brackets are
+    /// empty (`[]`). Empty brackets are an array-type suffix, not a
+    /// bracket-quoted identifier. `peek()` leaves the lexer offset right after
+    /// the peeked token, so the next raw byte decides.
+    fn peeked_empty_brackets(&self) -> bool {
+        self.lexer.input.get(self.lexer.offset) == Some(&b']')
+    }
+
     /// Parse a bracket-quoted identifier like `[name]` or `[ multi word name]`.
     fn parse_bracket_quoted_name(&mut self) -> Result<Name> {
         eat_assert!(self, TK_LBRACKET);
@@ -731,7 +739,7 @@ impl<'a> Parser<'a> {
                     eat_assert!(self, TK_TRANSACTION);
                     match self.peek()? {
                         Some(tok) => match tok.token_type {
-                            TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW => {
+                            TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => {
                                 Ok(Some(self.parse_nm()?))
                             }
                             _ => Ok(None),
@@ -1157,6 +1165,9 @@ impl<'a> Parser<'a> {
                     let tok = eat_assert!(self, TK_ID, TK_STRING);
                     from_bytes(tok.as_bytes())
                 }
+                TK_LBRACKET if !self.peeked_empty_brackets() => {
+                    self.parse_bracket_quoted_name()?.as_str().to_owned()
+                }
                 _ => return Ok(None),
             }
         } else {
@@ -1187,6 +1198,11 @@ impl<'a> Parser<'a> {
                     let tok = eat_assert!(self, TK_ID, TK_STRING);
                     type_name.push(' ');
                     type_name.push_str(from_bytes_as_str(tok.value));
+                }
+                TK_LBRACKET if !self.peeked_empty_brackets() => {
+                    let name = self.parse_bracket_quoted_name()?;
+                    type_name.push(' ');
+                    type_name.push_str(name.as_str());
                 }
                 _ => break,
             }
@@ -1743,9 +1759,30 @@ impl<'a> Parser<'a> {
                 Ok(Box::new(Expr::Raise(resolve, expr)))
             }
             TK_LBRACKET => {
-                // Bracket-quoted identifier: [name] or [multi word name]
+                // Bracket-quoted identifier: [name] or [multi word name],
+                // optionally qualified: [tbl].[col] or [db].[tbl].[col]
                 let name = self.parse_bracket_quoted_name()?;
-                Ok(Box::new(Expr::Id(name)))
+                let second_name = if self.peek()?.is_some_and(|t| t.token_type == TK_DOT) {
+                    eat_assert!(self, TK_DOT);
+                    Some(self.parse_nm()?)
+                } else {
+                    None
+                };
+                let third_name = if second_name.is_some()
+                    && self.peek()?.is_some_and(|t| t.token_type == TK_DOT)
+                {
+                    eat_assert!(self, TK_DOT);
+                    Some(self.parse_nm()?)
+                } else {
+                    None
+                };
+                match (second_name, third_name) {
+                    (Some(second), Some(third)) => {
+                        Ok(Box::new(Expr::DoublyQualified(name, second, third)))
+                    }
+                    (Some(second), None) => Ok(Box::new(Expr::Qualified(name, second))),
+                    _ => Ok(Box::new(Expr::Id(name))),
+                }
             }
             _ => {
                 let can_be_lit_str = tok.token_type == TK_STRING;
@@ -2300,6 +2337,9 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
 
+        if self.peek()?.is_some_and(|t| t.token_type == TK_LBRACKET) {
+            return Ok(Some(self.parse_bracket_quoted_name()?));
+        }
         let tok = eat_expect!(self, TK_ID, TK_STRING);
         Ok(Some(Name::from_bytes(tok.as_bytes())))
     }
@@ -3370,7 +3410,9 @@ impl<'a> Parser<'a> {
         eat_assert!(self, TK_ANALYZE);
         let name = match self.peek()? {
             Some(tok) => match tok.token_type.fallback_id_if_ok() {
-                TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW => Some(self.parse_fullname(false)?),
+                TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => {
+                    Some(self.parse_fullname(false)?)
+                }
                 _ => None,
             },
             _ => None,
@@ -3421,7 +3463,7 @@ impl<'a> Parser<'a> {
                     tok.as_bytes(),
                 )))))
             }
-            TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW => {
+            TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => {
                 Ok(Box::new(Expr::Name(self.parse_nm()?)))
             }
             tt if tt
@@ -3469,7 +3511,7 @@ impl<'a> Parser<'a> {
 
         let name = match self.peek()? {
             Some(tok) => match tok.token_type.fallback_id_if_ok() {
-                TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW => Some(self.parse_nm()?),
+                TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => Some(self.parse_nm()?),
                 _ => None,
             },
             _ => None,
@@ -3515,6 +3557,7 @@ impl<'a> Parser<'a> {
             TK_MINUS,
             TK_ID,
             TK_INDEXED,
+            TK_LBRACKET,
         );
 
         match tok.token_type {
@@ -3982,7 +4025,9 @@ impl<'a> Parser<'a> {
                         eat_assert!(self, TK_COLUMNKW);
                         Some(self.parse_nm()?)
                     }
-                    TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW => Some(self.parse_nm()?),
+                    TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => {
+                        Some(self.parse_nm()?)
+                    }
                     _ => None,
                 };
 
@@ -4106,7 +4151,15 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_set(&mut self) -> Result<Set> {
-        let tok = peek_expect!(self, TK_LP, TK_ID, TK_STRING, TK_JOIN_KW, TK_INDEXED);
+        let tok = peek_expect!(
+            self,
+            TK_LP,
+            TK_ID,
+            TK_STRING,
+            TK_JOIN_KW,
+            TK_INDEXED,
+            TK_LBRACKET
+        );
 
         match tok.token_type {
             TK_LP => {

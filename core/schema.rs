@@ -792,6 +792,12 @@ pub struct Schema {
     /// Track views that exist but have incompatible versions
     pub incompatible_views: HashSet<String>,
 
+    /// View rows in sqlite_schema whose stored SQL failed to parse (e.g.
+    /// older versions wrote view column lists without identifier quoting).
+    /// The rows are tolerated at load time so the database stays usable;
+    /// tracking the names lets DROP VIEW remove them.
+    pub broken_views: HashSet<String>,
+
     /// Root pages of tables/indexes that have been dropped but not yet checkpointed.
     /// In MVCC mode, when a table is dropped, the btree pages are not freed until checkpoint.
     /// integrity_check needs to know about these pages to avoid false positives about "page never used".
@@ -930,6 +936,7 @@ impl Schema {
             analyze_stats: AnalyzeStats::default(),
             table_to_materialized_views,
             incompatible_views,
+            broken_views: HashSet::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
             generated_columns_enabled: false,
@@ -1806,6 +1813,7 @@ impl Schema {
                             index_entry,
                             unique_set.columns.len(),
                             unique_set.conflict_clause,
+                            &unique_set.collations,
                         )?))?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
@@ -1837,6 +1845,7 @@ impl Schema {
                             index_entry,
                             column_indices_and_sort_orders,
                             unique_set.conflict_clause,
+                            &unique_set.collations,
                         )?))?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
@@ -2203,7 +2212,18 @@ impl Schema {
 
                 // Parse the SQL to determine if it's a regular or materialized view
                 let mut parser = Parser::new(sql.as_bytes());
-                if let Ok(Some(Cmd::Stmt(stmt))) = parser.next_cmd() {
+                let parsed = parser.next_cmd();
+                if !matches!(&parsed, Ok(Some(Cmd::Stmt(_)))) {
+                    // Tolerate view rows whose stored SQL no longer parses
+                    // (e.g. older versions wrote view column lists without
+                    // identifier quoting). The database stays usable; the
+                    // name is tracked so DROP VIEW can remove the row.
+                    tracing::warn!(
+                        "view '{view_name}' has unparseable SQL in sqlite_schema; \
+                         it is unavailable but can be removed with DROP VIEW: {sql}"
+                    );
+                    self.broken_views.insert(view_name);
+                } else if let Ok(Some(Cmd::Stmt(stmt))) = parsed {
                     match stmt {
                         Stmt::CreateMaterializedView { .. } => {
                             // Store materialized view info for later creation
@@ -2234,7 +2254,9 @@ impl Schema {
                             let mut final_columns = view_column_schema.flat_columns();
                             for (i, indexed_col) in column_names.iter().enumerate() {
                                 if let Some(col) = final_columns.get_mut(i) {
-                                    col.name = Some(indexed_col.col_name.to_string());
+                                    // as_str: Display would render the quoted form,
+                                    // embedding literal quote characters in the name
+                                    col.name = Some(indexed_col.col_name.as_str().to_string());
                                 }
                             }
 
@@ -2629,6 +2651,7 @@ impl Clone for Schema {
             analyze_stats: self.analyze_stats.clone(),
             table_to_materialized_views: self.table_to_materialized_views.clone(),
             incompatible_views,
+            broken_views: self.broken_views.clone(),
             dropped_root_pages: self.dropped_root_pages.clone(),
             type_registry: self.type_registry.clone(),
             generated_columns_enabled: self.generated_columns_enabled,
@@ -2885,6 +2908,10 @@ impl PartialEq for Table {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct UniqueSet {
     pub columns: Vec<(String, SortOrder)>,
+    /// Per-column collation overrides from the constraint definition,
+    /// e.g. `PRIMARY KEY(a COLLATE NOCASE)`. Parallel to `columns`; `None`
+    /// falls back to the column definition's collation.
+    pub collations: Vec<Option<CollationSeq>>,
     pub is_primary_key: bool,
     pub conflict_clause: Option<ResolveType>,
 }
@@ -4029,6 +4056,24 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
     Ok(())
 }
 
+/// Peel an optional `COLLATE` wrapper off a PRIMARY KEY / UNIQUE table
+/// constraint column, e.g. `PRIMARY KEY(a COLLATE NOCASE)`, returning the
+/// inner expression and the resolved collation.
+fn constraint_column_collation(expr: &Expr) -> Result<(&Expr, Option<CollationSeq>)> {
+    match expr {
+        Expr::Collate(inner, collation_name) => {
+            let collation_seq = CollationSeq::new(collation_name.as_str())?;
+            if collation_seq.is_custom() {
+                crate::bail_parse_error!(
+                    "custom collations are not supported in schema definitions"
+                );
+            }
+            Ok((inner.as_ref(), Some(collation_seq)))
+        }
+        _ => Ok((expr, None)),
+    }
+}
+
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
@@ -4082,8 +4127,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         has_autoincrement = true;
                     }
 
+                    let mut pk_collations = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
-                        let col_name = match column.expr.as_ref() {
+                        let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
+                        let col_name = match expr {
                             Expr::Id(id) => normalize_ident(id.as_str()),
                             Expr::Literal(Literal::String(value)) => {
                                 value.trim_matches('\'').to_owned()
@@ -4094,9 +4141,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         };
                         primary_key_columns
                             .push((col_name, column.order.unwrap_or(SortOrder::Asc)));
+                        pk_collations.push(collation);
                     }
                     unique_sets_constraints.push(UniqueSet {
                         columns: primary_key_columns.clone(),
+                        collations: pk_collations,
                         is_primary_key: true,
                         conflict_clause: *conflict_clause,
                     });
@@ -4106,9 +4155,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 } = &c.constraint
                 {
                     let mut unique_columns = Vec::try_with_capacity_ext(columns.len())?;
+                    let mut unique_collations = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
+                        let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
                         // preallocated enough to not need try_push
-                        match column.expr.as_ref() {
+                        match expr {
                             Expr::Id(id) => unique_columns.push((
                                 id.as_str().to_string(),
                                 column.order.unwrap_or(SortOrder::Asc),
@@ -4121,9 +4172,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 bail_parse_error!("unsupported unique key expression: {}", expr)
                             }
                         }
+                        unique_collations.push(collation);
                     }
                     let unique_set = UniqueSet {
                         columns: unique_columns,
+                        collations: unique_collations,
                         is_primary_key: false,
                         conflict_clause: *conflict_clause,
                     };
@@ -4300,6 +4353,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             }
                             unique_sets_columns.push(UniqueSet {
                                 columns: vec![(name.clone(), order)],
+                                collations: vec![None],
                                 is_primary_key: true,
                                 conflict_clause: *conflict_clause,
                             });
@@ -4323,6 +4377,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             unique = true;
                             unique_sets_columns.push(UniqueSet {
                                 columns: vec![(name.clone(), order)],
+                                collations: vec![None],
                                 is_primary_key: false,
                                 conflict_clause: *conflict,
                             });
@@ -5383,6 +5438,7 @@ impl Index {
         auto_index: (String, i64), // name, root_page
         column_count: usize,
         conflict_clause: Option<ResolveType>,
+        collation_overrides: &[Option<CollationSeq>],
     ) -> Result<Index> {
         let has_primary_key_index =
             table.get_rowid_alias_column().is_none() && !table.primary_key_columns.is_empty();
@@ -5390,7 +5446,7 @@ impl Index {
         let (index_name, root_page) = auto_index;
 
         let mut primary_keys = Vec::try_with_capacity_ext(column_count)?;
-        for (col_name, order) in table.primary_key_columns.iter() {
+        for (i, (col_name, order)) in table.primary_key_columns.iter().enumerate() {
             let Some((pos_in_table, _)) = table.get_column(col_name) else {
                 return Err(crate::LimboError::ParseError(format!(
                     "Column {} not found in table {}",
@@ -5403,7 +5459,11 @@ impl Index {
                 name: normalize_ident(col_name),
                 order: *order,
                 pos_in_table,
-                collation: column.collation_opt(),
+                collation: collation_overrides
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .or_else(|| column.collation_opt()),
                 default: column.default.clone(),
                 expr: None,
             });
@@ -5430,11 +5490,12 @@ impl Index {
         auto_index: (String, i64), // name, root_page
         column_indices_and_sort_orders: Vec<(usize, SortOrder)>,
         conflict_clause: Option<ResolveType>,
+        collation_overrides: &[Option<CollationSeq>],
     ) -> Result<Index> {
         let (index_name, root_page) = auto_index;
 
         let mut unique_cols = Vec::try_with_capacity_ext(column_indices_and_sort_orders.len())?;
-        for (pos, sort_order) in &column_indices_and_sort_orders {
+        for (i, (pos, sort_order)) in column_indices_and_sort_orders.iter().enumerate() {
             let Some((pos_in_table, col)) = table
                 .columns
                 .iter()
@@ -5451,7 +5512,11 @@ impl Index {
                 name: normalize_ident(col.name.as_ref().unwrap()),
                 order: *sort_order,
                 pos_in_table,
-                collation: col.collation_opt(),
+                collation: collation_overrides
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .or_else(|| col.collation_opt()),
                 default: col.default.clone(),
                 expr: None,
             });
@@ -5982,6 +6047,7 @@ mod tests {
             ("sqlite_autoindex_t1_1".to_string(), 2),
             1,
             None,
+            &[],
         )
         .unwrap();
     }
@@ -5995,6 +6061,7 @@ mod tests {
             ("sqlite_autoindex_t1_1".to_string(), 2),
             2,
             None,
+            &[],
         )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
@@ -6019,6 +6086,7 @@ mod tests {
             ("sqlite_autoindex_t1_1".to_string(), 2),
             1,
             None,
+            &[],
         )
         .unwrap();
     }
@@ -6055,6 +6123,7 @@ mod tests {
             ("sqlite_autoindex_t1_1".to_string(), 2),
             1,
             None,
+            &[],
         );
         assert!(result.is_err());
     }
@@ -6068,6 +6137,7 @@ mod tests {
             ("sqlite_autoindex_t1_1".to_string(), 2),
             vec![(1, SortOrder::Asc)],
             None,
+            &[],
         )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
@@ -6090,12 +6160,14 @@ mod tests {
                 ("sqlite_autoindex_t1_1".to_string(), 2),
                 1,
                 None,
+                &[],
             )?,
             Index::automatic_from_unique(
                 &table,
                 ("sqlite_autoindex_t1_2".to_string(), 3),
                 vec![(1, SortOrder::Asc)],
                 None,
+                &[],
             )?,
         ];
 
@@ -6133,18 +6205,21 @@ mod tests {
                 ("sqlite_autoindex_t1_1".to_string(), 2),
                 1,
                 None,
+                &[],
             )?,
             Index::automatic_from_unique(
                 &table,
                 ("sqlite_autoindex_t1_2".to_string(), 3),
                 vec![(1, SortOrder::Asc)],
                 None,
+                &[],
             )?,
             Index::automatic_from_unique(
                 &table,
                 ("sqlite_autoindex_t1_3".to_string(), 4),
                 vec![(2, SortOrder::Asc), (3, SortOrder::Asc)],
                 None,
+                &[],
             )?,
         ];
 
@@ -6184,6 +6259,7 @@ mod tests {
             ("sqlite_autoindex_t1_1".to_string(), 2),
             vec![(0, SortOrder::Asc), (1, SortOrder::Asc)],
             None,
+            &[],
         )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
@@ -6208,6 +6284,7 @@ mod tests {
             ("sqlite_autoindex_t1_1".to_string(), 2),
             1,
             None,
+            &[],
         )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
@@ -6230,6 +6307,7 @@ mod tests {
             ("sqlite_autoindex_t1_1".to_string(), 2),
             2,
             None,
+            &[],
         )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
@@ -6336,12 +6414,14 @@ mod tests {
                 ("sqlite_autoindex_t1_1".to_string(), 2),
                 vec![(0, SortOrder::Asc)],
                 None,
+                &[],
             )?,
             Index::automatic_from_primary_key(
                 &table,
                 ("sqlite_autoindex_t1_2".to_string(), 3),
                 1,
                 None,
+                &[],
             )?,
         ];
 
