@@ -1,7 +1,9 @@
-#![allow(clippy::redundant_clone)]
+#![allow(clippy::redundant_clone, clippy::missing_spin_loop)]
 
-use std::ops::Bound;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    ops::Bound,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use crate::skiplist::{base, SkipList};
 use crossbeam_epoch as epoch;
@@ -899,4 +901,123 @@ fn drops() {
     handle.pin().flush();
     assert_eq!(KEYS.load(Ordering::SeqCst), 8);
     assert_eq!(VALUES.load(Ordering::SeqCst), 7);
+}
+
+#[test]
+fn comparable_get() {
+    use crate::skiplist::equivalent::{Comparable, Equivalent};
+
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    struct Foo {
+        a: u64,
+        b: u32,
+    }
+
+    #[derive(PartialEq, Eq)]
+    struct FooRef<'a> {
+        data: &'a [u8],
+    }
+
+    impl PartialOrd for FooRef<'_> {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for FooRef<'_> {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            let a = u64::from_be_bytes(self.data[..8].try_into().unwrap());
+            let b = u32::from_be_bytes(self.data[8..].try_into().unwrap());
+            let other_a = u64::from_be_bytes(other.data[..8].try_into().unwrap());
+            let other_b = u32::from_be_bytes(other.data[8..].try_into().unwrap());
+            Foo { a, b }.cmp(&Foo {
+                a: other_a,
+                b: other_b,
+            })
+        }
+    }
+
+    impl<'a> Equivalent<FooRef<'a>> for Foo {
+        fn equivalent(&self, key: &FooRef<'a>) -> bool {
+            let a = u64::from_be_bytes(key.data[..8].try_into().unwrap());
+            let b = u32::from_be_bytes(key.data[8..].try_into().unwrap());
+            a == self.a && b == self.b
+        }
+    }
+
+    impl<'a> Comparable<FooRef<'a>> for Foo {
+        fn compare(&self, key: &FooRef<'a>) -> std::cmp::Ordering {
+            let a = u64::from_be_bytes(key.data[..8].try_into().unwrap());
+            let b = u32::from_be_bytes(key.data[8..].try_into().unwrap());
+            Self { a, b }.cmp(self)
+        }
+    }
+
+    let s = SkipList::new(epoch::default_collector().clone());
+    let foo = Foo { a: 1, b: 2 };
+
+    let g = &epoch::pin();
+    s.insert(foo, 12, g);
+
+    let buf = 1u64
+        .to_be_bytes()
+        .iter()
+        .chain(2u32.to_be_bytes().iter())
+        .copied()
+        .collect::<Vec<_>>();
+    let foo_ref = FooRef { data: &buf };
+
+    let ent = s.get(&foo_ref, g).unwrap();
+    assert_eq!(ent.key().a, 1);
+    assert_eq!(ent.key().b, 2);
+    assert_eq!(*ent.value(), 12);
+}
+
+// https://github.com/crossbeam-rs/crossbeam/pull/1143
+#[test]
+fn remove_race() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const NTHREADS: u32 = 16;
+    const KEY_RANGE: u32 = if cfg!(miri) { 100 } else { 100_000 };
+
+    let guard = &epoch::pin();
+    let s = SkipList::new(epoch::default_collector().clone());
+
+    for x in 0..KEY_RANGE {
+        s.insert(x, (), guard).release(guard);
+    }
+
+    let barrier1 = AtomicU32::new(NTHREADS);
+    let barrier2 = AtomicU32::new(NTHREADS);
+    let mut total_removed = AtomicU32::new(0);
+
+    std::thread::scope(|scope| {
+        for _ in 0..NTHREADS {
+            scope.spawn(|| {
+                let guard = &epoch::pin();
+                let mut removed_entries = Vec::with_capacity(KEY_RANGE as usize);
+
+                barrier1.fetch_sub(1, Ordering::Relaxed);
+                while barrier1.load(Ordering::Acquire) != 0 {}
+
+                for x in 0..KEY_RANGE {
+                    if let Some(entry) = s.remove(&x, guard) {
+                        removed_entries.push(entry);
+                    }
+                }
+
+                barrier2.fetch_sub(1, Ordering::Relaxed);
+                while barrier2.load(Ordering::Acquire) != 0 {}
+
+                total_removed.fetch_add(removed_entries.len() as u32, Ordering::Relaxed);
+
+                for entry in removed_entries.drain(..) {
+                    entry.release(guard);
+                }
+            });
+        }
+    });
+
+    assert_eq!(*total_removed.get_mut(), KEY_RANGE);
 }
