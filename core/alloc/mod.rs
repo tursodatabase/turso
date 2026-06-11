@@ -14,8 +14,8 @@ pub use api::{AllocError, Layout};
 pub use backend::{set_allocator, SetAllocatorError, TursoAllocBackend};
 pub use collections::{
     TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt, TursoFromIterator, TursoHashMapExt,
-    TursoHashSetExt, TursoIteratorExt, TursoNewExt, TursoTryNewExt, TursoTryWithCapacityExt,
-    TursoVecDequeExt, TursoVecExt,
+    TursoHashSetExt, TursoIteratorExt, TursoNewExt, TursoSliceExt, TursoTryNewExt,
+    TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

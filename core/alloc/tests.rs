@@ -209,6 +209,16 @@ fn iterator_try_unzip_builds_turso_collections() {
 }
 
 #[test]
+fn slice_try_to_vec_builds_turso_vec() {
+    let slice: &[u8] = &[1, 2, 3];
+
+    let values: Vec<u8> = slice.try_to_vec().unwrap();
+
+    assert_eq!(values.as_slice(), slice);
+    assert!(values.capacity() >= 3);
+}
+
+#[test]
 fn try_with_capacity_builds_turso_collections() {
     let values: Vec<usize> = TursoTryWithCapacityExt::try_with_capacity_ext(3).unwrap();
     let map: HashMap<usize, usize> = TursoTryWithCapacityExt::try_with_capacity_ext(3).unwrap();
