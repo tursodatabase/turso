@@ -1,0 +1,19 @@
+---
+source: partial_idx.sqltest
+expression: |-
+  SELECT COUNT(*)
+      FROM left_items
+      LEFT JOIN right_items ON 1
+      WHERE right_items.marker IS NULL;
+info:
+  statement_type: SELECT
+  tables:
+  - left_items
+  - right_items
+  setup_blocks:
+  - partial_index_left_join_where_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN left_items
+`--SCAN right_items

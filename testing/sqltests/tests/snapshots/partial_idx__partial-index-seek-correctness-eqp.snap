@@ -1,0 +1,13 @@
+---
+source: partial_idx.sqltest
+expression: SELECT id FROM samples WHERE library_id IS NULL AND attack_score IS NOT NULL AND name = 'a';
+info:
+  statement_type: SELECT
+  tables:
+  - samples
+  setup_blocks:
+  - partial_index_seek_schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH samples USING INDEX samples_pidx (name=?)

@@ -15,8 +15,9 @@ use crate::translate::optimizer::access_method::{
     BranchReadMode, ChosenInSeekCandidate, ResidualConstraintMode,
 };
 use crate::translate::optimizer::constraints::{
-    analyze_binary_term_for_index, constraints_from_where_clause, summarize_binary_term_for_index,
-    Constraint, RangeConstraintRef, TableConstraints,
+    analyze_binary_term_for_index, can_use_partial_index, constraints_from_where_clause,
+    partial_index_predicate_terms, summarize_binary_term_for_index, Constraint, RangeConstraintRef,
+    TableConstraints,
 };
 use crate::translate::optimizer::cost::{
     estimate_cost_for_scan_or_seek, estimate_rows_per_seek, rows_per_leaf_page_for_index,
@@ -446,6 +447,8 @@ struct MultiOrResidualPrePostFilters {
 fn partition_residual_multi_or_exprs(
     branch_terms: &[WhereTerm],
     access: &MultiIdxBranchAccess,
+    index: Option<&Index>,
+    rhs_table: &JoinedTable,
     lhs_mask: &TableMask,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
@@ -470,6 +473,18 @@ fn partition_residual_multi_or_exprs(
             }
         }
         MultiIdxBranchAccess::InSeek { constraint_idx, .. } => consumed[*constraint_idx] = true,
+    }
+    if let Some(index) = index {
+        if index.where_clause.is_some() {
+            let Some(predicate_terms) =
+                partial_index_predicate_terms(index, rhs_table, branch_terms)
+            else {
+                return Ok(None);
+            };
+            for idx in predicate_terms {
+                consumed[idx] = true;
+            }
+        }
     }
 
     let mut pre_filter_exprs = Vec::new();
@@ -789,6 +804,8 @@ fn analyze_and_terms_for_multi_index(
         let Some(summary) = summarize_binary_term_for_index(
             &term.expr,
             table_id,
+            table_reference,
+            where_clause,
             indexes,
             rowid_alias_column,
             table_references,
@@ -816,6 +833,13 @@ fn analyze_and_terms_for_multi_index(
     // that single lookup path over intersection.
     if let Some(indexes) = indexes {
         for index in indexes.iter().filter(|idx| idx.index_method.is_none()) {
+            // An unproven partial index cannot be the single-index alternative
+            // that suppresses intersection planning.
+            if index.where_clause.is_some()
+                && !can_use_partial_index(index, table_reference, where_clause)
+            {
+                continue;
+            }
             let mut columns_covered = 0;
             for (i, branch) in candidate_branches.iter().enumerate() {
                 let col_pos = branch.table_col_pos;
@@ -870,6 +894,7 @@ fn analyze_and_terms_for_multi_index(
                 branch.where_term_idx,
                 table_id,
                 table_reference,
+                where_clause,
                 indexes,
                 rowid_alias_column,
                 table_references,
@@ -990,6 +1015,8 @@ pub fn consider_multi_index_union(
                 let Some(partitioned_pre_post) = partition_residual_multi_or_exprs(
                     &synthetic_where_terms,
                     &chosen.access,
+                    chosen.index.as_deref(),
+                    rhs_table,
                     lhs_mask,
                     table_references,
                     subqueries,
