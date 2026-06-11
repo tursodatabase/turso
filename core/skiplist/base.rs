@@ -1971,7 +1971,14 @@ where
                 None => self.range.end_bound(),
             };
             if below_upper_bound(&bound, h.key().borrow()) {
-                self.head = next_head.clone();
+                // Release the reference owned by the old head before
+                // replacing it, otherwise its node is leaked (RefEntry has
+                // no Drop; see RefIter::next for the same pattern).
+                if let Some(e) = mem::replace(&mut self.head, next_head.clone()) {
+                    unsafe {
+                        e.node.decrement(guard);
+                    }
+                }
                 next_head
             } else {
                 unsafe {
@@ -1998,7 +2005,14 @@ where
                 None => self.range.start_bound(),
             };
             if above_lower_bound(&bound, t.key().borrow()) {
-                self.tail = next_tail.clone();
+                // Release the reference owned by the old tail before
+                // replacing it, otherwise its node is leaked (RefEntry has
+                // no Drop; see RefIter::next_back for the same pattern).
+                if let Some(e) = mem::replace(&mut self.tail, next_tail.clone()) {
+                    unsafe {
+                        e.node.decrement(guard);
+                    }
+                }
                 next_tail
             } else {
                 unsafe {
