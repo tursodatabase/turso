@@ -1,3 +1,4 @@
+use crate::alloc::TursoSliceExt;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
@@ -2266,7 +2267,12 @@ pub fn op_array_element(
                         if t.value.as_bytes().iter().any(|&b| b > 0x7F)
                             && std::str::from_utf8(t.value.as_bytes()).is_err()
                         {
-                            return Value::Blob(t.value.as_bytes().to_vec());
+                            return Value::Blob(
+                                t.value
+                                    .as_bytes()
+                                    .try_to_vec()
+                                    .expect("TODO: fallible allocations"),
+                            );
                         }
                     }
                     vref.to_owned()

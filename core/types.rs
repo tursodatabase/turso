@@ -1899,7 +1899,7 @@ impl<'a> ValueRef<'a> {
                 value: text.value.to_string().into(),
                 subtype: text.subtype,
             }),
-            ValueRef::Blob(b) => Value::Blob(b.to_vec()),
+            ValueRef::Blob(b) => Value::Blob(b.try_to_vec().expect("TODO: fallible allocations")),
         }
     }
 

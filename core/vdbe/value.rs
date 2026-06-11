@@ -1,3 +1,4 @@
+use crate::alloc::TursoSliceExt;
 use crate::turso_assert;
 use crate::{
     function::MathFunc,
@@ -549,7 +550,11 @@ impl Value {
         match (value, start_value) {
             (Value::Blob(b), Value::Numeric(Numeric::Integer(start))) => {
                 let (start, end) = calculate_postions(start, b.len(), length_value.as_ref());
-                Value::from_blob(b[start..end].to_vec())
+                Value::from_blob(
+                    b[start..end]
+                        .try_to_vec()
+                        .expect("TODO: fallible allocations"),
+                )
             }
             (value, Value::Numeric(Numeric::Integer(start))) => {
                 if let Some(text) = value.cast_text() {
@@ -1146,7 +1151,12 @@ impl Value {
 
     pub fn exec_concat(&self, rhs: &Value) -> Value {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
-            return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat().to_vec());
+            return Value::Blob(
+                [lhs.as_slice(), rhs.as_slice()]
+                    .concat()
+                    .try_to_vec()
+                    .expect("TODO: fallible allocations"),
+            );
         }
 
         let Some(lhs) = self.cast_text() else {

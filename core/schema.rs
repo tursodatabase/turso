@@ -522,7 +522,9 @@ impl TypeDef {
             not_null,
             is_domain: true,
             sql,
-            domain_checks: constraints.to_vec(),
+            domain_checks: constraints
+                .try_to_vec()
+                .expect("TODO: fallible allocations"),
             kind: TypeDefKind::Custom {
                 params: Vec::new(),
                 base: base_type.to_string(),
