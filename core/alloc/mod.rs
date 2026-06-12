@@ -160,5 +160,37 @@ pub type Rc<T> = std::rc::Rc<T>;
 
 pub type RcWeak<T> = std::rc::Weak<T>;
 
+/// An allocator that fails every allocation while its flag is set.
+///
+/// Delegates to [`TursoAllocator`] otherwise, so memory is still backed by
+/// the regular Turso heap. Shared test utility for exercising fallible
+/// allocation paths (skiplists, MvStore).
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FailOnDemandAlloc {
+    fail: crate::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl FailOnDemandAlloc {
+    pub(crate) fn fail_allocations(&self, fail: bool) {
+        self.fail.store(fail, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+unsafe impl ApiAllocator for FailOnDemandAlloc {
+    fn allocate(&self, layout: Layout) -> Result<std::ptr::NonNull<[u8]>, AllocError> {
+        if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(AllocError);
+        }
+        TursoAllocator.allocate(layout)
+    }
+
+    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: Layout) {
+        unsafe { TursoAllocator.deallocate(ptr, layout) }
+    }
+}
+
 #[cfg(test)]
 mod tests;

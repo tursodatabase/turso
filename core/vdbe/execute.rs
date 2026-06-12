@@ -8224,10 +8224,11 @@ pub fn op_function(
                         (MAIN_DB_ID, crate::util::normalize_ident(sequence_name))
                     };
                 program.connection.find_sequence(sequence_name)?;
-                let watermark = program
-                    .connection
-                    .mv_store_for_db(db_id)
-                    .and_then(|mv_store| mv_store.sequence_watermark(&sequence_key));
+                let watermark = if let Some(mv_store) = program.connection.mv_store_for_db(db_id) {
+                    mv_store.sequence_watermark(&sequence_key)?
+                } else {
+                    None
+                };
                 match watermark {
                     Some(watermark) => state.registers[*dest].set_int(watermark),
                     None => state.registers[*dest].set_value(Value::Null),
@@ -11806,7 +11807,7 @@ pub fn op_sequence_track_allocation(
             })?;
         let current_watermark =
             crate::mvcc::database::first_unsafe_sequence_watermark(&seq, value, true);
-        mv_store.set_sequence_watermark(&normalized_seq_name, current_watermark);
+        mv_store.set_sequence_watermark(&normalized_seq_name, current_watermark)?;
 
         if let Some((tx_id, _)) = program.connection.get_mv_tx_for_db(*db) {
             if mv_store.is_tx_rollbackable(tx_id) {

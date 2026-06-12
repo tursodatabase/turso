@@ -819,7 +819,7 @@ fn comparator() {
 
 #[test]
 fn try_insert_surfaces_allocation_failure() {
-    let alloc = super::map_tests::FailOnDemandAlloc::default();
+    let alloc = crate::alloc::FailOnDemandAlloc::default();
     let set: SkipSet<i32, _, _> = SkipSet::new_in(alloc.clone());
     set.try_insert(7).unwrap();
 

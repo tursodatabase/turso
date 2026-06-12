@@ -692,7 +692,7 @@ impl HybridBTreeDirectory {
         cursor.index_info = Some(Arc::new(IndexInfo {
             has_rowid: false,
             num_cols: Self::CHUNK_LEN,
-            key_info: vec![key_info(), key_info(), key_info()],
+            key_info: crate::alloc::vec![key_info(), key_info(), key_info()],
             is_unique: false,
         }));
 
@@ -1871,7 +1871,7 @@ impl FtsCursor {
         cursor.index_info = Some(Arc::new(IndexInfo {
             has_rowid: false,
             num_cols: 3,
-            key_info: vec![key_info(), key_info(), key_info()],
+            key_info: crate::alloc::vec![key_info(), key_info(), key_info()],
             is_unique: false,
         }));
         self.fts_dir_cursor = Some(cursor);

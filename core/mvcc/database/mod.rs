@@ -2790,14 +2790,7 @@ impl<Clock: LogicalClock, A: SkiplistAllocator> StateTransition for CommitStateM
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                     }
                     mvcc_store.unlock_commit_lock_if_held(tx);
-                    if let Err(e) =
-                        mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)
-                    {
-                        // The tx is already committed, so this must not fail
-                        // the commit; the tx lingers in `txs` (still fully
-                        // resolvable) until a later cleanup retires it.
-                        tracing::error!("failed to retire committed tx {}: {e}", self.tx_id);
-                    }
+                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -2877,14 +2870,7 @@ impl<Clock: LogicalClock, A: SkiplistAllocator> StateTransition for CommitStateM
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                         self.commit_coordinator.pager_commit_lock.unlock();
                     }
-                    if let Err(e) =
-                        mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)
-                    {
-                        // Read-only tx: remove_tx caches no finalized state,
-                        // so this is unreachable in practice; never fail a
-                        // committed tx regardless.
-                        tracing::error!("failed to retire committed tx {}: {e}", self.tx_id);
-                    }
+                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -3154,14 +3140,7 @@ impl<Clock: LogicalClock, A: SkiplistAllocator> StateTransition for CommitStateM
                     mvcc_store.release_exclusive_tx(&self.tx_id);
                 }
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
-                if let Err(e) =
-                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)
-                {
-                    // The tx is already committed, so this must not fail the
-                    // commit; the tx lingers in `txs` (still fully resolvable)
-                    // until a later cleanup retires it.
-                    tracing::error!("failed to retire committed tx {}: {e}", self.tx_id);
-                }
+                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                 if mvcc_store.storage.should_checkpoint() {
                     let state_machine = StateMachine::new(CheckpointStateMachine::new(
@@ -5348,7 +5327,9 @@ impl<Clock: LogicalClock, A: SkiplistAllocator> MvStore<Clock, A> {
         if let Err(e) = self.txs.try_insert(tx_id, tx) {
             // Release everything acquired above, mirroring the vanished-tx
             // bail-out: the transaction was never published.
-            self.commit_coordinator.pager_commit_lock.unlock();
+            if !already_holds_commit_lock {
+                self.commit_coordinator.pager_commit_lock.unlock();
+            }
             if !already_exclusive {
                 self.release_exclusive_tx(&tx_id);
             }
@@ -5442,7 +5423,13 @@ impl<Clock: LogicalClock, A: SkiplistAllocator> MvStore<Clock, A> {
 
         let sequence_name = crate::util::normalize_ident(sequence_name);
         let mut allocations = self.sequence_allocations.lock();
+        if !allocations.contains_key(&sequence_name) {
+            allocations.try_reserve(1)?;
+        }
         let tx_allocations = allocations.entry(sequence_name).or_default();
+        if !tx_allocations.contains_key(&tx_id) {
+            tx_allocations.try_reserve(1)?;
+        }
         tx_allocations
             .entry(tx_id)
             .and_modify(|value| *value = (*value).min(sequence_value))
@@ -5450,11 +5437,14 @@ impl<Clock: LogicalClock, A: SkiplistAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
-    pub fn set_sequence_watermark(&self, sequence_name: &str, watermark: i64) {
+    pub fn set_sequence_watermark(&self, sequence_name: &str, watermark: i64) -> Result<()> {
         let sequence_name = crate::util::normalize_ident(sequence_name);
-        self.sequence_watermarks
-            .lock()
-            .insert(sequence_name, watermark);
+        let mut watermarks = self.sequence_watermarks.lock();
+        if !watermarks.contains_key(&sequence_name) {
+            watermarks.try_reserve(1)?;
+        }
+        watermarks.insert(sequence_name, watermark);
+        Ok(())
     }
 
     /// Returns the first sequence value that is not safe for cursor scans to pass.
@@ -5462,7 +5452,7 @@ impl<Clock: LogicalClock, A: SkiplistAllocator> MvStore<Clock, A> {
     /// Readers can safely consume rows with sequence values less than this
     /// watermark. The value is the minimum of the current sequence boundary and
     /// any lower value already allocated by an active transaction.
-    pub fn sequence_watermark(&self, sequence_name: &str) -> Option<i64> {
+    pub fn sequence_watermark(&self, sequence_name: &str) -> Result<Option<i64>> {
         let sequence_name = crate::util::normalize_ident(sequence_name);
         let mut allocations = self.sequence_allocations.lock();
         let mut remove_allocations = false;
@@ -5490,9 +5480,9 @@ impl<Clock: LogicalClock, A: SkiplistAllocator> MvStore<Clock, A> {
         }
         let current_watermark = self.sequence_watermarks.lock().get(&sequence_name).copied();
         match (current_watermark, active_watermark) {
-            (Some(current), Some(active)) => Some(current.min(active)),
-            (Some(current), None) => Some(current),
-            (None, active) => active,
+            (Some(current), Some(active)) => Ok(Some(current.min(active))),
+            (Some(current), None) => Ok(Some(current)),
+            (None, active) => Ok(active),
         }
     }
 

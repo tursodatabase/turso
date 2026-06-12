@@ -1027,36 +1027,7 @@ fn comparator() {
     assert!(s.is_empty());
 }
 
-/// An allocator that fails every allocation while its flag is set.
-///
-/// Delegates to [`TursoAllocator`] otherwise, so nodes are still backed by the
-/// regular Turso heap.
-#[derive(Clone, Default)]
-pub(crate) struct FailOnDemandAlloc {
-    fail: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl FailOnDemandAlloc {
-    pub(crate) fn fail_allocations(&self, fail: bool) {
-        self.fail.store(fail, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-unsafe impl crate::alloc::ApiAllocator for FailOnDemandAlloc {
-    fn allocate(
-        &self,
-        layout: crate::alloc::Layout,
-    ) -> Result<std::ptr::NonNull<[u8]>, crate::alloc::AllocError> {
-        if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(crate::alloc::AllocError);
-        }
-        crate::alloc::TursoAllocator.allocate(layout)
-    }
-
-    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: crate::alloc::Layout) {
-        unsafe { crate::alloc::TursoAllocator.deallocate(ptr, layout) }
-    }
-}
+use crate::alloc::FailOnDemandAlloc;
 
 #[test]
 fn try_insert_surfaces_allocation_failure() {

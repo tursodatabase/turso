@@ -1366,7 +1366,7 @@ impl Connection {
                             *watermark_row,
                         )?;
                         if let Some(mv_store) = self.db.get_mv_store().as_ref() {
-                            mv_store.set_sequence_watermark(&normalized, watermark);
+                            mv_store.set_sequence_watermark(&normalized, watermark)?;
                         }
                         let sequence = seq.take().expect("sequence set above");
                         inner.fresh.sequences.insert(normalized, Arc::new(sequence));
@@ -3512,7 +3512,7 @@ impl Connection {
                         *watermark_row,
                     )?;
                     if let Some(mv_store) = self.db.get_mv_store().as_ref() {
-                        mv_store.set_sequence_watermark(&normalized, watermark);
+                        mv_store.set_sequence_watermark(&normalized, watermark)?;
                     }
                     let sequence = seq.take().expect("sequence set above");
                     self.with_database_schema_mut(MAIN_DB_ID, |schema| {
@@ -3820,7 +3820,7 @@ impl Connection {
                                 mv_store.set_sequence_watermark(
                                     &autoincrement_sequence_name(&rows[*idx].0),
                                     first_unsafe,
-                                );
+                                )?;
                             }
                             *idx += 1;
                             *sub = SyncRowStep::Start;

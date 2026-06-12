@@ -1024,7 +1024,7 @@ fn remove_race() {
 
 #[test]
 fn try_insert_family_surfaces_allocation_failure() {
-    let alloc = super::map_tests::FailOnDemandAlloc::default();
+    let alloc = crate::alloc::FailOnDemandAlloc::default();
     let guard = &epoch::pin();
     let s = SkipList::new_in(epoch::default_collector().clone(), alloc.clone());
 
