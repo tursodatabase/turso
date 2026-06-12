@@ -35,6 +35,7 @@
   "scripts": {
     "build": "tsup",
     "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build",
     "dev": "tsup --watch",
     "test": "ava integration-tests/*.test.mjs"
   },
