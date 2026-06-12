@@ -2848,7 +2848,7 @@ impl Table {
         }
     }
 
-    pub fn columns(&self) -> &Vec<Column> {
+    pub fn columns(&self) -> &[Column] {
         match self {
             Self::BTree(table) => &table.columns,
             Self::Virtual(table) => &table.columns,
