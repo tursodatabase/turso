@@ -2301,6 +2301,7 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
     use crate::mvcc::database::tests::MvccTestDbNoConn;
     use crate::mvcc::database::SortableIndexKey;
     use crate::translate::collate::CollationSeq;
@@ -2544,7 +2545,7 @@ mod tests {
             let version = committed_table_row_version(table_id, i);
             mvstore.rows.insert(
                 RowID::new(table_id, RowKey::Int(i)),
-                Arc::new(RwLock::new(vec![version])),
+                Arc::new(RwLock::new(std::vec![version])),
             );
         }
 
@@ -2617,7 +2618,7 @@ mod tests {
             let row_id = RowID::new(table_id, RowKey::Int(i));
             mvstore
                 .rows
-                .insert(row_id, Arc::new(RwLock::new(vec![version.clone()])));
+                .insert(row_id, Arc::new(RwLock::new(std::vec![version.clone()])));
             checkpoint.write_set.push((version, None));
         }
         checkpoint.state = CheckpointState::GcTableRows {

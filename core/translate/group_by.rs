@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use turso_parser::ast::{self, SortOrder};
 
 use super::{
@@ -159,7 +160,7 @@ impl EmitGroupBy {
              * then the collating sequence of the column is used to determine sort order.
              * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
              */
-            let order_collations_nulls: Vec<(
+            let order_collations_nulls: crate::alloc::Vec<(
                 SortOrder,
                 Option<CollationSeq>,
                 Option<turso_parser::ast::NullsOrder>,
@@ -174,9 +175,10 @@ impl EmitGroupBy {
                         &plan.table_references,
                         Some(t_ctx.resolver.symbol_table),
                     )?;
-                    Ok((*ord, collation, *nulls))
+                    Ok::<_, crate::LimboError>((*ord, collation, *nulls))
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .try_collect::<Result<crate::alloc::Vec<_>>>()
+                .expect("TODO: fallible allocations")?;
 
             // Resolve custom type comparators for GROUP BY columns (e.g. array_lt).
             let comparators = group_by
@@ -185,7 +187,8 @@ impl EmitGroupBy {
                 .map(|expr| {
                     custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
                 })
-                .collect();
+                .try_collect()
+                .expect("TODO: fallible allocations");
 
             program.emit_insn(Insn::SorterOpen {
                 cursor_id: sort_cursor,

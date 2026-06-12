@@ -1819,6 +1819,7 @@ mod tests {
     use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
 
     use super::*;
+    use crate::alloc::TursoSliceExt;
     use crate::{
         schema::{
             BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table,
@@ -2036,7 +2037,7 @@ mod tests {
             name: "sqlite_autoindex_test_table_1".to_string(),
             table_name: "test_table".to_string(),
             where_clause: None,
-            columns: vec![IndexColumn {
+            columns: crate::alloc::vec![IndexColumn {
                 name: "id".to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 0,
@@ -2133,7 +2134,7 @@ mod tests {
             name: "index1".to_string(),
             table_name: "table1".to_string(),
             where_clause: None,
-            columns: vec![IndexColumn {
+            columns: crate::alloc::vec![IndexColumn {
                 name: "id".to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 0,
@@ -2275,7 +2276,7 @@ mod tests {
                     name: index_name,
                     where_clause: None,
                     table_name: table_name.to_string(),
-                    columns: vec![IndexColumn {
+                    columns: crate::alloc::vec![IndexColumn {
                         name: "id".to_string(),
                         order: SortOrder::Asc,
                         pos_in_table: 0,
@@ -2300,7 +2301,7 @@ mod tests {
             name: "orders_customer_id_idx".to_string(),
             table_name: "orders".to_string(),
             where_clause: None,
-            columns: vec![IndexColumn {
+            columns: crate::alloc::vec![IndexColumn {
                 name: "customer_id".to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 1,
@@ -2319,7 +2320,7 @@ mod tests {
             name: "order_items_order_id_idx".to_string(),
             table_name: "order_items".to_string(),
             where_clause: None,
-            columns: vec![IndexColumn {
+            columns: crate::alloc::vec![IndexColumn {
                 name: "order_id".to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 1,
@@ -2809,7 +2810,7 @@ mod tests {
             name: "idx_xy".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
-            columns: vec![
+            columns: crate::alloc::vec![
                 IndexColumn {
                     name: "x".to_string(),
                     order: SortOrder::Asc,
@@ -2921,7 +2922,7 @@ mod tests {
             name: "idx1".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
-            columns: vec![
+            columns: crate::alloc::vec![
                 IndexColumn {
                     name: "c1".to_string(),
                     order: SortOrder::Asc,
@@ -3059,7 +3060,7 @@ mod tests {
             name: "idx1".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
-            columns: vec![
+            columns: crate::alloc::vec![
                 IndexColumn {
                     name: "c1".to_string(),
                     order: SortOrder::Asc,
@@ -3244,12 +3245,12 @@ mod tests {
         Arc::new(BTreeTable::new(
             1, // root_page, doesn't matter for tests
             name.to_string(),
-            vec![],
-            columns,
+            crate::alloc::vec![],
+            columns.try_to_vec().expect("TODO: fallible allocations"),
             BTreeCharacteristics::HAS_ROWID,
-            vec![],
-            vec![],
-            vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         ))
     }
@@ -3354,7 +3355,7 @@ mod tests {
             name: "idx_t2_a".to_string(),
             table_name: "t2".to_string(),
             where_clause: None,
-            columns: vec![IndexColumn {
+            columns: crate::alloc::vec![IndexColumn {
                 name: "a".to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 0,

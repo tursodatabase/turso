@@ -1,3 +1,4 @@
+use crate::alloc::TursoTryWithCapacityExt;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 #[cfg(any(test, injected_yields))]
@@ -7318,8 +7319,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let mut fresh = Schema::new();
         fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
-        let mut from_sql_indexes = Vec::with_capacity(10);
-        let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::default();
+        let mut from_sql_indexes =
+            crate::alloc::Vec::try_with_capacity_ext(10).expect("TODO: fallible allocations");
+        let mut automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>> =
+            HashMap::default();
         let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
         let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
         let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();

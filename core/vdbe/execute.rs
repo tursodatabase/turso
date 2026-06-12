@@ -1,3 +1,4 @@
+use crate::alloc::{TursoSliceExt, TursoTryWithCapacityExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
@@ -5799,7 +5800,7 @@ fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// - GroupConcat/StringAgg: [Null] (becomes Text on first non-null value)
 /// - JsonGroupObject/JsonbGroupObject: [Blob([])]
 /// - JsonGroupArray/JsonbGroupArray: [Blob([])]
-fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
+fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> Result<()> {
     match func {
         AggFunc::Count | AggFunc::Count0 => payload.push(Value::from_i64(0)),
         AggFunc::Sum | AggFunc::Total => {
@@ -6395,8 +6396,9 @@ fn op_window_step(
     match func {
         WindowFunc::RowNumber => {
             if let Register::Value(Value::Null) = state.registers[acc_reg] {
-                state.registers[acc_reg] =
-                    Register::Aggregate(AggContext::Builtin(vec![Value::from_i64(0)]));
+                state.registers[acc_reg] = Register::Aggregate(AggContext::Builtin(
+                    crate::alloc::vec![Value::from_i64(0)],
+                ));
             }
             let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
             else {
@@ -6492,7 +6494,7 @@ pub fn op_agg_step(
             },
             _ => {
                 // Built-in aggregates use flat payload
-                let mut payload = Vec::new();
+                let mut payload = crate::alloc::vec![];
                 init_agg_payload(func, &mut payload)?;
                 Register::Aggregate(AggContext::Builtin(payload))
             }
@@ -6778,15 +6780,20 @@ pub fn op_sorter_open(
     } else {
         (cache_size as usize) * page_size
     };
-    let mut order = Vec::with_capacity(order_collations_nulls.len());
-    let mut collations = Vec::with_capacity(order_collations_nulls.len());
-    let mut nulls_orders = Vec::with_capacity(order_collations_nulls.len());
+    let mut order = Vec::try_with_capacity_ext(order_collations_nulls.len())
+        .expect("TODO: fallible allocations");
+    let mut collations = crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
+        .expect("TODO: fallible allocations");
+    let mut nulls_orders = crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
+        .expect("TODO: fallible allocations");
     for (ord, coll, nulls) in order_collations_nulls.iter() {
         order.push(*ord);
         collations.push(coll.unwrap_or_default());
         nulls_orders.push(*nulls);
     }
-    let mut sort_comparators = Vec::with_capacity(order_collations_nulls.len());
+    let mut sort_comparators =
+        crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
+            .expect("TODO: fallible allocations");
     for (idx, (_, coll, _)) in order_collations_nulls.iter().enumerate() {
         let comparator = match comparators.get(idx).and_then(|c| c.as_ref()) {
             Some(comparator) => Some(make_sort_comparator(comparator)?),
@@ -9597,7 +9604,7 @@ pub fn op_yield(
 
 pub struct OpInsertState {
     pub sub_state: OpInsertSubState,
-    pub old_record: Option<(i64, Vec<Value>)>,
+    pub old_record: Option<(i64, crate::alloc::Vec<Value>)>,
     /// Set by the NoopCheck sub-state to indicate the row already has the exact
     /// same payload, so the physical write can be skipped.
     pub is_noop_update: bool,
@@ -9947,7 +9954,7 @@ pub fn op_insert(
                             .connection
                             .view_transaction_states
                             .get_or_create(view_name);
-                        tx_state.delete(table_name, key, values.clone());
+                        tx_state.delete(table_name, key, values.to_vec());
                     }
                 }
                 for view_name in dependent_views.iter() {
@@ -9956,7 +9963,7 @@ pub fn op_insert(
                         .view_transaction_states
                         .get_or_create(view_name);
 
-                    tx_state.insert(table_name, key, values.clone());
+                    tx_state.insert(table_name, key, values.to_vec());
                 }
 
                 break;
@@ -9991,7 +9998,7 @@ pub fn op_int_64(
 
 pub struct OpDeleteState {
     pub sub_state: OpDeleteSubState,
-    pub deleted_record: Option<(i64, Vec<Value>)>,
+    pub deleted_record: Option<(i64, crate::alloc::Vec<Value>)>,
 }
 
 #[derive(Clone, Copy)]
@@ -10086,7 +10093,7 @@ pub fn op_delete(
                             .connection
                             .view_transaction_states
                             .get_or_create(&view_name);
-                        tx_state.delete(table_name, key, values.clone());
+                        tx_state.delete(table_name, key, values.to_vec());
                     }
                 }
                 break;
@@ -12098,8 +12105,8 @@ pub fn op_page_count(
 pub struct OpParseSchemaInner {
     stmt: crate::Statement,
     schema_arc: Arc<Schema>,
-    from_sql_indexes: Vec<crate::util::UnparsedFromSqlIndex>,
-    automatic_indices: crate::HashMap<String, Vec<(String, i64)>>,
+    from_sql_indexes: crate::alloc::Vec<crate::util::UnparsedFromSqlIndex>,
+    automatic_indices: crate::HashMap<String, crate::alloc::Vec<(String, i64)>>,
     dbsp_state_roots: crate::HashMap<String, i64>,
     dbsp_state_index_roots: crate::HashMap<String, i64>,
     materialized_view_info: crate::HashMap<String, (String, i64)>,
@@ -12194,7 +12201,8 @@ pub fn op_parse_schema(
     *state.active_op_state.parse_schema() = Some(Box::new(OpParseSchemaInner {
         stmt,
         schema_arc,
-        from_sql_indexes: Vec::with_capacity(10),
+        from_sql_indexes: crate::alloc::Vec::try_with_capacity_ext(10)
+            .expect("TODO: fallible allocations"),
         automatic_indices: Default::default(),
         dbsp_state_roots: Default::default(),
         dbsp_state_index_roots: Default::default(),
@@ -14107,9 +14115,13 @@ pub fn op_add_column(
         let btree = Arc::make_mut(btree);
         btree.columns_mut().push((**column).clone());
         // Update CHECK constraints to include any constraints from the new column
-        btree.check_constraints.clone_from(check_constraints);
+        btree.check_constraints = check_constraints
+            .try_to_vec()
+            .expect("TODO: fallible allocations");
         // Update foreign keys to include any FK constraints from the new column
-        btree.foreign_keys.clone_from(foreign_keys);
+        btree.foreign_keys = foreign_keys
+            .try_to_vec()
+            .expect("TODO: fallible allocations");
 
         // Resolve generated column expressions and update virtual column metadata
         btree.prepare_generated_columns()?;
@@ -14617,9 +14629,11 @@ pub fn op_hash_build(
                 && s.num_keys == data.num_keys
         })
         .unwrap_or_else(|| OpHashBuildState {
-            key_values: Vec::with_capacity(data.num_keys),
+            key_values: crate::alloc::Vec::try_with_capacity_ext(data.num_keys)
+                .expect("TODO: fallible allocations"),
             key_idx: 0,
-            payload_values: Vec::with_capacity(data.num_payload),
+            payload_values: crate::alloc::Vec::try_with_capacity_ext(data.num_payload)
+                .expect("TODO: fallible allocations"),
             payload_idx: 0,
             rowid: None,
             cursor_id: data.cursor_id,
@@ -14644,7 +14658,10 @@ pub fn op_hash_build(
             initial_buckets: 1024,
             mem_budget,
             num_keys: data.num_keys,
-            collations: data.collations.clone(),
+            collations: data
+                .collations
+                .try_to_vec()
+                .expect("TODO: fallible allocations"),
             temp_store,
             track_matched: data.track_matched,
             partition_count: None,
@@ -14705,9 +14722,9 @@ pub fn op_hash_build(
     if let Some(ht) = state.hash_tables.get_mut(&data.hash_table_id) {
         let rowid = op_state.rowid.expect("rowid set");
         let pending = PendingHashInsert {
-            key_values: std::mem::take(&mut op_state.key_values),
+            key_values: std::mem::replace(&mut op_state.key_values, crate::alloc::vec![]),
             rowid,
-            payload_values: std::mem::take(&mut op_state.payload_values),
+            payload_values: std::mem::replace(&mut op_state.payload_values, crate::alloc::vec![]),
         };
         match ht.insert_pending(pending, Some(&mut state.metrics.hash_join))? {
             HashInsertResult::Done => {}
@@ -14748,7 +14765,10 @@ pub fn op_hash_distinct(
             initial_buckets: 1024,
             mem_budget,
             num_keys: data.num_keys,
-            collations: data.collations.clone(),
+            collations: data
+                .collations
+                .try_to_vec()
+                .expect("TODO: fallible allocations"),
             temp_store,
             track_matched: false,
             partition_count: None,
@@ -14853,7 +14873,8 @@ pub fn op_hash_probe(
                 )
             } else {
                 // Different hash table, read fresh keys
-                let mut keys = Vec::with_capacity(num_keys);
+                let mut keys = crate::alloc::Vec::try_with_capacity_ext(num_keys)
+                    .expect("TODO: fallible allocations");
                 for i in 0..num_keys {
                     let reg = &state.registers[key_start_reg + i];
                     keys.push(reg.get_value().clone());
@@ -14862,7 +14883,8 @@ pub fn op_hash_probe(
             }
         } else {
             // First entry, read probe keys from registers
-            let mut keys = Vec::with_capacity(num_keys);
+            let mut keys = crate::alloc::Vec::try_with_capacity_ext(num_keys)
+                .expect("TODO: fallible allocations");
             for i in 0..num_keys {
                 let reg = &state.registers[key_start_reg + i];
                 keys.push(reg.get_value().clone());
@@ -14906,7 +14928,7 @@ pub fn op_hash_probe(
                     IOResult::Done(()) => {}
                     IOResult::IO(io) => {
                         *state.active_op_state.hash_probe() = Some(OpHashProbeState {
-                            probe_keys: Vec::new(), // keys consumed
+                            probe_keys: crate::alloc::vec![], // keys consumed
                             hash_table_id,
                             partition_idx,
                             probe_buffered: true,
@@ -16354,6 +16376,7 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::BranchOffset;
     use crate::{Database, DatabaseOpts, MemoryIO, IO};
@@ -16372,7 +16395,7 @@ mod tests {
         conn.prepare("SELECT 1;").unwrap()
     }
 
-    fn make_spilled_hash_table() -> (HashTable, Vec<Value>, usize) {
+    fn make_spilled_hash_table() -> (HashTable, crate::alloc::Vec<Value>, usize) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let config = HashTableConfig {
             initial_buckets: 4,
@@ -16840,7 +16863,7 @@ mod tests {
 
     #[test]
     fn test_init_agg_payload_count() {
-        let mut payload = Vec::new();
+        let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::Count, &mut payload).unwrap();
         assert_eq!(payload.len(), 1);
         assert_eq!(payload[0], Value::from_i64(0));
@@ -16848,7 +16871,7 @@ mod tests {
 
     #[test]
     fn test_init_agg_payload_sum() {
-        let mut payload = Vec::new();
+        let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::Sum, &mut payload).unwrap();
         assert_eq!(payload.len(), 4);
         assert_eq!(payload[0], Value::Null); // acc
@@ -16859,7 +16882,7 @@ mod tests {
 
     #[test]
     fn test_init_agg_payload_avg() {
-        let mut payload = Vec::new();
+        let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::Avg, &mut payload).unwrap();
         assert_eq!(payload.len(), 3);
         assert_eq!(payload[0], Value::from_f64(0.0)); // sum
@@ -17087,7 +17110,7 @@ mod tests {
     fn test_array_agg_accumulates_correctly() {
         // Verify that array_agg produces correct results when accumulating
         // multiple values. Uses the direct payload approach (O(1) per row).
-        let mut payload = Vec::new();
+        let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::ArrayAgg, &mut payload).unwrap();
 
         // Simulate how AggStep accumulates values directly into the payload Vec.
@@ -17113,7 +17136,7 @@ mod tests {
     fn test_array_agg_zero_rows_produces_valid_result() {
         // array_agg with zero rows should return NULL, matching PostgreSQL.
         // The result must not be an invalid empty blob that crashes on decode.
-        let mut payload = Vec::new();
+        let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::ArrayAgg, &mut payload).unwrap();
         // No values accumulated — count stays 0.
         let result = finalize_agg_payload(&AggFunc::ArrayAgg, &payload).unwrap();

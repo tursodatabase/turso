@@ -1123,7 +1123,7 @@ fn update_from_scratch_col_name(idx: usize) -> String {
     format!("__update_from_{idx}")
 }
 
-fn update_from_scratch_columns(set_clause_count: usize) -> Vec<Column> {
+fn update_from_scratch_columns(set_clause_count: usize) -> crate::alloc::Vec<Column> {
     (0..set_clause_count)
         .map(|idx| {
             // Keep scratch-table columns at BLOB affinity so materializing SET payloads
@@ -1138,7 +1138,8 @@ fn update_from_scratch_columns(set_clause_count: usize) -> Vec<Column> {
                 ColDef::default(),
             )
         })
-        .collect()
+        .try_collect()
+        .expect("TODO: fallible allocations")
 }
 
 /// Build the SELECT that gathers the stable write set for an UPDATE before the
@@ -1157,17 +1158,17 @@ fn build_update_write_set_plan(
     let columns = if is_update_from {
         update_from_scratch_columns(plan.set_clauses.len())
     } else {
-        vec![(*ROWID_COLUMN).clone()]
+        crate::alloc::vec![(*ROWID_COLUMN).clone()]
     };
     let ephemeral_table = Arc::new(BTreeTable::new(
         0, // root_page, not relevant for ephemeral table definition
         "ephemeral_scratch".to_string(),
-        vec![],
+        crate::alloc::vec![],
         columns,
         BTreeCharacteristics::HAS_ROWID,
-        vec![],
-        vec![],
-        vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
     ));
 
@@ -3211,7 +3212,7 @@ fn ephemeral_index_build(
     table_reference: &JoinedTable,
     constraint_refs: &[RangeConstraintRef],
 ) -> Index {
-    let mut ephemeral_columns: Vec<IndexColumn> = table_reference
+    let mut ephemeral_columns: crate::alloc::Vec<IndexColumn> = table_reference
         .columns()
         .iter()
         .enumerate()
@@ -3231,7 +3232,8 @@ fn ephemeral_index_build(
         })
         // only include columns that are used in the query
         .filter(|c| table_reference.column_is_used(c.pos_in_table))
-        .collect();
+        .try_collect()
+        .expect("TODO: fallible allocations");
     // sort so that constraints first, then rest in whatever order they were in in the table
     ephemeral_columns.sort_by(|a, b| {
         let a_constraint = constraint_refs

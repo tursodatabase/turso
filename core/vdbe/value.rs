@@ -1146,7 +1146,7 @@ impl Value {
 
     pub fn exec_concat(&self, rhs: &Value) -> Value {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
-            return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat().to_vec());
+            return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat());
         }
 
         let Some(lhs) = self.cast_text() else {

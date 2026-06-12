@@ -486,7 +486,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             &self.configuration.table_name,
             &self.inverted_index_btree,
             // component, length, rowid
-            vec![key_info(), key_info(), key_info()],
+            crate::alloc::vec![key_info(), key_info(), key_info()],
         )?);
         self.stats_cursor = Some(open_index_cursor(
             connection,
@@ -494,7 +494,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             &self.configuration.table_name,
             &self.stats_btree,
             // component
-            vec![key_info()],
+            crate::alloc::vec![key_info()],
         )?);
         self.main_btree = Some(open_table_cursor(
             connection,
@@ -515,7 +515,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             &self.configuration.table_name,
             &self.inverted_index_btree,
             // component, length, rowid
-            vec![key_info(), key_info(), key_info()],
+            crate::alloc::vec![key_info(), key_info(), key_info()],
         )?);
         self.stats_cursor = Some(open_index_cursor(
             connection,
@@ -523,7 +523,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             &self.configuration.table_name,
             &self.stats_btree,
             // component
-            vec![key_info()],
+            crate::alloc::vec![key_info()],
         )?);
         Ok(IOResult::Done(()))
     }

@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::index_method::IndexMethodConfiguration;
@@ -440,12 +441,13 @@ fn emit_refill_index(
             .columns
             .iter()
             .map(|c| (c.order, c.collation, None))
-            .collect();
+            .try_collect()
+            .expect("TODO: fallible allocations");
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sorter_cursor_id,
             columns: columns.len(),
             order_collations_nulls,
-            comparators: vec![],
+            comparators: crate::alloc::vec![],
         });
         let content_reg = program.alloc_register();
         program.emit_insn(Insn::OpenPseudo {
@@ -874,7 +876,7 @@ fn index_matches_collation(index: &Index, collation: CollationSeq) -> bool {
 pub fn resolve_sorted_columns(
     table: &BTreeTable,
     cols: &[SortedColumn],
-) -> crate::Result<Vec<IndexColumn>> {
+) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
     resolve_sorted_columns_with_resolver(table, cols, None)
 }
 
@@ -882,8 +884,12 @@ fn resolve_sorted_columns_with_resolver(
     table: &BTreeTable,
     cols: &[SortedColumn],
     resolver: Option<&Resolver>,
-) -> crate::Result<Vec<IndexColumn>> {
-    let mut resolved = Vec::with_capacity(cols.len());
+) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
+    let mut resolved =
+        <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
+            cols.len(),
+        )
+        .expect("TODO: fallible allocations");
     for sc in cols {
         let order = sc.order.unwrap_or(SortOrder::Asc);
         let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref(), resolver)?;

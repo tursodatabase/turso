@@ -1518,8 +1518,8 @@ pub fn translate_alter_table(
                         db: database_id,
                         table: table_name.to_owned(),
                         column: Box::new(column),
-                        check_constraints: btree.check_constraints.clone(),
-                        foreign_keys: btree.foreign_keys.clone(),
+                        check_constraints: btree.check_constraints.to_vec(),
+                        foreign_keys: btree.foreign_keys.to_vec(),
                     });
                 },
             )?

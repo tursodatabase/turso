@@ -11,6 +11,7 @@ use super::{
         write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
     },
 };
+use crate::alloc::TursoIteratorExt;
 use crate::{
     io::CompletionGroup,
     io_yield_one,
@@ -882,7 +883,8 @@ impl BTreeCursor {
                     nulls_order: None,
                 }
             })
-            .collect::<Vec<_>>();
+            .try_collect::<crate::alloc::Vec<_>>()
+            .expect("TODO: fallible allocations");
         cursor.index_info = Some(Arc::new(IndexInfo {
             key_info,
             has_rowid: false,
@@ -9739,7 +9741,8 @@ mod tests {
                         default: None,
                         expr: None,
                     })
-                    .collect(),
+                    .try_collect()
+                    .unwrap(),
                 table_name: "test".to_string(),
                 root_page: index_root_page,
                 unique: false,
@@ -9910,7 +9913,7 @@ mod tests {
             let index_def = Index {
                 name: "testindex".to_string(),
                 where_clause: None,
-                columns: vec![IndexColumn {
+                columns: crate::alloc::vec![IndexColumn {
                     name: "testcol".to_string(),
                     order: SortOrder::Asc,
                     collation: None,

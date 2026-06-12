@@ -1183,6 +1183,7 @@ mod tests {
         MultiIndexBranchParams,
     };
     use crate::alloc::TursoIteratorExt;
+    use crate::alloc::TursoSliceExt;
     use crate::{
         schema::{
             BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table,
@@ -1245,12 +1246,12 @@ mod tests {
         Arc::new(BTreeTable::new(
             1,
             name.to_string(),
-            vec![],
-            columns,
+            crate::alloc::vec![],
+            columns.try_to_vec().expect("TODO: fallible allocations"),
             BTreeCharacteristics::HAS_ROWID,
-            vec![],
-            vec![],
-            vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         ))
     }
@@ -1361,7 +1362,7 @@ mod tests {
                 name: "idx_item_id".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
-                columns: vec![IndexColumn {
+                columns: crate::alloc::vec![IndexColumn {
                     name: "id".to_string(),
                     order: SortOrder::Asc,
                     pos_in_table: 0,
@@ -1512,7 +1513,7 @@ mod tests {
                 name: "idx_item_a".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
-                columns: vec![IndexColumn {
+                columns: crate::alloc::vec![IndexColumn {
                     name: "a".to_string(),
                     order: SortOrder::Asc,
                     pos_in_table: 1,
@@ -1627,7 +1628,7 @@ mod tests {
                 name: "idx_item_id_kind".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
-                columns: vec![
+                columns: crate::alloc::vec![
                     IndexColumn {
                         name: "id".to_string(),
                         order: SortOrder::Asc,
@@ -1825,7 +1826,7 @@ mod tests {
                 name: "idx_item_id".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
-                columns: vec![IndexColumn {
+                columns: crate::alloc::vec![IndexColumn {
                     name: "id".to_string(),
                     order: SortOrder::Asc,
                     pos_in_table: 0,

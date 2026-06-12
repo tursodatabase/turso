@@ -42,6 +42,15 @@ pub trait TursoBinaryHeapExt<T>: Sized {
     fn try_push(&mut self, value: T) -> Result<(), TryReserveError>;
 }
 
+/// Conversion from a slice into an allocator-aware `Vec`.
+///
+/// Named `try_to_vec` because the inherent `[T]::to_vec` would always shadow
+/// a trait method called `to_vec`, leaving call sites on the global
+/// allocator.
+pub trait TursoSliceExt<T> {
+    fn try_to_vec(&self) -> Result<crate::alloc::Vec<T>, TryReserveError>;
+}
+
 pub trait TursoFromIterator<T>: Sized {
     fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
     where

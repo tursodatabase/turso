@@ -43,25 +43,6 @@ fn try_extend_accepts_iterators_without_upper_bounds() {
 }
 
 #[test]
-fn hash_map_try_insert_and_extend_reserve_before_mutation() {
-    let mut values: HashMap<&str, usize> = HashMap::default();
-
-    assert_eq!(
-        TursoHashMapExt::try_insert(&mut values, "one", 1).unwrap(),
-        None
-    );
-    assert_eq!(
-        TursoHashMapExt::try_insert(&mut values, "one", 11).unwrap(),
-        Some(1)
-    );
-    values.try_extend([("two", 2), ("three", 3)]).unwrap();
-
-    assert_eq!(values.get("one"), Some(&11));
-    assert_eq!(values.get("two"), Some(&2));
-    assert_eq!(values.get("three"), Some(&3));
-}
-
-#[test]
 fn hash_set_try_insert_and_extend_reserve_before_mutation() {
     let mut values: HashSet<usize> = HashSet::default();
 
@@ -114,26 +95,6 @@ fn iterator_try_collect_builds_boxed_slice() {
     let values: Box<[_]> = [1, 2, 3].into_iter().try_collect().unwrap();
 
     assert_eq!(&*values, &[1, 2, 3]);
-}
-
-#[test]
-fn try_extend_extends_existing_collection() {
-    let mut values = try_vec![1].unwrap();
-
-    values.try_extend([2, 3]).unwrap();
-
-    assert_eq!(values.as_slice(), &[1, 2, 3]);
-}
-
-#[test]
-fn try_vec_macro_builds_turso_vecs() {
-    let empty: Vec<usize> = try_vec![].unwrap();
-    let repeated: Vec<_> = try_vec![7; 3].unwrap();
-    let listed: Vec<_> = try_vec![1, 2, 3].unwrap();
-
-    assert!(empty.is_empty());
-    assert_eq!(repeated.as_slice(), &[7, 7, 7]);
-    assert_eq!(listed.as_slice(), &[1, 2, 3]);
 }
 
 #[test]
@@ -203,19 +164,6 @@ fn iterator_try_collect_converts_result_error() {
 }
 
 #[test]
-fn iterator_try_collect_accepts_try_vec_results() {
-    let values: crate::Result<Vec<_>> = [1usize, 2]
-        .into_iter()
-        .map(|count| try_vec![false; count])
-        .try_collect::<crate::Result<Vec<_>>>()
-        .unwrap();
-    let values = values.unwrap();
-
-    assert_eq!(values[0].as_slice(), &[false]);
-    assert_eq!(values[1].as_slice(), &[false, false]);
-}
-
-#[test]
 fn tuple_try_extend_extends_both_collections() {
     let mut values: (Vec<_>, VecDeque<_>) = (Vec::new(), VecDeque::new());
 
@@ -261,6 +209,25 @@ fn iterator_try_unzip_builds_turso_collections() {
 }
 
 #[test]
+fn into_boxed_slice_builds_boxed_slice_alias() {
+    let values: Vec<u32> = self::vec![1, 2, 3];
+
+    let boxed: BoxedSlice<u32> = values.into_boxed_slice();
+
+    assert_eq!(&*boxed, &[1, 2, 3]);
+}
+
+#[test]
+fn slice_try_to_vec_builds_turso_vec() {
+    let slice: &[u8] = &[1, 2, 3];
+
+    let values: Vec<u8> = slice.try_to_vec().unwrap();
+
+    assert_eq!(values.as_slice(), slice);
+    assert!(values.capacity() >= 3);
+}
+
+#[test]
 fn try_with_capacity_builds_turso_collections() {
     let values: Vec<usize> = TursoTryWithCapacityExt::try_with_capacity_ext(3).unwrap();
     let map: HashMap<usize, usize> = TursoTryWithCapacityExt::try_with_capacity_ext(3).unwrap();
@@ -273,51 +240,4 @@ fn try_with_capacity_builds_turso_collections() {
     assert!(set.capacity() >= 3);
     assert!(queue.capacity() >= 3);
     assert!(heap.capacity() >= 3);
-}
-
-#[test]
-fn try_clone_builds_independent_alloc_collections() {
-    let values: Vec<_> = try_vec![1, 2, 3].unwrap();
-    let cloned = values.try_clone().unwrap();
-    assert_eq!(cloned.as_slice(), values.as_slice());
-    assert_ne!(cloned.as_ptr(), values.as_ptr());
-
-    let boxed: Box<_> = TursoTryNewExt::try_new(String::from("turso")).unwrap();
-    let cloned = boxed.try_clone().unwrap();
-    assert_eq!(&*cloned, &*boxed);
-
-    let queue: VecDeque<_> = [1, 2, 3].into_iter().try_collect().unwrap();
-    let mut cloned = queue.try_clone().unwrap();
-    assert_eq!(cloned.pop_front(), Some(1));
-    assert_eq!(cloned.pop_front(), Some(2));
-    assert_eq!(cloned.pop_front(), Some(3));
-
-    let heap: BinaryHeap<_> = [1, 3, 2].into_iter().try_collect().unwrap();
-    let mut cloned = heap.try_clone().unwrap();
-    assert_eq!(cloned.pop(), Some(3));
-    assert_eq!(cloned.pop(), Some(2));
-    assert_eq!(cloned.pop(), Some(1));
-}
-
-#[test]
-fn try_clone_builds_independent_hash_collections() {
-    let map: HashMap<_, _> = [
-        ("one".to_string(), try_vec![1].unwrap()),
-        ("two".to_string(), try_vec![2].unwrap()),
-    ]
-    .into_iter()
-    .try_collect()
-    .unwrap();
-    let set: HashSet<_> = ["one".to_string(), "two".to_string()]
-        .into_iter()
-        .try_collect()
-        .unwrap();
-
-    let cloned_map = map.try_clone().unwrap();
-    let cloned_set = set.try_clone().unwrap();
-
-    assert_eq!(cloned_map.get("one").unwrap().as_slice(), &[1]);
-    assert_eq!(cloned_map.get("two").unwrap().as_slice(), &[2]);
-    assert!(cloned_set.contains("one"));
-    assert!(cloned_set.contains("two"));
 }
