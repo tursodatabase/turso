@@ -331,6 +331,8 @@ jobs:
 
       - uses: "./.github/shared/install_sqlite"
       - name: Test
+        env:
+          SQLITE3_EXEC: sqlite3
         run: make test
 
   concurrent-simulator:
