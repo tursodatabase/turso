@@ -13,6 +13,7 @@ use super::{
     base::{self, try_pin_loop},
     comparator::{BasicComparator, Comparator},
 };
+use crate::alloc::TryReserveError;
 
 /// An ordered map based on a lock-free skip list.
 ///
@@ -168,6 +169,30 @@ where
         Entry::new(self.inner.get_or_insert(key, value, guard))
     }
 
+    /// Fallible version of [`get_or_insert`](Self::get_or_insert): returns an error instead of
+    /// aborting the process when node allocation fails.
+    ///
+    /// On error the map is unchanged and both `key` and `value` are dropped.
+    ///
+    /// # Example
+    /// ```
+    /// use turso_core::skiplist::SkipMap;
+    ///
+    /// let ages = SkipMap::new();
+    /// let gates_age = ages.try_get_or_insert("Bill Gates", 64).unwrap();
+    /// assert_eq!(*gates_age.value(), 64);
+    /// ```
+    pub fn try_get_or_insert(
+        &self,
+        key: K,
+        value: V,
+    ) -> Result<Entry<'_, K, V, C>, TryReserveError> {
+        let guard = &epoch::pin();
+        self.inner
+            .try_get_or_insert(key, value, guard)
+            .map(Entry::new)
+    }
+
     /// Finds an entry with the specified key, or inserts a new `key`-`value` pair if none exist,
     /// where value is calculated with a function.
     ///
@@ -197,6 +222,34 @@ where
     {
         let guard = &epoch::pin();
         Entry::new(self.inner.get_or_insert_with(key, value_fn, guard))
+    }
+
+    /// Fallible version of [`get_or_insert_with`](Self::get_or_insert_with): returns an error
+    /// instead of aborting the process when node allocation fails.
+    ///
+    /// On error the map is unchanged and both `key` and the value built by `value_fn` are
+    /// dropped.
+    ///
+    /// # Example
+    /// ```
+    /// use turso_core::skiplist::SkipMap;
+    ///
+    /// let ages = SkipMap::new();
+    /// let gates_age = ages.try_get_or_insert_with("Bill Gates", || 64).unwrap();
+    /// assert_eq!(*gates_age.value(), 64);
+    /// ```
+    pub fn try_get_or_insert_with<F>(
+        &self,
+        key: K,
+        value_fn: F,
+    ) -> Result<Entry<'_, K, V, C>, TryReserveError>
+    where
+        F: FnOnce() -> V,
+    {
+        let guard = &epoch::pin();
+        self.inner
+            .try_get_or_insert_with(key, value_fn, guard)
+            .map(Entry::new)
     }
 
     /// Returns an iterator over all entries in the map,
@@ -405,6 +458,25 @@ where
         Entry::new(self.inner.insert(key, value, guard))
     }
 
+    /// Fallible version of [`insert`](Self::insert): returns an error instead of aborting the
+    /// process when node allocation fails.
+    ///
+    /// On error the map is unchanged and both `key` and `value` are dropped.
+    ///
+    /// # Example
+    /// ```
+    /// use turso_core::skiplist::SkipMap;
+    ///
+    /// let map = SkipMap::new();
+    /// map.try_insert("key", "value").unwrap();
+    ///
+    /// assert_eq!(*map.get("key").unwrap().value(), "value");
+    /// ```
+    pub fn try_insert(&self, key: K, value: V) -> Result<Entry<'_, K, V, C>, TryReserveError> {
+        let guard = &epoch::pin();
+        self.inner.try_insert(key, value, guard).map(Entry::new)
+    }
+
     /// Inserts a `key`-`value` pair into the skip list and returns the new entry.
     ///
     /// If there is an existing entry with this key and compare(entry.value) returns true,
@@ -433,6 +505,35 @@ where
     {
         let guard = &epoch::pin();
         Entry::new(self.inner.compare_insert(key, value, compare_fn, guard))
+    }
+
+    /// Fallible version of [`compare_insert`](Self::compare_insert): returns an error instead of
+    /// aborting the process when node allocation fails.
+    ///
+    /// On error the map is unchanged and both `key` and `value` are dropped.
+    ///
+    /// # Example
+    /// ```
+    /// use turso_core::skiplist::SkipMap;
+    ///
+    /// let map = SkipMap::new();
+    /// map.try_insert("key", 1).unwrap();
+    /// map.try_compare_insert("key", 2, |x| x < &2).unwrap();
+    /// assert_eq!(*map.get("key").unwrap().value(), 2);
+    /// ```
+    pub fn try_compare_insert<F>(
+        &self,
+        key: K,
+        value: V,
+        compare_fn: F,
+    ) -> Result<Entry<'_, K, V, C>, TryReserveError>
+    where
+        F: Fn(&V) -> bool,
+    {
+        let guard = &epoch::pin();
+        self.inner
+            .try_compare_insert(key, value, compare_fn, guard)
+            .map(Entry::new)
     }
 
     /// Removes an entry with the specified `key` from the map and returns it.

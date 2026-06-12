@@ -9,6 +9,7 @@ use super::{
     comparator::{BasicComparator, Comparator},
     map,
 };
+use crate::alloc::TryReserveError;
 
 /// A set based on a lock-free skip list.
 ///
@@ -248,6 +249,24 @@ where
         Entry::new(self.inner.get_or_insert(key, ()))
     }
 
+    /// Fallible version of [`get_or_insert`](Self::get_or_insert): returns an error instead of
+    /// aborting the process when node allocation fails.
+    ///
+    /// On error the set is unchanged and `key` is dropped.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use turso_core::skiplist::SkipSet;
+    ///
+    /// let set = SkipSet::new();
+    /// let entry = set.try_get_or_insert(2).unwrap();
+    /// assert_eq!(*entry, 2);
+    /// ```
+    pub fn try_get_or_insert(&self, key: T) -> Result<Entry<'_, T, C>, TryReserveError> {
+        self.inner.try_get_or_insert(key, ()).map(Entry::new)
+    }
+
     /// Returns an iterator over all entries in the set.
     ///
     /// # Examples
@@ -322,6 +341,24 @@ where
     /// ```
     pub fn insert(&self, key: T) -> Entry<'_, T, C> {
         Entry::new(self.inner.insert(key, ()))
+    }
+
+    /// Fallible version of [`insert`](Self::insert): returns an error instead of aborting the
+    /// process when node allocation fails.
+    ///
+    /// On error the set is unchanged and `key` is dropped.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use turso_core::skiplist::SkipSet;
+    ///
+    /// let set = SkipSet::new();
+    /// set.try_insert(2).unwrap();
+    /// assert_eq!(*set.get(&2).unwrap(), 2);
+    /// ```
+    pub fn try_insert(&self, key: T) -> Result<Entry<'_, T, C>, TryReserveError> {
+        self.inner.try_insert(key, ()).map(Entry::new)
     }
 
     /// Removes an entry with the specified key from the set and returns it.

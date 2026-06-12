@@ -19,6 +19,7 @@ use super::{
     alloc_helper::Global,
     comparator::{BasicComparator, Comparator},
 };
+use crate::alloc::TryReserveError;
 
 /// Number of bits needed to store height.
 const HEIGHT_BITS: usize = 5;
@@ -168,17 +169,17 @@ unsafe impl<K: Sync, V: Sync> Send for NodeRef<'_, K, V> {}
 unsafe impl<K: Sync, V: Sync> Sync for NodeRef<'_, K, V> {}
 
 impl<K, V> Node<K, V> {
-    /// Allocates a node.
+    /// Allocates a node, returning the layout that could not be allocated on failure.
     ///
     /// The returned node will start with reference count of `ref_count` and the tower will be initialized
     /// with null pointers. However, the key and the value will be left uninitialized, and that is
     /// why this function is unsafe.
-    unsafe fn alloc(height: usize, ref_count: usize) -> *mut Self {
+    unsafe fn try_alloc(height: usize, ref_count: usize) -> Result<*mut Self, Layout> {
         let layout = Self::get_layout(height);
         unsafe {
             let ptr = match Global.allocate(layout) {
                 Some(ptr) => ptr.as_ptr().cast::<Self>(),
-                None => handle_alloc_error(layout),
+                None => return Err(layout),
             };
 
             ptr::addr_of_mut!((*ptr).refs_and_height)
@@ -186,7 +187,7 @@ impl<K, V> Node<K, V> {
             ptr::addr_of_mut!((*ptr).tower.pointers)
                 .cast::<Atomic<Self>>()
                 .write_bytes(0, height);
-            ptr
+            Ok(ptr)
         }
     }
 
@@ -640,7 +641,24 @@ where
 
     /// Finds an entry with the specified key, or inserts a new `key`-`value` pair if none exist.
     pub fn get_or_insert(&self, key: K, value: V, guard: &Guard) -> RefEntry<'_, K, V, C> {
+        match self.insert_internal(key, || value, |_| false, guard) {
+            Ok(entry) => entry,
+            Err(layout) => handle_alloc_error(layout),
+        }
+    }
+
+    /// Fallible version of [`get_or_insert`](Self::get_or_insert): returns an error instead of
+    /// aborting the process when node allocation fails.
+    ///
+    /// On error the skip list is unchanged and both `key` and `value` are dropped.
+    pub fn try_get_or_insert(
+        &self,
+        key: K,
+        value: V,
+        guard: &Guard,
+    ) -> Result<RefEntry<'_, K, V, C>, TryReserveError> {
         self.insert_internal(key, || value, |_| false, guard)
+            .map_err(|_| TryReserveError)
     }
 
     /// Finds an entry with the specified key, or inserts a new `key`-`value` pair if none exist,
@@ -654,7 +672,28 @@ where
     where
         F: FnOnce() -> V,
     {
+        match self.insert_internal(key, value, |_| false, guard) {
+            Ok(entry) => entry,
+            Err(layout) => handle_alloc_error(layout),
+        }
+    }
+
+    /// Fallible version of [`get_or_insert_with`](Self::get_or_insert_with): returns an error
+    /// instead of aborting the process when node allocation fails.
+    ///
+    /// On error the skip list is unchanged and both `key` and the value built by `value` are
+    /// dropped.
+    pub fn try_get_or_insert_with<F>(
+        &self,
+        key: K,
+        value: F,
+        guard: &Guard,
+    ) -> Result<RefEntry<'_, K, V, C>, TryReserveError>
+    where
+        F: FnOnce() -> V,
+    {
         self.insert_internal(key, value, |_| false, guard)
+            .map_err(|_| TryReserveError)
     }
 
     /// Returns an iterator over all entries in the skip list.
@@ -1022,13 +1061,17 @@ where
     /// Inserts an entry with the specified `key` and `value`.
     ///
     /// If `replace` is `true`, then any existing entry with this key will first be removed.
+    ///
+    /// If allocating the new node fails, returns the layout that could not be allocated.
+    /// In that case the skip list is unchanged and both `key` and the constructed value
+    /// are dropped.
     fn insert_internal<F, CompareF>(
         &self,
         key: K,
         value: F,
         replace: CompareF,
         guard: &Guard,
-    ) -> RefEntry<'_, K, V, C>
+    ) -> Result<RefEntry<'_, K, V, C>, Layout>
     where
         C: Comparator<K>,
         F: FnOnce() -> V,
@@ -1051,7 +1094,7 @@ where
                     // If a node with the key was found and we're not going to replace it, let's
                     // try returning it as an entry.
                     if let Some(e) = RefEntry::try_acquire(self, r) {
-                        return e;
+                        return Ok(e);
                     }
                 }
             }
@@ -1064,7 +1107,7 @@ where
                 // The reference count is initially two to account for:
                 // 1. The entry that will be returned.
                 // 2. The link at the level 0 of the tower.
-                let n = Node::<K, V>::alloc(height, 2);
+                let n = Node::<K, V>::try_alloc(height, 2)?;
 
                 // Write the key and the value into the node.
                 ptr::addr_of_mut!((*n).key).write(key);
@@ -1129,7 +1172,7 @@ where
                             Node::finalize(node.as_raw() as *mut Node<K, V>);
                             self.hot_data.len.fetch_sub(1, Ordering::Relaxed);
 
-                            return e;
+                            return Ok(e);
                         }
 
                         // If we couldn't increment the reference count, that means someone has
@@ -1241,7 +1284,7 @@ where
             }
 
             // Finally, return the new entry.
-            entry
+            Ok(entry)
         }
     }
 }
@@ -1257,7 +1300,24 @@ where
     /// If there is an existing entry with this key, it will be removed before inserting the new
     /// one.
     pub fn insert(&self, key: K, value: V, guard: &Guard) -> RefEntry<'_, K, V, C> {
+        match self.insert_internal(key, || value, |_| true, guard) {
+            Ok(entry) => entry,
+            Err(layout) => handle_alloc_error(layout),
+        }
+    }
+
+    /// Fallible version of [`insert`](Self::insert): returns an error instead of aborting the
+    /// process when node allocation fails.
+    ///
+    /// On error the skip list is unchanged and both `key` and `value` are dropped.
+    pub fn try_insert(
+        &self,
+        key: K,
+        value: V,
+        guard: &Guard,
+    ) -> Result<RefEntry<'_, K, V, C>, TryReserveError> {
         self.insert_internal(key, || value, |_| true, guard)
+            .map_err(|_| TryReserveError)
     }
 
     /// Inserts a `key`-`value` pair into the skip list and returns the new entry.
@@ -1275,7 +1335,28 @@ where
     where
         F: Fn(&V) -> bool,
     {
+        match self.insert_internal(key, || value, compare_fn, guard) {
+            Ok(entry) => entry,
+            Err(layout) => handle_alloc_error(layout),
+        }
+    }
+
+    /// Fallible version of [`compare_insert`](Self::compare_insert): returns an error instead of
+    /// aborting the process when node allocation fails.
+    ///
+    /// On error the skip list is unchanged and both `key` and `value` are dropped.
+    pub fn try_compare_insert<F>(
+        &self,
+        key: K,
+        value: V,
+        compare_fn: F,
+        guard: &Guard,
+    ) -> Result<RefEntry<'_, K, V, C>, TryReserveError>
+    where
+        F: Fn(&V) -> bool,
+    {
         self.insert_internal(key, || value, compare_fn, guard)
+            .map_err(|_| TryReserveError)
     }
 
     /// Removes an entry with the specified `key` from the map and returns it.
