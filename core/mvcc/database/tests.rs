@@ -1213,15 +1213,15 @@ fn test_recovery_rejects_schema_op_after_data_op_in_frame() {
     let commit_ts = 1u64 << 40;
     let data_version = RowVersion {
         id: 1,
-        begin: Some(TxTimestampOrID::Timestamp(commit_ts)),
-        end: None,
+        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(commit_ts))),
+        end: crate::mvcc::database::PackedTs::pack(None),
         row: generate_simple_string_row(MVTableId::from(-999), 1, "data"),
         btree_resident: false,
     };
     let schema_version = RowVersion {
         id: 2,
-        begin: Some(TxTimestampOrID::Timestamp(commit_ts)),
-        end: None,
+        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(commit_ts))),
+        end: crate::mvcc::database::PackedTs::pack(None),
         row: generate_simple_string_row(SQLITE_SCHEMA_MVCC_TABLE_ID, 1, "schema"),
         btree_resident: false,
     };
@@ -4440,8 +4440,8 @@ fn test_snapshot_isolation_tx_visible1() {
     let rv_visible = |begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>| {
         let row_version = RowVersion {
             id: 0, // Dummy ID for visibility tests
-            begin,
-            end,
+            begin: crate::mvcc::database::PackedTs::pack(begin),
+            end: crate::mvcc::database::PackedTs::pack(end),
             row: generate_simple_string_row((-2).into(), 1, "testme"),
             btree_resident: false,
         };
@@ -4540,8 +4540,8 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
 
     let inserted_row = RowVersion {
         id: 1,
-        begin: Some(TxTimestampOrID::TxID(42)),
-        end: None,
+        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(42))),
+        end: crate::mvcc::database::PackedTs::pack(None),
         row: generate_simple_string_row((-2).into(), 1, "x"),
         btree_resident: false,
     };
@@ -4552,8 +4552,8 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
 
     let deleted_row = RowVersion {
         id: 2,
-        begin: Some(TxTimestampOrID::Timestamp(1)),
-        end: Some(TxTimestampOrID::TxID(42)),
+        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(1))),
+        end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(42))),
         row: generate_simple_string_row((-2).into(), 2, "y"),
         btree_resident: false,
     };
@@ -4627,8 +4627,8 @@ fn test_commit_dependency_speculative_read() {
 
     let rv = RowVersion {
         id: 0,
-        begin: Some(TxTimestampOrID::TxID(1)),
-        end: None,
+        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
+        end: crate::mvcc::database::PackedTs::pack(None),
         row: generate_simple_string_row((-2).into(), 1, "test"),
         btree_resident: false,
     };
@@ -4659,8 +4659,8 @@ fn test_commit_dependency_cascade_abort() {
 
     let rv = RowVersion {
         id: 0,
-        begin: Some(TxTimestampOrID::TxID(1)),
-        end: None,
+        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
+        end: crate::mvcc::database::PackedTs::pack(None),
         row: generate_simple_string_row((-2).into(), 1, "test"),
         btree_resident: false,
     };
@@ -4734,8 +4734,8 @@ fn test_commit_dependency_speculative_ignore() {
 
     let rv = RowVersion {
         id: 0,
-        begin: Some(TxTimestampOrID::Timestamp(2)),
-        end: Some(TxTimestampOrID::TxID(3)),
+        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(2))),
+        end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(3))),
         row: generate_simple_string_row((-2).into(), 1, "test"),
         btree_resident: false,
     };
@@ -4763,8 +4763,8 @@ fn test_commit_dependency_multiple_reads_dedup() {
 
     let make_rv = |row_id: i64| RowVersion {
         id: row_id as u64,
-        begin: Some(TxTimestampOrID::TxID(1)),
-        end: None,
+        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
+        end: crate::mvcc::database::PackedTs::pack(None),
         row: generate_simple_string_row((-2).into(), row_id, "test"),
         btree_resident: false,
     };
@@ -5068,11 +5068,11 @@ fn test_commit_dep_threaded_commit_resolves() {
         for entry in mvcc_store.rows.iter() {
             let mut rvs = entry.value().write();
             for rv in rvs.iter_mut() {
-                if rv.begin == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                if rv.begin() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
+                    rv.set_begin(Some(TxTimestampOrID::Timestamp(end_ts)));
                 }
-                if rv.end == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                if rv.end() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
+                    rv.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
                 }
             }
         }
@@ -5320,11 +5320,11 @@ fn test_commit_dep_readonly_does_not_advance_timestamp() {
         for entry in mvcc_store.rows.iter() {
             let mut rvs = entry.value().write();
             for rv in rvs.iter_mut() {
-                if rv.begin == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                if rv.begin() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
+                    rv.set_begin(Some(TxTimestampOrID::Timestamp(end_ts)));
                 }
-                if rv.end == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                if rv.end() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
+                    rv.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
                 }
             }
         }
@@ -5482,11 +5482,11 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
         for entry in mvcc_store.rows.iter() {
             let mut rvs = entry.value().write();
             for rv in rvs.iter_mut() {
-                if rv.begin == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                if rv.begin() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
+                    rv.set_begin(Some(TxTimestampOrID::Timestamp(end_ts)));
                 }
-                if rv.end == Some(TxTimestampOrID::TxID(writer_tx_id)) {
-                    rv.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                if rv.end() == Some(TxTimestampOrID::TxID(writer_tx_id)) {
+                    rv.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
                 }
             }
         }
@@ -7153,8 +7153,8 @@ fn test_update_multiple_unique_columns_partial_rollback() {
 fn make_rv(begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>) -> RowVersion {
     RowVersion {
         id: 0,
-        begin,
-        end,
+        begin: crate::mvcc::database::PackedTs::pack(begin),
+        end: crate::mvcc::database::PackedTs::pack(end),
         row: generate_simple_string_row((-2).into(), 1, "gc_test"),
         btree_resident: false,
     }
@@ -7196,7 +7196,7 @@ fn test_gc_rule1_aborted_among_live_versions() {
     assert_eq!(versions.len(), 2);
     assert!(versions
         .iter()
-        .all(|rv| rv.begin.is_some() || rv.end.is_some()));
+        .all(|rv| rv.begin().is_some() || rv.end().is_some()));
 }
 
 /// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
@@ -7214,7 +7214,7 @@ fn test_gc_rule2_superseded_below_lwm_with_current() {
     let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 0);
     assert_eq!(dropped, 1);
     assert_eq!(versions.len(), 1);
-    assert!(versions[0].end.is_none()); // only current remains
+    assert!(versions[0].end().is_none()); // only current remains
 }
 
 /// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
@@ -7406,7 +7406,7 @@ fn test_gc_rule2_committed_current_disables_tombstone_guard() {
     // Superseded removed (has_current=true for committed version), current remains.
     assert_eq!(dropped, 1);
     assert_eq!(versions.len(), 1);
-    assert!(versions[0].end.is_none());
+    assert!(versions[0].end().is_none());
 }
 
 /// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
@@ -7539,8 +7539,8 @@ fn test_gc_integration_rollback_creates_aborted_garbage() {
     {
         let versions = entry.as_ref().unwrap().value().read();
         assert_eq!(versions.len(), 1);
-        assert!(versions[0].begin.is_none());
-        assert!(versions[0].end.is_none());
+        assert!(versions[0].begin().is_none());
+        assert!(versions[0].end().is_none());
     }
 
     // GC should clean up the version. The SkipMap entry stays (lazy removal
@@ -7566,8 +7566,8 @@ fn test_gc_integration_rollback_creates_aborted_garbage() {
 fn test_gc_shrinks_version_chain_capacity() {
     let make_version = |begin, end| RowVersion {
         id: 0,
-        begin,
-        end,
+        begin: crate::mvcc::database::PackedTs::pack(begin),
+        end: crate::mvcc::database::PackedTs::pack(end),
         row: generate_simple_string_row((-2).into(), 1, "shrink"),
         btree_resident: false,
     };
@@ -7831,8 +7831,8 @@ fn arbitrary_row_version(g: &mut Gen) -> RowVersion {
 
     RowVersion {
         id: 0,
-        begin,
-        end,
+        begin: crate::mvcc::database::PackedTs::pack(begin),
+        end: crate::mvcc::database::PackedTs::pack(end),
         row: generate_simple_string_row((-2).into(), 1, "qc"),
         btree_resident: bool::arbitrary(g),
     }
@@ -7887,7 +7887,7 @@ fn prop_gc_is_idempotent(chain: ArbitraryVersionChain) -> bool {
         && v1
             .iter()
             .zip(snapshot.iter())
-            .all(|(a, b)| a.begin == b.begin && a.end == b.end)
+            .all(|(a, b)| a.begin() == b.begin() && a.end() == b.end())
 }
 
 /// Aborted garbage (begin=None, end=None) is invisible to every transaction and
@@ -7899,7 +7899,7 @@ fn prop_gc_removes_all_aborted_garbage(chain: ArbitraryVersionChain) -> bool {
     MvStore::<MvccClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
     versions
         .iter()
-        .all(|rv| !matches!((&rv.begin, &rv.end), (None, None)))
+        .all(|rv| !matches!((&rv.begin(), &rv.end()), (None, None)))
 }
 
 /// Uncommitted inserts (begin=TxID, end=None) belong to an in-flight transaction.
@@ -7910,13 +7910,13 @@ fn prop_gc_retains_txid_begins(chain: ArbitraryVersionChain) -> bool {
     let txid_begins_before: usize = chain
         .versions
         .iter()
-        .filter(|rv| matches!(&rv.begin, Some(TxTimestampOrID::TxID(_))) && rv.end.is_none())
+        .filter(|rv| matches!(&rv.begin(), Some(TxTimestampOrID::TxID(_))) && rv.end().is_none())
         .count();
     let mut versions = chain.versions;
     MvStore::<MvccClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
     let txid_begins_after: usize = versions
         .iter()
-        .filter(|rv| matches!(&rv.begin, Some(TxTimestampOrID::TxID(_))) && rv.end.is_none())
+        .filter(|rv| matches!(&rv.begin(), Some(TxTimestampOrID::TxID(_))) && rv.end().is_none())
         .count();
     // Active uncommitted versions (begin=TxID, end=None) are never aborted garbage
     // and don't match rule 2 or 3, so they should be retained.
@@ -7930,8 +7930,9 @@ fn prop_gc_retains_txid_begins(chain: ArbitraryVersionChain) -> bool {
 fn prop_gc_retains_txid_ends(chain: ArbitraryVersionChain) -> bool {
     // Versions with end=TxID and non-None begin are not matched by any removal
     // rule (rule 1 requires (None,None), rule 2 requires end=Timestamp).
-    let filter =
-        |rv: &&RowVersion| matches!(&rv.end, Some(TxTimestampOrID::TxID(_))) && rv.begin.is_some();
+    let filter = |rv: &&RowVersion| {
+        matches!(&rv.end(), Some(TxTimestampOrID::TxID(_))) && rv.begin().is_some()
+    };
     let txid_ends_before: usize = chain.versions.iter().filter(filter).count();
     let mut versions = chain.versions;
     MvStore::<MvccClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
@@ -7949,7 +7950,7 @@ fn prop_gc_current_versions_protected_before_checkpoint(chain: ArbitraryVersionC
         .iter()
         .filter(|rv| {
             matches!(
-                (&rv.begin, &rv.end),
+                (&rv.begin(), &rv.end()),
                 (Some(TxTimestampOrID::Timestamp(_)), None)
             )
         })
@@ -7960,7 +7961,7 @@ fn prop_gc_current_versions_protected_before_checkpoint(chain: ArbitraryVersionC
         .iter()
         .filter(|rv| {
             matches!(
-                (&rv.begin, &rv.end),
+                (&rv.begin(), &rv.end()),
                 (Some(TxTimestampOrID::Timestamp(_)), None)
             )
         })
@@ -7986,16 +7987,16 @@ fn prop_gc_tombstone_guard_preserves_btree_safety(chain: ArbitraryVersionChain) 
     let had_committed_current = chain
         .versions
         .iter()
-        .any(|rv| rv.end.is_none() && matches!(&rv.begin, Some(TxTimestampOrID::Timestamp(_))));
+        .any(|rv| rv.end().is_none() && matches!(&rv.begin(), Some(TxTimestampOrID::Timestamp(_))));
     let had_uncheckpointed_tombstone = chain
         .versions
         .iter()
-        .any(|rv| matches!(&rv.end, Some(TxTimestampOrID::Timestamp(e)) if *e > chain.ckpt_max));
+        .any(|rv| matches!(&rv.end(), Some(TxTimestampOrID::Timestamp(e)) if *e > chain.ckpt_max));
     // Only non-garbage versions matter (aborted garbage is always removed first)
     let had_non_garbage = chain
         .versions
         .iter()
-        .any(|rv| !matches!((&rv.begin, &rv.end), (None, None)));
+        .any(|rv| !matches!((&rv.begin(), &rv.end()), (None, None)));
 
     if !had_committed_current && had_uncheckpointed_tombstone && had_non_garbage {
         !versions.is_empty()
@@ -8020,10 +8021,10 @@ fn prop_gc_no_orphaned_superseded_versions(chain: ArbitraryVersionChain) -> bool
 
     let has_committed_current = versions
         .iter()
-        .any(|rv| rv.end.is_none() && matches!(&rv.begin, Some(TxTimestampOrID::Timestamp(_))));
+        .any(|rv| rv.end().is_none() && matches!(&rv.begin(), Some(TxTimestampOrID::Timestamp(_))));
     let has_superseded = versions.iter().any(|rv| {
         matches!(
-            (&rv.begin, &rv.end),
+            (&rv.begin(), &rv.end()),
             (
                 Some(TxTimestampOrID::Timestamp(_)),
                 Some(TxTimestampOrID::Timestamp(_))
@@ -8036,7 +8037,7 @@ fn prop_gc_no_orphaned_superseded_versions(chain: ArbitraryVersionChain) -> bool
             .iter()
             .filter(|rv| {
                 matches!(
-                    (&rv.begin, &rv.end),
+                    (&rv.begin(), &rv.end()),
                     (
                         Some(TxTimestampOrID::Timestamp(_)),
                         Some(TxTimestampOrID::Timestamp(_))
@@ -8044,7 +8045,7 @@ fn prop_gc_no_orphaned_superseded_versions(chain: ArbitraryVersionChain) -> bool
                 )
             })
             .all(|rv| {
-                if let Some(TxTimestampOrID::Timestamp(e)) = &rv.end {
+                if let Some(TxTimestampOrID::Timestamp(e)) = &rv.end() {
                     *e > chain.lwm || *e > chain.ckpt_max
                 } else {
                     false

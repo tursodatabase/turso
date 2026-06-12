@@ -1036,7 +1036,7 @@ pub(crate) fn serialize_op_entry(
     row_version: &RowVersion,
     portable_extension: Option<&[u8]>,
 ) -> Result<()> {
-    let is_delete = row_version.end.is_some();
+    let is_delete = row_version.end().is_some();
 
     let mut flags = 0u8;
     if row_version.btree_resident {
@@ -3961,8 +3961,10 @@ mod tests {
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row: row.clone(),
             btree_resident: false,
         };
@@ -4046,12 +4048,14 @@ mod tests {
         let row = generate_simple_string_row(table_id, rowid, payload_text);
         let row_version = crate::mvcc::database::RowVersion {
             id: commit_ts,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: if is_delete {
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(if is_delete {
                 Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
             } else {
                 None
-            },
+            }),
             row,
             btree_resident,
         };
@@ -4173,8 +4177,10 @@ mod tests {
     ) -> crate::mvcc::database::RowVersion {
         crate::mvcc::database::RowVersion {
             id: commit_ts,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row: generate_simple_string_row(table_id, rowid, data),
             btree_resident: false,
         }
@@ -4780,8 +4786,10 @@ mod tests {
         let mut tx1 = crate::mvcc::database::LogRecord::new(10);
         tx1.push_row_version_for_test(&crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(10)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(10),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row: row.clone(),
             btree_resident: false,
         });
@@ -4791,8 +4799,10 @@ mod tests {
         let mut tx2 = crate::mvcc::database::LogRecord::new(20);
         tx2.push_row_version_for_test(&crate::mvcc::database::RowVersion {
             id: 2,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(20)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(20),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
         });
@@ -4944,8 +4954,10 @@ mod tests {
             3,
             &[crate::mvcc::database::RowVersion {
                 id: 3,
-                begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(3)),
-                end: None,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(3),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(None),
                 row: row3,
                 btree_resident: false,
             }],
@@ -4996,8 +5008,10 @@ mod tests {
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(123)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(123),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
         };
@@ -5468,8 +5482,10 @@ mod tests {
         let mut tx = crate::mvcc::database::LogRecord::new(300);
         tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(300)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(300),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row: generate_simple_string_row((-2).into(), 42, "flip"),
             btree_resident: false,
         });
@@ -5543,9 +5559,9 @@ mod tests {
                 if is_delete {
                     tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
                         id: 0,
-                        begin: None,
-                        end: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(
-                            tx.tx_timestamp,
+                        begin: crate::mvcc::database::PackedTs::pack(None),
+                        end: crate::mvcc::database::PackedTs::pack(Some(
+                            crate::mvcc::database::TxTimestampOrID::Timestamp(tx.tx_timestamp),
                         )),
                         row: Row::new_table_row(
                             RowID::new((-2).into(), RowKey::Int(rowid)),
@@ -5564,10 +5580,10 @@ mod tests {
                     let row = generate_simple_string_row((-2).into(), rowid, &payload);
                     tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
                         id: 0,
-                        begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(
-                            tx.tx_timestamp,
+                        begin: crate::mvcc::database::PackedTs::pack(Some(
+                            crate::mvcc::database::TxTimestampOrID::Timestamp(tx.tx_timestamp),
                         )),
-                        end: None,
+                        end: crate::mvcc::database::PackedTs::pack(None),
                         row: row.clone(),
                         btree_resident,
                     });
@@ -5599,10 +5615,10 @@ mod tests {
             });
             large_tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
                 id: rowid as u64,
-                begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(
-                    large_commit_ts,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(large_commit_ts),
                 )),
-                end: None,
+                end: crate::mvcc::database::PackedTs::pack(None),
                 row,
                 btree_resident: false,
             });
@@ -5636,12 +5652,14 @@ mod tests {
             let row = generate_simple_string_row((-2).into(), rowid, &payload_text);
             let row_version = crate::mvcc::database::RowVersion {
                 id: commit_ts,
-                begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-                end: if is_delete {
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(if is_delete {
                     Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
                 } else {
                     None
-                },
+                }),
                 row: row.clone(),
                 btree_resident,
             };
@@ -5743,8 +5761,10 @@ mod tests {
         row.id.table_id = (-2).into();
         let version = crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(55)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(55),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: true,
         };
@@ -5802,8 +5822,10 @@ mod tests {
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(10)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(10),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
         };
@@ -6094,8 +6116,10 @@ mod tests {
         let row = generate_simple_string_row(table_id, rowid, value);
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
         }
@@ -6128,8 +6152,10 @@ mod tests {
         let row = Row::new_index_row(row_id, 2);
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
         }
@@ -6154,16 +6180,16 @@ mod tests {
         let row = Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), record_bytes, 1);
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
-            begin: if is_delete {
+            begin: crate::mvcc::database::PackedTs::pack(if is_delete {
                 None
             } else {
                 Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
-            },
-            end: if is_delete {
+            }),
+            end: crate::mvcc::database::PackedTs::pack(if is_delete {
                 Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
             } else {
                 None
-            },
+            }),
             row,
             btree_resident: false,
         }
@@ -6181,16 +6207,16 @@ mod tests {
         let row = Row::new_index_row(row_id, 2);
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
-            begin: if is_delete {
+            begin: crate::mvcc::database::PackedTs::pack(if is_delete {
                 None
             } else {
                 Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
-            },
-            end: if is_delete {
+            }),
+            end: crate::mvcc::database::PackedTs::pack(if is_delete {
                 Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
             } else {
                 None
-            },
+            }),
             row,
             btree_resident: false,
         }
