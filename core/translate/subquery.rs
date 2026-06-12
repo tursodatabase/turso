@@ -863,7 +863,7 @@ fn get_subquery_parser<'a>(
                     .enumerate()
                     .map(|(i, c)| {
                         let rhs_collation = get_collseq_from_expr(&c.expr, table_references)?;
-                        Ok(IndexColumn {
+                        Ok::<_, crate::LimboError>(IndexColumn {
                             name: c.name(table_references).unwrap_or("").to_string(),
                             order: SortOrder::Asc,
                             pos_in_table: i,
@@ -872,7 +872,8 @@ fn get_subquery_parser<'a>(
                             expr: None,
                         })
                     })
-                    .collect::<Result<Vec<_>>>()?;
+                    .try_collect::<Result<crate::alloc::Vec<_>>>()
+                    .expect("TODO: fallible allocations")?;
 
                 let ephemeral_index = Arc::new(Index {
                     columns,

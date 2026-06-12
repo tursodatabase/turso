@@ -3656,7 +3656,7 @@ impl BTreeTable {
     /// columns in this order guarantees that all dependencies of generated columns are computed
     /// before the columns that reference them.
     pub(crate) fn columns_topo_sort(&self) -> Result<ColumnsTopologicalSort<'_>> {
-        let topo = self.column_graph()?.topological_sort.to_vec();
+        let topo = self.column_graph()?.topological_sort.try_to_vec()?;
         Ok(ColumnsTopologicalSort {
             columns: &self.columns,
             topological_sort: topo,
