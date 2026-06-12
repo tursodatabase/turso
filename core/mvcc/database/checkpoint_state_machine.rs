@@ -2453,7 +2453,10 @@ mod tests {
         .unwrap();
         let sortable_key = SortableIndexKey::new_from_record(key_record, index_info);
         let key_arc = Arc::new(sortable_key.clone());
-        let row = Row::new_index_row(RowID::new(index_id, RowKey::Record(sortable_key)), 2);
+        let row = Row::new_index_row(
+            RowID::new(index_id, RowKey::Record(Arc::new(sortable_key))),
+            2,
+        );
         let row_version = RowVersion {
             id: version_id,
             begin: begin.map(TxTimestampOrID::Timestamp),

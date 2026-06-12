@@ -790,10 +790,10 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     }
                 };
                 Ok(maybe_record.map(|record| {
-                    RowKey::Record(SortableIndexKey {
+                    RowKey::Record(Arc::new(SortableIndexKey {
                         key: record.clone(),
                         metadata: index_info.clone(),
-                    })
+                    }))
                 }))
             }
         }
@@ -1460,28 +1460,43 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
                     panic!("BTreeKey::IndexKey requires Index cursor type");
                 };
-                let sortable_key =
-                    SortableIndexKey::new_from_record((*record).clone(), index_info.clone());
+                let sortable_key = Arc::new(SortableIndexKey::new_from_record(
+                    (*record).clone(),
+                    index_info.clone(),
+                ));
                 RowID::new(self.table_id, RowKey::Record(sortable_key))
             }
         };
-        let record_buf = key
-            .get_record()
-            .ok_or_else(|| LimboError::InternalError("BTreeKey should have a record".to_string()))?
-            .get_payload()
-            .to_vec();
-        let num_columns = match key {
-            BTreeKey::IndexKey(record) => record.column_count(),
-            BTreeKey::TableRowId((_, record)) => record
-                .as_ref()
-                .ok_or_else(|| {
-                    LimboError::InternalError("TableRowId should have a record".to_string())
-                })?
-                .column_count(),
-        };
         let row = match &self.mv_cursor_type {
-            MvccCursorType::Table => Row::new_table_row(row_id, record_buf, num_columns),
-            MvccCursorType::Index(_) => Row::new_index_row(row_id, num_columns),
+            MvccCursorType::Table => {
+                let record_buf = key
+                    .get_record()
+                    .ok_or_else(|| {
+                        LimboError::InternalError("BTreeKey should have a record".to_string())
+                    })?
+                    .get_payload()
+                    .to_vec();
+                let BTreeKey::TableRowId((_, record)) = key else {
+                    return Err(LimboError::InternalError(
+                        "Table cursor requires a TableRowId key".to_string(),
+                    ));
+                };
+                let num_columns = record
+                    .as_ref()
+                    .ok_or_else(|| {
+                        LimboError::InternalError("TableRowId should have a record".to_string())
+                    })?
+                    .column_count();
+                Row::new_table_row(row_id, record_buf, num_columns)
+            }
+            MvccCursorType::Index(_) => {
+                let BTreeKey::IndexKey(record) = key else {
+                    return Err(LimboError::InternalError(
+                        "Index cursor requires an IndexKey".to_string(),
+                    ));
+                };
+                Row::new_index_row(row_id, record.column_count())
+            }
         };
 
         // Check if the cursor is currently positioned at a B-tree row that matches
