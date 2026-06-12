@@ -1090,3 +1090,41 @@ fn try_insert_surfaces_allocation_failure() {
     assert_eq!(map.len(), 2);
     assert_eq!(*map.get(&2).unwrap().value(), "two");
 }
+
+#[test]
+fn try_insert_failure_drops_value_exactly_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountsDrops(Arc<AtomicUsize>);
+    impl Drop for CountsDrops {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let alloc = FailOnDemandAlloc::default();
+    let map: SkipMap<i32, CountsDrops, _, _> = SkipMap::new_in(alloc.clone());
+
+    // Failed insert into an empty map: the value is dropped exactly once.
+    alloc.fail_allocations(true);
+    assert!(map.try_insert(1, CountsDrops(drops.clone())).is_err());
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+    assert!(map.is_empty());
+
+    // Successful insert; the stored value must not be dropped.
+    alloc.fail_allocations(false);
+    map.try_insert(1, CountsDrops(drops.clone())).unwrap();
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+
+    // Failed insert over an existing key (replace path): only the new value is
+    // dropped, the stored entry stays untouched.
+    alloc.fail_allocations(true);
+    assert!(map.try_insert(1, CountsDrops(drops.clone())).is_err());
+    assert_eq!(drops.load(Ordering::Relaxed), 2);
+    assert_eq!(map.len(), 1);
+
+    // Dropping the map finalizes the stored value exactly once.
+    drop(map);
+    assert_eq!(drops.load(Ordering::Relaxed), 3);
+}

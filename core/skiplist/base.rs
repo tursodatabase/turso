@@ -21,11 +21,16 @@ use crate::alloc::{ApiAllocator, TryReserveError, TursoAllocator};
 /// An allocator that can back a [`SkipList`].
 ///
 /// Blanket-implemented for every cloneable, thread-safe [`ApiAllocator`].
-/// Cloning must be cheap: deferred node destruction captures a clone of the
-/// allocator that is dropped once the node is reclaimed.
-pub trait SkiplistAllocator: ApiAllocator + Clone + Send + Sync {}
+/// Cloning must be cheap and must not panic: deferred node destruction
+/// captures a clone of the allocator that is dropped once the node is
+/// reclaimed. The `'static` bound is required for the same reason the insert
+/// APIs require `K: Send + 'static`: deferred destruction can run after the
+/// skip list itself is gone, so the allocator must not borrow from anything
+/// (in particular, `&LocalAlloc` would dangle by the time the deferred
+/// closure deallocates the node).
+pub trait SkiplistAllocator: ApiAllocator + Clone + Send + Sync + 'static {}
 
-impl<A: ApiAllocator + Clone + Send + Sync> SkiplistAllocator for A {}
+impl<A: ApiAllocator + Clone + Send + Sync + 'static> SkiplistAllocator for A {}
 
 /// Number of bits needed to store height.
 const HEIGHT_BITS: usize = 5;
@@ -1592,6 +1597,10 @@ impl<K, V, C, A: SkiplistAllocator> IntoIterator for SkipList<K, V, C, A> {
 
     fn into_iter(self) -> Self::IntoIter {
         unsafe {
+            // Clone the allocator before nulling the head: if `clone` panicked after the
+            // nulling, `SkipList::drop` would walk an empty list and leak every node.
+            let alloc = self.alloc.clone();
+
             // Load the front node.
             //
             // Unprotected loads are okay because this function is the only one currently using
@@ -1611,7 +1620,7 @@ impl<K, V, C, A: SkiplistAllocator> IntoIterator for SkipList<K, V, C, A> {
 
             IntoIter {
                 node: front as *mut Node<K, V>,
-                alloc: self.alloc.clone(),
+                alloc,
             }
         }
     }
