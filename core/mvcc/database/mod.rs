@@ -4372,7 +4372,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let version_id = self.get_version_id();
                 let row_version = RowVersion {
                     id: version_id,
-                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(tx.tx_id))),
+                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(
+                        tx.tx_id,
+                    ))),
                     end: crate::mvcc::database::PackedTs::pack(None),
                     row: row.clone(),
                     btree_resident: false,
@@ -4400,7 +4402,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let version_id = self.get_version_id();
                 let row_version = RowVersion {
                     id: version_id,
-                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(tx.tx_id))),
+                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(
+                        tx.tx_id,
+                    ))),
                     end: crate::mvcc::database::PackedTs::pack(None),
                     row,
                     btree_resident: false,
@@ -4488,7 +4492,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let version_id = self.get_version_id();
                 let row_version = RowVersion {
                     id: version_id,
-                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(tx.tx_id))),
+                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(
+                        tx.tx_id,
+                    ))),
                     end: crate::mvcc::database::PackedTs::pack(None),
                     row: row.clone(),
                     btree_resident: true,
@@ -4508,7 +4514,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let version_id = self.get_version_id();
                 let row_version = RowVersion {
                     id: version_id,
-                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(tx.tx_id))),
+                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(
+                        tx.tx_id,
+                    ))),
                     end: crate::mvcc::database::PackedTs::pack(None),
                     row,
                     btree_resident: true,
@@ -6089,9 +6097,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // has_current only counts committed current versions (begin=Timestamp).
         // Pending inserts (begin=TxID) don't count — they might roll back,
         // which would resurrect the B-tree row if the tombstone was removed.
-        let has_current = versions
-            .iter()
-            .any(|rv| rv.end().is_none() && matches!(&rv.begin(), Some(TxTimestampOrID::Timestamp(_))));
+        let has_current = versions.iter().any(|rv| {
+            rv.end().is_none() && matches!(&rv.begin(), Some(TxTimestampOrID::Timestamp(_)))
+        });
         versions.retain(|rv| match &rv.end() {
             Some(TxTimestampOrID::Timestamp(e)) if *e <= lwm => {
                 // Retain only if this is a tombstone AND not yet checkpointed.
@@ -7141,7 +7149,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let version_id = self.get_version_id();
                         let row_version = RowVersion {
                             id: version_id,
-                            begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(commit_ts))),
+                            begin: crate::mvcc::database::PackedTs::pack(Some(
+                                TxTimestampOrID::Timestamp(commit_ts),
+                            )),
                             end: crate::mvcc::database::PackedTs::pack(None),
                             row: row.clone(),
                             btree_resident,
@@ -7213,7 +7223,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             let row_version = RowVersion {
                                 id: version_id,
                                 begin: crate::mvcc::database::PackedTs::pack(None),
-                                end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(commit_ts))),
+                                end: crate::mvcc::database::PackedTs::pack(Some(
+                                    TxTimestampOrID::Timestamp(commit_ts),
+                                )),
                                 row: tombstone_row,
                                 btree_resident,
                             };
@@ -7266,7 +7278,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let version_id = self.get_version_id();
                         let row_version = RowVersion {
                             id: version_id,
-                            begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(commit_ts))),
+                            begin: crate::mvcc::database::PackedTs::pack(Some(
+                                TxTimestampOrID::Timestamp(commit_ts),
+                            )),
                             end: crate::mvcc::database::PackedTs::pack(None),
                             row: row.clone(),
                             btree_resident,
@@ -7307,7 +7321,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let row_version = RowVersion {
                             id: version_id,
                             begin: crate::mvcc::database::PackedTs::pack(None),
-                            end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(commit_ts))),
+                            end: crate::mvcc::database::PackedTs::pack(Some(
+                                TxTimestampOrID::Timestamp(commit_ts),
+                            )),
                             row: row.clone(),
                             btree_resident,
                         };

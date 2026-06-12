@@ -7566,8 +7566,8 @@ fn test_gc_integration_rollback_creates_aborted_garbage() {
 fn test_gc_shrinks_version_chain_capacity() {
     let make_version = |begin, end| RowVersion {
         id: 0,
-        begin,
-        end,
+        begin: crate::mvcc::database::PackedTs::pack(begin),
+        end: crate::mvcc::database::PackedTs::pack(end),
         row: generate_simple_string_row((-2).into(), 1, "shrink"),
         btree_resident: false,
     };
@@ -7930,8 +7930,9 @@ fn prop_gc_retains_txid_begins(chain: ArbitraryVersionChain) -> bool {
 fn prop_gc_retains_txid_ends(chain: ArbitraryVersionChain) -> bool {
     // Versions with end=TxID and non-None begin are not matched by any removal
     // rule (rule 1 requires (None,None), rule 2 requires end=Timestamp).
-    let filter =
-        |rv: &&RowVersion| matches!(&rv.end(), Some(TxTimestampOrID::TxID(_))) && rv.begin().is_some();
+    let filter = |rv: &&RowVersion| {
+        matches!(&rv.end(), Some(TxTimestampOrID::TxID(_))) && rv.begin().is_some()
+    };
     let txid_ends_before: usize = chain.versions.iter().filter(filter).count();
     let mut versions = chain.versions;
     MvStore::<MvccClock>::gc_version_chain(&mut versions, chain.lwm, chain.ckpt_max);
