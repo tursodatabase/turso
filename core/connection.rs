@@ -206,7 +206,7 @@ enum ReparsePhase {
     PopulateSequences {
         /// `(backing_table_name, seq_name)` worklist; `None` until lazily
         /// computed. Left empty when preserved sequences are grafted.
-        pending: Option<Vec<(String, String)>>,
+        pending: Option<crate::alloc::Vec<(String, String)>>,
         /// Index of the backing table currently being read.
         idx: usize,
         /// In-flight descriptor `SELECT`, created lazily per backing table.
@@ -235,7 +235,7 @@ pub enum LoadSequenceDescriptorsState {
     Start,
     Reading {
         /// `(backing_table_name, seq_name)` worklist captured from the schema.
-        pending: Vec<(String, String)>,
+        pending: crate::alloc::Vec<(String, String)>,
         /// Index of the backing table currently being read.
         idx: usize,
         /// In-flight descriptor `SELECT`, created lazily per backing table.
@@ -1282,7 +1282,7 @@ impl Connection {
                     if pending.is_none() {
                         if let Some(sequences) = inner.preserved_sequences.take() {
                             inner.fresh.sequences = sequences;
-                            *pending = Some(Vec::new());
+                            *pending = Some(crate::alloc::vec![]);
                         } else {
                             let work = inner.fresh.sequence_backing_table_names();
                             if !work.is_empty() {
