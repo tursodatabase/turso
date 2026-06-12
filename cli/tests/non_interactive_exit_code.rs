@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -9,6 +9,20 @@ fn temp_test_path(name: &str) -> PathBuf {
     static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
     let unique = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     std::env::temp_dir().join(format!("turso-{name}-{}-{unique}", std::process::id()))
+}
+
+fn dot_command_path_arg(path: &Path) -> String {
+    let path = path.display().to_string();
+    let mut arg = String::with_capacity(path.len() + 2);
+    arg.push('"');
+    for c in path.chars() {
+        if matches!(c, '\\' | '"') {
+            arg.push('\\');
+        }
+        arg.push(c);
+    }
+    arg.push('"');
+    arg
 }
 
 fn run_piped_script(script: &str) -> Output {
@@ -218,8 +232,8 @@ fn piped_stdin_import_row_error_returns_nonzero_and_keeps_successful_rows() {
     let csv_path = temp_test_path("unique-import.csv");
     std::fs::write(&csv_path, "a\na\nb\n").expect("failed to write csv");
     let script = format!(
-        ".mode list\nCREATE TABLE t(x UNIQUE);\n.import --csv \"{}\" t\nSELECT count(*) FROM t;\n",
-        csv_path.display()
+        ".mode list\nCREATE TABLE t(x UNIQUE);\n.import --csv {} t\nSELECT count(*) FROM t;\n",
+        dot_command_path_arg(&csv_path)
     );
     let output = run_piped_script(&script);
     let _ = std::fs::remove_file(&csv_path);
@@ -241,8 +255,8 @@ fn piped_stdin_dot_command_parse_error_returns_nonzero_and_continues() {
     let csv_path = temp_test_path("bad-import-option.csv");
     std::fs::write(&csv_path, "1\n").expect("failed to write csv");
     let script = format!(
-        ".mode list\n.import --badopt \"{}\" t\nSELECT 1;\n",
-        csv_path.display()
+        ".mode list\n.import --badopt {} t\nSELECT 1;\n",
+        dot_command_path_arg(&csv_path)
     );
     let output = run_piped_script(&script);
     let _ = std::fs::remove_file(&csv_path);
@@ -298,8 +312,8 @@ fn piped_stdin_parameter_error_returns_nonzero_and_continues() {
 fn piped_stdin_read_missing_file_reports_stderr_and_continues() {
     let missing_path = temp_test_path("missing-read.sql");
     let script = format!(
-        ".mode list\n.read \"{}\"\nSELECT 1;\n",
-        missing_path.display()
+        ".mode list\n.read {}\nSELECT 1;\n",
+        dot_command_path_arg(&missing_path)
     );
     let output = run_piped_script(&script);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -431,7 +445,7 @@ SELECT msg FROM log;\n";
     let sql_path = temp_test_path("dot-read-trigger.sql");
     std::fs::write(&sql_path, sql).expect("failed to write sql file");
 
-    let dot_read = format!(".read {}", sql_path.display());
+    let dot_read = format!(".read {}", dot_command_path_arg(&sql_path));
     let mut child = Command::new(env!("CARGO_BIN_EXE_tursodb"))
         .arg(":memory:")
         .stdin(Stdio::piped())
