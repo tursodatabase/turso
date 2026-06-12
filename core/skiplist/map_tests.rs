@@ -1128,3 +1128,54 @@ fn try_insert_failure_drops_value_exactly_once() {
     drop(map);
     assert_eq!(drops.load(Ordering::Relaxed), 3);
 }
+
+#[test]
+fn try_get_or_insert_family_fails_on_missing_key() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let alloc = FailOnDemandAlloc::default();
+    let map: SkipMap<i32, i32, _, _> = SkipMap::new_in(alloc.clone());
+
+    alloc.fail_allocations(true);
+    // A missing key forces a node allocation in every fallible variant.
+    assert!(map.try_get_or_insert(1, 10).is_err());
+    let calls = AtomicUsize::new(0);
+    assert!(map
+        .try_get_or_insert_with(1, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            10
+        })
+        .is_err());
+    // The value closure runs before the allocation is attempted; the value it
+    // built is dropped on failure.
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert!(map.try_compare_insert(1, 10, |_| false).is_err());
+    assert!(map.is_empty());
+
+    alloc.fail_allocations(false);
+    map.try_get_or_insert(1, 10).unwrap();
+    assert_eq!(map.len(), 1);
+
+    alloc.fail_allocations(true);
+    // Existing key: the fast path returns the entry without allocating, and
+    // the value closure is never invoked.
+    assert_eq!(*map.try_get_or_insert(1, 20).unwrap().value(), 10);
+    assert_eq!(
+        *map.try_get_or_insert_with(1, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            20
+        })
+        .unwrap()
+        .value(),
+        10
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    // A false predicate keeps the existing entry without allocating; a true
+    // predicate must allocate a replacement node and fails.
+    assert_eq!(
+        *map.try_compare_insert(1, 20, |_| false).unwrap().value(),
+        10
+    );
+    assert!(map.try_compare_insert(1, 20, |_| true).is_err());
+    assert_eq!(*map.get(&1).unwrap().value(), 10);
+}

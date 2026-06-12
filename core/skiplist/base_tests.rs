@@ -1021,3 +1021,43 @@ fn remove_race() {
 
     assert_eq!(*total_removed.get_mut(), KEY_RANGE);
 }
+
+#[test]
+fn try_insert_family_surfaces_allocation_failure() {
+    let alloc = super::map_tests::FailOnDemandAlloc::default();
+    let guard = &epoch::pin();
+    let s = SkipList::new_in(epoch::default_collector().clone(), alloc.clone());
+
+    alloc.fail_allocations(true);
+    // Every fallible insert needs a fresh node here, so all must fail.
+    assert!(s.try_insert(1, 10, guard).is_err());
+    assert!(s.try_get_or_insert(1, 10, guard).is_err());
+    assert!(s.try_get_or_insert_with(1, || 10, guard).is_err());
+    assert!(s.try_compare_insert(1, 10, |_| true, guard).is_err());
+    assert!(s.is_empty());
+
+    alloc.fail_allocations(false);
+    s.try_insert(1, 10, guard).unwrap().release(guard);
+    assert_eq!(s.len(), 1);
+
+    alloc.fail_allocations(true);
+    // Existing key: the get_or_insert variants take the no-allocation fast
+    // path and still succeed while allocations fail.
+    let e = s.try_get_or_insert(1, 20, guard).unwrap();
+    assert_eq!(*e.value(), 10);
+    e.release(guard);
+    let e = s.try_get_or_insert_with(1, || 20, guard).unwrap();
+    assert_eq!(*e.value(), 10);
+    e.release(guard);
+    // compare_insert with a false predicate also returns the existing entry
+    // without allocating...
+    let e = s.try_compare_insert(1, 20, |_| false, guard).unwrap();
+    assert_eq!(*e.value(), 10);
+    e.release(guard);
+    // ...but replacing always needs a new node and must fail, leaving the
+    // existing entry untouched.
+    assert!(s.try_insert(1, 20, guard).is_err());
+    assert!(s.try_compare_insert(1, 20, |_| true, guard).is_err());
+    assert_eq!(s.len(), 1);
+    assert_eq!(*s.get(&1, guard).unwrap().value(), 10);
+}
