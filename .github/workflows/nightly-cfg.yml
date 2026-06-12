@@ -28,7 +28,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # Pinned so upstream nightly regressions can't break this job
+          # independently of our changes; bump deliberately when needed.
+          toolchain: nightly-2025-12-17
       - name: Setup mold linker
         uses: "./.github/shared/setup-mold"
       - uses: Swatinem/rust-cache@v2
@@ -42,6 +46,6 @@ jobs:
       - name: Check core with the nightly allocator cfg
         env:
           RUSTFLAGS: "--cfg nightly"
-        # +nightly bypasses the rust-toolchain.toml stable pin.
+        # The explicit toolchain bypasses the rust-toolchain.toml stable pin.
         # --all-targets so cfg(test) code is covered too.
-        run: cargo +nightly check -p turso_core --all-targets --locked
+        run: cargo +nightly-2025-12-17 check -p turso_core --all-targets --locked
