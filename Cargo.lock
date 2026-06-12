@@ -3561,6 +3561,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory-benchmark-codspeed"
+version = "0.1.0"
+dependencies = [
+ "codspeed-criterion-compat",
+ "criterion",
+ "memory-benchmark",
+ "tokio",
+]
+
+[[package]]
 name = "memory-stats"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
