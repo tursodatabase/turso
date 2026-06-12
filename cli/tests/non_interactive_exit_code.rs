@@ -1,5 +1,29 @@
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::path::PathBuf;
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+fn temp_test_path(name: &str) -> PathBuf {
+    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+    let unique = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+    std::env::temp_dir().join(format!("turso-{name}-{}-{unique}", std::process::id()))
+}
+
+fn run_piped_script(script: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tursodb"))
+        .arg(":memory:")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run tursodb");
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(script.as_bytes()).unwrap();
+    drop(stdin);
+
+    child.wait_with_output().expect("failed to wait")
+}
 
 // ---------------------------------------------------------------------------
 // A. SQL argument mode
@@ -152,59 +176,21 @@ fn sqlite_dbpage_update_allows_unsafe_testing() {
 /// B8: Success path returns 0
 #[test]
 fn piped_stdin_returns_exit_code_zero_on_success() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tursodb"))
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to run tursodb");
-
-    let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(b"select 1;\n").unwrap();
-    drop(stdin);
-
-    let status = child.wait().expect("failed to wait");
-    assert_eq!(status.code(), Some(0));
+    let output = run_piped_script("select 1;\n");
+    assert_eq!(output.status.code(), Some(0));
 }
 
 /// B9: Parse/prepare failure returns non-zero
 #[test]
 fn piped_stdin_returns_exit_code_one_on_query_failure() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tursodb"))
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to run tursodb");
-
-    let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(b"select * from nonexistent;\n").unwrap();
-    drop(stdin);
-
-    let status = child.wait().expect("failed to wait");
-    assert_eq!(status.code(), Some(1));
+    let output = run_piped_script("select * from nonexistent;\n");
+    assert_eq!(output.status.code(), Some(1));
 }
 
 /// B10: Fail-fast in piped multi-statement failure
 #[test]
 fn piped_stdin_stops_execution_after_first_error() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tursodb"))
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to run tursodb");
-
-    let mut stdin = child.stdin.take().unwrap();
-    stdin
-        .write_all(b"select 'one'; select * from missing; select 'two';\n")
-        .unwrap();
-    drop(stdin);
-
-    let output = child.wait_with_output().expect("failed to wait");
+    let output = run_piped_script("select 'one'; select * from missing; select 'two';\n");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("one"), "first query should execute");
     assert!(
@@ -217,26 +203,91 @@ fn piped_stdin_stops_execution_after_first_error() {
 /// B11: Runtime/step failure in piped mode returns non-zero
 #[test]
 fn piped_stdin_runtime_error_returns_nonzero() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tursodb"))
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    let output = run_piped_script(
+        "create table t(x integer primary key);\n\
+         insert into t values(1);\n\
+         insert into t values(1);\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn piped_stdin_dot_command_parse_error_returns_nonzero_and_continues() {
+    let csv_path = temp_test_path("bad-import-option.csv");
+    std::fs::write(&csv_path, "1\n").expect("failed to write csv");
+    let script = format!(
+        ".mode list\n.import --badopt \"{}\" t\nSELECT 1;\n",
+        csv_path.display()
+    );
+    let output = run_piped_script(&script);
+    let _ = std::fs::remove_file(&csv_path);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stdout, "1\n");
+    assert!(
+        stderr.contains("unexpected argument '--badopt'"),
+        "expected clap parse error, got: {stderr}"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn piped_stdin_dot_command_help_returns_zero() {
+    let output = run_piped_script(".schema --help\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Display schema for a table"),
+        "expected .schema help, got: {stdout}"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn top_level_help_returns_zero() {
+    let output = Command::new(env!("CARGO_BIN_EXE_tursodb"))
+        .arg("--help")
+        .output()
         .expect("failed to run tursodb");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("The Turso interactive SQL shell"),
+        "expected top-level help, got: {stdout}"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
 
-    let mut stdin = child.stdin.take().unwrap();
-    stdin
-        .write_all(
-            b"create table t(x integer primary key);\n\
-              insert into t values(1);\n\
-              insert into t values(1);\n",
-        )
-        .unwrap();
-    drop(stdin);
+#[test]
+fn piped_stdin_parameter_error_returns_nonzero_and_continues() {
+    let output = run_piped_script(".mode list\n.parameter set x 41\nSELECT 1;\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("parameter name must start with one of"));
+    assert!(
+        stdout.ends_with("1\n"),
+        "SELECT after dot error should run: {stdout}"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
 
-    let status = child.wait().expect("failed to wait");
-    assert_eq!(status.code(), Some(1));
+#[test]
+fn piped_stdin_read_missing_file_reports_stderr_and_continues() {
+    let missing_path = temp_test_path("missing-read.sql");
+    let script = format!(
+        ".mode list\n.read \"{}\"\nSELECT 1;\n",
+        missing_path.display()
+    );
+    let output = run_piped_script(&script);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stdout, "1\n");
+    assert!(
+        stderr.contains(&format!(
+            "Error: cannot open \"{}\"",
+            missing_path.display()
+        )),
+        "expected .read error on stderr, got: {stderr:?}"
+    );
+    assert_eq!(output.status.code(), Some(1));
 }
 
 /// C1: .read handles multi-line CREATE TRIGGER correctly
@@ -251,7 +302,7 @@ END;\n\
 INSERT INTO t VALUES (1, 'hello');\n\
 SELECT msg FROM log;\n";
 
-    let sql_path = std::env::temp_dir().join("limbo_test_dot_read_trigger.sql");
+    let sql_path = temp_test_path("dot-read-trigger.sql");
     std::fs::write(&sql_path, sql).expect("failed to write sql file");
 
     let dot_read = format!(".read {}", sql_path.display());

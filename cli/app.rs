@@ -457,6 +457,11 @@ impl Limbo {
         self.had_query_error
     }
 
+    fn dot_command_error(&mut self, message: impl std::fmt::Display) {
+        self.had_query_error = true;
+        let _ = writeln!(io::stderr(), "{message}");
+    }
+
     fn toggle_echo(&mut self, arg: EchoMode) {
         match arg {
             EchoMode::On => self.opts.echo = true,
@@ -817,22 +822,22 @@ impl Limbo {
                 }
                 Command::Open(args) => {
                     if let Err(e) = self.open_db(&args.path, args.vfs_name.as_deref()) {
-                        let _ = self.writeln(e.to_string());
+                        self.dot_command_error(e);
                     }
                 }
                 Command::Schema(args) => {
                     if let Err(e) = self.display_schema(args.table_name.as_deref()) {
-                        let _ = self.writeln(e.to_string());
+                        self.dot_command_error(e);
                     }
                 }
                 Command::Tables(args) => {
                     if let Err(e) = self.display_tables(args.pattern.as_deref()) {
-                        let _ = self.writeln(e.to_string());
+                        self.dot_command_error(e);
                     }
                 }
                 Command::Databases => {
                     if let Err(e) = self.display_databases() {
-                        let _ = self.writeln(e.to_string());
+                        self.dot_command_error(e);
                     }
                 }
                 Command::Opcodes(args) => {
@@ -853,13 +858,13 @@ impl Limbo {
                 }
                 Command::OutputMode(args) => {
                     if let Err(e) = self.set_mode(args.mode) {
-                        let _ = self.writeln_fmt(format_args!("Error: {e}"));
+                        self.dot_command_error(format!("Error: {e}"));
                     }
                 }
                 Command::SetOutput(args) => {
                     if let Some(path) = args.path {
                         if let Err(e) = self.set_output_file(&path) {
-                            let _ = self.writeln_fmt(format_args!("Error: {e}"));
+                            self.dot_command_error(format!("Error: {e}"));
                         }
                     } else {
                         self.set_output_stdout();
@@ -869,14 +874,16 @@ impl Limbo {
                     self.toggle_echo(args.mode);
                 }
                 Command::Cwd(args) => {
-                    let _ = std::env::set_current_dir(args.directory);
+                    if let Err(e) = std::env::set_current_dir(args.directory) {
+                        self.dot_command_error(format!("Error: {e}"));
+                    }
                 }
                 Command::ShowInfo => {
                     let _ = self.show_info();
                 }
                 Command::Stats(args) => {
                     if let Err(e) = self.display_stats(args) {
-                        let _ = self.writeln(e.to_string());
+                        self.dot_command_error(e);
                     }
                 }
                 Command::Import(args) => {
@@ -887,12 +894,12 @@ impl Limbo {
                 Command::LoadExtension(args) => {
                     #[cfg(not(target_family = "wasm"))]
                     if let Err(e) = self.handle_load_extension(&args.path) {
-                        let _ = self.writeln(&e);
+                        self.dot_command_error(e);
                     }
                 }
                 Command::Dump => {
                     if let Err(e) = self.dump_database() {
-                        let _ = self.writeln_fmt(format_args!("/****** ERROR: {e} ******/"));
+                        self.dot_command_error(format!("/****** ERROR: {e} ******/"));
                     }
                 }
                 Command::DbConfig(args) => match (args.config.as_deref(), args.mode) {
@@ -907,7 +914,7 @@ impl Limbo {
                         let _ = self.writeln(format!("dqs_dml {val}"));
                     }
                     (Some(name), _) => {
-                        let _ = self.writeln(format!("unknown dbconfig: {name}"));
+                        self.dot_command_error(format!("unknown dbconfig: {name}"));
                     }
                     (None, _) => {
                         let dqs = if self.conn.get_dqs_dml() { "on" } else { "off" };
@@ -922,7 +929,7 @@ impl Limbo {
                 }
                 Command::ListIndexes(args) => {
                     if let Err(e) = self.display_indexes(args.tbl_name) {
-                        let _ = self.writeln(e.to_string());
+                        self.dot_command_error(e);
                     }
                 }
                 Command::Timer(timer_mode) => {
@@ -939,28 +946,31 @@ impl Limbo {
                 }
                 Command::Clone(args) => {
                     if let Err(e) = self.clone_database(&args.output_file) {
-                        let _ = self.writeln(e.to_string());
+                        self.dot_command_error(e);
                     }
                 }
                 Command::Manual(args) => {
-                    let w = self.writer.as_mut().unwrap();
-                    if let Err(e) = manual::display_manual(args.page.as_deref(), w) {
-                        let _ = self.writeln(e.to_string());
+                    let result = {
+                        let w = self.writer.as_mut().unwrap();
+                        manual::display_manual(args.page.as_deref(), w)
+                    };
+                    if let Err(e) = result {
+                        self.dot_command_error(e);
                     }
                 }
                 Command::Read(args) => {
                     if let Err(e) = self.read_sql_file(&args.path) {
-                        let _ = self.writeln(e.to_string());
+                        self.dot_command_error(e);
                     }
                 }
                 Command::Parameter(args) => {
                     if let Err(e) = self.handle_parameter_command(args) {
-                        let _ = self.writeln_fmt(format_args!("Error: {e}"));
+                        self.dot_command_error(format!("Error: {e}"));
                     }
                 }
                 Command::Dbtotxt(args) => {
                     if let Err(e) = self.dump_database_as_text(args.page_no) {
-                        let _ = self.writeln_fmt(format_args!("ERROR:{e}"));
+                        self.dot_command_error(format!("ERROR:{e}"));
                     }
                 }
             },

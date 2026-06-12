@@ -140,10 +140,14 @@ def test_output_file():
     with open(output_file, "r") as f:
         contents = f.read()
 
+    # Dot-command diagnostics go to stderr, never into the redirected output file.
+    assert "Error: pretty output can only be written to a tty" not in contents, (
+        "Error message for pretty mode must not leak into the output file"
+    )
+
     expected_lines = {
         f"Output: {output_filename}": "Can direct output to a file",
         "Output mode: list": "Output mode remains list when output is redirected",
-        "Error: pretty output can only be written to a tty": "Error message for pretty mode",
         "SELECT 'TEST_ECHO'": "Echoed command",
         "TEST_ECHO": "Echoed result",
         "Null value: turso": "Null value setting",
