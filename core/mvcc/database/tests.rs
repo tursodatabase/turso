@@ -181,7 +181,7 @@ fn mvcc_active_read_tx_blocks_vacuum_gate() {
         Err(LimboError::Busy)
     ));
 
-    db.mvcc_store.remove_tx(tx_id);
+    db.mvcc_store.remove_tx(tx_id).unwrap();
     db.mvcc_store.try_begin_vacuum_gate().unwrap();
     db.mvcc_store.release_vacuum_gate();
 }
@@ -287,7 +287,8 @@ fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
         .write()
         .replace(DatabaseHeader::default());
     db.mvcc_store
-        .insert_table_id_to_rootpage(MVTableId::from(-999_i64), Some(999));
+        .insert_table_id_to_rootpage(MVTableId::from(-999_i64), Some(999))
+        .unwrap();
 
     db.mvcc_store.try_begin_vacuum_gate().unwrap();
     db.mvcc_store.reset_after_vacuum(header, schema.as_ref());
@@ -7992,7 +7993,7 @@ fn test_gc_active_reader_pins_lwm() {
     );
 
     // Close the reader transaction.
-    db.mvcc_store.remove_tx(tx2);
+    db.mvcc_store.remove_tx(tx2).unwrap();
 
     // LWM should now be u64::MAX.
     assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
