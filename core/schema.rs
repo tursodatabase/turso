@@ -494,11 +494,9 @@ impl TypeDef {
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
-                        tag_names: variants
-                            .iter()
-                            .map(|v| v.tag_name.clone())
-                            .try_collect::<Vec<_>>()?
-                            .into(),
+                        // Arc<[T]> is a shared-pointer boundary: collect directly,
+                        // skipping the intermediate allocator Vec.
+                        tag_names: variants.iter().map(|v| v.tag_name.clone()).collect(),
                         variants,
                     }),
                 }
