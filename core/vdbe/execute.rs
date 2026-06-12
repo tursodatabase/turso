@@ -5800,7 +5800,7 @@ fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// - GroupConcat/StringAgg: [Null] (becomes Text on first non-null value)
 /// - JsonGroupObject/JsonbGroupObject: [Blob([])]
 /// - JsonGroupArray/JsonbGroupArray: [Blob([])]
-fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
+fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> Result<()> {
     match func {
         AggFunc::Count | AggFunc::Count0 => payload.push(Value::from_i64(0)),
         AggFunc::Sum | AggFunc::Total => {
@@ -6494,7 +6494,7 @@ pub fn op_agg_step(
             },
             _ => {
                 // Built-in aggregates use flat payload
-                let mut payload = Vec::new();
+                let mut payload = crate::alloc::vec![];
                 init_agg_payload(func, &mut payload)?;
                 Register::Aggregate(AggContext::Builtin(payload))
             }
@@ -6780,15 +6780,20 @@ pub fn op_sorter_open(
     } else {
         (cache_size as usize) * page_size
     };
-    let mut order = Vec::with_capacity(order_collations_nulls.len());
-    let mut collations = Vec::with_capacity(order_collations_nulls.len());
-    let mut nulls_orders = Vec::with_capacity(order_collations_nulls.len());
+    let mut order = Vec::try_with_capacity_ext(order_collations_nulls.len())
+        .expect("TODO: fallible allocations");
+    let mut collations = crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
+        .expect("TODO: fallible allocations");
+    let mut nulls_orders = crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
+        .expect("TODO: fallible allocations");
     for (ord, coll, nulls) in order_collations_nulls.iter() {
         order.push(*ord);
         collations.push(coll.unwrap_or_default());
         nulls_orders.push(*nulls);
     }
-    let mut sort_comparators = Vec::with_capacity(order_collations_nulls.len());
+    let mut sort_comparators =
+        crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
+            .expect("TODO: fallible allocations");
     for (idx, (_, coll, _)) in order_collations_nulls.iter().enumerate() {
         let comparator = match comparators.get(idx).and_then(|c| c.as_ref()) {
             Some(comparator) => Some(make_sort_comparator(comparator)?),
@@ -16858,7 +16863,7 @@ mod tests {
 
     #[test]
     fn test_init_agg_payload_count() {
-        let mut payload = Vec::new();
+        let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::Count, &mut payload).unwrap();
         assert_eq!(payload.len(), 1);
         assert_eq!(payload[0], Value::from_i64(0));
@@ -16866,7 +16871,7 @@ mod tests {
 
     #[test]
     fn test_init_agg_payload_sum() {
-        let mut payload = Vec::new();
+        let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::Sum, &mut payload).unwrap();
         assert_eq!(payload.len(), 4);
         assert_eq!(payload[0], Value::Null); // acc
@@ -16877,7 +16882,7 @@ mod tests {
 
     #[test]
     fn test_init_agg_payload_avg() {
-        let mut payload = Vec::new();
+        let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::Avg, &mut payload).unwrap();
         assert_eq!(payload.len(), 3);
         assert_eq!(payload[0], Value::from_f64(0.0)); // sum
@@ -17105,7 +17110,7 @@ mod tests {
     fn test_array_agg_accumulates_correctly() {
         // Verify that array_agg produces correct results when accumulating
         // multiple values. Uses the direct payload approach (O(1) per row).
-        let mut payload = Vec::new();
+        let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::ArrayAgg, &mut payload).unwrap();
 
         // Simulate how AggStep accumulates values directly into the payload Vec.
@@ -17131,7 +17136,7 @@ mod tests {
     fn test_array_agg_zero_rows_produces_valid_result() {
         // array_agg with zero rows should return NULL, matching PostgreSQL.
         // The result must not be an invalid empty blob that crashes on decode.
-        let mut payload = Vec::new();
+        let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::ArrayAgg, &mut payload).unwrap();
         // No values accumulated — count stays 0.
         let result = finalize_agg_payload(&AggFunc::ArrayAgg, &payload).unwrap();

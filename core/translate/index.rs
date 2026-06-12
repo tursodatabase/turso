@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::index_method::IndexMethodConfiguration;
@@ -440,12 +441,13 @@ fn emit_refill_index(
             .columns
             .iter()
             .map(|c| (c.order, c.collation, None))
-            .collect();
+            .try_collect()
+            .expect("TODO: fallible allocations");
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sorter_cursor_id,
             columns: columns.len(),
             order_collations_nulls,
-            comparators: vec![],
+            comparators: crate::alloc::vec![],
         });
         let content_reg = program.alloc_register();
         program.emit_insn(Insn::OpenPseudo {

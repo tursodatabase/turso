@@ -1058,14 +1058,14 @@ pub enum Insn {
         cursor_id: CursorID, // P1
         columns: usize,      // P2
         /// Combined order, collation, and nulls ordering per column.
-        order_collations_nulls: Vec<(
+        order_collations_nulls: crate::alloc::Vec<(
             SortOrder,
             Option<CollationSeq>,
             Option<turso_parser::ast::NullsOrder>,
         )>,
         /// Per-column custom type comparators for ORDER BY sorting.
         /// When present, the comparator is used instead of standard value comparison.
-        comparators: Vec<Option<SortComparatorType>>,
+        comparators: crate::alloc::Vec<Option<SortComparatorType>>,
     },
 
     /// Insert a row into the sorter.
