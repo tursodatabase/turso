@@ -1014,7 +1014,7 @@ impl AggregateState {
 
     pub fn from_blob(blob: &[u8]) -> Result<(Self, Vec<Value>)> {
         let record = ImmutableRecordRef::from_bin_record(blob);
-        let mut all_values: Vec<Value> = record.get_values_owned()?;
+        let mut all_values = record.get_values_owned()?;
 
         if all_values.is_empty() {
             return Err(LimboError::InternalError(
@@ -1049,6 +1049,8 @@ impl AggregateState {
         }
 
         // Split into group key and state values
+        // TODO: std boundary conversion; adjust once incremental uses the
+        // allocator with fallible allocations everywhere.
         let group_key = all_values[..group_key_count].to_vec();
         let state_values = &all_values[group_key_count..];
 

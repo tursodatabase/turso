@@ -157,8 +157,10 @@ impl MaterializedViewCursor {
             )));
         }
 
+        // TODO: std boundary conversion; adjust once incremental uses the
+        // allocator with fallible allocations everywhere.
         Ok(IOResult::Done(vec![(
-            HashableRow::new(rowid, btree_values),
+            HashableRow::new(rowid, btree_values.into_iter().collect()),
             weight,
         )]))
     }
