@@ -29,7 +29,7 @@ use std::{
     str::Chars,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     time::{Duration, Instant},
 };
@@ -121,6 +121,7 @@ pub struct Limbo {
     io: Arc<dyn turso_core::IO>,
     writer: Option<Box<dyn Write>>,
     conn: Arc<turso_core::Connection>,
+    interrupt_conn: Arc<RwLock<Arc<turso_core::Connection>>>,
     pub interrupt_count: Arc<AtomicUsize>,
     input_buff: ManuallyDrop<String>,
     pub(crate) opts: Settings,
@@ -279,11 +280,18 @@ impl Limbo {
             conn._free_extension_ctx(ext_api);
         }
         let interrupt_count = Arc::new(AtomicUsize::new(0));
+        let interrupt_conn = Arc::new(RwLock::new(conn.clone()));
         {
             let interrupt_count: Arc<AtomicUsize> = Arc::clone(&interrupt_count);
+            let interrupt_conn = interrupt_conn.clone();
             ctrlc::set_handler(move || {
-                // Increment the interrupt count on Ctrl-C
+                // Keep both import CSV reads and the current database connection interruptible.
                 interrupt_count.fetch_add(1, Ordering::Release);
+                let conn = interrupt_conn
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                conn.interrupt();
             })
             .expect("Error setting Ctrl-C handler");
         }
@@ -296,6 +304,7 @@ impl Limbo {
             io,
             writer: Some(get_writer(&opts.output)),
             conn,
+            interrupt_conn,
             interrupt_count,
             input_buff: ManuallyDrop::new(sql.unwrap_or_default()),
             read_state: ReadState::default(),
@@ -457,6 +466,13 @@ impl Limbo {
         self.had_query_error
     }
 
+    fn set_interrupt_connection(&self, conn: Arc<turso_core::Connection>) {
+        *self
+            .interrupt_conn
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = conn;
+    }
+
     fn dot_command_error(&mut self, message: impl std::fmt::Display) {
         self.had_query_error = true;
         let _ = writeln!(io::stderr(), "{message}");
@@ -492,7 +508,9 @@ impl Limbo {
             )
         };
         self.io = io;
-        self.conn = db.connect()?;
+        let conn = db.connect()?;
+        self.conn = conn.clone();
+        self.set_interrupt_connection(conn);
         self.opts.db_file = path.to_string();
         Ok(())
     }

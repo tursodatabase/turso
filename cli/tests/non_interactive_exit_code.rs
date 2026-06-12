@@ -1,7 +1,9 @@
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 fn temp_test_path(name: &str) -> PathBuf {
     static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -311,6 +313,107 @@ fn piped_stdin_read_missing_file_reports_stderr_and_continues() {
         "expected .read error on stderr, got: {stderr:?}"
     );
     assert_eq!(output.status.code(), Some(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn ctrl_c_interrupts_query_after_dot_open() {
+    let db_path = temp_test_path("interrupt-after-open.db");
+    let script = format!(
+        ".mode list\n.open {}\nSELECT * FROM generate_series(1, 1000000000);\n",
+        db_path.display()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tursodb"))
+        .arg(":memory:")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run tursodb");
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(script.as_bytes()).unwrap();
+    drop(stdin);
+
+    let stdout = child.stdout.take().unwrap();
+    let (query_started_tx, query_started_rx) = mpsc::channel();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut stdout = String::new();
+        let mut line = String::new();
+        while reader.read_line(&mut line)? != 0 {
+            if line.trim_end() == "1" {
+                let _ = query_started_tx.send(());
+            }
+            stdout.push_str(&line);
+            line.clear();
+        }
+        Ok::<_, std::io::Error>(stdout)
+    });
+
+    if let Err(e) = query_started_rx.recv_timeout(Duration::from_secs(3)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let stdout = stdout_reader
+            .join()
+            .expect("stdout reader thread panicked")
+            .expect("failed to read stdout");
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .expect("failed to read stderr");
+        panic!("query did not start before SIGINT: {e}; stdout={stdout:?}, stderr={stderr:?}");
+    }
+
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll child") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stdout = stdout_reader
+                .join()
+                .expect("stdout reader thread panicked")
+                .expect("failed to read stdout");
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .expect("failed to read stderr");
+            panic!("query did not exit after SIGINT; stdout={stdout:?}, stderr={stderr:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .expect("stdout reader thread panicked")
+        .expect("failed to read stdout");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .expect("failed to read stderr");
+    let _ = std::fs::remove_file(db_path);
+    let combined = format!("{stdout}{stderr}");
+    assert_eq!(status.code(), Some(1));
+    assert!(
+        combined.to_ascii_lowercase().contains("interrupt"),
+        "expected interrupt diagnostic, got: {combined:?}"
+    );
 }
 
 /// C1: .read handles multi-line CREATE TRIGGER correctly
