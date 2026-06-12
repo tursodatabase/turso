@@ -1,4 +1,3 @@
-use crate::alloc::TursoSliceExt;
 use crate::sync::Arc;
 use crate::{schema::BTreeTable, turso_assert_eq, turso_assert_ne};
 use turso_parser::{
@@ -2745,9 +2744,7 @@ fn rewrite_trigger_sql_for_column_rename(
             new_event,
             for_each_row,
             new_when_clause.as_deref().cloned(),
-            new_commands
-                .try_to_vec()
-                .expect("TODO: fallible allocations"),
+            new_commands.clone(),
             temporary,
             Some(target_database_id),
         );

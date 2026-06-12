@@ -98,7 +98,7 @@ pub struct Trigger {
     pub event: turso_parser::ast::TriggerEvent,
     pub for_each_row: bool,
     pub when_clause: Option<turso_parser::ast::Expr>,
-    pub commands: Vec<turso_parser::ast::TriggerCmd>,
+    pub commands: std::vec::Vec<turso_parser::ast::TriggerCmd>,
     pub temporary: bool,
     /// For temp triggers that target a table in a specific database.
     /// - `None` — the trigger was created without a db qualifier and
@@ -124,7 +124,7 @@ impl Trigger {
         event: turso_parser::ast::TriggerEvent,
         for_each_row: bool,
         when_clause: Option<turso_parser::ast::Expr>,
-        commands: Vec<turso_parser::ast::TriggerCmd>,
+        commands: std::vec::Vec<turso_parser::ast::TriggerCmd>,
         temporary: bool,
         target_database_id: Option<usize>,
     ) -> Self {
@@ -260,11 +260,11 @@ pub struct UnionDef {
 #[derive(Debug, Clone)]
 pub enum TypeDefKind {
     Custom {
-        params: Vec<ast::TypeParam>,
+        params: std::vec::Vec<ast::TypeParam>,
         base: String,
         encode: Option<Box<ast::Expr>>,
         decode: Option<Box<ast::Expr>>,
-        operators: Vec<TypeOperator>,
+        operators: std::vec::Vec<TypeOperator>,
         default: Option<Box<ast::Expr>>,
     },
     Struct(StructDef),
@@ -312,7 +312,7 @@ pub struct TypeDef {
     pub sql: String,
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
     /// Empty for regular CREATE TYPE definitions.
-    pub domain_checks: Vec<ast::DomainConstraint>,
+    pub domain_checks: std::vec::Vec<ast::DomainConstraint>,
     pub kind: TypeDefKind,
 }
 
@@ -438,7 +438,7 @@ impl TypeDef {
                 not_null: false,
                 is_domain: false,
                 sql,
-                domain_checks: Vec::new(),
+                domain_checks: std::vec::Vec::new(),
                 kind: TypeDefKind::Custom {
                     params: params.clone(),
                     base: base.clone(),
@@ -463,7 +463,7 @@ impl TypeDef {
                     not_null: false,
                     is_domain: false,
                     sql,
-                    domain_checks: Vec::new(),
+                    domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Struct(StructDef {
                         fields: struct_fields,
                     }),
@@ -492,7 +492,7 @@ impl TypeDef {
                     not_null: false,
                     is_domain: false,
                     sql,
-                    domain_checks: Vec::new(),
+                    domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
                         tag_names: variants
                             .iter()
@@ -522,15 +522,13 @@ impl TypeDef {
             not_null,
             is_domain: true,
             sql,
-            domain_checks: constraints
-                .try_to_vec()
-                .expect("TODO: fallible allocations"),
+            domain_checks: constraints.to_vec(),
             kind: TypeDefKind::Custom {
-                params: Vec::new(),
+                params: std::vec::Vec::new(),
                 base: base_type.to_string(),
                 encode: None,
                 decode: None,
-                operators: Vec::new(),
+                operators: std::vec::Vec::new(),
                 default,
             },
         }
@@ -4286,16 +4284,16 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     .map(|ast::Type { name, .. }| name)
                     .unwrap_or_default();
 
-                let ty_params: Vec<Box<Expr>> = match col_type {
+                let ty_params: std::vec::Vec<Box<Expr>> = match col_type {
                     Some(ast::Type {
                         size: Some(ast::TypeSize::MaxSize(ref expr)),
                         ..
-                    }) => vec![expr.clone()],
+                    }) => std::vec![expr.clone()],
                     Some(ast::Type {
                         size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
                         ..
-                    }) => vec![e1.clone(), e2.clone()],
-                    _ => Vec::new(),
+                    }) => std::vec![e1.clone(), e2.clone()],
+                    _ => std::vec::Vec::new(),
                 };
 
                 let mut typename_exactly_integer = false;
@@ -4814,7 +4812,7 @@ impl ResolvedFkRef {
 pub struct Column {
     pub name: Option<String>,
     pub ty_str: String,
-    pub ty_params: Vec<Box<Expr>>,
+    pub ty_params: std::vec::Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
     generated_type: GeneratedType,
     raw: u32,
@@ -4976,7 +4974,7 @@ impl Column {
         Self {
             name,
             ty_str,
-            ty_params: Vec::new(),
+            ty_params: std::vec::Vec::new(),
             default,
             generated_type,
             raw,
@@ -5208,16 +5206,16 @@ impl TryFrom<&ColumnDefinition> for Column {
             .map(|t| t.name.to_string())
             .unwrap_or_default();
 
-        let ty_params: Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
+        let ty_params: std::vec::Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
             Some(ast::Type {
                 size: Some(ast::TypeSize::MaxSize(ref expr)),
                 ..
-            }) => vec![expr.clone()],
+            }) => std::vec![expr.clone()],
             Some(ast::Type {
                 size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
                 ..
-            }) => vec![e1.clone(), e2.clone()],
-            _ => Vec::new(),
+            }) => std::vec![e1.clone(), e2.clone()],
+            _ => std::vec::Vec::new(),
         };
 
         let hidden = ty_str.contains("HIDDEN");
