@@ -10,10 +10,10 @@ use core::{
 use crossbeam_epoch as epoch;
 
 use super::{
-    base::{self, try_pin_loop},
+    base::{self, try_pin_loop, SkiplistAllocator},
     comparator::{BasicComparator, Comparator},
 };
-use crate::alloc::TryReserveError;
+use crate::alloc::{TryReserveError, TursoAllocator};
 
 /// An ordered map based on a lock-free skip list.
 ///
@@ -26,8 +26,8 @@ use crate::alloc::TryReserveError;
 ///
 /// [`BTreeMap`]: std::collections::BTreeMap
 /// [`Comparator`]: super::comparator::Comparator
-pub struct SkipMap<K, V, C = BasicComparator> {
-    inner: base::SkipList<K, V, C>,
+pub struct SkipMap<K, V, C = BasicComparator, A: SkiplistAllocator = TursoAllocator> {
+    inner: base::SkipList<K, V, C, A>,
 }
 
 impl<K, V> SkipMap<K, V> {
@@ -47,6 +47,25 @@ impl<K, V> SkipMap<K, V> {
     }
 }
 
+impl<K, V, A: SkiplistAllocator> SkipMap<K, V, BasicComparator, A> {
+    /// Returns a new, empty map with the default comparator that allocates its
+    /// nodes in `alloc`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use turso_core::alloc::TursoAllocator;
+    /// use turso_core::skiplist::SkipMap;
+    ///
+    /// let map: SkipMap<i32, &str, _, TursoAllocator> = SkipMap::new_in(TursoAllocator);
+    /// ```
+    pub fn new_in(alloc: A) -> Self {
+        Self {
+            inner: base::SkipList::new_in(epoch::default_collector().clone(), alloc),
+        }
+    }
+}
+
 impl<K, V, C> SkipMap<K, V, C> {
     /// Returns a new, empty map with the given comparator.
     ///
@@ -60,6 +79,30 @@ impl<K, V, C> SkipMap<K, V, C> {
     pub fn with_comparator(comparator: C) -> Self {
         Self {
             inner: base::SkipList::with_comparator(epoch::default_collector().clone(), comparator),
+        }
+    }
+}
+
+impl<K, V, C, A: SkiplistAllocator> SkipMap<K, V, C, A> {
+    /// Returns a new, empty map with the given comparator that allocates its
+    /// nodes in `alloc`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use turso_core::alloc::TursoAllocator;
+    /// use turso_core::skiplist::{SkipMap, comparator::BasicComparator};
+    ///
+    /// let map: SkipMap<i32, &str, _, TursoAllocator> =
+    ///     SkipMap::with_comparator_in(BasicComparator, TursoAllocator);
+    /// ```
+    pub fn with_comparator_in(comparator: C, alloc: A) -> Self {
+        Self {
+            inner: base::SkipList::with_comparator_in(
+                epoch::default_collector().clone(),
+                comparator,
+                alloc,
+            ),
         }
     }
 
@@ -103,7 +146,7 @@ impl<K, V, C> SkipMap<K, V, C> {
     }
 }
 
-impl<K, V, C> SkipMap<K, V, C>
+impl<K, V, C, A: SkiplistAllocator> SkipMap<K, V, C, A>
 where
     C: Comparator<K>,
 {
@@ -122,7 +165,7 @@ where
     /// numbers.insert(6, "six");
     /// assert_eq!(*numbers.front().unwrap().value(), "five");
     /// ```
-    pub fn front(&self) -> Option<Entry<'_, K, V, C>> {
+    pub fn front(&self) -> Option<Entry<'_, K, V, C, A>> {
         let guard = &epoch::pin();
         try_pin_loop(|| self.inner.front(guard)).map(Entry::new)
     }
@@ -142,7 +185,7 @@ where
     /// numbers.insert(6, "six");
     /// assert_eq!(*numbers.back().unwrap().value(), "six");
     /// ```
-    pub fn back(&self) -> Option<Entry<'_, K, V, C>> {
+    pub fn back(&self) -> Option<Entry<'_, K, V, C, A>> {
         let guard = &epoch::pin();
         try_pin_loop(|| self.inner.back(guard)).map(Entry::new)
     }
@@ -164,7 +207,7 @@ where
     /// let jobs_age = ages.get_or_insert("Steve Jobs", -1);
     /// assert_eq!(*jobs_age.value(), 65);
     /// ```
-    pub fn get_or_insert(&self, key: K, value: V) -> Entry<'_, K, V, C> {
+    pub fn get_or_insert(&self, key: K, value: V) -> Entry<'_, K, V, C, A> {
         let guard = &epoch::pin();
         Entry::new(self.inner.get_or_insert(key, value, guard))
     }
@@ -186,7 +229,7 @@ where
         &self,
         key: K,
         value: V,
-    ) -> Result<Entry<'_, K, V, C>, TryReserveError> {
+    ) -> Result<Entry<'_, K, V, C, A>, TryReserveError> {
         let guard = &epoch::pin();
         self.inner
             .try_get_or_insert(key, value, guard)
@@ -216,7 +259,7 @@ where
     /// let jobs_age = ages.get_or_insert_with("Steve Jobs", || -1);
     /// assert_eq!(*jobs_age.value(), 65);
     /// ```
-    pub fn get_or_insert_with<F>(&self, key: K, value_fn: F) -> Entry<'_, K, V, C>
+    pub fn get_or_insert_with<F>(&self, key: K, value_fn: F) -> Entry<'_, K, V, C, A>
     where
         F: FnOnce() -> V,
     {
@@ -242,7 +285,7 @@ where
         &self,
         key: K,
         value_fn: F,
-    ) -> Result<Entry<'_, K, V, C>, TryReserveError>
+    ) -> Result<Entry<'_, K, V, C, A>, TryReserveError>
     where
         F: FnOnce() -> V,
     {
@@ -274,14 +317,14 @@ where
     ///     println!("{} is {}", number, number_str);
     /// }
     /// ```
-    pub fn iter(&self) -> Iter<'_, K, V, C> {
+    pub fn iter(&self) -> Iter<'_, K, V, C, A> {
         Iter {
             inner: self.inner.ref_iter(),
         }
     }
 }
 
-impl<K, V, C> SkipMap<K, V, C>
+impl<K, V, C, A: SkiplistAllocator> SkipMap<K, V, C, A>
 where
     C: Comparator<K>,
 {
@@ -321,7 +364,7 @@ where
     /// numbers.insert("six", 6);
     /// assert_eq!(*numbers.get("six").unwrap().value(), 6);
     /// ```
-    pub fn get<Q>(&self, key: &Q) -> Option<Entry<'_, K, V, C>>
+    pub fn get<Q>(&self, key: &Q) -> Option<Entry<'_, K, V, C, A>>
     where
         C: Comparator<K, Q>,
         Q: ?Sized,
@@ -356,7 +399,7 @@ where
     /// let greater_than_thirteen = numbers.lower_bound(Excluded(&13));
     /// assert!(greater_than_thirteen.is_none());
     /// ```
-    pub fn lower_bound<'a, Q>(&'a self, bound: Bound<&Q>) -> Option<Entry<'a, K, V, C>>
+    pub fn lower_bound<'a, Q>(&'a self, bound: Bound<&Q>) -> Option<Entry<'a, K, V, C, A>>
     where
         C: Comparator<K, Q>,
         Q: ?Sized,
@@ -388,7 +431,7 @@ where
     /// let less_than_six = numbers.upper_bound(Excluded(&6));
     /// assert!(less_than_six.is_none());
     /// ```
-    pub fn upper_bound<'a, Q>(&'a self, bound: Bound<&Q>) -> Option<Entry<'a, K, V, C>>
+    pub fn upper_bound<'a, Q>(&'a self, bound: Bound<&Q>) -> Option<Entry<'a, K, V, C, A>>
     where
         C: Comparator<K, Q>,
         Q: ?Sized,
@@ -418,7 +461,7 @@ where
     ///     println!("{} is {}", number, number_str);
     /// }
     /// ```
-    pub fn range<Q, R>(&self, range: R) -> Range<'_, Q, R, K, V, C>
+    pub fn range<Q, R>(&self, range: R) -> Range<'_, Q, R, K, V, C, A>
     where
         R: RangeBounds<Q>,
         C: Comparator<K, Q>,
@@ -430,7 +473,7 @@ where
     }
 }
 
-impl<K, V, C> SkipMap<K, V, C>
+impl<K, V, C, A: SkiplistAllocator> SkipMap<K, V, C, A>
 where
     C: Comparator<K>,
     K: Send + 'static,
@@ -453,7 +496,7 @@ where
     ///
     /// assert_eq!(*map.get("key").unwrap().value(), "value");
     /// ```
-    pub fn insert(&self, key: K, value: V) -> Entry<'_, K, V, C> {
+    pub fn insert(&self, key: K, value: V) -> Entry<'_, K, V, C, A> {
         let guard = &epoch::pin();
         Entry::new(self.inner.insert(key, value, guard))
     }
@@ -472,7 +515,7 @@ where
     ///
     /// assert_eq!(*map.get("key").unwrap().value(), "value");
     /// ```
-    pub fn try_insert(&self, key: K, value: V) -> Result<Entry<'_, K, V, C>, TryReserveError> {
+    pub fn try_insert(&self, key: K, value: V) -> Result<Entry<'_, K, V, C, A>, TryReserveError> {
         let guard = &epoch::pin();
         self.inner.try_insert(key, value, guard).map(Entry::new)
     }
@@ -499,7 +542,7 @@ where
     /// map.compare_insert("absent_key", 0, |_| false);
     /// assert_eq!(*map.get("absent_key").unwrap().value(), 0);
     /// ```
-    pub fn compare_insert<F>(&self, key: K, value: V, compare_fn: F) -> Entry<'_, K, V, C>
+    pub fn compare_insert<F>(&self, key: K, value: V, compare_fn: F) -> Entry<'_, K, V, C, A>
     where
         F: Fn(&V) -> bool,
     {
@@ -526,7 +569,7 @@ where
         key: K,
         value: V,
         compare_fn: F,
-    ) -> Result<Entry<'_, K, V, C>, TryReserveError>
+    ) -> Result<Entry<'_, K, V, C, A>, TryReserveError>
     where
         F: Fn(&V) -> bool,
     {
@@ -554,7 +597,7 @@ where
     /// map.insert("key", "value");
     /// assert_eq!(*map.remove("key").unwrap().value(), "value");
     /// ```
-    pub fn remove<Q>(&self, key: &Q) -> Option<Entry<'_, K, V, C>>
+    pub fn remove<Q>(&self, key: &Q) -> Option<Entry<'_, K, V, C, A>>
     where
         C: Comparator<K, Q>,
         Q: ?Sized,
@@ -585,7 +628,7 @@ where
     /// // All entries have been removed now.
     /// assert!(numbers.is_empty());
     /// ```
-    pub fn pop_front(&self) -> Option<Entry<'_, K, V, C>> {
+    pub fn pop_front(&self) -> Option<Entry<'_, K, V, C, A>> {
         let guard = &epoch::pin();
         self.inner.pop_front(guard).map(Entry::new)
     }
@@ -612,7 +655,7 @@ where
     /// // All entries have been removed now.
     /// assert!(numbers.is_empty());
     /// ```
-    pub fn pop_back(&self) -> Option<Entry<'_, K, V, C>> {
+    pub fn pop_back(&self) -> Option<Entry<'_, K, V, C, A>> {
         let guard = &epoch::pin();
         self.inner.pop_back(guard).map(Entry::new)
     }
@@ -645,7 +688,7 @@ where
     }
 }
 
-impl<K, V, C> fmt::Debug for SkipMap<K, V, C>
+impl<K, V, C, A: SkiplistAllocator> fmt::Debug for SkipMap<K, V, C, A>
 where
     K: fmt::Debug,
     V: fmt::Debug,
@@ -655,9 +698,9 @@ where
     }
 }
 
-impl<K, V, C> IntoIterator for SkipMap<K, V, C> {
+impl<K, V, C, A: SkiplistAllocator> IntoIterator for SkipMap<K, V, C, A> {
     type Item = (K, V);
-    type IntoIter = IntoIter<K, V>;
+    type IntoIter = IntoIter<K, V, A>;
 
     fn into_iter(self) -> Self::IntoIter {
         IntoIter {
@@ -666,12 +709,12 @@ impl<K, V, C> IntoIterator for SkipMap<K, V, C> {
     }
 }
 
-impl<'a, K, V, C> IntoIterator for &'a SkipMap<K, V, C>
+impl<'a, K, V, C, A: SkiplistAllocator> IntoIterator for &'a SkipMap<K, V, C, A>
 where
     C: Comparator<K>,
 {
-    type Item = Entry<'a, K, V, C>;
-    type IntoIter = Iter<'a, K, V, C>;
+    type Item = Entry<'a, K, V, C, A>;
+    type IntoIter = Iter<'a, K, V, C, A>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -695,12 +738,12 @@ where
 }
 
 /// A reference-counted entry in a map.
-pub struct Entry<'a, K, V, C = BasicComparator> {
-    inner: ManuallyDrop<base::RefEntry<'a, K, V, C>>,
+pub struct Entry<'a, K, V, C = BasicComparator, A: SkiplistAllocator = TursoAllocator> {
+    inner: ManuallyDrop<base::RefEntry<'a, K, V, C, A>>,
 }
 
-impl<'a, K, V, C> Entry<'a, K, V, C> {
-    fn new(inner: base::RefEntry<'a, K, V, C>) -> Self {
+impl<'a, K, V, C, A: SkiplistAllocator> Entry<'a, K, V, C, A> {
+    fn new(inner: base::RefEntry<'a, K, V, C, A>) -> Self {
         Self {
             inner: ManuallyDrop::new(inner),
         }
@@ -722,7 +765,7 @@ impl<'a, K, V, C> Entry<'a, K, V, C> {
     }
 }
 
-impl<K, V, C> Drop for Entry<'_, K, V, C> {
+impl<K, V, C, A: SkiplistAllocator> Drop for Entry<'_, K, V, C, A> {
     fn drop(&mut self) {
         unsafe {
             ManuallyDrop::into_inner(ptr::read(&self.inner)).release_with_pin(epoch::pin);
@@ -730,7 +773,7 @@ impl<K, V, C> Drop for Entry<'_, K, V, C> {
     }
 }
 
-impl<K, V, C> Entry<'_, K, V, C>
+impl<K, V, C, A: SkiplistAllocator> Entry<'_, K, V, C, A>
 where
     C: Comparator<K>,
 {
@@ -759,7 +802,7 @@ where
     }
 }
 
-impl<K, V, C> Entry<'_, K, V, C>
+impl<K, V, C, A: SkiplistAllocator> Entry<'_, K, V, C, A>
 where
     C: Comparator<K>,
     K: Send + 'static,
@@ -774,7 +817,7 @@ where
     }
 }
 
-impl<K, V, C> Clone for Entry<'_, K, V, C> {
+impl<K, V, C, A: SkiplistAllocator> Clone for Entry<'_, K, V, C, A> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -782,7 +825,7 @@ impl<K, V, C> Clone for Entry<'_, K, V, C> {
     }
 }
 
-impl<K, V, C> fmt::Debug for Entry<'_, K, V, C>
+impl<K, V, C, A: SkiplistAllocator> fmt::Debug for Entry<'_, K, V, C, A>
 where
     K: fmt::Debug,
     V: fmt::Debug,
@@ -796,11 +839,11 @@ where
 }
 
 /// An owning iterator over the entries of a `SkipMap`.
-pub struct IntoIter<K, V> {
-    inner: base::IntoIter<K, V>,
+pub struct IntoIter<K, V, A: SkiplistAllocator = TursoAllocator> {
+    inner: base::IntoIter<K, V, A>,
 }
 
-impl<K, V> Iterator for IntoIter<K, V> {
+impl<K, V, A: SkiplistAllocator> Iterator for IntoIter<K, V, A> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -808,46 +851,46 @@ impl<K, V> Iterator for IntoIter<K, V> {
     }
 }
 
-impl<K, V> fmt::Debug for IntoIter<K, V> {
+impl<K, V, A: SkiplistAllocator> fmt::Debug for IntoIter<K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad("IntoIter { .. }")
     }
 }
 
 /// An iterator over the entries of a `SkipMap`.
-pub struct Iter<'a, K, V, C = BasicComparator> {
-    inner: base::RefIter<'a, K, V, C>,
+pub struct Iter<'a, K, V, C = BasicComparator, A: SkiplistAllocator = TursoAllocator> {
+    inner: base::RefIter<'a, K, V, C, A>,
 }
 
-impl<'a, K, V, C> Iterator for Iter<'a, K, V, C>
+impl<'a, K, V, C, A: SkiplistAllocator> Iterator for Iter<'a, K, V, C, A>
 where
     C: Comparator<K>,
 {
-    type Item = Entry<'a, K, V, C>;
+    type Item = Entry<'a, K, V, C, A>;
 
-    fn next(&mut self) -> Option<Entry<'a, K, V, C>> {
+    fn next(&mut self) -> Option<Entry<'a, K, V, C, A>> {
         let guard = &epoch::pin();
         self.inner.next(guard).map(Entry::new)
     }
 }
 
-impl<'a, K, V, C> DoubleEndedIterator for Iter<'a, K, V, C>
+impl<'a, K, V, C, A: SkiplistAllocator> DoubleEndedIterator for Iter<'a, K, V, C, A>
 where
     C: Comparator<K>,
 {
-    fn next_back(&mut self) -> Option<Entry<'a, K, V, C>> {
+    fn next_back(&mut self) -> Option<Entry<'a, K, V, C, A>> {
         let guard = &epoch::pin();
         self.inner.next_back(guard).map(Entry::new)
     }
 }
 
-impl<K, V, C> fmt::Debug for Iter<'_, K, V, C> {
+impl<K, V, C, A: SkiplistAllocator> fmt::Debug for Iter<'_, K, V, C, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad("Iter { .. }")
     }
 }
 
-impl<K, V, C> Drop for Iter<'_, K, V, C> {
+impl<K, V, C, A: SkiplistAllocator> Drop for Iter<'_, K, V, C, A> {
     fn drop(&mut self) {
         let guard = &epoch::pin();
         self.inner.drop_impl(guard);
@@ -855,42 +898,42 @@ impl<K, V, C> Drop for Iter<'_, K, V, C> {
 }
 
 /// An iterator over a subset of entries of a `SkipMap`.
-pub struct Range<'a, Q, R, K, V, C = BasicComparator>
+pub struct Range<'a, Q, R, K, V, C = BasicComparator, A: SkiplistAllocator = TursoAllocator>
 where
     C: Comparator<K> + Comparator<K, Q>,
     R: RangeBounds<Q>,
     Q: ?Sized,
 {
-    pub(crate) inner: base::RefRange<'a, Q, R, K, V, C>,
+    pub(crate) inner: base::RefRange<'a, Q, R, K, V, C, A>,
 }
 
-impl<'a, Q, R, K, V, C> Iterator for Range<'a, Q, R, K, V, C>
+impl<'a, Q, R, K, V, C, A: SkiplistAllocator> Iterator for Range<'a, Q, R, K, V, C, A>
 where
     C: Comparator<K> + Comparator<K, Q>,
     R: RangeBounds<Q>,
     Q: ?Sized,
 {
-    type Item = Entry<'a, K, V, C>;
+    type Item = Entry<'a, K, V, C, A>;
 
-    fn next(&mut self) -> Option<Entry<'a, K, V, C>> {
+    fn next(&mut self) -> Option<Entry<'a, K, V, C, A>> {
         let guard = &epoch::pin();
         self.inner.next(guard).map(Entry::new)
     }
 }
 
-impl<'a, Q, R, K, V, C> DoubleEndedIterator for Range<'a, Q, R, K, V, C>
+impl<'a, Q, R, K, V, C, A: SkiplistAllocator> DoubleEndedIterator for Range<'a, Q, R, K, V, C, A>
 where
     C: Comparator<K> + Comparator<K, Q>,
     R: RangeBounds<Q>,
     Q: ?Sized,
 {
-    fn next_back(&mut self) -> Option<Entry<'a, K, V, C>> {
+    fn next_back(&mut self) -> Option<Entry<'a, K, V, C, A>> {
         let guard = &epoch::pin();
         self.inner.next_back(guard).map(Entry::new)
     }
 }
 
-impl<Q, R, K, V, C> fmt::Debug for Range<'_, Q, R, K, V, C>
+impl<Q, R, K, V, C, A: SkiplistAllocator> fmt::Debug for Range<'_, Q, R, K, V, C, A>
 where
     C: Comparator<K> + Comparator<K, Q>,
     K: fmt::Debug,
@@ -907,7 +950,7 @@ where
     }
 }
 
-impl<Q, R, K, V, C> Drop for Range<'_, Q, R, K, V, C>
+impl<Q, R, K, V, C, A: SkiplistAllocator> Drop for Range<'_, Q, R, K, V, C, A>
 where
     C: Comparator<K> + Comparator<K, Q>,
     R: RangeBounds<Q>,

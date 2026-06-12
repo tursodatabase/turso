@@ -1026,3 +1026,67 @@ fn comparator() {
     assert_eq!(s.remove("AbC").unwrap().key(), "ABC");
     assert!(s.is_empty());
 }
+
+/// An allocator that fails every allocation while its flag is set.
+///
+/// Delegates to [`TursoAllocator`] otherwise, so nodes are still backed by the
+/// regular Turso heap.
+#[derive(Clone, Default)]
+pub(crate) struct FailOnDemandAlloc {
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FailOnDemandAlloc {
+    pub(crate) fn fail_allocations(&self, fail: bool) {
+        self.fail.store(fail, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+unsafe impl crate::alloc::ApiAllocator for FailOnDemandAlloc {
+    fn allocate(
+        &self,
+        layout: crate::alloc::Layout,
+    ) -> Result<std::ptr::NonNull<[u8]>, crate::alloc::AllocError> {
+        if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(crate::alloc::AllocError);
+        }
+        crate::alloc::TursoAllocator.allocate(layout)
+    }
+
+    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: crate::alloc::Layout) {
+        unsafe { crate::alloc::TursoAllocator.deallocate(ptr, layout) }
+    }
+}
+
+#[test]
+fn try_insert_surfaces_allocation_failure() {
+    let alloc = FailOnDemandAlloc::default();
+    let map: SkipMap<i32, String, _, _> = SkipMap::new_in(alloc.clone());
+    map.try_insert(1, "one".to_string()).unwrap();
+    assert_eq!(map.len(), 1);
+
+    alloc.fail_allocations(true);
+
+    // Inserting a new key needs a node allocation, which now fails. The map
+    // must be left unchanged.
+    assert!(map.try_insert(2, "two".to_string()).is_err());
+    assert!(map
+        .try_compare_insert(2, "two".to_string(), |_| true)
+        .is_err());
+    assert_eq!(map.len(), 1);
+    assert!(map.get(&2).is_none());
+
+    // Finding an existing key takes the no-allocation fast path and still
+    // succeeds while allocations fail.
+    let entry = map.try_get_or_insert(1, "uno".to_string()).unwrap();
+    assert_eq!(*entry.value(), "one");
+    let entry = map.try_get_or_insert_with(1, || "uno".to_string()).unwrap();
+    assert_eq!(*entry.value(), "one");
+
+    alloc.fail_allocations(false);
+
+    // The map stays fully usable after a failed insert.
+    map.try_insert(2, "two".to_string()).unwrap();
+    assert_eq!(map.len(), 2);
+    assert_eq!(*map.get(&2).unwrap().value(), "two");
+}

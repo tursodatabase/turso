@@ -15,11 +15,17 @@ use std::alloc::handle_alloc_error;
 use crossbeam_epoch::{self as epoch, Atomic, Collector, Guard, Shared};
 use crossbeam_utils::CachePadded;
 
-use super::{
-    alloc_helper::Global,
-    comparator::{BasicComparator, Comparator},
-};
-use crate::alloc::TryReserveError;
+use super::comparator::{BasicComparator, Comparator};
+use crate::alloc::{ApiAllocator, TryReserveError, TursoAllocator};
+
+/// An allocator that can back a [`SkipList`].
+///
+/// Blanket-implemented for every cloneable, thread-safe [`ApiAllocator`].
+/// Cloning must be cheap: deferred node destruction captures a clone of the
+/// allocator that is dropped once the node is reclaimed.
+pub trait SkiplistAllocator: ApiAllocator + Clone + Send + Sync {}
+
+impl<A: ApiAllocator + Clone + Send + Sync> SkiplistAllocator for A {}
 
 /// Number of bits needed to store height.
 const HEIGHT_BITS: usize = 5;
@@ -174,12 +180,16 @@ impl<K, V> Node<K, V> {
     /// The returned node will start with reference count of `ref_count` and the tower will be initialized
     /// with null pointers. However, the key and the value will be left uninitialized, and that is
     /// why this function is unsafe.
-    unsafe fn try_alloc(height: usize, ref_count: usize) -> Result<*mut Self, Layout> {
+    unsafe fn try_alloc<A: SkiplistAllocator>(
+        alloc: &A,
+        height: usize,
+        ref_count: usize,
+    ) -> Result<*mut Self, Layout> {
         let layout = Self::get_layout(height);
         unsafe {
-            let ptr = match Global.allocate(layout) {
-                Some(ptr) => ptr.as_ptr().cast::<Self>(),
-                None => return Err(layout),
+            let ptr = match alloc.allocate(layout) {
+                Ok(ptr) => ptr.as_ptr().cast::<Self>(),
+                Err(_) => return Err(layout),
             };
 
             ptr::addr_of_mut!((*ptr).refs_and_height)
@@ -194,11 +204,11 @@ impl<K, V> Node<K, V> {
     /// Deallocates a node.
     ///
     /// This function will not run any destructors.
-    unsafe fn dealloc(ptr: *mut Self) {
+    unsafe fn dealloc<A: SkiplistAllocator>(alloc: &A, ptr: *mut Self) {
         unsafe {
             let height = (*ptr).height();
             let layout = Self::get_layout(height);
-            Global.deallocate(NonNull::new_unchecked(ptr.cast::<u8>()), layout);
+            alloc.deallocate(NonNull::new_unchecked(ptr.cast::<u8>()), layout);
         }
     }
 
@@ -258,14 +268,14 @@ impl<K, V> Node<K, V> {
 
     /// Drops the key and value of a node, then deallocates it.
     #[cold]
-    unsafe fn finalize(ptr: *mut Self) {
+    unsafe fn finalize<A: SkiplistAllocator>(alloc: &A, ptr: *mut Self) {
         unsafe {
             // Call destructors: drop the key and the value.
             ptr::drop_in_place(&mut (*ptr).key);
             ptr::drop_in_place(&mut (*ptr).value);
 
             // Finally, deallocate the memory occupied by the node.
-            Self::dealloc(ptr);
+            Self::dealloc(alloc, ptr);
         }
     }
 }
@@ -299,8 +309,11 @@ impl<'a, K, V> NodeRef<'a, K, V> {
     }
 
     /// Decrements the reference count of a node, destroying it if the count becomes zero.
+    ///
+    /// `alloc` must be the allocator the node was allocated with; destruction captures a
+    /// clone of it.
     #[inline]
-    unsafe fn decrement(self, guard: &Guard) {
+    unsafe fn decrement<A: SkiplistAllocator>(self, alloc: &A, guard: &Guard) {
         if self
             .refs_and_height
             .fetch_sub(1 << HEIGHT_BITS, Ordering::Release)
@@ -308,15 +321,19 @@ impl<'a, K, V> NodeRef<'a, K, V> {
             == 1
         {
             fence(Ordering::Acquire);
-            unsafe { guard.defer_unchecked(move || Node::finalize(self.ptr.as_ptr())) }
+            let alloc = alloc.clone();
+            unsafe { guard.defer_unchecked(move || Node::finalize(&alloc, self.ptr.as_ptr())) }
         }
     }
 
     /// Decrements the reference count of a node, pinning the thread and destroying the node
     /// if the count become zero.
     #[inline]
-    unsafe fn decrement_with_pin<F, C>(self, parent: &SkipList<K, V, C>, pin: F)
-    where
+    unsafe fn decrement_with_pin<F, C, A: SkiplistAllocator>(
+        self,
+        parent: &SkipList<K, V, C, A>,
+        pin: F,
+    ) where
         F: FnOnce() -> Guard,
     {
         if self
@@ -328,7 +345,8 @@ impl<'a, K, V> NodeRef<'a, K, V> {
             fence(Ordering::Acquire);
             let guard = &pin();
             parent.check_guard(guard);
-            unsafe { guard.defer_unchecked(move || Node::finalize(self.ptr.as_ptr())) }
+            let alloc = parent.alloc.clone();
+            unsafe { guard.defer_unchecked(move || Node::finalize(&alloc, self.ptr.as_ptr())) }
         }
     }
 
@@ -474,7 +492,7 @@ struct HotData {
 // As a further future optimization, if `!mem::needs_drop::<K>() && !mem::needs_drop::<V>()`
 // (neither key nor the value have destructors), there's no point in creating a new local
 // collector, so we should simply use the global one.
-pub struct SkipList<K, V, C = BasicComparator> {
+pub struct SkipList<K, V, C = BasicComparator, A: SkiplistAllocator = TursoAllocator> {
     /// The head of the skip list (just a dummy node, not a real entry).
     head: Head<K, V>,
 
@@ -486,10 +504,19 @@ pub struct SkipList<K, V, C = BasicComparator> {
 
     /// The `Comparator` used to determine key ordering.
     comparator: C,
+
+    /// The allocator used for the skip list nodes.
+    alloc: A,
 }
 
-unsafe impl<K: Send + Sync, V: Send + Sync, C: Send + Sync> Send for SkipList<K, V, C> {}
-unsafe impl<K: Send + Sync, V: Send + Sync, C: Send + Sync> Sync for SkipList<K, V, C> {}
+unsafe impl<K: Send + Sync, V: Send + Sync, C: Send + Sync, A: SkiplistAllocator> Send
+    for SkipList<K, V, C, A>
+{
+}
+unsafe impl<K: Send + Sync, V: Send + Sync, C: Send + Sync, A: SkiplistAllocator> Sync
+    for SkipList<K, V, C, A>
+{
+}
 
 impl<K, V> SkipList<K, V> {
     /// Returns a new, empty skip list.
@@ -498,9 +525,24 @@ impl<K, V> SkipList<K, V> {
     }
 }
 
+impl<K, V, A: SkiplistAllocator> SkipList<K, V, BasicComparator, A> {
+    /// Returns a new, empty skip list that allocates its nodes in `alloc`.
+    pub fn new_in(collector: Collector, alloc: A) -> Self {
+        Self::with_comparator_in(collector, Default::default(), alloc)
+    }
+}
+
 impl<K, V, C> SkipList<K, V, C> {
     /// Returns a new, empty skip list using the given comparator.
     pub fn with_comparator(collector: Collector, comparator: C) -> Self {
+        Self::with_comparator_in(collector, comparator, TursoAllocator)
+    }
+}
+
+impl<K, V, C, A: SkiplistAllocator> SkipList<K, V, C, A> {
+    /// Returns a new, empty skip list using the given comparator, allocating its nodes
+    /// in `alloc`.
+    pub fn with_comparator_in(collector: Collector, comparator: C, alloc: A) -> Self {
         Self {
             head: Head::new(),
             collector,
@@ -510,6 +552,7 @@ impl<K, V, C> SkipList<K, V, C> {
                 max_height: AtomicUsize::new(1),
             }),
             comparator,
+            alloc,
         }
     }
 
@@ -543,12 +586,12 @@ impl<K, V, C> SkipList<K, V, C> {
     }
 }
 
-impl<K, V, C> SkipList<K, V, C>
+impl<K, V, C, A: SkiplistAllocator> SkipList<K, V, C, A>
 where
     C: Comparator<K>,
 {
     /// Returns the entry with the smallest key.
-    pub fn front<'a: 'g, 'g>(&'a self, guard: &'g Guard) -> Option<Entry<'a, 'g, K, V, C>> {
+    pub fn front<'a: 'g, 'g>(&'a self, guard: &'g Guard) -> Option<Entry<'a, 'g, K, V, C, A>> {
         self.check_guard(guard);
         let n = self.next_node(self.head.as_tower(), Bound::Unbounded, guard)?;
         Some(Entry {
@@ -559,7 +602,7 @@ where
     }
 
     /// Returns the entry with the largest key.
-    pub fn back<'a: 'g, 'g>(&'a self, guard: &'g Guard) -> Option<Entry<'a, 'g, K, V, C>> {
+    pub fn back<'a: 'g, 'g>(&'a self, guard: &'g Guard) -> Option<Entry<'a, 'g, K, V, C, A>> {
         self.check_guard(guard);
         let n = self.search_bound::<K>(Bound::Unbounded, true, guard)?;
         Some(Entry {
@@ -579,7 +622,11 @@ where
     }
 
     /// Returns an entry with the specified `key`.
-    pub fn get<'a: 'g, 'g, Q>(&'a self, key: &Q, guard: &'g Guard) -> Option<Entry<'a, 'g, K, V, C>>
+    pub fn get<'a: 'g, 'g, Q>(
+        &'a self,
+        key: &Q,
+        guard: &'g Guard,
+    ) -> Option<Entry<'a, 'g, K, V, C, A>>
     where
         C: Comparator<K, Q>,
         Q: ?Sized,
@@ -604,7 +651,7 @@ where
         &'a self,
         bound: Bound<&Q>,
         guard: &'g Guard,
-    ) -> Option<Entry<'a, 'g, K, V, C>>
+    ) -> Option<Entry<'a, 'g, K, V, C, A>>
     where
         C: Comparator<K, Q>,
         Q: ?Sized,
@@ -625,7 +672,7 @@ where
         &'a self,
         bound: Bound<&Q>,
         guard: &'g Guard,
-    ) -> Option<Entry<'a, 'g, K, V, C>>
+    ) -> Option<Entry<'a, 'g, K, V, C, A>>
     where
         C: Comparator<K, Q>,
         Q: ?Sized,
@@ -640,7 +687,7 @@ where
     }
 
     /// Finds an entry with the specified key, or inserts a new `key`-`value` pair if none exist.
-    pub fn get_or_insert(&self, key: K, value: V, guard: &Guard) -> RefEntry<'_, K, V, C> {
+    pub fn get_or_insert(&self, key: K, value: V, guard: &Guard) -> RefEntry<'_, K, V, C, A> {
         match self.insert_internal(key, || value, |_| false, guard) {
             Ok(entry) => entry,
             Err(layout) => handle_alloc_error(layout),
@@ -656,7 +703,7 @@ where
         key: K,
         value: V,
         guard: &Guard,
-    ) -> Result<RefEntry<'_, K, V, C>, TryReserveError> {
+    ) -> Result<RefEntry<'_, K, V, C, A>, TryReserveError> {
         self.insert_internal(key, || value, |_| false, guard)
             .map_err(|_| TryReserveError)
     }
@@ -668,7 +715,7 @@ where
     /// discarded. If closure is modifying some other state (such as shared counters or shared
     /// objects), it may lead to <u>undesired behaviour</u> such as counters being changed without
     /// result of closure inserted
-    pub fn get_or_insert_with<F>(&self, key: K, value: F, guard: &Guard) -> RefEntry<'_, K, V, C>
+    pub fn get_or_insert_with<F>(&self, key: K, value: F, guard: &Guard) -> RefEntry<'_, K, V, C, A>
     where
         F: FnOnce() -> V,
     {
@@ -688,7 +735,7 @@ where
         key: K,
         value: F,
         guard: &Guard,
-    ) -> Result<RefEntry<'_, K, V, C>, TryReserveError>
+    ) -> Result<RefEntry<'_, K, V, C, A>, TryReserveError>
     where
         F: FnOnce() -> V,
     {
@@ -697,7 +744,7 @@ where
     }
 
     /// Returns an iterator over all entries in the skip list.
-    pub fn iter<'a: 'g, 'g>(&'a self, guard: &'g Guard) -> Iter<'a, 'g, K, V, C> {
+    pub fn iter<'a: 'g, 'g>(&'a self, guard: &'g Guard) -> Iter<'a, 'g, K, V, C, A> {
         self.check_guard(guard);
         Iter {
             parent: self,
@@ -708,7 +755,7 @@ where
     }
 
     /// Returns an iterator over all entries in the skip list.
-    pub fn ref_iter(&self) -> RefIter<'_, K, V, C> {
+    pub fn ref_iter(&self) -> RefIter<'_, K, V, C, A> {
         RefIter {
             parent: self,
             head: None,
@@ -721,7 +768,7 @@ where
         &'a self,
         range: R,
         guard: &'g Guard,
-    ) -> Range<'a, 'g, Q, R, K, V, C>
+    ) -> Range<'a, 'g, Q, R, K, V, C, A>
     where
         C: Comparator<K, Q>,
         R: RangeBounds<Q>,
@@ -740,7 +787,7 @@ where
 
     /// Returns an iterator over a subset of entries in the skip list.
     #[allow(clippy::needless_lifetimes)]
-    pub fn ref_range<'a, Q, R>(&'a self, range: R) -> RefRange<'a, Q, R, K, V, C>
+    pub fn ref_range<'a, Q, R>(&'a self, range: R) -> RefRange<'a, Q, R, K, V, C, A>
     where
         C: Comparator<K, Q>,
         R: RangeBounds<Q>,
@@ -824,7 +871,7 @@ where
             guard,
         ) {
             Ok(_) => {
-                unsafe { curr.decrement(guard) }
+                unsafe { curr.decrement(&self.alloc, guard) }
                 Some(succ.with_tag(0))
             }
             Err(_) => None,
@@ -1071,7 +1118,7 @@ where
         value: F,
         replace: CompareF,
         guard: &Guard,
-    ) -> Result<RefEntry<'_, K, V, C>, Layout>
+    ) -> Result<RefEntry<'_, K, V, C, A>, Layout>
     where
         C: Comparator<K>,
         F: FnOnce() -> V,
@@ -1107,7 +1154,7 @@ where
                 // The reference count is initially two to account for:
                 // 1. The entry that will be returned.
                 // 2. The link at the level 0 of the tower.
-                let n = Node::<K, V>::try_alloc(height, 2)?;
+                let n = Node::<K, V>::try_alloc(&self.alloc, height, 2)?;
 
                 // Write the key and the value into the node.
                 ptr::addr_of_mut!((*n).key).write(key);
@@ -1151,13 +1198,13 @@ where
                 // We failed. Let's search for the key and try again.
                 {
                     // Create a guard that destroys the new node in case search panics.
-                    struct ScopeGuard<K, V>(*const Node<K, V>);
-                    impl<K, V> Drop for ScopeGuard<K, V> {
+                    struct ScopeGuard<'a, K, V, A: SkiplistAllocator>(*const Node<K, V>, &'a A);
+                    impl<K, V, A: SkiplistAllocator> Drop for ScopeGuard<'_, K, V, A> {
                         fn drop(&mut self) {
-                            unsafe { Node::finalize(self.0 as *mut Node<K, V>) }
+                            unsafe { Node::finalize(self.1, self.0 as *mut Node<K, V>) }
                         }
                     }
-                    let sg = ScopeGuard(node.as_raw());
+                    let sg = ScopeGuard(node.as_raw(), &self.alloc);
                     search = self.search_position(&n.key, guard);
                     mem::forget(sg);
                 }
@@ -1169,7 +1216,7 @@ where
                         // let's try returning it as an entry.
                         if let Some(e) = RefEntry::try_acquire(self, r) {
                             // Destroy the new node.
-                            Node::finalize(node.as_raw() as *mut Node<K, V>);
+                            Node::finalize(&self.alloc, node.as_raw() as *mut Node<K, V>);
                             self.hot_data.len.fetch_sub(1, Ordering::Relaxed);
 
                             return Ok(e);
@@ -1289,7 +1336,7 @@ where
     }
 }
 
-impl<K, V, C> SkipList<K, V, C>
+impl<K, V, C, A: SkiplistAllocator> SkipList<K, V, C, A>
 where
     C: Comparator<K>,
     K: Send + 'static,
@@ -1299,7 +1346,7 @@ where
     ///
     /// If there is an existing entry with this key, it will be removed before inserting the new
     /// one.
-    pub fn insert(&self, key: K, value: V, guard: &Guard) -> RefEntry<'_, K, V, C> {
+    pub fn insert(&self, key: K, value: V, guard: &Guard) -> RefEntry<'_, K, V, C, A> {
         match self.insert_internal(key, || value, |_| true, guard) {
             Ok(entry) => entry,
             Err(layout) => handle_alloc_error(layout),
@@ -1315,7 +1362,7 @@ where
         key: K,
         value: V,
         guard: &Guard,
-    ) -> Result<RefEntry<'_, K, V, C>, TryReserveError> {
+    ) -> Result<RefEntry<'_, K, V, C, A>, TryReserveError> {
         self.insert_internal(key, || value, |_| true, guard)
             .map_err(|_| TryReserveError)
     }
@@ -1331,7 +1378,7 @@ where
         value: V,
         compare_fn: F,
         guard: &Guard,
-    ) -> RefEntry<'_, K, V, C>
+    ) -> RefEntry<'_, K, V, C, A>
     where
         F: Fn(&V) -> bool,
     {
@@ -1351,7 +1398,7 @@ where
         value: V,
         compare_fn: F,
         guard: &Guard,
-    ) -> Result<RefEntry<'_, K, V, C>, TryReserveError>
+    ) -> Result<RefEntry<'_, K, V, C, A>, TryReserveError>
     where
         F: Fn(&V) -> bool,
     {
@@ -1360,7 +1407,7 @@ where
     }
 
     /// Removes an entry with the specified `key` from the map and returns it.
-    pub fn remove<Q>(&self, key: &Q, guard: &Guard) -> Option<RefEntry<'_, K, V, C>>
+    pub fn remove<Q>(&self, key: &Q, guard: &Guard) -> Option<RefEntry<'_, K, V, C, A>>
     where
         C: Comparator<K, Q>,
         Q: ?Sized,
@@ -1412,7 +1459,7 @@ where
                             .is_ok()
                         {
                             // Success! Decrement the reference count.
-                            n.decrement(guard);
+                            n.decrement(&self.alloc, guard);
                         } else {
                             // Failed! Just repeat the search to completely unlink the node.
                             self.search_bound(Bound::Included(key), false, guard);
@@ -1422,7 +1469,7 @@ where
                     return Some(entry);
                 } else {
                     // The node has already been marked.
-                    n.decrement(guard);
+                    n.decrement(&self.alloc, guard);
                     return None;
                 }
             }
@@ -1430,7 +1477,7 @@ where
     }
 
     /// Removes an entry from the front of the skip list.
-    pub fn pop_front(&self, guard: &Guard) -> Option<RefEntry<'_, K, V, C>> {
+    pub fn pop_front(&self, guard: &Guard) -> Option<RefEntry<'_, K, V, C, A>> {
         self.check_guard(guard);
         loop {
             let e = self.front(guard)?;
@@ -1445,7 +1492,7 @@ where
     }
 
     /// Removes an entry from the back of the skip list.
-    pub fn pop_back(&self, guard: &Guard) -> Option<RefEntry<'_, K, V, C>> {
+    pub fn pop_back(&self, guard: &Guard) -> Option<RefEntry<'_, K, V, C, A>> {
         self.check_guard(guard);
         loop {
             let e = self.back(guard)?;
@@ -1503,7 +1550,7 @@ where
     }
 }
 
-impl<K, V, C> Drop for SkipList<K, V, C> {
+impl<K, V, C, A: SkiplistAllocator> Drop for SkipList<K, V, C, A> {
     fn drop(&mut self) {
         unsafe {
             let mut node = NodeRef::from_shared(
@@ -1521,7 +1568,7 @@ impl<K, V, C> Drop for SkipList<K, V, C> {
                 );
 
                 // Deallocate every node.
-                Node::finalize(n.ptr.as_ptr());
+                Node::finalize(&self.alloc, n.ptr.as_ptr());
 
                 node = next;
             }
@@ -1529,7 +1576,7 @@ impl<K, V, C> Drop for SkipList<K, V, C> {
     }
 }
 
-impl<K, V, C> fmt::Debug for SkipList<K, V, C>
+impl<K, V, C, A: SkiplistAllocator> fmt::Debug for SkipList<K, V, C, A>
 where
     K: fmt::Debug,
     V: fmt::Debug,
@@ -1539,9 +1586,9 @@ where
     }
 }
 
-impl<K, V, C> IntoIterator for SkipList<K, V, C> {
+impl<K, V, C, A: SkiplistAllocator> IntoIterator for SkipList<K, V, C, A> {
     type Item = (K, V);
-    type IntoIter = IntoIter<K, V>;
+    type IntoIter = IntoIter<K, V, A>;
 
     fn into_iter(self) -> Self::IntoIter {
         unsafe {
@@ -1564,6 +1611,7 @@ impl<K, V, C> IntoIterator for SkipList<K, V, C> {
 
             IntoIter {
                 node: front as *mut Node<K, V>,
+                alloc: self.alloc.clone(),
             }
         }
     }
@@ -1574,13 +1622,13 @@ impl<K, V, C> IntoIterator for SkipList<K, V, C> {
 /// The lifetimes of the key and value are the same as that of the `Guard`
 /// used when creating the `Entry` (`'g`). This lifetime is also constrained to
 /// not outlive the `SkipList`.
-pub struct Entry<'a: 'g, 'g, K, V, C = BasicComparator> {
-    parent: &'a SkipList<K, V, C>,
+pub struct Entry<'a: 'g, 'g, K, V, C = BasicComparator, A: SkiplistAllocator = TursoAllocator> {
+    parent: &'a SkipList<K, V, C, A>,
     node: NodeRef<'g, K, V>,
     guard: &'g Guard,
 }
 
-impl<'a: 'g, 'g, K: 'a, V: 'a, C> Entry<'a, 'g, K, V, C> {
+impl<'a: 'g, 'g, K: 'a, V: 'a, C, A: SkiplistAllocator> Entry<'a, 'g, K, V, C, A> {
     /// Returns `true` if the entry is removed from the skip list.
     pub fn is_removed(&self) -> bool {
         self.node.is_removed()
@@ -1597,7 +1645,7 @@ impl<'a: 'g, 'g, K: 'a, V: 'a, C> Entry<'a, 'g, K, V, C> {
     }
 
     /// Returns a reference to the parent `SkipList`
-    pub fn skiplist(&self) -> &'a SkipList<K, V, C> {
+    pub fn skiplist(&self) -> &'a SkipList<K, V, C, A> {
         self.parent
     }
 
@@ -1606,12 +1654,12 @@ impl<'a: 'g, 'g, K: 'a, V: 'a, C> Entry<'a, 'g, K, V, C> {
     ///
     /// This method may return `None` if the reference count is already 0 and
     /// the node has been queued for deletion.
-    pub fn pin(&self) -> Option<RefEntry<'a, K, V, C>> {
+    pub fn pin(&self) -> Option<RefEntry<'a, K, V, C, A>> {
         unsafe { RefEntry::try_acquire(self.parent, self.node) }
     }
 }
 
-impl<K, V, C> Entry<'_, '_, K, V, C>
+impl<K, V, C, A: SkiplistAllocator> Entry<'_, '_, K, V, C, A>
 where
     C: Comparator<K>,
     K: Send + 'static,
@@ -1637,7 +1685,7 @@ where
     }
 }
 
-impl<K, V, C> Clone for Entry<'_, '_, K, V, C> {
+impl<K, V, C, A: SkiplistAllocator> Clone for Entry<'_, '_, K, V, C, A> {
     fn clone(&self) -> Self {
         Self {
             parent: self.parent,
@@ -1647,7 +1695,7 @@ impl<K, V, C> Clone for Entry<'_, '_, K, V, C> {
     }
 }
 
-impl<K, V, C> fmt::Debug for Entry<'_, '_, K, V, C>
+impl<K, V, C, A: SkiplistAllocator> fmt::Debug for Entry<'_, '_, K, V, C, A>
 where
     K: fmt::Debug,
     V: fmt::Debug,
@@ -1660,7 +1708,7 @@ where
     }
 }
 
-impl<K, V, C> Entry<'_, '_, K, V, C>
+impl<K, V, C, A: SkiplistAllocator> Entry<'_, '_, K, V, C, A>
 where
     C: Comparator<K>,
 {
@@ -1717,12 +1765,12 @@ where
 ///
 /// You *must* call `release` to free this type, otherwise the node will be
 /// leaked. This is because releasing the entry requires a `Guard`.
-pub struct RefEntry<'a, K, V, C = BasicComparator> {
-    parent: &'a SkipList<K, V, C>,
+pub struct RefEntry<'a, K, V, C = BasicComparator, A: SkiplistAllocator = TursoAllocator> {
+    parent: &'a SkipList<K, V, C, A>,
     node: NodeRef<'a, K, V>,
 }
 
-impl<'a, K: 'a, V: 'a, C: 'a> RefEntry<'a, K, V, C> {
+impl<'a, K: 'a, V: 'a, C: 'a, A: SkiplistAllocator> RefEntry<'a, K, V, C, A> {
     /// Returns `true` if the entry is removed from the skip list.
     pub fn is_removed(&self) -> bool {
         self.node.is_removed()
@@ -1739,14 +1787,14 @@ impl<'a, K: 'a, V: 'a, C: 'a> RefEntry<'a, K, V, C> {
     }
 
     /// Returns a reference to the parent `SkipList`
-    pub fn skiplist(&self) -> &'a SkipList<K, V, C> {
+    pub fn skiplist(&self) -> &'a SkipList<K, V, C, A> {
         self.parent
     }
 
     /// Releases the reference on the entry.
     pub fn release(self, guard: &Guard) {
         self.parent.check_guard(guard);
-        unsafe { self.node.decrement(guard) }
+        unsafe { self.node.decrement(&self.parent.alloc, guard) }
     }
 
     /// Releases the reference of the entry, pinning the thread only when
@@ -1760,7 +1808,10 @@ impl<'a, K: 'a, V: 'a, C: 'a> RefEntry<'a, K, V, C> {
 
     /// Tries to create a new `RefEntry` by incrementing the reference count of
     /// a node.
-    unsafe fn try_acquire(parent: &'a SkipList<K, V, C>, node: NodeRef<'_, K, V>) -> Option<Self> {
+    unsafe fn try_acquire(
+        parent: &'a SkipList<K, V, C, A>,
+        node: NodeRef<'_, K, V>,
+    ) -> Option<Self> {
         if unsafe { node.try_increment() } {
             Some(RefEntry {
                 parent,
@@ -1775,7 +1826,7 @@ impl<'a, K: 'a, V: 'a, C: 'a> RefEntry<'a, K, V, C> {
     }
 }
 
-impl<K, V, C> RefEntry<'_, K, V, C>
+impl<K, V, C, A: SkiplistAllocator> RefEntry<'_, K, V, C, A>
 where
     C: Comparator<K>,
     K: Send + 'static,
@@ -1803,7 +1854,7 @@ where
     }
 }
 
-impl<K, V, C> Clone for RefEntry<'_, K, V, C> {
+impl<K, V, C, A: SkiplistAllocator> Clone for RefEntry<'_, K, V, C, A> {
     fn clone(&self) -> Self {
         unsafe {
             // Incrementing will always succeed since we're already holding a reference to the node.
@@ -1816,7 +1867,7 @@ impl<K, V, C> Clone for RefEntry<'_, K, V, C> {
     }
 }
 
-impl<K, V, C> fmt::Debug for RefEntry<'_, K, V, C>
+impl<K, V, C, A: SkiplistAllocator> fmt::Debug for RefEntry<'_, K, V, C, A>
 where
     K: fmt::Debug,
     V: fmt::Debug,
@@ -1829,7 +1880,7 @@ where
     }
 }
 
-impl<K, V, C> RefEntry<'_, K, V, C>
+impl<K, V, C, A: SkiplistAllocator> RefEntry<'_, K, V, C, A>
 where
     C: Comparator<K>,
 {
@@ -1889,18 +1940,18 @@ where
 }
 
 /// An iterator over the entries of a `SkipList`.
-pub struct Iter<'a: 'g, 'g, K, V, C = BasicComparator> {
-    parent: &'a SkipList<K, V, C>,
+pub struct Iter<'a: 'g, 'g, K, V, C = BasicComparator, A: SkiplistAllocator = TursoAllocator> {
+    parent: &'a SkipList<K, V, C, A>,
     head: Option<NodeRef<'g, K, V>>,
     tail: Option<NodeRef<'g, K, V>>,
     guard: &'g Guard,
 }
 
-impl<'a: 'g, 'g, K: 'a, V: 'a, C> Iterator for Iter<'a, 'g, K, V, C>
+impl<'a: 'g, 'g, K: 'a, V: 'a, C, A: SkiplistAllocator> Iterator for Iter<'a, 'g, K, V, C, A>
 where
     C: Comparator<K>,
 {
-    type Item = Entry<'a, 'g, K, V, C>;
+    type Item = Entry<'a, 'g, K, V, C, A>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.head = match self.head {
@@ -1926,7 +1977,8 @@ where
     }
 }
 
-impl<'a: 'g, 'g, K: 'a, V: 'a, C> DoubleEndedIterator for Iter<'a, 'g, K, V, C>
+impl<'a: 'g, 'g, K: 'a, V: 'a, C, A: SkiplistAllocator> DoubleEndedIterator
+    for Iter<'a, 'g, K, V, C, A>
 where
     C: Comparator<K>,
 {
@@ -1953,7 +2005,7 @@ where
     }
 }
 
-impl<K, V, C> fmt::Debug for Iter<'_, '_, K, V, C>
+impl<K, V, C, A: SkiplistAllocator> fmt::Debug for Iter<'_, '_, K, V, C, A>
 where
     K: fmt::Debug,
     V: fmt::Debug,
@@ -1967,13 +2019,13 @@ where
 }
 
 /// An iterator over reference-counted entries of a `SkipList`.
-pub struct RefIter<'a, K, V, C = BasicComparator> {
-    parent: &'a SkipList<K, V, C>,
-    head: Option<RefEntry<'a, K, V, C>>,
-    tail: Option<RefEntry<'a, K, V, C>>,
+pub struct RefIter<'a, K, V, C = BasicComparator, A: SkiplistAllocator = TursoAllocator> {
+    parent: &'a SkipList<K, V, C, A>,
+    head: Option<RefEntry<'a, K, V, C, A>>,
+    tail: Option<RefEntry<'a, K, V, C, A>>,
 }
 
-impl<K, V, C> fmt::Debug for RefIter<'_, K, V, C>
+impl<K, V, C, A: SkiplistAllocator> fmt::Debug for RefIter<'_, K, V, C, A>
 where
     K: fmt::Debug,
     V: fmt::Debug,
@@ -1992,12 +2044,12 @@ where
     }
 }
 
-impl<'a, K: 'a, V: 'a, C> RefIter<'a, K, V, C>
+impl<'a, K: 'a, V: 'a, C, A: SkiplistAllocator> RefIter<'a, K, V, C, A>
 where
     C: Comparator<K>,
 {
     /// Advances the iterator and returns the next value.
-    pub fn next(&mut self, guard: &Guard) -> Option<RefEntry<'a, K, V, C>> {
+    pub fn next(&mut self, guard: &Guard) -> Option<RefEntry<'a, K, V, C, A>> {
         self.parent.check_guard(guard);
         let next_head = match &self.head {
             Some(e) => e.next(guard),
@@ -2009,14 +2061,14 @@ where
                 if self.parent.comparator.compare(next.key(), t.key()).is_ge() =>
             {
                 unsafe {
-                    next.node.decrement(guard);
+                    next.node.decrement(&self.parent.alloc, guard);
                 }
                 None
             }
             (Some(_), _) => {
                 if let Some(e) = mem::replace(&mut self.head, next_head.clone()) {
                     unsafe {
-                        e.node.decrement(guard);
+                        e.node.decrement(&self.parent.alloc, guard);
                     }
                 }
                 next_head
@@ -2026,7 +2078,7 @@ where
     }
 
     /// Removes and returns an element from the end of the iterator.
-    pub fn next_back(&mut self, guard: &Guard) -> Option<RefEntry<'a, K, V, C>> {
+    pub fn next_back(&mut self, guard: &Guard) -> Option<RefEntry<'a, K, V, C, A>> {
         self.parent.check_guard(guard);
         let next_tail = match &self.tail {
             Some(e) => e.prev(guard),
@@ -2038,14 +2090,14 @@ where
                 if self.parent.comparator.compare(h.key(), next.key()).is_ge() =>
             {
                 unsafe {
-                    next.node.decrement(guard);
+                    next.node.decrement(&self.parent.alloc, guard);
                 }
                 None
             }
             (_, Some(_)) => {
                 if let Some(e) = mem::replace(&mut self.tail, next_tail.clone()) {
                     unsafe {
-                        e.node.decrement(guard);
+                        e.node.decrement(&self.parent.alloc, guard);
                     }
                 }
                 next_tail
@@ -2055,27 +2107,27 @@ where
     }
 }
 
-impl<'a, K: 'a, V: 'a, C> RefIter<'a, K, V, C> {
+impl<'a, K: 'a, V: 'a, C, A: SkiplistAllocator> RefIter<'a, K, V, C, A> {
     /// Decrements the reference count of `RefEntry` owned by the iterator.
     pub fn drop_impl(&mut self, guard: &Guard) {
         self.parent.check_guard(guard);
         if let Some(e) = self.head.take() {
-            unsafe { e.node.decrement(guard) };
+            unsafe { e.node.decrement(&self.parent.alloc, guard) };
         }
         if let Some(e) = self.tail.take() {
-            unsafe { e.node.decrement(guard) };
+            unsafe { e.node.decrement(&self.parent.alloc, guard) };
         }
     }
 }
 
 /// An iterator over a subset of entries of a `SkipList`.
-pub struct Range<'a: 'g, 'g, Q, R, K, V, C = BasicComparator>
+pub struct Range<'a: 'g, 'g, Q, R, K, V, C = BasicComparator, A: SkiplistAllocator = TursoAllocator>
 where
     C: Comparator<K> + Comparator<K, Q>,
     R: RangeBounds<Q>,
     Q: ?Sized,
 {
-    parent: &'a SkipList<K, V, C>,
+    parent: &'a SkipList<K, V, C, A>,
     head: Option<NodeRef<'g, K, V>>,
     tail: Option<NodeRef<'g, K, V>>,
     range: R,
@@ -2083,13 +2135,14 @@ where
     _marker: PhantomData<fn() -> Q>, // covariant over `Q`
 }
 
-impl<'a: 'g, 'g, Q, R, K: 'a, V: 'a, C> Iterator for Range<'a, 'g, Q, R, K, V, C>
+impl<'a: 'g, 'g, Q, R, K: 'a, V: 'a, C, A: SkiplistAllocator> Iterator
+    for Range<'a, 'g, Q, R, K, V, C, A>
 where
     C: Comparator<K> + Comparator<K, Q>,
     R: RangeBounds<Q>,
     Q: ?Sized,
 {
-    type Item = Entry<'a, 'g, K, V, C>;
+    type Item = Entry<'a, 'g, K, V, C, A>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.head = match self.head {
@@ -2126,7 +2179,8 @@ where
     }
 }
 
-impl<'a: 'g, 'g, Q, R, K: 'a, V: 'a, C> DoubleEndedIterator for Range<'a, 'g, Q, R, K, V, C>
+impl<'a: 'g, 'g, Q, R, K: 'a, V: 'a, C, A: SkiplistAllocator> DoubleEndedIterator
+    for Range<'a, 'g, Q, R, K, V, C, A>
 where
     C: Comparator<K> + Comparator<K, Q>,
     R: RangeBounds<Q>,
@@ -2167,7 +2221,7 @@ where
     }
 }
 
-impl<Q, R, K, V, C> fmt::Debug for Range<'_, '_, Q, R, K, V, C>
+impl<Q, R, K, V, C, A: SkiplistAllocator> fmt::Debug for Range<'_, '_, Q, R, K, V, C, A>
 where
     C: Comparator<K> + Comparator<K, Q>,
     K: fmt::Debug,
@@ -2185,20 +2239,20 @@ where
 }
 
 /// An iterator over reference-counted subset of entries of a `SkipList`.
-pub struct RefRange<'a, Q, R, K, V, C = BasicComparator>
+pub struct RefRange<'a, Q, R, K, V, C = BasicComparator, A: SkiplistAllocator = TursoAllocator>
 where
     C: Comparator<K> + Comparator<K, Q>,
     R: RangeBounds<Q>,
     Q: ?Sized,
 {
-    parent: &'a SkipList<K, V, C>,
-    pub(crate) head: Option<RefEntry<'a, K, V, C>>,
-    pub(crate) tail: Option<RefEntry<'a, K, V, C>>,
+    parent: &'a SkipList<K, V, C, A>,
+    pub(crate) head: Option<RefEntry<'a, K, V, C, A>>,
+    pub(crate) tail: Option<RefEntry<'a, K, V, C, A>>,
     pub(crate) range: R,
     _marker: PhantomData<fn() -> Q>, // covariant over `Q`
 }
 
-unsafe impl<Q, R, K, V, C> Send for RefRange<'_, Q, R, K, V, C>
+unsafe impl<Q, R, K, V, C, A: SkiplistAllocator> Send for RefRange<'_, Q, R, K, V, C, A>
 where
     C: Comparator<K> + Comparator<K, Q>,
     R: RangeBounds<Q>,
@@ -2206,7 +2260,7 @@ where
 {
 }
 
-unsafe impl<Q, R, K, V, C> Sync for RefRange<'_, Q, R, K, V, C>
+unsafe impl<Q, R, K, V, C, A: SkiplistAllocator> Sync for RefRange<'_, Q, R, K, V, C, A>
 where
     C: Comparator<K> + Comparator<K, Q>,
     R: RangeBounds<Q>,
@@ -2214,7 +2268,7 @@ where
 {
 }
 
-impl<Q, R, K, V, C> fmt::Debug for RefRange<'_, Q, R, K, V, C>
+impl<Q, R, K, V, C, A: SkiplistAllocator> fmt::Debug for RefRange<'_, Q, R, K, V, C, A>
 where
     C: Comparator<K> + Comparator<K, Q>,
     K: fmt::Debug,
@@ -2231,14 +2285,14 @@ where
     }
 }
 
-impl<'a, Q, R, K: 'a, V: 'a, C> RefRange<'a, Q, R, K, V, C>
+impl<'a, Q, R, K: 'a, V: 'a, C, A: SkiplistAllocator> RefRange<'a, Q, R, K, V, C, A>
 where
     C: Comparator<K> + Comparator<K, Q>,
     R: RangeBounds<Q>,
     Q: ?Sized,
 {
     /// Advances the iterator and returns the next value.
-    pub fn next(&mut self, guard: &Guard) -> Option<RefEntry<'a, K, V, C>> {
+    pub fn next(&mut self, guard: &Guard) -> Option<RefEntry<'a, K, V, C, A>> {
         self.parent.check_guard(guard);
         let next_head = match self.head {
             Some(ref e) => e.next(guard),
@@ -2252,13 +2306,13 @@ where
                     if below_upper_bound(&self.parent.comparator, &bound, h.key()) {
                         if let Some(e) = mem::replace(&mut self.head, next_head.clone()) {
                             unsafe {
-                                e.node.decrement(guard);
+                                e.node.decrement(&self.parent.alloc, guard);
                             }
                         }
                         next_head
                     } else {
                         unsafe {
-                            h.node.decrement(guard);
+                            h.node.decrement(&self.parent.alloc, guard);
                         }
                         None
                     }
@@ -2268,13 +2322,13 @@ where
                     if below_upper_bound(&self.parent.comparator, &bound, h.key()) {
                         if let Some(e) = mem::replace(&mut self.head, next_head.clone()) {
                             unsafe {
-                                e.node.decrement(guard);
+                                e.node.decrement(&self.parent.alloc, guard);
                             }
                         }
                         next_head
                     } else {
                         unsafe {
-                            h.node.decrement(guard);
+                            h.node.decrement(&self.parent.alloc, guard);
                         }
                         None
                     }
@@ -2286,7 +2340,7 @@ where
     }
 
     /// Removes and returns an element from the end of the iterator.
-    pub fn next_back(&mut self, guard: &Guard) -> Option<RefEntry<'a, K, V, C>> {
+    pub fn next_back(&mut self, guard: &Guard) -> Option<RefEntry<'a, K, V, C, A>> {
         self.parent.check_guard(guard);
         let next_tail = match self.tail {
             Some(ref e) => e.prev(guard),
@@ -2300,13 +2354,13 @@ where
                     if above_lower_bound(&self.parent.comparator, &bound, t.key()) {
                         if let Some(e) = mem::replace(&mut self.tail, next_tail.clone()) {
                             unsafe {
-                                e.node.decrement(guard);
+                                e.node.decrement(&self.parent.alloc, guard);
                             }
                         }
                         next_tail
                     } else {
                         unsafe {
-                            t.node.decrement(guard);
+                            t.node.decrement(&self.parent.alloc, guard);
                         }
                         None
                     }
@@ -2316,13 +2370,13 @@ where
                     if above_lower_bound(&self.parent.comparator, &bound, t.key()) {
                         if let Some(e) = mem::replace(&mut self.tail, next_tail.clone()) {
                             unsafe {
-                                e.node.decrement(guard);
+                                e.node.decrement(&self.parent.alloc, guard);
                             }
                         }
                         next_tail
                     } else {
                         unsafe {
-                            t.node.decrement(guard);
+                            t.node.decrement(&self.parent.alloc, guard);
                         }
                         None
                     }
@@ -2337,23 +2391,26 @@ where
     pub fn drop_impl(&mut self, guard: &Guard) {
         self.parent.check_guard(guard);
         if let Some(e) = self.head.take() {
-            unsafe { e.node.decrement(guard) };
+            unsafe { e.node.decrement(&self.parent.alloc, guard) };
         }
         if let Some(e) = self.tail.take() {
-            unsafe { e.node.decrement(guard) };
+            unsafe { e.node.decrement(&self.parent.alloc, guard) };
         }
     }
 }
 
 /// An owning iterator over the entries of a `SkipList`.
-pub struct IntoIter<K, V> {
+pub struct IntoIter<K, V, A: SkiplistAllocator = TursoAllocator> {
     /// The current node.
     ///
     /// All preceding nods have already been destroyed.
     node: *mut Node<K, V>,
+
+    /// The allocator the nodes were allocated with.
+    alloc: A,
 }
 
-impl<K, V> Drop for IntoIter<K, V> {
+impl<K, V, A: SkiplistAllocator> Drop for IntoIter<K, V, A> {
     fn drop(&mut self) {
         // Iterate through the whole chain and destroy every node.
         while let Some(node) = NonNull::new(self.node) {
@@ -2367,7 +2424,7 @@ impl<K, V> Drop for IntoIter<K, V> {
 
                 // We can safely do this without deferring because references to
                 // keys & values that we give out never outlive the SkipList.
-                Node::finalize(node.ptr.as_ptr());
+                Node::finalize(&self.alloc, node.ptr.as_ptr());
 
                 self.node = next.as_raw() as *mut Node<K, V>;
             }
@@ -2375,7 +2432,7 @@ impl<K, V> Drop for IntoIter<K, V> {
     }
 }
 
-impl<K, V> Iterator for IntoIter<K, V> {
+impl<K, V, A: SkiplistAllocator> Iterator for IntoIter<K, V, A> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2401,7 +2458,7 @@ impl<K, V> Iterator for IntoIter<K, V> {
                 };
 
                 // Deallocate the current node and move to the next one.
-                Node::dealloc(self.node);
+                Node::dealloc(&self.alloc, self.node);
                 self.node = next.as_raw() as *mut Node<K, V>;
 
                 // The current node may be marked. If it is, it's been removed from the skip list
@@ -2414,7 +2471,7 @@ impl<K, V> Iterator for IntoIter<K, V> {
     }
 }
 
-impl<K, V> fmt::Debug for IntoIter<K, V> {
+impl<K, V, A: SkiplistAllocator> fmt::Debug for IntoIter<K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad("IntoIter { .. }")
     }
@@ -2422,9 +2479,11 @@ impl<K, V> fmt::Debug for IntoIter<K, V> {
 
 /// Helper function to retry an operation until pinning succeeds or `None` is
 /// returned.
-pub(crate) fn try_pin_loop<'a: 'g, 'g, F, K, V, C>(mut f: F) -> Option<RefEntry<'a, K, V, C>>
+pub(crate) fn try_pin_loop<'a: 'g, 'g, F, K, V, C, A: SkiplistAllocator>(
+    mut f: F,
+) -> Option<RefEntry<'a, K, V, C, A>>
 where
-    F: FnMut() -> Option<Entry<'a, 'g, K, V, C>>,
+    F: FnMut() -> Option<Entry<'a, 'g, K, V, C, A>>,
 {
     loop {
         if let Some(e) = f()?.pin() {

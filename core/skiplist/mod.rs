@@ -234,15 +234,17 @@
 //! (<https://github.com/crossbeam-rs/crossbeam>), licensed under MIT OR
 //! Apache-2.0 (see `licenses/core/`). Local modifications are kept minimal;
 //! prefer upstreaming fixes.
+//!
+//! Notable local modifications: node allocation is parameterized over a
+//! [`SkiplistAllocator`] (defaulting to Turso's allocator), and `try_`-prefixed
+//! insert methods surface allocation failure instead of aborting.
 
 #![warn(missing_docs, unsafe_op_in_unsafe_fn)]
-
-mod alloc_helper;
 
 pub mod base;
 
 #[doc(inline)]
-pub use base::SkipList;
+pub use base::{SkipList, SkiplistAllocator};
 
 pub mod map;
 pub mod set;
