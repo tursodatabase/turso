@@ -816,3 +816,20 @@ fn comparator() {
     s.remove(&encode(&[0f32]));
     assert!(!s.contains(&encode(&[-0f32])));
 }
+
+#[test]
+fn try_insert_surfaces_allocation_failure() {
+    let alloc = super::map_tests::FailOnDemandAlloc::default();
+    let set: SkipSet<i32, _, _> = SkipSet::new_in(alloc.clone());
+    set.try_insert(7).unwrap();
+
+    alloc.fail_allocations(true);
+    assert!(set.try_insert(8).is_err());
+    assert!(set.try_get_or_insert(8).is_err());
+    assert_eq!(*set.try_get_or_insert(7).unwrap(), 7);
+    assert_eq!(set.len(), 1);
+    alloc.fail_allocations(false);
+
+    set.try_insert(8).unwrap();
+    assert!(set.contains(&8));
+}

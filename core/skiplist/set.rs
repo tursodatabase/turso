@@ -6,9 +6,11 @@ use core::{
 };
 
 use super::{
+    base::SkiplistAllocator,
     comparator::{BasicComparator, Comparator},
     map,
 };
+use crate::alloc::{TryReserveError, TursoAllocator};
 
 /// A set based on a lock-free skip list.
 ///
@@ -21,8 +23,8 @@ use super::{
 ///
 /// [`BTreeSet`]: std::collections::BTreeSet
 /// [`Comparator`]: super::comparator::Comparator
-pub struct SkipSet<T, C = BasicComparator> {
-    inner: map::SkipMap<T, (), C>,
+pub struct SkipSet<T, C = BasicComparator, A: SkiplistAllocator = TursoAllocator> {
+    inner: map::SkipMap<T, (), C, A>,
 }
 
 impl<T> SkipSet<T> {
@@ -42,6 +44,25 @@ impl<T> SkipSet<T> {
     }
 }
 
+impl<T, A: SkiplistAllocator> SkipSet<T, BasicComparator, A> {
+    /// Returns a new, empty set with the default comparator that allocates its
+    /// nodes in `alloc`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use turso_core::alloc::TursoAllocator;
+    /// use turso_core::skiplist::SkipSet;
+    ///
+    /// let set: SkipSet<i32, _, TursoAllocator> = SkipSet::new_in(TursoAllocator);
+    /// ```
+    pub fn new_in(alloc: A) -> Self {
+        Self {
+            inner: map::SkipMap::new_in(alloc),
+        }
+    }
+}
+
 impl<T, C> SkipSet<T, C> {
     /// Returns a new, empty set with the given comparator.
     ///
@@ -55,6 +76,26 @@ impl<T, C> SkipSet<T, C> {
     pub fn with_comparator(comparator: C) -> Self {
         Self {
             inner: map::SkipMap::with_comparator(comparator),
+        }
+    }
+}
+
+impl<T, C, A: SkiplistAllocator> SkipSet<T, C, A> {
+    /// Returns a new, empty set with the given comparator that allocates its
+    /// nodes in `alloc`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use turso_core::alloc::TursoAllocator;
+    /// use turso_core::skiplist::{SkipSet, comparator::BasicComparator};
+    ///
+    /// let set: SkipSet<i32, _, TursoAllocator> =
+    ///     SkipSet::with_comparator_in(BasicComparator, TursoAllocator);
+    /// ```
+    pub fn with_comparator_in(comparator: C, alloc: A) -> Self {
+        Self {
+            inner: map::SkipMap::with_comparator_in(comparator, alloc),
         }
     }
 
@@ -96,7 +137,7 @@ impl<T, C> SkipSet<T, C> {
     }
 }
 
-impl<T, C> SkipSet<T, C>
+impl<T, C, A: SkiplistAllocator> SkipSet<T, C, A>
 where
     C: Comparator<T>,
 {
@@ -113,7 +154,7 @@ where
     /// set.insert(2);
     /// assert_eq!(*set.front().unwrap(), 1);
     /// ```
-    pub fn front(&self) -> Option<Entry<'_, T, C>> {
+    pub fn front(&self) -> Option<Entry<'_, T, C, A>> {
         self.inner.front().map(Entry::new)
     }
 
@@ -130,7 +171,7 @@ where
     /// set.insert(2);
     /// assert_eq!(*set.back().unwrap(), 2);
     /// ```
-    pub fn back(&self) -> Option<Entry<'_, T, C>> {
+    pub fn back(&self) -> Option<Entry<'_, T, C, A>> {
         self.inner.back().map(Entry::new)
     }
 
@@ -164,7 +205,7 @@ where
     /// assert_eq!(*set.get(&3).unwrap(), 3);
     /// assert!(set.get(&4).is_none());
     /// ```
-    pub fn get<Q>(&self, key: &Q) -> Option<Entry<'_, T, C>>
+    pub fn get<Q>(&self, key: &Q) -> Option<Entry<'_, T, C, A>>
     where
         C: Comparator<T, Q>,
         Q: ?Sized,
@@ -196,7 +237,7 @@ where
     /// let greater_than_thirteen = set.lower_bound(Excluded(&13));
     /// assert!(greater_than_thirteen.is_none());
     /// ```
-    pub fn lower_bound<'a, Q>(&'a self, bound: Bound<&Q>) -> Option<Entry<'a, T, C>>
+    pub fn lower_bound<'a, Q>(&'a self, bound: Bound<&Q>) -> Option<Entry<'a, T, C, A>>
     where
         C: Comparator<T, Q>,
         Q: ?Sized,
@@ -225,7 +266,7 @@ where
     /// let less_than_six = set.upper_bound(Excluded(&6));
     /// assert!(less_than_six.is_none());
     /// ```
-    pub fn upper_bound<'a, Q>(&'a self, bound: Bound<&Q>) -> Option<Entry<'a, T, C>>
+    pub fn upper_bound<'a, Q>(&'a self, bound: Bound<&Q>) -> Option<Entry<'a, T, C, A>>
     where
         C: Comparator<T, Q>,
         Q: ?Sized,
@@ -244,8 +285,26 @@ where
     /// let entry = set.get_or_insert(2);
     /// assert_eq!(*entry, 2);
     /// ```
-    pub fn get_or_insert(&self, key: T) -> Entry<'_, T, C> {
+    pub fn get_or_insert(&self, key: T) -> Entry<'_, T, C, A> {
         Entry::new(self.inner.get_or_insert(key, ()))
+    }
+
+    /// Fallible version of [`get_or_insert`](Self::get_or_insert): returns an error instead of
+    /// aborting the process when node allocation fails.
+    ///
+    /// On error the set is unchanged and `key` is dropped.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use turso_core::skiplist::SkipSet;
+    ///
+    /// let set = SkipSet::new();
+    /// let entry = set.try_get_or_insert(2).unwrap();
+    /// assert_eq!(*entry, 2);
+    /// ```
+    pub fn try_get_or_insert(&self, key: T) -> Result<Entry<'_, T, C, A>, TryReserveError> {
+        self.inner.try_get_or_insert(key, ()).map(Entry::new)
     }
 
     /// Returns an iterator over all entries in the set.
@@ -266,7 +325,7 @@ where
     /// assert_eq!(*set_iter.next().unwrap(), 12);
     /// assert!(set_iter.next().is_none());
     /// ```
-    pub fn iter(&self) -> Iter<'_, T, C> {
+    pub fn iter(&self) -> Iter<'_, T, C, A> {
         Iter {
             inner: self.inner.iter(),
         }
@@ -289,7 +348,7 @@ where
     /// assert_eq!(*set_range.next().unwrap(), 7);
     /// assert!(set_range.next().is_none());
     /// ```
-    pub fn range<Q, R>(&self, range: R) -> Range<'_, Q, R, T, C>
+    pub fn range<Q, R>(&self, range: R) -> Range<'_, Q, R, T, C, A>
     where
         R: RangeBounds<Q>,
         C: Comparator<T, Q>,
@@ -301,7 +360,7 @@ where
     }
 }
 
-impl<T, C> SkipSet<T, C>
+impl<T, C, A: SkiplistAllocator> SkipSet<T, C, A>
 where
     C: Comparator<T>,
     T: Send + 'static,
@@ -320,8 +379,26 @@ where
     /// set.insert(2);
     /// assert_eq!(*set.get(&2).unwrap(), 2);
     /// ```
-    pub fn insert(&self, key: T) -> Entry<'_, T, C> {
+    pub fn insert(&self, key: T) -> Entry<'_, T, C, A> {
         Entry::new(self.inner.insert(key, ()))
+    }
+
+    /// Fallible version of [`insert`](Self::insert): returns an error instead of aborting the
+    /// process when node allocation fails.
+    ///
+    /// On error the set is unchanged and `key` is dropped.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use turso_core::skiplist::SkipSet;
+    ///
+    /// let set = SkipSet::new();
+    /// set.try_insert(2).unwrap();
+    /// assert_eq!(*set.get(&2).unwrap(), 2);
+    /// ```
+    pub fn try_insert(&self, key: T) -> Result<Entry<'_, T, C, A>, TryReserveError> {
+        self.inner.try_insert(key, ()).map(Entry::new)
     }
 
     /// Removes an entry with the specified key from the set and returns it.
@@ -339,7 +416,7 @@ where
     /// assert_eq!(*set.remove(&2).unwrap(), 2);
     /// assert!(set.remove(&2).is_none());
     /// ```
-    pub fn remove<Q>(&self, key: &Q) -> Option<Entry<'_, T, C>>
+    pub fn remove<Q>(&self, key: &Q) -> Option<Entry<'_, T, C, A>>
     where
         C: Comparator<T, Q>,
         Q: ?Sized,
@@ -368,7 +445,7 @@ where
     /// // All entries have been removed now.
     /// assert!(set.is_empty());
     /// ```
-    pub fn pop_front(&self) -> Option<Entry<'_, T, C>> {
+    pub fn pop_front(&self) -> Option<Entry<'_, T, C, A>> {
         self.inner.pop_front().map(Entry::new)
     }
 
@@ -393,7 +470,7 @@ where
     /// // All entries have been removed now.
     /// assert!(set.is_empty());
     /// ```
-    pub fn pop_back(&self) -> Option<Entry<'_, T, C>> {
+    pub fn pop_back(&self) -> Option<Entry<'_, T, C, A>> {
         self.inner.pop_back().map(Entry::new)
     }
 
@@ -425,7 +502,7 @@ where
     }
 }
 
-impl<T, C> fmt::Debug for SkipSet<T, C>
+impl<T, C, A: SkiplistAllocator> fmt::Debug for SkipSet<T, C, A>
 where
     C: Comparator<T>,
     T: fmt::Debug,
@@ -435,9 +512,9 @@ where
     }
 }
 
-impl<T, C> IntoIterator for SkipSet<T, C> {
+impl<T, C, A: SkiplistAllocator> IntoIterator for SkipSet<T, C, A> {
     type Item = T;
-    type IntoIter = IntoIter<T>;
+    type IntoIter = IntoIter<T, A>;
 
     fn into_iter(self) -> Self::IntoIter {
         IntoIter {
@@ -446,12 +523,12 @@ impl<T, C> IntoIterator for SkipSet<T, C> {
     }
 }
 
-impl<'a, T, C> IntoIterator for &'a SkipSet<T, C>
+impl<'a, T, C, A: SkiplistAllocator> IntoIterator for &'a SkipSet<T, C, A>
 where
     C: Comparator<T>,
 {
-    type Item = Entry<'a, T, C>;
-    type IntoIter = Iter<'a, T, C>;
+    type Item = Entry<'a, T, C, A>;
+    type IntoIter = Iter<'a, T, C, A>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -475,12 +552,12 @@ where
 }
 
 /// A reference-counted entry in a set.
-pub struct Entry<'a, T, C = BasicComparator> {
-    inner: map::Entry<'a, T, (), C>,
+pub struct Entry<'a, T, C = BasicComparator, A: SkiplistAllocator = TursoAllocator> {
+    inner: map::Entry<'a, T, (), C, A>,
 }
 
-impl<'a, T, C> Entry<'a, T, C> {
-    fn new(inner: map::Entry<'a, T, (), C>) -> Self {
+impl<'a, T, C, A: SkiplistAllocator> Entry<'a, T, C, A> {
+    fn new(inner: map::Entry<'a, T, (), C, A>) -> Self {
         Self { inner }
     }
 
@@ -495,7 +572,7 @@ impl<'a, T, C> Entry<'a, T, C> {
     }
 }
 
-impl<T, C> Entry<'_, T, C>
+impl<T, C, A: SkiplistAllocator> Entry<'_, T, C, A>
 where
     C: Comparator<T>,
 {
@@ -520,7 +597,7 @@ where
     }
 }
 
-impl<T, C> Entry<'_, T, C>
+impl<T, C, A: SkiplistAllocator> Entry<'_, T, C, A>
 where
     C: Comparator<T>,
     T: Send + 'static,
@@ -533,7 +610,7 @@ where
     }
 }
 
-impl<T, C> Clone for Entry<'_, T, C> {
+impl<T, C, A: SkiplistAllocator> Clone for Entry<'_, T, C, A> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -541,7 +618,7 @@ impl<T, C> Clone for Entry<'_, T, C> {
     }
 }
 
-impl<T, C> fmt::Debug for Entry<'_, T, C>
+impl<T, C, A: SkiplistAllocator> fmt::Debug for Entry<'_, T, C, A>
 where
     T: fmt::Debug,
 {
@@ -552,7 +629,7 @@ where
     }
 }
 
-impl<T, C> Deref for Entry<'_, T, C> {
+impl<T, C, A: SkiplistAllocator> Deref for Entry<'_, T, C, A> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -561,11 +638,11 @@ impl<T, C> Deref for Entry<'_, T, C> {
 }
 
 /// An owning iterator over the entries of a `SkipSet`.
-pub struct IntoIter<T> {
-    inner: map::IntoIter<T, ()>,
+pub struct IntoIter<T, A: SkiplistAllocator = TursoAllocator> {
+    inner: map::IntoIter<T, (), A>,
 }
 
-impl<T> Iterator for IntoIter<T> {
+impl<T, A: SkiplistAllocator> Iterator for IntoIter<T, A> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -573,29 +650,29 @@ impl<T> Iterator for IntoIter<T> {
     }
 }
 
-impl<T> fmt::Debug for IntoIter<T> {
+impl<T, A: SkiplistAllocator> fmt::Debug for IntoIter<T, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad("IntoIter { .. }")
     }
 }
 
 /// An iterator over the entries of a `SkipSet`.
-pub struct Iter<'a, T, C = BasicComparator> {
-    inner: map::Iter<'a, T, (), C>,
+pub struct Iter<'a, T, C = BasicComparator, A: SkiplistAllocator = TursoAllocator> {
+    inner: map::Iter<'a, T, (), C, A>,
 }
 
-impl<'a, T, C> Iterator for Iter<'a, T, C>
+impl<'a, T, C, A: SkiplistAllocator> Iterator for Iter<'a, T, C, A>
 where
     C: Comparator<T>,
 {
-    type Item = Entry<'a, T, C>;
+    type Item = Entry<'a, T, C, A>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(Entry::new)
     }
 }
 
-impl<T, C> DoubleEndedIterator for Iter<'_, T, C>
+impl<T, C, A: SkiplistAllocator> DoubleEndedIterator for Iter<'_, T, C, A>
 where
     C: Comparator<T>,
 {
@@ -604,36 +681,36 @@ where
     }
 }
 
-impl<T, C> fmt::Debug for Iter<'_, T, C> {
+impl<T, C, A: SkiplistAllocator> fmt::Debug for Iter<'_, T, C, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad("Iter { .. }")
     }
 }
 
 /// An iterator over a subset of entries of a `SkipSet`.
-pub struct Range<'a, Q, R, T, C = BasicComparator>
+pub struct Range<'a, Q, R, T, C = BasicComparator, A: SkiplistAllocator = TursoAllocator>
 where
     C: Comparator<T> + Comparator<T, Q>,
     R: RangeBounds<Q>,
     Q: ?Sized,
 {
-    inner: map::Range<'a, Q, R, T, (), C>,
+    inner: map::Range<'a, Q, R, T, (), C, A>,
 }
 
-impl<'a, Q, R, T, C> Iterator for Range<'a, Q, R, T, C>
+impl<'a, Q, R, T, C, A: SkiplistAllocator> Iterator for Range<'a, Q, R, T, C, A>
 where
     C: Comparator<T> + Comparator<T, Q>,
     R: RangeBounds<Q>,
     Q: ?Sized,
 {
-    type Item = Entry<'a, T, C>;
+    type Item = Entry<'a, T, C, A>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(Entry::new)
     }
 }
 
-impl<Q, R, T, C> DoubleEndedIterator for Range<'_, Q, R, T, C>
+impl<Q, R, T, C, A: SkiplistAllocator> DoubleEndedIterator for Range<'_, Q, R, T, C, A>
 where
     C: Comparator<T> + Comparator<T, Q>,
     R: RangeBounds<Q>,
@@ -644,7 +721,7 @@ where
     }
 }
 
-impl<Q, R, T, C> fmt::Debug for Range<'_, Q, R, T, C>
+impl<Q, R, T, C, A: SkiplistAllocator> fmt::Debug for Range<'_, Q, R, T, C, A>
 where
     C: Comparator<T> + Comparator<T, Q>,
     T: fmt::Debug,

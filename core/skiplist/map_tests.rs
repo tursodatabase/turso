@@ -1026,3 +1026,156 @@ fn comparator() {
     assert_eq!(s.remove("AbC").unwrap().key(), "ABC");
     assert!(s.is_empty());
 }
+
+/// An allocator that fails every allocation while its flag is set.
+///
+/// Delegates to [`TursoAllocator`] otherwise, so nodes are still backed by the
+/// regular Turso heap.
+#[derive(Clone, Default)]
+pub(crate) struct FailOnDemandAlloc {
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FailOnDemandAlloc {
+    pub(crate) fn fail_allocations(&self, fail: bool) {
+        self.fail.store(fail, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+unsafe impl crate::alloc::ApiAllocator for FailOnDemandAlloc {
+    fn allocate(
+        &self,
+        layout: crate::alloc::Layout,
+    ) -> Result<std::ptr::NonNull<[u8]>, crate::alloc::AllocError> {
+        if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(crate::alloc::AllocError);
+        }
+        crate::alloc::TursoAllocator.allocate(layout)
+    }
+
+    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: crate::alloc::Layout) {
+        unsafe { crate::alloc::TursoAllocator.deallocate(ptr, layout) }
+    }
+}
+
+#[test]
+fn try_insert_surfaces_allocation_failure() {
+    let alloc = FailOnDemandAlloc::default();
+    let map: SkipMap<i32, String, _, _> = SkipMap::new_in(alloc.clone());
+    map.try_insert(1, "one".to_string()).unwrap();
+    assert_eq!(map.len(), 1);
+
+    alloc.fail_allocations(true);
+
+    // Inserting a new key needs a node allocation, which now fails. The map
+    // must be left unchanged.
+    assert!(map.try_insert(2, "two".to_string()).is_err());
+    assert!(map
+        .try_compare_insert(2, "two".to_string(), |_| true)
+        .is_err());
+    assert_eq!(map.len(), 1);
+    assert!(map.get(&2).is_none());
+
+    // Finding an existing key takes the no-allocation fast path and still
+    // succeeds while allocations fail.
+    let entry = map.try_get_or_insert(1, "uno".to_string()).unwrap();
+    assert_eq!(*entry.value(), "one");
+    let entry = map.try_get_or_insert_with(1, || "uno".to_string()).unwrap();
+    assert_eq!(*entry.value(), "one");
+
+    alloc.fail_allocations(false);
+
+    // The map stays fully usable after a failed insert.
+    map.try_insert(2, "two".to_string()).unwrap();
+    assert_eq!(map.len(), 2);
+    assert_eq!(*map.get(&2).unwrap().value(), "two");
+}
+
+#[test]
+fn try_insert_failure_drops_value_exactly_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountsDrops(Arc<AtomicUsize>);
+    impl Drop for CountsDrops {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let alloc = FailOnDemandAlloc::default();
+    let map: SkipMap<i32, CountsDrops, _, _> = SkipMap::new_in(alloc.clone());
+
+    // Failed insert into an empty map: the value is dropped exactly once.
+    alloc.fail_allocations(true);
+    assert!(map.try_insert(1, CountsDrops(drops.clone())).is_err());
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+    assert!(map.is_empty());
+
+    // Successful insert; the stored value must not be dropped.
+    alloc.fail_allocations(false);
+    map.try_insert(1, CountsDrops(drops.clone())).unwrap();
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+
+    // Failed insert over an existing key (replace path): only the new value is
+    // dropped, the stored entry stays untouched.
+    alloc.fail_allocations(true);
+    assert!(map.try_insert(1, CountsDrops(drops.clone())).is_err());
+    assert_eq!(drops.load(Ordering::Relaxed), 2);
+    assert_eq!(map.len(), 1);
+
+    // Dropping the map finalizes the stored value exactly once.
+    drop(map);
+    assert_eq!(drops.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn try_get_or_insert_family_fails_on_missing_key() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let alloc = FailOnDemandAlloc::default();
+    let map: SkipMap<i32, i32, _, _> = SkipMap::new_in(alloc.clone());
+
+    alloc.fail_allocations(true);
+    // A missing key forces a node allocation in every fallible variant.
+    assert!(map.try_get_or_insert(1, 10).is_err());
+    let calls = AtomicUsize::new(0);
+    assert!(map
+        .try_get_or_insert_with(1, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            10
+        })
+        .is_err());
+    // The value closure runs before the allocation is attempted; the value it
+    // built is dropped on failure.
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert!(map.try_compare_insert(1, 10, |_| false).is_err());
+    assert!(map.is_empty());
+
+    alloc.fail_allocations(false);
+    map.try_get_or_insert(1, 10).unwrap();
+    assert_eq!(map.len(), 1);
+
+    alloc.fail_allocations(true);
+    // Existing key: the fast path returns the entry without allocating, and
+    // the value closure is never invoked.
+    assert_eq!(*map.try_get_or_insert(1, 20).unwrap().value(), 10);
+    assert_eq!(
+        *map.try_get_or_insert_with(1, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            20
+        })
+        .unwrap()
+        .value(),
+        10
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    // A false predicate keeps the existing entry without allocating; a true
+    // predicate must allocate a replacement node and fails.
+    assert_eq!(
+        *map.try_compare_insert(1, 20, |_| false).unwrap().value(),
+        10
+    );
+    assert!(map.try_compare_insert(1, 20, |_| true).is_err());
+    assert_eq!(*map.get(&1).unwrap().value(), 10);
+}
