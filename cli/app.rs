@@ -23,8 +23,10 @@ use std::num::NonZeroUsize;
 use std::{
     fs::File,
     io::{self, BufRead, BufReader, IsTerminal, Write},
+    iter::Peekable,
     mem::{forget, ManuallyDrop},
     path::PathBuf,
+    str::Chars,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -779,26 +781,26 @@ impl Limbo {
     }
 
     pub fn handle_dot_command(&mut self, line: &str) {
-        let first = line.split_whitespace().next();
-        let parse = match first {
-            Some("parameter") | Some("param") => {
-                let args = shlex::split(line).unwrap_or_else(|| {
-                    line.split_whitespace()
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                });
-                if args.is_empty() {
-                    return;
-                }
-                CommandParser::try_parse_from(args)
-            }
-            _ => {
-                let args = line.split_whitespace();
-                CommandParser::try_parse_from(args)
+        let args = match split_dot_command_args(line) {
+            Ok(args) => args,
+            Err(e) => {
+                self.had_query_error = true;
+                let _ = writeln!(io::stderr(), "Error: {e}");
+                return;
             }
         };
+        if args.is_empty() {
+            return;
+        }
+        let parse = CommandParser::try_parse_from(args);
         match parse {
             Err(err) => {
+                if !matches!(
+                    err.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) {
+                    self.had_query_error = true;
+                }
                 // Let clap print with Styled Colors instead
                 let _ = err.print();
             }
@@ -2258,30 +2260,30 @@ fn parameter_name_to_index(name: &str) -> Option<NonZeroUsize> {
 }
 
 fn parse_parameter_value(value: &str) -> Result<Value, String> {
-    let value = value.trim();
-    if value.eq_ignore_ascii_case("null") {
+    let literal = value.trim();
+    if literal.eq_ignore_ascii_case("null") {
         return Ok(Value::Null);
     }
 
-    if let Ok(integer) = value.parse::<i64>() {
+    if let Ok(integer) = literal.parse::<i64>() {
         return Ok(Value::from_i64(integer));
     }
 
-    if value.contains(['.', 'e', 'E']) {
-        if let Ok(float) = value.parse::<f64>() {
+    if literal.contains(['.', 'e', 'E']) {
+        if let Ok(float) = literal.parse::<f64>() {
             return Ok(Value::from_f64(float));
         }
     }
 
-    if let Some(hex) = value
+    if let Some(hex) = literal
         .strip_prefix("x'")
-        .or_else(|| value.strip_prefix("X'"))
+        .or_else(|| literal.strip_prefix("X'"))
         .and_then(|stripped| stripped.strip_suffix('\''))
     {
         return parse_hex_blob(hex).map(Value::from_blob);
     }
 
-    if let Some(inner) = value
+    if let Some(inner) = literal
         .strip_prefix('\'')
         .and_then(|stripped| stripped.strip_suffix('\''))
     {
@@ -2371,9 +2373,269 @@ fn normalize_db_path(db_file: String) -> String {
     db_file
 }
 
+// Mirrors SQLite shell's parseDotCmdArgs for dot-command argument splitting.
+// Backslash escapes are resolved only inside double-quoted arguments.
+fn split_dot_command_args(line: &str) -> Result<Vec<String>, String> {
+    DotCommandArgParser::new(line).parse()
+}
+
+struct DotCommandArgParser<'a> {
+    chars: Peekable<Chars<'a>>,
+}
+
+impl<'a> DotCommandArgParser<'a> {
+    fn new(line: &'a str) -> Self {
+        Self {
+            chars: trim_dot_command_tail(line).chars().peekable(),
+        }
+    }
+
+    fn parse(mut self) -> Result<Vec<String>, String> {
+        let mut args = Vec::new();
+        loop {
+            self.skip_space();
+            let Some(c) = self.peek() else {
+                break;
+            };
+
+            let arg = match c {
+                '\'' | '"' => self.parse_quoted_arg(c)?,
+                _ => self.parse_unquoted_arg(),
+            };
+            args.push(arg);
+        }
+        Ok(args)
+    }
+
+    fn parse_quoted_arg(&mut self, delimiter: char) -> Result<String, String> {
+        let _ = self.chars.next();
+        let mut arg = String::new();
+        while let Some(c) = self.chars.next() {
+            if c == delimiter {
+                break;
+            }
+            if c == '\\' && delimiter == '"' {
+                arg.push(c);
+                let Some(next) = self.chars.next() else {
+                    break;
+                };
+                arg.push(next);
+                continue;
+            }
+            arg.push(c);
+        }
+        if delimiter == '"' {
+            resolve_dot_backslashes(&arg)
+        } else {
+            Ok(arg)
+        }
+    }
+
+    fn parse_unquoted_arg(&mut self) -> String {
+        let mut arg = String::new();
+        while let Some(c) = self.peek() {
+            if is_dot_command_space(c) {
+                break;
+            }
+            let _ = self.chars.next();
+            arg.push(c);
+        }
+        arg
+    }
+
+    fn skip_space(&mut self) {
+        while self.peek().is_some_and(is_dot_command_space) {
+            let _ = self.chars.next();
+        }
+    }
+
+    fn peek(&mut self) -> Option<char> {
+        self.chars.peek().copied()
+    }
+}
+
+fn trim_dot_command_tail(line: &str) -> &str {
+    let mut line = line.trim_end_matches(is_dot_command_space);
+    if let Some(without_semicolon) = line.strip_suffix(';') {
+        line = without_semicolon.trim_end_matches(is_dot_command_space);
+    }
+    line
+}
+
+fn is_dot_command_space(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\x0b' | '\x0c' | '\r' | ' ')
+}
+
+// Mirrors SQLite shell's resolve_backslashes for double-quoted dot-command args.
+// Turso stores command arguments as UTF-8 Strings, so raw non-UTF-8 escape output
+// is rejected even though SQLite can carry those bytes through C strings.
+fn resolve_dot_backslashes(input: &str) -> Result<String, String> {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' || i + 1 == bytes.len() {
+            output.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        match bytes[i] {
+            b'a' => output.push(b'\x07'),
+            b'b' => output.push(b'\x08'),
+            b't' => output.push(b'\t'),
+            b'n' => output.push(b'\n'),
+            b'v' => output.push(b'\x0b'),
+            b'f' => output.push(b'\x0c'),
+            b'r' => output.push(b'\r'),
+            b'"' => output.push(b'"'),
+            b'\'' => output.push(b'\''),
+            b'\\' => output.push(b'\\'),
+            b'x' => {
+                let mut value = 0u8;
+                let mut digits = 0;
+                while digits < 2 && i + 1 < bytes.len() {
+                    let Some(digit) = hex_digit_value(bytes[i + 1]) else {
+                        break;
+                    };
+                    value = (value << 4) | digit;
+                    i += 1;
+                    digits += 1;
+                }
+                output.push(value);
+            }
+            c @ b'0'..=b'7' => {
+                let mut value = u16::from(c - b'0');
+                let mut digits = 1;
+                while digits < 3 && i + 1 < bytes.len() {
+                    let next = bytes[i + 1];
+                    if !(b'0'..=b'7').contains(&next) {
+                        break;
+                    }
+                    value = (value << 3) + u16::from(next - b'0');
+                    i += 1;
+                    digits += 1;
+                }
+                output.push(value as u8);
+            }
+            c => output.push(c),
+        }
+        i += 1;
+    }
+    // SQLite observes the resolved argument through C-string APIs after this
+    // point, so an escaped NUL truncates the visible argument.
+    if let Some(nul) = output.iter().position(|byte| *byte == 0) {
+        output.truncate(nul);
+    }
+    String::from_utf8(output).map_err(|_| "dot-command escape produced invalid UTF-8".to_string())
+}
+
+fn hex_digit_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_split_dot_command_args_preserves_unquoted_windows_paths() {
+        assert_eq!(
+            split_dot_command_args(r#"open C:\Users\me\db.sqlite"#).unwrap(),
+            vec!["open", r#"C:\Users\me\db.sqlite"#]
+        );
+    }
+
+    #[test]
+    fn test_split_dot_command_args_strips_quotes_and_keeps_empty_arg() {
+        assert_eq!(
+            split_dot_command_args(r#"import "data file.csv" "weird table" "";"#).unwrap(),
+            vec!["import", "data file.csv", "weird table", ""]
+        );
+    }
+
+    #[test]
+    fn test_split_dot_command_args_double_quote_backslash_escapes() {
+        assert_eq!(
+            split_dot_command_args(r#"parameter set @x "two\nwords\"""#).unwrap(),
+            vec!["parameter", "set", "@x", "two\nwords\""]
+        );
+    }
+
+    #[test]
+    fn test_split_dot_command_args_single_quotes_do_not_resolve_backslashes() {
+        assert_eq!(
+            split_dot_command_args(r#"parameter set @x 'two\nwords'"#).unwrap(),
+            vec!["parameter", "set", "@x", r#"two\nwords"#]
+        );
+    }
+
+    #[test]
+    fn test_split_dot_command_args_uses_ascii_whitespace_only() {
+        assert_eq!(
+            split_dot_command_args("tables\u{00a0}x").unwrap(),
+            vec!["tables\u{00a0}x"]
+        );
+    }
+
+    #[test]
+    fn test_split_dot_command_args_treats_vertical_tab_as_space() {
+        assert_eq!(
+            split_dot_command_args("tables\x0bfoo").unwrap(),
+            vec!["tables", "foo"]
+        );
+    }
+
+    #[test]
+    fn test_split_dot_command_args_unterminated_quote() {
+        assert_eq!(
+            split_dot_command_args(r#"open "unterminated path"#).unwrap(),
+            vec!["open", "unterminated path"]
+        );
+    }
+
+    #[test]
+    fn test_resolve_dot_backslashes_zero_digit_hex_truncates_at_nul() {
+        assert_eq!(
+            split_dot_command_args(r#"parameter set @x "\xZZ""#).unwrap()[3],
+            ""
+        );
+    }
+
+    #[test]
+    fn test_resolve_dot_backslashes_truncates_at_nul_like_sqlite() {
+        assert_eq!(
+            split_dot_command_args(r#"parameter set @x "A\0B""#).unwrap()[3],
+            "A"
+        );
+    }
+
+    #[test]
+    fn test_resolve_dot_backslashes_decodes_hex_utf8_bytes() {
+        assert_eq!(
+            split_dot_command_args(r#"parameter set @x "\xC3\xA9""#).unwrap()[3],
+            "\u{00e9}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_dot_backslashes_decodes_octal_utf8_bytes() {
+        assert_eq!(
+            split_dot_command_args(r#"parameter set @x "\303\251""#).unwrap()[3],
+            "\u{00e9}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_dot_backslashes_rejects_invalid_utf8_bytes_current_turso_policy() {
+        assert!(split_dot_command_args(r#"parameter set @x "\xFF""#).is_err());
+    }
 
     #[test]
     fn test_normalize_db_path_adds_file_prefix_for_query_params() {
