@@ -2216,7 +2216,7 @@ mod rename_column_view {
     pub struct RewrittenView {
         pub sql: String,
         pub select_stmt: ast::Select,
-        pub columns: Vec<Column>,
+        pub columns: crate::alloc::Vec<Column>,
     }
 
     pub fn rewrite_view_sql_for_column_rename(
@@ -2321,7 +2321,7 @@ mod rename_column_view {
     fn apply_view_column_rename(
         view_columns: ViewColumnSchema,
         ctx: &ViewRewriteCtx,
-    ) -> Vec<Column> {
+    ) -> crate::alloc::Vec<Column> {
         let target_norm = ctx.target_table_norm.as_str();
         let mut columns = view_columns.columns;
 
@@ -2344,7 +2344,11 @@ mod rename_column_view {
             }
         }
 
-        columns.into_iter().map(|vc| vc.column).collect()
+        columns
+            .into_iter()
+            .map(|vc| vc.column)
+            .try_collect()
+            .expect("TODO: fallible allocations")
     }
 
     fn view_columns_from_select(

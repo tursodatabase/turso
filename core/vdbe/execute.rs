@@ -14110,9 +14110,13 @@ pub fn op_add_column(
         let btree = Arc::make_mut(btree);
         btree.columns_mut().push((**column).clone());
         // Update CHECK constraints to include any constraints from the new column
-        btree.check_constraints.clone_from(check_constraints);
+        btree.check_constraints = check_constraints
+            .try_to_vec()
+            .expect("TODO: fallible allocations");
         // Update foreign keys to include any FK constraints from the new column
-        btree.foreign_keys.clone_from(foreign_keys);
+        btree.foreign_keys = foreign_keys
+            .try_to_vec()
+            .expect("TODO: fallible allocations");
 
         // Resolve generated column expressions and update virtual column metadata
         btree.prepare_generated_columns()?;
