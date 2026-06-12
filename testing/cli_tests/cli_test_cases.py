@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import os
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -117,6 +119,78 @@ def verify_output_file(filepath: Path, expected_lines: dict) -> None:
         assert line in contents, f"Missing: {description}"
 
 
+def run_turso_script(script: str, extra_args=None) -> subprocess.CompletedProcess:
+    exec_name = os.environ.get("SQLITE_EXEC", "./scripts/limbo-sqlite3")
+    args = [exec_name]
+    if extra_args:
+        args.extend(extra_args)
+    return subprocess.run(
+        args,
+        input=script,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def sqlite3_baseline_exec() -> str | None:
+    configured = os.environ.get("SQLITE3_EXEC")
+    if configured:
+        return configured
+    return None
+
+
+def run_sqlite_script(script: str, sqlite3_exec: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sqlite3_exec],
+        input=script,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def normalize_shell_stdout(stdout: str) -> str:
+    lines = [
+        line
+        for line in stdout.splitlines()
+        if line != "Exiting Turso SQL Shell."
+    ]
+    return "\n".join(lines).rstrip()
+
+
+def assert_import_matches_sqlite(name: str, script: str, turso_args=None) -> None:
+    sqlite3_exec = sqlite3_baseline_exec()
+    if sqlite3_exec is None:
+        console.info(
+            f"Skipping SQLite differential import test {name}: SQLITE3_EXEC is not set",
+            _stack_offset=2,
+        )
+        return
+
+    console.test(f"Running SQLite differential import test: {name}", _stack_offset=2)
+    sqlite_result = run_sqlite_script(script, sqlite3_exec)
+    turso_result = run_turso_script(script, turso_args)
+    if sqlite_result.returncode == 0:
+        assert turso_result.returncode == 0, (
+            f"{name}: Turso failed when SQLite succeeded\n"
+            f"Turso return code: {turso_result.returncode}\n"
+            f"Turso stderr:\n{turso_result.stderr!r}"
+        )
+    assert normalize_shell_stdout(turso_result.stdout) == normalize_shell_stdout(
+        sqlite_result.stdout
+    ), (
+        f"{name}: stdout mismatch\n"
+        f"SQLite:\n{sqlite_result.stdout!r}\n"
+        f"Turso:\n{turso_result.stdout!r}"
+    )
+    assert turso_result.stderr == sqlite_result.stderr, (
+        f"{name}: stderr mismatch\n"
+        f"SQLite:\n{sqlite_result.stderr!r}\n"
+        f"Turso:\n{turso_result.stderr!r}"
+    )
+
+
 def test_output_file():
     shell = TestTursoShell()
     output_filename = "turso_output.txt"
@@ -197,7 +271,7 @@ def test_import_csv():
     )
     shell.run_test(
         "verify-csv-no-options",
-        "select * from csv_table;",
+        "select * from csv_table ORDER BY rowid;",
         "1|2.0|String'1\n3|4.0|String2",
     )
     shell.quit()
@@ -210,11 +284,12 @@ def test_import_csv_verbose():
     shell.run_test(
         "import-csv-verbose",
         ".import --csv -v ./testing/cli_tests/test_files/test.csv csv_table",
-        "Added 2 rows with 0 errors using 2 lines of input",
+        'Column separator ",", row separator "\\n"\n'
+        "Added 2 rows with 0 errors using 1 lines of input",
     )
     shell.run_test(
         "verify-csv-verbose",
-        "select * from csv_table;",
+        "select * from csv_table ORDER BY rowid;",
         "1|2.0|String'1\n3|4.0|String2",
     )
     shell.quit()
@@ -229,7 +304,11 @@ def test_import_csv_skip():
         ".import --csv --skip 1 ./testing/cli_tests/test_files/test.csv csv_table",
         "",
     )
-    shell.run_test("verify-csv-skip", "select * from csv_table;", "3|4.0|String2")
+    shell.run_test(
+        "verify-csv-skip",
+        "select * from csv_table ORDER BY rowid;",
+        "3|4.0|String2",
+    )
     shell.quit()
 
 
@@ -246,15 +325,233 @@ def test_import_csv_create_table_from_header():
     shell.run_test(
         "verify-auto-table-schema",
         ".schema auto_table",
-        "CREATE TABLE auto_table (id, interesting_number, interesting_string);",
+        'CREATE TABLE "auto_table" ("id" ANY, "interesting_number" ANY, "interesting_string" ANY);',
     )
     # Verify data was imported correctly (header row excluded)
     shell.run_test(
         "verify-auto-table-data",
-        "select * from auto_table;",
-        "1|2.0|String'1\n3|4.0|String2",
+        "select * from auto_table ORDER BY rowid;",
+        "1|2|String'1\n3|4|String2",
     )
     shell.quit()
+
+
+def test_import_csv_quotes_generated_identifiers():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "import_identifiers.csv"
+        path.write_text('"User Name","select","he""llo"\nAlice,1,x\n', encoding="utf-8")
+        shell = TestTursoShell()
+        try:
+            shell.run_test("open-memory", ".open :memory:", "")
+            shell.run_test(
+                "import-identifiers",
+                f'.import --csv "{path}" "weird table"',
+                "",
+            )
+            shell.run_test(
+                "verify-identifier-data",
+                'SELECT "User Name","select","he""llo" FROM "weird table";',
+                "Alice|1|x",
+            )
+        finally:
+            shell.quit()
+
+
+def test_import_csv_view_target_does_not_create_table():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "import_view.csv"
+        path.write_text("1\n", encoding="utf-8")
+        shell = TestTursoShell()
+        try:
+            shell.run_test("open-memory", ".open :memory:", "")
+            shell.run_test("create-view-base", "CREATE TABLE base(a);", "")
+            shell.run_test("create-view", "CREATE VIEW v AS SELECT a FROM base;", "")
+            shell.run_test(
+                "import-view",
+                f'.import --csv "{path}" v',
+                "Error: cannot modify v because it is a view",
+            )
+            shell.run_test(
+                "verify-view-still-exists",
+                "SELECT type FROM sqlite_master WHERE name='v';",
+                "view",
+            )
+        finally:
+            shell.quit()
+
+
+def test_import_csv_diagnostics_go_to_stderr_not_output_file():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "import_ragged.csv"
+        capture_path = Path(tmpdir) / "captured.txt"
+        path.write_text("x,y\n", encoding="utf-8")
+        result = run_turso_script(
+            f""".open :memory:
+CREATE TABLE t(a,b,c);
+.output "{capture_path}"
+.import --csv "{path}" t
+.output stdout
+.quit
+"""
+        )
+        expected = f"{path}:1: expected 3 columns but found 2 - filling the rest with NULL\n"
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == expected
+        assert expected not in result.stdout
+        assert capture_path.read_text(encoding="utf-8") == ""
+
+
+def test_import_csv_reports_malformed_csv_warnings():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "malformed.csv"
+        path.write_text('a,"b"c\n', encoding="utf-8")
+        result = run_turso_script(
+            f""".open :memory:
+CREATE TABLE t(a,b);
+.import --csv "{path}" t
+.quit
+"""
+        )
+        expected = (
+            f'{path}:1: unescaped " character\n'
+            f'{path}:1: unterminated "-quoted field\n'
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == expected
+
+
+def test_import_csv_reports_warnings_for_skip_and_header_rows():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        skip_path = Path(tmpdir) / "skip_warning.csv"
+        header_path = Path(tmpdir) / "header_warning.csv"
+        skip_path.write_text('"bad"x",c\n1,2\n', encoding="utf-8")
+        header_path.write_text('"bad"x",c\n1,2\n', encoding="utf-8")
+        result = run_turso_script(
+            f""".open :memory:
+CREATE TABLE skip_warn(a,b);
+.import --csv --skip 1 "{skip_path}" skip_warn
+.import --csv "{header_path}" header_warn
+SELECT * FROM skip_warn ORDER BY rowid;
+.quit
+"""
+        )
+        expected = (
+            f'{skip_path}:1: unescaped " character\n'
+            f'{header_path}:1: unescaped " character\n'
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == expected
+        assert "1|2" in result.stdout
+
+
+def test_import_csv_duplicate_header_rename_notice():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "duplicate_header.csv"
+        path.write_text("id,id,x_1\n1,2,3\n", encoding="utf-8")
+        result = run_turso_script(
+            f""".open :memory:
+.import --csv "{path}" auto_dupe
+.schema auto_dupe
+.quit
+"""
+        )
+        expected_stderr = (
+            f"Columns renamed during .import {path} due to duplicates:\n"
+            '"id" to "id_1",\n'
+            '"id" to "id_2"\n'
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == expected_stderr
+        assert '"id_1" ANY, "id_2" ANY, "x_1" ANY' in result.stdout
+
+
+def test_import_csv_matches_sqlite_quoted_fields():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "quoted_fields.csv"
+        path.write_bytes(
+            b'1,"",11\n'
+            b'2,"x",22\n'
+            b'3,"""",33\n'
+            b'4,"hello",44\n'
+            b'5,55,""\r\n'
+            b'6,66,"x"\n'
+            b'7,77,""""\n'
+            b'8,88,"hello"\n'
+            b'"",9,99\n'
+            b'"x",10,110\n'
+            b'"""",11,121\n'
+            b'"hello",12,132\n'
+        )
+        assert_import_matches_sqlite(
+            "quoted-fields",
+            f""".open :memory:
+.mode list
+.headers off
+CREATE TABLE t(a,b,c);
+.import --csv "{path}" t
+SELECT quote(a), quote(b), quote(c), typeof(a), typeof(b), typeof(c) FROM t ORDER BY rowid;
+""",
+        )
+
+
+def test_import_csv_matches_sqlite_multiline_quoted_fields():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "multiline.csv"
+        path.write_bytes(
+            b"column1,column2,column3,column4\n"
+            b'field1,field2,"x3 ""\r\ndata"" 3",field4\n'
+            b'x1,x2,"x3 ""\ndata"" 3",x4\n'
+        )
+        assert_import_matches_sqlite(
+            "multiline-quoted-fields",
+            f""".open :memory:
+.mode list
+.headers off
+CREATE TABLE t(a,b,c,d);
+.import --csv "{path}" t
+SELECT hex(a), hex(b), hex(c), hex(d) FROM t ORDER BY rowid;
+""",
+        )
+
+
+def test_import_csv_matches_sqlite_ragged_blank_rows_and_skip():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ragged_path = Path(tmpdir) / "ragged.csv"
+        skip_path = Path(tmpdir) / "skip.csv"
+        ragged_path.write_text("a,b\n\n1,2,3,4\n,,\n", encoding="utf-8")
+        skip_path.write_text("x,y,z\n1,2,3\n", encoding="utf-8")
+        assert_import_matches_sqlite(
+            "ragged-blank-rows-and-skip",
+            f""".open :memory:
+.mode list
+.headers off
+CREATE TABLE ragged(a,b,c);
+.import --csv "{ragged_path}" ragged
+CREATE TABLE skipped(a,b,c);
+.import --csv --skip 1 "{skip_path}" skipped
+SELECT quote(a), quote(b), quote(c), typeof(a), typeof(b), typeof(c) FROM ragged ORDER BY rowid;
+SELECT quote(a), quote(b), quote(c), typeof(a), typeof(b), typeof(c) FROM skipped ORDER BY rowid;
+""",
+        )
+
+
+def test_import_csv_matches_sqlite_generated_columns():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "generated.csv"
+        path.write_text("a,b\nx,y\n", encoding="utf-8")
+        assert_import_matches_sqlite(
+            "generated-columns",
+            f""".open :memory:
+.mode list
+.headers off
+CREATE TABLE t(a,b,c AS (a||b));
+.import --csv --skip 1 "{path}" t
+SELECT a,b,c FROM t ORDER BY rowid;
+SELECT count(*) FROM pragma_table_info('t');
+SELECT count(*) FROM pragma_table_xinfo('t');
+""",
+            ["--experimental-generated-columns"],
+        )
 
 
 def test_table_patterns():
@@ -500,6 +797,16 @@ def main():
     test_import_csv_verbose()
     test_import_csv_skip()
     test_import_csv_create_table_from_header()
+    test_import_csv_quotes_generated_identifiers()
+    test_import_csv_view_target_does_not_create_table()
+    test_import_csv_diagnostics_go_to_stderr_not_output_file()
+    test_import_csv_reports_malformed_csv_warnings()
+    test_import_csv_reports_warnings_for_skip_and_header_rows()
+    test_import_csv_duplicate_header_rename_notice()
+    test_import_csv_matches_sqlite_quoted_fields()
+    test_import_csv_matches_sqlite_multiline_quoted_fields()
+    test_import_csv_matches_sqlite_ragged_blank_rows_and_skip()
+    test_import_csv_matches_sqlite_generated_columns()
     test_table_patterns()
     test_update_with_limit()
     test_update_with_limit_and_offset()

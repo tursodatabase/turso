@@ -887,9 +887,17 @@ impl Limbo {
                     }
                 }
                 Command::Import(args) => {
-                    let w = self.writer.as_mut().unwrap();
-                    let mut import_file = ImportFile::new(self.conn.clone(), w);
-                    import_file.import(args)
+                    let import_failed = {
+                        let interrupt_count = self.interrupt_count.clone();
+                        let w = self.writer.as_mut().unwrap();
+                        let mut err = io::stderr();
+                        let mut import_file = ImportFile::new(self.conn.clone(), w, &mut err)
+                            .with_interrupt_count(interrupt_count);
+                        import_file.import(args)
+                    };
+                    if import_failed {
+                        self.had_query_error = true;
+                    }
                 }
                 Command::LoadExtension(args) => {
                     #[cfg(not(target_family = "wasm"))]

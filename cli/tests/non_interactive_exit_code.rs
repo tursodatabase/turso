@@ -212,6 +212,29 @@ fn piped_stdin_runtime_error_returns_nonzero() {
 }
 
 #[test]
+fn piped_stdin_import_row_error_returns_nonzero_and_keeps_successful_rows() {
+    let csv_path = temp_test_path("unique-import.csv");
+    std::fs::write(&csv_path, "a\na\nb\n").expect("failed to write csv");
+    let script = format!(
+        ".mode list\nCREATE TABLE t(x UNIQUE);\n.import --csv \"{}\" t\nSELECT count(*) FROM t;\n",
+        csv_path.display()
+    );
+    let output = run_piped_script(&script);
+    let _ = std::fs::remove_file(&csv_path);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stdout, "2\n");
+    assert_eq!(
+        stderr,
+        format!(
+            "{}:2: INSERT failed: UNIQUE constraint failed: t.x (19)\n",
+            csv_path.display()
+        )
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
 fn piped_stdin_dot_command_parse_error_returns_nonzero_and_continues() {
     let csv_path = temp_test_path("bad-import-option.csv");
     std::fs::write(&csv_path, "1\n").expect("failed to write csv");
