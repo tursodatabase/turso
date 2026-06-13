@@ -784,6 +784,7 @@ pub enum ScalarFunc {
     StatGet,
     ConnTxnId,
     IsAutocommit,
+    SequenceWatermark,
     // Test type functions (for custom type system testing)
     TestUintEncode,
     TestUintDecode,
@@ -910,6 +911,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::StatGet => false,  // internal ANALYZE function
             ScalarFunc::ConnTxnId => false, // depends on connection state
             ScalarFunc::IsAutocommit => false, // depends on connection state
+            ScalarFunc::SequenceWatermark => false, // depends on active MVCC transactions
             ScalarFunc::TestUintEncode
             | ScalarFunc::TestUintDecode
             | ScalarFunc::TestUintAdd
@@ -1049,6 +1051,7 @@ impl Display for ScalarFunc {
             Self::StatGet => "stat_get",
             Self::ConnTxnId => "conn_txn_id",
             Self::IsAutocommit => "is_autocommit",
+            Self::SequenceWatermark => "sequence_watermark_experimental",
             Self::TestUintEncode => "test_uint_encode",
             Self::TestUintDecode => "test_uint_decode",
             Self::TestUintAdd => "test_uint_add",
@@ -1152,7 +1155,8 @@ impl ScalarFunc {
             | Self::Upper
             | Self::ZeroBlob
             | Self::Likely
-            | Self::Unlikely => &[1],
+            | Self::Unlikely
+            | Self::SequenceWatermark => &[1],
             // 2-arg
             Self::Glob
             | Self::Instr
@@ -1711,6 +1715,9 @@ impl Func {
             "bin_record_json_object" => Ok(Some(Self::Scalar(ScalarFunc::BinRecordJsonObject))),
             "conn_txn_id" => Ok(Some(Self::Scalar(ScalarFunc::ConnTxnId))),
             "is_autocommit" => Ok(Some(Self::Scalar(ScalarFunc::IsAutocommit))),
+            "sequence_watermark_experimental" => {
+                Ok(Some(Self::Scalar(ScalarFunc::SequenceWatermark)))
+            }
             "acos" => Ok(Some(Self::Math(MathFunc::Acos))),
             "acosh" => Ok(Some(Self::Math(MathFunc::Acosh))),
             "asin" => Ok(Some(Self::Math(MathFunc::Asin))),

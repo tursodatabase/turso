@@ -8200,6 +8200,39 @@ pub fn op_function(
                 let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
                 state.registers[*dest].set_int(if auto_commit { 1 } else { 0 });
             }
+            ScalarFunc::SequenceWatermark => {
+                assert_eq!(arg_count, 1);
+                let sequence_name = match state.registers[*start_reg].get_value() {
+                    Value::Text(text) => text.as_str(),
+                    Value::Null => {
+                        state.registers[*dest].set_value(Value::Null);
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                    _ => {
+                        return Err(LimboError::InternalError(
+                            "sequence_watermark_experimental() argument must be TEXT".to_string(),
+                        ));
+                    }
+                };
+                let (db_id, sequence_key) =
+                    if let Some((schema_name, sequence_name)) = sequence_name.split_once('.') {
+                        (
+                            program.connection.get_database_id_by_name(schema_name)?,
+                            crate::util::normalize_ident(sequence_name),
+                        )
+                    } else {
+                        (MAIN_DB_ID, crate::util::normalize_ident(sequence_name))
+                    };
+                program.connection.find_sequence(sequence_name)?;
+                let watermark = program
+                    .connection
+                    .mv_store_for_db(db_id)
+                    .and_then(|mv_store| mv_store.sequence_watermark(&sequence_key));
+                match watermark {
+                    Some(watermark) => state.registers[*dest].set_int(watermark),
+                    None => state.registers[*dest].set_value(Value::Null),
+                }
+            }
             ScalarFunc::TestUintEncode => {
                 check_arg_count!(arg_count, 1);
                 let val = &state.registers[*start_reg];
@@ -11716,6 +11749,152 @@ pub fn op_set_sequence_currval(
         })?;
 
     program.connection.set_sequence_currval(&seq_name, value);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Publish sequence allocation metadata used by `sequence_watermark_experimental()`.
+///
+/// The translator emits this only after the sequence backing-table RMW has
+/// committed successfully. At that point `SequenceCommitInnerTx` has restored
+/// the connection's MVCC transaction to the outer tx, so any active allocation
+/// is attributed to the transaction whose row changes may become visible later.
+pub fn op_sequence_track_allocation(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        SequenceTrackAllocation {
+            db,
+            seq_name_reg,
+            value_reg,
+        },
+        insn
+    );
+
+    let seq_name = match state.registers[*seq_name_reg].get_value() {
+        Value::Text(t) => t.as_str().to_string(),
+        _ => {
+            return Err(crate::LimboError::ParseError(
+                "SequenceTrackAllocation: seq_name_reg must be text".to_string(),
+            ));
+        }
+    };
+    let value = state.registers[*value_reg]
+        .get_value()
+        .as_int()
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "SequenceTrackAllocation: value_reg must be integer".to_string(),
+            )
+        })?;
+
+    let bare_seq_name = seq_name
+        .rsplit_once('.')
+        .map(|(_, n)| n)
+        .unwrap_or(&seq_name);
+    let normalized_seq_name = crate::util::normalize_ident(bare_seq_name);
+
+    if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
+        let seq = program
+            .connection
+            .with_schema(*db, |s| s.get_sequence(&normalized_seq_name).cloned())
+            .ok_or_else(|| {
+                crate::LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
+            })?;
+        let current_watermark =
+            crate::mvcc::database::first_unsafe_sequence_watermark(&seq, value, true);
+        mv_store.set_sequence_watermark(&normalized_seq_name, current_watermark);
+
+        if let Some((tx_id, _)) = program.connection.get_mv_tx_for_db(*db) {
+            if mv_store.is_tx_rollbackable(tx_id) {
+                mv_store.register_sequence_allocation(tx_id, &normalized_seq_name, value)?;
+            }
+        }
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Register an in-flight sequence allocation against the *outer* transaction
+/// *before* the paired `SequenceCommitInnerTx` publishes the new boundary.
+///
+/// Without this, there is a window where one connection has committed the
+/// inner-tx RMW (so its allocated value is now readable by other connections
+/// and the next allocator can advance the stored watermark past it) but has not
+/// yet run `SequenceTrackAllocation` to register its allocation. A reader that
+/// computes `sequence_watermark_experimental()` in that window sees the
+/// advanced boundary without the lower active allocation, claims the value
+/// safe, and a forward-only cursor advances past a row the outer tx still holds
+/// uncommitted — skipping it once the outer tx commits.
+///
+/// Registering here, ahead of the commit that makes the value observable,
+/// guarantees the active allocation is in place before any other connection can
+/// advance the watermark past it. The post-commit `SequenceTrackAllocation`
+/// re-registers the same `(tx, value)` (an idempotent `min`) and additionally
+/// covers the skipped-inner-tx (exclusive outer / WAL) and autocommit paths,
+/// where the outer tx is not encoded in `saved_outer_reg`.
+pub fn op_sequence_register_allocation(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        SequenceRegisterAllocation {
+            db,
+            seq_name_reg,
+            value_reg,
+            saved_outer_reg,
+        },
+        insn
+    );
+
+    // Only the wrapped inner-tx path encodes a saved outer mv_tx. An empty
+    // blob means there is no outer tx whose uncommitted row needs protecting
+    // (autocommit) or the inner tx was skipped (exclusive / WAL) — both are
+    // handled by the post-commit `SequenceTrackAllocation`.
+    let saved_outer = match state.registers[*saved_outer_reg].get_value() {
+        Value::Blob(bytes) => decode_saved_outer_mv_tx(bytes.as_slice()),
+        _ => None,
+    };
+    let Some((outer_tx_id, _)) = saved_outer else {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+
+    let seq_name = match state.registers[*seq_name_reg].get_value() {
+        Value::Text(t) => t.as_str().to_string(),
+        _ => {
+            return Err(crate::LimboError::ParseError(
+                "SequenceRegisterAllocation: seq_name_reg must be text".to_string(),
+            ));
+        }
+    };
+    let value = state.registers[*value_reg]
+        .get_value()
+        .as_int()
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "SequenceRegisterAllocation: value_reg must be integer".to_string(),
+            )
+        })?;
+
+    let bare_seq_name = seq_name
+        .rsplit_once('.')
+        .map(|(_, n)| n)
+        .unwrap_or(&seq_name);
+    let normalized_seq_name = crate::util::normalize_ident(bare_seq_name);
+
+    if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
+        if mv_store.is_tx_rollbackable(outer_tx_id) {
+            mv_store.register_sequence_allocation(outer_tx_id, &normalized_seq_name, value)?;
+        }
+    }
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

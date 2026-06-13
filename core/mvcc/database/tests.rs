@@ -4096,6 +4096,292 @@ pub(crate) fn commit_tx_no_conn(
     Ok(())
 }
 
+#[test]
+fn test_sequence_watermark_tracks_lowest_active_allocation() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mv_store = db.get_mvcc_store();
+    let pager = conn.pager.load().clone();
+
+    mv_store.set_sequence_watermark("turso_cdc_pk_autoincrement", 13);
+    let tx1 = mv_store.begin_tx(pager.clone()).unwrap();
+    let tx2 = mv_store.begin_tx(pager.clone()).unwrap();
+    mv_store
+        .register_sequence_allocation(tx1, "turso_cdc_pk_autoincrement", 10)
+        .unwrap();
+    mv_store
+        .register_sequence_allocation(tx2, "turso_cdc_pk_autoincrement", 12)
+        .unwrap();
+    mv_store
+        .register_sequence_allocation(tx1, "turso_cdc_pk_autoincrement", 11)
+        .unwrap();
+
+    assert_eq!(
+        mv_store.sequence_watermark("turso_cdc_pk_autoincrement"),
+        Some(10)
+    );
+
+    commit_tx(mv_store.clone(), &conn, tx1).unwrap();
+    assert_eq!(
+        mv_store.sequence_watermark("turso_cdc_pk_autoincrement"),
+        Some(12)
+    );
+
+    mv_store.rollback_tx(tx2, pager, conn.as_ref(), crate::MAIN_DB_ID);
+    assert_eq!(
+        mv_store.sequence_watermark("turso_cdc_pk_autoincrement"),
+        Some(13)
+    );
+}
+
+#[test]
+fn test_sequence_watermark_function_returns_current_watermark_without_active_allocations() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mv_store = db.get_mvcc_store();
+    let pager = conn.pager.load().clone();
+
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    mv_store.set_sequence_watermark("s", 42);
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 42);
+
+    let tx_id = mv_store.begin_tx(pager.clone()).unwrap();
+    mv_store
+        .register_sequence_allocation(tx_id, "s", 10)
+        .unwrap();
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+
+    assert_eq!(rows[0][0].as_int().unwrap(), 10);
+
+    mv_store.rollback_tx(tx_id, pager, conn.as_ref(), crate::MAIN_DB_ID);
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+
+    assert_eq!(rows[0][0].as_int().unwrap(), 42);
+}
+
+#[test]
+fn test_sequence_watermark_tracks_nextval_allocations() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup.execute("CREATE SEQUENCE s START WITH 1").unwrap();
+
+    let rows = get_rows(&setup, "SELECT sequence_watermark_experimental('s')");
+    assert!(matches!(rows[0][0], Value::Null));
+
+    let rows = get_rows(&setup, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    let rows = get_rows(&setup, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(&writer, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    writer.execute("COMMIT").unwrap();
+    let rows = get_rows(&observer, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+}
+
+/// What this test checks: a sync-style cursor that bounds its scan by
+/// `sequence_watermark_experimental()` (read *outside* a transaction, as the
+/// contract requires) never skips a committed row, even while many writers
+/// concurrently allocate sequence ids in overlapping `BEGIN CONCURRENT`
+/// transactions and commit/abort them at random.
+///
+/// Why this matters: this is the exact hazard the watermark exists to prevent.
+/// A writer can allocate a low sequence id, stay open, and commit *after*
+/// another transaction publishes a higher id. A cursor that only advances on
+/// `id > last_seen` would step over the lower id and lose it forever. The
+/// watermark is the first id that is *not* safe to pass, so a reader that
+/// claims "everything below the watermark is final" must be correct: every
+/// committed row whose id is below the highest watermark the reader ever
+/// passed must have been observed by the reader.
+///
+/// The reader collects ids it sees and tracks `last` = the highest
+/// `watermark - 1` it has advanced to. After the workload drains, we read the
+/// authoritative committed set and assert no committed id `<= last` is missing
+/// from what the reader collected — i.e. the watermark never let the reader
+/// advance past a row it had not yet seen.
+#[test]
+fn test_sequence_watermark_reader_never_skips_committed_rows_fuzz() {
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let setup = db.connect();
+        setup
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, who INTEGER)")
+            .unwrap();
+        setup.execute("CREATE SEQUENCE s START WITH 1").unwrap();
+        setup.close().unwrap();
+    }
+
+    const N_WRITERS: u64 = 4;
+    const INSERTS_PER_WRITER: u64 = 25;
+    // Per-row commit retry budget: the only contention is the autonomous inner
+    // tx that advances the sequence backing table, which is transient, so a
+    // generous budget lets every row eventually commit without the test
+    // wedging.
+    const COMMIT_ATTEMPTS: u64 = 200;
+
+    let done = Arc::new(AtomicU64::new(0));
+
+    let mut writers = Vec::new();
+    for who in 0..N_WRITERS {
+        let db_arc = db.get_db();
+        let done = done.clone();
+        writers.push(std::thread::spawn(move || {
+            let conn = db_arc.connect().unwrap();
+            // Seed each writer differently so jitter (and thus the
+            // commit/abort interleaving) varies between threads but stays
+            // reproducible across runs.
+            let mut rng = ChaCha8Rng::seed_from_u64(0x5EED_0000 + who);
+            for _ in 0..INSERTS_PER_WRITER {
+                for _ in 0..COMMIT_ATTEMPTS {
+                    let txn = (|| -> crate::Result<bool> {
+                        conn.execute("BEGIN CONCURRENT")?;
+                        conn.execute(format!(
+                            "INSERT INTO t(id, who) VALUES (nextval('s'), {who})"
+                        ))?;
+                        // Widen the window in which the row is allocated but
+                        // uncommitted, so other writers publish higher ids
+                        // while this low id is still in flight — the precise
+                        // ordering the watermark must defend against. Roughly
+                        // 1-in-6 transactions abort instead of commit, leaving
+                        // sequence "holes" the reader must also tolerate.
+                        std::thread::sleep(Duration::from_micros(rng.random_range(0..200)));
+                        if rng.random_range(0..6) == 0 {
+                            conn.execute("ROLLBACK")?;
+                            Ok(false)
+                        } else {
+                            conn.execute("COMMIT")?;
+                            Ok(true)
+                        }
+                    })();
+                    match txn {
+                        Ok(_) => break,
+                        Err(_) => {
+                            // Transient conflict (e.g. Busy on the sequence
+                            // inner tx). Abandon this attempt's tx and retry.
+                            let _ = conn.execute("ROLLBACK");
+                            std::thread::sleep(Duration::from_micros(50));
+                        }
+                    }
+                }
+            }
+            conn.close().unwrap();
+            done.fetch_add(1, Ordering::SeqCst);
+        }));
+    }
+
+    let reader = db.connect();
+
+    // Read ids strictly below the watermark, advancing `last` to `watermark-1`.
+    // Returns false only when the watermark is not yet published (NULL), so the
+    // caller can tell a poll apart from a no-op.
+    let poll = |last: &mut i64, collected: &mut BTreeSet<i64>| -> bool {
+        let mut wm_stmt = match reader.prepare("SELECT sequence_watermark_experimental('s')") {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let mut watermark = None;
+        if wm_stmt
+            .run_with_row_callback(|row| {
+                watermark = row.get_values().next().and_then(|v| v.as_int());
+                Ok(())
+            })
+            .is_err()
+        {
+            return false;
+        }
+        let Some(watermark) = watermark else {
+            return false;
+        };
+        // The watermark is the first *unsafe* id, so it is an exclusive upper
+        // bound on what the reader may claim as final.
+        let query = format!("SELECT id FROM t WHERE id > {last} AND id < {watermark} ORDER BY id");
+        if let Ok(mut stmt) = reader.prepare(&query) {
+            let _ = stmt.run_with_row_callback(|row| {
+                if let Some(id) = row.get_values().next().and_then(|v| v.as_int()) {
+                    collected.insert(id);
+                }
+                Ok(())
+            });
+        }
+        let new_last = watermark - 1;
+        if new_last > *last {
+            *last = new_last;
+        }
+        true
+    };
+
+    let mut last: i64 = 0;
+    let mut collected: BTreeSet<i64> = BTreeSet::new();
+
+    // Poll concurrently with the writers.
+    while done.load(Ordering::SeqCst) < N_WRITERS {
+        poll(&mut last, &mut collected);
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    for writer in writers {
+        writer.join().unwrap();
+    }
+
+    // Drain: with no active allocations left, the watermark is the sequence
+    // boundary, so `last` advances to cover every committed row. Loop until it
+    // stops moving (bounded, so a bug cannot hang the test).
+    for _ in 0..1000 {
+        let prev = last;
+        poll(&mut last, &mut collected);
+        if last == prev {
+            break;
+        }
+    }
+
+    // Authoritative committed set, read outside any transaction.
+    let mut committed: BTreeSet<i64> = BTreeSet::new();
+    {
+        let mut stmt = reader.prepare("SELECT id FROM t ORDER BY id").unwrap();
+        stmt.run_with_row_callback(|row| {
+            if let Some(id) = row.get_values().next().and_then(|v| v.as_int()) {
+                committed.insert(id);
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // Sanity: the workload actually committed rows and the reader actually
+    // advanced — otherwise the invariant below is vacuous.
+    assert!(
+        !committed.is_empty(),
+        "no rows committed; workload did not exercise the watermark"
+    );
+    assert!(last > 0, "reader never advanced past any watermark");
+
+    // The invariant: every committed id the reader claimed as safe (id <= last)
+    // must have actually been observed. A skipped row is a watermark failure.
+    for id in &committed {
+        if *id <= last {
+            assert!(
+                collected.contains(id),
+                "watermark reader skipped committed id {id} (advanced last to {last}); \
+                 collected={collected:?}"
+            );
+        }
+    }
+}
+
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
 #[test]
