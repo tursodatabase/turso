@@ -1051,7 +1051,7 @@ impl Display for ScalarFunc {
             Self::StatGet => "stat_get",
             Self::ConnTxnId => "conn_txn_id",
             Self::IsAutocommit => "is_autocommit",
-            Self::SequenceWatermark => "sequence_watermark",
+            Self::SequenceWatermark => "sequence_watermark_experimental",
             Self::TestUintEncode => "test_uint_encode",
             Self::TestUintDecode => "test_uint_decode",
             Self::TestUintAdd => "test_uint_add",
@@ -1715,7 +1715,9 @@ impl Func {
             "bin_record_json_object" => Ok(Some(Self::Scalar(ScalarFunc::BinRecordJsonObject))),
             "conn_txn_id" => Ok(Some(Self::Scalar(ScalarFunc::ConnTxnId))),
             "is_autocommit" => Ok(Some(Self::Scalar(ScalarFunc::IsAutocommit))),
-            "sequence_watermark" => Ok(Some(Self::Scalar(ScalarFunc::SequenceWatermark))),
+            "sequence_watermark_experimental" => {
+                Ok(Some(Self::Scalar(ScalarFunc::SequenceWatermark)))
+            }
             "acos" => Ok(Some(Self::Math(MathFunc::Acos))),
             "acosh" => Ok(Some(Self::Math(MathFunc::Acosh))),
             "asin" => Ok(Some(Self::Math(MathFunc::Asin))),

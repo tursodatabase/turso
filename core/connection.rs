@@ -3614,7 +3614,7 @@ impl Connection {
     /// Drive one backing-table watermark read to completion (re-entrant).
     ///
     /// The returned row is converted by [`Self::sequence_watermark_from_row`]
-    /// into the exclusive upper bound used by `sequence_watermark()`.
+    /// into the exclusive upper bound used by `sequence_watermark_experimental()`.
     fn read_sequence_watermark_row_nonblock(
         self: &Arc<Connection>,
         backing_table_name: &str,
