@@ -1345,6 +1345,24 @@ impl TursoStatement {
         }
         stmt.get_column_decltype(index)
     }
+
+    /// Returns rich type information for the column at `index`.
+    ///
+    /// Wraps [`turso_core::Statement::get_column_type_info`]. Returns `None`
+    /// when the statement has been finalized, when the index is out of
+    /// bounds, when the connection does not have the experimental custom-
+    /// types feature enabled (the underlying call errors and we surface that
+    /// as "no info"; the C ABI has no error channel), when the statement is
+    /// in EXPLAIN mode, or when the expression behind the column has no
+    /// determined affinity.
+    pub fn column_type_info(&self, index: usize) -> Option<turso_core::ColumnTypeInfo> {
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle.as_ref()?;
+        if index >= stmt.num_columns() {
+            return None;
+        }
+        stmt.get_column_type_info(index).ok().flatten()
+    }
     /// finalize statement execution
     /// this method must be called in the end of statement execution (either successfull or not)
     pub fn finalize(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
