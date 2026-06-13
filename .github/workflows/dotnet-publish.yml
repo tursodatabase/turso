@@ -1,47 +1,88 @@
 name: Dotnet Publish
 
 on:
-  # Manually trigger the workflow
+  push:
+    branches:
+      - "**"
+    paths:
+      - ".github/workflows/dotnet-publish.yml"
+      - "bindings/dotnet/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "core/**"
+      - "sdk-kit/**"
+  # Manual trigger with dry-run / publish controls
   workflow_dispatch:
+    inputs:
+      skip-publish:
+        description: Skip publishing packages to NuGet.org
+        required: true
+        type: boolean
+        default: false
+      dry-run:
+        description: Dry run (build/pack/upload only, no publish)
+        required: true
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   working-directory: bindings/dotnet
 
 jobs:
-  # Build native libraries for each platform
+  # Build native libraries for each platform/architecture
   build-natives:
     strategy:
       matrix:
         include:
         - os: ubuntu-latest
           make-target: build-rust-linux64
-          artifact-name: linux64
+          artifact-name: native-linux-x64
           target: x86_64-unknown-linux-gnu
+          docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
 
-        - os: blacksmith-6vcpu-macos-latest
+        - os: ubuntu-latest
+          make-target: build-rust-linuxarm64
+          artifact-name: native-linux-arm64
+          target: aarch64-unknown-linux-gnu
+          docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
+
+        - os: macos-latest
           make-target: build-rust-macos64
-          artifact-name: macos64
+          artifact-name: native-osx-x64
           target: x86_64-apple-darwin
+          macos-deployment-target: "10.13"
 
-        - os: blacksmith-6vcpu-macos-latest
+        - os: macos-latest
           make-target: build-rust-macosarm64
           target: aarch64-apple-darwin
-          artifact-name: macosarm64
+          artifact-name: native-osx-arm64
+          macos-deployment-target: "11.0"
 
-        - os: windows-latest
+        - os: windows-2025
           make-target: build-rust-windows64
           target: x86_64-pc-windows-msvc
-          artifact-name: windows64
+          artifact-name: native-win-x64
+
+        - os: windows-2025
+          make-target: build-rust-windowsarm64
+          target: aarch64-pc-windows-msvc
+          artifact-name: native-win-arm64
 
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: ${{ env.working-directory }}
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -51,13 +92,53 @@ jobs:
       - name: Add target
         run: rustup target add ${{ matrix.target }}
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-dotnet-publish"
+          cache-on-failure: true
+
+      - name: Build rust native library (Linux in Docker)
+        if: contains(matrix.target, 'unknown-linux-gnu')
+        shell: bash
+        working-directory: .
+        run: |
+          mkdir -p $HOME/.cargo/git/db $HOME/.cargo/registry/cache $HOME/.cargo/registry/index
+          docker run --rm --user 0:0 \
+            -v $HOME/.cargo/git/db:/usr/local/cargo/git/db \
+            -v $HOME/.cargo/registry/cache:/usr/local/cargo/registry/cache \
+            -v $HOME/.cargo/registry/index:/usr/local/cargo/registry/index \
+            -v ${{ github.workspace }}:/build \
+            -w /build/bindings/dotnet \
+            ${{ matrix.docker }} \
+            bash -lc '
+              rustup target add ${{ matrix.target }}
+              if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+                apt-get update
+                apt-get install -y gcc-aarch64-linux-gnu
+                unset CFLAGS CXXFLAGS TARGET_CFLAGS TARGET_CXXFLAGS CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH LIBRARY_PATH
+                export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+                export CFLAGS="-DSIMSIMD_TARGET_SIERRA=0 -DSIMSIMD_TARGET_TURIN=0 -DSIMSIMD_TARGET_SAPPHIRE=0 -DSIMSIMD_TARGET_GENOA=0 -DSIMSIMD_TARGET_ICE=0 -DSIMSIMD_TARGET_SKYLAKE=0 -DSIMSIMD_TARGET_HASWELL=0"
+                export CFLAGS_aarch64_unknown_linux_gnu="$CFLAGS"
+              fi
+              make ${{ matrix.make-target }} RUST_RELEASE_OPT="--profile release-official"
+            '
+
+      - name: Build rust native library (macOS)
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos-deployment-target }}
+        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official'
+
       - name: Build rust native library
+        if: ${{ !contains(matrix.target, 'unknown-linux-gnu') && !contains(matrix.target, 'apple-darwin') }}
         run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official'
       
       - name: Upload rust native library
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: native-${{ matrix.artifact-name }}
+          name: ${{ matrix.artifact-name }}
           path: |
             ${{ env.working-directory }}/rs_compiled/**/turso_sdk_kit.dll
             ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.so
@@ -65,11 +146,13 @@ jobs:
 
           retention-days: 1
 
-  # Create Turso.Raw and Turso nuget packages
+  # Create NuGet packages; publish is opt-in
   publish:
     needs: build-natives
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     defaults:
       run:
@@ -77,15 +160,18 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       
-      - name: Install dotnet sdk 9.0
-        uses: actions/setup-dotnet@v4
+      - name: Install dotnet SDKs
+        uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: '9.0.x'
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
 
       - name: Download all native libraries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: native-*
           path: ${{ env.working-directory }}/rs_compiled
@@ -95,26 +181,30 @@ jobs:
         run:
           make pack
 
+      - name: Collect NuGet packages
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          rm -rf artifacts/nuget-packages
+          mkdir -p artifacts/nuget-packages
+          files=(
+            src/Turso.Data.Sqlite/bin/Release/Turso.Data.Sqlite.*.nupkg
+          )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No NuGet packages found to upload"
+            exit 1
+          fi
+          cp "${files[@]}" artifacts/nuget-packages/
+
+      - name: Upload NuGet packages to artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: nuget-packages
+          path: ${{ env.working-directory }}/artifacts/nuget-packages/*.nupkg
+          retention-days: 7
+
       # https://learn.microsoft.com/en-us/nuget/nuget-org/publish-a-package
       - name: Publish to nuget
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.skip-publish && !inputs.dry-run }}
         run: |
-          dotnet nuget push ${{ env.working-directory }}/src/Turso.Raw/bin/Release/Turso.Raw.*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json
-
-          dotnet nuget push ${{ env.working-directory }}/src/Turso/bin/Release/Turso.*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json
-
-      - name: Upload Turso.Raw to artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: Turso.Raw
-          path: ${{ env.working-directory }}/src/Turso.Raw/bin/Release/Turso.Raw.*.nupkg
-          retention-days: 7
-
-      - name: Upload Turso to artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: Turso
-          path: ${{ env.working-directory }}/src/Turso/bin/Release/Turso.*.nupkg
-          retention-days: 7
-
-
-
+          dotnet nuget push ${{ env.working-directory }}/src/Turso.Data.Sqlite/bin/Release/Turso.Data.Sqlite.*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate

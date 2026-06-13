@@ -21,12 +21,16 @@ public class SqliteFacadeTests
     [Test]
     public void ConnectionStringBuilderParsesSqliteAliasesAndEnums()
     {
-        var builder = new SqliteConnectionStringBuilder("Filename=:memory:;Mode=Memory;Cache=Shared;Command Timeout=7");
+        var builder = new SqliteConnectionStringBuilder("Filename=:memory:;Mode=Memory;Cache=Shared;Command Timeout=7;DateTimeKind=Utc;DateTimeFormat=Ticks;BinaryGUID=False;Version=3");
 
         builder.DataSource.Should().Be(":memory:");
         builder.Mode.Should().Be(SqliteOpenMode.Memory);
         builder.Cache.Should().Be(SqliteCacheMode.Shared);
         builder.DefaultTimeout.Should().Be(7);
+        builder.DateTimeKind.Should().Be(DateTimeKind.Utc);
+        builder.DateTimeFormat.Should().Be("Ticks");
+        builder.BinaryGUID.Should().BeFalse();
+        builder.Version.Should().Be(3);
         builder["DataSource"].Should().Be(":memory:");
     }
 
@@ -710,6 +714,41 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void GetValueMaterializesDeclaredGuidColumns()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery(
+            """
+            CREATE TABLE ValuesWithGuids (
+                TextGuid GUID,
+                BlobGuid UNIQUEIDENTIFIER,
+                RawBlob BLOB
+            );
+            INSERT INTO ValuesWithGuids VALUES (
+                'dc0d7e0e-365d-4948-ab9b-8ca8056bf93a',
+                X'0E7E0DDC5D364849AB9B8CA8056BF93A',
+                X'0E7E0DDC5D364849AB9B8CA8056BF93A'
+            );
+            """);
+
+        using var reader = connection.ExecuteReader("SELECT TextGuid, BlobGuid, RawBlob FROM ValuesWithGuids;");
+        reader.Read().Should().BeTrue();
+
+        var expected = new Guid("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+        reader.GetFieldType(0).Should().Be(typeof(Guid));
+        reader.GetFieldType(1).Should().Be(typeof(Guid));
+        reader.GetValue(0).Should().Be(expected);
+        reader.GetValue(1).Should().Be(expected);
+        reader.GetValue(2).Should().BeOfType<byte[]>();
+
+        var schema = reader.GetSchemaTable();
+        schema.Rows[0][SchemaTableColumn.DataType].Should().Be(typeof(Guid));
+        schema.Rows[1][SchemaTableColumn.DataType].Should().Be(typeof(Guid));
+        schema.Rows[2][SchemaTableColumn.DataType].Should().Be(typeof(byte[]));
+    }
+
+    [Test]
     public void GetFieldValueThrowsForNullTypedValues()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -720,6 +759,25 @@ public class SqliteFacadeTests
 
         Assert.Throws<InvalidOperationException>(() => reader.GetFieldValue<byte[]>(0))!
             .Message.Should().Be(Data.Sqlite.Properties.Resources.CalledOnNullValue(0));
+    }
+
+    [Test]
+    public void PrepareDoesNotRejectMultiStatementBatches()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            PRAGMA read_uncommitted = 1;
+            CREATE TABLE t(value INTEGER);
+            INSERT INTO t VALUES (1);
+            SELECT value FROM t;
+            """;
+
+        command.Prepare();
+        command.ExecuteScalar().Should().Be(1L);
     }
 
     [Test]

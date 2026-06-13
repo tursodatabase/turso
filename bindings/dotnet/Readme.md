@@ -2,15 +2,17 @@
 
 ADO.NET bindings for Turso local databases.
 
-The managed `Turso` package exposes `System.Data.Common` types such as `DbConnection`, `DbCommand`, `DbDataReader`, `DbParameter`, `DbTransaction`, and `DbProviderFactory`. The `Turso.Raw` package contains the native SDK-kit interop layer and runtime assets used by the provider.
+The `Turso.Data.Sqlite` package includes both a SQLite-compatible `Turso.Data.Sqlite` facade and Turso-specific `System.Data.Common` types such as `TursoConnection`, `TursoCommand`, `TursoDataReader`, `TursoParameter`, `TursoTransaction`, and `TursoFactory`.
 
 ## Install
 
 ```bash
-dotnet add package Turso
+dotnet add package Turso.Data.Sqlite
 ```
 
-`Turso` depends on `Turso.Raw`, so application code usually only needs to reference `Turso`.
+Application code only needs to reference `Turso.Data.Sqlite`.
+
+The package targets `net8.0`, `net9.0`, and `net10.0`.
 
 ## Getting started
 

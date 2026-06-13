@@ -24,8 +24,14 @@ all:
 build-rust-windows64:
 	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target x86_64-pc-windows-msvc $(RUST_RELEASE_OPT)
 
+build-rust-windowsarm64:
+	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target aarch64-pc-windows-msvc $(RUST_RELEASE_OPT)
+
 build-rust-linux64:
 	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target x86_64-unknown-linux-gnu $(RUST_RELEASE_OPT)
+
+build-rust-linuxarm64:
+	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target aarch64-unknown-linux-gnu $(RUST_RELEASE_OPT)
 
 build-rust-macos64:
 	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target x86_64-apple-darwin $(RUST_RELEASE_OPT)
@@ -38,7 +44,7 @@ build-rust:
 	$(MAKE) build-rust-$(OS_TARGET)
 
 build-dotnet:
-	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso/Turso.csproj
+	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Data/Turso.Data.csproj
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
 
 build: build-rust build-dotnet
@@ -53,8 +59,4 @@ benchmark: build-production
 	dotnet run -c Release --project ./src/Benchmarks/Benchmarks.csproj
 
 pack:
-	dotnet build -c Release ./src/Turso.Raw/Turso.Raw.csproj
-	
-	dotnet pack -c Release ./src/Turso.Raw/Turso.Raw.csproj
-	dotnet pack -c Release ./src/Turso/Turso.csproj
 	dotnet pack -c Release ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
