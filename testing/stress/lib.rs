@@ -1,3 +1,5 @@
+pub mod barrier;
+
 #[cfg(shuttle)]
 pub mod sync {
     pub use shuttle::sync::atomic;

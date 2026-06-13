@@ -32,6 +32,52 @@ use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use turso::Builder;
+use turso_stress::barrier::RequestableSync;
+
+/// A wrapper around `Database` that simplifies dropping the db.
+struct SharedDb {
+    db: Option<turso::Database>,
+    db_file: String,
+    vfs: Option<String>,
+}
+
+impl SharedDb {
+    fn new(db_file: String, vfs: Option<String>) -> Self {
+        Self {
+            db: None,
+            db_file,
+            vfs,
+        }
+    }
+
+    async fn get_or_init(&mut self) -> turso::Result<&turso::Database> {
+        if self.db.is_none() {
+            let mut builder = Builder::new_local(&self.db_file);
+            if let Some(ref vfs) = self.vfs {
+                builder = builder.with_io(vfs.clone());
+            }
+            self.db = Some(builder.build().await?);
+        }
+        Ok(self.db.as_ref().unwrap())
+    }
+
+    fn reset(&mut self) {
+        self.db = None;
+    }
+
+    async fn connect(
+        this: &Arc<Mutex<Self>>,
+        busy_timeout: u64,
+    ) -> turso::Result<turso::Connection> {
+        let conn = {
+            let mut guard = this.lock().await;
+            guard.get_or_init().await?.connect()?
+        };
+        conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
+        conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
+        Ok(conn)
+    }
+}
 
 /// Represents a column in a SQLite table
 #[derive(Debug, Clone)]
@@ -691,30 +737,22 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
     let vfs_option = opts.vfs.clone();
 
-    let mut builder = Builder::new_local(&db_file);
-    if let Some(ref vfs) = vfs_option {
-        builder = builder.with_io(vfs.clone());
-    }
-    let db = Arc::new(Mutex::new(builder.build().await?));
+    let db = Arc::new(Mutex::new(SharedDb::new(
+        db_file.clone(),
+        vfs_option.clone(),
+    )));
+    let reopen_sync = Arc::new(RequestableSync::new(opts.nr_threads));
 
     for thread in 0..opts.nr_threads {
         if stop {
             break;
         }
-        let db_file = db_file.clone();
-        let conn = db.lock().await.connect()?;
-
-        match opts.tx_mode {
-            TxMode::SQLite => {
-                conn.pragma_update("journal_mode", "WAL").await?;
-                conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
-            }
-            TxMode::Concurrent => {
-                conn.pragma_update("journal_mode", "mvcc").await?;
-            }
+        let conn = SharedDb::connect(&db, opts.busy_timeout).await?;
+        let journal_mode = match opts.tx_mode {
+            TxMode::SQLite => "WAL",
+            TxMode::Concurrent => "mvcc",
         };
-
-        conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
+        conn.pragma_update("journal_mode", journal_mode).await?;
 
         for stmt in &ddl_statements {
             let mut retry_counter = 0;
@@ -785,22 +823,19 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
         let nr_iterations = opts.nr_iterations;
         let db = db.clone();
-        let vfs_for_task = vfs_option.clone();
         let schema_for_task = schema.clone();
         let busy_timeout = opts.busy_timeout;
         let tx_mode = opts.tx_mode;
         let sql_log = sql_log.clone();
+        let reopen_sync = reopen_sync.clone();
 
         let progress_bar = multi_progress.add(ProgressBar::new(nr_iterations as u64));
         progress_bar.set_style(progress_style.clone());
         progress_bar.set_prefix(format!("Thread {thread}"));
 
         let handle = turso_stress::future::spawn(async move {
-            let mut conn = db.lock().await.connect()?;
-
-            conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
-
-            conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
+            let mut conn: Option<turso::Connection> = None;
+            let _close_guard = reopen_sync.clone().close_guard();
 
             progress_bar.set_message("executing queries...");
 
@@ -808,21 +843,27 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
             for i in 0..nr_iterations {
                 if gen_bool(&mut rng, 0.01) {
-                    // Reopen the database
-                    let mut db_guard = db.lock().await;
-                    let mut builder = Builder::new_local(&db_file);
-                    if let Some(ref vfs) = vfs_for_task {
-                        builder = builder.with_io(vfs.clone());
-                    }
-                    *db_guard = builder.build().await?;
-                    conn = db_guard.connect()?;
-                    conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
-                } else if gen_bool(&mut rng, 0.02) {
-                    // Reconnect to the database
-                    let db_guard = db.lock().await;
-                    conn = db_guard.connect()?;
-                    conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
+                    // force a reopen to exercise MVCC recovery
+                    let _ = reopen_sync.request_synchronization();
                 }
+
+                let _ = reopen_sync
+                    .maybe_rendezvous_and_run(async || {
+                        conn = None;
+                        db.lock().await.reset();
+                        turso_core::clear_database_registry();
+                    })
+                    .await;
+
+                if gen_bool(&mut rng, 0.02) {
+                    // force a reconnect
+                    conn = None;
+                }
+
+                if conn.is_none() {
+                    conn = Some(SharedDb::connect(&db, busy_timeout).await?);
+                }
+                let conn = conn.as_ref().unwrap();
 
                 let tx = if rng.get_random() % 2 == 0 {
                     match tx_mode {
@@ -991,12 +1032,16 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     }
                 }
             }
+
             // In case this thread is running an exclusive transaction, commit it so that it doesn't block other threads.
-            match conn.execute("COMMIT", ()).await {
-                Ok(_) => log_sql(&sql_log, thread, "COMMIT", "OK"),
-                Err(e) => log_sql(&sql_log, thread, "COMMIT", &format!("ERROR: {e}")),
+            if let Some(conn) = conn.as_ref() {
+                match conn.execute("COMMIT", ()).await {
+                    Ok(_) => log_sql(&sql_log, thread, "COMMIT", "OK"),
+                    Err(e) => log_sql(&sql_log, thread, "COMMIT", &format!("ERROR: {e}")),
+                }
             }
             progress_bar.finish_with_message("done");
+
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         });
         handles.push(handle);

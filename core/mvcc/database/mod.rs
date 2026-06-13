@@ -6891,6 +6891,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         ctx: &mut RecoverCtx,
         frame: Vec<ParsedOp>,
     ) -> Result<()> {
+        turso_assert_reachable!("Recovering MVCC frame");
         let mut max_commit_ts_seen = ctx.max_commit_ts_seen;
         let replay_cutoff_ts = ctx.replay_cutoff_ts;
         let cookie = ctx.cookie;
