@@ -1743,7 +1743,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         let mut values = record.get_values_owned()?;
                         values[3] = Value::from_i64(root_page as i64);
                         let record = ImmutableRecord::from_values(&values, values.len())?;
-                        row_version.row.data = Some(record.get_payload().to_owned());
+                        row_version.row.data = Some(Arc::from(record.get_payload()));
                         row_version.clone()
                     };
                     self.created_btrees
@@ -1776,7 +1776,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         let mut values = record.get_values_owned()?;
                         values[3] = Value::from_i64(root_page as i64);
                         let record = ImmutableRecord::from_values(&values, values.len())?;
-                        row_version.row.data = Some(record.get_payload().to_owned());
+                        row_version.row.data = Some(Arc::from(record.get_payload()));
                         row_version.clone()
                     };
 
