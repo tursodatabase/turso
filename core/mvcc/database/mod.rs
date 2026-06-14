@@ -7221,8 +7221,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             let row_version = RowVersion {
                                 id: version_id,
                                 begin: crate::mvcc::database::PackedTs::pack(Some(
-                                TxTimestampOrID::Timestamp(commit_ts),
-                            )),
+                                    TxTimestampOrID::Timestamp(commit_ts),
+                                )),
                                 end: crate::mvcc::database::PackedTs::pack(None),
                                 row: row.clone(),
                                 btree_resident,
@@ -7295,8 +7295,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                     id: version_id,
                                     begin: crate::mvcc::database::PackedTs::pack(None),
                                     end: crate::mvcc::database::PackedTs::pack(Some(
-                                    TxTimestampOrID::Timestamp(commit_ts),
-                                )),
+                                        TxTimestampOrID::Timestamp(commit_ts),
+                                    )),
                                     row: tombstone_row,
                                     btree_resident,
                                 };
@@ -7350,8 +7350,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             let row_version = RowVersion {
                                 id: version_id,
                                 begin: crate::mvcc::database::PackedTs::pack(Some(
-                                TxTimestampOrID::Timestamp(commit_ts),
-                            )),
+                                    TxTimestampOrID::Timestamp(commit_ts),
+                                )),
                                 end: crate::mvcc::database::PackedTs::pack(None),
                                 row: row.clone(),
                                 btree_resident,
@@ -7359,11 +7359,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
                                 panic!("Index writes must be to a record");
                             };
-                            self.insert_index_version(
-                                rowid.table_id,
-                                sortable_key,
-                                row_version
-                            );
+                            self.insert_index_version(rowid.table_id, sortable_key, row_version);
                         }
                         StreamingResult::DeleteIndexRow {
                             row,
@@ -7397,8 +7393,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 id: version_id,
                                 begin: crate::mvcc::database::PackedTs::pack(None),
                                 end: crate::mvcc::database::PackedTs::pack(Some(
-                                TxTimestampOrID::Timestamp(commit_ts),
-                            )),
+                                    TxTimestampOrID::Timestamp(commit_ts),
+                                )),
                                 row: row.clone(),
                                 btree_resident,
                             };
