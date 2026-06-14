@@ -191,7 +191,13 @@ fn translate_integrity_check_impl(
         target_pc: no_structural_error_label,
     });
 
-    program.emit_string8("*** in database main ***\n".to_string(), scratch_reg);
+    let database_name = resolver
+        .get_database_name_by_index(database_id)
+        .unwrap_or_else(|| "main".to_string());
+    program.emit_string8(
+        format!("*** in database {database_name} ***\n"),
+        scratch_reg,
+    );
     program.emit_insn(Insn::Concat {
         lhs: scratch_reg,
         rhs: message_reg,

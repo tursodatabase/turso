@@ -526,7 +526,10 @@ pub fn bind_and_rewrite_expr<'a>(
                                 let is_rowid_alias = col.is_rowid_alias();
                                 let normalized_tbl_name = normalize_ident(&tbl_name_str);
                                 let matching_tbl = referenced_tables
-                                    .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                                    .find_table_and_internal_id_by_identifier(
+                                        &normalized_tbl_name,
+                                        Some(database_id),
+                                    );
 
                                 if let Some((tbl_id, _)) = matching_tbl {
                                     *expr = Expr::Column {
@@ -553,7 +556,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         let normalized_col = normalize_ident(&tbl_name_str);
                         let field_name = normalize_ident(&col_name_str);
                         let matching_tbl = referenced_tables
-                            .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                            .find_table_and_internal_id_by_identifier(&normalized_tbl_name, None);
                         if let Some((tbl_id, tbl)) = matching_tbl {
                             let col_idx = tbl.columns().iter().position(|c| {
                                 c.name

@@ -568,3 +568,171 @@ fn test_begin_deferred_emits_no_transaction_opcodes(_tmp_db: TempDatabase) -> an
     );
     Ok(())
 }
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/6279
+///
+/// A `DoublyQualified` reference like `aux.t1.id` inside a correlated subquery
+/// must bind to `aux.t1` (an outer query reference), not to an identically-named
+/// `main.t1` in the subquery's own FROM clause.
+#[turso_macros::test]
+fn test_correlated_subquery_cross_database_same_table_name(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let turso = db.connect_limbo();
+
+    turso.execute("ATTACH ':memory:' AS aux")?;
+    turso.execute("CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, val TEXT)")?;
+    turso.execute("INSERT INTO aux.t1 VALUES (1, 'a'), (2, 'b'), (3, 'c')")?;
+    turso.execute("CREATE TABLE main.t1 (id INTEGER PRIMARY KEY, val TEXT)")?;
+    turso.execute("INSERT INTO main.t1 VALUES (2, 'x')")?;
+
+    // EXISTS must correlate per-row, not always evaluate true.
+    let rows = limbo_exec_rows(
+        &turso,
+        "SELECT id, val FROM aux.t1 WHERE EXISTS (
+            SELECT 1 FROM main.t1 WHERE main.t1.id = aux.t1.id
+        )",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            rusqlite::types::Value::Integer(2),
+            rusqlite::types::Value::Text("b".to_string())
+        ]],
+        "EXISTS should only match aux.t1 rows whose id exists in main.t1"
+    );
+
+    // NOT EXISTS must be the complement of the above.
+    let rows = limbo_exec_rows(
+        &turso,
+        "SELECT id, val FROM aux.t1 WHERE NOT EXISTS (
+            SELECT 1 FROM main.t1 WHERE main.t1.id = aux.t1.id
+        )",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Text("a".to_string())
+            ],
+            vec![
+                rusqlite::types::Value::Integer(3),
+                rusqlite::types::Value::Text("c".to_string())
+            ],
+        ]
+    );
+
+    // Correlated scalar subquery must be evaluated per-row, returning NULL
+    // when there is no matching row in main.t1.
+    let rows = limbo_exec_rows(
+        &turso,
+        "SELECT id, val, (
+            SELECT val FROM main.t1 WHERE main.t1.id = aux.t1.id
+        ) AS main_val FROM aux.t1 ORDER BY id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Text("a".to_string()),
+                rusqlite::types::Value::Null,
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Text("b".to_string()),
+                rusqlite::types::Value::Text("x".to_string()),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(3),
+                rusqlite::types::Value::Text("c".to_string()),
+                rusqlite::types::Value::Null,
+            ],
+        ]
+    );
+
+    Ok(())
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/6278
+///
+/// `PRAGMA aux.integrity_check` / `PRAGMA aux.quick_check` must enumerate the
+/// attached database's own tables/indexes, not main's. Previously this crashed
+/// with an I/O error when main had more pages than aux, and falsely reported
+/// "never used" pages when main had none.
+#[turso_macros::test]
+fn test_integrity_check_on_attached_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let turso = db.connect_limbo();
+
+    turso.execute("ATTACH ':memory:' AS aux")?;
+
+    // main has more tables/indexes (and thus more pages) than aux.
+    turso.execute("CREATE TABLE main.m1 (id INTEGER PRIMARY KEY)")?;
+    turso.execute("CREATE TABLE main.m2 (id INTEGER PRIMARY KEY)")?;
+    turso.execute("CREATE TABLE main.m3 (id INTEGER PRIMARY KEY)")?;
+    turso.execute("CREATE TABLE main.m4 (id INTEGER PRIMARY KEY)")?;
+    turso.execute("CREATE INDEX main.idx_m1 ON m1(id)")?;
+    turso.execute("CREATE INDEX main.idx_m2 ON m2(id)")?;
+    turso.execute("INSERT INTO main.m1 VALUES (1)")?;
+    turso.execute("INSERT INTO main.m2 VALUES (1)")?;
+    turso.execute("INSERT INTO main.m3 VALUES (1)")?;
+    turso.execute("INSERT INTO main.m4 VALUES (1)")?;
+
+    turso.execute("CREATE TABLE aux.a1 (id INTEGER PRIMARY KEY, val TEXT)")?;
+    turso.execute("INSERT INTO aux.a1 VALUES (1, 'hello')")?;
+
+    let rows = limbo_exec_rows(&turso, "PRAGMA aux.integrity_check");
+    assert_eq!(
+        rows,
+        vec![vec![rusqlite::types::Value::Text("ok".to_string())]],
+        "integrity_check on an attached db with fewer pages than main must not crash"
+    );
+
+    let rows = limbo_exec_rows(&turso, "PRAGMA aux.quick_check");
+    assert_eq!(
+        rows,
+        vec![vec![rusqlite::types::Value::Text("ok".to_string())]]
+    );
+
+    // main.integrity_check / unqualified integrity_check must still check main.
+    let rows = limbo_exec_rows(&turso, "PRAGMA main.integrity_check");
+    assert_eq!(
+        rows,
+        vec![vec![rusqlite::types::Value::Text("ok".to_string())]]
+    );
+    let rows = limbo_exec_rows(&turso, "PRAGMA integrity_check");
+    assert_eq!(
+        rows,
+        vec![vec![rusqlite::types::Value::Text("ok".to_string())]]
+    );
+
+    Ok(())
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/6278
+///
+/// When main has no user tables, `PRAGMA aux.integrity_check` must not treat
+/// aux's pages as "never used" pages of an empty main schema.
+#[turso_macros::test]
+fn test_integrity_check_on_attached_database_when_main_is_empty(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let turso = db.connect_limbo();
+
+    turso.execute("ATTACH ':memory:' AS aux")?;
+    turso.execute("CREATE TABLE aux.a1 (id INTEGER PRIMARY KEY, val TEXT NOT NULL)")?;
+    turso.execute("INSERT INTO aux.a1 VALUES (1, 'hello')")?;
+
+    let rows = limbo_exec_rows(&turso, "PRAGMA aux.integrity_check");
+    assert_eq!(
+        rows,
+        vec![vec![rusqlite::types::Value::Text("ok".to_string())]],
+        "integrity_check on an attached db must not report main's empty schema as corruption"
+    );
+
+    Ok(())
+}

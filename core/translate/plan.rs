@@ -1440,13 +1440,21 @@ impl TableReferences {
     /// Returns `(internal_id, &Table)` for the table with the given identifier.
     /// Searches `joined_tables` first, then visible `outer_query_refs`
     /// (excluding CTE-definition-only entries).
+    ///
+    /// If `database_id` is `Some`, a `joined_tables` entry only matches when its
+    /// `database_id` also matches. This disambiguates references like `aux.t1.id`
+    /// from an identically-named `main.t1` in `joined_tables`, allowing the lookup
+    /// to fall through to `outer_query_refs` where `aux.t1` lives.
     pub fn find_table_and_internal_id_by_identifier(
         &self,
         identifier: &str,
+        database_id: Option<usize>,
     ) -> Option<(TableInternalId, &Table)> {
         self.joined_tables
             .iter()
-            .find(|t| t.identifier == identifier)
+            .find(|t| {
+                t.identifier == identifier && database_id.is_none_or(|db_id| t.database_id == db_id)
+            })
             .map(|t| (t.internal_id, &t.table))
             .or_else(|| {
                 self.outer_query_refs
