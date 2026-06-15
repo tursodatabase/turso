@@ -1252,10 +1252,13 @@ pub enum CommitState<Clock: LogicalClock> {
         end_ts: u64,
         log_record: LogRecord,
     },
-    EndCommitLogicalLog {
+    FinishLogicalLogWrite {
         end_ts: u64,
     },
     SyncLogicalLog {
+        end_ts: u64,
+    },
+    EndCommitLogicalLog {
         end_ts: u64,
     },
     Checkpoint {
@@ -2947,7 +2950,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let end_ts = *end_ts;
                 let log_record = match std::mem::replace(
                     &mut self.state,
-                    CommitState::SyncLogicalLog { end_ts },
+                    CommitState::FinishLogicalLogWrite { end_ts },
                 ) {
                     CommitState::WriteLogicalLog { log_record, .. } => log_record,
                     _ => unreachable!(),
@@ -2962,8 +2965,17 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 }
             }
 
+            CommitState::FinishLogicalLogWrite { end_ts } => {
+                let c = mvcc_store.storage.on_log_write_complete()?;
+                self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
+                if c.succeeded() {
+                    Ok(TransitionResult::Continue)
+                } else {
+                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                }
+            }
+
             CommitState::SyncLogicalLog { end_ts } => {
-                mvcc_store.storage.on_log_write_complete()?;
                 // Skip fsync when synchronous mode is not FULL.
                 // NORMAL mode skips fsync on commit (but still fsyncs on checkpoint).
                 if self.sync_mode != SyncMode::Full {
@@ -8187,12 +8199,16 @@ impl<Clock: LogicalClock> Debug for CommitState<Clock> {
                 .field("end_ts", end_ts)
                 .field("log_record", log_record)
                 .finish(),
-            Self::EndCommitLogicalLog { end_ts } => f
-                .debug_struct("EndCommitLogicalLog")
+            Self::FinishLogicalLogWrite { end_ts } => f
+                .debug_struct("FinishLogicalLogWrite")
                 .field("end_ts", end_ts)
                 .finish(),
             Self::SyncLogicalLog { end_ts } => f
                 .debug_struct("SyncLogicalLog")
+                .field("end_ts", end_ts)
+                .finish(),
+            Self::EndCommitLogicalLog { end_ts } => f
+                .debug_struct("EndCommitLogicalLog")
                 .field("end_ts", end_ts)
                 .finish(),
             Self::Checkpoint { state_machine: _ } => f.debug_struct("Checkpoint").finish(),
