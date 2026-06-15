@@ -111,6 +111,7 @@ fn bench_workload(
         checkpoint,
         mvcc_checkpoint_threshold: (checkpoint && matches!(mode, JournalMode::Mvcc))
             .then_some(MVCC_CHECKPOINT_THRESHOLD_BYTES),
+        mvcc_gc_threshold: (matches!(mode, JournalMode::Mvcc)).then_some(16384i64),
     };
     let db_path = work_dir
         .join(format!("{mode}_{workload}_{total_ops}{suffix}.db"))
