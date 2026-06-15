@@ -18,9 +18,9 @@ crate-type = ["cdylib"]
 anyhow = "1.0"
 turso_sdk_kit = { workspace = true, features = ["fts"] }
 turso_sync_sdk_kit = { workspace = true }
-pyo3 = { version = "0.28.2", features = ["anyhow", "abi3-py310"] }
+pyo3 = { version = "0.29.0", features = ["anyhow", "abi3-py310"] }
 
 [build-dependencies]
 version_check = "0.9.5"
 # used where logic has to be version/distribution specific, e.g. pypy
-pyo3-build-config = { version = "0.28.2", features = ["abi3-py310"] }
+pyo3-build-config = { version = "0.29.0" }
