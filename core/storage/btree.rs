@@ -3015,7 +3015,9 @@ impl BTreeCursor {
                         if matches!(page_type, PageType::IndexInterior) {
                             turso_assert!(parent_contents.overflow_cells.len() == 1, "index interior page must have no more than 1 overflow cell, as a result of InteriorNodeReplacement");
                         } else {
-                            turso_assert!(false, "page type must have no overflow cells", { "page_type": page_type });
+                            turso_assert!(false, "page type must have no overflow cells", {
+                                "page_type": page_type
+                            });
                         }
                         let overflow_cell = parent_contents.overflow_cells.first().unwrap();
                         let parent_page_cell_idx = self.stack.current_cell_index() as usize;
@@ -5303,6 +5305,20 @@ impl BTreeCursor {
 
     pub fn is_write_in_progress(&self) -> bool {
         matches!(self.state, CursorState::Write(_))
+    }
+
+    /// True iff the cursor sits on a valid record that is NOT the first cell of
+    /// its page. Used by the MVCC checkpoint's sequential-write optimization:
+    /// only at such a position is "insert the next adjacent rowid here, without
+    /// re-seeking" provably within the page's divider bounds (the previous,
+    /// strictly smaller rowid is in this same page, and so is a strictly larger
+    /// one). At cell 0 the cursor has just crossed a leaf boundary, and the
+    /// adjacent rowid may belong on the LEFT side of the parent divider — a
+    /// divider whose row was deleted keeps its key, so the divider can
+    /// be >= the rowid being inserted — in which case the caller must re-seek
+    /// from the root.
+    pub fn is_positioned_past_page_start(&self) -> bool {
+        self.has_record() && self.stack.current_cell_index() > 0
     }
 
     /// saveAllCursors pass for this cursor's insert/delete entry. Iteration
