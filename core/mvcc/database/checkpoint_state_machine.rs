@@ -215,16 +215,10 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// during the unlocked prepare phase never strand a row. `u64::MAX` means
     /// "no upper bound" (collect everything), used before a snapshot is taken.
     snapshot_ts: u64,
-    /// Re-entrant sub-machine that builds the snapshot-consistent `local_schema`.
     build_local_schema_sm: Option<StateMachine<BuildLocalSchemaViewStateMachine<Clock, A>>>,
-    /// True if `BuildLocalSchemaView` began a pager read tx that must be ended before
-    /// leaving the state (so it does not linger into the WAL-backfill phase and cause Busy).
     build_local_schema_began_read_tx: bool,
-    /// Snapshot-consistent schema built at `snapshot_ts`; drives `index_id_to_index`.
+    /// Snapshot-consistent schema built at `snapshot_ts`; drives `index_id_to_index` in PASSIVE mode.
     local_schema: Option<Arc<Schema>>,
-    /// True when this state machine won the `checkpoint_in_progress` gate and must clear
-    /// it on completion/error. The off-lock collection phase makes the single-orchestrator
-    /// invariant explicit (previously implied by acquiring the blocking lock first).
     owns_checkpoint_in_progress: bool,
 }
 
