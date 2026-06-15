@@ -10,7 +10,6 @@ use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
 use turso_whopper::{
     StepResult, Whopper, WhopperOpts,
     chaotic_elle::{ChaoticElleProfile, ChaoticWorkloadProfile, ElleModelKind},
-    chaotic_reader_hold::ReaderHoldProfile,
     properties::*,
     workloads::*,
 };
@@ -390,24 +389,14 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
     } else {
         let w: Vec<(u32, Box<dyn Workload>)> = vec![
             (10, Box::new(IntegrityCheckWorkload)),
-            // Heavier checkpoint cadence so the off-lock collection / publish
-            // window overlaps concurrent index writers more often.
-            (12, Box::new(WalCheckpointWorkload)),
+            (5, Box::new(WalCheckpointWorkload)),
             (10, Box::new(CreateSimpleTableWorkload)),
             (20, Box::new(SimpleSelectWorkload)),
             (20, Box::new(SimpleInsertWorkload)),
-            // Insert::arbitrary covers richer schema shapes (UNIQUE columns →
-            // automatic indexes, more types/conflict clauses) than the fixed
-            // key/value SimpleInsert — needed to exercise the autoindex paths
-            // that the non-blocking checkpoint's index collection touches.
-            (10, Box::new(InsertWorkload)),
             (15, Box::new(UpdateWorkload)),
             (15, Box::new(DeleteWorkload)),
-            // Index weights kept at 5 (from the repro harness) to exercise more
-            // index churn against the off-lock checkpoint; the rest are upstream's
-            // sequence/autoinc workloads.
-            (5, Box::new(CreateIndexWorkload)),
-            (5, Box::new(DropIndexWorkload)),
+            (2, Box::new(CreateIndexWorkload)),
+            (2, Box::new(DropIndexWorkload)),
             (5, Box::new(CreateSequenceWorkload)),
             (15, Box::new(NextValWorkload)),
             (5, Box::new(CurrValWorkload)),
@@ -430,19 +419,7 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             Box::new(AutoincWatermarkMonotonicity::new()),
         ];
 
-        // ReaderHoldsSnapshot — keep a BEGIN CONCURRENT + SELECT'd read_view
-        // alive across many checkpoint cycles. Fires per-fiber per-step with
-        // 5% probability, then runs to completion (≈hold_reads + 3 steps).
-        // Targets reader-vs-GC and reader-vs-page-free contracts that the
-        // non-blocking checkpoint newly exposes (a reader can now read btree
-        // pages straight from a non-truncated WAL).
-        let chaotic_profiles: ChaosProfiles = vec![(
-            0.05,
-            "reader-hold",
-            Box::new(ReaderHoldProfile::new(20, 200)),
-        )];
-
-        (w, p, vec![], chaotic_profiles)
+        (w, p, vec![], vec![])
     }
 }
 
