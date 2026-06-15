@@ -19,7 +19,7 @@ use crate::storage::pager::SavepointResult;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, CheckpointResult, TursoRwLock};
 use crate::sync::atomic::{AtomicBool, AtomicI64};
-use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
 use crate::translate::plan::IterationDirection;
@@ -3174,6 +3174,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     self.state = CommitState::Checkpoint { state_machine };
                     return Ok(TransitionResult::Continue);
                 }
+                // Not checkpointing this commit. Reclaim invisible versions
+                // inline with a bounded, non-blocking GC pass so steady-state
+                // memory stays flat between checkpoints (which only fire on
+                // logical-log byte growth, not version accumulation). The pass
+                // does no I/O and is capped at MAX_CHAINS_PER_GC chains, so it
+                // doesn't meaningfully slow this committing connection. See
+                // `gc_incremental`.
+                if mvcc_store.should_gc() {
+                    mvcc_store.gc_incremental(MvStore::<Clock>::MAX_CHAINS_PER_GC);
+                }
                 tracing::trace!("logged(tx_id={}, end_ts={})", self.tx_id, *end_ts);
                 self.finalize(mvcc_store)?;
                 Ok(TransitionResult::Done(()))
@@ -3779,6 +3789,30 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// database live in one process. Multi-process MVCC will need a shared
     /// coordination mechanism before sync can rely on this watermark.
     sequence_allocations: Mutex<HashMap<String, StdHashMap<TxID, i64>>>,
+
+    /// Approximate count of live row versions across `rows` + `index_rows`.
+    /// Incremented on every inserted version, decremented when versions are
+    /// reclaimed (GC) or physically removed (savepoint rollback, checkpoint
+    /// purge). This is a *heuristic* used only to decide when to run an
+    /// incremental GC pass (`should_gc`) — never a correctness input. Aborted
+    /// versions are left counted until GC reclaims them (they still occupy
+    /// memory). See [`Self::live_version_count`].
+    live_version_count: AtomicUsize,
+    /// Snapshot of `live_version_count` taken at the end of the last
+    /// `gc_incremental` pass. `should_gc` fires once growth since this snapshot
+    /// crosses `gc_version_threshold`, giving a roughly fixed GC cadence per N
+    /// new versions regardless of how many a single pass reclaims.
+    live_versions_at_last_gc: AtomicUsize,
+    /// Growth in `live_version_count` (number of newly inserted versions since
+    /// the last GC pass) that triggers an incremental GC pass on the commit
+    /// path. Negative disables inline GC entirely. Configurable via the
+    /// `mvcc_gc_threshold` PRAGMA; mirrors `checkpoint_threshold`.
+    gc_version_threshold: AtomicI64,
+    /// Resume cursor for the incremental table-row GC sweep: the last `RowID`
+    /// processed by the previous `gc_incremental` pass. `None` restarts the
+    /// sweep from the beginning of `rows` (and marks the point where index
+    /// chains are swept — see `gc_incremental`).
+    gc_table_cursor: Mutex<Option<RowID>>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -3871,6 +3905,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
             sequence_watermarks: Mutex::new(HashMap::default()),
             sequence_allocations: Mutex::new(HashMap::default()),
+            live_version_count: AtomicUsize::new(0),
+            live_versions_at_last_gc: AtomicUsize::new(0),
+            gc_version_threshold: AtomicI64::new(Self::DEFAULT_GC_VERSION_THRESHOLD),
+            gc_table_cursor: Mutex::new(None),
         }
     }
 
@@ -5896,7 +5934,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             touched_rowids.insert(rowid.clone());
             if let Some(entry) = self.rows.get(&rowid) {
                 let mut versions = entry.value().write();
+                let before = versions.len();
                 versions.retain(|rv| rv.id != version_id);
+                self.dec_live_version_count(before - versions.len());
                 tracing::debug!(
                     "rollback_savepoint: removed table version(table_id={}, row_id={}, version_id={})",
                     rowid.table_id,
@@ -5910,7 +5950,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if let Some(index) = self.index_rows.get(&table_id) {
                 if let Some(entry) = index.value().get(&key) {
                     let mut versions = entry.value().write();
+                    let before = versions.len();
                     versions.retain(|rv| rv.id != version_id);
+                    self.dec_live_version_count(before - versions.len());
                     tracing::debug!(
                         "rollback_savepoint: removed index version(table_id={}, version_id={})",
                         table_id,
@@ -6172,6 +6214,71 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .unwrap_or(u64::MAX)
     }
 
+    /// Default `mvcc_gc_threshold`: run an incremental GC pass roughly every
+    /// this many newly inserted versions. Small enough that steady-state
+    /// memory stays bounded under heavy short-txn concurrency, large enough
+    /// that small workloads (and most unit tests) never trigger a pass.
+    pub const DEFAULT_GC_VERSION_THRESHOLD: i64 = 16 * 1024;
+
+    /// Upper bound on table-row chains scanned by one inline `gc_incremental`
+    /// pass on the commit path. Keeps a pass cheap (sub-millisecond) so it
+    /// doesn't noticeably slow the committing connection; steady state relies
+    /// on frequent passes resuming via `gc_table_cursor`.
+    pub const MAX_CHAINS_PER_GC: usize = 4096;
+
+    /// Current approximate live row-version count. Heuristic only (see the
+    /// `live_version_count` field) — never use for correctness decisions.
+    pub fn live_version_count(&self) -> usize {
+        self.live_version_count.load(Ordering::Relaxed)
+    }
+
+    /// Saturating decrement of the live-version heuristic. The counter is
+    /// approximate, so clamp at zero rather than risk an underflow wrap that
+    /// would make `should_gc` fire on every commit.
+    fn dec_live_version_count(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let mut current = self.live_version_count.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(n);
+            match self.live_version_count.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Set the inline-GC trigger threshold (growth in live versions since the
+    /// last GC pass). Negative disables inline GC. Mirrors
+    /// `set_checkpoint_threshold`; wired to the `mvcc_gc_threshold` PRAGMA.
+    pub fn set_gc_threshold(&self, threshold: i64) {
+        self.gc_version_threshold
+            .store(threshold, Ordering::Relaxed);
+    }
+
+    pub fn gc_threshold(&self) -> i64 {
+        self.gc_version_threshold.load(Ordering::Relaxed)
+    }
+
+    /// Whether an incremental GC pass should run now: inline GC is enabled
+    /// (threshold >= 0) and `live_version_count` has grown past the threshold
+    /// since the last pass. Heuristic — drift only changes GC frequency.
+    pub fn should_gc(&self) -> bool {
+        let threshold = self.gc_version_threshold.load(Ordering::Relaxed);
+        if threshold < 0 {
+            return false;
+        }
+        let current = self.live_version_count.load(Ordering::Relaxed);
+        let at_last = self.live_versions_at_last_gc.load(Ordering::Relaxed);
+        current.saturating_sub(at_last) >= threshold as usize
+    }
+
     /// Garbage-collects row versions that are invisible to all active transactions.
     /// Uses the low-water mark (LWM) to determine reclaimability in O(1) per version.
     /// Covers both table rows (`self.rows`) and index rows (`self.index_rows`).
@@ -6192,6 +6299,85 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.drop_unused_row_versions_inner(true)
     }
 
+    /// Incremental, non-blocking GC pass — the inline counterpart to
+    /// [`Self::drop_unused_row_versions`], driven from the commit path.
+    ///
+    /// Reclaims invisible versions (same rules as `gc_version_chain`) from up
+    /// to `max_chains` table-row chains, resuming from where the previous pass
+    /// stopped (`gc_table_cursor`) so repeated calls eventually cover the whole
+    /// `rows` map without scanning it all at once. Returns the number of
+    /// versions reclaimed.
+    ///
+    /// Safety / design notes:
+    /// - **Lazy mode only.** Empty SkipMap slots are left in place (no
+    ///   `entry.remove()`), so the pass needs no blocking checkpoint lock — it
+    ///   races no concurrent `get_or_insert_with` (see the TOCTOU note in
+    ///   `gc_table_row_versions`). Physical slot removal stays exclusive to the
+    ///   checkpoint's `_and_slots` sweep.
+    /// - **No I/O.** Pure in-memory chain reclamation under each chain's write
+    ///   lock; no `Completion`/yield machinery needed.
+    /// - **Index chains** are swept in full once per *full table-cursor cycle*
+    ///   (when the table sweep wraps back to the start). They are typically far
+    ///   fewer than table-row chains, so a periodic full sweep keeps per-pass
+    ///   cost bounded in the common case. This can be made incrementally
+    ///   resumable later if index counts grow large.
+    /// - `finalized_tx_states` pruning is intentionally skipped here: it needs
+    ///   the *complete* referenced-txid set across all chains, which a partial
+    ///   sweep cannot produce. The checkpoint path still prunes it.
+    pub fn gc_incremental(&self, max_chains: usize) -> usize {
+        let lwm = self.compute_lwm();
+        let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
+
+        let mut dropped = 0;
+        let mut processed = 0;
+        let mut last_key: Option<RowID> = None;
+
+        // Resume strictly after the last key processed by the previous pass.
+        let start_bound = match self.gc_table_cursor.lock().clone() {
+            Some(k) => Bound::Excluded(k),
+            None => Bound::Unbounded,
+        };
+        for entry in self.rows.range((start_bound, Bound::Unbounded)) {
+            if processed >= max_chains {
+                break;
+            }
+            {
+                let mut versions = entry.value().write();
+                dropped += Self::gc_version_chain(&mut versions, lwm, ckpt_max);
+            }
+            last_key = Some(entry.key().clone());
+            processed += 1;
+        }
+
+        // If we processed fewer chains than the budget, the range was
+        // exhausted — wrap the cursor to the start for the next pass.
+        let wrapped = processed < max_chains;
+        *self.gc_table_cursor.lock() = if wrapped { None } else { last_key };
+
+        // Sweep index chains once per full table-cursor cycle to bound the
+        // per-pass cost (see the doc comment). A throwaway referenced-txid set
+        // is collected and discarded — we do not prune finalized states here.
+        if wrapped {
+            let mut referenced_tx_ids = HashSet::default();
+            dropped += self.gc_index_row_versions(lwm, ckpt_max, &mut referenced_tx_ids, false);
+        }
+
+        self.dec_live_version_count(dropped);
+        // Reset the trigger baseline so `should_gc` measures growth from here.
+        self.live_versions_at_last_gc.store(
+            self.live_version_count.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+
+        if dropped > 0 {
+            tracing::trace!(
+                "gc_incremental: reclaimed {dropped} versions across {processed} chains (wrapped={wrapped}), live~{}",
+                self.live_version_count.load(Ordering::Relaxed)
+            );
+        }
+        dropped
+    }
+
     fn drop_unused_row_versions_inner(&self, remove_empty_slots: bool) -> usize {
         let lwm = self.compute_lwm();
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
@@ -6205,6 +6391,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     &mut referenced_tx_ids,
                     remove_empty_slots,
                 );
+        self.dec_live_version_count(dropped);
         let pruned_finalized = self.prune_finalized_tx_states(&referenced_tx_ids);
 
         tracing::trace!(
@@ -6493,6 +6680,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
         }
         versions.insert(position, row_version);
+        // A genuine insert (the collapse branch above `return`s without
+        // reaching here). Track it for the GC trigger heuristic.
+        self.live_version_count.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn write_row_to_pager(
@@ -6545,6 +6735,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub fn purge_row_versions_during_checkpoint(&self, rowid: RowID) {
         if let Some(entry) = self.rows.get(&rowid) {
             let mut versions = entry.value().write();
+            self.dec_live_version_count(versions.len());
             versions.clear();
             Self::shrink_version_chain_allocation(&mut versions);
         }
