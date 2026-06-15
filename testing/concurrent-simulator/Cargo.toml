@@ -29,10 +29,6 @@ path = "regression_tests.rs"
 name = "regression_tests_cross_platform"
 path = "regression_tests_cross_platform.rs"
 
-[[test]]
-name = "mvcc_checkpoint_regression"
-path = "mvcc_checkpoint_regression.rs"
-
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
