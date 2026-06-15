@@ -232,6 +232,7 @@ pub struct DatabaseOpts {
     pub enable_generated_columns: bool,
     pub enable_multiprocess_wal: bool,
     pub enable_without_rowid: bool,
+    pub enable_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
     enable_load_extension: bool,
 }
@@ -274,6 +275,11 @@ impl DatabaseOpts {
 
     pub fn with_vacuum(mut self, enable: bool) -> Self {
         self.enable_vacuum = enable;
+        self
+    }
+
+    pub fn with_mvcc_passive_checkpoint(mut self, enable: bool) -> Self {
+        self.enable_mvcc_passive_checkpoint = enable;
         self
     }
 
@@ -2847,6 +2853,10 @@ impl Database {
 
     pub fn experimental_vacuum_enabled(&self) -> bool {
         self.opts.enable_vacuum
+    }
+
+    pub fn experimental_mvcc_passive_checkpoint_enabled(&self) -> bool {
+        self.opts.enable_mvcc_passive_checkpoint
     }
 
     pub fn experimental_attach_enabled(&self) -> bool {

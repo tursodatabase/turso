@@ -578,6 +578,12 @@ impl MvccTestDbNoConn {
         Self::new_with_random_db_with_opts(DatabaseOpts::new())
     }
 
+    /// Opens a database with the experimental passive (non-blocking)
+    /// auto-checkpoint enabled. Used by the passive-checkpoint-specific tests.
+    pub fn new_with_random_db_passive() -> Self {
+        Self::new_with_random_db_with_opts(DatabaseOpts::new().with_mvcc_passive_checkpoint(true))
+    }
+
     /// Opens a database with a file and the requested options.
     pub fn new_with_random_db_with_opts(opts: DatabaseOpts) -> Self {
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -3216,7 +3222,7 @@ fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
 #[test]
 fn test_reader_consistent_during_large_indexed_commit_rewrite() {
     use crate::StepResult;
-    let db = MvccTestDbNoConn::new_with_random_db();
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
     let c1 = db.connect();
     c1.execute("CREATE TABLE t(pk INTEGER PRIMARY KEY, v INTEGER UNIQUE)")
         .unwrap();
@@ -3263,7 +3269,7 @@ fn test_reader_consistent_during_large_indexed_commit_rewrite() {
 fn test_checkpoint_two_scan_toctou_orphans_first_checkpoint_unique_index() {
     use crate::StepResult;
     let _ = tracing_subscriber::fmt::try_init();
-    let db = MvccTestDbNoConn::new_with_random_db();
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
 
     // connV (victim writer): create + populate, but DO NOT checkpoint, so the
     // table btree and both UNIQUE autoindexes are created fresh in the pass below.
@@ -3360,7 +3366,7 @@ fn test_checkpoint_two_scan_toctou_orphans_first_checkpoint_unique_index() {
 fn test_checkpoint_gc_anchor_loss_update_then_delete_strands_stale_row() {
     use crate::StepResult;
     let _ = tracing_subscriber::fmt::try_init();
-    let db = MvccTestDbNoConn::new_with_random_db();
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
 
     let conn_v = db.connect();
     conn_v
@@ -3790,7 +3796,7 @@ fn test_conflict_abort_of_indexed_update_keeps_btree_resident_index_entry() {
 /// `publish_checkpointed_schema_roots` writing the live schema.
 #[test]
 fn test_passive_checkpoint_tolerates_concurrent_create_after_snapshot() {
-    let db = MvccTestDbNoConn::new_with_random_db();
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
     let conn = db.connect();
     conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
