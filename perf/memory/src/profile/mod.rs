@@ -4,6 +4,7 @@ pub mod mixed;
 pub mod read;
 pub mod scan;
 pub mod series_blob;
+pub mod update_churn;
 
 /// Fixed RNG seed so randomized profiles generate the same workload on every
 /// run, keeping benchmark measurements comparable across runs.

@@ -5,9 +5,9 @@ use clap::ValueEnum;
 use turso::Connection;
 use turso::params::Params;
 
-use crate::profile::{
+use super::profile::{
     Phase, Profile, WorkItem, checkpoint::Checkpoint, insert::InsertHeavy, mixed::Mixed,
-    read::ReadHeavy, scan::ScanHeavy, series_blob::SeriesBlob,
+    read::ReadHeavy, scan::ScanHeavy, series_blob::SeriesBlob, update_churn::UpdateChurn,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -32,6 +32,7 @@ pub enum WorkloadProfile {
     Mixed,
     ScanHeavy,
     SeriesBlob,
+    UpdateChurn,
 }
 
 impl std::fmt::Display for WorkloadProfile {
@@ -42,6 +43,7 @@ impl std::fmt::Display for WorkloadProfile {
             WorkloadProfile::Mixed => write!(f, "mixed"),
             WorkloadProfile::ScanHeavy => write!(f, "scan-heavy"),
             WorkloadProfile::SeriesBlob => write!(f, "series-blob"),
+            WorkloadProfile::UpdateChurn => write!(f, "update-churn"),
         }
     }
 }
@@ -87,6 +89,7 @@ pub fn create_profile(
         WorkloadProfile::Mixed => Box::new(Mixed::new(iterations, batch_size)),
         WorkloadProfile::ScanHeavy => Box::new(ScanHeavy::new(iterations, batch_size)),
         WorkloadProfile::SeriesBlob => Box::new(SeriesBlob::new(iterations, batch_size)),
+        WorkloadProfile::UpdateChurn => Box::new(UpdateChurn::new(iterations, batch_size)),
     };
 
     if checkpoint {

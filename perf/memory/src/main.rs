@@ -1,5 +1,3 @@
-use std::time::{Duration, Instant};
-
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use memory_benchmark::measure::{MemoryReport, MemorySnapshot, file_size, take_snapshot};
@@ -7,6 +5,7 @@ use memory_benchmark::profile::Phase;
 use memory_benchmark::workload::{
     JournalMode, WorkloadConfig, WorkloadObserver, WorkloadProfile, clean_db_files, run_workload,
 };
+use std::time::{Duration, Instant};
 
 // Workspace Clippy runs with `--all-features`, which enables `turso`'s
 // mimalloc-backed global allocator. Skip the benchmark-only dhat allocator
@@ -62,10 +61,15 @@ struct Args {
     #[arg(long)]
     checkpoint: bool,
 
-    /// MVCC logical-log auto-checkpoint threshold in bytes
-    /// (PRAGMA mvcc_checkpoint_threshold); -1 disables. MVCC mode only
+    /// MVCC only: set `PRAGMA mvcc_checkpoint_threshold` (bytes; -1 disables
+    /// auto-checkpoint). Use -1 to isolate the inline-GC effect.
     #[arg(long = "mvcc-checkpoint-threshold")]
     mvcc_checkpoint_threshold: Option<i64>,
+
+    /// MVCC only: set `PRAGMA mvcc_gc_threshold` (live-version growth per
+    /// inline GC pass; -1 disables inline GC). Toggle this for A/B runs.
+    #[arg(long = "mvcc-gc-threshold")]
+    mvcc_gc_threshold: Option<i64>,
 }
 
 /// Takes RSS snapshots at phase transitions and tracks the RSS peak after
@@ -138,7 +142,44 @@ async fn async_main(args: Args) -> Result<()> {
         snapshots: vec![baseline_snapshot],
         peak_bytes: baseline,
     };
+    let timeout = Duration::from_millis(args.timeout);
+    let mut snapshots: Vec<MemorySnapshot> = Vec::new();
+    snapshots.push(take_snapshot(start, "baseline"));
 
+    let db = turso::Builder::new_local(db_path).build().await?;
+
+    // Setup connection for schema/seeding and journal mode
+    let setup_conn = db.connect()?;
+    setup_conn.busy_timeout(timeout)?;
+
+    let mode_str = match args.mode {
+        JournalMode::Wal => "'wal'",
+        JournalMode::Mvcc => "'mvcc'",
+    };
+    setup_conn.pragma_update("journal_mode", mode_str).await?;
+
+    // MVCC threshold knobs (shared across all connections via the mv_store).
+    if matches!(args.mode, JournalMode::Mvcc) {
+        if let Some(threshold) = args.mvcc_checkpoint_threshold {
+            setup_conn
+                .execute(
+                    &format!("PRAGMA mvcc_checkpoint_threshold = {threshold}"),
+                    (),
+                )
+                .await?;
+        }
+        if let Some(threshold) = args.mvcc_gc_threshold {
+            setup_conn
+                .execute(&format!("PRAGMA mvcc_gc_threshold = {threshold}"), ())
+                .await?;
+        }
+    }
+
+    if let Some(cache_size) = args.cache_size {
+        setup_conn
+            .pragma_update("cache_size", &cache_size.to_string())
+            .await?;
+    }
     let workload_name = run_workload(db_path, &cfg, &mut observer).await?;
 
     // Final snapshot
