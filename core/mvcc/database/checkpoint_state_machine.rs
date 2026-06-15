@@ -1,3 +1,4 @@
+use crate::alloc::TursoAllocator;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
@@ -8,6 +9,7 @@ use crate::mvcc::database::{
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::Index;
+use crate::skiplist::SkiplistAllocator;
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
@@ -130,7 +132,7 @@ pub struct LockStates {
 /// 7. Fsync the DB file
 /// 8. Truncate logical log to 0 (salt regenerated in memory), fsync, then truncate WAL
 /// 9. Releases the blocking_checkpoint_lock
-pub struct CheckpointStateMachine<Clock: LogicalClock> {
+pub struct CheckpointStateMachine<Clock: LogicalClock, A: SkiplistAllocator = TursoAllocator> {
     /// The current state of the state machine
     state: CheckpointState,
     /// The states of the locks held by the state machine - these are tracked for error handling so that they are
@@ -143,7 +145,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     /// Pager used for writing to the B-tree
     pager: Arc<Pager>,
     /// MVCC store containing the row versions.
-    mvstore: Arc<MvStore<Clock>>,
+    mvstore: Arc<MvStore<Clock, A>>,
     /// Connection to the database
     connection: Arc<Connection>,
     #[cfg(any(test, injected_yields))]
@@ -192,7 +194,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     collect_index_key_cursor: Option<Arc<SortableIndexKey>>,
     /// Async driver for `CheckpointState::CompactSequences`. Lazily set
     /// on first entry to that state; cleared when the driver completes.
-    seq_compact: Option<SeqCompactDriver<Clock>>,
+    seq_compact: Option<SeqCompactDriver<Clock, A>>,
 }
 
 /// One pending compaction job in the per-checkpoint sequence sweep.
@@ -255,7 +257,7 @@ enum SeqCompactPhase {
 /// would leave entries with `btree_resident: true` pointing at B-tree
 /// rows that no longer exist, surviving until `drop_unused_row_versions`
 /// Rule 3 catches up.
-struct SeqCompactDriver<Clock: LogicalClock> {
+struct SeqCompactDriver<Clock: LogicalClock, A: SkiplistAllocator = TursoAllocator> {
     /// Remaining backing tables to compact, in arbitrary order.
     pending: Vec<SeqCompaction>,
     /// Index of the in-flight compaction within `pending`.
@@ -280,11 +282,13 @@ struct SeqCompactDriver<Clock: LogicalClock> {
     pager: Arc<Pager>,
     /// MVCC store used to purge version-chain entries paired with each
     /// B-tree delete. See the struct-level comment for the invariant.
-    mvstore: Arc<MvStore<Clock>>,
+    mvstore: Arc<MvStore<Clock, A>>,
 }
 
 #[cfg(any(test, injected_yields))]
-impl<Clock: LogicalClock> ProvidesYieldContext for CheckpointStateMachine<Clock> {
+impl<Clock: LogicalClock, A: SkiplistAllocator> ProvidesYieldContext
+    for CheckpointStateMachine<Clock, A>
+{
     fn yield_context(&self) -> YieldContext {
         YieldContext::new(
             self.connection.yield_injector(),
@@ -400,7 +404,7 @@ fn is_schema_metadata_only_rewrite(current: &RowVersion, next: Option<&RowVersio
     }
 }
 
-impl<Clock: LogicalClock> SeqCompactDriver<Clock> {
+impl<Clock: LogicalClock, A: SkiplistAllocator> SeqCompactDriver<Clock, A> {
     /// Drive one step of the compaction sweep. Returns `IOResult::IO` on
     /// any cursor page IO so the caller can yield up; returns
     /// `IOResult::Done(())` when every pending backing table has been
@@ -537,7 +541,7 @@ impl<Clock: LogicalClock> SeqCompactDriver<Clock> {
     }
 }
 
-impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
+impl<Clock: LogicalClock, A: SkiplistAllocator> CheckpointStateMachine<Clock, A> {
     /// Build the per-checkpoint list of non-CYCLE sequence backing tables
     /// to compact. CYCLE seqs are skipped — they keep themselves at one
     /// row via inline compaction in the nextval bytecode and using
@@ -597,7 +601,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
     pub fn new(
         pager: Arc<Pager>,
-        mvstore: Arc<MvStore<Clock>>,
+        mvstore: Arc<MvStore<Clock, A>>,
         connection: Arc<Connection>,
         update_transaction_state: bool,
         sync_mode: SyncMode,
@@ -1577,7 +1581,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             self.mvstore.insert_table_id_to_rootpage(
                                 table_id,
                                 Some(created_root_page as u64),
-                            );
+                            )?;
                         }
                         SpecialWrite::BTreeDestroy {
                             table_id,
@@ -1623,7 +1627,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             self.mvstore.insert_table_id_to_rootpage(
                                 index_id,
                                 Some(created_root_page as u64),
-                            );
+                            )?;
                             // Index struct should already be stored in index_id_to_index from collect_committed_versions
                             turso_assert!(
                                 self.index_id_to_index.contains_key(&index_id),
@@ -2266,7 +2270,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     }
 }
 
-impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
+impl<Clock: LogicalClock, A: SkiplistAllocator> StateTransition
+    for CheckpointStateMachine<Clock, A>
+{
     type Context = ();
     type SMResult = CheckpointResult;
 
@@ -2490,7 +2496,9 @@ mod tests {
         let (_, tombstone_version) =
             index_row_version(index_id, "blue_river_906", 75, 2, None, Some(10), true);
 
-        mvstore.insert_index_version(index_id, garbage_key, garbage_version);
+        mvstore
+            .insert_index_version(index_id, garbage_key, garbage_version)
+            .unwrap();
         let entry = mvstore
             .index_rows
             .get(&index_id)
@@ -2501,7 +2509,9 @@ mod tests {
             .expect("key bucket should exist after first insert")
             .key()
             .clone();
-        mvstore.insert_index_version(index_id, tombstone_key, tombstone_version);
+        mvstore
+            .insert_index_version(index_id, tombstone_key, tombstone_version)
+            .unwrap();
 
         while checkpoint.collect_index_rows().is_some() {}
 
@@ -2584,7 +2594,9 @@ mod tests {
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
         for i in 0..row_count as i64 {
             let (key, version) = index_row_version(index_id, "k", i, 1, Some(5), None, false);
-            mvstore.insert_index_version(index_id, key, version);
+            mvstore
+                .insert_index_version(index_id, key, version)
+                .unwrap();
         }
 
         let first = checkpoint.collect_index_rows();
@@ -2665,7 +2677,9 @@ mod tests {
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
         for i in 0..row_count as i64 {
             let (key, version) = index_row_version(index_id, "k", i, 1, Some(5), None, false);
-            mvstore.insert_index_version(index_id, key, version.clone());
+            mvstore
+                .insert_index_version(index_id, key, version.clone())
+                .unwrap();
             checkpoint.index_write_set.push((index_id, version, false));
         }
         checkpoint.state = CheckpointState::GcIndexRows {

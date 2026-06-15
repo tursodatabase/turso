@@ -22,6 +22,7 @@ use turso_core::{
 };
 use turso_parser::ast::{ColumnConstraint, SortOrder};
 
+mod allocation_fault;
 pub mod chaotic_elle;
 pub mod elle;
 pub mod error_handling;
@@ -278,6 +279,8 @@ pub struct WhopperOpts {
     pub close_connections_gracefully: bool,
     /// Probabilty of a reopen fault.
     pub reopen_probability: f64,
+    /// Probability that a Turso fallible allocation fails.
+    pub allocation_fault_probability: f64,
 }
 
 /// Schema-generation bias
@@ -324,6 +327,7 @@ impl Default for WhopperOpts {
             disable_mvcc_auto_checkpoint: false,
             close_connections_gracefully: true,
             reopen_probability: 0.0,
+            allocation_fault_probability: 0.05,
         }
     }
 }
@@ -430,6 +434,11 @@ impl WhopperOpts {
         profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
     ) -> Self {
         self.chaotic_profiles = profiles;
+        self
+    }
+
+    pub fn with_allocation_fault_probability(mut self, probability: f64) -> Self {
+        self.allocation_fault_probability = probability;
         self
     }
 }
@@ -585,6 +594,7 @@ pub struct Whopper {
     disable_mvcc_auto_checkpoint: bool,
     /// If false, drop fiber connections without first closing them.
     close_connections_gracefully: bool,
+    allocation_faults_enabled: bool,
 }
 
 impl Whopper {
@@ -596,6 +606,7 @@ impl Whopper {
         });
 
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        allocation_fault::validate_probability(opts.allocation_fault_probability)?;
 
         // Create a separate RNG for IO operations with a derived seed
         let io_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1));
@@ -730,9 +741,12 @@ impl Whopper {
             chaotic_profiles: opts.chaotic_profiles,
             disable_mvcc_auto_checkpoint: opts.disable_mvcc_auto_checkpoint,
             close_connections_gracefully: opts.close_connections_gracefully,
+            allocation_faults_enabled: false,
         };
 
         whopper.open_connections()?;
+        whopper.allocation_faults_enabled =
+            allocation_fault::install(seed, opts.allocation_fault_probability)?;
 
         Ok(whopper)
     }
@@ -904,7 +918,11 @@ impl Whopper {
 
             if let Err(error) = op_result {
                 let in_tx = ctx.fiber.state.is_in_tx() && !ctx.fiber.connection.get_auto_commit();
-                match crate::error_handling::classify_op_error(&error, in_tx) {
+                match crate::error_handling::classify_op_error(
+                    &error,
+                    in_tx,
+                    self.allocation_faults_enabled,
+                ) {
                     crate::error_handling::ErrorAction::Rollback => {
                         ctx.fiber.current_op = Some(Operation::Rollback);
                     }
@@ -992,6 +1010,11 @@ impl Whopper {
                 self.seed, fiber_idx,
             )));
             if let Err(e) = op.init_op(&mut ctx) {
+                if self.allocation_faults_enabled
+                    && matches!(e, turso_core::LimboError::OutOfMemory)
+                {
+                    return Ok(());
+                }
                 let err = e.to_string().to_lowercase();
                 // Allow "no such table/index" and "already exists" errors
                 if err.contains("no such")

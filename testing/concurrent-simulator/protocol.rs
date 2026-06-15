@@ -143,6 +143,7 @@ pub fn limbo_error_to_kind(err: &LimboError) -> &'static str {
         LimboError::InternalError(_) => "InternalError",
         LimboError::Conflict(_) => "Conflict",
         LimboError::CheckpointFailed(_) => "CheckpointFailed",
+        LimboError::OutOfMemory => "OutOfMemory",
         LimboError::ParseError(_) => "ParseError",
         LimboError::TxError(_) => "TxError",
         LimboError::DatabaseFull(_) => "DatabaseFull",
@@ -168,6 +169,7 @@ fn error_kind_to_limbo_error(kind: &str, message: &str) -> LimboError {
         "InternalError" => LimboError::InternalError(message.to_string()),
         "Conflict" => LimboError::Conflict(message.to_string()),
         "CheckpointFailed" => LimboError::CheckpointFailed(message.to_string()),
+        "OutOfMemory" => LimboError::OutOfMemory,
         "ParseError" => LimboError::ParseError(message.to_string()),
         "TxError" => LimboError::TxError(message.to_string()),
         "DatabaseFull" => LimboError::DatabaseFull(message.to_string()),
@@ -204,6 +206,9 @@ mod tests {
                 LimboError::DatabaseFull("nextval: reached minimum value of sequence \"s\"".into()),
                 |e| matches!(e, LimboError::DatabaseFull(m) if m.starts_with("nextval: reached ")),
             ),
+            (LimboError::OutOfMemory, |e| {
+                matches!(e, LimboError::OutOfMemory)
+            }),
             (LimboError::Busy, |e| matches!(e, LimboError::Busy)),
             (LimboError::WriteWriteConflict, |e| {
                 matches!(e, LimboError::WriteWriteConflict)

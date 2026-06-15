@@ -81,6 +81,9 @@ struct Args {
     /// Probability of restarting the full worker cohort per step (multiprocess mode only)
     #[arg(long, default_value_t = 0.0)]
     restart_probability: f64,
+    /// Probability that a Turso fallible allocation fails.
+    #[arg(long, default_value_t = 0.05)]
+    allocation_fault_probability: f64,
     /// Stream multiprocess operation/lifecycle history as JSONL for deterministic debugging
     #[arg(long)]
     history_output: Option<PathBuf>,
@@ -99,6 +102,11 @@ enum SubCmd {
         /// Number of connections to open inside this worker process
         #[arg(long, default_value_t = 1)]
         connections_per_process: usize,
+        /// Probability that a Turso fallible allocation fails.
+        #[arg(long, default_value_t = 0.0)]
+        allocation_fault_probability: f64,
+        #[arg(long, default_value_t = 0, hide = true)]
+        allocation_fault_seed: u64,
     },
 }
 
@@ -111,6 +119,8 @@ fn main() -> anyhow::Result<()> {
         db_path,
         enable_mvcc,
         connections_per_process,
+        allocation_fault_probability,
+        allocation_fault_seed,
     }) = &args.subcommand
     {
         #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
@@ -119,6 +129,8 @@ fn main() -> anyhow::Result<()> {
                 db_path,
                 *enable_mvcc,
                 *connections_per_process,
+                *allocation_fault_probability,
+                *allocation_fault_seed,
             );
         }
         #[cfg(not(all(any(unix, target_os = "windows"), target_pointer_width = "64")))]
@@ -182,6 +194,7 @@ fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         restart_probability: args.restart_probability,
         history_output: args.history_output.clone(),
         keep_files: args.keep,
+        allocation_fault_probability: args.allocation_fault_probability,
     };
 
     println!(
@@ -198,6 +211,12 @@ fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     }
     if let Some(path) = &args.history_output {
         println!("history_output = {}", path.display());
+    }
+    if args.allocation_fault_probability > 0.0 {
+        println!(
+            "allocation_fault_probability = {}",
+            args.allocation_fault_probability
+        );
     }
 
     let mut whopper = MultiprocessWhopper::new(opts)?;
@@ -248,6 +267,12 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
 
     if opts.cosmic_ray_probability > 0.0 {
         println!("cosmic ray probability = {}", opts.cosmic_ray_probability);
+    }
+    if opts.allocation_fault_probability > 0.0 {
+        println!(
+            "allocation_fault_probability = {}",
+            opts.allocation_fault_probability
+        );
     }
 
     let reopen_probability = args.reopen_probability.unwrap_or(opts.reopen_probability);
@@ -436,7 +461,8 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_elle_tables(elle_tables)
         .with_workloads(workloads)
         .with_properties(properties)
-        .with_chaotic_profiles(chaotic_profiles);
+        .with_chaotic_profiles(chaotic_profiles)
+        .with_allocation_fault_probability(args.allocation_fault_probability);
 
     Ok(opts)
 }

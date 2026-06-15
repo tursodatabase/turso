@@ -49,6 +49,7 @@ pub struct MultiprocessOpts {
     pub restart_probability: f64,
     pub history_output: Option<PathBuf>,
     pub keep_files: bool,
+    pub allocation_fault_probability: f64,
 }
 
 struct OperationHistoryWriter {
@@ -223,6 +224,8 @@ pub struct MultiprocessWhopper {
     kill_probability: f64,
     restart_probability: f64,
     keep_files: bool,
+    allocation_faults_enabled: bool,
+    allocation_fault_probability: f64,
 }
 
 impl MultiprocessWhopper {
@@ -242,6 +245,8 @@ impl MultiprocessWhopper {
             rng.next_u64()
         });
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let allocation_faults_enabled =
+            crate::allocation_fault::validate_probability(opts.allocation_fault_probability)?;
 
         // Create database file on disk.
         // Use an atomic counter alongside the timestamp to guarantee uniqueness
@@ -339,6 +344,8 @@ impl MultiprocessWhopper {
                 &db_path,
                 opts.enable_mvcc,
                 opts.connections_per_process,
+                opts.allocation_fault_probability,
+                allocation_fault_worker_seed(seed, process_idx),
             )?;
             debug!("process {} ready: {:?}", handle.process_idx, telemetry);
             history.record(&HistoryEvent::WorkerSpawned {
@@ -387,6 +394,8 @@ impl MultiprocessWhopper {
             kill_probability: opts.kill_probability,
             restart_probability: opts.restart_probability,
             keep_files: opts.keep_files,
+            allocation_faults_enabled,
+            allocation_fault_probability: opts.allocation_fault_probability,
         })
     }
 
@@ -585,8 +594,14 @@ impl MultiprocessWhopper {
     ) -> anyhow::Result<(WorkerStartupTelemetry, OpResult)> {
         let sql = sql.into();
         let probe_worker_id = self.processes.len();
-        let (mut worker, telemetry) =
-            spawn_ready_worker(probe_worker_id, &self.db_path, self.enable_mvcc, 1)?;
+        let (mut worker, telemetry) = spawn_ready_worker(
+            probe_worker_id,
+            &self.db_path,
+            self.enable_mvcc,
+            1,
+            self.allocation_fault_probability,
+            allocation_fault_worker_seed(self.seed, probe_worker_id),
+        )?;
 
         let result = (|| -> anyhow::Result<OpResult> {
             for _ in 0..8 {
@@ -679,6 +694,8 @@ impl MultiprocessWhopper {
                 &self.db_path,
                 self.enable_mvcc,
                 self.connections_per_process,
+                self.allocation_fault_probability,
+                allocation_fault_worker_seed(self.seed, process_idx),
             )?;
             self.history.record(&HistoryEvent::WorkerSpawned {
                 step: Some(self.current_step),
@@ -973,7 +990,11 @@ impl MultiprocessWhopper {
             let in_tx = self.connection_states[connection_idx]
                 .fiber_state
                 .is_in_tx();
-            match crate::error_handling::classify_op_error(error, in_tx) {
+            match crate::error_handling::classify_op_error(
+                error,
+                in_tx,
+                self.allocation_faults_enabled,
+            ) {
                 crate::error_handling::ErrorAction::Rollback => {
                     debug!(
                         "connection {}: auto-rollback after {:?}",
@@ -1137,6 +1158,8 @@ impl MultiprocessWhopper {
             &self.db_path,
             self.enable_mvcc,
             self.connections_per_process,
+            self.allocation_fault_probability,
+            allocation_fault_worker_seed(self.seed, location.process_idx),
         )?;
         self.history.record(&HistoryEvent::WorkerSpawned {
             step: Some(self.current_step),
@@ -1205,8 +1228,17 @@ fn spawn_ready_worker(
     db_path: &Path,
     enable_mvcc: bool,
     connections_per_process: usize,
+    allocation_fault_probability: f64,
+    allocation_fault_seed: u64,
 ) -> anyhow::Result<(WorkerProcessHandle, WorkerStartupTelemetry)> {
-    let mut handle = spawn_worker(process_idx, db_path, enable_mvcc, connections_per_process)?;
+    let mut handle = spawn_worker(
+        process_idx,
+        db_path,
+        enable_mvcc,
+        connections_per_process,
+        allocation_fault_probability,
+        allocation_fault_seed,
+    )?;
     let response = recv_response(&mut handle)?;
     match response {
         WorkerResponse::Ready { telemetry } => Ok((handle, telemetry)),
@@ -1224,6 +1256,8 @@ fn spawn_worker(
     db_path: &Path,
     enable_mvcc: bool,
     connections_per_process: usize,
+    allocation_fault_probability: f64,
+    allocation_fault_seed: u64,
 ) -> anyhow::Result<WorkerProcessHandle> {
     let exe = worker_executable()?;
     let mut cmd = Command::new(&exe);
@@ -1232,6 +1266,10 @@ fn spawn_worker(
         .arg(db_path)
         .arg("--connections-per-process")
         .arg(connections_per_process.to_string())
+        .arg("--allocation-fault-probability")
+        .arg(allocation_fault_probability.to_string())
+        .arg("--allocation-fault-seed")
+        .arg(allocation_fault_seed.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -1254,6 +1292,10 @@ fn spawn_worker(
         responses,
         process_idx,
     })
+}
+
+fn allocation_fault_worker_seed(seed: u64, process_idx: usize) -> u64 {
+    seed ^ ((process_idx as u64).wrapping_add(1)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 fn worker_executable() -> anyhow::Result<PathBuf> {

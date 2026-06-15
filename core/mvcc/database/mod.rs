@@ -1,12 +1,13 @@
-use crate::alloc::TursoTryWithCapacityExt;
+use crate::alloc::{TursoAllocator, TursoTryWithCapacityExt};
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::{Schema, Sequence, Table};
+use crate::skiplist::comparator::BasicComparator;
 use crate::skiplist::map::Entry;
-use crate::skiplist::SkipMap;
+use crate::skiplist::{SkipMap, SkiplistAllocator};
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
 use crate::state_machine::TransitionResult;
@@ -109,6 +110,11 @@ pub struct MVTableId(i64);
 
 /// The versions of a single row
 pub type RowVersions = Arc<RwLock<Vec<RowVersion>>>;
+
+/// Per-index map of sortable keys to their version chains, stored as the
+/// values of [`MvStore::index_rows`].
+pub type IndexRowsMap<A = TursoAllocator> =
+    SkipMap<Arc<SortableIndexKey>, RowVersions, BasicComparator, A>;
 
 impl MVTableId {
     pub fn new(value: i64) -> Self {
@@ -547,8 +553,8 @@ struct PortableTableRef {
 }
 
 #[cfg(feature = "conn_raw_api")]
-fn rootpage_for_mv_table_id<Clock: LogicalClock>(
-    mvcc_store: &MvStore<Clock>,
+fn rootpage_for_mv_table_id<Clock: LogicalClock, A: SkiplistAllocator>(
+    mvcc_store: &MvStore<Clock, A>,
     table_id: MVTableId,
 ) -> i64 {
     mvcc_store
@@ -560,9 +566,9 @@ fn rootpage_for_mv_table_id<Clock: LogicalClock>(
 }
 
 #[cfg(feature = "conn_raw_api")]
-fn portable_table_name_for_mv_table_id<Clock: LogicalClock>(
+fn portable_table_name_for_mv_table_id<Clock: LogicalClock, A: SkiplistAllocator>(
     connection: &Connection,
-    mvcc_store: &MvStore<Clock>,
+    mvcc_store: &MvStore<Clock, A>,
     table_id: MVTableId,
 ) -> Option<String> {
     let rootpage = rootpage_for_mv_table_id(mvcc_store, table_id);
@@ -583,9 +589,9 @@ fn portable_table_name_for_mv_table_id<Clock: LogicalClock>(
 }
 
 #[cfg(feature = "conn_raw_api")]
-fn portable_delete_op_extension_for_row_version<Clock: LogicalClock>(
+fn portable_delete_op_extension_for_row_version<Clock: LogicalClock, A: SkiplistAllocator>(
     connection: &Connection,
-    mvcc_store: &MvStore<Clock>,
+    mvcc_store: &MvStore<Clock, A>,
     row_version: &RowVersion,
 ) -> Result<Option<Vec<u8>>> {
     if !connection.portable_logical_changes_enabled() {
@@ -1223,7 +1229,7 @@ impl AtomicTransactionState {
 }
 
 #[allow(clippy::large_enum_variant)]
-pub enum CommitState<Clock: LogicalClock> {
+pub enum CommitState<Clock: LogicalClock, A: SkiplistAllocator = TursoAllocator> {
     Initial,
     Commit {
         end_ts: u64,
@@ -1261,7 +1267,7 @@ pub enum CommitState<Clock: LogicalClock> {
     Checkpoint {
         // TODO: if and when we transform this code to async we won't be needing this explicit state machine nor
         // the mutex
-        state_machine: Mutex<StateMachine<CheckpointStateMachine<Clock>>>,
+        state_machine: Mutex<StateMachine<CheckpointStateMachine<Clock, A>>>,
     },
     CommitEnd {
         end_ts: u64,
@@ -1391,7 +1397,9 @@ fn commit_yield_key(tx_id: u64) -> u64 {
 }
 
 #[cfg(any(test, injected_yields))]
-impl<Clock: LogicalClock> ProvidesYieldContext for CommitStateMachine<Clock> {
+impl<Clock: LogicalClock, A: SkiplistAllocator> ProvidesYieldContext
+    for CommitStateMachine<Clock, A>
+{
     fn yield_context(&self) -> YieldContext {
         YieldContext::new(
             self.connection.yield_injector(),
@@ -1402,14 +1410,14 @@ impl<Clock: LogicalClock> ProvidesYieldContext for CommitStateMachine<Clock> {
     }
 }
 
-pub struct CommitStateMachine<Clock: LogicalClock> {
-    state: CommitState<Clock>,
+pub struct CommitStateMachine<Clock: LogicalClock, A: SkiplistAllocator = TursoAllocator> {
+    state: CommitState<Clock, A>,
     is_finalized: bool,
     #[cfg(any(test, injected_yields))]
     yield_instance_id: u64,
     did_commit_schema_change: bool,
     tx_id: TxID,
-    mvcc_store: Arc<MvStore<Clock>>,
+    mvcc_store: Arc<MvStore<Clock, A>>,
     connection: Arc<Connection>,
     /// Database index this commit is for (`MAIN_DB_ID` or an attached-db id).
     /// Threaded through so that `finish_committed_tx` can clear the matching
@@ -1425,7 +1433,7 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     _phantom: PhantomData<Clock>,
 }
 
-impl<Clock: LogicalClock> Debug for CommitStateMachine<Clock> {
+impl<Clock: LogicalClock, A: SkiplistAllocator> Debug for CommitStateMachine<Clock, A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CommitStateMachine")
             .field("state", &self.state)
@@ -1434,7 +1442,7 @@ impl<Clock: LogicalClock> Debug for CommitStateMachine<Clock> {
     }
 }
 
-impl<Clock: LogicalClock> Drop for CommitStateMachine<Clock> {
+impl<Clock: LogicalClock, A: SkiplistAllocator> Drop for CommitStateMachine<Clock, A> {
     fn drop(&mut self) {
         self.cleanup_unfinished_commit();
     }
@@ -1466,7 +1474,7 @@ pub struct DeleteRowStateMachine {
     cursor: Arc<RwLock<BTreeCursor>>,
 }
 
-impl<Clock: LogicalClock> CommitStateMachine<Clock> {
+impl<Clock: LogicalClock, A: SkiplistAllocator> CommitStateMachine<Clock, A> {
     pub(crate) fn cleanup_mvcc_checkpoint_state(&mut self) {
         if let CommitState::Checkpoint { state_machine } = &mut self.state {
             let _ = state_machine
@@ -1481,9 +1489,9 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
 
     #[allow(clippy::too_many_arguments)]
     fn new(
-        state: CommitState<Clock>,
+        state: CommitState<Clock, A>,
         tx_id: TxID,
-        mvcc_store: Arc<MvStore<Clock>>,
+        mvcc_store: Arc<MvStore<Clock, A>>,
         connection: Arc<Connection>,
         db_id: usize,
         commit_coordinator: Arc<CommitCoordinator>,
@@ -1579,7 +1587,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         rowid: &RowID,
         end_ts: u64,
         tx: &Transaction,
-        mvcc_store: &Arc<MvStore<Clock>>,
+        mvcc_store: &Arc<MvStore<Clock, A>>,
     ) -> Result<()> {
         let row_versions = mvcc_store.rows.get(rowid);
         if row_versions.is_none() {
@@ -1603,7 +1611,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         rowid: &RowID,
         end_ts: u64,
         tx: &Transaction,
-        mvcc_store: &Arc<MvStore<Clock>>,
+        mvcc_store: &Arc<MvStore<Clock, A>>,
     ) -> Result<()> {
         let RowKey::Record(record) = &rowid.row_id else {
             panic!("invalid index row_id type, should be Record")
@@ -1664,7 +1672,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         &self,
         end_ts: u64,
         tx: &Transaction,
-        mvcc_store: &Arc<MvStore<Clock>>,
+        mvcc_store: &Arc<MvStore<Clock, A>>,
         row_versions: &[RowVersion],
     ) -> Result<()> {
         // Check for conflicts - iterate in reverse for faster early termination
@@ -1827,7 +1835,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     /// in two passes so that log replay sees CREATE TABLE before INSERTs.
     fn step_build_log_record(
         &mut self,
-        mvcc_store: &Arc<MvStore<Clock>>,
+        mvcc_store: &Arc<MvStore<Clock, A>>,
     ) -> Result<TransitionResult<()>> {
         // First entry into BuildLogRecord (no chunk processed yet): a yield-
         // point to bracket the chunked yields so tests can count them exactly.
@@ -2237,7 +2245,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
 
     fn populate_portable_changes(
         &self,
-        mvcc_store: &Arc<MvStore<Clock>>,
+        mvcc_store: &Arc<MvStore<Clock, A>>,
         log_record: &mut LogRecord,
     ) -> Result<()> {
         #[cfg(not(feature = "conn_raw_api"))]
@@ -2484,7 +2492,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     /// references resolve via `txs[tx_id]` for visibility/conflict checks.
     fn step_rewrite_live_versions(
         &mut self,
-        mvcc_store: &Arc<MvStore<Clock>>,
+        mvcc_store: &Arc<MvStore<Clock, A>>,
     ) -> Result<TransitionResult<()>> {
         let tx_id = self.tx_id;
         let tx_entry = mvcc_store.txs.get(&tx_id);
@@ -2554,8 +2562,8 @@ impl WriteRowStateMachine {
     }
 }
 
-impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
-    type Context = Arc<MvStore<Clock>>;
+impl<Clock: LogicalClock, A: SkiplistAllocator> StateTransition for CommitStateMachine<Clock, A> {
+    type Context = Arc<MvStore<Clock, A>>;
     type SMResult = ();
 
     #[tracing::instrument(fields(state = ?self.state), skip(self, mvcc_store), level = Level::DEBUG)]
@@ -2782,7 +2790,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                     }
                     mvcc_store.unlock_commit_lock_if_held(tx);
-                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
+                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -2862,7 +2870,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                         self.commit_coordinator.pager_commit_lock.unlock();
                     }
-                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
+                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -3132,7 +3140,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     mvcc_store.release_exclusive_tx(&self.tx_id);
                 }
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
-                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
+                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                 if mvcc_store.storage.should_checkpoint() {
                     let state_machine = StateMachine::new(CheckpointStateMachine::new(
@@ -3667,9 +3675,13 @@ pub struct RecoverCtx {
 }
 
 /// A multi-version concurrency control database.
+///
+/// Generic over the skiplist allocator so tests can inject a failing
+/// allocator and exercise allocation-failure paths; production code uses
+/// the default [`TursoAllocator`].
 #[derive(Debug)]
-pub struct MvStore<Clock: LogicalClock> {
-    pub rows: SkipMap<RowID, Arc<RwLock<Vec<RowVersion>>>>,
+pub struct MvStore<Clock: LogicalClock, A: SkiplistAllocator = TursoAllocator> {
+    pub rows: SkipMap<RowID, Arc<RwLock<Vec<RowVersion>>>, BasicComparator, A>,
     /// Table ID is an opaque identifier that is only meaningful to the MV store.
     /// Each checkpointed MVCC table corresponds to a single B-tree on the pager,
     /// which naturally has a root page.
@@ -3681,15 +3693,18 @@ pub struct MvStore<Clock: LogicalClock> {
     /// Hence, we store the mapping here.
     /// The value is Option because tables created in an MVCC commit that have not
     /// been checkpointed yet have no real root page assigned yet.
-    pub table_id_to_rootpage: SkipMap<MVTableId, Option<u64>>,
+    pub table_id_to_rootpage: SkipMap<MVTableId, Option<u64>, BasicComparator, A>,
     /// Unlike table rows which are stored in a single map, we have a separate map for every index
     /// because operations like last() on an index are much easier when we don't have to take the
     /// table identifier into account.
-    pub index_rows: SkipMap<MVTableId, SkipMap<Arc<SortableIndexKey>, RowVersions>>,
-    txs: SkipMap<TxID, Transaction>,
+    pub index_rows: SkipMap<MVTableId, IndexRowsMap<A>, BasicComparator, A>,
+    txs: SkipMap<TxID, Transaction, BasicComparator, A>,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
-    finalized_tx_states: SkipMap<TxID, TransactionState>,
+    finalized_tx_states: SkipMap<TxID, TransactionState, BasicComparator, A>,
+    /// Allocator backing every skiplist in this store, including lazily
+    /// created per-index maps in `index_rows`.
+    alloc: A,
     tx_ids: AtomicU64,
     version_id_counter: AtomicU64,
     next_rowid: AtomicU64,
@@ -3752,6 +3767,16 @@ pub struct MvStore<Clock: LogicalClock> {
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
+    /// Creates a new database backed by the default [`TursoAllocator`].
+    pub fn new(
+        clock: Clock,
+        storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
+    ) -> Result<Self> {
+        Self::new_in(clock, storage, TursoAllocator)
+    }
+}
+
+impl<Clock: LogicalClock, A: SkiplistAllocator> MvStore<Clock, A> {
     fn uses_durable_mvcc_metadata(&self, connection: &Arc<Connection>) -> bool {
         !connection.db.is_in_memory_db()
     }
@@ -3798,17 +3823,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         *connection.db.schema.lock() = connection.schema.read().clone();
     }
 
-    /// Creates a new database.
-    pub fn new(
+    /// Creates a new database whose skiplists allocate through `alloc`.
+    pub fn new_in(
         clock: Clock,
         storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
-    ) -> Self {
-        Self {
-            rows: SkipMap::new(),
-            table_id_to_rootpage: SkipMap::from_iter(vec![(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1))]), // table id 1 / root page 1 is always sqlite_schema.
-            index_rows: SkipMap::new(),
-            txs: SkipMap::new(),
-            finalized_tx_states: SkipMap::new(),
+        alloc: A,
+    ) -> Result<Self> {
+        let table_id_to_rootpage = SkipMap::new_in(alloc.clone());
+        // table id 1 / root page 1 is always sqlite_schema.
+        table_id_to_rootpage.try_insert(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1))?;
+        Ok(Self {
+            rows: SkipMap::new_in(alloc.clone()),
+            table_id_to_rootpage,
+            index_rows: SkipMap::new_in(alloc.clone()),
+            txs: SkipMap::new_in(alloc.clone()),
+            finalized_tx_states: SkipMap::new_in(alloc.clone()),
+            alloc,
             tx_ids: AtomicU64::new(1), // let's reserve transaction 0 for special purposes
             version_id_counter: AtomicU64::new(1), // Reserve 0 for special purposes
             next_rowid: AtomicU64::new(0), // TODO: determine this from B-Tree
@@ -3826,7 +3856,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
             sequence_watermarks: Mutex::new(HashMap::default()),
             sequence_allocations: Mutex::new(HashMap::default()),
-        }
+        })
     }
 
     /// Get the table ID from the root page.
@@ -3853,8 +3883,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     /// Insert a table ID and root page mapping.
     /// Root page must be positive here, because we only invoke this method with Some() for checkpointed tables.
-    pub fn insert_table_id_to_rootpage(&self, table_id: MVTableId, root_page: Option<u64>) {
-        self.table_id_to_rootpage.insert(table_id, root_page);
+    pub fn insert_table_id_to_rootpage(
+        &self,
+        table_id: MVTableId,
+        root_page: Option<u64>,
+    ) -> Result<()> {
+        self.table_id_to_rootpage.try_insert(table_id, root_page)?;
         let minimum: i64 = if let Some(root_page) = root_page {
             // On recovery, we assign table_id = -root_page. Let's make sure we don't get any clashes between checkpointed and non-checkpointed tables
             // E.g. if we checkpoint a table that has physical root page 7, let's require the next table_id to be less than -7 (or if table_id is already smaller, then smaller than that.)
@@ -3866,6 +3900,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         if minimum <= self.next_table_id.load(Ordering::SeqCst) {
             self.next_table_id.store(minimum - 1, Ordering::SeqCst);
         }
+        Ok(())
     }
 
     pub fn remove_table_id_to_rootpage(&self, table_id: &MVTableId) {
@@ -3965,10 +4000,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
         self.table_id_to_rootpage.clear();
         self.table_id_to_last_rowid.write().clear();
-        self.insert_table_id_to_rootpage(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1));
+        // This runs after the VACUUM image is committed, where failure cannot
+        // be rolled back; a lost mapping would corrupt every later lookup.
+        self.insert_table_id_to_rootpage(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1))
+            .expect("post-VACUUM rootpage mapping rebuild must not fail");
         for root_page in root_pages {
             let table_id = MVTableId::from(-root_page);
-            self.insert_table_id_to_rootpage(table_id, Some(root_page as u64));
+            self.insert_table_id_to_rootpage(table_id, Some(root_page as u64))
+                .expect("post-VACUUM rootpage mapping rebuild must not fail");
         }
         self.global_header.write().replace(header);
     }
@@ -4360,7 +4399,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         for root_page in sqlite_schema_root_pages {
             turso_assert!(root_page > 0, "root_page={root_page} must be positive");
             let root_page_as_table_id = MVTableId::from(-(root_page));
-            self.insert_table_id_to_rootpage(root_page_as_table_id, Some(root_page as u64));
+            self.insert_table_id_to_rootpage(root_page_as_table_id, Some(root_page as u64))?;
         }
         Ok(())
     }
@@ -4426,7 +4465,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 // returns the canonical Arc (ours on miss, an existing one
                 // on hit), which we hand to savepoint tracking.
                 let (canonical_key, row_versions) =
-                    self.insert_index_version(index_id, sortable_key, row_version);
+                    self.insert_index_version(index_id, sortable_key, row_version)?;
                 tx.insert_to_write_set(
                     RowID::new(id.table_id, RowKey::Record(canonical_key.clone())),
                     row_versions,
@@ -4449,10 +4488,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     row,
                     btree_resident: false,
                 };
+                // The fallible chain insert goes first: if it fails, no
+                // savepoint tracking, rowid-allocator, or write-set state may
+                // reference a version that never landed.
+                let row_versions = self.insert_version(id.clone(), row_version)?;
                 tx.record_created_table_version(id.clone(), version_id);
                 let allocator = self.get_rowid_allocator(&id.table_id);
                 allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
-                let row_versions = self.insert_version(id.clone(), row_version);
                 tx.insert_to_write_set(id, row_versions);
             }
         }
@@ -4489,7 +4531,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     panic!("Index writes must be to a record");
                 };
                 let (canonical_key, row_versions) =
-                    self.insert_index_version(index_id, sortable_key, row_version);
+                    self.insert_index_version(index_id, sortable_key, row_version)?;
                 tx.insert_to_write_set(
                     RowID::new(id.table_id, RowKey::Record(canonical_key.clone())),
                     row_versions,
@@ -4497,8 +4539,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 tx.record_created_index_version((index_id, canonical_key), version_id);
             }
             None => {
+                let row_versions = self.insert_version(id.clone(), row_version)?;
                 tx.record_created_table_version(id.clone(), version_id);
-                let row_versions = self.insert_version(id.clone(), row_version);
                 tx.insert_to_write_set(id, row_versions);
             }
         }
@@ -4543,7 +4585,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     panic!("Index writes must be to a record");
                 };
                 let (canonical_key, row_versions) =
-                    self.insert_index_version(index_id, sortable_key, row_version);
+                    self.insert_index_version(index_id, sortable_key, row_version)?;
                 tx.insert_to_write_set(
                     RowID::new(id.table_id, RowKey::Record(canonical_key.clone())),
                     row_versions,
@@ -4561,8 +4603,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     row,
                     btree_resident: true,
                 };
+                let row_versions = self.insert_version(id.clone(), row_version)?;
                 tx.record_created_table_version(id.clone(), version_id);
-                let row_versions = self.insert_version(id.clone(), row_version);
                 tx.insert_to_write_set(id, row_versions);
             }
         }
@@ -4653,7 +4695,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tracing::trace!("delete(tx_id={}, id={:?})", tx_id, id);
         match maybe_index_id {
             Some(index_id) => {
-                let rows = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
+                let rows = self.index_rows_map(index_id)?;
                 let rows = rows.value();
                 let RowKey::Record(sortable_key) = id.row_id.clone() else {
                     panic!("Index deletes must have a record row_id");
@@ -4769,7 +4811,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         turso_assert_eq!(tx.state, TransactionState::Active);
         match maybe_index_id {
             Some(index_id) => {
-                let rows = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
+                let rows = self.index_rows_map(index_id)?;
                 let rows = rows.value();
                 let RowKey::Record(sortable_key) = &id.row_id else {
                     panic!("Index reads must have a record row_id");
@@ -4869,7 +4911,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub(crate) fn advance_cursor_and_get_row_id_for_table(
         &self,
         table_id: MVTableId,
-        mv_store_iterator: &mut Option<MvccIterator<'static, RowID>>,
+        mv_store_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
         tx_id: TxID,
     ) -> Option<(RowID, RowVersions)> {
         let mv_store_iterator = mv_store_iterator.as_mut().expect(
@@ -4904,7 +4946,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     pub(crate) fn advance_cursor_and_get_row_id_for_index(
         &self,
-        mv_store_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>>>,
+        mv_store_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
         tx_id: TxID,
     ) -> Option<RowID> {
         let mv_store_iterator = mv_store_iterator.as_mut().expect(
@@ -4956,7 +4998,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 !btree_is_invalid
             }
             RowKey::Record(record) => {
-                let index_rows = self.index_rows.get_or_insert_with(table_id, SkipMap::new);
+                // Pure read: an absent per-index map means no MVCC versions.
+                let Some(index_rows) = self.index_rows.get(&table_id) else {
+                    return true;
+                };
                 let index_rows = index_rows.value();
                 let Some(versions) = index_rows.get(record.as_ref()) else {
                     // No MVCC version -> B-tree is valid
@@ -4977,7 +5022,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn find_last_visible_version(
         &self,
         tx: &Transaction,
-        row: &Entry<'_, RowID, Arc<RwLock<Vec<RowVersion>>>>,
+        row: &Entry<'_, RowID, Arc<RwLock<Vec<RowVersion>>>, BasicComparator, A>,
     ) -> Option<(RowID, RowVersions)> {
         row.value()
             .read()
@@ -4990,7 +5035,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn find_last_visible_index_version(
         &self,
         tx: &Transaction,
-        row: Entry<'_, Arc<SortableIndexKey>, Arc<RwLock<Vec<RowVersion>>>>,
+        row: Entry<'_, Arc<SortableIndexKey>, Arc<RwLock<Vec<RowVersion>>>, BasicComparator, A>,
     ) -> Option<RowID> {
         row.value()
             .read()
@@ -5007,6 +5052,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 'a,
                 Arc<SortableIndexKey>,
                 Arc<RwLock<Vec<RowVersion>>>,
+                BasicComparator,
+                A,
             >,
         >,
     {
@@ -5025,7 +5072,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         table_id: MVTableId,
     ) -> Option<(RowID, RowVersions)>
     where
-        I: Iterator<Item = Entry<'a, RowID, Arc<RwLock<Vec<RowVersion>>>>>,
+        I: Iterator<Item = Entry<'a, RowID, Arc<RwLock<Vec<RowVersion>>>, BasicComparator, A>>,
     {
         loop {
             let row = rows.next()?;
@@ -5044,7 +5091,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         inclusive: bool,
         direction: IterationDirection,
         tx_id: TxID,
-        table_iterator: &mut Option<MvccIterator<'static, RowID>>,
+        table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
     ) -> Option<RowID> {
         let table_id = start.table_id;
         let iter_box = {
@@ -5057,19 +5104,33 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             match direction {
                 IterationDirection::Forwards => Box::new(self.rows.range(range))
                     as Box<
-                        dyn Iterator<Item = Entry<'_, RowID, Arc<RwLock<Vec<RowVersion>>>>>
-                            + Send
+                        dyn Iterator<
+                                Item = Entry<
+                                    '_,
+                                    RowID,
+                                    Arc<RwLock<Vec<RowVersion>>>,
+                                    BasicComparator,
+                                    A,
+                                >,
+                            > + Send
                             + Sync,
                     >,
                 IterationDirection::Backwards => Box::new(self.rows.range(range).rev())
                     as Box<
-                        dyn Iterator<Item = Entry<'_, RowID, Arc<RwLock<Vec<RowVersion>>>>>
-                            + Send
+                        dyn Iterator<
+                                Item = Entry<
+                                    '_,
+                                    RowID,
+                                    Arc<RwLock<Vec<RowVersion>>>,
+                                    BasicComparator,
+                                    A,
+                                >,
+                            > + Send
                             + Sync,
                     >,
             }
         };
-        *table_iterator = Some(static_iterator_hack!(iter_box, RowID));
+        *table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
 
         let mv_store_iterator = table_iterator
             .as_mut()
@@ -5092,9 +5153,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         inclusive: bool,
         direction: IterationDirection,
         tx_id: TxID,
-        index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>>>,
-    ) -> Option<RowID> {
-        let index_rows = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
+        index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
+    ) -> Result<Option<RowID>> {
+        // The iterator handed back to the cursor borrows the per-index map
+        // entry, so an absent map must still be created here (lazily) to keep
+        // iterator state consistent with later inserts.
+        let index_rows = self.index_rows_map(index_id)?;
         let index_rows = index_rows.value();
         let start = if inclusive {
             Bound::Included(start)
@@ -5106,19 +5170,31 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             IterationDirection::Forwards => Box::new(index_rows.range(range))
                 as Box<
                     dyn Iterator<
-                            Item = Entry<'_, Arc<SortableIndexKey>, Arc<RwLock<Vec<RowVersion>>>>,
+                            Item = Entry<
+                                '_,
+                                Arc<SortableIndexKey>,
+                                Arc<RwLock<Vec<RowVersion>>>,
+                                BasicComparator,
+                                A,
+                            >,
                         > + Send
                         + Sync,
                 >,
             IterationDirection::Backwards => Box::new(index_rows.range(range).rev())
                 as Box<
                     dyn Iterator<
-                            Item = Entry<'_, Arc<SortableIndexKey>, Arc<RwLock<Vec<RowVersion>>>>,
+                            Item = Entry<
+                                '_,
+                                Arc<SortableIndexKey>,
+                                Arc<RwLock<Vec<RowVersion>>>,
+                                BasicComparator,
+                                A,
+                            >,
                         > + Send
                         + Sync,
                 >,
         };
-        *index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>));
+        *index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A));
         let mv_store_iterator = index_iterator
             .as_mut()
             .expect("index_iterator was assigned above if it was None");
@@ -5128,7 +5204,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx.value();
-        self.find_next_visible_index_row(tx, mv_store_iterator)
+        Ok(self.find_next_visible_index_row(tx, mv_store_iterator))
     }
 
     /// Begins an exclusive write transaction that prevents concurrent writes.
@@ -5248,13 +5324,24 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let tx = Transaction::new(tx_id, begin_ts, header);
         tx.pager_commit_lock_held.store(true, Ordering::Release);
+        if let Err(e) = self.txs.try_insert(tx_id, tx) {
+            // Release everything acquired above, mirroring the vanished-tx
+            // bail-out: the transaction was never published.
+            if !already_holds_commit_lock {
+                self.commit_coordinator.pager_commit_lock.unlock();
+            }
+            if !already_exclusive {
+                self.release_exclusive_tx(&tx_id);
+            }
+            unlock_checkpoint_guard();
+            return Err(e.into());
+        }
         tracing::trace!(
             "begin_exclusive_tx(tx_id={}, begin_ts={}) - exclusive write logical log transaction",
             tx_id,
             begin_ts
         );
         tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
-        self.txs.insert(tx_id, tx);
         Ok(tx_id)
     }
 
@@ -5275,21 +5362,30 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let header = self.get_new_transaction_database_header(&pager);
         let tx = Transaction::new(tx_id, begin_ts, header);
         tracing::trace!("begin_tx(tx_id={}, begin_ts={})", tx_id, begin_ts);
-        self.txs.insert(tx_id, tx);
+        if let Err(e) = self.txs.try_insert(tx_id, tx) {
+            // The transaction was never published, so release the
+            // blocking-checkpoint read guard acquired above (normally
+            // released by `remove_tx`).
+            self.blocking_checkpoint_lock.unlock();
+            return Err(e.into());
+        }
 
         Ok(tx_id)
     }
 
-    pub fn remove_tx(&self, tx_id: TxID) {
-        self.remove_sequence_allocations(tx_id);
+    pub fn remove_tx(&self, tx_id: TxID) -> Result<()> {
         if let Some(entry) = self.txs.get(&tx_id) {
             let tx = entry.value();
             if let TransactionState::Committed(commit_ts) = tx.state.load() {
                 // Read-only transactions cannot leave row versions with stale TxID
                 // references, so they do not need finalized-state caching.
                 if !tx.write_set.lock().is_empty() {
+                    // Must land before the tx leaves `txs`: bailing out here
+                    // keeps the tx (and its checkpoint guard) alive, whereas
+                    // removing it anyway would strand stale TxID references
+                    // with no resolvable state.
                     self.finalized_tx_states
-                        .insert(tx_id, TransactionState::Committed(commit_ts));
+                        .try_insert(tx_id, TransactionState::Committed(commit_ts))?;
                 }
             }
             let dep_set = std::mem::take(&mut *tx.commit_dep_set.lock());
@@ -5302,8 +5398,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 "remove_tx({tx_id}): commit_dep_set is not empty"
             );
         }
+        self.remove_sequence_allocations(tx_id);
         self.txs.remove(&tx_id);
         self.blocking_checkpoint_lock.unlock();
+        Ok(())
     }
 
     pub fn register_sequence_allocation(
@@ -5325,7 +5423,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let sequence_name = crate::util::normalize_ident(sequence_name);
         let mut allocations = self.sequence_allocations.lock();
+        if !allocations.contains_key(&sequence_name) {
+            allocations.try_reserve(1)?;
+        }
         let tx_allocations = allocations.entry(sequence_name).or_default();
+        if !tx_allocations.contains_key(&tx_id) {
+            tx_allocations.try_reserve(1)?;
+        }
         tx_allocations
             .entry(tx_id)
             .and_modify(|value| *value = (*value).min(sequence_value))
@@ -5333,11 +5437,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(())
     }
 
-    pub fn set_sequence_watermark(&self, sequence_name: &str, watermark: i64) {
+    pub fn set_sequence_watermark(&self, sequence_name: &str, watermark: i64) -> Result<()> {
         let sequence_name = crate::util::normalize_ident(sequence_name);
-        self.sequence_watermarks
-            .lock()
-            .insert(sequence_name, watermark);
+        let mut watermarks = self.sequence_watermarks.lock();
+        if !watermarks.contains_key(&sequence_name) {
+            watermarks.try_reserve(1)?;
+        }
+        watermarks.insert(sequence_name, watermark);
+        Ok(())
     }
 
     /// Returns the first sequence value that is not safe for cursor scans to pass.
@@ -5345,7 +5452,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Readers can safely consume rows with sequence values less than this
     /// watermark. The value is the minimum of the current sequence boundary and
     /// any lower value already allocated by an active transaction.
-    pub fn sequence_watermark(&self, sequence_name: &str) -> Option<i64> {
+    pub fn sequence_watermark(&self, sequence_name: &str) -> Result<Option<i64>> {
         let sequence_name = crate::util::normalize_ident(sequence_name);
         let mut allocations = self.sequence_allocations.lock();
         let mut remove_allocations = false;
@@ -5373,9 +5480,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
         let current_watermark = self.sequence_watermarks.lock().get(&sequence_name).copied();
         match (current_watermark, active_watermark) {
-            (Some(current), Some(active)) => Some(current.min(active)),
-            (Some(current), None) => Some(current),
-            (None, active) => active,
+            (Some(current), Some(active)) => Ok(Some(current.min(active))),
+            (Some(current), None) => Ok(Some(current)),
+            (None, active) => Ok(active),
         }
     }
 
@@ -5399,9 +5506,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Use this anywhere the commit state machine would otherwise call
     /// `remove_tx` directly. Other call sites that don't have a connection
     /// context (e.g. tests poking internal state) keep using `remove_tx`.
-    pub fn finish_committed_tx(&self, tx_id: TxID, conn: &Connection, db_id: usize) {
+    pub fn finish_committed_tx(&self, tx_id: TxID, conn: &Connection, db_id: usize) -> Result<()> {
         conn.set_mv_tx_for_db(db_id, None);
-        self.remove_tx(tx_id);
+        self.remove_tx(tx_id)
     }
 
     fn get_new_transaction_database_header(&self, pager: &Arc<Pager>) -> DatabaseHeader {
@@ -5525,7 +5632,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tx_id: TxID,
         connection: &Arc<Connection>,
         db_id: usize,
-    ) -> Result<StateMachine<Box<CommitStateMachine<Clock>>>> {
+    ) -> Result<StateMachine<Box<CommitStateMachine<Clock, A>>>> {
         let state = Box::new(CommitStateMachine::new(
             CommitState::Initial,
             tx_id,
@@ -5626,7 +5733,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // already completed its register_commit_dependency call (it runs under the
         // read lock), so no future txs.get() for this tx_id can come from a
         // speculative read path.
-        self.remove_tx(tx_id);
+        self.remove_tx(tx_id)
+            .expect("removing a Terminated tx caches no finalized state and cannot allocate");
     }
 
     fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
@@ -5642,7 +5750,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
                 }
-                self.finish_committed_tx(tx_id, connection, db_id);
+                if let Err(e) = self.finish_committed_tx(tx_id, connection, db_id) {
+                    // Drop-path cleanup cannot propagate. Leaving the
+                    // committed tx in `txs` is safe (readers still resolve
+                    // its state); it only delays garbage collection.
+                    tracing::error!(
+                        "cleanup_dropped_commit: failed to retire committed tx {tx_id}: {e}"
+                    );
+                }
             }
             Some(TransactionState::Aborted | TransactionState::Terminated) | None => {
                 if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
@@ -6293,13 +6408,30 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     /// Inserts a new row version into the database, while making sure that the row version
     /// is inserted in the correct order. Returns a reference to the modified version chain.
-    fn insert_version(&self, id: RowID, row_version: RowVersion) -> Arc<RwLock<Vec<RowVersion>>> {
+    ///
+    /// On allocation failure the chain is untouched: the fallible skiplist
+    /// insert happens before any version is appended.
+    fn insert_version(&self, id: RowID, row_version: RowVersion) -> Result<RowVersions> {
         let versions = self
             .rows
-            .get_or_insert_with(id, || Arc::new(RwLock::new(Vec::new())));
+            .try_get_or_insert_with(id, || Arc::new(RwLock::new(Vec::new())))?;
         let row_versions = versions.value().clone();
         self.insert_version_raw(&mut row_versions.write(), row_version);
-        row_versions
+        Ok(row_versions)
+    }
+
+    /// Returns the per-index map for `index_id`, lazily creating an empty one.
+    ///
+    /// Use this only when the entry must exist afterwards (e.g. an iterator
+    /// borrows it); pure reads should use `self.index_rows.get` and treat an
+    /// absent map as empty instead of allocating.
+    pub(crate) fn index_rows_map(
+        &self,
+        index_id: MVTableId,
+    ) -> Result<Entry<'_, MVTableId, IndexRowsMap<A>, BasicComparator, A>> {
+        Ok(self
+            .index_rows
+            .try_get_or_insert_with(index_id, || SkipMap::new_in(self.alloc.clone()))?)
     }
 
     /// Gets an existing Arc<SortableIndexKey> from the index if the key exists,
@@ -6309,7 +6441,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         index_id: MVTableId,
         key: Arc<SortableIndexKey>,
     ) -> Arc<SortableIndexKey> {
-        let index = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
+        // Pure read: an absent per-index map cannot hold an existing Arc.
+        let Some(index) = self.index_rows.get(&index_id) else {
+            return key;
+        };
         let index = index.value();
         let existing = index.get(&*key).map(|entry| entry.key().clone());
         existing.unwrap_or(key)
@@ -6322,10 +6457,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         index_id: MVTableId,
         key: Arc<SortableIndexKey>,
         mut row_version: RowVersion,
-    ) -> (Arc<SortableIndexKey>, RowVersions) {
-        let index = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
+    ) -> Result<(Arc<SortableIndexKey>, RowVersions)> {
+        // Both fallible skiplist inserts happen before the version is
+        // appended, so an allocation failure leaves every chain untouched.
+        // (A per-index map created by the first insert may be left behind
+        // empty if the second fails; empty slots are valid — lazy removal
+        // already leaves them around.)
+        let index = self.index_rows_map(index_id)?;
         let index = index.value();
-        let entry = index.get_or_insert_with(key, || Arc::new(RwLock::new(Vec::new())));
+        let entry = index.try_get_or_insert_with(key, || Arc::new(RwLock::new(Vec::new())))?;
         // The Arc that's actually stored in the SkipMap may be the one we
         // passed in (on miss) or a pre-existing one (on hit). Return that
         // canonical Arc so savepoint tracking and the SkipMap stay in sync.
@@ -6333,7 +6473,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         row_version.row.id.row_id = RowKey::Record(canonical_key.clone());
         let row_versions = entry.value().clone();
         self.insert_version_raw(&mut row_versions.write(), row_version);
-        (canonical_key, row_versions)
+        Ok((canonical_key, row_versions))
     }
 
     /// Inserts a new row version into the internal data structure for versions,
@@ -6434,7 +6574,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn get_last_table_rowid(
         &self,
         table_id: MVTableId,
-        table_iterator: &mut Option<MvccIterator<'static, RowID>>,
+        table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
         tx_id: TxID,
     ) -> Option<RowKey> {
         let tx = self
@@ -6448,7 +6588,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         };
         let range = create_seek_range(Bound::Included(max_rowid), IterationDirection::Backwards);
         let iter_box = Box::new(self.rows.range(range).rev());
-        *table_iterator = Some(static_iterator_hack!(iter_box, RowID));
+        *table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
         let iter = table_iterator
             .as_mut()
             .expect("table_iterator was assigned above");
@@ -6501,12 +6641,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         &self,
         index_id: MVTableId,
         tx_id: TxID,
-        index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>>>,
-    ) -> Option<RowKey> {
-        let index = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
+        index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
+    ) -> Result<Option<RowKey>> {
+        // Like `seek_index`, the escaping iterator borrows the per-index map
+        // entry, so an absent map is created lazily here.
+        let index = self.index_rows_map(index_id)?;
         let index = index.value();
         let iter_box = Box::new(index.iter().rev());
-        *index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>));
+        *index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A));
         let iter = index_iterator
             .as_mut()
             .expect("index_iterator was assigned above");
@@ -6515,8 +6657,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx.value();
-        self.find_next_visible_index_row(tx, iter)
-            .map(|row| row.row_id)
+        Ok(self
+            .find_next_visible_index_row(tx, iter)
+            .map(|row| row.row_id))
     }
 
     pub fn get_logical_log_file(&self) -> Arc<dyn File> {
@@ -7246,7 +7389,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                             panic!("Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}");
                                         }
                                     }
-                                    self.insert_table_id_to_rootpage(table_id, None);
+                                    self.insert_table_id_to_rootpage(table_id, None)?;
                                 } else {
                                     dropped_root_pages.remove(&root_page);
                                     let table_id = self.get_table_id_from_root_page(root_page);
@@ -7279,9 +7422,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             btree_resident,
                         };
                         {
-                            let versions = self.rows.get_or_insert_with(rowid.clone(), || {
-                                Arc::new(RwLock::new(Vec::new()))
-                            });
+                            let versions =
+                                self.rows.try_get_or_insert_with(rowid.clone(), || {
+                                    Arc::new(RwLock::new(Vec::new()))
+                                })?;
                             let mut versions = versions.value().write();
                             self.insert_version_raw(&mut versions, row_version);
                         }
@@ -7300,7 +7444,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
                             // See comment in UpsertTableRow: old logs may have data rows
                             // serialized before the schema INSERT that registers the table_id.
-                            self.insert_table_id_to_rootpage(rowid.table_id, None);
+                            self.insert_table_id_to_rootpage(rowid.table_id, None)?;
                         }
                         let tombstone_row = if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                             let rowid_int = rowid.row_id.to_int_or_panic();
@@ -7351,9 +7495,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 row: tombstone_row,
                                 btree_resident,
                             };
-                            let versions = self.rows.get_or_insert_with(rowid.clone(), || {
-                                Arc::new(RwLock::new(Vec::new()))
-                            });
+                            let versions =
+                                self.rows.try_get_or_insert_with(rowid.clone(), || {
+                                    Arc::new(RwLock::new(Vec::new()))
+                                })?;
                             let mut versions = versions.value().write();
                             self.insert_version_raw(&mut versions, row_version);
                         }
@@ -7410,7 +7555,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
                             panic!("Index writes must be to a record");
                         };
-                        self.insert_index_version(rowid.table_id, sortable_key, row_version);
+                        self.insert_index_version(rowid.table_id, sortable_key, row_version)?;
                     }
                     StreamingResult::DeleteIndexRow {
                         row,
@@ -7449,7 +7594,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             row: row.clone(),
                             btree_resident,
                         };
-                        self.insert_index_version(rowid.table_id, sortable_key, row_version);
+                        self.insert_index_version(rowid.table_id, sortable_key, row_version)?;
                     }
                     StreamingResult::UpdateHeader { header, commit_ts } => {
                         max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
@@ -7757,9 +7902,9 @@ pub fn create_seek_range<K: Ord>(
 /// TE’s state is Aborted"
 /// Ref: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf , page 301,
 /// 2.6. Updating a Version.
-fn is_write_write_conflict(
-    txs: &SkipMap<TxID, Transaction>,
-    finalized_tx_states: &SkipMap<TxID, TransactionState>,
+fn is_write_write_conflict<A: SkiplistAllocator>(
+    txs: &SkipMap<TxID, Transaction, BasicComparator, A>,
+    finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx: &Transaction,
     rv: &RowVersion,
 ) -> bool {
@@ -7835,11 +7980,11 @@ impl RowVersion {
     /// A row is visible to a transaction if:
     /// * Begin is visible to the transaction
     /// * End timestamp is not applicable yet, meaning deletion of row is not visible to this transaction
-    fn is_visible_to(
+    fn is_visible_to<A: SkiplistAllocator>(
         &self,
         tx: &Transaction,
-        txs: &SkipMap<TxID, Transaction>,
-        finalized_tx_states: &SkipMap<TxID, TransactionState>,
+        txs: &SkipMap<TxID, Transaction, BasicComparator, A>,
+        finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     ) -> bool {
         is_begin_visible(txs, finalized_tx_states, tx, self)
             && is_end_visible(txs, finalized_tx_states, tx, self)
@@ -7853,11 +7998,11 @@ impl RowVersion {
     /// 3. The current transaction itself has deleted/updated this row (end = current tx_id)
     ///
     /// This is used by dual-cursor to determine if a B-tree row should be shown or hidden.
-    fn is_btree_invalidating_version(
+    fn is_btree_invalidating_version<A: SkiplistAllocator>(
         &self,
         tx: &Transaction,
-        txs: &SkipMap<TxID, Transaction>,
-        finalized_tx_states: &SkipMap<TxID, TransactionState>,
+        txs: &SkipMap<TxID, Transaction, BasicComparator, A>,
+        finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     ) -> bool {
         // If the version is fully visible, it invalidates the B-tree
         if self.is_visible_to(tx, txs, finalized_tx_states) {
@@ -7917,8 +8062,8 @@ impl RowVersion {
 ///
 /// The lock on `commit_dep_set` serializes with the drain in commit/abort
 /// resolution, preventing the race where we push an entry after the drain.
-fn register_commit_dependency(
-    txs: &SkipMap<TxID, Transaction>,
+fn register_commit_dependency<A: SkiplistAllocator>(
+    txs: &SkipMap<TxID, Transaction, BasicComparator, A>,
     dependent_tx: &Transaction,
     depended_on_tx_id: TxID,
 ) {
@@ -7975,9 +8120,9 @@ fn register_commit_dependency(
     }
 }
 
-fn lookup_tx_state(
-    txs: &SkipMap<TxID, Transaction>,
-    finalized_tx_states: &SkipMap<TxID, TransactionState>,
+fn lookup_tx_state<A: SkiplistAllocator>(
+    txs: &SkipMap<TxID, Transaction, BasicComparator, A>,
+    finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx_id: TxID,
 ) -> Option<TransactionState> {
     txs.get(&tx_id)
@@ -7985,8 +8130,8 @@ fn lookup_tx_state(
         .or_else(|| finalized_tx_states.get(&tx_id).map(|entry| *entry.value()))
 }
 
-fn lookup_finalized_tx_state(
-    finalized_tx_states: &SkipMap<TxID, TransactionState>,
+fn lookup_finalized_tx_state<A: SkiplistAllocator>(
+    finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx_id: TxID,
 ) -> Option<TransactionState> {
     finalized_tx_states.get(&tx_id).map(|entry| {
@@ -8002,9 +8147,9 @@ fn lookup_finalized_tx_state(
     })
 }
 
-fn is_begin_visible(
-    txs: &SkipMap<TxID, Transaction>,
-    finalized_tx_states: &SkipMap<TxID, TransactionState>,
+fn is_begin_visible<A: SkiplistAllocator>(
+    txs: &SkipMap<TxID, Transaction, BasicComparator, A>,
+    finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx: &Transaction,
     rv: &RowVersion,
 ) -> bool {
@@ -8093,9 +8238,9 @@ fn is_begin_visible(
     }
 }
 
-fn is_end_visible(
-    txs: &SkipMap<TxID, Transaction>,
-    finalized_tx_states: &SkipMap<TxID, TransactionState>,
+fn is_end_visible<A: SkiplistAllocator>(
+    txs: &SkipMap<TxID, Transaction, BasicComparator, A>,
+    finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     current_tx: &Transaction,
     row_version: &RowVersion,
 ) -> bool {
@@ -8162,7 +8307,7 @@ fn is_end_visible(
     }
 }
 
-impl<Clock: LogicalClock> Debug for CommitState<Clock> {
+impl<Clock: LogicalClock, A: SkiplistAllocator> Debug for CommitState<Clock, A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Initial => write!(f, "Initial"),
