@@ -148,6 +148,7 @@ pub struct Builder {
     enable_generated_columns: bool,
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
+    enable_mvcc_passive_checkpoint: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
     io: Option<Arc<dyn turso_core::IO>>,
@@ -167,6 +168,7 @@ impl Builder {
             enable_generated_columns: false,
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
+            enable_mvcc_passive_checkpoint: false,
             vfs: None,
             encryption_opts: None,
             io: None,
@@ -233,6 +235,11 @@ impl Builder {
         self
     }
 
+    pub fn experimental_mvcc_passive_checkpoint(mut self, enabled: bool) -> Self {
+        self.enable_mvcc_passive_checkpoint = enabled;
+        self
+    }
+
     pub fn with_io(mut self, vfs: String) -> Self {
         self.vfs = Some(vfs);
         self
@@ -272,6 +279,9 @@ impl Builder {
         }
         if self.enable_without_rowid {
             features.push("without_rowid");
+        }
+        if self.enable_mvcc_passive_checkpoint {
+            features.push("mvcc_passive_checkpoint");
         }
         if features.is_empty() {
             return None;
