@@ -488,6 +488,36 @@ async fn test_multiple_connections_fuzz_mvcc() {
             weight_commit: 8,
             weight_rollback: 8,
             weight_checkpoint: 2,
+            checkpoint_modes: vec![CheckpointMode::Truncate],
+            weight_ddl: 10,
+            weight_dml: 66,
+            dml_gen_options: DmlGenOptions {
+                weight_insert: 25,
+                weight_delete: 25,
+                weight_select: 25,
+                weight_update: 25,
+            },
+        },
+        reopen_probability: 0.1,
+        ..FuzzOptions::default()
+    };
+    multiple_connections_fuzz(mvcc_fuzz_options).await
+}
+
+#[tokio::test]
+// Same as test_multiple_connections_fuzz_mvcc, but with the experimental passive checkpoint enabled.
+async fn test_multiple_connections_fuzz_mvcc_passive_checkpoint() {
+    let mvcc_fuzz_options = FuzzOptions {
+        mvcc_enabled: true,
+        experimental_mvcc_passive_checkpoint: true,
+        max_num_connections: 2,
+        operations_per_connection: 1000,
+        query_gen_options: QueryGenOptions {
+            weight_begin_deferred: 4,
+            weight_begin_concurrent: 12,
+            weight_commit: 8,
+            weight_rollback: 8,
+            weight_checkpoint: 2,
             checkpoint_modes: vec![CheckpointMode::Passive],
             weight_ddl: 10,
             weight_dml: 66,
@@ -512,6 +542,7 @@ struct FuzzOptions {
     max_num_connections: usize,
     query_gen_options: QueryGenOptions,
     mvcc_enabled: bool,
+    experimental_mvcc_passive_checkpoint: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -544,6 +575,7 @@ impl Default for FuzzOptions {
             max_num_connections: 8,
             query_gen_options: QueryGenOptions::default(),
             mvcc_enabled: false,
+            experimental_mvcc_passive_checkpoint: false,
         }
     }
 }
@@ -595,6 +627,7 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
         let tempdir = tempfile::TempDir::new().unwrap();
         let db_path = tempdir.path().join("test.db");
         let db = Builder::new_local(db_path.to_str().unwrap())
+            .experimental_mvcc_passive_checkpoint(opts.experimental_mvcc_passive_checkpoint)
             .build()
             .await
             .unwrap();
@@ -696,6 +729,7 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                 connections.clear();
                 let _ = db.take();
                 let reopened = Builder::new_local(db_path.to_str().unwrap())
+                    .experimental_mvcc_passive_checkpoint(opts.experimental_mvcc_passive_checkpoint)
                     .build()
                     .await
                     .unwrap();
