@@ -16136,6 +16136,10 @@ fn op_journal_mode_inner(
                         program.connection.db.durable_storage.clone(),
                         enc_ctx,
                         program.connection.db.mv_store_allocator.clone(),
+                        program
+                            .connection
+                            .db
+                            .experimental_mvcc_passive_checkpoint_enabled(),
                     )?;
                     // Arm the abandonment guard *before* the irreversible
                     // store install + demote so a reset/drop at any subsequent

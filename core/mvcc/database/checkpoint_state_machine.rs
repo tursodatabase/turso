@@ -680,11 +680,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // mode, MVCC checkpoint writes from the mv store back to the pager —
         // so the schema must match the pager being checkpointed.
         let schema = connection.clone_shared_schema(database_id);
-        // `index_id_to_index` is intentionally left empty here and populated from the
-        // snapshot-consistent `local_schema` in the `BuildLocalSchemaView` Done handler
-        // (Fix A) — the live connection schema can include objects created after
-        // `snapshot_ts` that this pass must not see.
-        let index_id_to_index = HashMap::default();
+        let index_id_to_index = if connection.experimental_mvcc_passive_checkpoint_enabled() {
+            HashMap::default()
+        } else {
+            schema
+                .indexes
+                .values()
+                .flatten()
+                .map(|index| {
+                    turso_assert!(index.root_page != 0, "index root_page must be non-zero");
+                    (
+                        mvstore.get_table_id_from_root_page(index.root_page),
+                        index.clone(),
+                    )
+                })
+                .collect()
+        };
 
         let mvcc_meta_table = schema.get_btree_table(MVCC_META_TABLE_NAME).map(|table| {
             turso_assert!(
@@ -1477,7 +1488,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             if let Some(entry) = self.mvstore.rows.get(row_id) {
                 let is_now_empty = {
                     let mut versions = entry.value().write();
-                    MvStore::<Clock, A>::gc_version_chain(&mut versions, lwm, ckpt_max);
+                    MvStore::<Clock, A>::gc_version_chain(
+                        &mut versions,
+                        lwm,
+                        ckpt_max,
+                        self.mvstore.experimental_mvcc_passive_checkpoint,
+                    );
                     versions.is_empty()
                 };
                 if is_now_empty {
@@ -1541,7 +1557,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         .get(sortable_key)
                         .expect("index row from write set must exist in inner map");
                     let mut versions = inner_entry.value().write();
-                    MvStore::<Clock, A>::gc_version_chain(&mut versions, lwm, ckpt_max);
+                    MvStore::<Clock, A>::gc_version_chain(
+                        &mut versions,
+                        lwm,
+                        ckpt_max,
+                        self.mvstore.experimental_mvcc_passive_checkpoint,
+                    );
                     versions.is_empty()
                 };
                 if is_now_empty {
@@ -1663,7 +1684,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 // Resample after serializing (via `checkpoint_in_progress`) so
                 // already-durable index deletes are not replayed.
                 self.refresh_checkpoint_bounds();
-                self.state = CheckpointState::BuildLocalSchemaView;
+                self.state = if self
+                    .connection
+                    .experimental_mvcc_passive_checkpoint_enabled()
+                {
+                    CheckpointState::BuildLocalSchemaView
+                } else {
+                    CheckpointState::CollectTableRows
+                };
                 Ok(TransitionResult::Continue)
             }
             CheckpointState::BuildLocalSchemaView => {
