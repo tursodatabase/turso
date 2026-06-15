@@ -29,6 +29,8 @@ pub fn run_worker(
     db_path: &str,
     enable_mvcc: bool,
     connections_per_process: usize,
+    allocation_fault_probability: f64,
+    allocation_fault_seed: u64,
 ) -> anyhow::Result<()> {
     // Install a panic hook that writes to stderr so panics don't pollute stdout JSON protocol.
     std::panic::set_hook(Box::new(|info| {
@@ -76,6 +78,7 @@ pub fn run_worker(
     }
 
     let telemetry = worker_startup_telemetry(&db)?;
+    crate::allocation_fault::install(allocation_fault_seed, allocation_fault_probability)?;
 
     // Signal ready
     send_response(&WorkerResponse::Ready { telemetry })?;

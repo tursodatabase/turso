@@ -114,6 +114,7 @@ fn create_multiprocess_whopper_with_shape_and_keep(
         restart_probability: 0.0,
         history_output: None,
         keep_files,
+        allocation_fault_probability: 0.0,
     })
     .expect("create multiprocess whopper")
 }
