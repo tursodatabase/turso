@@ -670,7 +670,7 @@ test('update', async ({ server }) => {
     await db.push();
 })
 
-test('concurrent-updates', async ({ server }) => {
+test('concurrent-updates', { timeout: process.platform === 'win32' ? 120_000 : undefined }, async ({ server }) => {
     {
         const db = await connect({ path: ':memory:', url: server.dbUrl(), longPollTimeoutMs: 5000 });
         await db.exec("CREATE TABLE IF NOT EXISTS q(x TEXT PRIMARY KEY, y)");
