@@ -130,6 +130,7 @@ async fn async_main(args: Args) -> Result<()> {
         cache_size: args.cache_size,
         checkpoint: args.checkpoint,
         mvcc_checkpoint_threshold: args.mvcc_checkpoint_threshold,
+        mvcc_gc_threshold: args.mvcc_gc_threshold,
     };
 
     let start = Instant::now();
@@ -142,44 +143,7 @@ async fn async_main(args: Args) -> Result<()> {
         snapshots: vec![baseline_snapshot],
         peak_bytes: baseline,
     };
-    let timeout = Duration::from_millis(args.timeout);
-    let mut snapshots: Vec<MemorySnapshot> = Vec::new();
-    snapshots.push(take_snapshot(start, "baseline"));
 
-    let db = turso::Builder::new_local(db_path).build().await?;
-
-    // Setup connection for schema/seeding and journal mode
-    let setup_conn = db.connect()?;
-    setup_conn.busy_timeout(timeout)?;
-
-    let mode_str = match args.mode {
-        JournalMode::Wal => "'wal'",
-        JournalMode::Mvcc => "'mvcc'",
-    };
-    setup_conn.pragma_update("journal_mode", mode_str).await?;
-
-    // MVCC threshold knobs (shared across all connections via the mv_store).
-    if matches!(args.mode, JournalMode::Mvcc) {
-        if let Some(threshold) = args.mvcc_checkpoint_threshold {
-            setup_conn
-                .execute(
-                    &format!("PRAGMA mvcc_checkpoint_threshold = {threshold}"),
-                    (),
-                )
-                .await?;
-        }
-        if let Some(threshold) = args.mvcc_gc_threshold {
-            setup_conn
-                .execute(&format!("PRAGMA mvcc_gc_threshold = {threshold}"), ())
-                .await?;
-        }
-    }
-
-    if let Some(cache_size) = args.cache_size {
-        setup_conn
-            .pragma_update("cache_size", &cache_size.to_string())
-            .await?;
-    }
     let workload_name = run_workload(db_path, &cfg, &mut observer).await?;
 
     // Final snapshot

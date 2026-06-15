@@ -64,6 +64,9 @@ pub struct WorkloadConfig {
     /// Only meaningful in MVCC mode; WAL's 1000-frame threshold is not
     /// configurable.
     pub mvcc_checkpoint_threshold: Option<i64>,
+    /// MVCC inline-GC trigger threshold in live-version growth (`PRAGMA
+    /// mvcc_gc_threshold`; -1 disables inline GC). Only meaningful in MVCC mode.
+    pub mvcc_gc_threshold: Option<i64>,
 }
 
 /// Hooks invoked at workload milestones so callers can take measurements.
@@ -130,6 +133,12 @@ pub async fn run_workload(
     if let Some(threshold) = cfg.mvcc_checkpoint_threshold {
         setup_conn
             .pragma_update("mvcc_checkpoint_threshold", &threshold.to_string())
+            .await?;
+    }
+
+    if let Some(threshold) = cfg.mvcc_gc_threshold {
+        setup_conn
+            .pragma_update("mvcc_gc_threshold", &threshold.to_string())
             .await?;
     }
 

@@ -107,7 +107,7 @@ cargo run --release -p memory-benchmark -- --mode mvcc --workload insert-heavy -
 # All CLI options
 cargo run --release -p memory-benchmark -- \
   --mode wal|mvcc \
-  --workload insert-heavy|read-heavy|mixed|scan-heavy|series-blob \
+  --workload insert-heavy|read-heavy|mixed|scan-heavy|series-blob|update-churn \
   -i <iterations> \
   -b <batch-size> \
   --connections <N> \
@@ -115,8 +115,16 @@ cargo run --release -p memory-benchmark -- \
   --mvcc-checkpoint-threshold <bytes> \
   --timeout <ms> \
   --cache-size <pages> \
+  --mvcc-checkpoint-threshold <bytes>   # MVCC only; -1 disables auto-checkpoint
+  --mvcc-gc-threshold <versions>        # MVCC only; -1 disables inline GC
   --format human|json|csv
 ```
+
+The two `--mvcc-*-threshold` flags set the corresponding PRAGMAs on the shared
+mv_store before the run. They are the knobs for isolating MVCC GC behavior:
+disable the checkpoint (`--mvcc-checkpoint-threshold=-1`) so the only
+reclamation is inline GC, then A/B the GC threshold (e.g. `-1` off vs `16384`
+default vs a smaller, more aggressive value) on the `update-churn` workload.
 
 Every run produces a `dhat-heap.json` in the current directory. This file contains per-allocation-site data for the entire run.
 
@@ -129,6 +137,7 @@ Every run produces a `dhat-heap.json` in the current directory. This file contai
 | `mixed` | 50% SELECT / 50% INSERT | Seeds 10k rows |
 | `scan-heavy` | Full table scans with LIKE | Seeds 10k rows |
 | `series-blob` | `INSERT INTO bench(data) SELECT zeroblob(2048) FROM generate_series(1, ?)` | Creates `bench`; `batch-size` is the series length |
+| `update-churn` | Repeated UPDATEs to a fixed 10k-row set (key space partitioned per connection to avoid write-write conflicts) | Seeds 10k rows. Generates superseded versions — the MVCC GC accumulation case. |
 
 Profiles implement the `Profile` trait in `perf/memory/src/profile/`. To add a new workload, create a new file implementing the trait and wire it into the `WorkloadProfile` enum in `main.rs`.
 
