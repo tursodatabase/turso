@@ -1591,12 +1591,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     fn step_inner(&mut self, _context: &()) -> Result<TransitionResult<CheckpointResult>> {
         match &self.state {
             CheckpointState::PrepareCheckpoint => {
-                // Single-orchestrator gate. Multiple commits may have triggered
-                // `should_checkpoint()` concurrently; only one runs the checkpoint,
-                // the rest skip and let the in-flight one cover their work. This
-                // was previously implicit in `blocking_checkpoint_lock` being the
-                // first thing taken; now that the lock is moved past the pager
-                // write phase, we need an explicit flag.
                 if self
                     .mvstore
                     .checkpoint_in_progress
@@ -1711,12 +1705,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
                 tracing::debug!("Collected {} index row changes", self.index_write_set.len());
 
-                // Off-lock collection (the CPU-heavy MVCC-store scan) is complete.
-                // Acquire the blocking checkpoint lock now: the pager write-out,
-                // commit, marker publication and GC below all run under the lock,
-                // as before — but readers/writers were NOT blocked during the
-                // scan. Non-blocking write(): a concurrent reader/VACUUM holding
-                // a conflicting lock yields Busy, which auto-checkpoint swallows.
                 inject_transition_yield!(self, CheckpointYieldPoint::BeforeAcquireLock);
                 if !self.lock_states.blocking_checkpoint_lock_held {
                     tracing::debug!("Acquiring blocking checkpoint lock after collection");
@@ -1727,11 +1715,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     self.lock_states.blocking_checkpoint_lock_held = true;
                 }
 
-                // The durable boundary is the snapshot we collected against, NOT a
-                // freshly-read watermark: collection filtered by `snapshot_ts`
-                // (begin_ts <= snapshot_ts), so commits that landed during the
-                // off-lock scan are deferred to the next pass. Claiming durability
-                // beyond `snapshot_ts` would mark un-checkpointed versions durable.
                 let durable_old = self.durable_txid_max_old.map(u64::from).unwrap_or_default();
                 #[cfg(any(test, debug_assertions))]
                 {
