@@ -34,7 +34,11 @@ pub enum ErrorAction {
 /// transaction that needs rolling back (i.e. not autocommit). The
 /// drivers compute this from their own fiber-state tracking before
 /// calling in.
-pub fn classify_op_error(err: &LimboError, in_tx: bool) -> ErrorAction {
+pub fn classify_op_error(
+    err: &LimboError,
+    in_tx: bool,
+    allocation_faults_enabled: bool,
+) -> ErrorAction {
     // DatabaseFull is overloaded — it is raised for both real storage
     // exhaustion (pager.rs) and autoincrement max-rowid overflow
     // (translate/insert.rs). Only swallow the well-defined "non-
@@ -75,6 +79,13 @@ pub fn classify_op_error(err: &LimboError, in_tx: bool) -> ErrorAction {
                 ErrorAction::ClearTxn
             }
         }
+        LimboError::OutOfMemory if allocation_faults_enabled => {
+            if in_tx {
+                ErrorAction::Rollback
+            } else {
+                ErrorAction::ClearTxn
+            }
+        }
         LimboError::Corrupt(_) | LimboError::CheckpointFailed(_) => ErrorAction::Respawn,
         _ => ErrorAction::Fatal,
     }
@@ -87,38 +98,46 @@ mod tests {
     #[test]
     fn parse_error_in_tx_queues_rollback() {
         let err = LimboError::ParseError("nope".into());
-        assert_eq!(classify_op_error(&err, true), ErrorAction::Rollback);
+        assert_eq!(classify_op_error(&err, true, false), ErrorAction::Rollback);
     }
 
     #[test]
     fn parse_error_autocommit_clears_txn() {
         let err = LimboError::ParseError("nope".into());
-        assert_eq!(classify_op_error(&err, false), ErrorAction::ClearTxn);
+        assert_eq!(classify_op_error(&err, false, false), ErrorAction::ClearTxn);
     }
 
     #[test]
     fn sequence_exhaustion_is_swallowed() {
         let err = LimboError::DatabaseFull("nextval: reached minimum value of \"s\"".into());
-        assert_eq!(classify_op_error(&err, true), ErrorAction::Rollback);
-        assert_eq!(classify_op_error(&err, false), ErrorAction::ClearTxn);
+        assert_eq!(classify_op_error(&err, true, false), ErrorAction::Rollback);
+        assert_eq!(classify_op_error(&err, false, false), ErrorAction::ClearTxn);
     }
 
     #[test]
     fn generic_database_full_is_fatal() {
         let err = LimboError::DatabaseFull("disk image is full".into());
-        assert_eq!(classify_op_error(&err, true), ErrorAction::Fatal);
-        assert_eq!(classify_op_error(&err, false), ErrorAction::Fatal);
+        assert_eq!(classify_op_error(&err, true, false), ErrorAction::Fatal);
+        assert_eq!(classify_op_error(&err, false, false), ErrorAction::Fatal);
     }
 
     #[test]
     fn corrupt_respawns() {
         let err = LimboError::Corrupt("bad page".into());
-        assert_eq!(classify_op_error(&err, true), ErrorAction::Respawn);
+        assert_eq!(classify_op_error(&err, true, false), ErrorAction::Respawn);
+    }
+
+    #[test]
+    fn out_of_memory_is_recoverable_only_when_faults_are_enabled() {
+        let err = LimboError::OutOfMemory;
+        assert_eq!(classify_op_error(&err, true, true), ErrorAction::Rollback);
+        assert_eq!(classify_op_error(&err, false, true), ErrorAction::ClearTxn);
+        assert_eq!(classify_op_error(&err, true, false), ErrorAction::Fatal);
     }
 
     #[test]
     fn unknown_error_is_fatal() {
         let err = LimboError::InternalError("unexpected".into());
-        assert_eq!(classify_op_error(&err, true), ErrorAction::Fatal);
+        assert_eq!(classify_op_error(&err, true, false), ErrorAction::Fatal);
     }
 }

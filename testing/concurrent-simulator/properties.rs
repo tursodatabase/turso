@@ -259,6 +259,7 @@ impl Property for IntegrityCheckProperty {
                         | LimboError::CommitDependencyAborted
                         | LimboError::SchemaUpdated
                         | LimboError::SchemaConflict
+                        | LimboError::OutOfMemory
                 ) {
                     return Ok(());
                 }
@@ -1169,6 +1170,7 @@ impl Property for SequenceCorrectnessProperty {
                     || err_msg.contains("Write-write conflict")
                     || err_msg.contains("Commit dependency aborted")
                     || err_msg.contains("Database schema conflict")
+                    || err_msg.contains("Out of memory")
                     || err_msg.contains("setval requires an exclusive transaction")
                 {
                     self.fiber_last_nextval
