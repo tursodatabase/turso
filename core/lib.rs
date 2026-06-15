@@ -232,7 +232,7 @@ pub struct DatabaseOpts {
     pub enable_generated_columns: bool,
     pub enable_multiprocess_wal: bool,
     pub enable_without_rowid: bool,
-    pub enable_mvcc_passive_checkpoint: bool,
+    pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
     enable_load_extension: bool,
 }
@@ -278,8 +278,8 @@ impl DatabaseOpts {
         self
     }
 
-    pub fn with_mvcc_passive_checkpoint(mut self, enable: bool) -> Self {
-        self.enable_mvcc_passive_checkpoint = enable;
+    pub fn with_experimental_mvcc_passive_checkpoint(mut self, enable: bool) -> Self {
+        self.enable_experimental_mvcc_passive_checkpoint = enable;
         self
     }
 
@@ -2014,6 +2014,7 @@ impl Database {
                             self.durable_storage.clone(),
                             enc_ctx,
                             self.mv_store_allocator.clone(),
+                            self.experimental_mvcc_passive_checkpoint_enabled(),
                         )?;
                         self.mv_store.store(Some(mv_store));
                     }
@@ -2856,7 +2857,7 @@ impl Database {
     }
 
     pub fn experimental_mvcc_passive_checkpoint_enabled(&self) -> bool {
-        self.opts.enable_mvcc_passive_checkpoint
+        self.opts.enable_experimental_mvcc_passive_checkpoint
     }
 
     pub fn experimental_attach_enabled(&self) -> bool {
