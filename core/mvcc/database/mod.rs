@@ -3789,6 +3789,7 @@ pub struct MvStore<Clock: LogicalClock> {
     /// database live in one process. Multi-process MVCC will need a shared
     /// coordination mechanism before sync can rely on this watermark.
     sequence_allocations: Mutex<HashMap<String, StdHashMap<TxID, i64>>>,
+    experimental_mvcc_passive_checkpoint: bool,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -3842,6 +3843,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn new(
         clock: Clock,
         storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
+        experimental_mvcc_passive_checkpoint: bool,
     ) -> Self {
         Self {
             rows: SkipMap::new(),
@@ -3867,6 +3869,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
             sequence_watermarks: Mutex::new(HashMap::default()),
             sequence_allocations: Mutex::new(HashMap::default()),
+            experimental_mvcc_passive_checkpoint,
         }
     }
 
@@ -6211,7 +6214,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         for entry in self.rows.iter() {
             let is_now_empty = {
                 let mut versions = entry.value().write();
-                dropped += Self::gc_version_chain(&mut versions, lwm, ckpt_max);
+                dropped += Self::gc_version_chain(
+                    &mut versions,
+                    lwm,
+                    ckpt_max,
+                    self.experimental_mvcc_passive_checkpoint,
+                );
                 Self::collect_referenced_txids(&versions, referenced_tx_ids);
                 versions.is_empty()
             };
@@ -6244,7 +6252,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             for inner_entry in inner_map.iter() {
                 let is_now_empty = {
                     let mut versions = inner_entry.value().write();
-                    dropped += Self::gc_version_chain(&mut versions, lwm, ckpt_max);
+                    dropped += Self::gc_version_chain(
+                        &mut versions,
+                        lwm,
+                        ckpt_max,
+                        self.experimental_mvcc_passive_checkpoint,
+                    );
                     Self::collect_referenced_txids(&versions, referenced_tx_ids);
                     versions.is_empty()
                 };
@@ -6298,11 +6311,20 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Rule 3: Current checkpointed sole-survivor (end=None, b <= ckpt_max,
     ///         b < lwm, no other versions remain) — remove.
     ///
-    fn gc_version_chain(versions: &mut Vec<RowVersion>, lwm: u64, ckpt_max: u64) -> usize {
+    fn gc_version_chain(
+        versions: &mut Vec<RowVersion>,
+        lwm: u64,
+        ckpt_max: u64,
+        passive: bool,
+    ) -> usize {
         let before = versions.len();
 
         // Rule 1: aborted garbage
         versions.retain(|rv| !matches!((&rv.begin(), &rv.end()), (None, None)));
+
+        let has_current = versions.iter().any(|rv| {
+            matches!(rv.begin(), Some(TxTimestampOrID::Timestamp(_))) && rv.end().is_none()
+        });
 
         // Rule 2: superseded versions are removable only when BOTH consumers of
         // the chain are done with them:
@@ -6323,7 +6345,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // in the same chain but moves the index entry to a new key chain, so
         // only the table side loses its anchor).
         versions.retain(|rv| match &rv.end() {
-            Some(TxTimestampOrID::Timestamp(e)) if *e <= lwm => *e > ckpt_max,
+            Some(TxTimestampOrID::Timestamp(e)) if *e <= lwm => {
+                if passive {
+                    *e > ckpt_max
+                } else {
+                    !has_current && *e > ckpt_max
+                }
+            }
             _ => true,
         });
 
@@ -6712,22 +6740,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             self.storage.set_header(header);
                         }
                         HeaderReadResult::NoLog => {
-                            // Empty/truncated logical log on top of committed WAL
-                            // frames is the NORMAL steady state of a Passive
-                            // checkpoint (which truncates the logical log to 0 but
-                            // intentionally leaves the WAL non-empty), NOT corruption.
-                            // The committed WAL holds the durable B-tree state plus
-                            // the `__turso_internal_mvcc_meta` boundary row; an empty
-                            // log means there are no uncheckpointed ops to replay.
-                            // Fall through to backfill WAL→DB and (re)write a fresh
-                            // header in RetryHeader, exactly like the interrupted
-                            // case — just with no existing header to reuse.
-                            //
-                            // NOTE: `NoLog` cannot distinguish a deliberately-
-                            // truncated log from a deleted one, so a deleted log atop
-                            // committed WAL also recovers here rather than failing
-                            // closed. That is correct — the WAL is the authoritative
-                            // durable state and no committed data is lost.
+                            if !connection.experimental_mvcc_passive_checkpoint_enabled() {
+                                return Err(LimboError::Corrupt(
+                                    "WAL has committed frames but logical log header is missing"
+                                        .to_string(),
+                                ));
+                            }
                         }
                         HeaderReadResult::Invalid => {
                             // A present-but-undecodable header is a torn header write
@@ -7239,6 +7257,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         ctx: &mut RecoverCtx,
         frame: Vec<ParsedOp>,
     ) -> Result<()> {
+        let passive = connection.experimental_mvcc_passive_checkpoint_enabled();
         let mut max_commit_ts_seen = ctx.max_commit_ts_seen;
         let replay_cutoff_ts = ctx.replay_cutoff_ts;
         let cookie = ctx.cookie;
@@ -7633,7 +7652,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 begin: crate::mvcc::database::PackedTs::pack(None),
                                 end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(commit_ts))),
                                 row: tombstone_row.clone(),
-                                btree_resident,
+                                btree_resident: if passive { true } else { btree_resident },
                             };
                             self.insert_version_raw(&mut versions, row_version);
                         }
@@ -7646,7 +7665,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                         TxTimestampOrID::Timestamp(commit_ts),
                                     )),
                                     row: tombstone_row,
-                                    btree_resident,
+                                    btree_resident: if passive { true } else { btree_resident },
                                 };
                                 let versions = self.rows.get_or_insert_with(rowid.clone(), || {
                                     Arc::new(RwLock::new(Vec::new()))
@@ -7744,7 +7763,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                     TxTimestampOrID::Timestamp(commit_ts),
                                 )),
                                 row: row.clone(),
-                                btree_resident,
+                                btree_resident: if passive { true } else { btree_resident },
                             };
                             self.insert_index_version(rowid.table_id, sortable_key, row_version);
                         }
