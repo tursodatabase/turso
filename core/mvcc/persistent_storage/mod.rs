@@ -57,6 +57,25 @@ pub trait DurableStorage: Send + Sync + Debug {
         Ok(())
     }
 
+    /// Called as the final durability step of a write commit, after the
+    /// logical-log bytes have been written but before the commit is made
+    /// visible (i.e. before the logical-log offset is advanced).
+    ///
+    /// Mirrors `on_checkpoint_end`, but returns a `Completion`: the commit is
+    /// NOT made visible until the returned completion succeeds, so backends
+    /// that durably persist the captured bytes elsewhere (e.g. uploading them
+    /// to object storage in diskless deployments) can surface that async work
+    /// through the completion. It is invoked at a point where no internal
+    /// storage lock is held; implementations must therefore not perform
+    /// inline/blocking I/O that could re-enter those locks — they should kick
+    /// off the work asynchronously and report completion here.
+    ///
+    /// The default returns an already-completed completion (no durable storage
+    /// beyond the logical log itself).
+    fn on_commit_end(&self) -> Result<Completion> {
+        Ok(Completion::new_yield())
+    }
+
     /// Persist the current logical-log header to durable storage.
     ///
     /// This is used by MVCC recovery/checkpoint flows. Keeping this in the trait avoids
