@@ -642,6 +642,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         database_id: usize,
         mode: CheckpointMode,
     ) -> Self {
+        assert!(
+            !matches!(mode, CheckpointMode::Passive { .. })
+                || connection.experimental_mvcc_passive_checkpoint_enabled(),
+            "passive checkpoint mode requires experimental_mvcc_passive_checkpoint"
+        );
         let checkpoint_lock = mvstore.blocking_checkpoint_lock.clone();
         // Use the shared DB schema (not the per-connection cache, which may be
         // stale) for the database whose pager we're checkpointing. Unlike WAL
@@ -1585,12 +1590,17 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
                 self.owns_checkpoint_in_progress = true;
 
-                // Capture an upper bound for what we'll consider "committed enough
-                // to flush this pass." Concurrent commits arriving with a higher
-                // begin_ts during the unlocked write phase get picked up by the
-                // next checkpoint. `durable_txid_max_new` is derived from the same
-                // watermark, so the marker never claims a version durable that we
-                // did not actually flush.
+                if !self
+                    .connection
+                    .experimental_mvcc_passive_checkpoint_enabled()
+                    && !self.lock_states.blocking_checkpoint_lock_held
+                {
+                    if !self.checkpoint_lock.write() {
+                        return Err(crate::LimboError::Busy);
+                    }
+                    self.lock_states.blocking_checkpoint_lock_held = true;
+                }
+
                 self.snapshot_ts = self.mvstore.last_committed_tx_ts.load(Ordering::Acquire);
 
                 // Checkpoint state machines can be created before they are run.

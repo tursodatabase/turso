@@ -2519,6 +2519,10 @@ impl Connection {
         self.db.experimental_vacuum_enabled()
     }
 
+    pub fn experimental_mvcc_passive_checkpoint_enabled(&self) -> bool {
+        self.db.experimental_mvcc_passive_checkpoint_enabled()
+    }
+
     pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
         self.db.experimental_multiprocess_wal_enabled()
     }
