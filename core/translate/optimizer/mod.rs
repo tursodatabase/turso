@@ -2265,14 +2265,17 @@ fn optimize_table_access(
                             });
                         continue;
                     };
-                    // Ephemeral indexes mirror rowid/column lookups. If the constraint targets an
-                    // expression (table_col_pos == None) we cannot derive a seek key that matches
-                    // the row layout, so fall back to a scan in that situation.
+                    // Ephemeral indexes mirror rowid/column lookups; expression-index
+                    // constraints (table_col_pos == None) fall back to a scan.
+                    let table_columns = table_references.joined_tables()[table_idx].table.columns();
+                    let is_strict = table_references.joined_tables()[table_idx]
+                        .table
+                        .is_strict();
                     let usable: Vec<(usize, &Constraint)> = table_constraints
                         .constraints
                         .iter()
                         .enumerate()
-                        .filter(|(_, c)| c.usable && c.table_col_pos.is_some())
+                        .filter(|(_, c)| c.can_drive_index_seek(table_columns, is_strict))
                         .collect();
                     // Find this table's position in best_join_order (which excludes build tables)
                     let join_order_pos = best_join_order

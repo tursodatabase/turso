@@ -596,6 +596,10 @@ pub(super) fn choose_best_in_seek_candidate(
                 if table_collation != index_collation {
                     continue;
                 }
+                let idx_aff = constrained_column.affinity_with_strict(rhs_table.table.is_strict());
+                if !constraint.satisfies_index_affinity(idx_aff) {
+                    continue;
+                }
             }
 
             let rows_per_seek = if (index_info.unique && index_info.column_count == 1)
@@ -1442,18 +1446,16 @@ fn find_best_access_method_for_subquery(
         .iter()
         .enumerate()
         .filter(|(_, c)| {
-            c.usable
-                && c.table_col_pos.is_some()
-                && matches!(
-                    c.operator.as_ast_operator(),
-                    Some(
-                        ast::Operator::Equals
-                            | ast::Operator::Greater
-                            | ast::Operator::GreaterEquals
-                            | ast::Operator::Less
-                            | ast::Operator::LessEquals
-                    )
+            matches!(
+                c.operator.as_ast_operator(),
+                Some(
+                    ast::Operator::Equals
+                        | ast::Operator::Greater
+                        | ast::Operator::GreaterEquals
+                        | ast::Operator::Less
+                        | ast::Operator::LessEquals
                 )
+            ) && c.can_drive_index_seek(&subquery.columns, false)
         })
         .collect();
 

@@ -1,36 +1,16 @@
 use super::*;
 
-fn index_seek_affinities(
-    idx: &Index,
-    tables: &TableReferences,
-    seek_def: &SeekDef,
-    seek_key: &SeekKey,
-) -> String {
-    let table = tables
-        .joined_tables()
-        .iter()
-        .find(|jt| jt.table.get_name() == idx.table_name)
-        .expect("index source table not found in table references");
-
-    idx.columns
-        .iter()
-        .zip(seek_def.iter(seek_key))
-        .map(|(ic, key_component)| {
-            let col_aff = if let Some(ref expr) = ic.expr {
-                crate::translate::expr::get_expr_affinity(expr, Some(tables), None)
-            } else {
-                table
-                    .table
-                    .get_column_at(ic.pos_in_table)
-                    .expect("index column position out of bounds")
-                    .affinity()
-            };
-            match key_component {
-                SeekKeyComponent::Expr(expr) if col_aff.expr_needs_no_affinity_change(expr) => {
-                    affinity::SQLITE_AFF_NONE
-                }
-                _ => col_aff.aff_mask(),
+fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
+    // Apply the constraint's resolved comparison affinity to the seek key,
+    // not the indexed column's affinity.
+    seek_def
+        .iter(seek_key)
+        .zip(seek_def.iter_affinity(seek_key))
+        .map(|(key_component, aff)| match key_component {
+            SeekKeyComponent::Expr(expr) if aff.expr_needs_no_affinity_change(expr) => {
+                affinity::SQLITE_AFF_NONE
             }
+            _ => aff.aff_mask(),
         })
         .collect()
 }
@@ -222,8 +202,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 0,
                 &self.t_ctx.resolver,
             )?;
-            let affinities =
-                index_seek_affinities(idx, self.tables, self.seek_def, &self.seek_def.start);
+            let affinities = index_seek_affinities(self.seek_def, &self.seek_def.start);
             if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
                 self.program.emit_insn(Insn::Affinity {
                     start_reg: self.start_reg,
@@ -342,8 +321,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         self.seek_def.prefix.len(),
                         &self.t_ctx.resolver,
                     )?;
-                    let affinities =
-                        index_seek_affinities(idx, self.tables, self.seek_def, &self.seek_def.end);
+                    let affinities = index_seek_affinities(self.seek_def, &self.seek_def.end);
                     if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
                         self.program.emit_insn(Insn::Affinity {
                             start_reg: self.start_reg,
