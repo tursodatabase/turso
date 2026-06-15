@@ -3041,6 +3041,7 @@ impl Connection {
                 db.open_flags,
                 db.durable_storage.clone(),
                 enc_ctx,
+                db.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             db.mv_store.store(Some(mv_store.clone()));
             let bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;

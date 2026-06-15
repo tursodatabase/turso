@@ -68,6 +68,7 @@ pub fn open_mv_store(
     flags: OpenFlags,
     durable_storage: Option<Arc<dyn mvcc::persistent_storage::DurableStorage>>,
     encryption_ctx: Option<crate::storage::encryption::EncryptionContext>,
+    experimental_mvcc_passive_checkpoint: bool,
 ) -> Result<Arc<MvStore>> {
     // `encryption_ctx` encrypts database pages, but a custom DurableStorage
     // writes the MVCC log itself. If the database is encrypted, the custom
@@ -98,5 +99,9 @@ pub fn open_mv_store(
             ))
         };
 
-    Ok(Arc::new(MvStore::new(mvcc::MvccClock::new(), storage)))
+    Ok(Arc::new(MvStore::new(
+        mvcc::MvccClock::new(),
+        storage,
+        experimental_mvcc_passive_checkpoint,
+    )))
 }
