@@ -38,13 +38,7 @@ const SQLITE_SCHEMA_COLUMN_COUNT: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointState {
-    /// Unlocked prelude: claim the `MvStore::checkpoint_in_progress` single-orchestrator
-    /// gate, capture `snapshot_ts` (the collection upper bound), and refresh bounds.
-    /// No `blocking_checkpoint_lock` is held here — collection and the pager write-out
-    /// run entirely off-lock.
     PrepareCheckpoint,
-    /// Build a snapshot-consistent schema (btree scan of page 1 + MVCC delta overlay
-    /// at `snapshot_ts`) and derive `index_id_to_index` from it. Runs off-lock.
     BuildLocalSchemaView,
     CollectTableRows,
     CollectIndexRows,
