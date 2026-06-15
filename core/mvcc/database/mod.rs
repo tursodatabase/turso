@@ -1252,6 +1252,12 @@ pub enum CommitState<Clock: LogicalClock> {
         end_ts: u64,
         log_record: LogRecord,
     },
+    /// Await durable persistence of the just-written logical-log bytes (e.g.
+    /// upload to object storage in diskless server deployments) before the
+    /// commit is made visible. See `DurableStorage::persist_log_durably`.
+    PersistLogDurably {
+        end_ts: u64,
+    },
     EndCommitLogicalLog {
         end_ts: u64,
     },
@@ -2947,7 +2953,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let end_ts = *end_ts;
                 let log_record = match std::mem::replace(
                     &mut self.state,
-                    CommitState::SyncLogicalLog { end_ts },
+                    CommitState::PersistLogDurably { end_ts },
                 ) {
                     CommitState::WriteLogicalLog { log_record, .. } => log_record,
                     _ => unreachable!(),
@@ -2955,6 +2961,22 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let (c, append_bytes) = mvcc_store.storage.log_tx(log_record, None)?;
                 self.pending_log_append_bytes = Some(append_bytes);
                 // if Completion Completed without errors we can continue
+                if c.succeeded() {
+                    Ok(TransitionResult::Continue)
+                } else {
+                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                }
+            }
+
+            CommitState::PersistLogDurably { end_ts } => {
+                // Wait for the just-written logical-log bytes to become durable
+                // (e.g. uploaded to object storage) before the commit is made
+                // visible in `CommitEnd`. Runs outside the logical-log lock, so
+                // backends are free to surface async I/O through the returned
+                // completion without risking a deadlock against that lock.
+                let end_ts = *end_ts;
+                let c = mvcc_store.storage.on_commit_end()?;
+                self.state = CommitState::SyncLogicalLog { end_ts };
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
@@ -8186,6 +8208,10 @@ impl<Clock: LogicalClock> Debug for CommitState<Clock> {
                 .debug_struct("WriteLogicalLog")
                 .field("end_ts", end_ts)
                 .field("log_record", log_record)
+                .finish(),
+            Self::PersistLogDurably { end_ts } => f
+                .debug_struct("PersistLogDurably")
+                .field("end_ts", end_ts)
                 .finish(),
             Self::EndCommitLogicalLog { end_ts } => f
                 .debug_struct("EndCommitLogicalLog")
