@@ -225,6 +225,27 @@ expect pattern {
     \ngenerate_series\n|^generate_series\n|\ngenerate_series$|^generate_series$
 }
 
+@skip-if sqlite "SQLite builds may register extra collations such as decimal or uint"
+test pragma-collation-list {
+    PRAGMA collation_list;
+}
+expect {
+    0|BINARY
+    1|NOCASE
+    2|RTRIM
+}
+
+test pragma-collation-list-table-valued-function {
+    SELECT name FROM pragma_collation_list
+    WHERE name IN ('BINARY', 'NOCASE', 'RTRIM')
+    ORDER BY name;
+}
+expect {
+    BINARY
+    NOCASE
+    RTRIM
+}
+
 test pragma-temp-store {
 		PRAGMA temp_store;
 }

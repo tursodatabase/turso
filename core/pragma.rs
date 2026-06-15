@@ -203,6 +203,7 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["cache_spill"],
         ),
+        CollationList => Pragma::new(PragmaFlags::Result0, &["seq", "name"]),
         #[cfg(target_vendor = "apple")]
         PragmaName::Fullfsync => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
