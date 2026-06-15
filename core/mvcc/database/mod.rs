@@ -3248,6 +3248,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                 if mvcc_store.storage.should_checkpoint() {
+                    let auto_checkpoint_mode = if self
+                        .connection
+                        .experimental_mvcc_passive_checkpoint_enabled()
+                    {
+                        crate::storage::wal::CheckpointMode::Passive {
+                            upper_bound_inclusive: None,
+                        }
+                    } else {
+                        crate::storage::wal::CheckpointMode::Truncate {
+                            upper_bound_inclusive: None,
+                        }
+                    };
                     let state_machine = StateMachine::new(CheckpointStateMachine::new(
                         self.pager.clone(),
                         mvcc_store.clone(),
@@ -3255,13 +3267,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         false,
                         self.connection.get_sync_mode(),
                         self.db_id,
-                        // Auto-checkpoint runs Passive so the WAL→DB backfill leaves the
-                        // WAL non-empty (no explicit truncation) and does not fight
-                        // concurrent readers/writers for WAL exclusivity. The WAL resets
-                        // via restart-on-write.
-                        crate::storage::wal::CheckpointMode::Passive {
-                            upper_bound_inclusive: None,
-                        },
+                        auto_checkpoint_mode,
                     ));
                     let state_machine = Mutex::new(state_machine);
                     self.state = CommitState::Checkpoint { state_machine };
