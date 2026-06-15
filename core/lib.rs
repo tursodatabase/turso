@@ -145,8 +145,8 @@ pub use io::WindowsIOCP;
 pub use io::{
     clock::{Clock, MonotonicInstant, WallClockInstant},
     get_registered_io, list_registered_io, register_io, unregister_io, Buffer, Completion,
-    CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO, SyscallIO,
-    WriteCompletion, IO,
+    CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO, SharedBufferData,
+    SyscallIO, WriteCompletion, IO,
 };
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
