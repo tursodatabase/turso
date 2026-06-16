@@ -4952,10 +4952,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .expect("transaction should exist in txs map");
         let tx = tx.value();
         let versions = versions.read();
-        versions
-            .iter()
-            .rev()
-            .any(|version| version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states))
+        versions.iter().rev().any(|version| {
+            version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
+        })
     }
 
     /// Check if the B-tree version of a row should be shown to the given transaction.
