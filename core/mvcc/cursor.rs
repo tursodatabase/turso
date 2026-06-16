@@ -344,42 +344,42 @@ pub(crate) use static_iterator_hack;
 /// Forward index cursors only; [`reset`](Self::reset) on any reposition, since
 /// the finger is monotonic.
 #[derive(Default)]
-struct IndexShadowFinger {
-    /// Iterator over `index_rows`; `None` until first use or after reset.
-    iter: Option<MvccIterator<'static, Arc<SortableIndexKey>>>,
-    /// Current head: key and whether its chain shadows the B-tree row. `None`
-    /// once the finger runs past the last version.
-    peek: Option<(Arc<SortableIndexKey>, bool)>,
-    /// Set once the finger runs past the last version; distinguishes "not yet
-    /// created" from "done" while `iter` and `peek` are both `None`.
-    exhausted: bool,
+enum IndexShadowFinger {
+    /// Not yet created; built lazily on the next shadow check.
+    #[default]
+    Uninitialized,
+    /// Positioned at `key`, whose version chain `shadows` the B-tree row or not.
+    Peeked {
+        iter: MvccIterator<'static, Arc<SortableIndexKey>>,
+        key: Arc<SortableIndexKey>,
+        shadows: bool,
+    },
+    /// Ran past the last version; every remaining B-tree row is visible.
+    Exhausted,
 }
 
 impl IndexShadowFinger {
-    /// Drop the finger so the next shadow check rebuilds it. Required on any
-    /// B-tree reposition (seek/rewind): a finger left ahead of the new position
-    /// would report a shadowed row as valid.
+    /// Reset so the next shadow check rebuilds the finger. Required on any B-tree
+    /// reposition (seek/rewind): a finger left ahead of the new position would
+    /// report a shadowed row as valid.
     fn reset(&mut self) {
-        *self = Self::default();
+        *self = Self::Uninitialized;
     }
 
-    /// Advance one entry, resolving its shadow bit up front so no borrowed
-    /// skiplist `Entry` is held across calls.
-    fn advance<Clock: LogicalClock>(&mut self, db: &MvStore<Clock>, tx_id: u64) {
-        let Some(iter) = self.iter.as_mut() else {
-            self.peek = None;
-            self.exhausted = true;
-            return;
-        };
+    /// Advance `iter` to its next entry, resolving the shadow bit up front so no
+    /// borrowed skiplist `Entry` is held afterward.
+    fn advance<Clock: LogicalClock>(
+        mut iter: MvccIterator<'static, Arc<SortableIndexKey>>,
+        db: &MvStore<Clock>,
+        tx_id: u64,
+    ) -> Self {
         match iter.next() {
-            Some(entry) => {
-                let shadows = db.index_chain_invalidates_btree(entry.value(), tx_id);
-                self.peek = Some((entry.key().clone(), shadows));
-            }
-            None => {
-                self.peek = None;
-                self.exhausted = true;
-            }
+            Some(entry) => Self::Peeked {
+                shadows: db.index_chain_invalidates_btree(entry.value(), tx_id),
+                key: entry.key().clone(),
+                iter,
+            },
+            None => Self::Exhausted,
         }
     }
 
@@ -393,33 +393,42 @@ impl IndexShadowFinger {
         tx_id: u64,
         key: &Arc<SortableIndexKey>,
     ) -> bool {
-        if self.iter.is_none() && !self.exhausted {
-            // Scoped so the skiplist guard drops before `advance` re-borrows `db`.
-            {
+        if matches!(self, Self::Uninitialized) {
+            // Scoped so the skiplist guard drops before `step` re-borrows `db`.
+            let iter = {
                 let index_rows = db.index_rows.get_or_insert_with(table_id, SkipMap::new);
-                let index_rows = index_rows.value();
                 let iter_box: Box<
                     dyn Iterator<Item = Entry<'_, Arc<SortableIndexKey>, RowVersions>>
                         + Send
                         + Sync,
-                > = Box::new(index_rows.iter());
-                self.iter = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>));
-            }
-            self.advance(db, tx_id);
+                > = Box::new(index_rows.value().iter());
+                static_iterator_hack!(iter_box, Arc<SortableIndexKey>)
+            };
+            *self = Self::advance(iter, db, tx_id);
         }
         loop {
-            match &self.peek {
+            match self {
                 // No version at or after this key -> B-tree row is visible.
-                None => return true,
-                Some((finger_key, shadows)) => match finger_key.as_ref().cmp(key.as_ref()) {
-                    // Finger behind the B-tree (a version-only key); catch up.
-                    std::cmp::Ordering::Less => self.advance(db, tx_id),
+                Self::Exhausted => return true,
+                Self::Uninitialized => unreachable!("created just above"),
+                Self::Peeked {
+                    key: finger_key,
+                    shadows,
+                    ..
+                } => match finger_key.as_ref().cmp(key.as_ref()) {
                     // No version exactly at this key -> visible.
                     std::cmp::Ordering::Greater => return true,
                     // Version present at this key -> shadowed iff it invalidates.
                     std::cmp::Ordering::Equal => return !*shadows,
+                    // Finger behind the B-tree (a version-only key); catch up below.
+                    std::cmp::Ordering::Less => {}
                 },
             }
+            // Step the finger forward; only the `Less` arm above falls through here.
+            let Self::Peeked { iter, .. } = std::mem::replace(self, Self::Uninitialized) else {
+                unreachable!("Less arm matched Peeked")
+            };
+            *self = Self::advance(iter, db, tx_id);
         }
     }
 }
