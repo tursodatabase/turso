@@ -246,7 +246,8 @@ pub fn translate_pragma(
         )?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
             // These pragmas take a parameter but are queries, not setters
-            PragmaName::IndexInfo
+            PragmaName::CompileOptions
+            | PragmaName::IndexInfo
             | PragmaName::IndexXinfo
             | PragmaName::IndexList
             | PragmaName::ForeignKeyList
@@ -365,6 +366,16 @@ fn update_pragma(
             connection.bump_prepare_context_generation();
             Ok(TransactionMode::None)
         }
+        PragmaName::CompileOptions => query_pragma(
+            PragmaName::CompileOptions,
+            resolver,
+            Some(value),
+            pager,
+            connection,
+            database_id,
+            schema_was_explicit,
+            program,
+        ),
         PragmaName::Encoding => {
             let year = chrono::Local::now().year();
             bail_parse_error!("It's {year}. UTF-8 won.");
@@ -814,6 +825,15 @@ fn query_pragma(
             program.emit_int(spill_enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::CompileOptions => {
+            for option in compile_options() {
+                program.emit_string8(option.to_string(), register);
+                program.emit_result_row(register, 1);
+            }
+
+            program.add_pragma_result_column("compile_options".to_string());
             Ok(TransactionMode::None)
         }
         PragmaName::DatabaseList => {
@@ -1767,6 +1787,16 @@ fn update_cache_size(
         .map_err(|e| LimboError::InternalError(format!("Failed to update page cache size: {e}")))?;
 
     Ok(())
+}
+
+// current example for test, todo!()
+pub(crate) fn compile_options() -> &'static [&'static str] {
+    &[
+        "MAX_COLUMN=2000",
+        "MAX_LENGTH=1000000000",
+        "MAX_LIKE_PATTERN_LENGTH=50000",
+        "THREADSAFE=1",
+    ]
 }
 
 pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";

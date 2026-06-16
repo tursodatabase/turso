@@ -1778,6 +1778,8 @@ pub enum PragmaName {
     CacheSize,
     /// set the cache spill behavior
     CacheSpill,
+    /// List compile-time options
+    CompileOptions,
     /// encryption cipher algorithm name for encrypted databases
     #[strum(serialize = "cipher")]
     #[cfg_attr(feature = "serde", serde(rename = "cipher"))]

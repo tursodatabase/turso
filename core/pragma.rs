@@ -46,6 +46,7 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
                 | PragmaFlags::NoColumns1,
             &["cache_size"],
         ),
+        CompileOptions => Pragma::new(PragmaFlags::Result0, &["compile_options"]),
         DataSyncRetry => Pragma::new(
             PragmaFlags::Result0 | PragmaFlags::NoColumns1,
             &["data_sync_retry"],

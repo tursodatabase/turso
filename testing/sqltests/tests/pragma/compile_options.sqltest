@@ -1,0 +1,25 @@
+@database :memory:
+
+test pragma-compile-options-has-threadsafe {
+    SELECT compile_options FROM pragma_compile_options WHERE compile_options = 'THREADSAFE=1';
+}
+expect {
+    THREADSAFE=1
+}
+
+test pragma-compile-options-table-valued-function {
+    SELECT compile_options FROM pragma_compile_options WHERE compile_options = 'MAX_COLUMN=2000';
+}
+expect {
+    MAX_COLUMN=2000
+}
+
+test pragma-compile-options-equals-syntax {
+    PRAGMA compile_options = 1;
+}
+expect {
+    MAX_COLUMN=2000
+    MAX_LENGTH=1000000000
+    MAX_LIKE_PATTERN_LENGTH=50000
+    THREADSAFE=1
+}

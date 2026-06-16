@@ -151,7 +151,7 @@ ongoing work to pass the full SQLite TCL test suite.
 | PRAGMA cell_size_check           | ❌ No         |                                              |
 | PRAGMA checkpoint_fullfsync      | ❌ No         |                                              |
 | PRAGMA collation_list            | ❌ No         |                                              |
-| PRAGMA compile_options           | ❌ No         |                                              |
+| PRAGMA compile_options           | ✅ Yes        |                                              |
 | PRAGMA count_changes             | Not Needed | deprecated in SQLite                         |
 | PRAGMA data_store_directory      | Not Needed | deprecated in SQLite                         |
 | PRAGMA data_version              | ❌ No         |                                              |
