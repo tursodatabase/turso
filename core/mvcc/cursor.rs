@@ -338,37 +338,33 @@ macro_rules! static_iterator_hack {
 
 pub(crate) use static_iterator_hack;
 
-/// Forward-scan finger over `index_rows`, co-advanced with the B-tree cursor.
-///
-/// The dual cursor walks the durable B-tree and `index_rows` (ordered by the
-/// same key) together. Rather than an `index_rows.get()` (O(log N)) per scanned
-/// B-tree row to decide whether a newer MVCC version shadows it, the finger is
-/// stepped along with the cursor, turning the shadow check into an amortized-O(1)
-/// merge step. Forward index cursors only; [`reset`](Self::reset) on any
-/// reposition (seek/rewind), since the finger is monotonic.
+/// Forward-scan finger over `index_rows`, co-advanced with the B-tree cursor so
+/// the per-row "is this B-tree row shadowed by MVCC?" check is an amortized-O(1)
+/// merge step instead of an `index_rows.get()` (O(log N)) per scanned row.
+/// Forward index cursors only; [`reset`](Self::reset) on any reposition, since
+/// the finger is monotonic.
 #[derive(Default)]
 struct IndexShadowFinger {
-    /// Live iterator over `index_rows`; `None` until first use or after reset.
+    /// Iterator over `index_rows`; `None` until first use or after reset.
     iter: Option<MvccIterator<'static, Arc<SortableIndexKey>>>,
-    /// Resolved head: the key and whether its chain shadows the B-tree row.
-    /// `None` once the finger runs past the last version.
+    /// Current head: key and whether its chain shadows the B-tree row. `None`
+    /// once the finger runs past the last version.
     peek: Option<(Arc<SortableIndexKey>, bool)>,
-    /// True once the finger has run past the last version; distinguishes
-    /// "not yet created" from "done" while `iter` and `peek` are both `None`.
+    /// Set once the finger runs past the last version; distinguishes "not yet
+    /// created" from "done" while `iter` and `peek` are both `None`.
     exhausted: bool,
 }
 
 impl IndexShadowFinger {
-    /// Drop the finger; it is lazily re-created the next time a shadow check
-    /// runs. Must be called on any B-tree reposition (seek/rewind), otherwise
-    /// the monotonic finger could sit ahead of the new position and report a
-    /// shadowed row as valid.
+    /// Drop the finger so the next shadow check rebuilds it. Required on any
+    /// B-tree reposition (seek/rewind): a finger left ahead of the new position
+    /// would report a shadowed row as valid.
     fn reset(&mut self) {
         *self = Self::default();
     }
 
-    /// Advance one entry, eagerly resolving whether its chain shadows the B-tree
-    /// row (so we never hold a borrowed skiplist `Entry` across calls).
+    /// Advance one entry, resolving its shadow bit up front so no borrowed
+    /// skiplist `Entry` is held across calls.
     fn advance<Clock: LogicalClock>(&mut self, db: &MvStore<Clock>, tx_id: u64) {
         let Some(iter) = self.iter.as_mut() else {
             self.peek = None;
@@ -398,6 +394,7 @@ impl IndexShadowFinger {
         key: &Arc<SortableIndexKey>,
     ) -> bool {
         if self.iter.is_none() && !self.exhausted {
+            // Scoped so the skiplist guard drops before `advance` re-borrows `db`.
             {
                 let index_rows = db.index_rows.get_or_insert_with(table_id, SkipMap::new);
                 let index_rows = index_rows.value();
@@ -517,9 +514,8 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         let valid = self
             .index_finger
             .btree_row_is_valid(&self.db, self.table_id, self.tx_id, rec);
-        // Safety net: in debug/test/simulator builds, prove the finger agrees with
-        // the authoritative per-row lookup. Any divergence (e.g. a missed reset
-        // after a reposition) fails the MVCC test suite instead of shipping.
+        // Debug-only cross-check: any finger divergence (e.g. a missed reset)
+        // fails the test suite instead of shipping.
         #[cfg(debug_assertions)]
         debug_assert_eq!(
             valid,
