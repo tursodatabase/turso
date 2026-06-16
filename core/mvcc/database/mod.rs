@@ -4932,6 +4932,32 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.find_next_visible_index_row(tx, mv_store_iterator)
     }
 
+    /// Whether an already-resolved index version chain shadows (invalidates) the
+    /// corresponding B-tree row for `tx_id`.
+    ///
+    /// This is exactly the predicate used by the `RowKey::Record` branch of
+    /// [`Self::query_btree_version_is_valid`], but it takes the version chain
+    /// directly instead of looking it up by key. A forward index scan keeps a
+    /// skiplist finger co-positioned with the B-tree and calls this on the
+    /// chain the finger already points at, replacing one `index_rows.get()`
+    /// (O(log N)) per scanned row with an amortized-O(1) merge step.
+    pub(crate) fn index_chain_invalidates_btree(
+        &self,
+        versions: &RwLock<Vec<RowVersion>>,
+        tx_id: TxID,
+    ) -> bool {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .expect("transaction should exist in txs map");
+        let tx = tx.value();
+        let versions = versions.read();
+        versions
+            .iter()
+            .rev()
+            .any(|version| version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states))
+    }
+
     /// Check if the B-tree version of a row should be shown to the given transaction.
     ///
     /// Returns true if the B-tree version is valid (should be shown).
