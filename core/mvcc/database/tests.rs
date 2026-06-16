@@ -3117,7 +3117,7 @@ fn test_reader_consistent_during_large_indexed_commit_rewrite() {
     loop {
         match commit.step().unwrap() {
             StepResult::Done => break,
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 // Concurrent reader: its fresh snapshot may be past c1's CommitEnd while
                 // c1 is mid-RewriteLiveVersions. Integrity + a couple index reads must hold.
                 let integ = get_rows(&c2, "PRAGMA integrity_check");
@@ -3171,7 +3171,7 @@ fn test_checkpoint_two_scan_toctou_orphans_first_checkpoint_unique_index() {
     let step_to_next_yield = |checkpoint: &mut crate::Statement, expect_remaining: usize| {
         for _ in 0..200_000 {
             match checkpoint.step().unwrap() {
-                StepResult::IO => {
+                StepResult::IO | StepResult::Yield => {
                     if injector.remaining_len() == expect_remaining {
                         return true;
                     }
@@ -3211,7 +3211,7 @@ fn test_checkpoint_two_scan_toctou_orphans_first_checkpoint_unique_index() {
                 checkpoint_done = true;
                 break;
             }
-            StepResult::IO => pager_io.step().unwrap(),
+            StepResult::IO | StepResult::Yield => pager_io.step().unwrap(),
             other => panic!("unexpected checkpoint step after resume: {other:?}"),
         }
     }
@@ -3257,7 +3257,7 @@ fn test_checkpoint_gc_anchor_loss_update_then_delete_strands_stale_row() {
     let step_to_next_yield = |checkpoint: &mut crate::Statement, expect_remaining: usize| {
         for _ in 0..200_000 {
             match checkpoint.step().unwrap() {
-                StepResult::IO => {
+                StepResult::IO | StepResult::Yield => {
                     if injector.remaining_len() == expect_remaining {
                         return true;
                     }
@@ -3291,7 +3291,7 @@ fn test_checkpoint_gc_anchor_loss_update_then_delete_strands_stale_row() {
                 checkpoint_done = true;
                 break;
             }
-            StepResult::IO => pager_io.step().unwrap(),
+            StepResult::IO | StepResult::Yield => pager_io.step().unwrap(),
             other => panic!("unexpected checkpoint step after resume: {other:?}"),
         }
     }
@@ -3686,11 +3686,11 @@ fn test_passive_checkpoint_tolerates_concurrent_create_after_snapshot() {
     let mut parked = false;
     for _ in 0..10_000 {
         match insert_stmt.step().unwrap() {
-            StepResult::IO if injector.is_empty() => {
+            StepResult::IO | StepResult::Yield if injector.is_empty() => {
                 parked = true;
                 break;
             }
-            StepResult::IO => {}
+            StepResult::IO | StepResult::Yield => {}
             StepResult::Done => {
                 panic!("INSERT completed before the checkpoint acquire-lock yield fired")
             }
@@ -3721,7 +3721,7 @@ fn test_passive_checkpoint_tolerates_concurrent_create_after_snapshot() {
                 done = true;
                 break;
             }
-            StepResult::IO => {}
+            StepResult::IO | StepResult::Yield => {}
             other => panic!("unexpected resume step result: {other:?}"),
         }
     }
