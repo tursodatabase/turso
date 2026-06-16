@@ -22,9 +22,11 @@ use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::plan::BitSet;
+use crate::translate::select::SQLITE_MAX_COLUMN;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
+use crate::vdbe::value::SQLITE_MAX_LIKE_PATTERN_LENGTH;
 use crate::{bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
@@ -829,7 +831,7 @@ fn query_pragma(
         }
         PragmaName::CompileOptions => {
             for option in compile_options() {
-                program.emit_string8(option.to_string(), register);
+                program.emit_string8(option, register);
                 program.emit_result_row(register, 1);
             }
 
@@ -1789,13 +1791,12 @@ fn update_cache_size(
     Ok(())
 }
 
-// current example for test, todo!()
-pub(crate) fn compile_options() -> &'static [&'static str] {
-    &[
-        "MAX_COLUMN=2000",
-        "MAX_LENGTH=1000000000",
-        "MAX_LIKE_PATTERN_LENGTH=50000",
-        "THREADSAFE=1",
+fn compile_options() -> [String; 4] {
+    [
+        format!("MAX_COLUMN={SQLITE_MAX_COLUMN}"),
+        format!("MAX_LENGTH={}", Value::MAX_BLOB_LENGTH),
+        format!("MAX_LIKE_PATTERN_LENGTH={SQLITE_MAX_LIKE_PATTERN_LENGTH}"),
+        "THREADSAFE=1".to_string(),
     ]
 }
 

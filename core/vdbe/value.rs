@@ -8,6 +8,8 @@ use crate::{
     LimboError, Result, Value, ValueRef,
 };
 
+pub(crate) const SQLITE_MAX_LIKE_PATTERN_LENGTH: usize = 50000;
+
 // we use math functions from Rust stdlib in order to be as portable as possible for the production version of the tursodb
 #[cfg(not(test))]
 mod cmath {
@@ -1183,8 +1185,7 @@ impl Value {
     }
 
     pub fn exec_like(pattern: &str, text: &str, escape: Option<char>) -> Result<bool, LimboError> {
-        const MAX_LIKE_PATTERN_LENGTH: usize = 50000;
-        if pattern.len() > MAX_LIKE_PATTERN_LENGTH {
+        if pattern.len() > SQLITE_MAX_LIKE_PATTERN_LENGTH {
             return Err(LimboError::Constraint(
                 "LIKE or GLOB pattern too complex".to_string(),
             ));
