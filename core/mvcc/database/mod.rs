@@ -4841,6 +4841,36 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(None)
     }
 
+    /// Like [`read_visible_from_versions`] but serializes the visible row's
+    /// payload directly into `record` instead of cloning a `Row`. Mirrors the
+    /// btree cursor, which serializes a cell straight into its reusable record.
+    /// Returns true if a visible version was found. The version-chain read lock
+    /// is held only for the serialization copy.
+    pub(crate) fn read_visible_into_record(
+        &self,
+        tx_id: TxID,
+        versions: &RowVersions,
+        record: &mut ImmutableRecord,
+    ) -> Result<bool> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let tx = tx.value();
+        turso_assert_eq!(tx.state, TransactionState::Active);
+        let versions = versions.read();
+        if let Some(rv) = versions
+            .iter()
+            .rev()
+            .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
+        {
+            record.invalidate();
+            record.start_serialization(rv.row.payload())?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Gets all row ids in the database.
     pub fn scan_row_ids(&self) -> Result<Vec<RowID>> {
         tracing::trace!("scan_row_ids");

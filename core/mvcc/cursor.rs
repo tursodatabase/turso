@@ -421,31 +421,61 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
-        let current_pos = &self.current_pos;
-        tracing::trace!("current_row({:?})", current_pos);
-        match current_pos {
+        tracing::trace!("current_row({:?})", self.current_pos);
+        match &self.current_pos {
+            CursorPosition::Loaded { in_btree: true, .. } => self.btree_cursor.record(),
             CursorPosition::Loaded {
-                row_id: _,
-                in_btree,
-                ..
+                in_btree: false, ..
             } => {
-                if *in_btree {
-                    self.btree_cursor.record()
-                } else {
-                    let Some(row) = self.read_mvcc_current_row()? else {
-                        return Ok(IOResult::Done(None));
-                    };
-                    {
-                        let record = self.get_immutable_record_or_create()?;
-                        record.invalidate();
-                        record.start_serialization(row.payload())?;
-                    }
+                // Lightweight handle clone (refcount bump) so we can drop the
+                // borrow of `current_pos` and mutably borrow the reusable record.
+                let versions = match &self.current_pos {
+                    CursorPosition::Loaded { versions, .. } => versions.clone(),
+                    _ => unreachable!("matched Loaded above"),
+                };
 
-                    let record_ref = self.reusable_immutable_record.as_ref().ok_or_else(|| {
-                        LimboError::InternalError("immutable record not initialized".to_string())
-                    })?;
-                    Ok(IOResult::Done(Some(record_ref)))
+                let found = if let Some(versions) = &versions {
+                    // Fast path: serialize the visible version straight into our
+                    // reusable record — like the btree cursor does with a cell —
+                    // instead of cloning a `Row` first.
+                    if self.reusable_immutable_record.is_none() {
+                        self.reusable_immutable_record = Some(ImmutableRecord::new(1024)?);
+                    }
+                    let record = self.reusable_immutable_record.as_mut().unwrap();
+                    self.db
+                        .read_visible_into_record(self.tx_id, versions, record)?
+                } else {
+                    // Cold fallback (seek-positioned, no cached chain): point
+                    // lookup, then serialize.
+                    let row_id = match &self.current_pos {
+                        CursorPosition::Loaded { row_id, .. } => row_id.clone(),
+                        _ => unreachable!("matched Loaded above"),
+                    };
+                    let maybe_index_id = match &self.mv_cursor_type {
+                        MvccCursorType::Index(_) => Some(self.table_id),
+                        MvccCursorType::Table => None,
+                    };
+                    match self
+                        .db
+                        .read_from_table_or_index(self.tx_id, &row_id, maybe_index_id)?
+                    {
+                        Some(row) => {
+                            let record = self.get_immutable_record_or_create()?;
+                            record.invalidate();
+                            record.start_serialization(row.payload())?;
+                            true
+                        }
+                        None => false,
+                    }
+                };
+
+                if !found {
+                    return Ok(IOResult::Done(None));
                 }
+                let record_ref = self.reusable_immutable_record.as_ref().ok_or_else(|| {
+                    LimboError::InternalError("immutable record not initialized".to_string())
+                })?;
+                Ok(IOResult::Done(Some(record_ref)))
             }
             CursorPosition::BeforeFirst => {
                 // Before first is not a valid position, so we return none.
