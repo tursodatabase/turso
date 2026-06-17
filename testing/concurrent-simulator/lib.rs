@@ -274,6 +274,8 @@ pub struct WhopperOpts {
     pub keep_files: bool,
     /// Enable MVCC (Multi-Version Concurrency Control).
     pub enable_mvcc: bool,
+    /// Enable the experimental non-blocking (passive) MVCC checkpoint.
+    pub experimental_mvcc_passive_checkpoint: bool,
     /// Enable database encryption with random cipher.
     pub enable_encryption: bool,
     /// Elle tables to create: vec of (table_name, create_sql).
@@ -334,6 +336,7 @@ impl Default for WhopperOpts {
             cosmic_ray_probability: 0.0,
             keep_files: false,
             enable_mvcc: false,
+            experimental_mvcc_passive_checkpoint: false,
             enable_encryption: false,
             elle_tables: vec![],
             workloads: vec![],
@@ -422,6 +425,11 @@ impl WhopperOpts {
 
     pub fn with_enable_mvcc(mut self, enable: bool) -> Self {
         self.enable_mvcc = enable;
+        self
+    }
+
+    pub fn with_experimental_mvcc_passive_checkpoint(mut self, enable: bool) -> Self {
+        self.experimental_mvcc_passive_checkpoint = enable;
         self
     }
 
@@ -608,6 +616,8 @@ pub struct Whopper {
     chaotic_profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
     /// Setting this to true sets `pramga mvcc_checkpoint_threshold = -1` (disabled).
     disable_mvcc_auto_checkpoint: bool,
+    /// Open databases with the experimental non-blocking (passive) MVCC checkpoint enabled.
+    experimental_mvcc_passive_checkpoint: bool,
     /// If false, drop fiber connections without first closing them.
     close_connections_gracefully: bool,
     allocation_fault_injector: Option<&'static SimulatorAllocationFaultInjector>,
@@ -657,7 +667,11 @@ impl Whopper {
         };
 
         let db = {
-            let db_opts = DatabaseOpts::new().with_encryption(encryption_opts.is_some());
+            let db_opts = DatabaseOpts::new()
+                .with_encryption(encryption_opts.is_some())
+                .with_experimental_mvcc_passive_checkpoint(
+                    opts.experimental_mvcc_passive_checkpoint,
+                );
 
             match Database::open_file_with_flags(
                 io.clone(),
@@ -761,6 +775,7 @@ impl Whopper {
             stats: Stats::default(),
             chaotic_profiles: opts.chaotic_profiles,
             disable_mvcc_auto_checkpoint: opts.disable_mvcc_auto_checkpoint,
+            experimental_mvcc_passive_checkpoint: opts.experimental_mvcc_passive_checkpoint,
             close_connections_gracefully: opts.close_connections_gracefully,
             allocation_fault_injector,
         };
@@ -1487,7 +1502,9 @@ impl Whopper {
 
     /// Open database connections for all fibers.
     fn open_connections(&mut self) -> anyhow::Result<()> {
-        let db_opts = DatabaseOpts::new().with_encryption(self.encryption_opts.is_some());
+        let db_opts = DatabaseOpts::new()
+            .with_encryption(self.encryption_opts.is_some())
+            .with_experimental_mvcc_passive_checkpoint(self.experimental_mvcc_passive_checkpoint);
         let db = Database::open_file_with_flags(
             self.io.clone(),
             &self.db_path,
