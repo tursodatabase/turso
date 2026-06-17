@@ -2955,7 +2955,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     CommitState::WriteLogicalLog { log_record, .. } => log_record,
                     _ => unreachable!(),
                 };
-                let (c, append_bytes) = mvcc_store.storage.log_tx(log_record, None)?;
+                let (c, append_bytes) = mvcc_store.storage.log_tx(self.tx_id, log_record, None)?;
                 self.pending_log_append_bytes = Some(append_bytes);
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
@@ -2966,7 +2966,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
 
             CommitState::FinishLogicalLogWrite { end_ts } => {
-                let c = mvcc_store.storage.on_log_write_complete()?;
+                let c = mvcc_store.storage.on_log_write_complete(self.tx_id)?;
                 self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)

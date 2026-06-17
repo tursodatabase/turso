@@ -8,7 +8,7 @@ use crate::turso_assert;
 use std::fmt::Debug;
 
 pub mod logical_log;
-use crate::mvcc::database::{LogRecord, RowVersion};
+use crate::mvcc::database::{LogRecord, RowVersion, TxID};
 use crate::mvcc::persistent_storage::logical_log::{
     serialize_header_entry, serialize_op_entry, LogicalLog, OnSerializationComplete,
     DEFAULT_LOG_CHECKPOINT_THRESHOLD,
@@ -34,12 +34,16 @@ pub trait DurableStorage: Send + Sync + Debug {
 
     /// Write a transaction to the logical log without advancing the writer offset.
     ///
+    /// `tx_id` is the in-memory MVCC transaction id whose record is being
+    /// appended. It is not part of the logical-log wire format.
+    ///
     /// If `on_serialization_complete` is provided, it is called with shared
     /// ownership of the framed bytes and the running CRC after framing but
     /// before the disk write. The callback runs while the internal write lock
     /// is held, so it should be fast.
     fn log_tx(
         &self,
+        tx_id: TxID,
         m: LogRecord,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)>;
@@ -56,7 +60,7 @@ pub trait DurableStorage: Send + Sync + Debug {
     ///
     /// Implementations may return a completion for any additional durability
     /// work that must finish before commit publication.
-    fn on_log_write_complete(&self) -> Result<Completion> {
+    fn on_log_write_complete(&self, _tx_id: TxID) -> Result<Completion> {
         Ok(Completion::new_yield())
     }
 
@@ -173,6 +177,7 @@ impl DurableStorage for Storage {
 
     fn log_tx(
         &self,
+        _tx_id: TxID,
         m: LogRecord,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {

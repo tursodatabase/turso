@@ -14403,7 +14403,7 @@ fn dropped_attached_commit_rolls_back_remaining_attached_mvcc_txs() {
 fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
     use crate::io::FileSyncType;
     use crate::mvcc;
-    use crate::mvcc::database::{LogRecord, RowVersion};
+    use crate::mvcc::database::{LogRecord, RowVersion, TxID};
     use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
     use crate::mvcc::persistent_storage::DurableStorage;
     use crate::storage::encryption::EncryptionContext;
@@ -14447,19 +14447,23 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
         }
         fn log_tx(
             &self,
+            tx_id: TxID,
             m: LogRecord,
             c: OnSerializationComplete<'_>,
         ) -> Result<(Completion, u64)> {
             if self.arm_log_tx_busy.swap(false, Ordering::AcqRel) {
                 return Err(LimboError::Busy);
             }
-            self.inner.log_tx(m, c)
+            self.inner.log_tx(tx_id, m, c)
         }
         fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
             self.inner.upgrade_header_for_log_tx(m)
         }
         fn sync(&self, t: FileSyncType) -> Result<Completion> {
             self.inner.sync(t)
+        }
+        fn on_log_write_complete(&self, tx_id: TxID) -> Result<Completion> {
+            self.inner.on_log_write_complete(tx_id)
         }
         fn update_header(&self) -> Result<Completion> {
             self.inner.update_header()

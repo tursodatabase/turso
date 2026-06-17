@@ -1,5 +1,6 @@
 use crate::common::{ExecRows, TempDatabase};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use turso_core::{Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, StepResult};
 
@@ -26,19 +27,30 @@ fn create_mvcc_db(io: &Arc<dyn turso_core::io::IO + Send>, path: &Path) -> anyho
 #[derive(Debug)]
 struct RecordingDurableStorage {
     inner: Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>,
-    used_log_tx: std::sync::atomic::AtomicBool,
+    used_log_tx: AtomicBool,
+    last_log_tx_id: AtomicU64,
+    last_completed_tx_id: AtomicU64,
 }
 
 impl RecordingDurableStorage {
     fn new(inner: Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>) -> Self {
         Self {
             inner,
-            used_log_tx: std::sync::atomic::AtomicBool::new(false),
+            used_log_tx: AtomicBool::new(false),
+            last_log_tx_id: AtomicU64::new(0),
+            last_completed_tx_id: AtomicU64::new(0),
         }
     }
 
     fn saw_log_tx(&self) -> bool {
-        self.used_log_tx.load(std::sync::atomic::Ordering::SeqCst)
+        self.used_log_tx.load(Ordering::SeqCst)
+    }
+
+    fn last_tx_ids(&self) -> (u64, u64) {
+        (
+            self.last_log_tx_id.load(Ordering::SeqCst),
+            self.last_completed_tx_id.load(Ordering::SeqCst),
+        )
     }
 }
 
@@ -63,14 +75,15 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
 
     fn log_tx(
         &self,
+        tx_id: turso_core::mvcc::database::TxID,
         m: turso_core::mvcc::database::LogRecord,
         on_serialization_complete: Option<
             &dyn Fn(turso_core::SharedBufferData, u32) -> turso_core::Result<()>,
         >,
     ) -> turso_core::Result<(turso_core::Completion, u64)> {
-        self.used_log_tx
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.inner.log_tx(m, on_serialization_complete)
+        self.used_log_tx.store(true, Ordering::SeqCst);
+        self.last_log_tx_id.store(tx_id, Ordering::SeqCst);
+        self.inner.log_tx(tx_id, m, on_serialization_complete)
     }
 
     fn sync(
@@ -78,6 +91,14 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         sync_type: turso_core::io::FileSyncType,
     ) -> turso_core::Result<turso_core::Completion> {
         self.inner.sync(sync_type)
+    }
+
+    fn on_log_write_complete(
+        &self,
+        tx_id: turso_core::mvcc::database::TxID,
+    ) -> turso_core::Result<turso_core::Completion> {
+        self.last_completed_tx_id.store(tx_id, Ordering::SeqCst);
+        self.inner.on_log_write_complete(tx_id)
     }
 
     fn update_header(&self) -> turso_core::Result<turso_core::Completion> {
@@ -205,6 +226,12 @@ fn test_mvcc_custom_durable_storage_injected(tmp_db: TempDatabase) -> anyhow::Re
     assert!(
         recording.saw_log_tx(),
         "expected MVCC commit to call injected DurableStorage::log_tx()"
+    );
+    let (log_tx_id, completed_tx_id) = recording.last_tx_ids();
+    assert_ne!(log_tx_id, 0, "expected log_tx to receive a live tx_id");
+    assert_eq!(
+        completed_tx_id, log_tx_id,
+        "expected DurableStorage hooks to receive the same tx_id"
     );
 
     conn.close()?;
