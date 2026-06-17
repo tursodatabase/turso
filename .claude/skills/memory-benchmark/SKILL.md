@@ -112,7 +112,6 @@ cargo run --release -p memory-benchmark -- \
   -b <batch-size> \
   --connections <N> \
   --checkpoint \
-  --mvcc-checkpoint-threshold <bytes> \
   --timeout <ms> \
   --cache-size <pages> \
   --mvcc-checkpoint-threshold <bytes>   # MVCC only; -1 disables auto-checkpoint
