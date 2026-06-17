@@ -1887,10 +1887,8 @@ fn test_checkpoint_allows_index_schema_update_after_rename_column() {
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
 fn test_bootstrap_recovers_committed_wal_without_log_file() {
-    // A non-blocking (Passive) checkpoint truncates the logical log to 0 but
-    // intentionally leaves the WAL non-empty. On the next open the log is absent
-    // (NoLog) while the WAL holds committed frames — this is the normal steady
-    // state, not corruption. Recovery must materialize from the WAL, not fail closed.
+    // A Passive checkpoint truncates the logical log to 0 but leaves the WAL non-empty,
+    // so reopen sees NoLog + committed WAL — the normal steady state, not corruption.
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let db_path = db.path.as_ref().unwrap().clone();
     {
@@ -3575,10 +3573,9 @@ fn test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check() {
             .unwrap();
         let mut iters = 0u64;
         while !reader_stop.load(Ordering::Acquire) {
-            // The only sound concurrent oracle: a single-snapshot integrity_check. It validates
-            // every table row against its index entries within one consistent read, so it flags a
-            // genuine table/index desync without assuming any particular value or comparing across
-            // two separate snapshots.
+            // Single-snapshot integrity_check: the only sound concurrent oracle — it checks
+            // table rows against index entries in one consistent read, no cross-snapshot
+            // assumptions.
             if let Some(ic) = read_retry(&reader, "PRAGMA integrity_check") {
                 assert_eq!(
                     ic.len(),
@@ -3745,11 +3742,10 @@ fn test_reader_does_not_see_inflight_index_tombstone() {
 /// leave the pre-update index entry tombstoned (regression guard; this path is correct).
 #[test]
 fn test_rollback_of_indexed_update_keeps_btree_resident_index_entry() {
-    // Minimal repro candidate for the turso_stress "row missing from index" bug:
-    // an UPDATE of an indexed UNIQUE column, inside a tx that ROLLS BACK, must not
-    // leave the pre-update index entry tombstoned — especially when that entry is
-    // already btree-resident (checkpointed + GC'd from the MVCC store), which is
-    // when the UPDATE creates a synthetic tombstone over the btree entry.
+    // Repro for the turso_stress "row missing from index" bug: an UPDATE of an indexed
+    // UNIQUE column inside a tx that ROLLS BACK must not leave the pre-update index entry
+    // tombstoned — especially when it's already btree-resident (the UPDATE then creates a
+    // synthetic tombstone over the btree entry).
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(pk NUMERIC PRIMARY KEY, v NUMERIC UNIQUE)")

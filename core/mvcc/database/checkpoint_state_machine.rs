@@ -202,10 +202,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     update_transaction_state: bool,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
-    /// Checkpoint mode. `should_restart_log()` (Truncate/Restart) gates the explicit WAL
-    /// file truncation in `TruncateWal`; Passive leaves the WAL non-empty (max_frame is
-    /// not reset) and relies on restart-on-write, so the auto-checkpoint does not fight
-    /// concurrent readers/writers for WAL exclusivity.
+    /// Checkpoint mode. `should_restart_log()` (Truncate/Restart) gates the WAL
+    /// truncation in `TruncateWal`; Passive leaves the WAL non-empty (restart-on-write).
     mode: CheckpointMode,
     /// Internal metadata table info for persisting `persistent_tx_ts_max` atomically with pager commit.
     mvcc_meta_table: Option<(MVTableId, usize)>,
@@ -221,13 +219,10 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// Async driver for `CheckpointState::CompactSequences`. Lazily set
     /// on first entry to that state; cleared when the driver completes.
     seq_compact: Option<SeqCompactDriver<Clock, A>>,
-    /// Snapshot timestamp captured at the start of the off-lock prepare phase
-    /// (`= mvstore.last_committed_tx_ts`). Collection treats it as the upper
-    /// bound: versions whose insert (`begin_ts`) committed *after* it are deferred
-    /// to the next pass, and tombstones that committed after it are clamped to
-    /// "live" (see `maybe_get_checkpointable_versions`) so concurrent commits
-    /// during the unlocked prepare phase never strand a row. `u64::MAX` means
-    /// "no upper bound" (collect everything), used before a snapshot is taken.
+    /// Upper-bound timestamp for collection (`= mvstore.last_committed_tx_ts` at the
+    /// start of the off-lock prepare phase). Versions inserted after it are deferred and
+    /// tombstones after it are clamped to "live" so concurrent commits never strand a row
+    /// (see `maybe_get_checkpointable_versions`). `u64::MAX` = no bound (collect all).
     snapshot_ts: u64,
     build_local_schema_sm: Option<StateMachine<BuildLocalSchemaViewStateMachine<Clock, A>>>,
     build_local_schema_began_read_tx: bool,
@@ -820,10 +815,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
             // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
             // Resolve in-flight TxID begin/end markers to the owning tx's true state
-            // (under off-lock collection the chain may not be rewritten to a Timestamp
-            // yet). Only a Committed tx contributes a timestamp; Active/Preparing/
-            // Aborted resolve to None (the insert/delete has not happened from this
-            // checkpoint's snapshot view). Uses the PackedTs accessors.
+            // (off-lock collection may not have rewritten the chain to a Timestamp yet).
+            // Only a Committed tx contributes a timestamp; others resolve to None.
             let begin_ts = match version.begin() {
                 Some(TxTimestampOrID::Timestamp(e)) => Some(e),
                 Some(TxTimestampOrID::TxID(t)) => {
@@ -844,18 +837,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
                 None => None,
             };
-            // Upper bound: a version whose insert is not yet visible at our
-            // snapshot committed during the off-lock prepare phase. Defer it to
-            // the next checkpoint pass and don't let it influence DB-file
-            // existence for the versions we DO checkpoint now.
+            // Insert not visible at our snapshot (committed during the off-lock prepare
+            // phase): defer to the next pass and don't let it affect DB-file existence now.
             if begin_ts.is_some_and(|b| b > self.snapshot_ts) {
                 continue;
             }
-            // A tombstone that committed after our snapshot has not happened yet
-            // from this pass's perspective. Clamp it to "live" (end=None) so the
-            // row is checkpointed as PRESENT rather than skipped/stranded; a later
-            // pass (once the delete is <= snapshot) checkpoints the deletion. This
-            // is the fix for the future-tombstone orphan bug.
+            // Tombstone committed after our snapshot: clamp to "live" (end=None) so the
+            // row is checkpointed as PRESENT, not stranded; a later pass (delete <=
+            // snapshot) checkpoints the deletion. Fixes the future-tombstone orphan bug.
             let future_committed_tombstone = end_ts.is_some_and(|e| e > self.snapshot_ts);
             if future_committed_tombstone {
                 end_ts = None;
@@ -912,18 +901,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             let should_checkpoint =
                 is_uncheckpointed_insert || is_delete_and_exists_in_db_file || is_schema_delete;
             if should_checkpoint {
-                // Push a clamped clone when the row carried a future tombstone, so
-                // the B-tree write treats it as a live insert (end=None).
+                // Future tombstone: push a clamped clone so the B-tree write sees a live insert.
                 let checkpoint_version = if future_committed_tombstone {
                     let mut v = version.clone();
                     v.set_end(None);
                     v
                 } else {
                     let mut version = version.clone();
-                    // Normalize the clone's end to the resolved end_ts: a Committed(ts)
-                    // delete stays a delete; an in-flight/aborted end (resolved to None)
-                    // becomes a live insert so the downstream is_delete is consistent and
-                    // we don't run a spurious delete on the row.
+                    // Normalize the clone's end to the resolved end_ts so downstream
+                    // is_delete is consistent (in-flight/aborted end -> live insert).
                     version.set_end(end_ts.map(TxTimestampOrID::Timestamp));
                     version
                 };
@@ -1304,14 +1290,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         if !schema.dropped_root_pages.is_empty() {
             return true;
         }
-        // A negative root page only counts as "unpublished" if THIS checkpoint
-        // materialized that object — i.e. it has a real root page in
-        // `table_id_to_rootpage` that we have not yet written back into the
-        // schema. A table/index created by a transaction that committed AFTER
-        // this checkpoint's snapshot is legitimately deferred to a later
-        // checkpoint and has no mapping yet, so its negative placeholder must
-        // NOT be treated as our unpublished work (that was the false-positive
-        // that panicked the TruncateWal assert under off-lock collection).
+        // A negative root page is "unpublished" only if THIS checkpoint materialized the
+        // object (has a real root page in `table_id_to_rootpage` not yet written back to
+        // the schema). Objects created after our snapshot are deferred to a later
+        // checkpoint and have no mapping yet, so their placeholders aren't our work —
+        // counting them was the false-positive that panicked the TruncateWal assert.
         let owned_negative = |root_page: i64| -> bool {
             root_page < 0
                 && self
@@ -1375,14 +1358,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             return Ok(());
         }
 
-        // Patch the LIVE connection/db schema (NOT local_schema): this is what
-        // `clone_schema()` below propagates to the connection, so subsequent
-        // queries resolve the real root pages. Writing local_schema (the
-        // checkpoint's private snapshot) would leave the live schema pointing at
-        // the negative placeholders, orphaning the freshly-allocated btree pages.
-        // This must happen as soon as the pager commit succeeds because the
-        // committed root pages are then visible through WAL even if the later WAL
-        // checkpoint/log truncation is busy.
+        // Patch the LIVE connection/db schema (NOT local_schema, the checkpoint's private
+        // snapshot) so `clone_schema()` propagates real root pages to the connection;
+        // otherwise the live schema keeps the negative placeholders and orphans the new
+        // btree pages. Done at pager-commit time since the roots are then visible via WAL.
         let mut schema_ref = self.connection.db.schema.lock();
         let schema = Schema::try_make_mut(&mut schema_ref)?;
         for (name, table) in schema.tables.iter_mut() {
@@ -1397,12 +1376,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 #[cfg(feature = "conn_raw_api")]
                 let old_root_page = btree_table.root_page;
                 let table_id = MVTableId::from(btree_table.root_page);
-                // Only resolve tables this checkpoint actually materialized. With
-                // off-lock collection + snapshot_ts deferral, the live connection
-                // schema can contain tables created AFTER our snapshot (still a
-                // negative placeholder root page) that this pass did NOT checkpoint.
-                // Leave those untouched — a later checkpoint that includes them
-                // publishes their real root page.
+                // Only resolve tables this pass materialized. The live schema can hold
+                // tables created after our snapshot (still negative placeholders) that we
+                // didn't checkpoint; leave those for a later pass to publish.
                 if let Some(root_page) = self
                     .mvstore
                     .table_id_to_rootpage
@@ -1424,8 +1400,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             for index in table_index_list.iter_mut() {
                 if index.root_page < 0 {
                     let table_id = MVTableId::from(index.root_page);
-                    // Same as tables above: skip indexes not materialized by this
-                    // pass (created after snapshot_ts); resolved by a later checkpoint.
+                    // Same as tables: skip indexes not materialized by this pass.
                     if let Some(root_page) = self
                         .mvstore
                         .table_id_to_rootpage
@@ -1641,9 +1616,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_err()
                 {
-                    // Another checkpoint is already running. Return a no-op result;
-                    // we did no work and own no resources, so Finalize's cleanup is
-                    // skipped on this path.
+                    // Another checkpoint is already running: no-op (no work, no resources).
                     self.state = CheckpointState::Finalize;
                     return Ok(TransitionResult::Done(CheckpointResult::default()));
                 }
@@ -2507,11 +2480,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
 
             CheckpointState::TruncateWal => {
-                // With the experimental passive checkpoint off, every mode resets the WAL
-                // (the pre-feature baseline: MVCC checkpoints were always TRUNCATE). This
-                // keeps the logical-log-truncated-but-WAL-non-empty (NoLog steady) state
-                // exclusive to passive mode, so flag-off recovery still treats NoLog over a
-                // committed WAL as corruption.
+                // With passive off, every mode resets the WAL (baseline: MVCC checkpoints
+                // were always TRUNCATE), keeping the NoLog-over-committed-WAL steady state
+                // exclusive to passive so flag-off recovery still treats it as corruption.
                 let restart_wal = self.mode.should_restart_log()
                     || !self
                         .connection
@@ -2534,10 +2505,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         return Ok(TransitionResult::Io(io));
                     }
                 }
-                // Passive: no explicit WAL truncation — leave the WAL non-empty (max_frame
-                // is NOT reset), and let the next write restart-on-write. The logical log
-                // was already truncated to 0, so recovery sees NoLog + a committed WAL,
-                // which is the normal Passive steady state (handled in recovery).
+                // Passive: leave the WAL non-empty (restart-on-write). The logical log is
+                // already truncated, so recovery sees NoLog + committed WAL — the normal
+                // Passive steady state.
                 turso_assert!(
                     !self.has_pending_root_publication(),
                     "checkpoint finalized after pager writes without publishing schema changes"
@@ -2571,12 +2541,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
             CheckpointState::Finalize => {
                 tracing::debug!("Releasing blocking checkpoint lock");
-                // The blocking checkpoint lock is still held here (v1 holds it
-                // through write/commit/GC/Finalize), so the slot-removing GC
-                // variant is safe: no concurrent writer can race the empty-slot
-                // removal. This bounds the skip-map entry counts — the lazy
-                // (non-removing) GC otherwise leaves empty chain slots behind
-                // forever for rows never written again.
+                // The blocking checkpoint lock is still held here, so the slot-removing GC
+                // variant is safe (no writer can race the empty-slot removal). This bounds
+                // skip-map entries that lazy GC would otherwise leave behind forever.
                 assert!(
                     self.lock_states.blocking_checkpoint_lock_held,
                     "finalize GC requires the blocking checkpoint lock"
@@ -2637,11 +2604,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
 }
 
 /// Re-entrant state machine that builds a snapshot-consistent `Schema` for the
-/// checkpoint: it scans the on-disk `sqlite_schema` B-tree (root page 1) and then
-/// overlays the MVCC delta (committed sqlite_schema versions visible at
-/// `snapshot_ts`), so the schema matches exactly the rows the checkpoint collects.
-/// Using the live connection schema instead would include objects created after
-/// `snapshot_ts` and mis-map index ids (Fix A).
+/// checkpoint: scans the on-disk `sqlite_schema` B-tree (root page 1) and overlays the
+/// MVCC delta visible at `snapshot_ts`, matching exactly the rows the checkpoint
+/// collects. The live schema would include post-snapshot objects and mis-map index ids.
 enum BuildLocalSchemaViewState {
     Rewind,
     ReadRowid,

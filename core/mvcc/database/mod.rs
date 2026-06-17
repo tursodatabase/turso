@@ -3688,10 +3688,9 @@ pub enum CompleteCheckpointState {
         header_result: HeaderReadResult,
         checkpoint_result: CheckpointResult,
     },
-    /// Main path: driving `wal.checkpoint(Truncate)`. Reached from either a
-    /// Valid header (already reused via `set_header`) or a `NoLog` log (the
-    /// normal Passive steady state) — the fresh header is (re)written later in
-    /// `RetryHeader`, so no header payload is needed here.
+    /// Main path: driving `wal.checkpoint(Truncate)`. Reached from a Valid header (reused
+    /// via `set_header`) or a `NoLog` log (the Passive steady state); the fresh header is
+    /// (re)written later in `RetryHeader`.
     DriveCheckpoint,
     /// Awaiting the `db_file.sync` completion after a successful backfill.
     AwaitDbFileSync {
@@ -3861,25 +3860,16 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     exclusive_tx: AtomicU64,
     commit_coordinator: Arc<CommitCoordinator>,
     global_header: Arc<RwLock<Option<DatabaseHeader>>>,
-    /// MVCC checkpoints lock readers and writers out of the engine only during the
-    /// in-memory marker-publication and metadata-mutation phase. The MvStore → WAL
-    /// write-out (BeginPagerTxn → WriteRow → WriteIndexRow → CommitPagerTxn) runs
-    /// WITHOUT this lock, so concurrent `BEGIN CONCURRENT`s don't observe the writer
-    /// flag and don't return Busy during the I/O-heavy portion of the checkpoint.
-    /// The procedure is:
-    /// - (unlocked) Snapshot MvStore via snapshot_ts; collect committed versions;
-    ///   begin pager txn; write rows; commit pager txn (WAL has the data, fsynced).
-    /// - (locked) Take the blocking_checkpoint_lock; publish durable_txid_max,
-    ///   global_header and schema roots; release the lock.
-    /// - (unlocked) GC; CheckpointWal → SyncDbFile → truncate logical log → TruncateWal.
+    /// Held by checkpoints only during the brief in-memory publish phase; the I/O-heavy
+    /// MvStore → WAL write-out runs unlocked, so concurrent `BEGIN CONCURRENT`s aren't
+    /// blocked. Phases: (unlocked) snapshot + collect + write + commit pager txn;
+    /// (locked) publish durable_txid_max / global_header / schema roots; (unlocked) GC,
+    /// CheckpointWal, truncate logical log, TruncateWal.
     blocking_checkpoint_lock: Arc<TursoRwLock>,
-    /// Single-orchestrator gate for MVCC checkpoints. Set when a CheckpointStateMachine
-    /// is actively running its unlocked write-out phase; cleared on completion or
-    /// error. Multiple commits triggering `should_checkpoint()` race to set this;
-    /// only one wins and runs the checkpoint, the others skip it. Necessary because
-    /// the previously-implicit single-orchestrator invariant (provided by
-    /// `blocking_checkpoint_lock` being acquired in AcquireLock as the *first* state)
-    /// no longer holds once the lock is moved past the pager-write phase.
+    /// Single-orchestrator gate: set while a CheckpointStateMachine runs its unlocked
+    /// write-out phase, cleared on completion/error. Commits racing `should_checkpoint()`
+    /// contend on it; only one wins. Needed because the lock no longer guards the start
+    /// of the checkpoint (it's acquired after the pager-write phase, not before).
     checkpoint_in_progress: AtomicBool,
     /// The highest transaction ID that has been made durable in the WAL.
     /// Used to skip checkpointing transactions from mv store to WAL that have already been processed.
@@ -6948,24 +6938,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             matches!(rv.begin(), Some(TxTimestampOrID::Timestamp(_))) && rv.end().is_none()
         });
 
-        // Rule 2: superseded versions are removable only when BOTH consumers of
-        // the chain are done with them:
-        //   - readers:    e <= lwm — no present or future snapshot can land
-        //     inside the version's [begin, end) interval;
-        //   - checkpoint: e <= ckpt_max — the durable boundary has passed the
-        //     supersession, so the B-tree no longer reflects this version.
-        //
-        // The second condition must hold even when a newer current version
-        // exists in the chain. The off-lock checkpoint can durably write a
-        // version and publish boundary < e while a concurrent UPDATE/DELETE has
-        // already superseded it in memory; until a later checkpoint catches up
-        // past e, this version's `begin <= boundary` is the chain's only proof
-        // (for exists_in_db_file) that the B-tree physically contains the row.
-        // Dropping it strands the B-tree copy forever: a later committed DELETE
-        // classifies as "row never durably existed" and is silently skipped,
-        // desyncing the table from its indexes (an UPDATE keeps the table rowid
-        // in the same chain but moves the index entry to a new key chain, so
-        // only the table side loses its anchor).
+        // Rule 2: a superseded version (end=Timestamp(e)) is removable only when no
+        // reader can see it (e <= lwm) AND its supersession is durable (e <= ckpt_max).
+        // The ckpt_max condition holds even with a newer current version: under off-lock
+        // checkpoint the boundary can be published < e, and this version's begin <=
+        // boundary is the chain's only proof (exists_in_db_file) that the B-tree holds the
+        // row. Dropping it strands the B-tree copy — a later DELETE is then skipped as
+        // "never durably existed", desyncing the table from its indexes.
         versions.retain(|rv| match &rv.end() {
             Some(TxTimestampOrID::Timestamp(e)) if *e <= lwm => {
                 if passive {
@@ -7437,9 +7416,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             }
                         }
                         HeaderReadResult::Invalid => {
-                            // A present-but-undecodable header is a torn header write
-                            // / genuine corruption, not a clean truncation — fail
-                            // closed.
+                            // Present but undecodable: a torn header write / genuine
+                            // corruption, not a clean truncation — fail closed.
                             return Err(LimboError::Corrupt(
                                 "WAL has committed frames but logical log header is invalid"
                                     .to_string(),
