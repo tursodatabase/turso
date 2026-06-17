@@ -1,3 +1,5 @@
+import type { ExperimentalFeature } from "@tursodatabase/database-common"
+
 export declare const enum DatabaseChangeType {
     Insert = 'insert',
     Update = 'update',
@@ -110,6 +112,12 @@ export interface DatabaseOpts {
      * optional parameter to enable internal logging for the database
      */
     tracing?: 'error' | 'warn' | 'info' | 'debug' | 'trace',
+    /**
+     * optional list of experimental features to enable on the local database
+     * (e.g. 'views', 'index_method', 'vacuum'). mirrors the `experimental`
+     * option of the non-sync `Database`.
+     */
+    experimental?: ExperimentalFeature[],
     /**
      * When enabled, write statements execute on remote server instead of locally.
      * After each write (or transaction commit), changes are pulled for read-your-writes consistency.

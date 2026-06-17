@@ -290,6 +290,12 @@ export interface SyncEngineOpts {
   useTransform: boolean
   protocolVersion?: SyncEngineProtocolVersion
   bootstrapIfEmpty: boolean
+  /**
+   * Experimental features to enable on the local database (e.g. "views",
+   * "index_method", "vacuum"). Mirrors the `experimental` option of the
+   * non-sync `Database`.
+   */
+  experimental?: Array<string>
   /** Encryption cipher for the Turso Cloud database. */
   remoteEncryptionCipher?: string
   /**

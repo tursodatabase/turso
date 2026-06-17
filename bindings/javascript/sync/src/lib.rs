@@ -143,6 +143,10 @@ pub struct SyncEngineOpts {
     pub use_transform: bool,
     pub protocol_version: Option<SyncEngineProtocolVersion>,
     pub bootstrap_if_empty: bool,
+    /// Experimental features to enable on the local database (e.g. "views",
+    /// "index_method", "vacuum"). Mirrors the `experimental` option of the
+    /// non-sync `Database`.
+    pub experimental: Option<Vec<String>>,
     /// Encryption cipher for the Turso Cloud database.
     pub remote_encryption_cipher: Option<String>,
     /// Base64-encoded encryption key for the Turso Cloud database.
@@ -171,6 +175,7 @@ struct SyncEngineOptsFilled {
     pub use_transform: bool,
     pub protocol_version: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
+    pub db_opts: turso_core::DatabaseOpts,
     pub remote_encryption_cipher: Option<CipherMode>,
     pub remote_encryption_key: Option<String>,
     pub partial_sync_opts: Option<PartialSyncOpts>,
@@ -245,6 +250,13 @@ impl SyncEngine {
                 turso_node::browser::opfs()
             }
         };
+        let db_opts = match &opts.experimental {
+            Some(experimental) => turso_node::apply_experimental_features(
+                turso_core::DatabaseOpts::new(),
+                experimental,
+            ),
+            None => turso_core::DatabaseOpts::new(),
+        };
         #[allow(clippy::arc_with_non_send_sync)]
         let db = Arc::new(Mutex::new(turso_node::Database::new_with_io(
             opts.path.clone(),
@@ -255,7 +267,7 @@ impl SyncEngine {
                 timeout: None,
                 default_query_timeout: None,
                 tracing: opts.tracing.clone(),
-                experimental: None,
+                experimental: opts.experimental.clone(),
                 encryption: None, // Local encryption not supported in sync mode
             }),
         )?));
@@ -278,6 +290,7 @@ impl SyncEngine {
                 _ => DatabaseSyncEngineProtocolVersion::V1,
             },
             bootstrap_if_empty: opts.bootstrap_if_empty,
+            db_opts,
             remote_encryption_cipher: match opts.remote_encryption_cipher.as_deref() {
                 Some("aes256gcm") | Some("aes-256-gcm") => Some(CipherMode::Aes256Gcm),
                 Some("aes128gcm") | Some("aes-128-gcm") => Some(CipherMode::Aes128Gcm),
@@ -343,6 +356,7 @@ impl SyncEngine {
             use_transform: self.opts.use_transform,
             protocol_version_hint: self.opts.protocol_version,
             bootstrap_if_empty: self.opts.bootstrap_if_empty,
+            db_opts: self.opts.db_opts,
             reserved_bytes: self
                 .opts
                 .remote_encryption_cipher
