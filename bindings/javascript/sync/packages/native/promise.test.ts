@@ -282,6 +282,24 @@ test('simple-db', async () => {
     await expect(async () => await db.pull()).rejects.toThrowError(/sync is disabled as database was opened without sync support/);
 })
 
+test('experimental features are propagated to the local database', async () => {
+    // Generated columns are gated behind the `generated_columns` experimental
+    // feature. A synced database opened without the `experimental` option must
+    // reject the DDL, proving the feature is off by default.
+    const dbDefault = new Database({ path: ':memory:' });
+    await dbDefault.connect();
+    await expect(async () => await dbDefault.exec("CREATE TABLE t(x INTEGER, y INTEGER AS (x * 2))"))
+        .rejects.toThrowError(/Generated columns require/);
+
+    // The same statement succeeds once the feature is enabled, which only works
+    // if `experimental` is threaded through the sync engine to the local engine.
+    const dbExperimental = new Database({ path: ':memory:', experimental: ['generated_columns'] });
+    await dbExperimental.connect();
+    await dbExperimental.exec("CREATE TABLE t(x INTEGER, y INTEGER AS (x * 2))");
+    await dbExperimental.exec("INSERT INTO t(x) VALUES (1), (2), (3)");
+    expect(await (await dbExperimental.prepare("SELECT y FROM t ORDER BY x")).all()).toEqual([{ y: 2 }, { y: 4 }, { y: 6 }]);
+})
+
 test('implicit connect', async ({ server }) => {
     const db = new Database({ path: ':memory:', url: server.dbUrl() });
     const defer = await db.prepare("SELECT * FROM not_found");
