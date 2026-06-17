@@ -230,6 +230,10 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         db_config: turso_sdk_kit::rsapi::TursoDatabaseConfig,
         sync_config: TursoDatabaseSyncConfig,
     ) -> Result<Arc<Self>, turso_sdk_kit::rsapi::TursoError> {
+        // Mirror the database's experimental features onto the connections the
+        // sync engine opens internally (e.g. the revert connection), so they
+        // match the main database opened via TursoDatabase below.
+        let db_opts = db_config.database_opts();
         let sync_engine_opts = turso_sync_engine::database_sync_engine::DatabaseSyncEngineOpts {
             remote_url: sync_config.remote_url.clone(),
             client_name: sync_config.client_name.clone(),
@@ -242,6 +246,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             protocol_version_hint: turso_sync_engine::types::DatabaseSyncEngineProtocolVersion::V1,
             bootstrap_if_empty: sync_config.bootstrap_if_empty,
             reserved_bytes: sync_config.reserved_bytes.unwrap_or(0),
+            db_opts,
             partial_sync_opts: sync_config.partial_sync_opts.clone(),
             remote_encryption_key: sync_config.remote_encryption_key.clone(),
             push_operations_threshold: sync_config.push_operations_threshold,
