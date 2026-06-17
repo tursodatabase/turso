@@ -1787,10 +1787,10 @@ fn test_bootstrap_recovers_committed_wal_without_log_file() {
     assert_eq!(rows[0][1].to_string(), "x");
 }
 
-/// A FULL checkpoint (passive off) keeps the WAL but, instead of truncating the logical
-/// log to NoLog, resets it to a fresh empty header — so reopen sees a Valid (empty) log
-/// over the committed WAL and reconciles cleanly. Regression for whopper `--enable-mvcc`
-/// (no passive flag) hitting "WAL has committed frames but logical log header is missing".
+/// MVCC supports only Passive and Truncate, so a requested FULL checkpoint maps to
+/// Truncate (resets the WAL). The reopen then recovers cleanly. Regression for whopper
+/// `--enable-mvcc` (no passive flag) hitting "WAL has committed frames but logical log
+/// header is missing" back when FULL kept the WAL while truncating the logical log.
 #[test]
 fn test_full_checkpoint_reopen_recovers_truncate_mode() {
     let db = MvccTestDbNoConn::new_with_random_db();
