@@ -344,15 +344,12 @@ pub(crate) use static_iterator_hack;
 /// Forward index cursors only; [`reset`](Self::reset) on any reposition, since
 /// the finger is monotonic.
 #[derive(Default)]
-enum IndexShadowFinger {
+pub(crate) enum IndexShadowFinger {
     /// Not yet created; built lazily on the next shadow check.
     #[default]
     Uninitialized,
     /// Positioned at `key`, holding its version chain. The shadow bit is resolved
-    /// lazily (only when a B-tree row matches this key exactly), so stepping over
-    /// MVCC-only keys is a pure pointer-chase with no lock/iterate and, crucially,
-    /// no `is_btree_invalidating_version` side effects (commit-dependency
-    /// registration) on rows the scan never observes.
+    /// lazily (only when a B-tree row matches this key exactly)
     Peeked {
         iter: MvccIterator<'static, Arc<SortableIndexKey>>,
         key: Arc<SortableIndexKey>,
@@ -387,7 +384,7 @@ impl IndexShadowFinger {
     /// Whether the B-tree row `key` is visible (not shadowed by an MVCC version),
     /// served from the co-positioned finger. Forward equivalent of
     /// [`MvStore::query_btree_version_is_valid`] for index keys.
-    fn btree_row_is_valid<Clock: LogicalClock>(
+    pub(crate) fn btree_row_is_valid<Clock: LogicalClock>(
         &mut self,
         db: &MvStore<Clock>,
         table_id: MVTableId,

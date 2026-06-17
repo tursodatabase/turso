@@ -5058,6 +5058,95 @@ fn test_commit_dependency_speculative_ignore() {
     );
 }
 
+/// Regression: the forward-scan [`IndexShadowFinger`] must NOT evaluate the
+/// shadow predicate (and thus must not fire its `register_commit_dependency`
+/// side effect) for index versions whose keys it merely *steps over* — i.e.
+/// MVCC-only keys with no matching B-tree row. The authoritative
+/// `query_btree_version_is_valid` path only ever evaluates the version chain for
+/// keys that exactly match a B-tree row (`index_rows.get(btree_key)`), so an
+/// eager finger that resolved the shadow bit on every advance would register a
+/// commit dependency on a `Preparing` writer for a row the scan never observes —
+/// a spurious dependency that cascade-aborts the reader if that writer aborts.
+///
+/// Setup: B-tree keys 10 and 30 (no MVCC versions), plus a single MVCC-only
+/// tombstone at key 20 deleted by a `Preparing` writer that the reader would
+/// speculatively invalidate. A forward scan checks 10 (finger ahead → visible)
+/// then 30 (finger behind → steps over key 20). Key 20 is never an exact match,
+/// so no dependency may be registered.
+#[test]
+fn test_index_finger_no_spurious_dep_on_stepped_over_key() {
+    use crate::mvcc::cursor::IndexShadowFinger;
+
+    let db = MvccTestDb::new();
+    let store = &db.mvcc_store;
+    let table_id = MVTableId::from(-999_i64);
+
+    // Single-column ascending integer index key.
+    let info = std::sync::Arc::new(crate::types::IndexInfo {
+        key_info: vec![crate::types::KeyInfo {
+            sort_order: turso_parser::ast::SortOrder::Asc,
+            collation: crate::translate::collate::CollationSeq::Binary,
+            nulls_order: None,
+        }],
+        has_rowid: false,
+        num_cols: 1,
+        is_unique: false,
+    });
+    let idx_key = |v: i64| {
+        let rec = crate::types::ImmutableRecord::from_values(&[Value::from_i64(v)], 1).unwrap();
+        std::sync::Arc::new(SortableIndexKey::new_from_record(rec, info.clone()))
+    };
+
+    // Reader started after the writer's prepared end_ts → speculatively
+    // invalidates the writer's tombstone (the dependency-registering path).
+    let reader_id: TxID = 9_000_100;
+    let writer_id: TxID = 9_000_050;
+    store.txs.insert(
+        writer_id,
+        new_tx(writer_id, 1, TransactionState::Preparing(40)),
+    );
+    store
+        .txs
+        .insert(reader_id, new_tx(reader_id, 100, TransactionState::Active));
+
+    // MVCC-only tombstone at key 20: committed insert (begin Timestamp) deleted
+    // by the Preparing writer (end TxID). Not present in the B-tree.
+    let key20 = idx_key(20);
+    let row_id = RowID::new(table_id, RowKey::Record(key20.clone()));
+    let tombstone = RowVersion {
+        id: 20,
+        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(5))),
+        end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(writer_id))),
+        row: Row::new_index_row(row_id, 1),
+        btree_resident: false,
+    };
+    store
+        .index_rows
+        .get_or_insert_with(table_id, SkipMap::new)
+        .value()
+        .insert(key20, Arc::new(RwLock::new(vec![tombstone])));
+
+    let mut finger = IndexShadowFinger::default();
+    // B-tree key 10: finger seeds at the first index key >= 10 (key 20), which is
+    // ahead → row visible, predicate not evaluated.
+    assert!(finger.btree_row_is_valid(store, table_id, reader_id, &idx_key(10)));
+    // B-tree key 30: finger (at key 20) is behind → steps over the tombstone.
+    // It must advance past it WITHOUT evaluating the shadow predicate.
+    assert!(finger.btree_row_is_valid(store, table_id, reader_id, &idx_key(30)));
+
+    let reader = store.txs.get(&reader_id).unwrap();
+    assert_eq!(
+        reader.value().commit_dep_counter.load(Ordering::Acquire),
+        0,
+        "finger registered a spurious commit dependency for a key it only stepped over"
+    );
+    let writer = store.txs.get(&writer_id).unwrap();
+    assert!(
+        writer.value().commit_dep_set.lock().is_empty(),
+        "writer's commit-dep set must stay empty: reader never observed the tombstoned row"
+    );
+}
+
 /// Test that multiple speculative reads from the same preparing tx only
 /// register one commit dependency (dedup).
 #[test]
