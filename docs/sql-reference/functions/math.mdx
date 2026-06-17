@@ -73,6 +73,8 @@ The single-argument `log(X)` returns the natural logarithm (base e), matching SQ
 | `power(X, Y)` | Alias for `pow(X, Y)` | REAL |
 | `sqrt(X)` | Square root of X. X must be >= 0 | REAL |
 | `sign(X)` | Returns -1, 0, or +1 for negative, zero, or positive X | INTEGER |
+| `gcd(A, B)` | Greatest common divisor of two integers | INTEGER |
+| `lcm(A, B)` | Least common multiple of two integers | INTEGER |
 
 ### Constants
 
@@ -264,6 +266,55 @@ exp(X)
 ```sql
 SELECT exp(0);   -- 1.0
 SELECT exp(1);   -- 2.718281828459045
+```
+
+---
+
+### gcd()
+
+```sql
+gcd(A, B)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `A` | INTEGER | First operand |
+| `B` | INTEGER | Second operand |
+
+**Returns:** INTEGER. The greatest common divisor of A and B. The result is always non-negative regardless of the signs of the inputs. `gcd(0, 0)` returns `0`. Returns NULL if either argument is NULL. Raises an integer-overflow error when the result is not representable as a signed 64-bit integer (the only such case involves `-9223372036854775808`).
+
+```sql
+SELECT gcd(12, 8);     -- 4
+SELECT gcd(-12, 8);    -- 4
+SELECT gcd(0, 7);      -- 7
+SELECT gcd(0, 0);      -- 0
+SELECT gcd(NULL, 7);   -- NULL
+```
+
+<Info>
+`gcd` and `lcm` are PostgreSQL/MySQL/Oracle-compatible additions that SQLite does not ship. They operate on signed 64-bit integers; non-integer text inputs that cannot be parsed return NULL.
+</Info>
+
+---
+
+### lcm()
+
+```sql
+lcm(A, B)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `A` | INTEGER | First operand |
+| `B` | INTEGER | Second operand |
+
+**Returns:** INTEGER. The least common multiple of A and B. The result is always non-negative regardless of the signs of the inputs. `lcm(_, 0)` and `lcm(0, _)` return `0`. Returns NULL if either argument is NULL. Raises an integer-overflow error when the multiplication does not fit in a signed 64-bit integer.
+
+```sql
+SELECT lcm(4, 6);      -- 12
+SELECT lcm(-4, 6);     -- 12
+SELECT lcm(5, 0);      -- 0
+SELECT lcm(NULL, 7);   -- NULL
 ```
 
 ---
