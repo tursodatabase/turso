@@ -3285,26 +3285,49 @@ fn test_reader_consistent_during_large_indexed_commit_rewrite() {
     c1.execute("BEGIN CONCURRENT").unwrap();
     c1.execute("UPDATE t SET v = v + 5_000_000").unwrap();
     let mut commit = c1.prepare("COMMIT").unwrap();
-    let pager_io = c1.pager.load().io.clone();
-    let mut steps = 0;
+    // Co-drive c1's COMMIT and a c2 integrity_check non-blocking against the shared IO.
+    // A blocking read on c2 would deadlock: it can't finish while c1's commit is parked
+    // mid-RewriteLiveVersions, and c1 only advances when stepped. Stepping both keeps
+    // progress flowing while still exercising c2 reads across the rewrite window.
+    let io = c1.pager.load().io.clone();
+    let mut check = c2.prepare("PRAGMA integrity_check").unwrap();
+    let mut last_row: Option<Vec<Value>> = None;
+    let mut commit_done = false;
+    let mut checks = 0u32;
     loop {
-        match commit.step().unwrap() {
-            StepResult::Done => break,
-            StepResult::IO | StepResult::Yield => {
-                // Concurrent reader: its fresh snapshot may be past c1's CommitEnd while
-                // c1 is mid-RewriteLiveVersions. Integrity + a couple index reads must hold.
-                let integ = get_rows(&c2, "PRAGMA integrity_check");
-                assert_eq!(
-                    &integ[0][0].to_string(),
-                    "ok",
-                    "integrity failed mid-rewrite at step {steps}: {integ:?}"
-                );
-                pager_io.step().unwrap();
-                steps += 1;
+        if !commit_done {
+            match commit.step().unwrap() {
+                StepResult::Done => commit_done = true,
+                StepResult::IO | StepResult::Yield => {}
+                other => panic!("unexpected commit step: {other:?}"),
             }
-            other => panic!("unexpected commit step: {other:?}"),
         }
+        match check.step().unwrap() {
+            StepResult::Row => {
+                last_row = Some(check.row().unwrap().get_values().cloned().collect());
+            }
+            StepResult::Done => {
+                let row = last_row.take().expect("integrity_check returns a row");
+                assert_eq!(
+                    &row[0].to_string(),
+                    "ok",
+                    "integrity failed mid-rewrite: {row:?}"
+                );
+                checks += 1;
+                if commit_done {
+                    break;
+                }
+                check = c2.prepare("PRAGMA integrity_check").unwrap();
+            }
+            StepResult::IO | StepResult::Yield => {}
+            other => panic!("unexpected check step: {other:?}"),
+        }
+        io.step().unwrap();
     }
+    assert!(
+        checks >= 1,
+        "expected at least one concurrent integrity_check"
+    );
     let integ = get_rows(&c1, "PRAGMA integrity_check");
     assert_eq!(&integ[0][0].to_string(), "ok", "final integrity: {integ:?}");
 }
