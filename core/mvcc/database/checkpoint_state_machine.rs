@@ -2496,7 +2496,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
 
             CheckpointState::TruncateWal => {
-                if self.mode.should_restart_log() {
+                // With the experimental passive checkpoint off, every mode resets the WAL
+                // (the pre-feature baseline: MVCC checkpoints were always TRUNCATE). This
+                // keeps the logical-log-truncated-but-WAL-non-empty (NoLog steady) state
+                // exclusive to passive mode, so flag-off recovery still treats NoLog over a
+                // committed WAL as corruption.
+                let restart_wal = self.mode.should_restart_log()
+                    || !self
+                        .connection
+                        .experimental_mvcc_passive_checkpoint_enabled();
+                if restart_wal {
                     // Truncate/Restart: explicitly zero the WAL file. This must be done
                     // explicitly because MVCC calls wal.checkpoint() directly, bypassing
                     // the pager's TruncateWalFile phase. `truncate_wal` is resumable: it
