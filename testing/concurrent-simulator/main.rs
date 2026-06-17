@@ -60,6 +60,9 @@ struct Args {
     /// Enable MVCC (Multi-Version Concurrency Control)
     #[arg(long)]
     enable_mvcc: bool,
+    /// Enable the experimental non-blocking (passive) MVCC checkpoint (requires --enable-mvcc)
+    #[arg(long)]
+    enable_experimental_mvcc_passive_checkpoint: bool,
     /// Enable database encryption
     #[arg(long)]
     enable_encryption: bool,
@@ -139,6 +142,12 @@ fn main() -> anyhow::Result<()> {
             let mut rng = rand::rng();
             rng.next_u64()
         });
+
+    if args.enable_experimental_mvcc_passive_checkpoint && !args.enable_mvcc {
+        return Err(anyhow::anyhow!(
+            "--enable-experimental-mvcc-passive-checkpoint requires --enable-mvcc"
+        ));
+    }
 
     println!("mode = {}", args.mode);
     println!("seed = {seed}");
@@ -366,9 +375,16 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
 
         (w, p, et, chaotic)
     } else {
+        let allow_passive_checkpoint =
+            !args.enable_mvcc || args.enable_experimental_mvcc_passive_checkpoint;
         let w: Vec<(u32, Box<dyn Workload>)> = vec![
             (10, Box::new(IntegrityCheckWorkload)),
-            (5, Box::new(WalCheckpointWorkload)),
+            (
+                5,
+                Box::new(WalCheckpointWorkload {
+                    allow_passive: allow_passive_checkpoint,
+                }),
+            ),
             (10, Box::new(CreateSimpleTableWorkload)),
             (20, Box::new(SimpleSelectWorkload)),
             (20, Box::new(SimpleInsertWorkload)),
@@ -432,6 +448,7 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_max_connections(args.max_connections)
         .with_keep_files(args.keep)
         .with_enable_mvcc(args.enable_mvcc)
+        .with_experimental_mvcc_passive_checkpoint(args.enable_experimental_mvcc_passive_checkpoint)
         .with_enable_encryption(args.enable_encryption)
         .with_elle_tables(elle_tables)
         .with_workloads(workloads)
