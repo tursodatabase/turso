@@ -47,6 +47,15 @@ pub struct DatabaseSyncEngineOpts {
     pub protocol_version_hint: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
     pub reserved_bytes: usize,
+    /// Experimental [`turso_core::DatabaseOpts`] applied whenever the sync
+    /// engine opens the local database itself (the main connection in
+    /// [`DatabaseSyncEngine::create_db`] and the revert connection in
+    /// [`DatabaseSyncEngine::open_revert_db_conn`]). Bindings translate their
+    /// user-facing experimental feature list into these options. Note that
+    /// callers which open the main database on their own (e.g. the sdk-kit
+    /// path) must still apply the same options there — this field only governs
+    /// databases opened internally by the engine.
+    pub db_opts: turso_core::DatabaseOpts,
     pub partial_sync_opts: Option<PartialSyncOpts>,
     /// Base64-encoded encryption key for the Turso Cloud database
     pub remote_encryption_key: Option<String>,
@@ -526,7 +535,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 main_db_path,
                 main_db_storage.clone(),
                 OpenFlags::Create,
-                turso_core::DatabaseOpts::new(),
+                opts.db_opts,
                 None,
                 None,
             )? {
@@ -556,7 +565,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     Some(&self.revert_db_wal_path),
                     self.db_file.clone(),
                     OpenFlags::Create,
-                    turso_core::DatabaseOpts::new(),
+                    self.opts.db_opts,
                     None,
                     None,
                 )? {
