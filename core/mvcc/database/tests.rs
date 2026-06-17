@@ -1928,6 +1928,43 @@ fn test_bootstrap_recovers_committed_wal_without_log_file() {
     assert_eq!(rows[0][1].to_string(), "x");
 }
 
+/// With the experimental passive checkpoint off, every checkpoint mode (incl. FULL)
+/// resets the WAL like the pre-feature baseline, so a FULL checkpoint followed by a
+/// reopen recovers cleanly instead of leaving a logical-log-truncated / WAL-non-empty
+/// state. Regression for whopper `--enable-mvcc` (no passive flag) hitting
+/// "WAL has committed frames but logical log header is missing" on reopen.
+#[test]
+fn test_full_checkpoint_reopen_recovers_truncate_mode() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path.as_ref().unwrap().clone();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(FULL)").unwrap();
+    }
+
+    {
+        let mut manager = DATABASE_MANAGER.lock();
+        manager.clear();
+    }
+
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file(io, &db_path).expect("FULL checkpoint reopen should recover");
+    let conn = db
+        .connect()
+        .expect("connect should recover after FULL checkpoint");
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(
+        rows.len(),
+        1,
+        "committed row must survive FULL-checkpoint reopen"
+    );
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "x");
+}
+
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
