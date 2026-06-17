@@ -383,6 +383,9 @@ jobs:
           - name: btree-rebalance
             iterations: 5
             args: "--mode btree-rebalance --allocation-fault-probability 0"
+          - name: in-process-mvcc-passive
+            iterations: 25
+            args: "--mode fast --reopen-probability 0.01 --enable-mvcc --enable-experimental-mvcc-passive-checkpoint"
           - name: multiprocess
             iterations: 10
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"

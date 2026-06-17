@@ -235,7 +235,9 @@ impl Workload for DropIndexWorkload {
 }
 
 /// Run WAL checkpoint with a randomly selected mode.
-pub struct WalCheckpointWorkload;
+pub struct WalCheckpointWorkload {
+    pub allow_passive: bool,
+}
 
 impl Workload for WalCheckpointWorkload {
     fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
@@ -243,9 +245,12 @@ impl Workload for WalCheckpointWorkload {
         if *ctx.fiber_state != FiberState::Idle {
             return None;
         }
-        let mode = ["PASSIVE", "FULL", "RESTART", "TRUNCATE"]
-            .choose(rng)
-            .expect("array is not empty");
+        let modes: &[&str] = if self.allow_passive {
+            &["PASSIVE", "FULL", "RESTART", "TRUNCATE"]
+        } else {
+            &["FULL", "RESTART", "TRUNCATE"]
+        };
+        let mode = modes.choose(rng).expect("array is not empty");
         Some(Operation::WalCheckpoint {
             mode: mode.to_string(),
         })
