@@ -2596,7 +2596,7 @@ impl Jsonb {
                         }
                         None => {
                             if !mode.allows_insert() {
-                                bail_parse_error!("Can't insert")
+                                bail_parse_error!("Cant insert")
                             }
                             let placeholder = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
                             let placeholder_bytes = placeholder.as_bytes();
