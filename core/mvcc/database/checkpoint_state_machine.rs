@@ -2323,7 +2323,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
             CheckpointState::TruncateLogicalLog => {
                 tracing::debug!("Truncating logical log file");
-                let c = self.truncate_logical_log()?;
+                // FULL with passive off keeps the WAL (no restart), so truncating the log
+                // to NoLog would look like corruption on reopen. Reset it to a fresh empty
+                // header instead, so recovery sees a Valid (empty) log over the committed
+                // WAL. Restart modes (WAL emptied) and passive (NoLog steady state) truncate.
+                let reset_instead_of_truncate = !self
+                    .connection
+                    .experimental_mvcc_passive_checkpoint_enabled()
+                    && !self.mode.should_restart_log();
+                let c = if reset_instead_of_truncate {
+                    self.mvstore.storage.reset_to_fresh_header()?
+                } else {
+                    self.truncate_logical_log()?
+                };
                 self.state = CheckpointState::FsyncLogicalLog;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
@@ -2400,14 +2412,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
 
             CheckpointState::TruncateWal => {
-                // With passive off, every mode resets the WAL (baseline: MVCC checkpoints
-                // were always TRUNCATE), keeping the NoLog-over-committed-WAL steady state
-                // exclusive to passive so flag-off recovery still treats it as corruption.
-                let restart_wal = self.mode.should_restart_log()
-                    || !self
-                        .connection
-                        .experimental_mvcc_passive_checkpoint_enabled();
-                if restart_wal {
+                if self.mode.should_restart_log() {
                     // Truncate/Restart: explicitly zero the WAL file. This must be done
                     // explicitly because MVCC calls wal.checkpoint() directly, bypassing
                     // the pager's TruncateWalFile phase. `truncate_wal` is resumable: it
