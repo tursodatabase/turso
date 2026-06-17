@@ -657,6 +657,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 || connection.experimental_mvcc_passive_checkpoint_enabled(),
             "passive checkpoint mode requires experimental_mvcc_passive_checkpoint"
         );
+        // MVCC supports only Passive (off-lock, requires the experimental flag) and
+        // Truncate (blocking). Full/Restart map to Truncate — the pre-feature baseline
+        // always checkpointed via TRUNCATE.
+        let mode = match mode {
+            CheckpointMode::Passive { .. } | CheckpointMode::Truncate { .. } => mode,
+            CheckpointMode::Full | CheckpointMode::Restart => CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        };
         let checkpoint_lock = mvstore.blocking_checkpoint_lock.clone();
         // Use the shared DB schema (not the per-connection cache, which may be
         // stale) for the database whose pager we're checkpointing. Unlike WAL
@@ -2392,19 +2401,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
             CheckpointState::TruncateLogicalLog => {
                 tracing::debug!("Truncating logical log file");
-                // FULL with passive off keeps the WAL (no restart), so truncating the log
-                // to NoLog would look like corruption on reopen. Reset it to a fresh empty
-                // header instead, so recovery sees a Valid (empty) log over the committed
-                // WAL. Restart modes (WAL emptied) and passive (NoLog steady state) truncate.
-                let reset_instead_of_truncate = !self
-                    .connection
-                    .experimental_mvcc_passive_checkpoint_enabled()
-                    && !self.mode.should_restart_log();
-                let c = if reset_instead_of_truncate {
-                    self.mvstore.storage.reset_to_fresh_header()?
-                } else {
-                    self.truncate_logical_log()?
-                };
+                let c = self.truncate_logical_log()?;
                 self.state = CheckpointState::FsyncLogicalLog;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
