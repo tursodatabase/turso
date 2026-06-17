@@ -225,6 +225,66 @@ fn mvcc_vacuum_gate_blocks_new_read_and_write_tx() {
     db.mvcc_store.release_vacuum_gate();
 }
 
+/// What this test checks: a single autocommit statement left suspended after
+/// yielding a row keeps the connection-level MVCC transaction open (and thus the
+/// blocking-checkpoint read guard), even though `get_auto_commit()` still reports
+/// true. `has_open_mvcc_tx()` detects this, and `rollback_implicit_mvcc_tx()`
+/// releases it without closing the connection — and the connection stays usable.
+/// Why this matters: the turso-server connection pool relies on this to release
+/// the checkpoint guard before pooling a connection whose streamed cursor was
+/// abandoned mid-result; otherwise every blocking checkpoint is starved with Busy.
+#[test]
+fn test_rollback_implicit_mvcc_tx_releases_suspended_autocommit_tx() {
+    let db = MvccTestDb::new();
+    db.conn.execute("CREATE TABLE t(x)").unwrap();
+    db.conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    db.conn.execute("INSERT INTO t VALUES (2)").unwrap();
+
+    // A fully-consumed statement leaves no open transaction.
+    assert!(!db.conn.has_open_mvcc_tx());
+    assert!(db.conn.get_auto_commit());
+
+    // Open an implicit (autocommit) read transaction and leave it suspended:
+    // step a SELECT to its first row without finishing it. This mirrors a
+    // streamed cursor that a client abandoned mid-result.
+    let mut stmt = db.conn.query("SELECT x FROM t").unwrap().unwrap();
+    let io = db.conn.pager.load().io.clone();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => break,
+            StepResult::IO => io.step().unwrap(),
+            other => panic!("expected a row, got {other:?}"),
+        }
+    }
+
+    // The leak state: an open MVCC transaction, yet the connection still reports
+    // autocommit — so a `!in_transaction()` / `exec("ROLLBACK")` based cleanup
+    // would miss it.
+    assert!(
+        db.conn.has_open_mvcc_tx(),
+        "suspended autocommit SELECT must hold an implicit MVCC transaction"
+    );
+    assert!(
+        db.conn.get_auto_commit(),
+        "implicit MVCC transaction must still read as autocommit (the blind spot)"
+    );
+
+    // The fix: explicitly release the implicit transaction while the suspended
+    // statement is still alive (exactly the connection-pool cleanup situation).
+    db.conn.rollback_implicit_mvcc_tx();
+    assert!(
+        !db.conn.has_open_mvcc_tx(),
+        "rollback_implicit_mvcc_tx must release the implicit MVCC transaction"
+    );
+
+    // The still-alive suspended statement must not corrupt the connection: it can
+    // be dropped and the connection reused for further work.
+    drop(stmt);
+    assert!(!db.conn.has_open_mvcc_tx());
+    db.conn.execute("INSERT INTO t VALUES (3)").unwrap();
+    assert!(!db.conn.has_open_mvcc_tx());
+}
+
 #[test]
 fn mvcc_pragma_page_size_propagates_to_global_header() {
     // MvStore captures global_header from the pager during bootstrap (before any user PRAGMA
