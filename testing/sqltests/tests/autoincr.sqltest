@@ -171,6 +171,25 @@ expect {
     t3|1
 }
 
+# Test: A NULL sqlite_sequence.name row does not match a later AUTOINCREMENT update.
+@cross-check-integrity
+test autoinc-null-sequence-name-skipped-on-insert {
+    CREATE TABLE t1(i INTEGER PRIMARY KEY AUTOINCREMENT);
+    CREATE TABLE t2(i INTEGER PRIMARY KEY AUTOINCREMENT);
+    CREATE TABLE t3(i INTEGER PRIMARY KEY AUTOINCREMENT);
+    INSERT INTO t1 VALUES(NULL);
+    INSERT INTO t2 VALUES(NULL);
+    INSERT INTO t3 VALUES(NULL);
+    UPDATE sqlite_sequence SET name=NULL WHERE name='t2';
+    INSERT INTO t3 VALUES(NULL);
+    SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+    1|t1|1
+    2||1
+    3|t3|2
+}
+
 # Test: Dropping an AUTOINCREMENT table removes its entry from sqlite_sequence.
 @cross-check-integrity
 test autoinc-drop-table-removes-sequence-entry {
@@ -183,6 +202,21 @@ test autoinc-drop-table-removes-sequence-entry {
 }
 expect {
     t2
+}
+
+# Test: DROP TABLE skips unrelated NULL sqlite_sequence.name rows.
+@cross-check-integrity
+test autoinc-drop-table-skips-null-sequence-name {
+    CREATE TABLE t1(i INTEGER PRIMARY KEY AUTOINCREMENT);
+    CREATE TABLE t2(i INTEGER PRIMARY KEY AUTOINCREMENT);
+    INSERT INTO t1 VALUES(NULL);
+    INSERT INTO t2 VALUES(NULL);
+    UPDATE sqlite_sequence SET name=NULL WHERE name='t1';
+    DROP TABLE t2;
+    SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+    1||1
 }
 
 # Test: When the last AUTOINCREMENT table is dropped, the sequence table remains but is empty.
@@ -227,6 +261,22 @@ expect {
     t2|2
 }
 
+# Test: ALTER TABLE RENAME skips unrelated NULL sqlite_sequence.name rows.
+@cross-check-integrity
+test autoinc-rename-table-skips-null-sequence-name {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY AUTOINCREMENT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY AUTOINCREMENT);
+    INSERT INTO t1 VALUES(NULL);
+    INSERT INTO t2 VALUES(NULL);
+    UPDATE sqlite_sequence SET name=NULL WHERE name='t1';
+    ALTER TABLE t2 RENAME TO t3;
+    SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+    1||1
+    2|t3|1
+}
+
 # Regression test for https://github.com/tursodatabase/turso/issues/6769
 @skip-if sqlite "ALTER COLUMN is a Turso extension"
 test autoinc-alter-column-clears-sequence-row {
@@ -246,6 +296,21 @@ expect {
     1|x
     2|y
     |z
+}
+
+# ALTER COLUMN cleanup skips unrelated NULL sqlite_sequence.name rows.
+@skip-if sqlite "ALTER COLUMN is a Turso extension"
+test autoinc-alter-column-skips-null-sequence-name {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY AUTOINCREMENT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY AUTOINCREMENT);
+    INSERT INTO t1 VALUES(NULL);
+    INSERT INTO t2 VALUES(NULL);
+    UPDATE sqlite_sequence SET name=NULL WHERE name='t1';
+    ALTER TABLE t2 ALTER COLUMN id TO id2 TEXT;
+    SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+    1||1
 }
 
 # Test: AUTOINCREMENT fails if the maximum rowid is reached. (Assumes 64-bit rowid)
