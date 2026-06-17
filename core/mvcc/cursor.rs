@@ -338,6 +338,101 @@ macro_rules! static_iterator_hack {
 
 pub(crate) use static_iterator_hack;
 
+/// Forward-scan finger over `index_rows`, co-advanced with the B-tree cursor so
+/// the per-row "is this B-tree row shadowed by MVCC?" check is an amortized-O(1)
+/// merge step instead of an `index_rows.get()` (O(log N)) per scanned row.
+/// Forward index cursors only; [`reset`](Self::reset) on any reposition, since
+/// the finger is monotonic.
+#[derive(Default)]
+enum IndexShadowFinger {
+    /// Not yet created; built lazily on the next shadow check.
+    #[default]
+    Uninitialized,
+    /// Positioned at `key`, whose version chain `shadows` the B-tree row or not.
+    Peeked {
+        iter: MvccIterator<'static, Arc<SortableIndexKey>>,
+        key: Arc<SortableIndexKey>,
+        shadows: bool,
+    },
+    /// Ran past the last version; every remaining B-tree row is visible.
+    Exhausted,
+}
+
+impl IndexShadowFinger {
+    /// Reset so the next shadow check rebuilds the finger. Required on any B-tree
+    /// reposition (seek/rewind): a finger left ahead of the new position would
+    /// report a shadowed row as valid.
+    fn reset(&mut self) {
+        *self = Self::Uninitialized;
+    }
+
+    /// Advance `iter` to its next entry, resolving the shadow bit up front so no
+    /// borrowed skiplist `Entry` is held afterward.
+    fn advance<Clock: LogicalClock>(
+        mut iter: MvccIterator<'static, Arc<SortableIndexKey>>,
+        db: &MvStore<Clock>,
+        tx_id: u64,
+    ) -> Self {
+        match iter.next() {
+            Some(entry) => Self::Peeked {
+                shadows: db.index_chain_invalidates_btree(entry.value(), tx_id),
+                key: entry.key().clone(),
+                iter,
+            },
+            None => Self::Exhausted,
+        }
+    }
+
+    /// Whether the B-tree row `key` is visible (not shadowed by an MVCC version),
+    /// served from the co-positioned finger. Forward equivalent of
+    /// [`MvStore::query_btree_version_is_valid`] for index keys.
+    fn btree_row_is_valid<Clock: LogicalClock>(
+        &mut self,
+        db: &MvStore<Clock>,
+        table_id: MVTableId,
+        tx_id: u64,
+        key: &Arc<SortableIndexKey>,
+    ) -> bool {
+        if matches!(self, Self::Uninitialized) {
+            // Scoped so the skiplist guard drops before `step` re-borrows `db`.
+            let iter = {
+                let index_rows = db.index_rows.get_or_insert_with(table_id, SkipMap::new);
+                let iter_box: Box<
+                    dyn Iterator<Item = Entry<'_, Arc<SortableIndexKey>, RowVersions>>
+                        + Send
+                        + Sync,
+                > = Box::new(index_rows.value().iter());
+                static_iterator_hack!(iter_box, Arc<SortableIndexKey>)
+            };
+            *self = Self::advance(iter, db, tx_id);
+        }
+        loop {
+            match self {
+                // No version at or after this key -> B-tree row is visible.
+                Self::Exhausted => return true,
+                Self::Uninitialized => unreachable!("created just above"),
+                Self::Peeked {
+                    key: finger_key,
+                    shadows,
+                    ..
+                } => match finger_key.as_ref().cmp(key.as_ref()) {
+                    // No version exactly at this key -> visible.
+                    std::cmp::Ordering::Greater => return true,
+                    // Version present at this key -> shadowed iff it invalidates.
+                    std::cmp::Ordering::Equal => return !*shadows,
+                    // Finger behind the B-tree (a version-only key); catch up below.
+                    std::cmp::Ordering::Less => {}
+                },
+            }
+            // Step the finger forward; only the `Less` arm above falls through here.
+            let Self::Peeked { iter, .. } = std::mem::replace(self, Self::Uninitialized) else {
+                unreachable!("Less arm matched Peeked")
+            };
+            *self = Self::advance(iter, db, tx_id);
+        }
+    }
+}
+
 pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
     pub db: Arc<MvStore<Clock>>,
     #[cfg(any(test, injected_yields))]
@@ -363,6 +458,8 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
     btree_advance_state: Option<AdvanceBtreeState>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: DualCursorPeek,
+    /// Forward-scan finger over `index_rows`; see [`IndexShadowFinger`].
+    index_finger: IndexShadowFinger,
 }
 
 pub enum NextRowidResult {
@@ -413,7 +510,32 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             count_state: None,
             btree_advance_state: None,
             dual_peek: DualCursorPeek::default(),
+            index_finger: IndexShadowFinger::default(),
         })
+    }
+
+    /// Forward-direction shadow check: finger fast-path for index cursors, the
+    /// authoritative per-row lookup for table cursors.
+    fn btree_row_is_valid_forward(&mut self, key: &RowKey) -> bool {
+        let RowKey::Record(rec) = key else {
+            return self.query_btree_version_is_valid(key);
+        };
+        let valid = self
+            .index_finger
+            .btree_row_is_valid(&self.db, self.table_id, self.tx_id, rec);
+        // Debug-only cross-check: any finger divergence (e.g. a missed reset)
+        // fails the test suite instead of shipping.
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            valid,
+            self.db.query_btree_version_is_valid(
+                self.table_id,
+                &RowKey::Record(rec.clone()),
+                self.tx_id
+            ),
+            "index finger diverged from query_btree_version_is_valid"
+        );
+        valid
     }
 
     /// Returns the current row as an immutable record.
@@ -647,7 +769,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 Some(AdvanceBtreeState::RewindCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     match key {
-                        Some(k) if self.query_btree_version_is_valid(&k) => {
+                        Some(k) if self.btree_row_is_valid_forward(&k) => {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
@@ -681,7 +803,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     if let Some(key) = key {
-                        if self.query_btree_version_is_valid(&key) {
+                        if self.btree_row_is_valid_forward(&key) {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key,
                                 versions: None,
@@ -838,6 +960,8 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     /// Reset dual peek state (called on rewind/last/seek)
     fn reset_dual_peek(&mut self) {
         self.dual_peek = DualCursorPeek::default();
+        // The forward finger is monotonic; a reposition invalidates it.
+        self.index_finger.reset();
     }
 
     /// Seek btree cursor and set btree_peek to the result.
