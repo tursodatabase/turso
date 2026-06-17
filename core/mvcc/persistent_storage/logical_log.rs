@@ -553,12 +553,10 @@ pub struct LogicalLog {
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
     encrypted_payload_chunk_size: usize,
-    /// Highest `commit_ts` of any frame appended since the last truncation. A
-    /// checkpoint must NOT truncate the log while frames above its checkpointed
-    /// boundary remain (concurrent commits during the off-lock checkpoint, which
-    /// it excluded from this pass's backfill) — truncating would destroy them.
-    /// Maintained under the `RwLock<LogicalLog>` write lock, which also serializes
-    /// appends, so `truncate` can compare it against the boundary race-free.
+    /// Highest `commit_ts` appended since the last truncation. Lets `truncate` avoid
+    /// discarding frames above a checkpoint's boundary (commits that landed during the
+    /// off-lock checkpoint). Maintained under the write lock that also serializes appends,
+    /// so the comparison is race-free.
     max_appended_commit_ts: u64,
 }
 
@@ -628,10 +626,8 @@ impl LogicalLog {
     ) -> Result<(Completion, u64)> {
         let op_count = tx.op_count;
         let commit_ts = tx.tx_timestamp;
-        // Track the highest committed ts in the log so `truncate` can tell whether
-        // uncheckpointed frames (above a checkpoint's boundary) remain. Updating
-        // on write (not on offset-advance) can only over-estimate for an abandoned
-        // deferred write, which makes `truncate` conservatively skip — never lose.
+        // Updated on write, not offset-advance: an abandoned deferred write can only
+        // over-estimate, making `truncate` conservatively skip — never lose frames.
         self.max_appended_commit_ts = self.max_appended_commit_ts.max(commit_ts);
         // `tx.buf` is laid out as:
         //   [LOG_HDR slot (56B, zeros)] [TX_HEADER slot (24B, zeros)] [payload]
@@ -991,22 +987,16 @@ impl LogicalLog {
         self.write_header(header)
     }
 
-    /// Truncate the log to reclaim checkpointed frames. `checkpointed_through_ts`
-    /// is the boundary the calling checkpoint published (`persistent_tx_ts_max`):
-    /// frames with `commit_ts <= boundary` are durable in the WAL/DB and may be
-    /// discarded. If any frame ABOVE the boundary remains — a commit that landed
-    /// during the off-lock checkpoint's unlocked prepare phase, excluded from this
-    /// pass's backfill — truncating to 0 would destroy it (it is NOT in WAL/DB),
-    /// so we skip entirely: the checkpointed prefix is harmlessly skipped by
-    /// recovery (which replays only `commit_ts > boundary`), and a later
-    /// checkpoint that catches up reclaims the space. The check is race-free
-    /// because appends and truncation both hold the `RwLock<LogicalLog>` write
-    /// lock, so no commit can slip a frame in between the check and the truncate.
+    /// Truncate the log to reclaim checkpointed frames. `checkpointed_through_ts` is the
+    /// boundary the checkpoint published; frames with `commit_ts <= boundary` are durable
+    /// in the WAL/DB. If any frame ABOVE the boundary remains (a commit during the off-lock
+    /// prepare phase, not in this pass's backfill), truncating would destroy it, so we skip
+    /// entirely — recovery replays only `commit_ts > boundary` and a later checkpoint
+    /// reclaims the space. Race-free: appends and truncation share the write lock.
     pub fn truncate(&mut self, checkpointed_through_ts: u64) -> Result<Completion> {
         if self.max_appended_commit_ts > checkpointed_through_ts {
             // Uncheckpointed frames above the boundary remain — keep the whole log
-            // (offset, salt, and CRC chain unchanged) so they survive to be
-            // checkpointed next pass. Return an already-complete no-op.
+            // (offset/salt/CRC unchanged) so they survive to the next pass. No-op.
             let c = Completion::new_trunc(|_| {});
             c.complete(0);
             return Ok(c);
@@ -1975,20 +1965,12 @@ impl StreamingLogicalLogReader {
         }
 
         let header_bytes = return_if_io!(self.read_exact_at(0, LOG_HDR_SIZE));
-        // An all-zero header region is *absence*, not *corruption*: no log header
-        // was ever durably written here (a fsync'd header carries LOG_MAGIC and,
-        // being synced, always survives a crash). It is the residue of a commit
-        // that crashed before its fsync — NOT a torn truncate (truncate is atomic
-        // and never leaves a half-written file). On an empty log (fresh, or one a
-        // checkpoint atomically truncated to 0), a commit writes its header page
-        // (offset 0) and a frame page un-fsynced; un-fsynced writes have no
-        // ordering guarantee, so a crash can keep the frame (file size non-zero)
-        // while losing the header write (offset 0 reads back as the zeroed floor).
-        // There are no acknowledged commits in such a file, so treat it as NoLog
-        // and recover from the durable boundary / WAL, rather than failing closed
-        // and refusing to open. A header with ANY non-zero structure but an invalid
-        // magic/len/CRC (a torn rewrite of a once-valid header) is genuine
-        // corruption and still fails closed.
+        // An all-zero header is *absence*, not corruption: a fsync'd header carries
+        // LOG_MAGIC and survives crashes, so zeros mean a commit crashed before its fsync
+        // (the un-fsynced header write at offset 0 was lost while a frame page survived) —
+        // not a torn truncate (truncate is atomic). No commits were acknowledged, so treat
+        // it as NoLog and recover from the WAL. A non-zero but invalid header (torn rewrite
+        // of a once-valid one) is genuine corruption and still fails closed.
         if header_bytes.iter().all(|&b| b == 0) {
             return Ok(IOResult::Done(HeaderReadResult::NoLog));
         }
