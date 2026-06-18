@@ -45,6 +45,14 @@ impl From<std::collections::TryReserveError> for TryReserveError {
     }
 }
 
+/// Allocator safe to clone into concurrent data structures and deferred drops.
+///
+/// Cloning must be cheap and must not panic. The `'static` bound allows
+/// deferred reclamation to outlive the container that captured the allocator.
+pub trait ConcurrentAllocator: ApiAllocator + Clone + Send + Sync + 'static {}
+
+impl<A: ApiAllocator + Clone + Send + Sync + 'static> ConcurrentAllocator for A {}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TursoAllocator;
 
