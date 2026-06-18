@@ -1532,6 +1532,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                                 self.table_id,
                                 sortable_key.clone(),
                                 inclusive,
+                                op.eq_only(),
                                 direction,
                                 self.tx_id,
                                 &mut self.index_iterator,

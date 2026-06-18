@@ -5182,11 +5182,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .map(|(row_id, _versions)| row_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn seek_index(
         &self,
         index_id: MVTableId,
         start: SortableIndexKey,
         inclusive: bool,
+        eq_only: bool,
         direction: IterationDirection,
         tx_id: TxID,
         index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
@@ -5196,12 +5198,31 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .index_rows
             .get_or_insert_with(index_id, move || SkipMap::new_in(alloc));
         let index_rows = index_rows.value();
-        let start = if inclusive {
-            Bound::Included(start)
+        let range = if eq_only {
+            // An eq-only seek (point lookup, NoConflict, unique-constraint probe,
+            // index delete) only cares about entries whose key matches `start`.
+            // Bound BOTH ends of the range to the probe key so the skiplist walk
+            // stops at the matching cluster instead of scanning forward over every
+            // invisible neighbor until it happens to find the next visible row.
+            //
+            // `SortableIndexKey` ordering compares only the probe's columns (see
+            // `SortableIndexKey::compare`, which clamps to `min(num_cols)`), so
+            // `start..=start` captures all entries sharing the probed prefix
+            // regardless of their trailing rowid — exactly the set an eq-only seek
+            // may match. Without this bound a single seek costs O(pending invisible
+            // versions), which compounds into quadratic work when each row of a
+            // concurrent batch insert pays it. The cursor's position after the seek
+            // is still set by `PickWinner` from the merged MVCC/B-tree peeks, so
+            // returning early here does not change where the cursor lands.
+            (Bound::Included(start.clone()), Bound::Included(start))
         } else {
-            Bound::Excluded(start)
+            let start = if inclusive {
+                Bound::Included(start)
+            } else {
+                Bound::Excluded(start)
+            };
+            create_seek_range(start, direction)
         };
-        let range = create_seek_range(start, direction);
         let iter_box = match direction {
             IterationDirection::Forwards => {
                 Box::new(index_rows.range(range)) as IndexRowIterator<'_, A>
