@@ -5083,7 +5083,7 @@ fn test_index_finger_no_spurious_dep_on_stepped_over_key() {
 
     // Single-column ascending integer index key.
     let info = std::sync::Arc::new(crate::types::IndexInfo {
-        key_info: vec![crate::types::KeyInfo {
+        key_info: crate::alloc::vec![crate::types::KeyInfo {
             sort_order: turso_parser::ast::SortOrder::Asc,
             collation: crate::translate::collate::CollationSeq::Binary,
             nulls_order: None,
