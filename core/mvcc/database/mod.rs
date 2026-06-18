@@ -3813,6 +3813,21 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// sweep from the beginning of `rows` (and marks the point where index
     /// chains are swept — see `gc_incremental`).
     gc_table_cursor: Mutex<Option<RowID>>,
+    /// Resume cursor for the incremental index-row GC sweep: the last
+    /// `(index id, key)` processed by the previous `gc_incremental` pass.
+    /// `None` restarts from the beginning of `index_rows`. Mirrors
+    /// `gc_table_cursor` but over the nested `index_rows` maps, so a single
+    /// huge index can't force an unbounded pass.
+    gc_index_cursor: Mutex<Option<(MVTableId, Arc<SortableIndexKey>)>>,
+    /// Single-flight gate for inline GC. Many connections commit concurrently
+    /// (each shares this `MvStore`), and the commit path calls
+    /// `gc_incremental` without holding any global lock — so without this gate
+    /// several threads would run overlapping GC passes at once. That is *safe*
+    /// (per-chain write locks + idempotent reclamation) but wasteful: redundant
+    /// scans plus thrashing of `gc_table_cursor`. This flag ensures at most one
+    /// inline pass runs at a time; a committer that loses the race simply skips
+    /// GC for that commit.
+    gc_in_progress: AtomicBool,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -3909,6 +3924,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             live_versions_at_last_gc: AtomicUsize::new(0),
             gc_version_threshold: AtomicI64::new(Self::DEFAULT_GC_VERSION_THRESHOLD),
             gc_table_cursor: Mutex::new(None),
+            gc_index_cursor: Mutex::new(None),
+            gc_in_progress: AtomicBool::new(false),
         }
     }
 
@@ -6314,17 +6331,31 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ///   races no concurrent `get_or_insert_with` (see the TOCTOU note in
     ///   `gc_table_row_versions`). Physical slot removal stays exclusive to the
     ///   checkpoint's `_and_slots` sweep.
-    /// - **No I/O.** Pure in-memory chain reclamation under each chain's write
-    ///   lock; no `Completion`/yield machinery needed.
-    /// - **Index chains** are swept in full once per *full table-cursor cycle*
-    ///   (when the table sweep wraps back to the start). They are typically far
-    ///   fewer than table-row chains, so a periodic full sweep keeps per-pass
-    ///   cost bounded in the common case. This can be made incrementally
-    ///   resumable later if index counts grow large.
     /// - `finalized_tx_states` pruning is intentionally skipped here: it needs
     ///   the *complete* referenced-txid set across all chains, which a partial
     ///   sweep cannot produce. The checkpoint path still prunes it.
     pub fn gc_incremental(&self, max_chains: usize) -> usize {
+        // Single-flight: only one inline GC pass runs at a time across all
+        // connections (see `gc_in_progress`). Losing the race is a no-op — the
+        // growth that triggered this commit's `should_gc` will retrigger soon,
+        // or the in-flight pass already covers the same chains. The RAII guard
+        // releases the gate even if the body panics, so a stuck flag can never
+        // wedge GC for the lifetime of the store.
+        if self
+            .gc_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return 0;
+        }
+        struct GcGate<'a>(&'a AtomicBool);
+        impl Drop for GcGate<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _gate = GcGate(&self.gc_in_progress);
+
         let lwm = self.compute_lwm();
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
 
@@ -6351,16 +6382,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         // If we processed fewer chains than the budget, the range was
         // exhausted — wrap the cursor to the start for the next pass.
-        let wrapped = processed < max_chains;
-        *self.gc_table_cursor.lock() = if wrapped { None } else { last_key };
+        let table_wrapped = processed < max_chains;
+        *self.gc_table_cursor.lock() = if table_wrapped { None } else { last_key };
 
-        // Sweep index chains once per full table-cursor cycle to bound the
-        // per-pass cost (see the doc comment). A throwaway referenced-txid set
-        // is collected and discarded — we do not prune finalized states here.
-        if wrapped {
-            let mut referenced_tx_ids = HashSet::default();
-            dropped += self.gc_index_row_versions(lwm, ckpt_max, &mut referenced_tx_ids, false);
-        }
+        // Sweep index chains with their own bounded, resumable budget (see
+        // `gc_index_incremental`). Each map has an independent cursor so a
+        // single huge index can't force an unbounded pass.
+        dropped += self.gc_index_incremental(lwm, ckpt_max, max_chains);
 
         self.dec_live_version_count(dropped);
         // Reset the trigger baseline so `should_gc` measures growth from here.
@@ -6371,10 +6399,63 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         if dropped > 0 {
             tracing::trace!(
-                "gc_incremental: reclaimed {dropped} versions across {processed} chains (wrapped={wrapped}), live~{}",
+                "gc_incremental: reclaimed {dropped} versions ({processed} table chains, table_wrapped={table_wrapped}), live~{}",
                 self.live_version_count.load(Ordering::Relaxed)
             );
         }
+        dropped
+    }
+
+    /// Resumable index-chain GC: the index-map counterpart to the table sweep
+    /// in [`Self::gc_incremental`]. Applies `gc_version_chain` to up to
+    /// `max_chains` index version chains, resuming strictly after the
+    /// `(index id, key)` the previous pass stopped at (`gc_index_cursor`) and
+    /// wrapping to the start when the nested maps are exhausted. Lazy mode: it
+    /// never removes empty slots (no blocking lock), exactly like the table
+    /// sweep. Returns the number of versions reclaimed.
+    ///
+    /// `index_rows` is nested (`MVTableId -> key -> chain`), so the cursor is a
+    /// `(MVTableId, key)` pair: the outer scan resumes at the saved index id
+    /// (inclusive, to finish its remaining keys) and the inner scan resumes
+    /// after the saved key; later indexes start from their first key.
+    fn gc_index_incremental(&self, lwm: u64, ckpt_max: u64, max_chains: usize) -> usize {
+        let mut dropped = 0;
+        let mut processed = 0;
+        let mut last: Option<(MVTableId, Arc<SortableIndexKey>)> = None;
+
+        let cursor = self.gc_index_cursor.lock().clone();
+        let outer_start = match &cursor {
+            Some((index_id, _)) => Bound::Included(*index_id),
+            None => Bound::Unbounded,
+        };
+        'outer: for outer in self.index_rows.range((outer_start, Bound::Unbounded)) {
+            if processed >= max_chains {
+                break;
+            }
+            let index_id = *outer.key();
+            let inner = outer.value();
+            // Resume after the saved key only within the index that the cursor
+            // pointed into; every later index starts from its first key.
+            let inner_start = match &cursor {
+                Some((cursor_id, key)) if *cursor_id == index_id => Bound::Excluded(key.clone()),
+                _ => Bound::Unbounded,
+            };
+            for inner_entry in inner.range((inner_start, Bound::Unbounded)) {
+                if processed >= max_chains {
+                    break 'outer;
+                }
+                {
+                    let mut versions = inner_entry.value().write();
+                    dropped += Self::gc_version_chain(&mut versions, lwm, ckpt_max);
+                }
+                last = Some((index_id, inner_entry.key().clone()));
+                processed += 1;
+            }
+        }
+
+        // Fewer chains than the budget => nested maps exhausted; wrap to start.
+        let wrapped = processed < max_chains;
+        *self.gc_index_cursor.lock() = if wrapped { None } else { last };
         dropped
     }
 
