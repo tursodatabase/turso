@@ -3796,14 +3796,14 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// purge). This is a *heuristic* used only to decide when to run an
     /// incremental GC pass (`should_gc`) — never a correctness input. Aborted
     /// versions are left counted until GC reclaims them (they still occupy
-    /// memory). See [`Self::live_version_count`].
-    live_version_count: AtomicUsize,
-    /// Snapshot of `live_version_count` taken at the end of the last
+    /// memory). See [`Self::live_version_count_approx`].
+    live_version_count_approx: AtomicUsize,
+    /// Snapshot of `live_version_count_approx` taken at the end of the last
     /// `gc_incremental` pass. `should_gc` fires once growth since this snapshot
     /// crosses `gc_version_threshold`, giving a roughly fixed GC cadence per N
     /// new versions regardless of how many a single pass reclaims.
     live_versions_at_last_gc: AtomicUsize,
-    /// Growth in `live_version_count` (number of newly inserted versions since
+    /// Growth in `live_version_count_approx` (number of newly inserted versions since
     /// the last GC pass) that triggers an incremental GC pass on the commit
     /// path. Negative disables inline GC entirely. Configurable via the
     /// `mvcc_gc_threshold` PRAGMA; mirrors `checkpoint_threshold`.
@@ -3828,6 +3828,17 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// inline pass runs at a time; a committer that loses the race simply skips
     /// GC for that commit.
     gc_in_progress: AtomicBool,
+    /// LWM observed by the last inline GC pass that actually ran. When a
+    /// long-running transaction pins the LWM, re-scanning at the same LWM
+    /// reclaims nothing new — any version superseded since then has
+    /// `end_ts > LWM` (the pinning txn is older) and stays visible. So an inline
+    /// pass short-circuits when the LWM hasn't advanced, avoiding wasted scans
+    /// while a long txn is open. `u64::MAX` means "no pass has run yet" and also
+    /// the no-active-txn state, which never short-circuits (there is always
+    /// potential garbage to reclaim then). Aborted garbage and post-checkpoint
+    /// sole-survivors that a skipped pass leaves behind are still collected by
+    /// the checkpoint's full sweep.
+    gc_last_lwm: AtomicU64,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -3920,12 +3931,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
             sequence_watermarks: Mutex::new(HashMap::default()),
             sequence_allocations: Mutex::new(HashMap::default()),
-            live_version_count: AtomicUsize::new(0),
+            live_version_count_approx: AtomicUsize::new(0),
             live_versions_at_last_gc: AtomicUsize::new(0),
             gc_version_threshold: AtomicI64::new(Self::DEFAULT_GC_VERSION_THRESHOLD),
             gc_table_cursor: Mutex::new(None),
             gc_index_cursor: Mutex::new(None),
             gc_in_progress: AtomicBool::new(false),
+            gc_last_lwm: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -5326,13 +5338,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         };
         let tx_id = maybe_existing_tx_id.unwrap_or_else(|| self.get_tx_id());
         let begin_ts = if let Some(tx_id) = maybe_existing_tx_id {
+            // Upgrade path: the transaction is already published in `txs`
+            // (from begin_tx), so it is already visible to compute_lwm().
             self.txs
                 .get(&tx_id)
                 .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?
                 .value()
                 .begin_ts
         } else {
-            self.get_begin_timestamp()
+            // Fresh path: publish the transaction into `txs` atomically with
+            // begin_ts allocation, under the clock lock — same begin-publish
+            // window fix as begin_tx(). Without this, inline GC on a concurrent
+            // committer's commit path could compute an LWM above our begin_ts
+            // and reclaim a version this snapshot still needs. The header read
+            // (possibly blocking I/O) happens before the clock lock is taken;
+            // the error paths below remove this tx if begin fails. The real
+            // header is set here, so the tail only flips `pager_commit_lock_held`.
+            let header = self.get_new_transaction_database_header(&pager);
+            self.clock.get_timestamp(|ts| {
+                self.txs.insert(tx_id, Transaction::new(tx_id, ts, header));
+            })
         };
         #[cfg(any(test, injected_yields))]
         let exclusive_yield_context = YieldContext::new(
@@ -5349,7 +5374,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let already_exclusive = self.is_exclusive_tx(&tx_id);
         if !already_exclusive {
             self.acquire_exclusive_tx(&tx_id, exclusive_yield_context)
-                .inspect_err(|_| unlock_checkpoint_guard())?;
+                .inspect_err(|_| {
+                    // Fresh txns were already published into `txs` above; undo
+                    // that so a failed begin doesn't leave a phantom Active txn
+                    // pinning the LWM forever.
+                    if maybe_existing_tx_id.is_none() {
+                        self.txs.remove(&tx_id);
+                    }
+                    unlock_checkpoint_guard();
+                })?;
         }
 
         // Hoist: validate the existing tx still exists and snapshot the
@@ -5376,6 +5409,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     "begin_exclusive_tx: tx_id={} failed with Busy on pager_commit_lock",
                     tx_id
                 );
+                if maybe_existing_tx_id.is_none() {
+                    self.txs.remove(&tx_id);
+                }
                 if !already_exclusive {
                     self.release_exclusive_tx(&tx_id);
                 }
@@ -5384,9 +5420,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
         }
 
-        let header = self.get_new_transaction_database_header(&pager);
-
         if let Some(existing_tx_id) = maybe_existing_tx_id {
+            // Upgrade path: read the (possibly blocking) header now that all
+            // locks are held, then apply it to the already-published txn.
+            let header = self.get_new_transaction_database_header(&pager);
             // Re-fetch the Ref now that all blocking I/O is done. If the tx
             // vanished between the earlier validation and now (extraordinarily
             // narrow window — only checkpoint can remove a tx and it cannot
@@ -5414,15 +5451,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             return Ok(tx_id);
         }
 
-        let tx = Transaction::new(tx_id, begin_ts, header);
-        tx.pager_commit_lock_held.store(true, Ordering::Release);
+        // Fresh path: the transaction (with its header) was already published
+        // into `txs` under the clock lock during begin_ts allocation. Now that
+        // we hold the commit lock, just record that.
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .expect("fresh exclusive tx was published during begin_ts allocation");
+        tx.value()
+            .pager_commit_lock_held
+            .store(true, Ordering::Release);
         tracing::trace!(
             "begin_exclusive_tx(tx_id={}, begin_ts={}) - exclusive write logical log transaction",
             tx_id,
             begin_ts
         );
         tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
-        self.txs.insert(tx_id, tx);
         Ok(tx_id)
     }
 
@@ -5437,13 +5481,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             return Err(LimboError::Busy);
         }
         let tx_id = self.get_tx_id();
-        let begin_ts = self.get_begin_timestamp();
 
-        // Set txn's header to the global header
+        // Set txn's header to the global header. Do the (possibly blocking)
+        // header read BEFORE taking the clock lock below.
         let header = self.get_new_transaction_database_header(&pager);
-        let tx = Transaction::new(tx_id, begin_ts, header);
+
+        // Allocate begin_ts and publish the transaction into `txs` atomically
+        // under the clock lock. This closes the "begin-publish window": between
+        // allocating a snapshot timestamp and inserting into `txs`, the txn is
+        // invisible to `compute_lwm`. Inline GC runs on the commit path holding
+        // only `blocking_checkpoint_lock.read()` (same as us), so a writer that
+        // commits in that window could compute an LWM above our begin_ts and
+        // reclaim a version this snapshot still needs — a snapshot-isolation
+        // violation. Publishing under the clock lock orders us strictly before
+        // or after any commit timestamp (commits also take the clock lock), so
+        // any GC that runs after a later commit already sees our begin_ts.
+        let begin_ts = self.clock.get_timestamp(|ts| {
+            self.txs.insert(tx_id, Transaction::new(tx_id, ts, header));
+        });
         tracing::trace!("begin_tx(tx_id={}, begin_ts={})", tx_id, begin_ts);
-        self.txs.insert(tx_id, tx);
 
         Ok(tx_id)
     }
@@ -5953,7 +6009,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let mut versions = entry.value().write();
                 let before = versions.len();
                 versions.retain(|rv| rv.id != version_id);
-                self.dec_live_version_count(before - versions.len());
+                self.dec_live_version_count_approx(before - versions.len());
                 tracing::debug!(
                     "rollback_savepoint: removed table version(table_id={}, row_id={}, version_id={})",
                     rowid.table_id,
@@ -5969,7 +6025,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     let mut versions = entry.value().write();
                     let before = versions.len();
                     versions.retain(|rv| rv.id != version_id);
-                    self.dec_live_version_count(before - versions.len());
+                    self.dec_live_version_count_approx(before - versions.len());
                     tracing::debug!(
                         "rollback_savepoint: removed index version(table_id={}, version_id={})",
                         table_id,
@@ -6244,22 +6300,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub const MAX_CHAINS_PER_GC: usize = 4096;
 
     /// Current approximate live row-version count. Heuristic only (see the
-    /// `live_version_count` field) — never use for correctness decisions.
-    pub fn live_version_count(&self) -> usize {
-        self.live_version_count.load(Ordering::Relaxed)
+    /// `live_version_count_approx` field) — never use for correctness decisions.
+    pub fn live_version_count_approx(&self) -> usize {
+        self.live_version_count_approx.load(Ordering::Relaxed)
     }
 
     /// Saturating decrement of the live-version heuristic. The counter is
     /// approximate, so clamp at zero rather than risk an underflow wrap that
     /// would make `should_gc` fire on every commit.
-    fn dec_live_version_count(&self, n: usize) {
+    fn dec_live_version_count_approx(&self, n: usize) {
         if n == 0 {
             return;
         }
-        let mut current = self.live_version_count.load(Ordering::Relaxed);
+        let mut current = self.live_version_count_approx.load(Ordering::Relaxed);
         loop {
             let next = current.saturating_sub(n);
-            match self.live_version_count.compare_exchange_weak(
+            match self.live_version_count_approx.compare_exchange_weak(
                 current,
                 next,
                 Ordering::Relaxed,
@@ -6284,14 +6340,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Whether an incremental GC pass should run now: inline GC is enabled
-    /// (threshold >= 0) and `live_version_count` has grown past the threshold
+    /// (threshold >= 0) and `live_version_count_approx` has grown past the threshold
     /// since the last pass. Heuristic — drift only changes GC frequency.
     pub fn should_gc(&self) -> bool {
         let threshold = self.gc_version_threshold.load(Ordering::Relaxed);
         if threshold < 0 {
             return false;
         }
-        let current = self.live_version_count.load(Ordering::Relaxed);
+        let current = self.live_version_count_approx.load(Ordering::Relaxed);
         let at_last = self.live_versions_at_last_gc.load(Ordering::Relaxed);
         current.saturating_sub(at_last) >= threshold as usize
     }
@@ -6322,8 +6378,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Reclaims invisible versions (same rules as `gc_version_chain`) from up
     /// to `max_chains` table-row chains, resuming from where the previous pass
     /// stopped (`gc_table_cursor`) so repeated calls eventually cover the whole
-    /// `rows` map without scanning it all at once. Returns the number of
-    /// versions reclaimed.
+    /// `rows` map without scanning it all at once.
     ///
     /// Safety / design notes:
     /// - **Lazy mode only.** Empty SkipMap slots are left in place (no
@@ -6357,6 +6412,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let _gate = GcGate(&self.gc_in_progress);
 
         let lwm = self.compute_lwm();
+
+        // Short-circuit when a long-running transaction has pinned the LWM at
+        // the same value since the last pass: nothing newly reclaimable can
+        // exist below it (any version superseded since then ends above the
+        // pinning txn's begin_ts). `u64::MAX` (no active txns) never
+        // short-circuits — that is exactly when the most is reclaimable. Reset
+        // the trigger baseline so `should_gc` doesn't spin on every commit
+        // while the LWM is stuck.
+        if lwm != u64::MAX && lwm == self.gc_last_lwm.load(Ordering::Relaxed) {
+            self.live_versions_at_last_gc.store(
+                self.live_version_count_approx.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            return 0;
+        }
+
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
 
         let mut dropped = 0;
@@ -6390,17 +6461,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // single huge index can't force an unbounded pass.
         dropped += self.gc_index_incremental(lwm, ckpt_max, max_chains);
 
-        self.dec_live_version_count(dropped);
+        self.dec_live_version_count_approx(dropped);
         // Reset the trigger baseline so `should_gc` measures growth from here.
         self.live_versions_at_last_gc.store(
-            self.live_version_count.load(Ordering::Relaxed),
+            self.live_version_count_approx.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+
+        // Record the LWM only once a full cycle (both cursors wrapped back to
+        // the start) has completed at this LWM, so the short-circuit above
+        // never skips chains we haven't yet swept at the current LWM. Until the
+        // cycle finishes, leave `gc_last_lwm` unchanged so subsequent passes
+        // keep scanning.
+        let full_cycle =
+            self.gc_table_cursor.lock().is_none() && self.gc_index_cursor.lock().is_none();
+        if full_cycle {
+            self.gc_last_lwm.store(lwm, Ordering::Relaxed);
+        }
 
         if dropped > 0 {
             tracing::trace!(
                 "gc_incremental: reclaimed {dropped} versions ({processed} table chains, table_wrapped={table_wrapped}), live~{}",
-                self.live_version_count.load(Ordering::Relaxed)
+                self.live_version_count_approx.load(Ordering::Relaxed)
             );
         }
         dropped
@@ -6472,7 +6554,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     &mut referenced_tx_ids,
                     remove_empty_slots,
                 );
-        self.dec_live_version_count(dropped);
+        self.dec_live_version_count_approx(dropped);
         let pruned_finalized = self.prune_finalized_tx_states(&referenced_tx_ids);
 
         tracing::trace!(
@@ -6763,7 +6845,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         versions.insert(position, row_version);
         // A genuine insert (the collapse branch above `return`s without
         // reaching here). Track it for the GC trigger heuristic.
-        self.live_version_count.fetch_add(1, Ordering::Relaxed);
+        self.live_version_count_approx
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn write_row_to_pager(
@@ -6816,7 +6899,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub fn purge_row_versions_during_checkpoint(&self, rowid: RowID) {
         if let Some(entry) = self.rows.get(&rowid) {
             let mut versions = entry.value().write();
-            self.dec_live_version_count(versions.len());
+            self.dec_live_version_count_approx(versions.len());
             versions.clear();
             Self::shrink_version_chain_allocation(&mut versions);
         }

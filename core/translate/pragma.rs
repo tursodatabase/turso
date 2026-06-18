@@ -687,9 +687,15 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::MvccGcThreshold => {
+            // 0 is rejected: it would run an inline GC pass on every commit even
+            // with zero new versions (`should_gc` compares growth `>= threshold`),
+            // which is pure overhead. Use -1 to disable, or a positive growth
+            // threshold.
             let threshold = match parse_signed_number(&value)? {
-                Value::Numeric(Numeric::Integer(size)) if size >= -1 => size,
-                _ => bail_parse_error!("mvcc_gc_threshold must be -1, 0, or a positive integer"),
+                Value::Numeric(Numeric::Integer(size)) if size == -1 || size >= 1 => size,
+                _ => bail_parse_error!(
+                    "mvcc_gc_threshold must be -1 (disabled) or a positive integer"
+                ),
             };
 
             connection.set_mvcc_gc_threshold(threshold)?;

@@ -8125,10 +8125,10 @@ fn test_gc_active_reader_pins_lwm() {
 /// version. Exactness here is convenient for the test but only approximate
 /// accuracy is required by the engine.
 #[test]
-fn test_live_version_count_tracks_inserts_and_gc() {
+fn test_live_version_count_approx_tracks_inserts_and_gc() {
     let db = MvccTestDb::new();
     let table_id: MVTableId = (-2).into();
-    let start = db.mvcc_store.live_version_count();
+    let start = db.mvcc_store.live_version_count_approx();
 
     // Insert a row + commit -> one live version.
     let tx = db
@@ -8139,7 +8139,7 @@ fn test_live_version_count_tracks_inserts_and_gc() {
         .insert(tx, generate_simple_string_row(table_id, 1, "v1"))
         .unwrap();
     commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
-    assert_eq!(db.mvcc_store.live_version_count(), start + 1);
+    assert_eq!(db.mvcc_store.live_version_count_approx(), start + 1);
 
     // Update the row + commit -> a second version (old one superseded, not
     // removed, so the count grows to two).
@@ -8151,13 +8151,13 @@ fn test_live_version_count_tracks_inserts_and_gc() {
         .update(tx, generate_simple_string_row(table_id, 1, "v2"))
         .unwrap();
     commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
-    assert_eq!(db.mvcc_store.live_version_count(), start + 2);
+    assert_eq!(db.mvcc_store.live_version_count_approx(), start + 2);
 
     // No active readers -> the superseded version is reclaimable. GC drops it
     // and the counter follows.
     let dropped = db.mvcc_store.drop_unused_row_versions();
     assert_eq!(dropped, 1);
-    assert_eq!(db.mvcc_store.live_version_count(), start + 1);
+    assert_eq!(db.mvcc_store.live_version_count_approx(), start + 1);
 }
 
 /// `should_gc` fires once live-version growth since the last pass crosses the
@@ -8399,7 +8399,7 @@ fn test_gc_incremental_concurrent_is_safe() {
         })
         .sum();
     assert_eq!(
-        db.mvcc_store.live_version_count(),
+        db.mvcc_store.live_version_count_approx(),
         table_live + index_live,
         "live-version counter drifted from actual chain contents"
     );
