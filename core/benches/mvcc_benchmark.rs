@@ -1,4 +1,6 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{
@@ -15,7 +17,7 @@ use codspeed_criterion_compat::{
 use turso_core::mvcc::clock::MvccClock;
 use turso_core::mvcc::database::{MvStore, Row, RowID, RowKey};
 use turso_core::types::{IOResult, ImmutableRecord, Text};
-use turso_core::{Connection, Database, MemoryIO, Value};
+use turso_core::{Connection, Database, MemoryIO, Statement, StepResult, Value};
 
 struct BenchDb {
     _db: Arc<Database>,
@@ -186,18 +188,228 @@ fn bench(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// "Huge multi-write" batch-insert benchmark.
+//
+// Models the shape of a workload that hit a pathological MVCC slowdown: a single
+// batch `INSERT ... SELECT` that joins a `VALUES` list of new rows against a
+// one-row `metadata` table and inserts them into a table with a UNIQUE index,
+// with `RETURNING`. The hot path is the per-row eq-only index probe (NoConflict).
+//
+// The `pending_invisible` parameter opens a second connection that holds an
+// uncommitted `BEGIN CONCURRENT` transaction full of index entries that are
+// invisible to the measured connection — reproducing concurrent in-flight batch
+// inserts. Before the eq-only seek bound was added, each probe scanned O(pending)
+// invisible skiplist entries, so this benchmark's time grew with `pending`; after
+// the fix it should stay roughly flat.
+//
+// To isolate the *index* (`seq`) seek path that the fix touches, the ghost rows'
+// rowids sit *below* every measured rowid (so the separate table-rowid seek never
+// walks into them) while their `seq` values sit *above* (so the index probe does).
+// ---------------------------------------------------------------------------
+
+/// Number of anonymized payload (TEXT) columns on `core`, mirroring wide rows
+/// without reproducing any real schema.
+const HUGE_WRITE_PAYLOAD_COLS: usize = 8;
+/// Rows inserted per measured batch (kept small so the benchmark stays quick while
+/// exercising the same per-row index-probe path as a much larger batch).
+const HUGE_WRITE_ROWS_PER_BATCH: usize = 32;
+/// First rowid/`seq` the measured batches use. Kept above every ghost *rowid* so
+/// the table's rowid-uniqueness seek never walks into the ghost rows.
+const HUGE_WRITE_SEQ_BASE: i64 = 1_000_000;
+/// The ghost connection's invisible index entries use `seq` values far above
+/// anything the measured batch inserts, so every measured eq-only index probe
+/// scans toward them (pre-fix) rather than stopping at a visible neighbor.
+const GHOST_SEQ_BASE: i64 = 100_000_000;
+/// Rebuild the database (and ghost) every this many measured batches to keep the
+/// committed-row footprint bounded over a long Criterion run.
+const HUGE_WRITE_RESET_EVERY: u64 = 2_000;
+
+fn payload_columns() -> String {
+    (0..HUGE_WRITE_PAYLOAD_COLS)
+        .map(|c| format!("c{c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn create_core_table_sql() -> String {
+    let cols = (0..HUGE_WRITE_PAYLOAD_COLS)
+        .map(|c| format!("c{c} TEXT"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "CREATE TABLE core(rowid_pk INTEGER PRIMARY KEY, seq INTEGER, {cols}, \
+         rank INTEGER, row_number INTEGER, created_ts INTEGER, modified_ts INTEGER)"
+    )
+}
+
+/// The anonymized, shrunken batch write. `?1` is the rolling base for the unique
+/// `seq` (and rowid), so successive iterations insert disjoint, ascending keys.
+fn build_huge_multi_write(rows: usize) -> String {
+    let col_list = payload_columns();
+    let mut values = String::new();
+    for off in 0..rows {
+        if off > 0 {
+            values.push(',');
+        }
+        let payload = (0..HUGE_WRITE_PAYLOAD_COLS)
+            .map(|c| format!("'v{c}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // (payload..., rank, off)
+        values.push_str(&format!("({payload}, 0, {off})"));
+    }
+    format!(
+        "WITH metadata_values AS (SELECT max_row_number, latest_op_timestamp FROM metadata), \
+         new_rows({col_list}, rank, off) AS (VALUES {values}) \
+         INSERT INTO core (rowid_pk, seq, {col_list}, rank, row_number, created_ts, modified_ts) \
+         SELECT ?1 + off, ?1 + off, {col_list}, rank, max_row_number + off, \
+                latest_op_timestamp, latest_op_timestamp \
+         FROM new_rows, metadata_values \
+         RETURNING rowid_pk, row_number"
+    )
+}
+
+fn ghost_insert_sql(pending: i64) -> String {
+    let col_list = payload_columns();
+    let payload = (0..HUGE_WRITE_PAYLOAD_COLS)
+        .map(|_| "'ghost'")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut values = String::new();
+    for j in 0..pending {
+        if j > 0 {
+            values.push(',');
+        }
+        // Low rowid (out of the measured rowid seek's forward path), high seq
+        // (in the measured index probe's forward path).
+        let rowid = j + 1;
+        let seq = GHOST_SEQ_BASE + j;
+        values.push_str(&format!("({rowid}, {seq}, {payload}, 0, {seq}, 0, 0)"));
+    }
+    format!(
+        "INSERT INTO core (rowid_pk, seq, {col_list}, rank, row_number, created_ts, modified_ts) \
+         VALUES {values}"
+    )
+}
+
+/// A fresh MVCC database with the benchmark schema and, optionally, a ghost
+/// connection holding `pending` uncommitted (invisible) index entries.
+struct HugeMultiWriteHarness {
+    db: Arc<Database>,
+    conn: Arc<Connection>,
+    // Held only to keep the BEGIN CONCURRENT transaction (and its invisible rows)
+    // alive for the lifetime of the harness.
+    _ghost: Option<Arc<Connection>>,
+}
+
+impl HugeMultiWriteHarness {
+    fn new(pending: i64) -> Self {
+        // In-memory IO: no fsync per commit, so the measurement reflects the
+        // CPU-bound index-probe path the eq-only seek bound affects.
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        // Keep everything in MvStore so the measurement reflects the in-memory
+        // index path rather than checkpoint I/O.
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.wal_auto_actions_disable();
+        conn.execute("CREATE TABLE metadata(max_row_number INTEGER, latest_op_timestamp INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO metadata VALUES (1000000, 1700000000)")
+            .unwrap();
+        conn.execute(create_core_table_sql()).unwrap();
+        conn.execute("CREATE UNIQUE INDEX idx_core_seq ON core(seq)")
+            .unwrap();
+
+        let ghost = (pending > 0).then(|| {
+            let ghost = db.connect().unwrap();
+            ghost.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+            ghost.execute("BEGIN CONCURRENT").unwrap();
+            ghost.execute(ghost_insert_sql(pending)).unwrap();
+            // Intentionally not committed: these rows stay invisible to `conn`.
+            ghost
+        });
+
+        Self {
+            db,
+            conn,
+            _ghost: ghost,
+        }
+    }
+}
+
+fn run_to_completion(db: &Arc<Database>, stmt: &mut Statement) {
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::IO | StepResult::Yield => {
+                db.io.step().unwrap();
+            }
+            // Drain the RETURNING rows.
+            StepResult::Row => {}
+            StepResult::Done => break,
+            StepResult::Busy => panic!("huge multi-write batch insert returned Busy"),
+            StepResult::Interrupt => panic!("huge multi-write batch insert was interrupted"),
+        }
+    }
+}
+
+fn bench_huge_multi_write(c: &mut Criterion) {
+    let idx1 = NonZeroUsize::new(1).unwrap();
+    let sql = build_huge_multi_write(HUGE_WRITE_ROWS_PER_BATCH);
+
+    let mut group = c.benchmark_group("mvcc-huge-multi-write");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(HUGE_WRITE_ROWS_PER_BATCH as u64));
+
+    for &pending in &[0i64, 1_000, 4_000] {
+        group.bench_function(
+            format!("rows={HUGE_WRITE_ROWS_PER_BATCH}/pending_invisible={pending}"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    let mut harness: Option<HugeMultiWriteHarness> = None;
+                    let mut stmt: Option<Statement> = None;
+                    let mut base = HUGE_WRITE_SEQ_BASE;
+                    for i in 0..iters {
+                        if i % HUGE_WRITE_RESET_EVERY == 0 {
+                            // Rebuild from scratch (setup time is excluded from `total`).
+                            let h = HugeMultiWriteHarness::new(pending);
+                            stmt = Some(h.conn.prepare(&sql).unwrap());
+                            harness = Some(h);
+                            base = HUGE_WRITE_SEQ_BASE;
+                        }
+                        let db = &harness.as_ref().unwrap().db;
+                        let stmt = stmt.as_mut().unwrap();
+                        stmt.bind_at(idx1, Value::from_i64(base)).unwrap();
+                        let start = Instant::now();
+                        run_to_completion(db, stmt);
+                        total += start.elapsed();
+                        stmt.reset().unwrap();
+                        base += HUGE_WRITE_ROWS_PER_BATCH as i64;
+                    }
+                    total
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
 #[cfg(not(feature = "codspeed"))]
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench
+    targets = bench, bench_huge_multi_write
 }
 
 #[cfg(feature = "codspeed")]
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench
+    targets = bench, bench_huge_multi_write
 }
 
 criterion_main!(benches);
