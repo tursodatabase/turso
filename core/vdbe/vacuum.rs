@@ -2897,8 +2897,7 @@ mod tests {
 
         let before = io.counts();
         assert_eq!(
-            before.db,
-            0,
+            before.db, 0,
             "target build with synchronous=OFF must not sync the destination db file before finalization"
         );
 

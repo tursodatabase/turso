@@ -1,4 +1,4 @@
-use crate::alloc::{ConcurrentAllocator, TursoAllocator};
+use crate::alloc::{ConcurrentAllocator, TryReserveError, TursoAllocator};
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
@@ -1190,9 +1190,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         !self.created_btrees.is_empty() || self.has_unpublished_schema_changes()
     }
 
-    fn publish_checkpointed_schema_roots(&mut self) {
+    fn publish_checkpointed_schema_roots(&mut self) -> Result<(), TryReserveError> {
         if !self.has_pending_root_publication() {
-            return;
+            return Ok(());
         }
 
         // Patch sqlite_schema in MV Store to contain positive rootpages instead of negative ones
@@ -1221,12 +1221,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 *existing = row_version;
             } else {
                 self.mvstore
-                    .insert_version_raw(&mut row_versions, row_version);
+                    .insert_version_raw(&mut row_versions, row_version)?;
             }
         }
 
         if !self.has_unpublished_schema_changes() {
-            return;
+            return Ok(());
         }
 
         // Patch in-memory schema to do the same. This must happen as soon as the
@@ -1277,6 +1277,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         drop(schema_ref);
         *self.connection.schema.write() = self.connection.db.clone_schema();
         self.connection.bump_prepare_context_generation();
+        Ok(())
     }
 
     fn gc_checkpointed_table_versions(&mut self) -> Option<IOCompletions> {
@@ -1568,7 +1569,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         *special_write,
                     )
                 };
-                tracing::debug!("WriteRow: num_columns={num_columns}, table_id={table_id:?}, special_write={special_write:?}");
+                tracing::debug!(
+                    "WriteRow: num_columns={num_columns}, table_id={table_id:?}, special_write={special_write:?}"
+                );
 
                 // Handle CREATE TABLE / DROP TABLE / CREATE INDEX / DROP INDEX ops
                 if let Some(special_write) = special_write {
@@ -1577,10 +1580,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             let created_root_page: u32 = self.pager.io.block(|| {
                                 self.pager.btree_create(&CreateBTreeFlags::new_table())
                             })?;
-                            self.mvstore.insert_table_id_to_rootpage(
-                                table_id,
-                                Some(created_root_page as u64),
-                            );
+                            // TODO: If this allocation fails, we would have created a Btree here that is dangling, see later how we should handle this error
+                            crate::without_allocation_faults!(self
+                                .mvstore
+                                .insert_table_id_to_rootpage(
+                                    table_id,
+                                    Some(created_root_page as u64),
+                                )
+                                .expect(crate::alloc::ALLOC_ERR_MSG));
                         }
                         SpecialWrite::BTreeDestroy {
                             table_id,
@@ -1623,10 +1630,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             let created_root_page: u32 = self.pager.io.block(|| {
                                 self.pager.btree_create(&CreateBTreeFlags::new_index())
                             })?;
-                            self.mvstore.insert_table_id_to_rootpage(
-                                index_id,
-                                Some(created_root_page as u64),
-                            );
+                            // TODO: If this allocation fails, we would have created a Btree here that is dangling, see later how we should handle this error
+                            crate::without_allocation_faults!(self
+                                .mvstore
+                                .insert_table_id_to_rootpage(
+                                    index_id,
+                                    Some(created_root_page as u64),
+                                )
+                                .expect(crate::alloc::ALLOC_ERR_MSG));
                             // Index struct should already be stored in index_id_to_index from collect_committed_versions
                             turso_assert!(
                                 self.index_id_to_index.contains_key(&index_id),
@@ -2105,7 +2116,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             )
                         })?;
                         self.mvstore.global_header.write().replace(header);
-                        self.publish_checkpointed_schema_roots();
+                        // TODO: not sure what is the error handling supposed to be here for alloc error
+                        crate::without_allocation_faults!(self
+                            .publish_checkpointed_schema_roots()
+                            .expect(crate::alloc::ALLOC_ERR_MSG));
                         inject_transition_failure!(
                             self,
                             CheckpointYieldPoint::AfterDurableBoundaryAdvanced
@@ -2495,7 +2509,9 @@ mod tests {
         let (_, tombstone_version) =
             index_row_version(index_id, "blue_river_906", 75, 2, None, Some(10), true);
 
-        mvstore.insert_index_version(index_id, garbage_key, garbage_version);
+        mvstore
+            .insert_index_version(index_id, garbage_key, garbage_version)
+            .unwrap();
         let entry = mvstore
             .index_rows
             .get(&index_id)
@@ -2506,7 +2522,9 @@ mod tests {
             .expect("key bucket should exist after first insert")
             .key()
             .clone();
-        mvstore.insert_index_version(index_id, tombstone_key, tombstone_version);
+        mvstore
+            .insert_index_version(index_id, tombstone_key, tombstone_version)
+            .unwrap();
 
         while checkpoint.collect_index_rows().is_some() {}
 
@@ -2589,7 +2607,9 @@ mod tests {
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
         for i in 0..row_count as i64 {
             let (key, version) = index_row_version(index_id, "k", i, 1, Some(5), None, false);
-            mvstore.insert_index_version(index_id, key, version);
+            mvstore
+                .insert_index_version(index_id, key, version)
+                .unwrap();
         }
 
         let first = checkpoint.collect_index_rows();
@@ -2670,7 +2690,9 @@ mod tests {
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
         for i in 0..row_count as i64 {
             let (key, version) = index_row_version(index_id, "k", i, 1, Some(5), None, false);
-            mvstore.insert_index_version(index_id, key, version.clone());
+            mvstore
+                .insert_index_version(index_id, key, version.clone())
+                .unwrap();
             checkpoint.index_write_set.push((index_id, version, false));
         }
         checkpoint.state = CheckpointState::GcIndexRows {

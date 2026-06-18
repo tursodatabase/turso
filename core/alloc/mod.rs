@@ -26,6 +26,8 @@ pub use collections::{
     TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt,
 };
 
+pub const ALLOC_ERR_MSG: &str = "TODO: fallible allocations";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TryReserveError;
 
