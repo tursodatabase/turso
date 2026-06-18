@@ -50,7 +50,14 @@ export type InArgs = Array<InValue> | Record<string, InValue>;
 export type InStatement = { sql: string; args?: InArgs } | string;
 
 /** Transaction execution modes */
-export type TransactionMode = "write" | "read" | "deferred";
+export type TransactionMode = "write" | "read" | "deferred" | "immediate" | "exclusive" | "concurrent" | string;
+
+export interface BatchOptions {
+  mode?: TransactionMode;
+  raw?: boolean;
+}
+
+export type BatchRow = Record<string, InValue> | Array<InValue>;
 
 /**
  * A result row that can be accessed both as an array and as an object.
@@ -78,6 +85,20 @@ export interface ResultSet {
   lastInsertRowid: bigint | undefined;
   /** Convert result set to JSON */
   toJSON(): any;
+}
+
+/**
+ * Result set returned by batch().
+ */
+export interface BatchResultSet {
+  /** Column names in the result set */
+  columns: Array<string>;
+  /** Column type information */
+  columnTypes: Array<string>;
+  /** Result rows */
+  rows: Array<BatchRow>;
+  /** Number of rows affected by the statement */
+  rowsAffected: number;
 }
 
 /**
@@ -111,7 +132,7 @@ export class LibsqlError extends Error {
  */
 export interface Transaction {
   execute(stmt: InStatement): Promise<ResultSet>;
-  batch(stmts: Array<InStatement>): Promise<Array<ResultSet>>;
+  batch(stmts: Array<InStatement>): Promise<Array<BatchResultSet>>;
   executeMultiple(sql: string): Promise<void>;
   commit(): Promise<void>;
   rollback(): Promise<void>;
@@ -128,8 +149,8 @@ export interface Transaction {
 export interface Client {
   execute(stmt: InStatement): Promise<ResultSet>;
   execute(sql: string, args?: InArgs): Promise<ResultSet>;
-  batch(stmts: Array<InStatement>, mode?: TransactionMode): Promise<Array<ResultSet>>;
-  migrate(stmts: Array<InStatement>): Promise<Array<ResultSet>>;
+  batch(stmts: Array<InStatement>, options?: TransactionMode | BatchOptions): Promise<Array<BatchResultSet>>;
+  migrate(stmts: Array<InStatement>): Promise<Array<BatchResultSet>>;
   transaction(mode?: TransactionMode): Promise<Transaction>;
   executeMultiple(sql: string): Promise<void>;
   sync(): Promise<any>;
@@ -246,6 +267,28 @@ class LibSQLClient implements Client {
     return resultSet;
   }
 
+  private convertBatchResult(result: any): BatchResultSet {
+    return {
+      columns: result.columns || [],
+      columnTypes: result.columnTypes || [],
+      rows: result.rows || [],
+      rowsAffected: result.rowsAffected || 0,
+    };
+  }
+
+  private normalizeBatchOptions(options?: TransactionMode | BatchOptions): { mode?: TransactionMode; raw: boolean } {
+    if (options != null && typeof options === "object") {
+      return {
+        mode: options.mode,
+        raw: options.raw === true,
+      };
+    }
+    return {
+      mode: options,
+      raw: false,
+    };
+  }
+
   async execute(stmt: InStatement): Promise<ResultSet>;
   async execute(sql: string, args?: InArgs): Promise<ResultSet>;
   async execute(stmtOrSql: InStatement | string, args?: InArgs): Promise<ResultSet> {
@@ -276,22 +319,29 @@ class LibSQLClient implements Client {
     }
   }
 
-  async batch(stmts: Array<InStatement>, mode?: TransactionMode): Promise<Array<ResultSet>> {
+  async batch(stmts: Array<InStatement>, options?: TransactionMode | BatchOptions): Promise<Array<BatchResultSet>> {
     await this.execLock.acquire();
     try {
       if (this._closed) {
         throw new LibsqlError("Client is closed", "CLIENT_CLOSED");
       }
 
-      const sqlStatements = stmts.map(stmt => {
-        const normalized = this.normalizeStatement(stmt);
-        return normalized.sql; // For now, ignore args in batch
-      });
+      if (!Array.isArray(stmts)) {
+        throw new TypeError("Expected first argument to be an array of statements");
+      }
 
-      const result = await this.session.batch(sqlStatements);
+      const { mode, raw } = this.normalizeBatchOptions(options);
+      const batchMode = mode ?? "deferred";
 
-      // Return array of result sets (simplified - actual implementation would be more complex)
-      return [this.convertResult(result)];
+      const results = await this.session.batch(
+        stmts,
+        batchMode,
+        undefined,
+        this._defaultSafeIntegers,
+        raw,
+      );
+
+      return results.map((result: any) => this.convertBatchResult(result));
     } catch (error: any) {
       if (error instanceof LibsqlError) {
         throw error;
@@ -302,7 +352,7 @@ class LibSQLClient implements Client {
     }
   }
 
-  async migrate(stmts: Array<InStatement>): Promise<Array<ResultSet>> {
+  async migrate(stmts: Array<InStatement>): Promise<Array<BatchResultSet>> {
     // For now, just call batch - in a real implementation this would disable foreign keys
     return this.batch(stmts, "write");
   }
@@ -374,13 +424,22 @@ class LibSQLClient implements Client {
         }
         return executeInTx(stmtOrSql);
       },
-      batch: async (stmts: Array<InStatement>): Promise<Array<ResultSet>> => {
+      batch: async (stmts: Array<InStatement>): Promise<Array<BatchResultSet>> => {
         ensureOpen();
-        const results: Array<ResultSet> = [];
-        for (const stmt of stmts) {
-          results.push(await executeInTx(stmt));
+        if (!Array.isArray(stmts)) {
+          throw new TypeError("Expected first argument to be an array of statements");
         }
-        return results;
+        try {
+          const results = await txSession.batch(
+            stmts,
+            undefined,
+            undefined,
+            this._defaultSafeIntegers,
+          );
+          return results.map((result: any) => this.convertBatchResult(result));
+        } catch (error: any) {
+          throw mapDatabaseError(error, "BATCH_ERROR");
+        }
       },
       executeMultiple: async (sql: string): Promise<void> => {
         ensureOpen();
