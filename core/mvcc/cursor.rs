@@ -301,8 +301,11 @@ pub enum MvccCursorType {
     Index(Arc<IndexInfo>),
 }
 
-pub(crate) type MvccIterator<'l, T> =
-    Box<dyn Iterator<Item = Entry<'l, T, RowVersions>> + Send + Sync>;
+pub(crate) type MvccIterator<'l, T, A = crate::alloc::TursoAllocator> = Box<
+    dyn Iterator<Item = Entry<'l, T, RowVersions, crate::skiplist::comparator::BasicComparator, A>>
+        + Send
+        + Sync,
+>;
 
 /// Extends the lifetime of a SkipMap iterator to `'static`.
 ///
@@ -326,11 +329,36 @@ pub(crate) type MvccIterator<'l, T> =
 ///   that outlives the cursor.
 macro_rules! static_iterator_hack {
     ($iter:expr, $key_type:ty) => {
+        static_iterator_hack!($iter, $key_type, crate::alloc::TursoAllocator)
+    };
+    ($iter:expr, $key_type:ty, $alloc:ty) => {
         // SAFETY: See macro documentation above.
         unsafe {
             std::mem::transmute::<
-                Box<dyn Iterator<Item = Entry<'_, $key_type, RowVersions>> + Send + Sync>,
-                Box<dyn Iterator<Item = Entry<'static, $key_type, RowVersions>> + Send + Sync>,
+                Box<
+                    dyn Iterator<
+                            Item = Entry<
+                                '_,
+                                $key_type,
+                                RowVersions,
+                                crate::skiplist::comparator::BasicComparator,
+                                $alloc,
+                            >,
+                        > + Send
+                        + Sync,
+                >,
+                Box<
+                    dyn Iterator<
+                            Item = Entry<
+                                'static,
+                                $key_type,
+                                RowVersions,
+                                crate::skiplist::comparator::BasicComparator,
+                                $alloc,
+                            >,
+                        > + Send
+                        + Sync,
+                >,
             >($iter)
         }
     };
