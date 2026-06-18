@@ -372,15 +372,16 @@ pub(crate) use static_iterator_hack;
 /// Forward index cursors only; [`reset`](Self::reset) on any reposition, since
 /// the finger is monotonic.
 #[derive(Default)]
-enum IndexShadowFinger {
+pub(crate) enum IndexShadowFinger {
     /// Not yet created; built lazily on the next shadow check.
     #[default]
     Uninitialized,
-    /// Positioned at `key`, whose version chain `shadows` the B-tree row or not.
+    /// Positioned at `key`, holding its version chain. The shadow bit is resolved
+    /// lazily (only when a B-tree row matches this key exactly)
     Peeked {
         iter: MvccIterator<'static, Arc<SortableIndexKey>>,
         key: Arc<SortableIndexKey>,
-        shadows: bool,
+        versions: RowVersions,
     },
     /// Ran past the last version; every remaining B-tree row is visible.
     Exhausted,
@@ -394,17 +395,14 @@ impl IndexShadowFinger {
         *self = Self::Uninitialized;
     }
 
-    /// Advance `iter` to its next entry, resolving the shadow bit up front so no
-    /// borrowed skiplist `Entry` is held afterward.
-    fn advance<Clock: LogicalClock>(
-        mut iter: MvccIterator<'static, Arc<SortableIndexKey>>,
-        db: &MvStore<Clock>,
-        tx_id: u64,
-    ) -> Self {
+    /// Advance `iter` to its next entry, cloning the key and version-chain `Arc`
+    /// (both cheap) so no borrowed skiplist `Entry` is held afterward. The shadow
+    /// bit is deliberately not resolved here — see [`Self::Peeked`].
+    fn advance(mut iter: MvccIterator<'static, Arc<SortableIndexKey>>) -> Self {
         match iter.next() {
             Some(entry) => Self::Peeked {
-                shadows: db.index_chain_invalidates_btree(entry.value(), tx_id),
                 key: entry.key().clone(),
+                versions: entry.value().clone(),
                 iter,
             },
             None => Self::Exhausted,
@@ -414,7 +412,7 @@ impl IndexShadowFinger {
     /// Whether the B-tree row `key` is visible (not shadowed by an MVCC version),
     /// served from the co-positioned finger. Forward equivalent of
     /// [`MvStore::query_btree_version_is_valid`] for index keys.
-    fn btree_row_is_valid<Clock: LogicalClock>(
+    pub(crate) fn btree_row_is_valid<Clock: LogicalClock>(
         &mut self,
         db: &MvStore<Clock>,
         table_id: MVTableId,
@@ -425,14 +423,20 @@ impl IndexShadowFinger {
             // Scoped so the skiplist guard drops before `step` re-borrows `db`.
             let iter = {
                 let index_rows = db.index_rows.get_or_insert_with(table_id, SkipMap::new);
+                // Seed the finger at the first index key >= the B-tree key rather
+                // than at the start of `index_rows`, so a seek-initiated scan does
+                // not re-walk every preceding version on its first row check.
                 let iter_box: Box<
                     dyn Iterator<Item = Entry<'_, Arc<SortableIndexKey>, RowVersions>>
                         + Send
                         + Sync,
-                > = Box::new(index_rows.value().iter());
+                > = Box::new(index_rows.value().range::<SortableIndexKey, _>((
+                    std::ops::Bound::Included(key.as_ref()),
+                    std::ops::Bound::Unbounded,
+                )));
                 static_iterator_hack!(iter_box, Arc<SortableIndexKey>)
             };
-            *self = Self::advance(iter, db, tx_id);
+            *self = Self::advance(iter);
         }
         loop {
             match self {
@@ -441,13 +445,16 @@ impl IndexShadowFinger {
                 Self::Uninitialized => unreachable!("created just above"),
                 Self::Peeked {
                     key: finger_key,
-                    shadows,
+                    versions,
                     ..
                 } => match finger_key.as_ref().cmp(key.as_ref()) {
                     // No version exactly at this key -> visible.
                     std::cmp::Ordering::Greater => return true,
-                    // Version present at this key -> shadowed iff it invalidates.
-                    std::cmp::Ordering::Equal => return !*shadows,
+                    // Version present at this key -> resolve the shadow bit now,
+                    // on the one key that actually matches a B-tree row.
+                    std::cmp::Ordering::Equal => {
+                        return !db.index_chain_invalidates_btree(versions, tx_id)
+                    }
                     // Finger behind the B-tree (a version-only key); catch up below.
                     std::cmp::Ordering::Less => {}
                 },
@@ -456,7 +463,7 @@ impl IndexShadowFinger {
             let Self::Peeked { iter, .. } = std::mem::replace(self, Self::Uninitialized) else {
                 unreachable!("Less arm matched Peeked")
             };
-            *self = Self::advance(iter, db, tx_id);
+            *self = Self::advance(iter);
         }
     }
 }
