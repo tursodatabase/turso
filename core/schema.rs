@@ -1791,6 +1791,12 @@ impl Schema {
                     );
                     pk_index_added = true;
 
+                    // WITHOUT ROWID tables store the PRIMARY KEY in the table B-tree itself,
+                    // so SQLite does not create a separate automatic index entry for it.
+                    if !table.has_rowid {
+                        continue;
+                    }
+
                     if unique_set.columns.len() == 1 {
                         let col_name = &unique_set.columns.first().unwrap().0;
                         let Some((_, column)) = table.get_column(col_name) else {
@@ -3335,6 +3341,40 @@ impl BTreeTable {
                 .as_ref()
                 .is_some_and(|n| n.eq_ignore_ascii_case(name))
         })
+    }
+
+    /// Appends the PRIMARY KEY suffix required by WITHOUT ROWID secondary indexes.
+    /// Rowid tables store the row locator outside `columns` via `has_rowid`, so
+    /// their index columns are returned unchanged.
+    fn add_without_rowid_primary_key_suffix(
+        &self,
+        mut index_columns: Vec<IndexColumn>,
+    ) -> Result<Vec<IndexColumn>> {
+        if self.has_rowid {
+            return Ok(index_columns);
+        }
+
+        for (col_name, order) in &self.primary_key_columns {
+            let Some((pos_in_table, column)) = self.get_column(col_name) else {
+                return Err(crate::LimboError::ParseError(format!(
+                    "Column {} not found in table {}",
+                    col_name, self.name
+                )));
+            };
+            if index_columns.iter().any(|c| c.pos_in_table == pos_in_table) {
+                continue;
+            }
+            index_columns.try_push(IndexColumn {
+                name: normalize_ident(col_name),
+                order: *order,
+                pos_in_table,
+                collation: column.collation_opt(),
+                default: column.default.clone(),
+                expr: None,
+            })?;
+        }
+
+        Ok(index_columns)
     }
 
     pub fn from_sql(sql: &str, root_page: i64) -> Result<BTreeTable> {
@@ -5403,6 +5443,8 @@ impl Index {
                         on_conflict: None,
                     })
                 } else {
+                    let index_columns =
+                        table.add_without_rowid_primary_key_suffix(index_columns)?;
                     Ok(Index {
                         name: index_name,
                         table_name: normalize_ident(tbl_name.as_str()),
@@ -5521,6 +5563,8 @@ impl Index {
                 expr: None,
             });
         }
+
+        let unique_cols = table.add_without_rowid_primary_key_suffix(unique_cols)?;
 
         Ok(Index {
             name: normalize_ident(index_name.as_str()),
@@ -6401,6 +6445,90 @@ mod tests {
             table.to_sql(),
             "CREATE TABLE t (code TEXT PRIMARY KEY, val TEXT) STRICT, WITHOUT ROWID"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_without_rowid_secondary_index_columns_include_primary_key() -> Result<()> {
+        let table = BTreeTable::from_sql(
+            r#"CREATE TABLE t(a TEXT, b TEXT, c TEXT, PRIMARY KEY(a, b)) WITHOUT ROWID"#,
+            0,
+        )?;
+
+        let index = Index::from_sql(
+            &SymbolTable::default(),
+            "CREATE INDEX idx ON t(c, a)",
+            2,
+            &table,
+        )?;
+
+        assert_eq!(index.columns.len(), 3);
+        assert_eq!(index.columns[0].name, "c");
+        assert_eq!(index.columns[1].name, "a");
+        assert_eq!(index.columns[2].name, "b");
+        assert!(!index.has_rowid);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_schema_loading_without_rowid_unique_automatic_index() -> Result<()> {
+        let mut schema = Schema::new();
+        let syms = SymbolTable::default();
+        let mut from_sql_indexes = Vec::new();
+        let mut automatic_indices = HashMap::default();
+        let mut dbsp_state_roots = HashMap::default();
+        let mut dbsp_state_index_roots = HashMap::default();
+        let mut materialized_view_info = HashMap::default();
+
+        schema.handle_schema_row(
+            "table",
+            "registry",
+            "registry",
+            2,
+            Some(
+                "CREATE TABLE registry(
+                    tenant TEXT,
+                    key TEXT,
+                    token TEXT UNIQUE,
+                    PRIMARY KEY(tenant, key)
+                ) WITHOUT ROWID",
+            ),
+            &syms,
+            &mut from_sql_indexes,
+            &mut automatic_indices,
+            &mut dbsp_state_roots,
+            &mut dbsp_state_index_roots,
+            &mut materialized_view_info,
+            &|_| None,
+        )?;
+        schema.handle_schema_row(
+            "index",
+            "sqlite_autoindex_registry_2",
+            "registry",
+            3,
+            None,
+            &syms,
+            &mut from_sql_indexes,
+            &mut automatic_indices,
+            &mut dbsp_state_roots,
+            &mut dbsp_state_index_roots,
+            &mut materialized_view_info,
+            &|_| None,
+        )?;
+
+        schema.populate_indices(&syms, from_sql_indexes, automatic_indices, false)?;
+
+        let mut indexes = schema.get_indices("registry");
+        let index = indexes.next().expect("expected one automatic index");
+        assert!(indexes.next().is_none());
+        assert_eq!(index.name, "sqlite_autoindex_registry_2");
+        assert_eq!(index.columns.len(), 3);
+        assert_eq!(index.columns[0].name, "token");
+        assert_eq!(index.columns[1].name, "tenant");
+        assert_eq!(index.columns[2].name, "key");
+        assert!(!index.has_rowid);
+
         Ok(())
     }
 
