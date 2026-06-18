@@ -3416,12 +3416,20 @@ fn test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check() {
     conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
         .unwrap();
 
-    // Busy-tolerant read so transient lock contention isn't mistaken for a repro.
+    // Retry transient MVCC concurrency errors (Busy / BusySnapshot / a snapshot whose
+    // dependency aborted) so they aren't mistaken for a repro — only a non-"ok" integrity
+    // result or a genuine error should fail the test.
+    fn is_transient(e: &LimboError) -> bool {
+        matches!(
+            e,
+            LimboError::Busy | LimboError::BusySnapshot | LimboError::CommitDependencyAborted
+        )
+    }
     fn read_retry(conn: &Arc<Connection>, query: &str) -> Option<Vec<Vec<Value>>> {
         for _ in 0..100_000 {
             let mut stmt = match conn.prepare(query) {
                 Ok(s) => s,
-                Err(LimboError::Busy) => {
+                Err(e) if is_transient(&e) => {
                     std::thread::yield_now();
                     continue;
                 }
@@ -3434,7 +3442,7 @@ fn test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check() {
             });
             match res {
                 Ok(()) => return Some(rows),
-                Err(LimboError::Busy) => {
+                Err(e) if is_transient(&e) => {
                     std::thread::yield_now();
                     continue;
                 }
