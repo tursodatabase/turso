@@ -16,7 +16,12 @@ else
 endif
 
 RUST_RELEASE_OPT ?= 
+RUST_PROFILE_DIR ?= debug
 DOTNET_RELEASE_OPT ?=
+IOS_FRAMEWORK_NAME = libturso_sdk_kit
+IOS_DYLIB_FILE = libturso_sdk_kit.dylib
+IOS_FRAMEWORK_BUILD_DIR = ./rs_compiled/ios-frameworks
+IOS_XCFRAMEWORK_DIR = ./rs_compiled/ios-universal/native/$(IOS_FRAMEWORK_NAME).xcframework
 
 all:
 	echo "make [build|test|benchmark|build-production]"
@@ -38,6 +43,63 @@ build-rust-macos64:
 
 build-rust-macosarm64:
 	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-darwin $(RUST_RELEASE_OPT)
+
+build-rust-androidarm64:
+	cargo ndk --target aarch64-linux-android --platform 31 build -p turso_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
+
+build-rust-androidarm:
+	cargo ndk --target armv7-linux-androideabi --platform 31 build -p turso_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
+
+build-rust-androidx64:
+	cargo ndk --target x86_64-linux-android --platform 31 build -p turso_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
+
+build-rust-androidx86:
+	cargo ndk --target i686-linux-android --platform 31 build -p turso_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
+
+build-rust-android: build-rust-androidarm64 build-rust-androidarm build-rust-androidx64 build-rust-androidx86
+
+build-rust-iosarm64:
+	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-ios $(RUST_RELEASE_OPT)
+
+build-rust-iossimulatorarm64:
+	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-ios-sim $(RUST_RELEASE_OPT)
+
+build-rust-ios: build-rust-iosarm64 build-rust-iossimulatorarm64
+
+package-rust-iosframework:
+	rm -rf "$(IOS_FRAMEWORK_BUILD_DIR)" "$(IOS_XCFRAMEWORK_DIR)"
+	mkdir -p "$(IOS_FRAMEWORK_BUILD_DIR)/device/$(IOS_FRAMEWORK_NAME).framework" "$(IOS_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_FRAMEWORK_NAME).framework" ./rs_compiled/ios-universal/native
+	cp ./rs_compiled/aarch64-apple-ios/$(RUST_PROFILE_DIR)/$(IOS_DYLIB_FILE) "$(IOS_FRAMEWORK_BUILD_DIR)/device/$(IOS_FRAMEWORK_NAME).framework/$(IOS_FRAMEWORK_NAME)"
+	install_name_tool -id @rpath/$(IOS_FRAMEWORK_NAME).framework/$(IOS_FRAMEWORK_NAME) "$(IOS_FRAMEWORK_BUILD_DIR)/device/$(IOS_FRAMEWORK_NAME).framework/$(IOS_FRAMEWORK_NAME)"
+	cp ./rs_compiled/aarch64-apple-ios-sim/$(RUST_PROFILE_DIR)/$(IOS_DYLIB_FILE) "$(IOS_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_FRAMEWORK_NAME).framework/$(IOS_FRAMEWORK_NAME)"
+	install_name_tool -id @rpath/$(IOS_FRAMEWORK_NAME).framework/$(IOS_FRAMEWORK_NAME) "$(IOS_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_FRAMEWORK_NAME).framework/$(IOS_FRAMEWORK_NAME)"
+	printf '%s\n' \
+	'<?xml version="1.0" encoding="UTF-8"?>' \
+	'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+	'<plist version="1.0">' \
+	'<dict>' \
+	'  <key>CFBundleDevelopmentRegion</key>' \
+	'  <string>en</string>' \
+	'  <key>CFBundleExecutable</key>' \
+	'  <string>$(IOS_FRAMEWORK_NAME)</string>' \
+	'  <key>CFBundleIdentifier</key>' \
+	'  <string>com.turso.turso-sdk-kit</string>' \
+	'  <key>CFBundleInfoDictionaryVersion</key>' \
+	'  <string>6.0</string>' \
+	'  <key>CFBundlePackageType</key>' \
+	'  <string>FMWK</string>' \
+	'  <key>CFBundleSignature</key>' \
+	'  <string>????</string>' \
+	'  <key>CFBundleVersion</key>' \
+	'  <string>1.0.0</string>' \
+	'  <key>CFBundleShortVersionString</key>' \
+	'  <string>1.0.0</string>' \
+	'  <key>MinimumOSVersion</key>' \
+	'  <string>12.2</string>' \
+	'</dict>' \
+	'</plist>' > "$(IOS_FRAMEWORK_BUILD_DIR)/device/$(IOS_FRAMEWORK_NAME).framework/Info.plist"
+	cp "$(IOS_FRAMEWORK_BUILD_DIR)/device/$(IOS_FRAMEWORK_NAME).framework/Info.plist" "$(IOS_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_FRAMEWORK_NAME).framework/Info.plist"
+	xcodebuild -create-xcframework -framework "$(IOS_FRAMEWORK_BUILD_DIR)/device/$(IOS_FRAMEWORK_NAME).framework" -framework "$(IOS_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_FRAMEWORK_NAME).framework" -output "$(IOS_XCFRAMEWORK_DIR)"
 
 build-rust: 
 	echo "Building for $(OS_TARGET)"
