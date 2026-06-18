@@ -28,12 +28,13 @@ use memory_benchmark::workload::{
 
 const MODES: [JournalMode; 2] = [JournalMode::Wal, JournalMode::Mvcc];
 
-const WORKLOADS: [WorkloadProfile; 5] = [
+const WORKLOADS: [WorkloadProfile; 6] = [
     WorkloadProfile::InsertHeavy,
     WorkloadProfile::ReadHeavy,
     WorkloadProfile::Mixed,
     WorkloadProfile::ScanHeavy,
     WorkloadProfile::SeriesBlob,
+    WorkloadProfile::UpdateChurn,
 ];
 
 /// Workload scale series: the base iteration count is multiplied by each of
