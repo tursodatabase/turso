@@ -253,6 +253,8 @@ pub struct WhopperOpts {
     pub max_drain_steps: usize,
     /// Probability of cosmic ray bit flip on each step (0.0-1.0).
     pub cosmic_ray_probability: f64,
+    /// Probability that an `ftruncate()` call fails with an injected I/O error (0.0-1.0).
+    pub truncate_fault_probability: f64,
     /// Keep mmap I/O files on disk after run.
     pub keep_files: bool,
     /// Enable MVCC (Multi-Version Concurrency Control).
@@ -313,6 +315,7 @@ impl Default for WhopperOpts {
             max_steps: 100_000,
             max_drain_steps: 1_000_000,
             cosmic_ray_probability: 0.0,
+            truncate_fault_probability: 0.0,
             keep_files: false,
             enable_mvcc: false,
             enable_encryption: false,
@@ -329,27 +332,31 @@ impl Default for WhopperOpts {
 }
 
 impl WhopperOpts {
-    /// Create options for "fast" mode: 100k steps, no cosmic rays.
+    /// Create options for "fast" mode: 100k steps, no cosmic rays, 1% ftruncate faults.
     pub fn fast() -> Self {
         Self {
             max_steps: 100_000,
+            truncate_fault_probability: 0.01,
             ..Default::default()
         }
     }
 
-    /// Create options for "chaos" mode: 10M steps, no cosmic rays.
+    /// Create options for "chaos" mode: 10M steps, no cosmic rays, 1% ftruncate faults.
     pub fn chaos() -> Self {
         Self {
             max_steps: 10_000_000,
+            truncate_fault_probability: 0.01,
             ..Default::default()
         }
     }
 
-    /// Create options for "ragnarök" mode: 1M steps, 0.01% cosmic ray probability.
+    /// Create options for "ragnarök" mode: 1M steps, 0.01% cosmic ray probability,
+    /// 1% ftruncate faults.
     pub fn ragnarok() -> Self {
         Self {
             max_steps: 1_000_000,
             cosmic_ray_probability: 0.0001,
+            truncate_fault_probability: 0.01,
             ..Default::default()
         }
     }
@@ -392,6 +399,11 @@ impl WhopperOpts {
 
     pub fn with_cosmic_ray_probability(mut self, probability: f64) -> Self {
         self.cosmic_ray_probability = probability;
+        self
+    }
+
+    pub fn with_truncate_fault_probability(mut self, probability: f64) -> Self {
+        self.truncate_fault_probability = probability;
         self
     }
 
@@ -585,6 +597,11 @@ pub struct Whopper {
     disable_mvcc_auto_checkpoint: bool,
     /// If false, drop fiber connections without first closing them.
     close_connections_gracefully: bool,
+    /// True when `ftruncate()` fault injection is active. Injected I/O errors
+    /// are then expected, so they are treated as recoverable (the operation is
+    /// rolled back) rather than crashing the run. With injection off, an
+    /// `IoError` still aborts the run so genuine I/O bugs are not masked.
+    truncate_fault_injection: bool,
 }
 
 impl Whopper {
@@ -602,6 +619,7 @@ impl Whopper {
 
         let fault_config = IOFaultConfig {
             cosmic_ray_probability: opts.cosmic_ray_probability,
+            truncate_fault_probability: opts.truncate_fault_probability,
         };
 
         let io = Arc::new(SimulatorIO::new(opts.keep_files, io_rng, fault_config));
@@ -730,6 +748,7 @@ impl Whopper {
             chaotic_profiles: opts.chaotic_profiles,
             disable_mvcc_auto_checkpoint: opts.disable_mvcc_auto_checkpoint,
             close_connections_gracefully: opts.close_connections_gracefully,
+            truncate_fault_injection: opts.truncate_fault_probability > 0.0,
         };
 
         whopper.open_connections()?;
@@ -766,6 +785,7 @@ impl Whopper {
     fn perform_work(&mut self, fiber_idx: usize) -> anyhow::Result<()> {
         let exec_id = self.context.fibers[fiber_idx].execution_id;
         let txn_id = self.context.fibers[fiber_idx].txn_id;
+        let truncate_fault_injection = self.truncate_fault_injection;
         trace!(
             "perform_work: step={}, fiber_idx={}/{} exec_id={:?} txn_id={:?}",
             self.current_step,
@@ -904,7 +924,28 @@ impl Whopper {
 
             if let Err(error) = op_result {
                 let in_tx = ctx.fiber.state.is_in_tx() && !ctx.fiber.connection.get_auto_commit();
-                match crate::error_handling::classify_op_error(&error, in_tx) {
+                // An injected ftruncate fault is expected under active fault
+                // injection: a failed WAL write/truncate surfaces as a
+                // CompletionError, and a failed checkpoint truncate surfaces as a
+                // CheckpointFailed (the write is durable, only the checkpoint
+                // maintenance op failed). Both are recoverable here, so roll back /
+                // clear txn instead of aborting the run; without injection they stay
+                // Respawn/Fatal so real bugs are not masked.
+                let action = if truncate_fault_injection
+                    && matches!(
+                        error,
+                        turso_core::LimboError::CompletionError(..)
+                            | turso_core::LimboError::CheckpointFailed(..)
+                    ) {
+                    if in_tx {
+                        crate::error_handling::ErrorAction::Rollback
+                    } else {
+                        crate::error_handling::ErrorAction::ClearTxn
+                    }
+                } else {
+                    crate::error_handling::classify_op_error(&error, in_tx)
+                };
+                match action {
                     crate::error_handling::ErrorAction::Rollback => {
                         ctx.fiber.current_op = Some(Operation::Rollback);
                     }

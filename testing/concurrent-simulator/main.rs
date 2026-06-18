@@ -249,6 +249,12 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     if opts.cosmic_ray_probability > 0.0 {
         println!("cosmic ray probability = {}", opts.cosmic_ray_probability);
     }
+    if opts.truncate_fault_probability > 0.0 {
+        println!(
+            "truncate fault probability = {}",
+            opts.truncate_fault_probability
+        );
+    }
 
     let reopen_probability = args.reopen_probability.unwrap_or(opts.reopen_probability);
 

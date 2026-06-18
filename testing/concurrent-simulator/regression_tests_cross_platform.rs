@@ -28,6 +28,7 @@ fn test_concurrent_commit_no_yield_spin() {
     let io_rng = ChaCha8Rng::seed_from_u64(42);
     let fault_config = IOFaultConfig {
         cosmic_ray_probability: 0.0,
+        truncate_fault_probability: 0.0,
     };
     let io = Arc::new(SimulatorIO::new(false, io_rng, fault_config));
 

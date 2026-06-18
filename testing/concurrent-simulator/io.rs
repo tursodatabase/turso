@@ -7,19 +7,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::debug;
 use turso_core::{
-    Clock, Completion, File, IO, MonotonicInstant, OpenFlags, Result, WallClockInstant,
+    Clock, Completion, CompletionError, File, IO, MonotonicInstant, OpenFlags, Result,
+    WallClockInstant,
 };
 
 #[derive(Debug, Clone)]
 pub struct IOFaultConfig {
     /// Probability of a cosmic ray bit flip on write (0.0-1.0)
     pub cosmic_ray_probability: f64,
+    /// Probability that an `ftruncate()` call fails with an I/O error (0.0-1.0)
+    pub truncate_fault_probability: f64,
 }
 
 impl Default for IOFaultConfig {
     fn default() -> Self {
         Self {
             cosmic_ray_probability: 0.0,
+            truncate_fault_probability: 0.0,
         }
     }
 }
@@ -34,7 +38,7 @@ pub struct SimulatorIO {
     files: Mutex<Vec<(String, Arc<SimulatorFile>)>>,
     file_sizes: Arc<Mutex<HashMap<String, u64>>>,
     keep_files: bool,
-    rng: Mutex<ChaCha8Rng>,
+    rng: Arc<Mutex<ChaCha8Rng>>,
     fault_config: IOFaultConfig,
     /// Simulated time in microseconds, incremented on each step
     time: AtomicU64,
@@ -48,7 +52,7 @@ impl SimulatorIO {
             files: Mutex::new(Vec::new()),
             file_sizes: Arc::new(Mutex::new(HashMap::new())),
             keep_files,
-            rng: Mutex::new(rng),
+            rng: Arc::new(Mutex::new(rng)),
             fault_config,
             time: AtomicU64::new(0),
             pending: Arc::new(Mutex::new(Vec::new())),
@@ -143,6 +147,8 @@ impl IO for SimulatorIO {
             path,
             self.file_sizes.clone(),
             self.pending.clone(),
+            self.fault_config.truncate_fault_probability,
+            self.rng.clone(),
         ));
         let insert_key = canonical_key(path);
 
@@ -171,7 +177,10 @@ impl IO for SimulatorIO {
         // Complete any pending IO operations
         let mut pending = self.pending.lock().unwrap();
         for pc in pending.drain(..) {
-            pc.completion.complete(pc.result);
+            match pc.error {
+                Some(err) => pc.completion.error(err),
+                None => pc.completion.complete(pc.result),
+            }
         }
         drop(pending);
 
@@ -230,6 +239,9 @@ impl IO for SimulatorIO {
 struct PendingCompletion {
     completion: Completion,
     result: i32,
+    /// When set, the completion is finished with this I/O error instead of the
+    /// success `result`, used to inject faults (e.g. a failed `ftruncate`).
+    error: Option<CompletionError>,
 }
 type PendingQueue = Arc<Mutex<Vec<PendingCompletion>>>;
 
@@ -243,6 +255,10 @@ struct SimulatorFile {
     path: String,
     _file: StdFile,
     pending: PendingQueue,
+    /// Probability that an `ftruncate()` call fails with an injected I/O error.
+    truncate_fault_probability: f64,
+    /// Shared with `SimulatorIO` so fault decisions stay seeded/deterministic.
+    rng: Arc<Mutex<ChaCha8Rng>>,
 }
 
 impl SimulatorFile {
@@ -250,6 +266,8 @@ impl SimulatorFile {
         file_path: &str,
         file_sizes: Arc<Mutex<HashMap<String, u64>>>,
         pending: PendingQueue,
+        truncate_fault_probability: f64,
+        rng: Arc<Mutex<ChaCha8Rng>>,
     ) -> Self {
         let file = OpenOptions::new()
             .read(true)
@@ -281,6 +299,8 @@ impl SimulatorFile {
             path: file_path.to_string(),
             _file: file,
             pending,
+            truncate_fault_probability,
+            rng,
         }
     }
 }
@@ -309,6 +329,7 @@ impl File for SimulatorFile {
         self.pending.lock().unwrap().push(PendingCompletion {
             completion: c.clone(),
             result,
+            error: None,
         });
         Ok(c)
     }
@@ -340,6 +361,7 @@ impl File for SimulatorFile {
         self.pending.lock().unwrap().push(PendingCompletion {
             completion: c.clone(),
             result,
+            error: None,
         });
         Ok(c)
     }
@@ -383,6 +405,7 @@ impl File for SimulatorFile {
         self.pending.lock().unwrap().push(PendingCompletion {
             completion: c.clone(),
             result: total_written as i32,
+            error: None,
         });
         Ok(c)
     }
@@ -392,11 +415,32 @@ impl File for SimulatorFile {
         self.pending.lock().unwrap().push(PendingCompletion {
             completion: c.clone(),
             result: 0,
+            error: None,
         });
         Ok(c)
     }
 
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+        // Inject an `ftruncate()` fault with the configured probability. The
+        // completion is finished with an I/O error during `step()`, exercising
+        // the engine's TRUNCATE-checkpoint error handling.
+        let inject_fault = self.truncate_fault_probability > 0.0 && {
+            let mut rng = self.rng.lock().unwrap();
+            rng.random::<f64>() < self.truncate_fault_probability
+        };
+        if inject_fault {
+            debug!("injecting ftruncate() fault for file {}", self.path);
+            self.pending.lock().unwrap().push(PendingCompletion {
+                completion: c.clone(),
+                result: -1,
+                error: Some(CompletionError::IOError(
+                    std::io::ErrorKind::Other,
+                    "simulated ftruncate fault",
+                )),
+            });
+            return Ok(c);
+        }
+
         let mut size = self.size.lock().unwrap();
         *size = len as usize;
         let mut sizes = self.file_sizes.lock().unwrap();
@@ -404,6 +448,7 @@ impl File for SimulatorFile {
         self.pending.lock().unwrap().push(PendingCompletion {
             completion: c.clone(),
             result: 0,
+            error: None,
         });
         Ok(c)
     }

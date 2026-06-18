@@ -71,6 +71,12 @@ pub struct CheckpointResult {
     pub wal_truncate_sent: bool,
     /// Whether WAL sync I/O has been submitted after truncation
     pub wal_sync_sent: bool,
+    /// I/O error captured by the WAL truncate completion, if any. Surfaced as a
+    /// checkpoint error rather than silently dropped, matching SQLite's TRUNCATE
+    /// checkpoint, which returns the result code of `sqlite3OsTruncate`.
+    wal_truncate_err: Arc<crate::sync::OnceLock<CompletionError>>,
+    /// I/O error captured by the post-truncation WAL sync completion, if any.
+    wal_sync_err: Arc<crate::sync::OnceLock<CompletionError>>,
 }
 
 impl Drop for CheckpointResult {
@@ -94,6 +100,8 @@ impl CheckpointResult {
             db_truncate_sent: false,
             wal_truncate_sent: false,
             wal_sync_sent: false,
+            wal_truncate_err: Arc::new(crate::sync::OnceLock::new()),
+            wal_sync_err: Arc::new(crate::sync::OnceLock::new()),
         }
     }
 
@@ -3983,6 +3991,12 @@ impl Wal for WalFile {
             }
         };
         if !should_skip_truncate {
+            // The callback only logs; the truncate's I/O error is *not* swallowed.
+            // `trunc_c` is added to the returned CompletionGroup, whose first
+            // member error is surfaced to the caller (via `wait_for_completion`
+            // or the VDBE driver's `get_error` check), so a failed truncate
+            // propagates as a real error and the write is retried rather than
+            // proceeding with orphaned frames still on disk.
             let trunc_c = file.truncate(
                 WAL_HEADER_SIZE as u64,
                 Completion::new_trunc(|res| {
@@ -4862,28 +4876,41 @@ impl WalFile {
         let file = self.coordination.prepare_truncate()?;
 
         if !result.wal_truncate_sent {
-            let c = Completion::new_trunc({
-                move |res| {
-                    if let Err(err) = res {
-                        tracing::debug!("WAL truncate failed: {err}")
-                    } else {
-                        tracing::trace!("WAL file truncated to 0 B");
-                    }
+            let err = result.wal_truncate_err.clone();
+            let c = Completion::new_trunc(move |res| match res {
+                Ok(_) => tracing::trace!("WAL file truncated to 0 B"),
+                Err(e) => {
+                    tracing::debug!("WAL truncate failed: {e}");
+                    let _ = err.set(e);
                 }
             });
             let c = file.truncate(0, c)?;
             result.wal_truncate_sent = true;
-            // after truncation - there will be nothing in the WAL
+            // SQLite (walRestartHdr) makes the in-memory header authoritative for
+            // "zero valid frames" *before* the on-disk truncate, so the wal-index
+            // header never disagrees with what readers should see. We mirror that
+            // ordering; the truncate's outcome is surfaced as an error below
+            // rather than swallowed.
             result.wal_max_frame = 0;
             result.wal_total_backfilled = 0;
             io_yield_one!(c);
-        } else if !result.wal_sync_sent {
+        }
+        // The truncate completion has fired by the time we re-enter. Like
+        // SQLite's TRUNCATE checkpoint (which returns the rc of
+        // sqlite3OsTruncate), report a failed truncation as a checkpoint error
+        // instead of claiming a successfully emptied log.
+        if let Some(e) = result.wal_truncate_err.get().cloned() {
+            return Err(LimboError::CompletionError(e));
+        }
+
+        if !result.wal_sync_sent {
+            let err = result.wal_sync_err.clone();
             let c = file.sync(
-                Completion::new_sync(move |res| {
-                    if let Err(err) = res {
-                        tracing::debug!("WAL sync failed: {err}")
-                    } else {
-                        tracing::trace!("WAL file synced after truncation");
+                Completion::new_sync(move |res| match res {
+                    Ok(_) => tracing::trace!("WAL file synced after truncation"),
+                    Err(e) => {
+                        tracing::debug!("WAL sync failed: {e}");
+                        let _ = err.set(e);
                     }
                 }),
                 sync_type,
@@ -4891,6 +4918,10 @@ impl WalFile {
             result.wal_sync_sent = true;
             io_yield_one!(c);
         }
+        if let Some(e) = result.wal_sync_err.get().cloned() {
+            return Err(LimboError::CompletionError(e));
+        }
+
         Ok(IOResult::Done(()))
     }
 

@@ -78,6 +78,14 @@ pub struct Opts {
         help = "If true, this will run a modified minimal version of turso_stress that ensure the DB is deterministic (no sources of randomness that are not controlled by the seed)"
     )]
     pub check_uncontrolled_nondeterminism: bool,
+
+    /// Probability of issuing a TRUNCATE checkpoint per iteration
+    #[clap(
+        long,
+        help = "Probability (0.0-1.0) of running PRAGMA wal_checkpoint(TRUNCATE) per iteration",
+        default_value_t = 0.01
+    )]
+    pub truncate_checkpoint_probability: f64,
 }
 
 /// Returns a constrained value when running under miri or shuttle,
