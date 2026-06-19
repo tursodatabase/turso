@@ -18,7 +18,7 @@ pub use allocation_site::{
 /// The underlying allocator trait: `allocator_api2::alloc::Allocator` on
 /// stable, `std::alloc::Allocator` on `--cfg nightly` builds.
 pub use api::ApiAllocator;
-pub use api::{AllocError, Layout};
+pub use api::{AllocError, Global, Layout};
 pub use backend::{set_allocator, SetAllocatorError, TursoAllocBackend};
 pub use collections::{
     TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt, TursoFromIterator, TursoHashMapExt,

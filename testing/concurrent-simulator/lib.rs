@@ -22,6 +22,7 @@ use turso_core::{
 };
 use turso_parser::ast::{ColumnConstraint, SortOrder};
 
+mod allocation_fault;
 pub mod chaotic_elle;
 pub mod elle;
 pub mod error_handling;
@@ -38,6 +39,10 @@ pub mod workloads;
 mod yield_injection;
 
 use crate::{
+    allocation_fault::{
+        AllocationFaultConfig, AllocationFaultContext, SimulatorAllocationFaultInjector,
+        install_global_allocation_fault_backend,
+    },
     chaotic_elle::{ChaoticWorkload, ChaoticWorkloadProfile},
     io::FILE_SIZE_SOFT_LIMIT,
     properties::Property,
@@ -78,6 +83,18 @@ fn step_stmt_with_injected_yield(
     connection.set_yield_injector(Some(yield_injector));
     let _guard = InstalledYieldInjector { connection };
     stmt.step()
+}
+
+fn step_stmt_with_injections(
+    connection: &Arc<Connection>,
+    yield_injector: Arc<SimulatorYieldInjector>,
+    allocation_fault_injector: Option<&'static SimulatorAllocationFaultInjector>,
+    allocation_fault_context: AllocationFaultContext,
+    stmt: &mut Statement,
+) -> turso_core::Result<turso_core::StepResult> {
+    let _allocation_fault_guard =
+        allocation_fault_injector.map(|injector| injector.enter_context(allocation_fault_context));
+    step_stmt_with_injected_yield(connection, yield_injector, stmt)
 }
 
 /// A bounded container for sampling values with reservoir sampling.
@@ -278,6 +295,8 @@ pub struct WhopperOpts {
     pub close_connections_gracefully: bool,
     /// Probabilty of a reopen fault.
     pub reopen_probability: f64,
+    /// Probability of failing a scoped Turso allocation while stepping a statement.
+    pub allocation_fault_probability: f64,
 }
 
 /// Schema-generation bias
@@ -324,6 +343,7 @@ impl Default for WhopperOpts {
             disable_mvcc_auto_checkpoint: false,
             close_connections_gracefully: true,
             reopen_probability: 0.0,
+            allocation_fault_probability: 0.0,
         }
     }
 }
@@ -430,6 +450,11 @@ impl WhopperOpts {
         profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
     ) -> Self {
         self.chaotic_profiles = profiles;
+        self
+    }
+
+    pub fn with_allocation_fault_probability(mut self, probability: f64) -> Self {
+        self.allocation_fault_probability = probability;
         self
     }
 }
@@ -585,6 +610,7 @@ pub struct Whopper {
     disable_mvcc_auto_checkpoint: bool,
     /// If false, drop fiber connections without first closing them.
     close_connections_gracefully: bool,
+    allocation_fault_injector: Option<&'static SimulatorAllocationFaultInjector>,
 }
 
 impl Whopper {
@@ -596,6 +622,12 @@ impl Whopper {
         });
 
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let allocation_fault_injector = install_global_allocation_fault_backend(
+            AllocationFaultConfig {
+                probability: opts.allocation_fault_probability,
+            },
+            seed.wrapping_add(2),
+        )?;
 
         // Create a separate RNG for IO operations with a derived seed
         let io_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1));
@@ -730,6 +762,7 @@ impl Whopper {
             chaotic_profiles: opts.chaotic_profiles,
             disable_mvcc_auto_checkpoint: opts.disable_mvcc_auto_checkpoint,
             close_connections_gracefully: opts.close_connections_gracefully,
+            allocation_fault_injector,
         };
 
         whopper.open_connections()?;
@@ -740,6 +773,12 @@ impl Whopper {
     /// Check if the simulation is complete (reached max steps or WAL limit).
     pub fn is_done(&self) -> bool {
         self.current_step >= self.max_steps
+    }
+
+    pub fn allocation_fault_count(&self) -> u64 {
+        self.allocation_fault_injector
+            .map(SimulatorAllocationFaultInjector::injected_faults)
+            .unwrap_or(0)
     }
 
     /// Perform a single simulation step.
@@ -789,7 +828,17 @@ impl Whopper {
                     txn_id = txn_id
                 );
                 let _enter = span.enter();
-                let step_result = step_stmt_with_injected_yield(&connection, yield_injector, stmt);
+                let step_result = step_stmt_with_injections(
+                    &connection,
+                    yield_injector,
+                    self.allocation_fault_injector,
+                    AllocationFaultContext {
+                        step: self.current_step as u64,
+                        fiber_idx: fiber_idx as u64,
+                        execution_id: exec_id.unwrap_or(0),
+                    },
+                    stmt,
+                );
                 match step_result {
                     Ok(result) => {
                         trace!("{:?}", result);
@@ -865,7 +914,8 @@ impl Whopper {
                 Err(turso_core::LimboError::Busy
                     | turso_core::LimboError::BusySnapshot
                     | turso_core::LimboError::WriteWriteConflict
-                    | turso_core::LimboError::CommitDependencyAborted)
+                    | turso_core::LimboError::CommitDependencyAborted
+                    | turso_core::LimboError::OutOfMemory)
             ) && ctx.fiber.connection.get_auto_commit()
             {
                 let _ = ctx.fiber.connection.execute("ROLLBACK");
@@ -1116,12 +1166,23 @@ impl Whopper {
         let fiber = &mut self.context.fibers[fiber_idx];
         let connection = fiber.connection.clone();
         let yield_injector = fiber.yield_injector.clone();
+        let exec_id = fiber.execution_id.unwrap_or(0);
 
         let mut stmt_borrow = fiber.statement.borrow_mut();
         let Some(stmt) = stmt_borrow.as_mut() else {
             return Some(Ok(Vec::new()));
         };
-        let step_result = step_stmt_with_injected_yield(&connection, yield_injector, stmt);
+        let step_result = step_stmt_with_injections(
+            &connection,
+            yield_injector,
+            self.allocation_fault_injector,
+            AllocationFaultContext {
+                step: self.current_step as u64,
+                fiber_idx: fiber_idx as u64,
+                execution_id: exec_id,
+            },
+            stmt,
+        );
         match step_result {
             Ok(turso_core::StepResult::Row) => {
                 if let Some(row) = stmt.row() {
