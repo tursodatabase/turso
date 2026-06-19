@@ -53,6 +53,31 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test valid-time-preserves-fraction {
+    -- Sub-second input round-trips at millisecond resolution; the previous
+    -- ENCODE (`time(value)`) silently truncated to whole seconds.
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, t time) STRICT;
+    INSERT INTO t1 VALUES (1, '14:30:00.789');
+    SELECT id, t FROM t1;
+}
+expect {
+    1|14:30:00.789
+}
+
+@requires strict "uses STRICT tables"
+test valid-time-trims-trailing-zeros {
+    -- Matches PostgreSQL: '14:30:00.500' renders as '14:30:00.5'.
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, t time) STRICT;
+    INSERT INTO t1 VALUES (1, '14:30:00.500');
+    INSERT INTO t1 VALUES (2, '14:30:00.000');
+    SELECT id, t FROM t1 ORDER BY id;
+}
+expect {
+    1|14:30:00.5
+    2|14:30:00
+}
+
+@requires strict "uses STRICT tables"
 test invalid-time-rejected {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, t time) STRICT;
     INSERT INTO t1 VALUES (1, 'not-a-time');
@@ -69,6 +94,18 @@ test valid-timestamp-accepted {
 }
 expect {
     1|2024-01-15 14:30:00
+}
+
+@requires strict "uses STRICT tables"
+test valid-timestamp-preserves-fraction {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    INSERT INTO t1 VALUES (1, '2024-01-15 14:30:00.789');
+    INSERT INTO t1 VALUES (2, '2024-01-15 14:30:00.500');
+    SELECT id, ts FROM t1 ORDER BY id;
+}
+expect {
+    1|2024-01-15 14:30:00.789
+    2|2024-01-15 14:30:00.5
 }
 
 @requires strict "uses STRICT tables"

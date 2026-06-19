@@ -384,6 +384,7 @@ fn execute_sql_inner(conn: &Arc<Connection>, sql: &str) -> WorkerResponse {
                             | turso_core::LimboError::BusySnapshot
                             | turso_core::LimboError::WriteWriteConflict
                             | turso_core::LimboError::CommitDependencyAborted
+                            | turso_core::LimboError::OutOfMemory
                     ) {
                         rollback_autocommit = true;
                     }

@@ -16,11 +16,11 @@ use crossbeam_epoch::{self as epoch, Atomic, Collector, Guard, Shared};
 use crossbeam_utils::CachePadded;
 
 use super::comparator::{BasicComparator, Comparator};
-use crate::alloc::{ApiAllocator, TryReserveError, TursoAllocator};
+use crate::alloc::{ConcurrentAllocator, TryReserveError, TursoAllocator};
 
 /// An allocator that can back a [`SkipList`].
 ///
-/// Blanket-implemented for every cloneable, thread-safe [`ApiAllocator`].
+/// Blanket-implemented for every [`ConcurrentAllocator`].
 /// Cloning must be cheap and must not panic: deferred node destruction
 /// captures a clone of the allocator that is dropped once the node is
 /// reclaimed. The `'static` bound is required for the same reason the insert
@@ -28,9 +28,9 @@ use crate::alloc::{ApiAllocator, TryReserveError, TursoAllocator};
 /// skip list itself is gone, so the allocator must not borrow from anything
 /// (in particular, `&LocalAlloc` would dangle by the time the deferred
 /// closure deallocates the node).
-pub trait SkiplistAllocator: ApiAllocator + Clone + Send + Sync + 'static {}
+pub trait SkiplistAllocator: ConcurrentAllocator {}
 
-impl<A: ApiAllocator + Clone + Send + Sync + 'static> SkiplistAllocator for A {}
+impl<A: ConcurrentAllocator> SkiplistAllocator for A {}
 
 /// Number of bits needed to store height.
 const HEIGHT_BITS: usize = 5;

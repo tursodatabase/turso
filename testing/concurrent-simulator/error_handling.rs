@@ -28,6 +28,14 @@ pub enum ErrorAction {
     Fatal,
 }
 
+pub fn recoverable_error_action(in_tx: bool) -> ErrorAction {
+    if in_tx {
+        ErrorAction::Rollback
+    } else {
+        ErrorAction::ClearTxn
+    }
+}
+
 /// Classify a `LimboError` returned by a simulator op.
 ///
 /// `in_tx` should be true iff the fiber is mid an explicit
@@ -61,20 +69,9 @@ pub fn classify_op_error(err: &LimboError, in_tx: bool) -> ErrorAction {
         | LimboError::CommitDependencyAborted
         | LimboError::InvalidArgument(..)
         | LimboError::ParseError(..)
-        | LimboError::TxError(..) => {
-            if in_tx {
-                ErrorAction::Rollback
-            } else {
-                ErrorAction::ClearTxn
-            }
-        }
-        LimboError::DatabaseFull(_) if is_seq_exhaustion => {
-            if in_tx {
-                ErrorAction::Rollback
-            } else {
-                ErrorAction::ClearTxn
-            }
-        }
+        | LimboError::TxError(..)
+        | LimboError::OutOfMemory => recoverable_error_action(in_tx),
+        LimboError::DatabaseFull(_) if is_seq_exhaustion => recoverable_error_action(in_tx),
         LimboError::Corrupt(_) | LimboError::CheckpointFailed(_) => ErrorAction::Respawn,
         _ => ErrorAction::Fatal,
     }
@@ -108,6 +105,18 @@ mod tests {
         let err = LimboError::DatabaseFull("disk image is full".into());
         assert_eq!(classify_op_error(&err, true), ErrorAction::Fatal);
         assert_eq!(classify_op_error(&err, false), ErrorAction::Fatal);
+    }
+
+    #[test]
+    fn out_of_memory_is_recoverable() {
+        assert_eq!(
+            classify_op_error(&LimboError::OutOfMemory, true),
+            ErrorAction::Rollback
+        );
+        assert_eq!(
+            classify_op_error(&LimboError::OutOfMemory, false),
+            ErrorAction::ClearTxn
+        );
     }
 
     #[test]

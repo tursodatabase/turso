@@ -259,6 +259,7 @@ impl Property for IntegrityCheckProperty {
                         | LimboError::CommitDependencyAborted
                         | LimboError::SchemaUpdated
                         | LimboError::SchemaConflict
+                        | LimboError::OutOfMemory
                 ) {
                     return Ok(());
                 }
@@ -1163,7 +1164,8 @@ impl Property for SequenceCorrectnessProperty {
                 // ever lets the fiber state drift between generate and
                 // execute we want a clean ignore rather than a spurious
                 // failure.
-                if err_msg.contains("Database is busy")
+                if matches!(e, LimboError::OutOfMemory)
+                    || err_msg.contains("Database is busy")
                     || err_msg.contains("Database schema changed")
                     || err_msg.contains("Database snapshot is stale")
                     || err_msg.contains("Write-write conflict")
@@ -1234,6 +1236,9 @@ impl Property for SequenceCorrectnessProperty {
                     let _ = value;
                 }
                 Err(e) => {
+                    if matches!(e, LimboError::OutOfMemory) {
+                        return Ok(());
+                    }
                     let err_msg = e.to_string();
                     if err_msg.contains("does not exist") {
                         return Ok(());

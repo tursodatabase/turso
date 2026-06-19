@@ -250,6 +250,31 @@ pub(crate) fn compute_array_length(val: &Value) -> Option<i64> {
     }
 }
 
+/// Compute the element count at array dimension `dim` (1-based). For `dim == 1`,
+/// returns the same value as [`compute_array_length`]. For `dim > 1`, the array
+/// is assumed to be uniform — each outer element is itself an array — and the
+/// walker recurses into element zero `dim - 1` times.
+///
+/// Returns `None` for NULL or non-array input, for `dim < 1`, for an empty
+/// array when `dim > 1` (no element zero to peek into), and for `dim` deeper
+/// than the array's actual nesting. Matches PostgreSQL's
+/// `array_length(arr, dim)` contract — except Turso doesn't track per-
+/// dimension lower bounds, so `array_upper(arr, dim)` equals this function
+/// for all valid `dim`.
+pub(crate) fn compute_array_length_at_dim(val: &Value, dim: i64) -> Option<i64> {
+    if dim < 1 {
+        return None;
+    }
+    if dim == 1 {
+        return compute_array_length(val);
+    }
+    // dim > 1: peek into element zero and recurse. Uniform-shape arrays let
+    // us answer "length at depth N" by looking at any element at depth 1;
+    // element zero is the cheapest to extract.
+    let first = array_values_from_any(val)?.into_iter().next()?;
+    compute_array_length_at_dim(&first, dim - 1)
+}
+
 pub(crate) fn exec_array_append(arr: &Value, elem: &Value) -> Result<Value> {
     let Some(mut elements) = array_values_from_any(arr) else {
         return Ok(Value::Null);

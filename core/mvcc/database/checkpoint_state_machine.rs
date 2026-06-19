@@ -1,3 +1,4 @@
+use crate::alloc::{ConcurrentAllocator, TursoAllocator};
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
@@ -130,7 +131,7 @@ pub struct LockStates {
 /// 7. Fsync the DB file
 /// 8. Truncate logical log to 0 (salt regenerated in memory), fsync, then truncate WAL
 /// 9. Releases the blocking_checkpoint_lock
-pub struct CheckpointStateMachine<Clock: LogicalClock> {
+pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
     /// The current state of the state machine
     state: CheckpointState,
     /// The states of the locks held by the state machine - these are tracked for error handling so that they are
@@ -143,7 +144,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     /// Pager used for writing to the B-tree
     pager: Arc<Pager>,
     /// MVCC store containing the row versions.
-    mvstore: Arc<MvStore<Clock>>,
+    mvstore: Arc<MvStore<Clock, A>>,
     /// Connection to the database
     connection: Arc<Connection>,
     #[cfg(any(test, injected_yields))]
@@ -192,7 +193,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     collect_index_key_cursor: Option<Arc<SortableIndexKey>>,
     /// Async driver for `CheckpointState::CompactSequences`. Lazily set
     /// on first entry to that state; cleared when the driver completes.
-    seq_compact: Option<SeqCompactDriver<Clock>>,
+    seq_compact: Option<SeqCompactDriver<Clock, A>>,
 }
 
 /// One pending compaction job in the per-checkpoint sequence sweep.
@@ -248,14 +249,14 @@ enum SeqCompactPhase {
 /// from inside the checkpoint state machine can propagate a yield
 /// upward without ever blocking the executor.
 ///
-/// Generic over `Clock` so it can hold an `Arc<MvStore<Clock>>` — the
+/// Generic over `Clock` so it can hold an `Arc<MvStore<Clock, A>>` — the
 /// driver paired-deletes from the B-tree (via the cursor) AND from the
 /// MVCC version chain (via `purge_row_versions_during_checkpoint`) so
 /// the two layers stay consistent. Skipping the version-chain purge
 /// would leave entries with `btree_resident: true` pointing at B-tree
 /// rows that no longer exist, surviving until `drop_unused_row_versions`
 /// Rule 3 catches up.
-struct SeqCompactDriver<Clock: LogicalClock> {
+struct SeqCompactDriver<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
     /// Remaining backing tables to compact, in arbitrary order.
     pending: Vec<SeqCompaction>,
     /// Index of the in-flight compaction within `pending`.
@@ -280,11 +281,13 @@ struct SeqCompactDriver<Clock: LogicalClock> {
     pager: Arc<Pager>,
     /// MVCC store used to purge version-chain entries paired with each
     /// B-tree delete. See the struct-level comment for the invariant.
-    mvstore: Arc<MvStore<Clock>>,
+    mvstore: Arc<MvStore<Clock, A>>,
 }
 
 #[cfg(any(test, injected_yields))]
-impl<Clock: LogicalClock> ProvidesYieldContext for CheckpointStateMachine<Clock> {
+impl<Clock: LogicalClock, A: ConcurrentAllocator> ProvidesYieldContext
+    for CheckpointStateMachine<Clock, A>
+{
     fn yield_context(&self) -> YieldContext {
         YieldContext::new(
             self.connection.yield_injector(),
@@ -400,7 +403,7 @@ fn is_schema_metadata_only_rewrite(current: &RowVersion, next: Option<&RowVersio
     }
 }
 
-impl<Clock: LogicalClock> SeqCompactDriver<Clock> {
+impl<Clock: LogicalClock, A: ConcurrentAllocator> SeqCompactDriver<Clock, A> {
     /// Drive one step of the compaction sweep. Returns `IOResult::IO` on
     /// any cursor page IO so the caller can yield up; returns
     /// `IOResult::Done(())` when every pending backing table has been
@@ -537,7 +540,7 @@ impl<Clock: LogicalClock> SeqCompactDriver<Clock> {
     }
 }
 
-impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
+impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, A> {
     /// Build the per-checkpoint list of non-CYCLE sequence backing tables
     /// to compact. CYCLE seqs are skipped — they keep themselves at one
     /// row via inline compaction in the nextval bytecode and using
@@ -597,7 +600,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
     pub fn new(
         pager: Arc<Pager>,
-        mvstore: Arc<MvStore<Clock>>,
+        mvstore: Arc<MvStore<Clock, A>>,
         connection: Arc<Connection>,
         update_transaction_state: bool,
         sync_mode: SyncMode,
@@ -2266,7 +2269,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     }
 }
 
-impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
+impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
+    for CheckpointStateMachine<Clock, A>
+{
     type Context = ();
     type SMResult = CheckpointResult;
 

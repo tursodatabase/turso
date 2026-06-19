@@ -249,7 +249,7 @@ jobs:
     # Image ships node 20 + chromium + firefox + system deps. Bump the tag
     # whenever the `playwright` dep in bindings/javascript/yarn.lock changes.
     container:
-      image: mcr.microsoft.com/playwright:v1.60.0-jammy
+      image: mcr.microsoft.com/playwright:v1.61.0-jammy
     # GitHub mounts /github/home (uid 1001) as $HOME, but the image runs as
     # root — Firefox refuses to launch unless HOME is root-owned.
     env:
@@ -394,7 +394,7 @@ jobs:
     # Image ships node 20 + chromium + firefox + system deps. Bump the tag
     # whenever the `playwright` dep in bindings/javascript/yarn.lock changes.
     container:
-      image: mcr.microsoft.com/playwright:v1.60.0-jammy
+      image: mcr.microsoft.com/playwright:v1.61.0-jammy
     # GitHub mounts /github/home (uid 1001) as $HOME, but the image runs as
     # root — Firefox refuses to launch unless HOME is root-owned.
     env:

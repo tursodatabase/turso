@@ -104,11 +104,20 @@ pub struct Builder {
     remote_encryption_key: Option<String>,
     // Encryption cipher for the Turso Cloud database
     remote_encryption_cipher: Option<RemoteEncryptionCipher>,
-    // Whether to enable the experimental `index_method` engine feature
-    // (e.g. `CREATE INDEX … USING fts (...)`). Mirrors the local Builder's
-    // `experimental_index_method` flag so synced databases can use the
-    // same SQL surface as their local-only counterparts.
-    experimental_index_method: bool,
+    // Experimental engine features to enable on the local synced database.
+    // These mirror the local [`crate::Builder`] flags so synced databases
+    // expose the same SQL surface as their local-only counterparts. Local
+    // at-rest `encryption` is intentionally omitted because the sync engine
+    // does not support local encryption (cloud encryption is configured
+    // separately via `with_remote_encryption`).
+    enable_attach: bool,
+    enable_custom_types: bool,
+    enable_index_method: bool,
+    enable_materialized_views: bool,
+    enable_vacuum: bool,
+    enable_generated_columns: bool,
+    enable_multiprocess_wal: bool,
+    enable_without_rowid: bool,
 }
 
 impl Builder {
@@ -124,8 +133,29 @@ impl Builder {
             partial_sync_config_experimental: None,
             remote_encryption_key: None,
             remote_encryption_cipher: None,
-            experimental_index_method: false,
+            enable_attach: false,
+            enable_custom_types: false,
+            enable_index_method: false,
+            enable_materialized_views: false,
+            enable_vacuum: false,
+            enable_generated_columns: false,
+            enable_multiprocess_wal: false,
+            enable_without_rowid: false,
         }
+    }
+
+    /// Enable the experimental `attach` engine feature for the synced database.
+    /// Mirrors the local [`crate::Builder::experimental_attach`] method.
+    pub fn experimental_attach(mut self, enable: bool) -> Self {
+        self.enable_attach = enable;
+        self
+    }
+
+    /// Enable the experimental `custom_types` engine feature for the synced
+    /// database. Mirrors the local [`crate::Builder::experimental_custom_types`].
+    pub fn experimental_custom_types(mut self, enable: bool) -> Self {
+        self.enable_custom_types = enable;
+        self
     }
 
     /// Enable the experimental `index_method` engine feature for the synced
@@ -134,7 +164,46 @@ impl Builder {
     /// engine. Mirrors the local [`crate::Builder::experimental_index_method`]
     /// method so callers can use the same SQL surface in synced mode.
     pub fn experimental_index_method(mut self, enable: bool) -> Self {
-        self.experimental_index_method = enable;
+        self.enable_index_method = enable;
+        self
+    }
+
+    /// Enable the experimental materialized `views` engine feature for the
+    /// synced database. Mirrors the local
+    /// [`crate::Builder::experimental_materialized_views`].
+    pub fn experimental_materialized_views(mut self, enable: bool) -> Self {
+        self.enable_materialized_views = enable;
+        self
+    }
+
+    /// Enable the experimental `vacuum` engine feature for the synced database.
+    /// Mirrors the local [`crate::Builder::experimental_vacuum`].
+    pub fn experimental_vacuum(mut self, enable: bool) -> Self {
+        self.enable_vacuum = enable;
+        self
+    }
+
+    /// Enable the experimental `generated_columns` engine feature for the
+    /// synced database. Mirrors the local
+    /// [`crate::Builder::experimental_generated_columns`].
+    pub fn experimental_generated_columns(mut self, enable: bool) -> Self {
+        self.enable_generated_columns = enable;
+        self
+    }
+
+    /// Enable the experimental `multiprocess_wal` engine feature for the synced
+    /// database. Mirrors the local
+    /// [`crate::Builder::experimental_multiprocess_wal`].
+    pub fn experimental_multiprocess_wal(mut self, enable: bool) -> Self {
+        self.enable_multiprocess_wal = enable;
+        self
+    }
+
+    /// Enable the experimental `without_rowid` engine feature for the synced
+    /// database. Mirrors the local
+    /// [`crate::Builder::experimental_without_rowid`].
+    pub fn experimental_without_rowid(mut self, enable: bool) -> Self {
+        self.enable_without_rowid = enable;
         self
     }
 
@@ -217,22 +286,49 @@ impl Builder {
         self
     }
 
+    /// Compose the `experimental_features` comma-separated string consumed by
+    /// [`turso_sdk_kit::rsapi::TursoDatabaseConfig`] (and ultimately
+    /// `turso_core::DatabaseOpts::with_experimental_feature`) from the boolean
+    /// flags on this Builder. Returns `None` when no feature is enabled. The
+    /// feature tokens must match the names parsed by the core.
+    fn experimental_features_string(&self) -> Option<String> {
+        let mut features: Vec<&str> = Vec::new();
+        if self.enable_attach {
+            features.push("attach");
+        }
+        if self.enable_custom_types {
+            features.push("custom_types");
+        }
+        if self.enable_index_method {
+            features.push("index_method");
+        }
+        if self.enable_materialized_views {
+            features.push("views");
+        }
+        if self.enable_vacuum {
+            features.push("vacuum");
+        }
+        if self.enable_generated_columns {
+            features.push("generated_columns");
+        }
+        if self.enable_multiprocess_wal {
+            features.push("multiprocess_wal");
+        }
+        if self.enable_without_rowid {
+            features.push("without_rowid");
+        }
+        if features.is_empty() {
+            None
+        } else {
+            Some(features.join(","))
+        }
+    }
+
     // Build the synced database object, initialize and open it.
     pub async fn build(self) -> Result<Database> {
-        // Compose the experimental_features comma-separated string from the
-        // boolean flags exposed on this Builder. Today only `index_method`
-        // is wired; future synced-compatible flags can be added here.
-        let experimental_features = {
-            let mut features: Vec<&str> = Vec::new();
-            if self.experimental_index_method {
-                features.push("index_method");
-            }
-            if features.is_empty() {
-                None
-            } else {
-                Some(features.join(","))
-            }
-        };
+        // Compose the experimental_features string from the boolean flags
+        // exposed on this Builder.
+        let experimental_features = self.experimental_features_string();
 
         // Build core database config for the embedded engine.
         let db_config = turso_sdk_kit::rsapi::TursoDatabaseConfig {
@@ -819,6 +915,43 @@ mod tests {
             .take(8)
             .map(char::from)
             .collect()
+    }
+
+    #[test]
+    fn experimental_features_string_composition() {
+        use crate::sync::Builder;
+
+        // No features enabled -> no experimental_features string at all.
+        assert_eq!(
+            Builder::new_remote(":memory:").experimental_features_string(),
+            None
+        );
+
+        // A single feature.
+        assert_eq!(
+            Builder::new_remote(":memory:")
+                .experimental_index_method(true)
+                .experimental_features_string()
+                .as_deref(),
+            Some("index_method")
+        );
+
+        // Multiple features are emitted in a stable, comma-separated order
+        // using the exact tokens the core parser understands.
+        assert_eq!(
+            Builder::new_remote(":memory:")
+                .experimental_attach(true)
+                .experimental_custom_types(true)
+                .experimental_index_method(true)
+                .experimental_materialized_views(true)
+                .experimental_vacuum(true)
+                .experimental_generated_columns(true)
+                .experimental_multiprocess_wal(true)
+                .experimental_without_rowid(true)
+                .experimental_features_string()
+                .as_deref(),
+            Some("attach,custom_types,index_method,views,vacuum,generated_columns,multiprocess_wal,without_rowid")
+        );
     }
 
     async fn handle_response(resp: reqwest::Response) -> Result<()> {

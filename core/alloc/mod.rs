@@ -6,14 +6,19 @@
 
 use std::fmt;
 
+mod allocation_site;
 mod api;
 mod backend;
 mod collections;
 
+pub use allocation_site::{
+    current_allocation_site, enter_allocation_site, AllocationSite, AllocationSiteGuard,
+    MvStoreAllocationSite,
+};
 /// The underlying allocator trait: `allocator_api2::alloc::Allocator` on
 /// stable, `std::alloc::Allocator` on `--cfg nightly` builds.
 pub use api::ApiAllocator;
-pub use api::{AllocError, Layout};
+pub use api::{AllocError, Global, Layout};
 pub use backend::{set_allocator, SetAllocatorError, TursoAllocBackend};
 pub use collections::{
     TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt, TursoFromIterator, TursoHashMapExt,
@@ -44,6 +49,14 @@ impl From<std::collections::TryReserveError> for TryReserveError {
         Self
     }
 }
+
+/// Allocator safe to clone into concurrent data structures and deferred drops.
+///
+/// Cloning must be cheap and must not panic. The `'static` bound allows
+/// deferred reclamation to outlive the container that captured the allocator.
+pub trait ConcurrentAllocator: ApiAllocator + Clone + Send + Sync + 'static {}
+
+impl<A: ApiAllocator + Clone + Send + Sync + 'static> ConcurrentAllocator for A {}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TursoAllocator;

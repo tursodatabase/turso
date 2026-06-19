@@ -53,8 +53,11 @@ pub trait DurableStorage: Send + Sync + Debug {
 
     /// Called after a logical-log write completed successfully, before the
     /// transaction is made visible by advancing the logical-log offset.
-    fn on_log_write_complete(&self) -> Result<()> {
-        Ok(())
+    ///
+    /// Implementations may return a completion for any additional durability
+    /// work that must finish before commit publication.
+    fn on_log_write_complete(&self) -> Result<Completion> {
+        Ok(Completion::new_yield())
     }
 
     /// Persist the current logical-log header to durable storage.

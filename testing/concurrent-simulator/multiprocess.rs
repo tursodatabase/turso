@@ -605,7 +605,8 @@ impl MultiprocessWhopper {
                         | LimboError::SchemaConflict
                         | LimboError::Busy
                         | LimboError::BusySnapshot
-                        | LimboError::TableLocked,
+                        | LimboError::TableLocked
+                        | LimboError::OutOfMemory,
                     ) => continue,
                     _ => return Ok(op_result),
                 }
