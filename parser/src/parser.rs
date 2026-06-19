@@ -287,7 +287,7 @@ impl<'a> Parser<'a> {
                             parsed_offset: (offset, 1).into(),
                             expected: &[TK_SEMI],
                             got: tt,
-                            token_text: token_text.clone(),
+                            token_text,
                             offset,
                             expected_display: crate::token::TokenType::format_expected_tokens(&[
                                 TK_SEMI,
@@ -1827,7 +1827,7 @@ impl<'a> Parser<'a> {
                                 parsed_offset: (self.offset() - name.len(), name.len()).into(),
                                 got: TK_STRING,
                                 expected: &[TK_ID, TK_INDEXED, TK_JOIN_KW],
-                                token_text: token_text.clone(),
+                                token_text,
                                 offset,
                                 expected_display: crate::token::TokenType::format_expected_tokens(
                                     &[TK_ID, TK_INDEXED, TK_JOIN_KW],
@@ -5222,6 +5222,7 @@ mod tests {
         }
     }
 
+    #[expect(clippy::large_stack_frames)]
     #[test]
     fn test_parser() {
         let test_cases = vec![

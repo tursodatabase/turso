@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "The Turso parser library"
 
+[lints]
+workspace = true
+
 [lib]
 name = "turso_parser"
 

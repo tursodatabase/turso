@@ -154,7 +154,6 @@ either = { version = "1.15" }
 loom = { version = "0.7" }
 shuttle = { version = "0.8.1" }
 
-
 [profile.dev.package.similar]
 opt-level = 3
 

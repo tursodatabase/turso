@@ -74,6 +74,7 @@ fn setup_rusqlite(temp_dir: &TempDir, query: &str) -> rusqlite::Connection {
     sqlite_conn
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_open(criterion: &mut Criterion) {
     // https://github.com/tursodatabase/turso/issues/174
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
@@ -116,6 +117,7 @@ fn bench_open(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_alter(criterion: &mut Criterion) {
     // https://github.com/tursodatabase/turso/issues/174
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
@@ -316,6 +318,7 @@ fn bench_alter(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_prepare_query(criterion: &mut Criterion) {
     // https://github.com/tursodatabase/turso/issues/174
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
@@ -398,6 +401,7 @@ fn bench_prepare_query(criterion: &mut Criterion) {
     }
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_execute_select_rows(criterion: &mut Criterion) {
     // https://github.com/tursodatabase/turso/issues/174
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
@@ -466,6 +470,7 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_execute_select_1(criterion: &mut Criterion) {
     // https://github.com/tursodatabase/turso/issues/174
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
@@ -518,6 +523,7 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_execute_select_count(criterion: &mut Criterion) {
     // https://github.com/tursodatabase/turso/issues/174
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
@@ -570,6 +576,7 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_insert_rows(criterion: &mut Criterion) {
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
@@ -987,6 +994,7 @@ fn generate_batch_insert(start: i64, num: usize) -> String {
     inserts
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_concurrent_writes(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("Concurrent writes");
 
@@ -1042,6 +1050,7 @@ fn bench_concurrent_writes(criterion: &mut Criterion) {
     });
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_insert_randomblob(criterion: &mut Criterion) {
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
