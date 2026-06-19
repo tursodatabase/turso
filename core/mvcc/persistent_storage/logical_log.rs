@@ -3483,10 +3483,13 @@ impl StreamingLogicalLogReader {
                 // the same shape metadata as non-recovered rows.
                 let column_count =
                     crate::types::ImmutableRecordRef::from_bin_record(&record_bytes).column_count();
-                let row = Row::new_table_row(
-                    RowID::new(table_id, rowid.row_id.clone()),
-                    record_bytes,
-                    column_count,
+                let row = crate::with_mv_store_allocation_site!(
+                    RowPayload,
+                    Row::new_table_row(
+                        RowID::new(table_id, rowid.row_id.clone()),
+                        &record_bytes,
+                        column_count,
+                    )?
                 );
                 Ok(StreamingResult::UpsertTableRow {
                     row,
@@ -4417,9 +4420,10 @@ mod tests {
                     tx_id,
                     Row::new_table_row(
                         RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob().to_vec(),
+                        data.as_blob(),
                         5,
-                    ),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             // now insert a row into table -2
@@ -4489,9 +4493,10 @@ mod tests {
                     tx_id,
                     Row::new_table_row(
                         RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob().to_vec(),
+                        data.as_blob(),
                         5,
-                    ),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -4603,9 +4608,10 @@ mod tests {
                     tx_id,
                     Row::new_table_row(
                         RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob().to_vec(),
+                        data.as_blob(),
                         5,
-                    ),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -5665,9 +5671,10 @@ mod tests {
                         )),
                         row: Row::new_table_row(
                             RowID::new((-2).into(), RowKey::Int(rowid)),
-                            Vec::new(),
+                            &[],
                             0,
-                        ),
+                        )
+                        .unwrap(),
                         btree_resident,
                     });
                     expected.push(ExpectedTableOp::Delete {
@@ -6277,7 +6284,8 @@ mod tests {
         commit_ts: u64,
         is_delete: bool,
     ) -> crate::mvcc::database::RowVersion {
-        let row = Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), record_bytes, 1);
+        let row =
+            Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), &record_bytes, 1).unwrap();
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
             begin: crate::mvcc::database::PackedTs::pack(if is_delete {

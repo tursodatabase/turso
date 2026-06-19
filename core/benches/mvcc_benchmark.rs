@@ -113,11 +113,8 @@ fn bench(c: &mut Criterion) {
             db.mvcc_store
                 .update(
                     tx_id,
-                    Row::new_table_row(
-                        RowID::new((-2).into(), RowKey::Int(1)),
-                        record_data.clone(),
-                        1,
-                    ),
+                    Row::new_table_row(RowID::new((-2).into(), RowKey::Int(1)), record_data, 1)
+                        .unwrap(),
                 )
                 .unwrap();
             let mv_store = &db.mvcc_store;
@@ -140,11 +137,7 @@ fn bench(c: &mut Criterion) {
     db.mvcc_store
         .insert(
             tx_id,
-            Row::new_table_row(
-                RowID::new((-2).into(), RowKey::Int(1)),
-                record_data.clone(),
-                1,
-            ),
+            Row::new_table_row(RowID::new((-2).into(), RowKey::Int(1)), record_data, 1).unwrap(),
         )
         .unwrap();
     group.bench_function("read", |b| {
@@ -166,11 +159,7 @@ fn bench(c: &mut Criterion) {
     db.mvcc_store
         .insert(
             tx_id,
-            Row::new_table_row(
-                RowID::new((-2).into(), RowKey::Int(1)),
-                record_data.clone(),
-                1,
-            ),
+            Row::new_table_row(RowID::new((-2).into(), RowKey::Int(1)), record_data, 1).unwrap(),
         )
         .unwrap();
     group.bench_function("update", |b| {
@@ -178,11 +167,8 @@ fn bench(c: &mut Criterion) {
             db.mvcc_store
                 .update(
                     tx_id,
-                    Row::new_table_row(
-                        RowID::new((-2).into(), RowKey::Int(1)),
-                        record_data.clone(),
-                        1,
-                    ),
+                    Row::new_table_row(RowID::new((-2).into(), RowKey::Int(1)), record_data, 1)
+                        .unwrap(),
                 )
                 .unwrap();
         })
