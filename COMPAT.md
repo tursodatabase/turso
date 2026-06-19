@@ -154,7 +154,7 @@ ongoing work to pass the full SQLite TCL test suite.
 | PRAGMA compile_options           | ❌ No         |                                              |
 | PRAGMA count_changes             | Not Needed | deprecated in SQLite                         |
 | PRAGMA data_store_directory      | Not Needed | deprecated in SQLite                         |
-| PRAGMA data_version              | ❌ No         |                                              |
+| PRAGMA data_version              | ✅ Yes        |                                              |
 | PRAGMA database_list             | ✅ Yes        |                                              |
 | PRAGMA default_cache_size        | Not Needed | deprecated in SQLite                         |
 | PRAGMA defer_foreign_keys        | ❌ No         |                                              |
@@ -182,14 +182,14 @@ ongoing work to pass the full SQLite TCL test suite.
 | PRAGMA max_page_count            | ✅ Yes        |                                              |
 | PRAGMA mmap_size                 | ❌ No         |                                              |
 | PRAGMA module_list               | 🚧 Partial    | Works, but only `completion` and `generate_series` are registered modules |
-| PRAGMA optimize                  | ❌ No         |                                              |
+| PRAGMA optimize                  | ✅ Yes        | No-op compatibility pragma                  |
 | PRAGMA page_count                | ✅ Yes        |                                              |
 | PRAGMA page_size                 | ✅ Yes        |                                              |
 | PRAGMA parser_trace              | ❌ No         |                                              |
 | PRAGMA pragma_list               | ✅ Yes        |                                              |
 | PRAGMA query_only                | ✅ Yes        |                                              |
 | PRAGMA quick_check               | ✅ Yes        |                                              |
-| PRAGMA read_uncommitted          | ❌ No         |                                              |
+| PRAGMA read_uncommitted          | ✅ Yes        | Connection-local setting                    |
 | PRAGMA recursive_triggers        | ❌ No         |                                              |
 | PRAGMA reverse_unordered_selects | ❌ No         |                                              |
 | PRAGMA schema_version            | ✅ Yes        | For writes, emulate defensive mode (always noop)|
