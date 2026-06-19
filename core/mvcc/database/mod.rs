@@ -2272,7 +2272,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         {
             let _ = mvcc_store;
             let _ = log_record;
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(feature = "conn_raw_api")]

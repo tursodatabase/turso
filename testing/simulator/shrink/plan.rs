@@ -28,6 +28,9 @@ impl InteractionPlan {
         let mut plan = self.clone();
 
         let all_interactions = self.interactions_list();
+        if failing_execution.interaction_index >= all_interactions.len() {
+            return plan;
+        }
         let failing_interaction = &all_interactions[failing_execution.interaction_index];
 
         let range = self.find_interactions_range(failing_interaction.id());
@@ -336,5 +339,19 @@ impl InteractionPlan {
             idx += 1;
             retain
         });
+    }
+}
+
+#[cfg(test)]
+mod general_tests {
+    use super::*;
+
+    #[test]
+    fn shrink_empty_plan_returns_empty_plan() {
+        let plan = InteractionPlan::new(false);
+
+        let shrunk = plan.shrink_interaction_plan(&Execution::new(0, 0));
+
+        assert_eq!(shrunk.len(), 0);
     }
 }

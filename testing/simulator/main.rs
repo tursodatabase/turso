@@ -37,21 +37,47 @@ fn main() -> anyhow::Result<()> {
     init_logger()?;
     let mut cli_opts = SimulatorCLI::parse();
     cli_opts.validate()?;
+    load_bugbase_cli_options(&mut cli_opts)?;
 
     let profile = Profile::parse_from_type(cli_opts.profile.clone())?;
     tracing::debug!(sim_profile = ?profile);
 
-    if let Some(command) = cli_opts.subcommand.take() {
+    run_cli_command(&mut cli_opts, &profile)
+}
+
+fn load_bugbase_cli_options(cli_opts: &mut SimulatorCLI) -> anyhow::Result<()> {
+    let Some(seed) = cli_opts.load else {
+        return Ok(());
+    };
+    if cli_opts.disable_bugbase {
+        anyhow::bail!("cannot use --load with --disable-bugbase");
+    }
+
+    let mut bugbase = BugBase::load()?;
+    let bug = bugbase
+        .get_or_load_bug(seed)?
+        .ok_or_else(|| anyhow!("bug '{seed}' not found in bug base"))?;
+    let mut loaded_cli_opts = bug.last_cli_opts();
+    loaded_cli_opts.load = None;
+    loaded_cli_opts.seed = Some(seed);
+    loaded_cli_opts.validate()?;
+    *cli_opts = loaded_cli_opts;
+    Ok(())
+}
+
+fn run_cli_command(cli_opts: &mut SimulatorCLI, profile: &Profile) -> anyhow::Result<()> {
+    if let Some(command) = cli_opts.subcommand.clone() {
         match command {
             SimulatorCommand::List => {
                 let mut bugbase = BugBase::load()?;
                 bugbase.list_bugs()
             }
             SimulatorCommand::Loop { n, short_circuit } => {
+                cli_opts.subcommand = None;
                 banner();
                 for i in 0..n {
                     println!("iteration {i}");
-                    let result = testing_main(&mut cli_opts, &profile);
+                    let result = testing_main(cli_opts, profile);
                     if result.is_err() && short_circuit {
                         println!("short circuiting after {i} iterations");
                         return result;
@@ -98,7 +124,10 @@ fn main() -> anyhow::Result<()> {
 
                 let results = bugs
                     .into_iter()
-                    .map(|mut cli_opts| testing_main(&mut cli_opts, &profile))
+                    .map(|mut cli_opts| {
+                        let profile = Profile::parse_from_type(cli_opts.profile.clone())?;
+                        run_cli_command(&mut cli_opts, &profile)
+                    })
                     .collect::<Vec<_>>();
 
                 let (successes, failures): (Vec<_>, Vec<_>) =
@@ -116,7 +145,7 @@ fn main() -> anyhow::Result<()> {
         }
     } else {
         banner();
-        testing_main(&mut cli_opts, &profile)
+        testing_main(cli_opts, profile)
     }
 }
 
@@ -240,6 +269,21 @@ fn run_simulator(
 
             if cli_opts.disable_heuristic_shrinking && !cli_opts.enable_brute_force_shrinking {
                 tracing::info!("shrinking is disabled, skipping shrinking");
+                if let Some(bugbase) = bugbase.as_deref_mut() {
+                    bugbase
+                        .add_bug(env.opts.seed, plan.clone(), Some(error.clone()), cli_opts)
+                        .unwrap();
+                }
+                return Err(anyhow!("failed with error: '{}'", error));
+            }
+
+            let interaction_count = plan.interactions_list().len();
+            if last_execution.interaction_index >= interaction_count {
+                tracing::info!(
+                    failing_interaction_index = last_execution.interaction_index,
+                    interaction_count,
+                    "skipping shrinking because the failure happened before a replayable interaction"
+                );
                 if let Some(bugbase) = bugbase.as_deref_mut() {
                     bugbase
                         .add_bug(env.opts.seed, plan.clone(), Some(error.clone()), cli_opts)
