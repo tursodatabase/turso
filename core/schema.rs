@@ -2317,7 +2317,11 @@ impl Schema {
                     Trigger::new(
                         trigger_name,
                         sql.to_string(),
-                        tbl_name.name.to_string(),
+                        // Store the bare (unquoted) table name. `Name::to_string()`
+                        // renders the quoted form (`"t1"`), which then fails every
+                        // schema lookup since `normalize_ident` does not strip quotes.
+                        // This must match the bucket key used in `add_trigger` below.
+                        tbl_name.name.as_str().to_string(),
                         time,
                         event,
                         for_each_row,
