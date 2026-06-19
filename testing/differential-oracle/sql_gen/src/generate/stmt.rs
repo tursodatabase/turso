@@ -340,6 +340,7 @@ fn generate_insert_values<C: Capabilities>(
     let insert_expr_gen = if expr_prob > 0.0 {
         let mut policy = generator.policy().clone();
         policy.expr_weights.column_ref = 0;
+        policy.expr_weights.fts_match = 0;
         policy.max_expr_depth = expr_max_depth;
         Some(SqlGen::<C>::new(generator.schema().clone(), policy))
     } else {
@@ -1804,8 +1805,8 @@ fn generate_expression_index<C: Capabilities>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::Policy;
-    use crate::schema::{ColumnDef, SchemaBuilder, Table};
+    use crate::policy::{ExprWeights, Policy};
+    use crate::schema::{ColumnDef, FtsIndexSpec, Index, SchemaBuilder, Table};
     use crate::{DmlOnly, Full, SelectOnly};
 
     fn test_generator() -> SqlGen<Full> {
@@ -1842,6 +1843,39 @@ mod tests {
 
         let sql = stmt.unwrap().to_string();
         assert!(sql.starts_with("INSERT INTO"));
+    }
+
+    #[test]
+    fn test_generate_insert_values_excludes_fts_predicates() {
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "docs",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("body", DataType::Text),
+                ],
+            ))
+            .index(
+                Index::new("docs_fts", "docs", vec!["body".to_string()]).fts(FtsIndexSpec::new()),
+            )
+            .build();
+        let mut policy = Policy::fts();
+        policy.insert_config.cte_probability = 0.0;
+        policy.insert_config.expression_value_probability = 1.0;
+        policy.insert_config.min_rows = 1;
+        policy.insert_config.max_rows = 1;
+        policy.expr_weights = ExprWeights {
+            fts_match: 100,
+            ..ExprWeights::all_zero()
+        };
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut ctx = Context::new_with_seed(7);
+
+        let stmt = generate_insert(&generator, &mut ctx).unwrap();
+        let sql = stmt.to_string();
+
+        assert!(!sql.contains("fts_match("), "{sql}");
+        assert!(!sql.contains(" MATCH "), "{sql}");
     }
 
     #[test]

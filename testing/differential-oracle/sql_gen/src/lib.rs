@@ -44,6 +44,7 @@ pub mod policy;
 pub mod schema;
 pub mod strategy;
 pub mod trace;
+pub mod visit;
 
 // Re-export main types
 pub use ast::{

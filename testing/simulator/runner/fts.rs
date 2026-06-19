@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use anyhow::bail;
 use rand::RngCore;
 use sql_gen as sg;
+use sql_gen::visit::{AstVisitor as SqlgenAstVisitor, ExprContext as SqlgenExprContext};
 
 use crate::{
     model::{
@@ -290,7 +291,7 @@ struct FtsPendingSql {
 
 fn sqlgen_stmt_tables(schema: &sg::Schema, stmt: &sg::Stmt) -> Vec<String> {
     let mut collector = SqlgenTableCollector::default();
-    walk_sqlgen_stmt(stmt, &mut collector);
+    sg::visit::walk_stmt(stmt, &mut collector);
     let mut tables = collector.tables;
 
     match stmt {
@@ -316,25 +317,6 @@ fn sqlgen_stmt_tables(schema: &sg::Schema, stmt: &sg::Stmt) -> Vec<String> {
     tables
 }
 
-#[derive(Clone, Copy)]
-struct SqlgenExprContext {
-    in_order_by: bool,
-}
-
-impl SqlgenExprContext {
-    const DEFAULT: Self = Self { in_order_by: false };
-    const ORDER_BY: Self = Self { in_order_by: true };
-}
-
-trait SqlgenAstVisitor {
-    fn table(&mut self, _table: &str) {}
-    fn with_clause(&mut self, _with: &sg::ast::WithClause) {}
-    fn select(&mut self, _select: &sg::ast::SelectStmt) {}
-    fn compound_arm(&mut self, _arm: &sg::ast::CompoundSelectArm) {}
-    fn join(&mut self, _join: &sg::ast::JoinClause) {}
-    fn expr(&mut self, _expr: &sg::Expr, _context: SqlgenExprContext) {}
-}
-
 #[derive(Default)]
 struct SqlgenTableCollector {
     tables: Vec<String>,
@@ -343,251 +325,6 @@ struct SqlgenTableCollector {
 impl SqlgenAstVisitor for SqlgenTableCollector {
     fn table(&mut self, table: &str) {
         push_sqlgen_table(&mut self.tables, table);
-    }
-}
-
-fn walk_sqlgen_stmt(stmt: &sg::Stmt, visitor: &mut impl SqlgenAstVisitor) {
-    match stmt {
-        sg::Stmt::Select(select) => walk_sqlgen_select(select, visitor),
-        sg::Stmt::Insert(insert) => walk_sqlgen_insert(insert, visitor),
-        sg::Stmt::Update(update) => walk_sqlgen_update(update, visitor),
-        sg::Stmt::Delete(delete) => walk_sqlgen_delete(delete, visitor),
-        sg::Stmt::CreateTable(create_table) => {
-            visitor.table(&create_table.table);
-            for column in &create_table.columns {
-                if let Some(default) = &column.default {
-                    walk_sqlgen_expr(default, SqlgenExprContext::DEFAULT, visitor);
-                }
-                if let Some(check) = &column.check {
-                    walk_sqlgen_expr(check, SqlgenExprContext::DEFAULT, visitor);
-                }
-            }
-        }
-        sg::Stmt::DropTable(drop_table) => visitor.table(&drop_table.table),
-        sg::Stmt::AlterTable(alter_table) => {
-            visitor.table(&alter_table.table);
-            if let sg::ast::AlterTableAction::AddColumn(column) = &alter_table.action {
-                if let Some(default) = &column.default {
-                    walk_sqlgen_expr(default, SqlgenExprContext::DEFAULT, visitor);
-                }
-                if let Some(check) = &column.check {
-                    walk_sqlgen_expr(check, SqlgenExprContext::DEFAULT, visitor);
-                }
-            }
-        }
-        sg::Stmt::CreateIndex(create_index) => visitor.table(&create_index.table),
-        sg::Stmt::PragmaForeignKeyList(pragma) => visitor.table(&pragma.table),
-        sg::Stmt::CreateTrigger(create_trigger) => {
-            visitor.table(&create_trigger.table);
-            if let Some(when_clause) = &create_trigger.when_clause {
-                walk_sqlgen_expr(when_clause, SqlgenExprContext::DEFAULT, visitor);
-            }
-            for stmt in &create_trigger.body {
-                walk_sqlgen_trigger_stmt(stmt, visitor);
-            }
-        }
-        sg::Stmt::DropIndex(_)
-        | sg::Stmt::OptimizeIndex(_)
-        | sg::Stmt::DropTrigger(_)
-        | sg::Stmt::Begin
-        | sg::Stmt::Commit
-        | sg::Stmt::Rollback
-        | sg::Stmt::CreateView
-        | sg::Stmt::DropView
-        | sg::Stmt::Vacuum
-        | sg::Stmt::Reindex
-        | sg::Stmt::Analyze
-        | sg::Stmt::Savepoint(_)
-        | sg::Stmt::Release(_) => {}
-    }
-}
-
-fn walk_sqlgen_trigger_stmt(stmt: &sg::ast::TriggerStmt, visitor: &mut impl SqlgenAstVisitor) {
-    match stmt {
-        sg::ast::TriggerStmt::Insert(insert) => walk_sqlgen_insert(insert, visitor),
-        sg::ast::TriggerStmt::Update(update) => walk_sqlgen_update(update, visitor),
-        sg::ast::TriggerStmt::Delete(delete) => walk_sqlgen_delete(delete, visitor),
-        sg::ast::TriggerStmt::Select(select) => walk_sqlgen_select(select, visitor),
-    }
-}
-
-fn walk_sqlgen_insert(insert: &sg::ast::InsertStmt, visitor: &mut impl SqlgenAstVisitor) {
-    visitor.table(&insert.table);
-    if let Some(with) = &insert.with_clause {
-        walk_sqlgen_with(with, visitor);
-    }
-    for row in &insert.values {
-        for expr in row {
-            walk_sqlgen_expr(expr, SqlgenExprContext::DEFAULT, visitor);
-        }
-    }
-}
-
-fn walk_sqlgen_update(update: &sg::ast::UpdateStmt, visitor: &mut impl SqlgenAstVisitor) {
-    visitor.table(&update.table);
-    if let Some(with) = &update.with_clause {
-        walk_sqlgen_with(with, visitor);
-    }
-    if let Some(from) = &update.from {
-        visitor.table(&from.table);
-    }
-    for join in &update.joins {
-        walk_sqlgen_join(join, visitor);
-    }
-    for (_, expr) in &update.sets {
-        walk_sqlgen_expr(expr, SqlgenExprContext::DEFAULT, visitor);
-    }
-    if let Some(where_clause) = &update.where_clause {
-        walk_sqlgen_expr(where_clause, SqlgenExprContext::DEFAULT, visitor);
-    }
-    if let Some(returning) = &update.returning {
-        for expr in returning {
-            walk_sqlgen_expr(expr, SqlgenExprContext::DEFAULT, visitor);
-        }
-    }
-}
-
-fn walk_sqlgen_delete(delete: &sg::ast::DeleteStmt, visitor: &mut impl SqlgenAstVisitor) {
-    visitor.table(&delete.table);
-    if let Some(with) = &delete.with_clause {
-        walk_sqlgen_with(with, visitor);
-    }
-    if let Some(where_clause) = &delete.where_clause {
-        walk_sqlgen_expr(where_clause, SqlgenExprContext::DEFAULT, visitor);
-    }
-}
-
-fn walk_sqlgen_with(with: &sg::ast::WithClause, visitor: &mut impl SqlgenAstVisitor) {
-    visitor.with_clause(with);
-    for cte in &with.ctes {
-        walk_sqlgen_select(&cte.query, visitor);
-    }
-}
-
-fn walk_sqlgen_select(select: &sg::ast::SelectStmt, visitor: &mut impl SqlgenAstVisitor) {
-    visitor.select(select);
-    if let Some(with) = &select.with_clause {
-        walk_sqlgen_with(with, visitor);
-    }
-    if let Some(from) = &select.from {
-        visitor.table(&from.table);
-    }
-    for join in &select.joins {
-        walk_sqlgen_join(join, visitor);
-    }
-    for column in &select.columns {
-        walk_sqlgen_expr(&column.expr, SqlgenExprContext::DEFAULT, visitor);
-    }
-    if let Some(where_clause) = &select.where_clause {
-        walk_sqlgen_expr(where_clause, SqlgenExprContext::DEFAULT, visitor);
-    }
-    if let Some(group_by) = &select.group_by {
-        for expr in &group_by.exprs {
-            walk_sqlgen_expr(expr, SqlgenExprContext::DEFAULT, visitor);
-        }
-        if let Some(having) = &group_by.having {
-            walk_sqlgen_expr(having, SqlgenExprContext::DEFAULT, visitor);
-        }
-    }
-    for arm in &select.compounds {
-        visitor.compound_arm(arm);
-        if let Some(from) = &arm.from {
-            visitor.table(&from.table);
-        }
-        for column in &arm.columns {
-            walk_sqlgen_expr(&column.expr, SqlgenExprContext::DEFAULT, visitor);
-        }
-        if let Some(where_clause) = &arm.where_clause {
-            walk_sqlgen_expr(where_clause, SqlgenExprContext::DEFAULT, visitor);
-        }
-    }
-    for order_by in &select.order_by {
-        walk_sqlgen_expr(&order_by.expr, SqlgenExprContext::ORDER_BY, visitor);
-    }
-}
-
-fn walk_sqlgen_join(join: &sg::ast::JoinClause, visitor: &mut impl SqlgenAstVisitor) {
-    visitor.join(join);
-    visitor.table(&join.table);
-    if let Some(sg::ast::JoinConstraint::On(expr)) = &join.constraint {
-        walk_sqlgen_expr(expr, SqlgenExprContext::DEFAULT, visitor);
-    }
-}
-
-fn walk_sqlgen_expr(
-    expr: &sg::Expr,
-    context: SqlgenExprContext,
-    visitor: &mut impl SqlgenAstVisitor,
-) {
-    visitor.expr(expr, context);
-    match expr {
-        sg::Expr::ColumnRef(_) | sg::Expr::Literal(_) => {}
-        sg::Expr::BinaryOp(binary) => {
-            walk_sqlgen_expr(&binary.left, context, visitor);
-            walk_sqlgen_expr(&binary.right, context, visitor);
-        }
-        sg::Expr::UnaryOp(unary) => {
-            walk_sqlgen_expr(&unary.operand, context, visitor);
-        }
-        sg::Expr::FunctionCall(function) => {
-            for arg in &function.args {
-                walk_sqlgen_expr(arg, context, visitor);
-            }
-            if let Some(filter) = &function.filter {
-                walk_sqlgen_expr(filter, context, visitor);
-            }
-        }
-        sg::Expr::FtsMatch(fts) => {
-            walk_sqlgen_expr(&fts.query, SqlgenExprContext::DEFAULT, visitor);
-        }
-        sg::Expr::Subquery(select) => walk_sqlgen_select(select, visitor),
-        sg::Expr::Case(case_expr) => {
-            if let Some(operand) = &case_expr.operand {
-                walk_sqlgen_expr(operand, context, visitor);
-            }
-            for (when_expr, then_expr) in &case_expr.when_clauses {
-                walk_sqlgen_expr(when_expr, context, visitor);
-                walk_sqlgen_expr(then_expr, context, visitor);
-            }
-            if let Some(else_clause) = &case_expr.else_clause {
-                walk_sqlgen_expr(else_clause, context, visitor);
-            }
-        }
-        sg::Expr::Cast(cast) => {
-            walk_sqlgen_expr(&cast.expr, context, visitor);
-        }
-        sg::Expr::Between(between) => {
-            walk_sqlgen_expr(&between.expr, context, visitor);
-            walk_sqlgen_expr(&between.low, context, visitor);
-            walk_sqlgen_expr(&between.high, context, visitor);
-        }
-        sg::Expr::InList(in_list) => {
-            walk_sqlgen_expr(&in_list.expr, context, visitor);
-            for item in &in_list.list {
-                walk_sqlgen_expr(item, context, visitor);
-            }
-        }
-        sg::Expr::InSubquery(in_subquery) => {
-            walk_sqlgen_expr(&in_subquery.expr, context, visitor);
-            walk_sqlgen_select(&in_subquery.subquery, visitor);
-        }
-        sg::Expr::IsNull(is_null) => {
-            walk_sqlgen_expr(&is_null.expr, context, visitor);
-        }
-        sg::Expr::Exists(exists) => {
-            walk_sqlgen_select(&exists.subquery, visitor);
-        }
-        sg::Expr::Parenthesized(inner) => walk_sqlgen_expr(inner, context, visitor),
-        sg::Expr::ArrayLiteral(array) => {
-            for element in &array.elements {
-                walk_sqlgen_expr(element, context, visitor);
-            }
-        }
-        sg::Expr::ArraySubscript(subscript) => {
-            walk_sqlgen_expr(&subscript.array, context, visitor);
-            walk_sqlgen_expr(&subscript.index, context, visitor);
-        }
-        sg::Expr::WindowFunction(_) | sg::Expr::Collate(_) | sg::Expr::Raise(_) => {}
     }
 }
 
@@ -1019,7 +756,7 @@ fn record_sqlgen_stmt_tags(
     }
 
     let mut recorder = SqlgenTagRecorder { tags };
-    walk_sqlgen_stmt(stmt, &mut recorder);
+    sg::visit::walk_stmt(stmt, &mut recorder);
 }
 
 fn record_sqlgen_fts_index_spec_tags(tags: &mut BTreeSet<FtsFeatureTag>, spec: &sg::FtsIndexSpec) {
