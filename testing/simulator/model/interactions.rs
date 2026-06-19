@@ -21,7 +21,9 @@ use crate::{
         metrics::InteractionStats,
         property::{Property, PropertyDiscriminants},
     },
-    runner::env::{ShadowTablesMut, SimConnection, SimulationType, SimulatorEnv},
+    runner::env::{
+        ShadowTablesMut, SimConnection, SimulationType, SimulatorEnv, simulator_database_opts,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -925,10 +927,7 @@ fn reopen_database(env: &mut SimulatorEnv) {
                 env.io.clone(),
                 env.get_db_path().to_str().expect("path should be 'to_str'"),
                 turso_core::OpenFlags::default(),
-                turso_core::DatabaseOpts::new()
-                    .with_autovacuum(true)
-                    .with_attach(true)
-                    .with_generated_columns(true),
+                simulator_database_opts(env.opts.enable_fts),
                 None,
             ) {
                 Ok(db) => db,

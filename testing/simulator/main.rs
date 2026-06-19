@@ -605,7 +605,10 @@ fn init_logger() -> anyhow::Result<()> {
                 .without_time()
                 .with_thread_ids(false),
         )
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,tantivy=warn")),
+        )
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(file)

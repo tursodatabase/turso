@@ -48,6 +48,7 @@ tempfile.workspace = true
 hex = { workspace = true }
 itertools = { workspace = true }
 sql_generation = { workspace = true }
+sql_gen = { path = "../differential-oracle/sql_gen", optional = true }
 turso_parser = { workspace = true }
 schemars = { workspace = true }
 garde = { workspace = true, features = ["derive", "serde"] }
@@ -62,3 +63,6 @@ bitmaps = { workspace = true }
 bitflags.workspace = true
 derive_builder = "0.20.2"
 turso_macros = { workspace = true }
+
+[features]
+fts = ["turso_core/fts", "dep:sql_gen"]
