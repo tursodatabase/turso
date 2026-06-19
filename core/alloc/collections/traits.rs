@@ -61,6 +61,13 @@ pub trait TursoFromIterator<T>: Sized {
         I: IntoIterator<Item = T>;
 }
 
+#[cfg(nightly)]
+pub trait TursoFromIteratorIn<T, A>: Sized {
+    fn try_from_iter_in<I>(iter: I, alloc: A) -> Result<Self, TryReserveError>
+    where
+        I: IntoIterator<Item = T>;
+}
+
 pub trait TursoIteratorExt: Iterator + Sized {
     #[inline]
     fn try_collect<C>(self) -> Result<C, TryReserveError>
@@ -77,6 +84,15 @@ pub trait TursoIteratorExt: Iterator + Sized {
         Self: Iterator<Item = (A, B)>,
     {
         <(FromA, FromB) as TursoFromIterator<(A, B)>>::try_from_iter(self)
+    }
+
+    #[cfg(nightly)]
+    #[inline]
+    fn try_collect_in<C, A>(self, alloc: A) -> Result<C, TryReserveError>
+    where
+        C: TursoFromIteratorIn<Self::Item, A>,
+    {
+        C::try_from_iter_in(self, alloc)
     }
 }
 

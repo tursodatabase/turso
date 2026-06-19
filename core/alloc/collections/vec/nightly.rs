@@ -1,16 +1,13 @@
-use std::{iter::TrustedLen, ptr, slice};
+use std::{alloc::Allocator, iter::TrustedLen, ptr, slice};
 
 use super::super::{
-    TryClone, TursoAllocExt, TursoFromIterator, TursoSliceExt, TursoTryWithCapacityExt, TursoVecExt,
+    TryClone, TursoAllocExt, TursoFromIterator, TursoFromIteratorIn, TursoSliceExt,
+    TursoTryWithCapacityExt, TursoVecExt,
 };
 use crate::alloc::{TryReserveError, TursoAllocator, Vec};
 
 pub(super) const fn vec<T>() -> Vec<T> {
     Vec::new_in(TursoAllocator)
-}
-
-fn vec_with_capacity<T>(capacity: usize) -> Vec<T> {
-    Vec::with_capacity_in(capacity, TursoAllocator)
 }
 
 impl<T> TursoAllocExt for Vec<T> {
@@ -23,7 +20,7 @@ impl<T> TursoAllocExt for Vec<T> {
 impl<T> TursoVecExt<T> for Vec<T> {
     #[inline(always)]
     fn with_capacity(capacity: usize) -> Self {
-        vec_with_capacity(capacity)
+        Vec::with_capacity_in(capacity, TursoAllocator)
     }
 
     #[inline(always)]
@@ -48,13 +45,16 @@ impl<T> TursoTryWithCapacityExt for Vec<T> {
     }
 }
 
-impl<T> TursoFromIterator<T> for Vec<T> {
+impl<T, A> TursoFromIterator<T> for Vec<T, A>
+where
+    A: Allocator + Default,
+{
     #[inline(always)]
     fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
     where
         I: IntoIterator<Item = T>,
     {
-        <Self as TrySpecFromIter<T, I::IntoIter>>::try_from_iter(iter.into_iter())
+        <Self as TursoFromIteratorIn<T, A>>::try_from_iter_in(iter, A::default())
     }
 
     #[inline(always)]
@@ -63,6 +63,19 @@ impl<T> TursoFromIterator<T> for Vec<T> {
         I: IntoIterator<Item = T>,
     {
         self.try_spec_extend(iter.into_iter())
+    }
+}
+
+impl<T, A> TursoFromIteratorIn<T, A> for Vec<T, A>
+where
+    A: Allocator,
+{
+    #[inline]
+    fn try_from_iter_in<I>(iter: I, alloc: A) -> Result<Self, TryReserveError>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        <Self as TrySpecFromIter<T, I::IntoIter, A>>::try_from_iter_in(iter.into_iter(), alloc)
     }
 }
 
@@ -75,7 +88,11 @@ impl<T: Clone> TursoSliceExt<T> for [T] {
     }
 }
 
-impl<T: Clone> TryClone for Vec<T> {
+impl<T, A> TryClone for Vec<T, A>
+where
+    T: Clone,
+    A: Allocator + Clone,
+{
     type Error = TryReserveError;
 
     #[inline(always)]
@@ -98,9 +115,10 @@ trait TrySpecExtend<T, I> {
     fn try_spec_extend(&mut self, iter: I) -> Result<(), TryReserveError>;
 }
 
-impl<T, I> TrySpecExtend<T, I> for Vec<T>
+impl<T, I, A> TrySpecExtend<T, I> for Vec<T, A>
 where
     I: Iterator<Item = T>,
+    A: Allocator,
 {
     #[inline]
     default fn try_spec_extend(&mut self, iter: I) -> Result<(), TryReserveError> {
@@ -108,9 +126,10 @@ where
     }
 }
 
-impl<T, I> TrySpecExtend<T, I> for Vec<T>
+impl<T, I, A> TrySpecExtend<T, I> for Vec<T, A>
 where
     I: TrustedLen<Item = T>,
+    A: Allocator,
 {
     #[inline]
     default fn try_spec_extend(&mut self, iter: I) -> Result<(), TryReserveError> {
@@ -127,10 +146,11 @@ trait TrySpecExtendRef<'a, T, I> {
     fn try_spec_extend_ref(&mut self, iter: I) -> Result<(), TryReserveError>;
 }
 
-impl<'a, T, I> TrySpecExtendRef<'a, T, I> for Vec<T>
+impl<'a, T, I, A> TrySpecExtendRef<'a, T, I> for Vec<T, A>
 where
     T: Clone + 'a,
     I: Iterator<Item = &'a T>,
+    A: Allocator,
 {
     #[inline]
     default fn try_spec_extend_ref(&mut self, iter: I) -> Result<(), TryReserveError> {
@@ -138,9 +158,10 @@ where
     }
 }
 
-impl<'a, T> TrySpecExtendRef<'a, T, slice::Iter<'a, T>> for Vec<T>
+impl<'a, T, A> TrySpecExtendRef<'a, T, slice::Iter<'a, T>> for Vec<T, A>
 where
     T: Copy + 'a,
+    A: Allocator,
 {
     #[inline]
     fn try_spec_extend_ref(&mut self, iter: slice::Iter<'a, T>) -> Result<(), TryReserveError> {
@@ -153,21 +174,25 @@ where
 /// Collection has different fast paths from extension, most notably the
 /// empty-iterator case and exact preallocation for `TrustedLen`, so route it
 /// through its own trait.
-trait TrySpecFromIter<T, I>: Sized {
-    fn try_from_iter(iter: I) -> Result<Self, TryReserveError>;
+trait TrySpecFromIter<T, I, A>: Sized
+where
+    A: Allocator,
+{
+    fn try_from_iter_in(iter: I, alloc: A) -> Result<Self, TryReserveError>;
 }
 
-impl<T, I> TrySpecFromIter<T, I> for Vec<T>
+impl<T, I, A> TrySpecFromIter<T, I, A> for Vec<T, A>
 where
     I: Iterator<Item = T>,
+    A: Allocator,
 {
     #[inline]
-    default fn try_from_iter(mut iter: I) -> Result<Self, TryReserveError> {
+    default fn try_from_iter_in(mut iter: I, alloc: A) -> Result<Self, TryReserveError> {
         let Some(first) = iter.next() else {
-            return Ok(vec());
+            return Ok(Vec::new_in(alloc));
         };
 
-        let mut values = vec();
+        let mut values = Vec::new_in(alloc);
         let (lower, upper) = iter.size_hint();
         let initial = upper.unwrap_or(lower).saturating_add(1);
         values.try_reserve(initial).map_err(TryReserveError::from)?;
@@ -182,19 +207,20 @@ where
     }
 }
 
-impl<T, I> TrySpecFromIter<T, I> for Vec<T>
+impl<T, I, A> TrySpecFromIter<T, I, A> for Vec<T, A>
 where
     I: TrustedLen<Item = T>,
+    A: Allocator,
 {
     #[inline]
-    fn try_from_iter(iter: I) -> Result<Self, TryReserveError> {
+    fn try_from_iter_in(iter: I, alloc: A) -> Result<Self, TryReserveError> {
         let additional = trusted_len(iter.size_hint())?;
         if additional == 0 {
-            return Ok(vec());
+            return Ok(Vec::new_in(alloc));
         }
 
         let mut values =
-            Vec::try_with_capacity_in(additional, TursoAllocator).map_err(TryReserveError::from)?;
+            Vec::try_with_capacity_in(additional, alloc).map_err(TryReserveError::from)?;
         unsafe {
             values.extend_trusted_unchecked(iter);
         }
@@ -225,7 +251,10 @@ trait TryVecInternal<T> {
         T: Copy;
 }
 
-impl<T> TryVecInternal<T> for Vec<T> {
+impl<T, A> TryVecInternal<T> for Vec<T, A>
+where
+    A: Allocator,
+{
     #[inline]
     fn try_extend_desugared<I>(
         &mut self,
@@ -320,14 +349,17 @@ fn trusted_len(size_hint: (usize, Option<usize>)) -> Result<usize, TryReserveErr
 }
 
 /// Publishes the vector length for direct writes, including during unwinding.
-struct SetLenOnDrop<'a, T> {
-    vec: &'a mut Vec<T>,
+struct SetLenOnDrop<'a, T, A: Allocator> {
+    vec: &'a mut Vec<T, A>,
     len: usize,
 }
 
-impl<'a, T> SetLenOnDrop<'a, T> {
+impl<'a, T, A> SetLenOnDrop<'a, T, A>
+where
+    A: Allocator,
+{
     #[inline]
-    fn new(vec: &'a mut Vec<T>) -> Self {
+    fn new(vec: &'a mut Vec<T, A>) -> Self {
         Self {
             len: vec.len(),
             vec,
@@ -345,7 +377,10 @@ impl<'a, T> SetLenOnDrop<'a, T> {
     }
 }
 
-impl<T> Drop for SetLenOnDrop<'_, T> {
+impl<T, A> Drop for SetLenOnDrop<'_, T, A>
+where
+    A: Allocator,
+{
     #[inline]
     fn drop(&mut self) {
         unsafe {

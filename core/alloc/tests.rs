@@ -24,7 +24,7 @@ impl Iterator for LowerBoundOnly {
 
 #[test]
 fn try_extend_accepts_exact_size_iterators() {
-    let mut values = Vec::new();
+    let mut values: Vec<_> = TursoAllocExt::new();
 
     values.try_extend([1, 2, 3]).unwrap();
 
@@ -33,7 +33,7 @@ fn try_extend_accepts_exact_size_iterators() {
 
 #[test]
 fn try_extend_accepts_iterators_without_upper_bounds() {
-    let mut values = Vec::new();
+    let mut values: Vec<_> = TursoAllocExt::new();
 
     values
         .try_extend(LowerBoundOnly { next: 0, end: 3 })
@@ -97,6 +97,14 @@ fn binary_heap_try_push_and_extend_reserve_before_mutation() {
 #[test]
 fn iterator_try_collect_builds_turso_vec() {
     let values: Vec<_> = [1, 2, 3].into_iter().try_collect().unwrap();
+
+    assert_eq!(values.as_slice(), &[1, 2, 3]);
+}
+
+#[cfg(nightly)]
+#[test]
+fn iterator_try_collect_in_builds_global_vec() {
+    let values: Vec<_, Global> = [1, 2, 3].into_iter().try_collect_in(Global).unwrap();
 
     assert_eq!(values.as_slice(), &[1, 2, 3]);
 }
@@ -176,7 +184,7 @@ fn iterator_try_collect_converts_result_error() {
 
 #[test]
 fn tuple_try_extend_extends_both_collections() {
-    let mut values: (Vec<_>, VecDeque<_>) = (Vec::new(), VecDeque::new());
+    let mut values: (Vec<_>, VecDeque<_>) = (TursoAllocExt::new(), VecDeque::new());
 
     values
         .try_extend([(1, "one"), (2, "two"), (3, "three")])

@@ -12,6 +12,8 @@ mod traits;
 mod vec;
 mod vec_deque;
 
+#[cfg(nightly)]
+pub use traits::TursoFromIteratorIn;
 pub use traits::{
     TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt, TursoFromIterator, TursoHashMapExt,
     TursoHashSetExt, TursoIteratorExt, TursoNewExt, TursoSliceExt, TursoTryNewExt,
