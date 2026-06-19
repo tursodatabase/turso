@@ -553,6 +553,11 @@ pub struct LogicalLog {
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
     encrypted_payload_chunk_size: usize,
+    /// Highest `commit_ts` appended since the last truncation. Lets `truncate` avoid
+    /// discarding frames above a checkpoint's boundary (commits that landed during the
+    /// off-lock checkpoint). Maintained under the write lock that also serializes appends,
+    /// so the comparison is race-free.
+    max_appended_commit_ts: u64,
 }
 
 impl LogicalLog {
@@ -571,6 +576,7 @@ impl LogicalLog {
             pending_running_crc: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
+            max_appended_commit_ts: 0,
         }
     }
 
@@ -620,6 +626,9 @@ impl LogicalLog {
     ) -> Result<(Completion, u64)> {
         let op_count = tx.op_count;
         let commit_ts = tx.tx_timestamp;
+        // Updated on write, not offset-advance: an abandoned deferred write can only
+        // over-estimate, making `truncate` conservatively skip — never lose frames.
+        self.max_appended_commit_ts = self.max_appended_commit_ts.max(commit_ts);
         // `tx.buf` is laid out as:
         //   [LOG_HDR slot (56B, zeros)] [TX_HEADER slot (24B, zeros)] [payload]
         debug_assert!(
@@ -978,7 +987,21 @@ impl LogicalLog {
         self.write_header(header)
     }
 
-    pub fn truncate(&mut self) -> Result<Completion> {
+    /// Truncate the log to reclaim checkpointed frames. `checkpointed_through_ts` is the
+    /// boundary the checkpoint published; frames with `commit_ts <= boundary` are durable
+    /// in the WAL/DB. If any frame ABOVE the boundary remains (a commit during the off-lock
+    /// prepare phase, not in this pass's backfill), truncating would destroy it, so we skip
+    /// entirely — recovery replays only `commit_ts > boundary` and a later checkpoint
+    /// reclaims the space. Race-free: appends and truncation share the write lock.
+    pub fn truncate(&mut self, checkpointed_through_ts: u64) -> Result<Completion> {
+        if self.max_appended_commit_ts > checkpointed_through_ts {
+            // Uncheckpointed frames above the boundary remain — keep the whole log
+            // (offset/salt/CRC unchanged) so they survive to the next pass. No-op.
+            let c = Completion::new_trunc(|_| {});
+            c.complete(0);
+            return Ok(c);
+        }
+
         // Regenerate salt so stale frames (from before truncation) cannot validate
         // against the new CRC chain.
         let mut header = self.current_or_new_header()?;
@@ -994,6 +1017,7 @@ impl LogicalLog {
         });
         let c = self.file.truncate(0, completion)?;
         self.offset = 0;
+        self.max_appended_commit_ts = 0;
         Ok(c)
     }
 
@@ -1941,6 +1965,15 @@ impl StreamingLogicalLogReader {
         }
 
         let header_bytes = return_if_io!(self.read_exact_at(0, LOG_HDR_SIZE));
+        // An all-zero header is *absence*, not corruption: a fsync'd header carries
+        // LOG_MAGIC and survives crashes, so zeros mean a commit crashed before its fsync
+        // (the un-fsynced header write at offset 0 was lost while a frame page survived) —
+        // not a torn truncate (truncate is atomic). No commits were acknowledged, so treat
+        // it as NoLog and recover from the WAL. A non-zero but invalid header (torn rewrite
+        // of a once-valid one) is genuine corruption and still fails closed.
+        if header_bytes.iter().all(|&b| b == 0) {
+            return Ok(IOResult::Done(HeaderReadResult::NoLog));
+        }
         let hdr_len = u16::from_le_bytes([header_bytes[6], header_bytes[7]]) as usize;
         if hdr_len != LOG_HDR_SIZE {
             self.set_invalid_header_state();
@@ -6018,8 +6051,9 @@ mod tests {
         let salt_before = log.header.as_ref().unwrap().salt;
 
         // Truncate to 0 (simulates checkpoint truncation); header with new salt
-        // will be written together with the next frame.
-        let c = log.truncate().unwrap();
+        // will be written together with the next frame. u64::MAX boundary => all
+        // frames are considered checkpointed, so it truncates unconditionally.
+        let c = log.truncate(u64::MAX).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let salt_after = log.header.as_ref().unwrap().salt;

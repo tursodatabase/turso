@@ -2036,6 +2036,10 @@ impl Connection {
                 true,
                 self.get_sync_mode(),
                 MAIN_DB_ID,
+                // Explicit Connection::checkpoint fully resets the WAL.
+                crate::storage::wal::CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                },
             );
             loop {
                 match ckpt_sm.step(&()) {
@@ -2513,6 +2517,10 @@ impl Connection {
 
     pub fn experimental_vacuum_enabled(&self) -> bool {
         self.db.experimental_vacuum_enabled()
+    }
+
+    pub fn experimental_mvcc_passive_checkpoint_enabled(&self) -> bool {
+        self.db.experimental_mvcc_passive_checkpoint_enabled()
     }
 
     pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
@@ -3033,6 +3041,7 @@ impl Connection {
                 db.open_flags,
                 db.durable_storage.clone(),
                 enc_ctx,
+                db.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             db.mv_store.store(Some(mv_store.clone()));
             let bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;
