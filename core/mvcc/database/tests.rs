@@ -3912,6 +3912,154 @@ fn test_checkpoint_retry_does_not_replay_checkpointed_btree_resident_unique_dele
     assert_eq!(&integrity[0][0].to_string(), "ok");
 }
 
+/// Reproducer for the following bug: a passive checkpoint advances the durable boundary past the
+/// commit timestamp of a transaction that is still in-flight, then that transaction commits
+/// successfully BELOW the boundary and is silently lost on reopen.
+///
+///   1. Tx A takes commit timestamp T_a, then stalls just after preparing its log record
+///      (still `Preparing`; its row's `begin` is still `TxID(A)`).
+///   2. Tx B starts committing later, so it gets T_b > T_a, and finalizes FIRST, advancing
+///      `last_committed_tx_ts` to T_b (commits finalize out of timestamp order).
+///   3. A passive checkpoint samples `snapshot_ts = last_committed_tx_ts = T_b` and publishes
+///      durable boundary = T_b. Because A is still `Preparing`, the checkpoint SKIPS A's row
+///      (never writes it to the B-tree) — yet the boundary jumps past T_a.
+///   4. A resumes and its COMMIT returns success, writing its log frame at T_a < T_b.
+///   5. On reopen, recovery replays only frames with commit_ts > boundary(T_b), so A's
+///      frame@T_a is discarded; A was never in the B-tree => the acknowledged row
+///      (100,'A-committed') is GONE.
+#[test]
+fn repro_critical1_passive_checkpoint_boundary_skips_inflight_commit() {
+    use crate::StepResult;
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    {
+        let conn = db.connect();
+        // Drive checkpoints explicitly; no surprise auto-checkpoints.
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'seed')").unwrap();
+        // Baseline durable boundary (non-zero).
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        // (1) Tx A: insert a row, begin committing, park right after it takes its commit
+        // timestamp T_a (LogRecordPrepared => still Preparing, begin = TxID(A)).
+        let conn_a = db.connect();
+        conn_a.execute("BEGIN CONCURRENT").unwrap();
+        conn_a
+            .execute("INSERT INTO t VALUES (100, 'A-committed')")
+            .unwrap();
+        conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+            CommitYieldPoint::LogRecordPrepared.point(),
+        ])));
+        let mut a_commit = conn_a.prepare("COMMIT").unwrap();
+        assert!(
+            matches!(a_commit.step().unwrap(), StepResult::Yield),
+            "A's commit should yield right after taking its commit timestamp T_a"
+        );
+
+        // (2) Tx B (also CONCURRENT, so it does not block on A's Preparing state) commits
+        // fully AFTER A took T_a => T_b > T_a; last_committed_tx_ts = T_b.
+        let conn_b = db.connect();
+        conn_b.execute("BEGIN CONCURRENT").unwrap();
+        conn_b.execute("INSERT INTO t VALUES (200, 'B')").unwrap();
+        conn_b.execute("COMMIT").unwrap();
+
+        // (3) Drive a PASSIVE auto-checkpoint (threshold=0) via a CONCURRENT writer's COMMIT,
+        // and park it at BeforeAcquireLock. (Auto-checkpoint runs inside the COMMIT statement,
+        // so stepping the COMMIT surfaces the checkpoint's yields; an explicit
+        // `PRAGMA wal_checkpoint` is driven to completion internally and can't be parked.)
+        // The checkpoint samples snapshot_ts (= T_c >= T_b) and runs its OFF-LOCK collection
+        // NOW, while A is still Preparing, so A's row (begin = TxID(A)) is SKIPPED -- never
+        // collected into the B-tree write set. It cannot yet take the blocking write lock
+        // (A still holds its read lock), so we park it just before that.
+        let conn_c = db.connect();
+        conn_c
+            .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforeAcquireLock.point()]);
+        conn_c.set_yield_injector(Some(injector.clone()));
+        conn_c.execute("BEGIN CONCURRENT").unwrap();
+        conn_c.execute("INSERT INTO t VALUES (300, 'C')").unwrap();
+        let mut checkpoint = conn_c.prepare("COMMIT").unwrap();
+        let pager_io = conn_c.pager.load().io.clone();
+        let mut parked = false;
+        for _ in 0..200_000 {
+            match checkpoint.step().unwrap() {
+                StepResult::IO | StepResult::Yield if injector.is_empty() => {
+                    parked = true;
+                    break;
+                }
+                StepResult::IO | StepResult::Yield => pager_io.step().unwrap(),
+                StepResult::Row => {}
+                StepResult::Done => {
+                    panic!("checkpoint completed before the BeforeAcquireLock yield fired")
+                }
+                other => panic!("unexpected checkpoint step: {other:?}"),
+            }
+        }
+        assert!(
+            parked,
+            "checkpoint must park before acquiring the blocking lock (after off-lock collection)"
+        );
+
+        // (4) Resume A to a SUCCESSFUL commit while the checkpoint is parked. A finalizes
+        // (releases its read lock; its row's begin becomes Timestamp(T_a)) and appends its log
+        // frame at commit_ts = T_a (< the boundary the checkpoint is about to publish). A's
+        // COMMIT returns Ok and the row is visible.
+        a_commit
+            .run_ignore_rows()
+            .expect("A's COMMIT must return Ok (the write is acknowledged to the client)");
+        drop(a_commit);
+        let before = get_rows(&conn, "SELECT id, v FROM t WHERE id = 100");
+        println!("A's COMMIT returned Ok; row 100 immediately after commit -> {before:?}");
+        assert_eq!(
+            before.len(),
+            1,
+            "precondition: A must be visible after its COMMIT succeeded, got {before:?}"
+        );
+
+        // (5) Resume the checkpoint to completion. A released its read lock, so the checkpoint
+        // now acquires the write lock, publishes a durable boundary >= T_b, writes its
+        // collected pages (which DO NOT include A), and truncates the logical log up to the
+        // boundary -- discarding A's frame@T_a.
+        let mut done = false;
+        for _ in 0..200_000 {
+            match checkpoint.step().unwrap() {
+                StepResult::Done => {
+                    done = true;
+                    break;
+                }
+                StepResult::Row => {}
+                StepResult::IO | StepResult::Yield => pager_io.step().unwrap(),
+                other => panic!("unexpected checkpoint step after resume: {other:?}"),
+            }
+        }
+        assert!(done, "checkpoint did not complete");
+        drop(checkpoint);
+        conn_c.set_yield_injector(None);
+
+        // A is still visible in-memory right after the checkpoint (before any crash).
+        let mid = get_rows(&conn, "SELECT id, v FROM t WHERE id = 100");
+        println!("after checkpoint, before reopen: row 100 -> {mid:?}");
+    }
+
+    // (6) Crash/reopen. A was never checkpointed into the B-tree and its log frame@T_a is at
+    // or below the published boundary, so recovery cannot restore it.
+    db.restart();
+    let conn = db.connect();
+    let after = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    println!("after reopen, all rows -> {after:?}");
+    let a_row = get_rows(&conn, "SELECT id, v FROM t WHERE id = 100");
+    assert_eq!(
+        a_row.len(),
+        1,
+        "DATA LOSS: acknowledged committed row (100,'A-committed') is gone after reopen \
+         (passive checkpoint published a boundary past A's in-flight commit and skipped A's \
+         row), all rows = {after:?}"
+    );
+}
+
 /// What this test checks: user-facing SQL plus a commit yield can produce out-of-order commit completion without lowering checkpoint metadata.
 #[test]
 fn test_checkpoint_stale_unique_index_delete_with_out_of_order_commit_yield() {

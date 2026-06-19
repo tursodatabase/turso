@@ -6315,6 +6315,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .unwrap_or(u64::MAX)
     }
 
+    /// Lowest commit timestamp among transactions that have taken a commit
+    /// timestamp (`Preparing`) at or below `snapshot_ts` but have not yet
+    /// finalized. A passive checkpoint must not publish a durable boundary at
+    /// or above this value: such a transaction is skipped by collection (its
+    /// row still carries a `TxID` begin/end), yet it may still commit
+    /// successfully below the boundary and be discarded on recovery.
+    pub fn min_unfinalized_commit_ts(&self, snapshot_ts: u64) -> u64 {
+        self.txs
+            .iter()
+            .filter_map(|entry| match entry.value().state.load() {
+                TransactionState::Preparing(end_ts) if end_ts <= snapshot_ts => Some(end_ts),
+                _ => None,
+            })
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
     /// Default `mvcc_gc_threshold`: run an incremental GC pass roughly every
     /// this many newly inserted versions. Small enough that steady-state
     /// memory stays bounded under heavy short-txn concurrency, large enough

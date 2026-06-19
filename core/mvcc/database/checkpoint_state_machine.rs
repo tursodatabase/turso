@@ -210,6 +210,13 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// tombstones after it are clamped to "live" so concurrent commits never strand a row
     /// (see `maybe_get_checkpointable_versions`). `u64::MAX` = no bound (collect all).
     snapshot_ts: u64,
+    /// Lowest commit timestamp of a transaction that was still `Preparing` (had
+    /// taken a commit timestamp `<= snapshot_ts` but not finalized) when the
+    /// snapshot was sampled. The published durable boundary is clamped strictly
+    /// below this so an out-of-order concurrent commit below `snapshot_ts` is
+    /// never skipped by collection yet swept past by the boundary. `u64::MAX` =
+    /// no in-flight commit to clamp against.
+    min_unfinalized_commit_ts: u64,
     build_local_schema_sm: Option<StateMachine<BuildLocalSchemaViewStateMachine<Clock, A>>>,
     build_local_schema_began_read_tx: bool,
     /// Snapshot-consistent schema built at `snapshot_ts`; drives `index_id_to_index` in PASSIVE mode.
@@ -719,6 +726,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             // Set in PrepareCheckpoint once the off-lock snapshot is taken; until
             // then `u64::MAX` disables the upper-bound filter (collect everything).
             snapshot_ts: u64::MAX,
+            min_unfinalized_commit_ts: u64::MAX,
             build_local_schema_sm: None,
             build_local_schema_began_read_tx: false,
             local_schema: None,
@@ -1590,6 +1598,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
 
                 self.snapshot_ts = self.mvstore.last_committed_tx_ts.load(Ordering::Acquire);
+                // Sample in-flight commits at the same cut as `snapshot_ts`: any tx that
+                // took a commit timestamp <= snapshot_ts but is still `Preparing` is skipped
+                // by collection, so the boundary must stay strictly below its commit_ts.
+                self.min_unfinalized_commit_ts =
+                    self.mvstore.min_unfinalized_commit_ts(self.snapshot_ts);
 
                 // Checkpoint state machines can be created before they are run.
                 // Resample after serializing (via `checkpoint_in_progress`) so
@@ -1698,7 +1711,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         { "collected_max": collected_max, "snapshot_ts": self.snapshot_ts }
                     );
                 }
-                self.durable_txid_max_new = durable_old.max(self.snapshot_ts);
+                // Never publish a boundary at or above a still-in-flight commit sampled at
+                // snapshot time: that commit was skipped by collection but may finalize below
+                // the boundary and be discarded on recovery (silent data loss).
+                let boundary_cap = self.min_unfinalized_commit_ts.saturating_sub(1);
+                self.durable_txid_max_new = durable_old.max(self.snapshot_ts.min(boundary_cap));
                 self.maybe_stage_mvcc_metadata_write()?;
 
                 self.mvstore.storage.on_checkpoint_start()?;
