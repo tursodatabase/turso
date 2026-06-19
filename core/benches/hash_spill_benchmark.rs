@@ -25,7 +25,7 @@ fn create_hash_table(mem_budget: usize) -> HashTable {
         initial_buckets: 64,
         mem_budget,
         num_keys: 1,
-        collations: vec![CollationSeq::Binary],
+        collations: turso_core::alloc::vec![CollationSeq::Binary],
         temp_store: turso_core::TempStore::Default,
         track_matched: false,
         partition_count: None,
@@ -36,8 +36,8 @@ fn create_hash_table(mem_budget: usize) -> HashTable {
 /// Insert entries with integer keys and no payload
 fn insert_integer_entries(ht: &mut HashTable, count: usize) {
     for i in 0..count {
-        let key = vec![Value::from_i64(i as i64)];
-        let _ = ht.insert(key, i as i64, vec![], None);
+        let key = turso_core::alloc::vec![Value::from_i64(i as i64)];
+        let _ = ht.insert(key, i as i64, turso_core::alloc::vec![], None);
     }
 }
 
@@ -45,8 +45,8 @@ fn insert_integer_entries(ht: &mut HashTable, count: usize) {
 fn insert_entries_with_text_payload(ht: &mut HashTable, count: usize, text_size: usize) {
     let payload_text: String = "x".repeat(text_size);
     for i in 0..count {
-        let key = vec![Value::from_i64(i as i64)];
-        let payload = vec![Value::Text(payload_text.clone().into())];
+        let key = turso_core::alloc::vec![Value::from_i64(i as i64)];
+        let payload = turso_core::alloc::vec![Value::Text(payload_text.clone().into())];
         let _ = ht.insert(key, i as i64, payload, None);
     }
 }
@@ -54,12 +54,13 @@ fn insert_entries_with_text_payload(ht: &mut HashTable, count: usize, text_size:
 /// Insert entries with text keys (for NOCASE hash testing)
 fn insert_text_key_entries(ht: &mut HashTable, count: usize) {
     for i in 0..count {
-        let key = vec![Value::Text(format!("key_{i}").into())];
-        let _ = ht.insert(key, i as i64, vec![], None);
+        let key = turso_core::alloc::vec![Value::Text(format!("key_{i}").into())];
+        let _ = ht.insert(key, i as i64, turso_core::alloc::vec![], None);
     }
 }
 
 /// Benchmark: Build phase with tight memory budget (forces frequent spilling)
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_build_tight_budget(c: &mut Criterion) {
     let mut group = c.benchmark_group("HashTable Build (Tight Budget)");
 
@@ -99,6 +100,7 @@ fn bench_build_tight_budget(c: &mut Criterion) {
 }
 
 /// Benchmark: Build phase with relaxed memory budget (occasional spilling)
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_build_relaxed_budget(c: &mut Criterion) {
     let mut group = c.benchmark_group("HashTable Build (Relaxed Budget)");
 
@@ -138,6 +140,7 @@ fn bench_build_relaxed_budget(c: &mut Criterion) {
 }
 
 /// Benchmark: Build + Probe with spilling
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_build_and_probe(c: &mut Criterion) {
     let mut group = c.benchmark_group("HashTable Build+Probe");
 
@@ -157,7 +160,8 @@ fn bench_build_and_probe(c: &mut Criterion) {
                     // Probe phase - look up every key
                     let mut found = 0;
                     for i in 0..count {
-                        let key = vec![Value::Numeric(Numeric::Integer(i as i64))];
+                        let key =
+                            turso_core::alloc::vec![Value::Numeric(Numeric::Integer(i as i64))];
                         if ht.has_spilled() {
                             let partition_idx = ht.partition_for_keys(&key).unwrap();
                             if !ht.is_partition_loaded(partition_idx) {
@@ -195,7 +199,7 @@ fn bench_build_and_probe(c: &mut Criterion) {
                     // Probe phase
                     let mut found = 0;
                     for i in 0..count {
-                        let key = vec![Value::from_i64(i as i64)];
+                        let key = turso_core::alloc::vec![Value::from_i64(i as i64)];
                         if ht.has_spilled() {
                             let partition_idx = ht.partition_for_keys(&key).unwrap();
                             if !ht.is_partition_loaded(partition_idx) {
@@ -225,6 +229,7 @@ fn bench_build_and_probe(c: &mut Criterion) {
 }
 
 /// Benchmark: Text key hashing (tests NOCASE optimization)
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_text_key_hashing(c: &mut Criterion) {
     let mut group = c.benchmark_group("HashTable Text Keys");
 
@@ -242,7 +247,7 @@ fn bench_text_key_hashing(c: &mut Criterion) {
                         initial_buckets: 64,
                         mem_budget: 64 * 1024,
                         num_keys: 1,
-                        collations: vec![CollationSeq::Binary],
+                        collations: turso_core::alloc::vec![CollationSeq::Binary],
                         temp_store: turso_core::TempStore::Default,
                         track_matched: false,
                         partition_count: None,
@@ -266,7 +271,7 @@ fn bench_text_key_hashing(c: &mut Criterion) {
                         initial_buckets: 64,
                         mem_budget: 64 * 1024,
                         num_keys: 1,
-                        collations: vec![CollationSeq::NoCase],
+                        collations: turso_core::alloc::vec![CollationSeq::NoCase],
                         temp_store: turso_core::TempStore::Default,
                         track_matched: false,
                         partition_count: None,
@@ -284,6 +289,7 @@ fn bench_text_key_hashing(c: &mut Criterion) {
 }
 
 /// Benchmark: Large payload serialization
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_large_payload_spill(c: &mut Criterion) {
     let mut group = c.benchmark_group("HashTable Large Payload Spill");
 

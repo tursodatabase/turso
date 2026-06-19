@@ -82,6 +82,7 @@
 
 extern crate proc_macro;
 mod atomic_enum;
+mod codspeed;
 mod ext;
 mod test;
 
@@ -185,6 +186,16 @@ pub fn derive_description_from_doc(item: TokenStream) -> TokenStream {
         }
     }
     generate_get_description(enum_name, &variant_description_map, enum_variants)
+}
+
+#[proc_macro_attribute]
+pub fn codspeed_criterion_benchmark(attr: TokenStream, input: TokenStream) -> TokenStream {
+    codspeed::criterion_benchmark_attribute(attr, input)
+}
+
+#[proc_macro_attribute]
+pub fn divan_bench(attr: TokenStream, input: TokenStream) -> TokenStream {
+    codspeed::divan_bench_attribute(attr, input)
 }
 
 /// Processes a Rust docs to extract the description string.

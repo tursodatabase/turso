@@ -71,6 +71,7 @@ fn run_to_completion(db: &Database, stmt: &mut turso_core::Statement) {
 // flat:   SELECT x FROM t          (read integer directly from record)
 // struct: SELECT val.x FROM t      (read blob, deserialize, extract field)
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_select_one_field(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("select_one_field");
 
@@ -119,6 +120,7 @@ fn bench_select_one_field(criterion: &mut Criterion) {
 // flat:   SELECT x, y FROM t
 // struct: SELECT val.x, val.y FROM t
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_select_two_fields(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("select_two_fields");
 
@@ -166,6 +168,7 @@ fn bench_select_two_fields(criterion: &mut Criterion) {
 // struct: SELECT val.x FROM t WHERE val.x > 5000
 // Same data, same selectivity (~50%), isolates deserialization cost in the filter path.
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_where_filter(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("where_filter");
 
@@ -214,6 +217,7 @@ fn bench_where_filter(criterion: &mut Criterion) {
 // flat:   INSERT INTO t VALUES (id, x, y)
 // struct: INSERT INTO t VALUES (id, struct_pack(x, y))
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_insert(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("insert");
 
@@ -273,6 +277,7 @@ fn bench_insert(criterion: &mut Criterion) {
 // union:  SELECT val.i FROM t             (read blob, check tag, extract value)
 // All rows have the same tag so every extract succeeds.
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_union_extract(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("union_extract");
 
@@ -311,6 +316,7 @@ fn bench_union_extract(criterion: &mut Criterion) {
 // flat:   SELECT typeof(x) FROM t         (return type string for a column)
 // union:  SELECT union_tag(val) FROM t    (read blob, extract tag name)
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_union_tag(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("union_tag");
 
