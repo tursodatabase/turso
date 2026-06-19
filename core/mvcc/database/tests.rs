@@ -1,7 +1,7 @@
 use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
-use crate::io::PlatformIO;
+use crate::io::{PlatformIO, IO};
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
@@ -147,6 +147,120 @@ impl FailureInjector for FixedFailureInjector {
     }
 }
 
+#[derive(Clone, Default)]
+struct FailOnDemandAlloc {
+    fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FailOnDemandAlloc {
+    fn fail_allocations(&self, fail: bool) {
+        self.fail.store(fail, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+unsafe impl crate::alloc::ApiAllocator for FailOnDemandAlloc {
+    fn allocate(
+        &self,
+        layout: crate::alloc::Layout,
+    ) -> std::result::Result<std::ptr::NonNull<[u8]>, crate::alloc::AllocError> {
+        if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(crate::alloc::AllocError);
+        }
+        <crate::alloc::TursoAllocator as crate::alloc::ApiAllocator>::allocate(
+            &crate::alloc::TursoAllocator,
+            layout,
+        )
+    }
+
+    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: crate::alloc::Layout) {
+        unsafe {
+            <crate::alloc::TursoAllocator as crate::alloc::ApiAllocator>::deallocate(
+                &crate::alloc::TursoAllocator,
+                ptr,
+                layout,
+            )
+        }
+    }
+}
+
+fn test_mvcc_storage(name: &str) -> Arc<dyn crate::mvcc::persistent_storage::DurableStorage> {
+    let io = Arc::new(MemoryIO::new());
+    let file = io.open_file(name, OpenFlags::Create, false).unwrap();
+    Arc::new(crate::mvcc::persistent_storage::Storage::new(
+        file, io, None,
+    ))
+}
+
+#[test]
+fn mv_store_skiplist_allocations_are_fallible() {
+    let alloc = FailOnDemandAlloc::default();
+    alloc.fail_allocations(true);
+    let store = MvStore::new_in(
+        MvccClock::new(),
+        test_mvcc_storage("mv-store-oom-new.db-log"),
+        alloc.clone(),
+    );
+    assert!(matches!(store, Err(LimboError::OutOfMemory)));
+
+    alloc.fail_allocations(false);
+    let store = MvStore::new_in(
+        MvccClock::new(),
+        test_mvcc_storage("mv-store-oom-insert.db-log"),
+        alloc.clone(),
+    )
+    .unwrap();
+    alloc.fail_allocations(true);
+
+    let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
+    let row_version = RowVersion {
+        id: 1,
+        begin: PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
+        end: PackedTs::pack(None),
+        row: Row::new_table_row(row_id.clone(), Vec::new(), 0),
+        btree_resident: false,
+    };
+    let result = store.insert_version(row_id, row_version);
+    assert!(matches!(result, Err(crate::alloc::TryReserveError)));
+    assert!(store.rows.is_empty());
+}
+
+#[test]
+fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
+    let alloc = FailOnDemandAlloc::default();
+    let store = MvStore::new_in(
+        MvccClock::new(),
+        test_mvcc_storage("mv-store-oom-insert-ordering.db-log"),
+        alloc.clone(),
+    )
+    .unwrap();
+
+    let tx_id = 7;
+    let tx = new_tx(tx_id, 1, TransactionState::Active);
+    tx.begin_savepoint();
+    store.txs.try_insert(tx_id, tx).unwrap();
+
+    let table_id = MVTableId::from(-2);
+    let row_id = RowID::new(table_id, RowKey::Int(42));
+    let row = Row::new_table_row(row_id.clone(), Vec::new(), 0);
+    let allocator = store.get_rowid_allocator(&table_id);
+
+    alloc.fail_allocations(true);
+    let result = store.insert(tx_id, row);
+    assert!(matches!(result, Err(LimboError::OutOfMemory)));
+
+    assert!(store.rows.get(&row_id).is_none());
+    assert_eq!(allocator.max_rowid.load(Ordering::SeqCst), 0);
+
+    let tx = store.txs.get(&tx_id).unwrap();
+    let tx = tx.value();
+    assert!(tx.write_set.lock().is_empty());
+
+    let savepoints = tx.savepoint_stack.read();
+    let savepoint = savepoints.last().unwrap();
+    assert!(savepoint.created_table_versions.is_empty());
+    assert!(savepoint.newly_added_to_write_set.is_empty());
+}
+
 impl MvccTestDb {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
@@ -181,7 +295,7 @@ fn mvcc_active_read_tx_blocks_vacuum_gate() {
         Err(LimboError::Busy)
     ));
 
-    db.mvcc_store.remove_tx(tx_id);
+    db.mvcc_store.remove_tx(tx_id).unwrap();
     db.mvcc_store.try_begin_vacuum_gate().unwrap();
     db.mvcc_store.release_vacuum_gate();
 }
@@ -287,7 +401,8 @@ fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
         .write()
         .replace(DatabaseHeader::default());
     db.mvcc_store
-        .insert_table_id_to_rootpage(MVTableId::from(-999_i64), Some(999));
+        .insert_table_id_to_rootpage(MVTableId::from(-999_i64), Some(999))
+        .unwrap();
 
     db.mvcc_store.try_begin_vacuum_gate().unwrap();
     db.mvcc_store.reset_after_vacuum(header, schema.as_ref());
@@ -8102,7 +8217,7 @@ fn test_gc_active_reader_pins_lwm() {
     );
 
     // Close the reader transaction.
-    db.mvcc_store.remove_tx(tx2);
+    db.mvcc_store.remove_tx(tx2).unwrap();
 
     // LWM should now be u64::MAX.
     assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
@@ -8662,7 +8777,7 @@ fn test_gc_incremental_respects_held_snapshot() {
 
     // Close the snapshot; now incremental GC reclaims the superseded v1
     // without any checkpoint having run.
-    db.mvcc_store.remove_tx(tx2);
+    db.mvcc_store.remove_tx(tx2).unwrap();
     assert_eq!(
         db.mvcc_store
             .gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC),
