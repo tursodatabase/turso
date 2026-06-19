@@ -68,8 +68,8 @@ pub use policy::{
     UnaryOpWeights, UpdateConfig,
 };
 pub use schema::{
-    ColumnDef, DataType, Index, Schema, SchemaBuilder, SchemaTransactionState, Table,
-    split_qualified_name,
+    ColumnDef, DataType, FtsColumnWeight, FtsIndexSpec, FtsTokenizer, Index, IndexKind, Schema,
+    SchemaBuilder, SchemaTransactionState, Table, split_qualified_name,
 };
 pub use strategy::{GeneratedSql, SqlStrategy};
 pub use trace::{Coverage, CoverageReport, ExprKind, Origin, OriginPath, StmtKind, TreeMode};

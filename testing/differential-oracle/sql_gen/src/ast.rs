@@ -5,7 +5,7 @@
 
 use crate::context::Context;
 use crate::functions::AGGREGATE_FUNCTIONS;
-use crate::schema::{DataType, Schema};
+use crate::schema::{DataType, FtsIndexSpec, FtsTokenizer, Schema};
 use std::fmt;
 
 // =============================================================================
@@ -1262,6 +1262,7 @@ pub struct CreateIndexStmt {
 #[derive(Debug, Clone)]
 pub enum CreateIndexKind {
     BTree { unique: bool },
+    Fts(FtsIndexSpec),
 }
 
 impl fmt::Display for CreateIndexStmt {
@@ -1274,7 +1275,13 @@ impl fmt::Display for CreateIndexStmt {
         if self.if_not_exists {
             write!(f, "IF NOT EXISTS ")?;
         }
-        write!(f, "{} ON {} (", self.name, self.table)?;
+        write!(f, "{} ON {}", self.name, self.table)?;
+
+        if matches!(self.kind, CreateIndexKind::Fts(_)) {
+            write!(f, " USING fts")?;
+        }
+
+        write!(f, " (")?;
 
         for (i, col) in self.columns.iter().enumerate() {
             if i > 0 {
@@ -1283,8 +1290,43 @@ impl fmt::Display for CreateIndexStmt {
             write!(f, "{col}")?;
         }
 
-        write!(f, ")")
+        write!(f, ")")?;
+
+        if let CreateIndexKind::Fts(spec) = &self.kind {
+            write_fts_index_options(f, spec)?;
+        }
+
+        Ok(())
     }
+}
+
+fn write_fts_index_options(f: &mut fmt::Formatter<'_>, spec: &FtsIndexSpec) -> fmt::Result {
+    if spec.is_default() {
+        return Ok(());
+    }
+
+    write!(f, " WITH (")?;
+
+    let mut needs_comma = false;
+    if spec.tokenizer != FtsTokenizer::Default {
+        write!(f, "tokenizer = '{}'", spec.tokenizer)?;
+        needs_comma = true;
+    }
+    if !spec.weights.is_empty() {
+        if needs_comma {
+            write!(f, ", ")?;
+        }
+        write!(f, "weights = '")?;
+        for (i, field_weight) in spec.weights.iter().enumerate() {
+            if i > 0 {
+                write!(f, ",")?;
+            }
+            write!(f, "{}={:.1}", field_weight.column, field_weight.weight)?;
+        }
+        write!(f, "'")?;
+    }
+
+    write!(f, ")")
 }
 
 /// A DROP INDEX statement.
@@ -2158,6 +2200,27 @@ mod tests {
         };
 
         assert_eq!(select.to_string(), "SELECT name FROM users LIMIT 10");
+    }
+
+    #[test]
+    fn test_create_fts_index_display() {
+        let create_index = CreateIndexStmt {
+            name: "docs_fts".to_string(),
+            table: "docs".to_string(),
+            columns: vec!["title".to_string(), "body".to_string()],
+            kind: CreateIndexKind::Fts(
+                FtsIndexSpec::new()
+                    .with_tokenizer(FtsTokenizer::Raw)
+                    .with_weight("title", 4.0)
+                    .with_weight("body", 1.0),
+            ),
+            if_not_exists: true,
+        };
+
+        assert_eq!(
+            create_index.to_string(),
+            "CREATE INDEX IF NOT EXISTS docs_fts ON docs USING fts (title, body) WITH (tokenizer = 'raw', weights = 'title=4.0,body=1.0')"
+        );
     }
 
     #[test]

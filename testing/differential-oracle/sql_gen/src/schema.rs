@@ -199,6 +199,97 @@ impl Table {
     }
 }
 
+/// The storage/index method represented by a schema index.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum IndexKind {
+    BTree,
+    Fts(FtsIndexSpec),
+}
+
+impl IndexKind {
+    pub fn is_btree(&self) -> bool {
+        matches!(self, IndexKind::BTree)
+    }
+}
+
+/// Configuration for a Turso `CREATE INDEX ... USING fts` index.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct FtsIndexSpec {
+    pub tokenizer: FtsTokenizer,
+    pub weights: Vec<FtsColumnWeight>,
+}
+
+impl Default for FtsIndexSpec {
+    fn default() -> Self {
+        Self {
+            tokenizer: FtsTokenizer::Default,
+            weights: Vec::new(),
+        }
+    }
+}
+
+impl FtsIndexSpec {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_tokenizer(mut self, tokenizer: FtsTokenizer) -> Self {
+        self.tokenizer = tokenizer;
+        self
+    }
+
+    pub fn with_weight(mut self, column: impl Into<String>, weight: f32) -> Self {
+        self.weights.push(FtsColumnWeight {
+            column: column.into(),
+            weight,
+        });
+        self
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.tokenizer == FtsTokenizer::Default && self.weights.is_empty()
+    }
+}
+
+/// Supported tokenizer names accepted by Turso's FTS index method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum FtsTokenizer {
+    Default,
+    Raw,
+    Simple,
+    Whitespace,
+    Ngram,
+}
+
+impl FtsTokenizer {
+    pub fn name(&self) -> &'static str {
+        match self {
+            FtsTokenizer::Default => "default",
+            FtsTokenizer::Raw => "raw",
+            FtsTokenizer::Simple => "simple",
+            FtsTokenizer::Whitespace => "whitespace",
+            FtsTokenizer::Ngram => "ngram",
+        }
+    }
+}
+
+impl fmt::Display for FtsTokenizer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+/// Per-column FTS scoring weight.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct FtsColumnWeight {
+    pub column: String,
+    pub weight: f32,
+}
+
 /// An index definition in a schema.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -209,6 +300,8 @@ pub struct Index {
     pub unique: bool,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub database: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "IndexKind::is_btree"))]
+    pub kind: IndexKind,
 }
 
 impl Index {
@@ -223,12 +316,23 @@ impl Index {
             columns,
             unique: false,
             database: None,
+            kind: IndexKind::BTree,
         }
     }
 
     pub fn unique(mut self) -> Self {
         self.unique = true;
         self
+    }
+
+    pub fn fts(mut self, spec: FtsIndexSpec) -> Self {
+        self.unique = false;
+        self.kind = IndexKind::Fts(spec);
+        self
+    }
+
+    pub fn is_fts(&self) -> bool {
+        matches!(self.kind, IndexKind::Fts(_))
     }
 
     pub fn in_database(mut self, db: impl Into<String>) -> Self {
@@ -521,6 +625,9 @@ impl Schema {
                     index = index.unique();
                 }
             }
+            CreateIndexKind::Fts(spec) => {
+                index = index.fts(spec.clone());
+            }
         }
         self.indexes.push(index);
     }
@@ -809,6 +916,31 @@ mod tests {
         assert_eq!(schema.indexes.len(), 1);
         assert!(schema.table_names().contains("users"));
         assert!(schema.index_names().contains("idx_users_id"));
+    }
+
+    #[test]
+    fn test_fts_index_builder() {
+        let index = Index::new(
+            "docs_fts",
+            "docs",
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unique()
+        .fts(
+            FtsIndexSpec::new()
+                .with_tokenizer(FtsTokenizer::Raw)
+                .with_weight("title", 4.0),
+        );
+
+        assert!(index.is_fts());
+        assert!(!index.unique);
+        assert!(matches!(
+            index.kind,
+            IndexKind::Fts(FtsIndexSpec {
+                tokenizer: FtsTokenizer::Raw,
+                ..
+            })
+        ));
     }
 
     #[test]
