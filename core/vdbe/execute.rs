@@ -12837,6 +12837,18 @@ pub fn op_populate_materialized_views(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_data_version(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(DataVersion { db, dest }, insn);
+    state.registers[*dest].set_int(program.connection.data_version(*db));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_read_cookie(
     program: &Program,
     state: &mut ProgramState,

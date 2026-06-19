@@ -1608,6 +1608,11 @@ pub enum Insn {
         db: usize,
         dest: usize,
     },
+    /// Write the current PRAGMA data_version value for database P1 to memory cell P2.
+    DataVersion {
+        db: usize,
+        dest: usize,
+    },
     /// Read cookie number P3 from database P1 and write it into register P2
     ReadCookie {
         db: usize,
@@ -2134,6 +2139,7 @@ impl InsnVariants {
             InsnVariants::Or => execute::op_or,
             InsnVariants::Noop => execute::op_noop,
             InsnVariants::PageCount => execute::op_page_count,
+            InsnVariants::DataVersion => execute::op_data_version,
             InsnVariants::ReadCookie => execute::op_read_cookie,
             InsnVariants::SetCookie => execute::op_set_cookie,
             InsnVariants::OpenEphemeral | InsnVariants::OpenAutoindex => execute::op_open_ephemeral,

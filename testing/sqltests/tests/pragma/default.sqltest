@@ -248,6 +248,44 @@ expect {
 		1
 }
 
+test pragma-read-uncommitted-default {
+    PRAGMA read_uncommitted;
+}
+expect {
+    0
+}
+
+test pragma-read-uncommitted-set {
+    PRAGMA read_uncommitted = ON;
+    PRAGMA read_uncommitted;
+}
+expect {
+    1
+}
+
+test pragma-read-uncommitted-table-valued {
+    PRAGMA read_uncommitted = 1;
+    SELECT read_uncommitted FROM pragma_read_uncommitted;
+}
+expect {
+    1
+}
+
+test pragma-data-version-table-valued {
+    SELECT data_version > 0 FROM pragma_data_version;
+}
+expect {
+    1
+}
+
+test pragma-optimize-noop {
+    PRAGMA optimize;
+    SELECT 1;
+}
+expect {
+    1
+}
+
 test pragma-function-list-has-abs {
     SELECT name, builtin, type, enc, narg, flags FROM pragma_function_list WHERE name = 'abs';
 }

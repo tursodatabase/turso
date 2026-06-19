@@ -3798,6 +3798,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         *connection.db.schema.lock() = connection.schema.read().clone();
     }
 
+    pub(crate) fn tx_has_changes(&self, tx_id: TxID) -> bool {
+        self.txs.get(&tx_id).is_some_and(|tx| {
+            let tx = tx.value();
+            !tx.write_set.lock().is_empty() || tx.header_dirty.load(Ordering::Acquire)
+        })
+    }
+
     /// Creates a new database.
     pub fn new(
         clock: Clock,

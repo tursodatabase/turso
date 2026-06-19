@@ -1784,6 +1784,8 @@ pub enum PragmaName {
     EncryptionCipher,
     /// Control fsync error retry behavior (0 = off/panic, 1 = on/retry)
     DataSyncRetry,
+    /// Reports whether another connection has committed changes to the database.
+    DataVersion,
     /// List databases
     DatabaseList,
     /// Encoding - only support utf8
@@ -1809,8 +1811,12 @@ pub enum PragmaName {
     JournalMode,
     /// `locking_mode` pragma
     LockingMode,
+    /// Run lightweight query planner maintenance.
+    Optimize,
     /// Run a quick integrity check (skips expensive index consistency validation)
     QuickCheck,
+    /// Enable or disable READ UNCOMMITTED isolation mode.
+    ReadUncommitted,
     /// encryption key for encrypted databases, specified as hexadecimal string.
     #[strum(serialize = "hexkey")]
     #[cfg_attr(feature = "serde", serde(rename = "hexkey"))]

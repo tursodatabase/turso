@@ -22,7 +22,9 @@ use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::plan::BitSet;
-use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
+use crate::util::{
+    normalize_ident, parse_pragma_bool, parse_signed_number, parse_string, IOExt as _,
+};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value};
@@ -365,6 +367,16 @@ fn update_pragma(
             connection.bump_prepare_context_generation();
             Ok(TransactionMode::None)
         }
+        PragmaName::DataVersion => query_pragma(
+            PragmaName::DataVersion,
+            resolver,
+            Some(value),
+            pager,
+            connection,
+            database_id,
+            schema_was_explicit,
+            program,
+        ),
         PragmaName::Encoding => {
             let year = chrono::Local::now().year();
             bail_parse_error!("It's {year}. UTF-8 won.");
@@ -445,6 +457,7 @@ fn update_pragma(
             schema_was_explicit,
             program,
         ),
+        PragmaName::Optimize => Ok(TransactionMode::None),
         PragmaName::MaxPageCount => {
             let data = parse_signed_number(&value)?;
             let max_page_count_value = match data {
@@ -617,6 +630,16 @@ fn update_pragma(
         PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
+            resolver,
+            Some(value),
+            pager,
+            connection,
+            database_id,
+            schema_was_explicit,
+            program,
+        ),
+        PragmaName::ReadUncommitted => query_pragma(
+            PragmaName::ReadUncommitted,
             resolver,
             Some(value),
             pager,
@@ -816,6 +839,15 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
+        PragmaName::DataVersion => {
+            program.emit_insn(Insn::DataVersion {
+                db: database_id,
+                dest: register,
+            });
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
         PragmaName::DatabaseList => {
             let base_reg = register;
             program.alloc_registers(2);
@@ -972,6 +1004,7 @@ fn query_pragma(
             }
             Ok(TransactionMode::None)
         }
+        PragmaName::Optimize => Ok(TransactionMode::None),
         PragmaName::PageCount => {
             program.emit_insn(Insn::PageCount {
                 db: database_id,
@@ -1422,6 +1455,21 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.columns[1].to_string());
             program.add_pragma_result_column(pragma.columns[2].to_string());
             Ok(TransactionMode::Read)
+        }
+        PragmaName::ReadUncommitted => {
+            if let Some(value_expr) = value {
+                let read_uncommitted = parse_pragma_bool(&value_expr)?;
+                connection.set_read_uncommitted(read_uncommitted);
+                return Ok(TransactionMode::None);
+            }
+
+            let register = program.alloc_register();
+            let read_uncommitted = connection.get_read_uncommitted();
+            program.emit_int(read_uncommitted as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+
+            Ok(TransactionMode::None)
         }
         PragmaName::QueryOnly => {
             if let Some(value_expr) = value {

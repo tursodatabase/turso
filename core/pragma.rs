@@ -50,6 +50,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::Result0 | PragmaFlags::NoColumns1,
             &["data_sync_retry"],
         ),
+        DataVersion => Pragma::new(
+            PragmaFlags::ReadOnly | PragmaFlags::Result0,
+            &["data_version"],
+        ),
         DatabaseList => Pragma::new(PragmaFlags::Result0, &["seq", "name", "file"]),
         Encoding => Pragma::new(
             PragmaFlags::Result0 | PragmaFlags::NoColumns1,
@@ -77,6 +81,7 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
             &["page_count"],
         ),
+        Optimize => Pragma::new(PragmaFlags::NoColumns, &[]),
         PageSize => Pragma::new(
             PragmaFlags::Result0 | PragmaFlags::SchemaReq | PragmaFlags::NoColumns1,
             &["page_size"],
@@ -152,6 +157,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         QuickCheck => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::ReadOnly | PragmaFlags::Result0,
             &["message"],
+        ),
+        ReadUncommitted => Pragma::new(
+            PragmaFlags::Result0 | PragmaFlags::NoColumns1,
+            &["read_uncommitted"],
         ),
         CaptureDataChangesConn | UnstableCaptureDataChangesConn => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,

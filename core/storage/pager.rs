@@ -3096,6 +3096,10 @@ impl Pager {
         wal.holds_write_lock()
     }
 
+    pub fn has_dirty_pages(&self) -> bool {
+        !self.dirty_pages.read().is_empty()
+    }
+
     /// Rollback and clean up an attached database pager's transaction.
     /// Unlike rollback_tx, this doesn't modify connection-level state.
     pub fn rollback_attached(&self) {

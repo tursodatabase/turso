@@ -346,6 +346,8 @@ pub struct Connection {
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     pub(super) query_only: AtomicBool,
+    pub(super) read_uncommitted: AtomicBool,
+    pub(super) data_version_local_writes: RwLock<HashMap<usize, u64>>,
     pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
@@ -3295,6 +3297,40 @@ impl Connection {
         self.bump_prepare_context_generation();
     }
 
+    pub fn get_read_uncommitted(&self) -> bool {
+        self.read_uncommitted.load(Ordering::SeqCst)
+    }
+
+    pub fn set_read_uncommitted(&self, value: bool) {
+        self.read_uncommitted.store(value, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn data_version(&self, database_id: usize) -> i64 {
+        let db = self.get_source_database(database_id);
+        let db_key = Arc::as_ptr(&db) as usize;
+        let local_writes = self
+            .data_version_local_writes
+            .read()
+            .get(&db_key)
+            .copied()
+            .unwrap_or(0);
+        db.current_data_version()
+            .saturating_sub(local_writes)
+            .min(i64::MAX as u64) as i64
+    }
+
+    pub(crate) fn bump_data_version(&self, database_id: usize) {
+        let db = self.get_source_database(database_id);
+        let db_key = Arc::as_ptr(&db) as usize;
+        db.bump_data_version();
+        *self
+            .data_version_local_writes
+            .write()
+            .entry(db_key)
+            .or_insert(0) += 1;
+    }
+
     pub fn set_vdbe_trace(&self, value: bool) {
         self.vdbe_trace.store(value, Ordering::SeqCst);
     }
@@ -4596,6 +4632,36 @@ mod tests {
         let catalog = conn.attached_databases.read();
         let index = *catalog.name_to_index.get(alias).unwrap();
         catalog.index_to_data.get(&index).unwrap().clone()
+    }
+
+    #[test]
+    fn test_pragma_data_version_tracks_other_connection_commits() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("data-version.db");
+        let conn0 = open_connection(&db_path);
+        let conn1 = open_connection(&db_path);
+
+        let conn0_initial = query_single_i64(&conn0, "PRAGMA data_version");
+        let conn1_initial = query_single_i64(&conn1, "PRAGMA data_version");
+
+        conn0
+            .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(1)")
+            .unwrap();
+
+        assert_eq!(
+            query_single_i64(&conn0, "PRAGMA data_version"),
+            conn0_initial
+        );
+        assert!(query_single_i64(&conn1, "PRAGMA data_version") > conn1_initial);
+
+        let conn1_after_conn0 = query_single_i64(&conn1, "PRAGMA data_version");
+        conn1.execute("INSERT INTO t VALUES(2)").unwrap();
+
+        assert_eq!(
+            query_single_i64(&conn1, "PRAGMA data_version"),
+            conn1_after_conn0
+        );
+        assert!(query_single_i64(&conn0, "PRAGMA data_version") > conn0_initial);
     }
 
     #[test]

@@ -194,6 +194,7 @@ enum CommitState {
         state_machine: StateMachine<Box<CommitStateMachine<MvccClock>>>,
         db_id: usize,
         mv_store: Arc<MvStore>,
+        data_version_changed: bool,
     },
 }
 
@@ -685,6 +686,8 @@ pub struct ProgramState {
     pub query_deadline: Option<crate::MonotonicInstant>,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
+    // Main database data_version bump pending until commit fully finishes.
+    main_data_version_changed: bool,
     /// In-flight commit-state-machine for an autonomous sequence
     /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
     /// entry and drives it one step per opcode call, yielding
@@ -804,6 +807,7 @@ impl ProgramState {
             query_deadline: None,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
+            main_data_version_changed: false,
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
             sequence_inner_retry_count: 0,
@@ -932,6 +936,7 @@ impl ProgramState {
         // CheckpointStateMachine again, so release its checkpoint lock before
         // replacing commit_state with Ready.
         self.commit_state.cleanup_mvcc_checkpoint_state();
+        self.main_data_version_changed = false;
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
         self.current_collation = None;
@@ -1949,12 +1954,26 @@ impl Program {
             // We don't want to commit on nested statements. Let parent handle it.
             return Ok(IOResult::Done(()));
         }
+        if matches!(program_state.commit_state, CommitState::Ready) {
+            program_state.main_data_version_changed = !rollback
+                && if let Some(mv_store) = mv_store {
+                    self.connection
+                        .get_mv_tx_id()
+                        .is_some_and(|tx_id| mv_store.tx_has_changes(tx_id))
+                } else {
+                    matches!(tx_state, TransactionState::Write { .. }) && pager.has_dirty_pages()
+                };
+        }
         let res = if let Some(mv_store) = mv_store {
             self.commit_txn_mvcc(pager, program_state, mv_store, rollback)
         } else {
             self.commit_txn_wal(pager, program_state, rollback)
         }?;
         if !res.is_io() {
+            if program_state.main_data_version_changed {
+                self.connection.bump_data_version(crate::MAIN_DB_ID);
+            }
+            program_state.main_data_version_changed = false;
             if self.change_cnt_on {
                 self.connection
                     .set_changes(program_state.n_change.load(Ordering::SeqCst));
@@ -2117,16 +2136,21 @@ impl Program {
             program_state.commit_state,
             CommitState::CommittingAttachedMvcc { .. }
         ) {
-            let (step_result, db_id) = {
+            let (step_result, db_id, data_version_changed) = {
                 let CommitState::CommittingAttachedMvcc {
                     state_machine,
                     db_id,
                     mv_store: ref attached_mv,
+                    data_version_changed,
                 } = &mut program_state.commit_state
                 else {
                     unreachable!()
                 };
-                (state_machine.step(attached_mv)?, *db_id)
+                (
+                    state_machine.step(attached_mv)?,
+                    *db_id,
+                    *data_version_changed,
+                )
             };
             match step_result {
                 IOResult::Done(_) => {
@@ -2135,6 +2159,9 @@ impl Program {
                         .expect("attached MVCC transaction should always have a pager");
                     conn.publish_database_schema(db_id);
                     conn.set_mv_tx_for_db(db_id, None);
+                    if data_version_changed {
+                        conn.bump_data_version(db_id);
+                    }
                     attached_pager.end_read_tx();
                     // Fall through to look for more
                 }
@@ -2151,6 +2178,7 @@ impl Program {
                 conn.set_mv_tx_for_db(db_id, None);
                 continue;
             };
+            let data_version_changed = attached_mv_store.tx_has_changes(tx_id);
             let mut state_machine = match attached_mv_store.commit_tx(tx_id, &conn, db_id) {
                 Ok(sm) => sm,
                 Err(e) => {
@@ -2172,6 +2200,9 @@ impl Program {
                         .expect("attached MVCC transaction should always have a pager");
                     conn.publish_database_schema(db_id);
                     conn.set_mv_tx_for_db(db_id, None);
+                    if data_version_changed {
+                        conn.bump_data_version(db_id);
+                    }
                     attached_pager.end_read_tx();
                     continue;
                 }
@@ -2180,6 +2211,7 @@ impl Program {
                         state_machine,
                         db_id,
                         mv_store: attached_mv_store,
+                        data_version_changed,
                     };
                     return Ok(IOResult::IO(io));
                 }
@@ -2291,6 +2323,7 @@ impl Program {
                     continue;
                 }
                 if !rollback {
+                    let data_version_changed = attached_pager.has_dirty_pages();
                     // Commit dirty pages to WAL, then end write+read transactions.
                     // We disable auto-checkpoint and avoid pager.commit_tx() since
                     // the checkpoint logic can leave read locks held.
@@ -2311,6 +2344,9 @@ impl Program {
                     // WAL commit succeeded — publish the connection-local schema
                     // changes to the shared Database so other connections can see them.
                     connection.publish_database_schema(db_id);
+                    if data_version_changed {
+                        connection.bump_data_version(db_id);
+                    }
                     attached_pager.end_write_tx();
                     attached_pager.end_read_tx();
                     attached_pager.commit_dirty_pages_end();

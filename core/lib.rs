@@ -607,6 +607,7 @@ pub struct Database {
     builtin_syms: parking_lot::RwLock<SymbolTable>,
     opts: DatabaseOpts,
     n_connections: AtomicUsize,
+    data_version: AtomicU64,
 
     /// In Memory Page 1 for Empty Dbs
     init_page_1: Arc<ArcSwapOption<Page>>,
@@ -678,6 +679,14 @@ impl Database {
         is_memory_like(&self.path)
     }
 
+    pub(crate) fn current_data_version(&self) -> u64 {
+        self.data_version.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn bump_data_version(&self) -> u64 {
+        self.data_version.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
     fn new(
         opts: DatabaseOpts,
         flags: OpenFlags,
@@ -737,6 +746,7 @@ impl Database {
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
+            data_version: AtomicU64::new(1),
 
             init_page_1: Arc::new(ArcSwapOption::new(init_page_1)),
 
@@ -1993,6 +2003,8 @@ impl Database {
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
+            read_uncommitted: AtomicBool::new(false),
+            data_version_local_writes: RwLock::new(HashMap::default()),
             vdbe_trace: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
             dqs_dml: AtomicBool::new(true),
