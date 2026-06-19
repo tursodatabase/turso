@@ -137,6 +137,11 @@ fn run_cli_command(cli_opts: &mut SimulatorCLI, profile: &Profile) -> anyhow::Re
                 println!("\t{} failed runs", failures.len());
                 Ok(())
             }
+            #[cfg(feature = "fts")]
+            SimulatorCommand::Fts(command) => {
+                banner();
+                runner::fts::run_fts_campaign(cli_opts, command, profile)
+            }
             SimulatorCommand::PrintSchema => {
                 let schema = schemars::schema_for!(crate::Profile);
                 println!("{}", serde_json::to_string_pretty(&schema).unwrap());

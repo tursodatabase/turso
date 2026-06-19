@@ -318,6 +318,10 @@ pub fn execute_interaction_turso(
                 execute_fts_sql(conn, &sql.sql).inspect_err(|err| tracing::error!(?err))
             };
 
+            if let Some(fts_state) = env.fts_state.as_mut() {
+                fts_state.finish_sql_result(results.is_ok());
+            }
+
             if let Err(err) = &results
                 && !interaction.ignore_error
             {

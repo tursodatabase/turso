@@ -23,6 +23,8 @@ use crate::model::Query;
 use crate::profiles::Profile;
 use crate::runner::SimIO;
 use crate::runner::cli::IoBackend;
+#[cfg(feature = "fts")]
+use crate::runner::fts::FtsPlanState;
 use crate::runner::io::SimulatorIO;
 use crate::runner::memory::io::MemorySimIO;
 const DEFAULT_CACHE_SIZE: usize = 2000;
@@ -1088,6 +1090,8 @@ pub(crate) struct SimulatorEnv {
     pub(crate) attached_dbs: Vec<String>,
     /// Sequences are global objects, not affected by transactions/savepoints
     pub sequences: Vec<ShadowSequence>,
+    #[cfg(feature = "fts")]
+    pub(crate) fts_state: Option<FtsPlanState>,
 }
 
 impl UnwindSafe for SimulatorEnv {}
@@ -1114,6 +1118,8 @@ impl SimulatorEnv {
             committed_tables: self.committed_tables.clone(),
             attached_dbs: self.attached_dbs.clone(),
             sequences: self.sequences.clone(),
+            #[cfg(feature = "fts")]
+            fts_state: self.fts_state.clone(),
         }
     }
 
@@ -1449,6 +1455,8 @@ impl SimulatorEnv {
             connection_last_query: Bitmap::new(),
             attached_dbs,
             sequences: Vec::new(),
+            #[cfg(feature = "fts")]
+            fts_state: None,
         }
     }
 

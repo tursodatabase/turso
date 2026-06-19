@@ -47,6 +47,12 @@ impl InteractionPlan {
         rng: &mut impl rand::Rng,
         env: &mut SimulatorEnv,
     ) -> Option<Interactions> {
+        #[cfg(feature = "fts")]
+        if env.opts.enable_fts {
+            let state = env.fts_state.as_mut()?;
+            return crate::runner::fts::next_fts_interactions(state);
+        }
+
         // First interaction
         if self.len_properties() == 0 {
             // First create at least one table
