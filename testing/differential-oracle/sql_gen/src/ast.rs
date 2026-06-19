@@ -337,6 +337,7 @@ impl Expr {
                 .or_else(|| b.right.unordered_limit_reason()),
             Expr::UnaryOp(u) => u.operand.unordered_limit_reason(),
             Expr::FunctionCall(fc) => fc.args.iter().find_map(|a| a.unordered_limit_reason()),
+            Expr::FtsMatch(fts) => fts.query.unordered_limit_reason(),
             Expr::Case(c) => c
                 .operand
                 .as_ref()
@@ -394,6 +395,7 @@ impl Expr {
                 .args
                 .iter()
                 .find_map(|a| a.non_unique_order_by_reason(schema)),
+            Expr::FtsMatch(fts) => fts.query.non_unique_order_by_reason(schema),
             Expr::Case(c) => c
                 .operand
                 .as_ref()
@@ -452,6 +454,7 @@ impl Expr {
                 }
                 fc.args.iter().any(|a| a.contains_aggregate())
             }
+            Expr::FtsMatch(fts) => fts.query.contains_aggregate(),
             Expr::BinaryOp(b) => b.left.contains_aggregate() || b.right.contains_aggregate(),
             Expr::UnaryOp(u) => u.operand.contains_aggregate(),
             Expr::Cast(c) => c.expr.contains_aggregate(),
@@ -491,6 +494,7 @@ impl Expr {
         match self {
             Expr::ColumnRef(_) => true,
             Expr::FunctionCall(fc) => fc.args.iter().any(|a| a.contains_column_ref()),
+            Expr::FtsMatch(fts) => !fts.columns.is_empty() || fts.query.contains_column_ref(),
             Expr::BinaryOp(b) => b.left.contains_column_ref() || b.right.contains_column_ref(),
             Expr::UnaryOp(u) => u.operand.contains_column_ref(),
             Expr::Cast(c) => c.expr.contains_column_ref(),
@@ -531,6 +535,7 @@ impl Expr {
         match self {
             Expr::Subquery(_) => true,
             Expr::FunctionCall(fc) => fc.args.iter().any(|a| a.contains_scalar_subquery()),
+            Expr::FtsMatch(fts) => fts.query.contains_scalar_subquery(),
             Expr::BinaryOp(b) => {
                 b.left.contains_scalar_subquery() || b.right.contains_scalar_subquery()
             }
@@ -1537,6 +1542,7 @@ pub enum Expr {
     BinaryOp(Box<BinaryOpExpr>),
     UnaryOp(Box<UnaryOpExpr>),
     FunctionCall(FunctionCallExpr),
+    FtsMatch(FtsMatchExpr),
     Subquery(Box<SelectStmt>),
     Case(Box<CaseExpr>),
     Cast(Box<CastExpr>),
@@ -1567,6 +1573,7 @@ impl fmt::Display for Expr {
             Expr::BinaryOp(b) => write!(f, "{b}"),
             Expr::UnaryOp(u) => write!(f, "{u}"),
             Expr::FunctionCall(fc) => write!(f, "{fc}"),
+            Expr::FtsMatch(fts) => write!(f, "{fts}"),
             Expr::Subquery(s) => write!(f, "({s})"),
             Expr::Case(c) => write!(f, "{c}"),
             Expr::Cast(c) => write!(f, "{c}"),
@@ -1634,6 +1641,21 @@ impl Expr {
             name,
             args,
             filter: Some(Box::new(filter)),
+        })
+    }
+
+    /// Create an FTS match predicate (records to context).
+    pub fn fts_match(
+        ctx: &mut Context,
+        columns: Vec<ColumnRef>,
+        query: Expr,
+        syntax: FtsMatchSyntax,
+    ) -> Self {
+        ctx.record(ExprKind::FtsMatch);
+        Expr::FtsMatch(FtsMatchExpr {
+            columns,
+            query: Box::new(query),
+            syntax,
         })
     }
 
@@ -1995,6 +2017,55 @@ impl fmt::Display for FunctionCallExpr {
             write!(f, " FILTER (WHERE {filter_expr})")?;
         }
         Ok(())
+    }
+}
+
+/// Syntax form for an FTS match predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtsMatchSyntax {
+    Function,
+    Match,
+}
+
+/// A Turso FTS predicate: either `fts_match(...)` or `(col, ...) MATCH query`.
+#[derive(Debug, Clone)]
+pub struct FtsMatchExpr {
+    pub columns: Vec<ColumnRef>,
+    pub query: Box<Expr>,
+    pub syntax: FtsMatchSyntax,
+}
+
+impl fmt::Display for FtsMatchExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.syntax {
+            FtsMatchSyntax::Function => {
+                write!(f, "fts_match(")?;
+                for (i, col) in self.columns.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{col}")?;
+                }
+                if !self.columns.is_empty() {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{})", self.query)
+            }
+            FtsMatchSyntax::Match => {
+                if self.columns.len() == 1 {
+                    write!(f, "{} MATCH {}", self.columns[0], self.query)
+                } else {
+                    write!(f, "(")?;
+                    for (i, col) in self.columns.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{col}")?;
+                    }
+                    write!(f, ") MATCH {}", self.query)
+                }
+            }
+        }
     }
 }
 

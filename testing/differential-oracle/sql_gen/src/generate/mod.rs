@@ -18,6 +18,7 @@
 //! 3. Never use hardcoded values for probabilities, ranges, or weights
 
 pub mod expr;
+pub mod fts;
 pub mod literal;
 pub mod select;
 pub mod stmt;
