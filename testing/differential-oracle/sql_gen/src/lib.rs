@@ -67,7 +67,10 @@ pub use policy::{
     TriggerBodyStmtWeights, TriggerConfig, TriggerEventWeights, TriggerTimingWeights,
     UnaryOpWeights, UpdateConfig,
 };
-pub use schema::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table};
+pub use schema::{
+    ColumnDef, DataType, Index, Schema, SchemaBuilder, SchemaTransactionState, Table,
+    split_qualified_name,
+};
 pub use strategy::{GeneratedSql, SqlStrategy};
 pub use trace::{Coverage, CoverageReport, ExprKind, Origin, OriginPath, StmtKind, TreeMode};
 
