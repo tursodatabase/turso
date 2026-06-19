@@ -79,6 +79,23 @@ impl FtsSql {
         self.transaction
     }
 
+    pub(crate) fn starts_transaction(&self) -> bool {
+        self.transaction && self.sql.eq_ignore_ascii_case("BEGIN")
+    }
+
+    pub(crate) fn ends_transaction(&self) -> bool {
+        self.transaction
+            && (self.sql.eq_ignore_ascii_case("COMMIT")
+                || self.sql.eq_ignore_ascii_case("ROLLBACK"))
+    }
+
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub(crate) fn table_rename(&self) -> Option<&FtsTableRename> {
+        self.table_rename.as_ref()
+    }
 }
 
 impl Display for FtsSql {
