@@ -6390,6 +6390,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ///   the *complete* referenced-txid set across all chains, which a partial
     ///   sweep cannot produce. The checkpoint path still prunes it.
     pub fn gc_incremental(&self, max_chains: usize) -> usize {
+        // Hold the checkpoint read lock for the whole pass so a stop-the-world
+        // checkpoint cannot run concurrently.
+        if !self.blocking_checkpoint_lock.read() {
+            return 0;
+        }
+        struct CheckpointReadGuard<'a>(&'a TursoRwLock);
+        impl Drop for CheckpointReadGuard<'_> {
+            fn drop(&mut self) {
+                self.0.unlock();
+            }
+        }
+        let _ckpt_guard = CheckpointReadGuard(&self.blocking_checkpoint_lock);
+
         // Single-flight: only one inline GC pass runs at a time across all
         // connections (see `gc_in_progress`). Losing the race is a no-op — the
         // growth that triggered this commit's `should_gc` will retrigger soon,

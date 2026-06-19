@@ -8490,6 +8490,86 @@ fn test_gc_incremental_reclaims_index_chains_resumably() {
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
 }
 
+/// Inline GC must never run concurrently with a stop-the-world checkpoint:
+/// the checkpoint reads version chains to flush them to the B-tree and removes
+/// empty slots, so a concurrent GC mutating those chains would corrupt the
+/// on-disk image (e.g. drop an index version before the checkpoint flushed it,
+/// leaving a table row without its index entry). `gc_incremental` enforces this
+/// by holding the checkpoint read lock; if the checkpoint holds the write lock,
+/// GC must skip entirely. Regression test for the Antithesis integrity-check
+/// failure ("row N missing from index ...").
+#[test]
+fn test_gc_incremental_skips_while_checkpoint_holds_write_lock() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+
+    // One reclaimable superseded version (insert+commit, then update+commit).
+    let tx = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .insert(tx, generate_simple_string_row(table_id, 1, "v1"))
+        .unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+    let tx = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .update(tx, generate_simple_string_row(table_id, 1, "v2"))
+        .unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+    // No active txns -> all reader read-locks released, LWM = MAX.
+    assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
+
+    let row_id = RowID::new(table_id, RowKey::Int(1));
+
+    // Simulate a stop-the-world checkpoint by taking the write lock.
+    assert!(
+        db.mvcc_store.blocking_checkpoint_lock.write(),
+        "no readers should remain after commits, so write lock is acquirable"
+    );
+
+    // GC cannot take the read lock -> it must skip and reclaim nothing.
+    assert_eq!(
+        db.mvcc_store
+            .gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC),
+        0,
+        "GC must not run while a checkpoint holds the write lock"
+    );
+    assert_eq!(
+        db.mvcc_store
+            .rows
+            .get(&row_id)
+            .unwrap()
+            .value()
+            .read()
+            .len(),
+        2,
+        "superseded version must survive while the checkpoint holds the lock"
+    );
+
+    // Once the checkpoint releases, GC runs and reclaims the superseded version.
+    db.mvcc_store.blocking_checkpoint_lock.unlock();
+    assert_eq!(
+        db.mvcc_store
+            .gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC),
+        1,
+        "GC runs once the checkpoint lock is released"
+    );
+    assert_eq!(
+        db.mvcc_store
+            .rows
+            .get(&row_id)
+            .unwrap()
+            .value()
+            .read()
+            .len(),
+        1
+    );
+}
+
 /// Incremental GC uses the lazy path: it empties a chain's version vec but
 /// leaves the (now empty) SkipMap slot in place — slot removal is reserved for
 /// the checkpoint's blocking `_and_slots` sweep.
