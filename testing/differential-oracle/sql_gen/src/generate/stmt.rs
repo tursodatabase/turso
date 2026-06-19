@@ -1029,11 +1029,13 @@ pub fn generate_create_index<C: Capabilities>(
         None => index_name,
     };
 
-    // Select columns for the index
+    // Select columns for the index. Use a subsequence so the same column is not
+    // emitted more than once.
     let max_cols = table.columns.len().min(create_index_config.max_columns);
-    let num_cols = ctx.gen_range_inclusive(1, max_cols);
-    let columns: Vec<String> = (0..num_cols)
-        .filter_map(|_| ctx.choose(&table.columns).map(|c| c.name.clone()))
+    let picked_columns = ctx.subsequence(&table.columns, 1..=max_cols);
+    let columns: Vec<String> = picked_columns
+        .iter()
+        .map(|column| column.name.clone())
         .collect();
 
     if columns.is_empty() {
@@ -1792,6 +1794,18 @@ mod tests {
                 Stmt::Select(_) | Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
             ));
         }
+    }
+
+    #[test]
+    fn test_generate_create_index_defaults_to_btree() {
+        let generator = test_generator();
+        let mut ctx = Context::new_with_seed(42);
+
+        let stmt = generate_create_index(&generator, &mut ctx).unwrap();
+        let sql = stmt.to_string();
+
+        assert!(sql.starts_with("CREATE"));
+        assert!(sql.contains(" INDEX "));
     }
 
     #[test]
