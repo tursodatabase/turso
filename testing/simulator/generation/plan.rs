@@ -332,6 +332,25 @@ impl Interactions {
                 let interaction = builder.build().unwrap();
                 vec![interaction]
             }
+            #[cfg(feature = "fts")]
+            InteractionsType::FtsSql(sql) => {
+                let mut builder =
+                    InteractionBuilder::with_interaction(InteractionType::FtsSql(sql.clone()));
+                builder
+                    .connection_index(self.connection_index)
+                    .ignore_error(sql.ignore_error)
+                    .id(id);
+                let interaction = builder.build().unwrap();
+                vec![interaction]
+            }
+            #[cfg(feature = "fts")]
+            InteractionsType::FtsOracle(check) => {
+                let mut builder =
+                    InteractionBuilder::with_interaction(InteractionType::FtsOracle(check.clone()));
+                builder.connection_index(self.connection_index).id(id);
+                let interaction = builder.build().unwrap();
+                vec![interaction]
+            }
         };
 
         assert!(!ret.is_empty());
