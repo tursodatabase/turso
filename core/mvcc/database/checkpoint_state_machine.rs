@@ -31,6 +31,15 @@ use strum::EnumCount;
 
 const COLLECT_PREEMPTION_THRESHOLD: usize = 1024;
 
+macro_rules! with_mvcc_checkpoint_allocation_site {
+    ($site:ident, $expr:expr) => {{
+        #[cfg(feature = "allocation_metric")]
+        let _turso_allocation_site_guard =
+            crate::alloc::enter_allocation_site(crate::alloc::MvccCheckpointAllocationSite::$site);
+        $expr
+    }};
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointState {
     AcquireLock,
@@ -565,30 +574,33 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         };
         let db_id = crate::MAIN_DB_ID;
         self.connection.with_schema(db_id, |schema| {
-            schema
-                .sequences
-                .iter()
-                .filter(|(_, seq)| !seq.cycle)
-                .filter_map(|(_, seq)| {
-                    let backing_name =
-                        crate::translate::sequence::sequence_backing_table_name(&seq.name);
-                    let bt = schema.get_btree_table(&backing_name)?;
-                    let backing_root = resolve_root(bt.root_page)?;
-                    // Resolve the MVCC table_id once per sequence so the
-                    // per-row purge in `ScanDelete` doesn't re-scan
-                    // `table_id_to_rootpage` on every deletion. Uses the
-                    // schema-side root (pre-resolve) because
-                    // `get_table_id_from_root_page` already understands
-                    // the negative uncheckpointed-sentinel encoding.
-                    let table_id = self.mvstore.get_table_id_from_root_page(bt.root_page);
-                    Some(SeqCompaction {
-                        backing_root,
-                        backing_num_cols: bt.columns().len(),
-                        table_id,
-                        increment_positive: seq.increment_by >= 0,
+            with_mvcc_checkpoint_allocation_site!(
+                CheckpointSequenceCompactions,
+                schema
+                    .sequences
+                    .values()
+                    .filter(|seq| !seq.cycle)
+                    .filter_map(|seq| {
+                        let backing_name =
+                            crate::translate::sequence::sequence_backing_table_name(&seq.name);
+                        let bt = schema.get_btree_table(&backing_name)?;
+                        let backing_root = resolve_root(bt.root_page)?;
+                        // Resolve the MVCC table_id once per sequence so the
+                        // per-row purge in `ScanDelete` doesn't re-scan
+                        // `table_id_to_rootpage` on every deletion. Uses the
+                        // schema-side root (pre-resolve) because
+                        // `get_table_id_from_root_page` already understands
+                        // the negative uncheckpointed-sentinel encoding.
+                        let table_id = self.mvstore.get_table_id_from_root_page(bt.root_page);
+                        Some(SeqCompaction {
+                            backing_root,
+                            backing_num_cols: bt.columns().len(),
+                            table_id,
+                            increment_positive: seq.increment_by >= 0,
+                        })
                     })
-                })
-                .collect()
+                    .collect()
+            )
         })
     }
 
@@ -993,7 +1005,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
                 if !skip_write {
                     tracing::trace!("adding to write_set {:?}", (&version, &special_write));
-                    self.write_set.push((version, special_write));
+                    with_mvcc_checkpoint_allocation_site!(
+                        CheckpointWriteSet,
+                        self.write_set.push((version, special_write))
+                    );
                 }
             }
             processed += 1;
@@ -1057,7 +1072,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
                     // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
                     // the database file.
-                    self.index_write_set.push((index_id, version, is_delete));
+                    with_mvcc_checkpoint_allocation_site!(
+                        CheckpointIndexWriteSet,
+                        self.index_write_set.push((index_id, version, is_delete))
+                    );
                 }
                 processed += 1;
                 if processed >= COLLECT_PREEMPTION_THRESHOLD {
@@ -1425,21 +1443,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             ],
             2,
         )?;
-        let row = Row::new_table_row(
-            RowID::new(table_id, RowKey::Int(1)),
-            record.get_payload().to_vec(),
-            num_columns,
+        // TODO eleminate this allocation here by just returing the underlying vec in ImmutableRecord.
+        // this can only be done when ImmutableRecord starts using Vec<u8, TursoAllocator>
+        let payload = with_mvcc_checkpoint_allocation_site!(
+            CheckpointMetadataPayload,
+            record.get_payload().to_vec()
         );
-        self.write_set.push((
-            RowVersion {
-                id: 0,
-                begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(new))),
-                end: crate::mvcc::database::PackedTs::pack(None),
-                row,
-                btree_resident: true,
-            },
-            None,
-        ));
+        let row = Row::new_table_row(RowID::new(table_id, RowKey::Int(1)), payload, num_columns);
+        with_mvcc_checkpoint_allocation_site!(
+            CheckpointWriteSet,
+            self.write_set.push((
+                RowVersion {
+                    id: 0,
+                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(
+                        new,
+                    ))),
+                    end: crate::mvcc::database::PackedTs::pack(None),
+                    row,
+                    btree_resident: true,
+                },
+                None,
+            ))
+        );
         Ok(())
     }
 
