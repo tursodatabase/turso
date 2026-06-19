@@ -186,14 +186,27 @@ enum CommitState {
     Committing,
     /// Committing attached database pagers after main pager commit is done.
     CommittingAttached,
-    /// Multi-database MVCC commit in progress: every state machine in `sms` has
-    /// already passed the validation phase, so what remains is durable
-    /// finalization. We process them sequentially; on IO yield, we resume at
-    /// `current` after the IO completes.
+    /// Multi-database MVCC commit in progress. `phase` distinguishes the
+    /// validation pass — which must complete for every DB before any is
+    /// finalized, so a validation conflict rolls them all back atomically —
+    /// from durable finalization. We process `sms` sequentially; on IO yield
+    /// we resume at `current` within the same `phase` after the IO completes.
     CommittingMultiDbMvcc {
         sms: Vec<DbCommitSm>,
         current: usize,
+        phase: MultiDbCommitPhase,
     },
+}
+
+/// Phase of an in-progress multi-database MVCC commit (`CommittingMultiDbMvcc`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultiDbCommitPhase {
+    /// Stepping each DB through `Initial`/`Commit`. No DB may finalize until
+    /// every DB has validated. Yields only under yield injection
+    /// (test/simulator); on resume we continue validating from `current`.
+    Validating,
+    /// Every DB validated; running durable finalization (may yield real IO).
+    Finalizing,
 }
 
 impl CommitState {
@@ -282,30 +295,37 @@ impl std::fmt::Debug for DbCommitSm {
     }
 }
 
-/// Drive a per-DB commit state machine through `Initial` and `Commit` only.
-/// MVCC validation is purely synchronous (no IO yields), so on success the
-/// state machine is left at the next post-validation state, ready for
-/// `continue_multi_db_mvcc_commit` to finalize it.
+/// Step a per-DB commit state machine through its validation phase (`Initial`
+/// and `Commit`) only, stopping at the first post-validation state. Returns
+/// `IOResult::IO` if the state machine yields mid-validation, so the caller can
+/// suspend the whole multi-DB commit and resume later without having finalized
+/// any DB.
+///
+/// In production MVCC validation performs no real IO, so this completes
+/// synchronously. Under `cfg(any(test, injected_yields))`,
+/// `inject_transition_yield!` injects synthetic yields at the `Initial`/
+/// `Commit` boundaries (`CommitYieldPoint::{CommitValidation,
+/// WaitForDependencies}`, added to the commit state machine after this path was
+/// originally written). We must propagate those yields — swallowing them would
+/// make the commit unable to pause mid-validation, which the concurrency tests
+/// and deterministic simulator rely on (e.g. a writer interleaving while this
+/// tx is `Preparing`). The post-validation finalization phase already yields
+/// the same way.
 fn step_through_validation(
     sm: &mut StateMachine<Box<CommitStateMachine<MvccClock>>>,
     mv_store: &Arc<MvStore>,
-) -> Result<()> {
+) -> Result<IOResult<()>> {
     loop {
         if sm.is_finalized() {
-            return Ok(());
+            return Ok(IOResult::Done(()));
         }
         if sm.current_state().is_past_validation() {
-            return Ok(());
+            return Ok(IOResult::Done(()));
         }
         match sm.try_step_inner(mv_store)? {
             TransitionResult::Continue => continue,
-            TransitionResult::Done(()) => return Ok(()),
-            TransitionResult::Io(_) => {
-                panic!(
-                    "MVCC validation phase yielded IO; only post-validation \
-                     states are allowed to perform IO"
-                );
-            }
+            TransitionResult::Done(()) => return Ok(IOResult::Done(())),
+            TransitionResult::Io(io) => return Ok(IOResult::IO(io)),
         }
     }
 }
@@ -2211,32 +2231,17 @@ impl Program {
             }
 
             if !sms.is_empty() {
-                // Phase 1: validate every DB. Validation is synchronous (no IO
-                // yields), so a failure on DB N can be cleanly rolled back on
-                // DBs 0..N-1 by walking the same vector.
-                let mut validation_err: Option<LimboError> = None;
-                for entry in &mut sms {
-                    if let Err(e) =
-                        step_through_validation(&mut entry.state_machine, &entry.mv_store)
-                    {
-                        validation_err = Some(e);
-                        break;
-                    }
-                }
-
-                if let Some(err) = validation_err {
-                    rollback_validated_sms(&sms, &conn);
-                    // Belt-and-suspenders: clear any tx tracking that
-                    // rollback_tx didn't already (e.g. for state machines that
-                    // failed before set_mv_tx_for_db was reached).
-                    conn.set_mv_tx(None);
-                    conn.rollback_attached_mvcc_txs(true);
-                    return Err(err);
-                }
-
-                // Phase 2: finalize every DB. May yield IO; on yield we keep
-                // the remaining state machines alive in `commit_state`.
-                program_state.commit_state = CommitState::CommittingMultiDbMvcc { sms, current: 0 };
+                // Move the state machines into `commit_state` before stepping
+                // any of them: validation can yield (under yield injection),
+                // and tracking them here means a statement abandoned mid-yield
+                // is rolled back by `cleanup_abandoned_mvcc_commit`. The driver
+                // validates every DB before finalizing any, so a validation
+                // conflict rolls them all back atomically.
+                program_state.commit_state = CommitState::CommittingMultiDbMvcc {
+                    sms,
+                    current: 0,
+                    phase: MultiDbCommitPhase::Validating,
+                };
                 match self.continue_multi_db_mvcc_commit(&pager, &conn, program_state)? {
                     IOResult::Done(()) => {}
                     IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -2272,69 +2277,140 @@ impl Program {
         Ok(IOResult::Done(()))
     }
 
-    /// Walk every per-DB commit state machine through its remaining post-
-    /// validation states (`WaitForDependencies` → `CommitEnd`). Yields IO when
-    /// the active state machine yields; on resume, picks up at `current` and
-    /// keeps going. Caller must have already moved `commit_state` into
-    /// `CommittingMultiDbMvcc { .. }`.
+    /// Drive every per-DB commit state machine to completion in two phases.
+    ///
+    /// In `Validating`, each DB is stepped through `Initial`/`Commit` (see
+    /// `step_through_validation`); no DB is finalized until all have validated,
+    /// so a validation conflict rolls them all back atomically. In
+    /// `Finalizing`, each validated DB runs its durable post-validation states
+    /// (`WaitForDependencies` → `CommitEnd`). Either phase may yield IO; on
+    /// resume we pick up at `current` within the recorded `phase`. Caller must
+    /// have already moved `commit_state` into `CommittingMultiDbMvcc { .. }`.
     fn continue_multi_db_mvcc_commit(
         &self,
         main_pager: &Arc<Pager>,
         conn: &Arc<Connection>,
         program_state: &mut ProgramState,
     ) -> Result<IOResult<()>> {
+        // Outcome of one unit of work, computed under a scoped borrow of
+        // `commit_state` so the validation-failure arm can replace it after the
+        // borrow ends.
+        enum Step {
+            Continue,
+            Yield(IOCompletions),
+            ValidationFailed(LimboError),
+            Finished,
+        }
         loop {
-            let CommitState::CommittingMultiDbMvcc { sms, current } =
-                &mut program_state.commit_state
-            else {
-                unreachable!("continue_multi_db_mvcc_commit called outside CommittingMultiDbMvcc");
-            };
-            if *current >= sms.len() {
-                break;
-            }
-            let idx = *current;
-            // Split borrow so we can pass `&entry.mv_store` to `step` while
-            // also holding `&mut entry.state_machine`.
-            let DbCommitSm {
-                state_machine,
-                mv_store,
-                db_id,
-                pager: db_pager,
-            } = &mut sms[idx];
-            let db_id = *db_id;
-            // The validation pass may have already finalized this state
-            // machine via the read-only fast path in `Initial` (which calls
-            // `finish_committed_tx` under the hood). We still owe the
-            // connection-side cleanup that the old commit path did
-            // unconditionally on `Done`: clearing tx state and releasing the
-            // pager's read lock.
-            if state_machine.is_finalized() {
-                if db_id == crate::MAIN_DB_ID {
-                    conn.set_mv_tx(None);
-                    conn.set_tx_state(TransactionState::None);
-                    main_pager.end_read_tx();
-                } else {
-                    conn.set_mv_tx_for_db(db_id, None);
-                    db_pager.end_read_tx();
-                }
-                *current += 1;
-                continue;
-            }
-            match state_machine.step(mv_store)? {
-                IOResult::Done(_) => {
-                    debug_assert!(state_machine.is_finalized());
-                    conn.publish_database_schema(db_id);
-                    if db_id == crate::MAIN_DB_ID {
-                        conn.set_mv_tx(None);
-                        conn.set_tx_state(TransactionState::None);
-                        main_pager.end_read_tx();
-                    } else {
-                        conn.set_mv_tx_for_db(db_id, None);
-                        db_pager.end_read_tx();
+            let step = {
+                let CommitState::CommittingMultiDbMvcc {
+                    sms,
+                    current,
+                    phase,
+                } = &mut program_state.commit_state
+                else {
+                    unreachable!(
+                        "continue_multi_db_mvcc_commit called outside CommittingMultiDbMvcc"
+                    );
+                };
+                match phase {
+                    MultiDbCommitPhase::Validating => {
+                        if *current >= sms.len() {
+                            // Every DB validated — restart from the top to
+                            // finalize.
+                            *phase = MultiDbCommitPhase::Finalizing;
+                            *current = 0;
+                            Step::Continue
+                        } else {
+                            let entry = &mut sms[*current];
+                            match step_through_validation(&mut entry.state_machine, &entry.mv_store)
+                            {
+                                Ok(IOResult::Done(())) => {
+                                    *current += 1;
+                                    Step::Continue
+                                }
+                                Ok(IOResult::IO(io)) => Step::Yield(io),
+                                Err(e) => Step::ValidationFailed(e),
+                            }
+                        }
                     }
-                    *current += 1;
+                    MultiDbCommitPhase::Finalizing => {
+                        if *current >= sms.len() {
+                            Step::Finished
+                        } else {
+                            let idx = *current;
+                            // Split borrow so we can pass `&entry.mv_store` to
+                            // `step` while also holding `&mut state_machine`.
+                            let DbCommitSm {
+                                state_machine,
+                                mv_store,
+                                db_id,
+                                pager: db_pager,
+                            } = &mut sms[idx];
+                            let db_id = *db_id;
+                            // A read-only tx may have been finalized during
+                            // validation via the `Initial` fast path (which
+                            // calls `finish_committed_tx`). We still owe the
+                            // connection-side cleanup the commit path does on
+                            // `Done`: clearing tx state and releasing the
+                            // pager's read lock.
+                            if state_machine.is_finalized() {
+                                if db_id == crate::MAIN_DB_ID {
+                                    conn.set_mv_tx(None);
+                                    conn.set_tx_state(TransactionState::None);
+                                    main_pager.end_read_tx();
+                                } else {
+                                    conn.set_mv_tx_for_db(db_id, None);
+                                    db_pager.end_read_tx();
+                                }
+                                *current += 1;
+                                Step::Continue
+                            } else {
+                                match state_machine.step(mv_store)? {
+                                    IOResult::Done(_) => {
+                                        debug_assert!(state_machine.is_finalized());
+                                        conn.publish_database_schema(db_id);
+                                        if db_id == crate::MAIN_DB_ID {
+                                            conn.set_mv_tx(None);
+                                            conn.set_tx_state(TransactionState::None);
+                                            main_pager.end_read_tx();
+                                        } else {
+                                            conn.set_mv_tx_for_db(db_id, None);
+                                            db_pager.end_read_tx();
+                                        }
+                                        *current += 1;
+                                        Step::Continue
+                                    }
+                                    IOResult::IO(io) => Step::Yield(io),
+                                }
+                            }
+                        }
+                    }
                 }
-                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            };
+
+            match step {
+                Step::Continue => continue,
+                Step::Yield(io) => return Ok(IOResult::IO(io)),
+                Step::Finished => break,
+                Step::ValidationFailed(err) => {
+                    // Validation failed for one DB; none have finalized yet, so
+                    // take the state machines back out of `commit_state` (also
+                    // resetting it to `Ready`) and roll every DB back so the
+                    // multi-DB commit is atomic on conflict.
+                    let CommitState::CommittingMultiDbMvcc { sms, .. } =
+                        std::mem::replace(&mut program_state.commit_state, CommitState::Ready)
+                    else {
+                        unreachable!("commit_state changed during multi-DB validation");
+                    };
+                    rollback_validated_sms(&sms, conn);
+                    // Belt-and-suspenders: clear any tx tracking that
+                    // rollback_tx didn't already (e.g. for state machines that
+                    // failed before set_mv_tx_for_db was reached).
+                    conn.set_mv_tx(None);
+                    conn.rollback_attached_mvcc_txs(true);
+                    return Err(err);
+                }
             }
         }
         program_state.commit_state = CommitState::Ready;
