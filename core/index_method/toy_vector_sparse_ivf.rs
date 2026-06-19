@@ -315,6 +315,8 @@ pub struct VectorSparseInvertedIndexMethodCursor {
     delete_state: VectorSparseInvertedIndexDeleteState,
     search_state: VectorSparseInvertedIndexSearchState,
     search_result: VecDeque<(i64, f64)>,
+    /// Outer-join null-row flag. See [`IndexMethodCursor::set_null_flag`].
+    null_flag: bool,
 }
 
 impl IndexMethod for VectorSparseInvertedIndexMethod {
@@ -389,6 +391,7 @@ impl VectorSparseInvertedIndexMethodCursor {
             insert_state: VectorSparseInvertedIndexInsertState::Init,
             delete_state: VectorSparseInvertedIndexDeleteState::Init,
             search_state: VectorSparseInvertedIndexSearchState::Init,
+            null_flag: false,
         }
     }
 }
@@ -1601,5 +1604,13 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
     fn query_next(&mut self) -> Result<IOResult<bool>> {
         let _ = self.search_result.pop_front();
         Ok(IOResult::Done(!self.search_result.is_empty()))
+    }
+
+    fn set_null_flag(&mut self, flag: bool) {
+        self.null_flag = flag;
+    }
+
+    fn get_null_flag(&self) -> bool {
+        self.null_flag
     }
 }

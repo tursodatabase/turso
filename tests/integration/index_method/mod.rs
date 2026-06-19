@@ -647,6 +647,105 @@ fn test_fts_sql_queries(tmp_db: TempDatabase) {
     assert!(ids.contains(&4));
 }
 
+/// Regression test for https://github.com/tursodatabase/turso/issues/7531
+///
+/// A LEFT JOIN whose nullable side is driven by an FTS index method used to panic
+/// ("set_null_flag on unexpected cursor type") whenever the FTS search produced no
+/// right-side rows: the executor applied `NullRow` to the index-method cursor, which
+/// did not support null-extension. The cursor must instead null-extend like a BTree
+/// or virtual-table cursor.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_left_join_null_extension(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE terms(id INTEGER PRIMARY KEY, q TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(title, body)")
+        .unwrap();
+    conn.execute("INSERT INTO terms VALUES (1,'database'),(2,'rust'),(3,'missing')")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (10,'database','x')")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (20,'rust','database')")
+        .unwrap();
+
+    // Helper: collect (terms.id, Option<docs.id>) pairs from a result set.
+    let pairs = |rows: Vec<Vec<rusqlite::types::Value>>| -> Vec<(i64, Option<i64>)> {
+        rows.iter()
+            .map(|r| {
+                let left = match &r[0] {
+                    rusqlite::types::Value::Integer(i) => *i,
+                    other => panic!("expected integer terms.id, got {other:?}"),
+                };
+                let right = match &r[1] {
+                    rusqlite::types::Value::Integer(i) => Some(*i),
+                    rusqlite::types::Value::Null => None,
+                    other => panic!("expected integer or null docs.id, got {other:?}"),
+                };
+                (left, right)
+            })
+            .collect()
+    };
+
+    // Exact repro from the issue: a constant FTS query that matches nothing means
+    // every outer row must be null-extended rather than panicking.
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT terms.id, docs.id \
+         FROM terms LEFT JOIN docs ON fts_match(docs.title, docs.body, 'nomatch') \
+         ORDER BY terms.id, docs.id",
+    );
+    assert_eq!(
+        pairs(rows),
+        vec![(1, None), (2, None), (3, None)],
+        "constant non-matching FTS query must null-extend every outer row"
+    );
+
+    // Mixed case with a correlated FTS query: some outer rows match, some don't.
+    // This exercises the null-flag *reset* on re-query — a no-match row must not
+    // leak NULLs into a subsequent matching row, and vice versa. 'database' hits
+    // doc 10 (title) and doc 20 (body); 'rust' hits doc 20 (title); 'missing' hits
+    // nothing and is null-extended.
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT terms.id, docs.id \
+         FROM terms LEFT JOIN docs ON fts_match(docs.title, docs.body, terms.q) \
+         ORDER BY terms.id, docs.id",
+    );
+    assert_eq!(
+        pairs(rows),
+        vec![(1, Some(10)), (1, Some(20)), (2, Some(20)), (3, None)],
+        "correlated FTS LEFT JOIN must return real matches and null-extend non-matches"
+    );
+
+    // Reverse ordering of outer rows so a non-matching row precedes matching ones,
+    // specifically stressing that a stale null flag is cleared before the next match.
+    conn.execute("DELETE FROM terms").unwrap();
+    conn.execute("INSERT INTO terms VALUES (1,'missing'),(2,'database'),(3,'nope'),(4,'rust')")
+        .unwrap();
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT terms.id, docs.id \
+         FROM terms LEFT JOIN docs ON fts_match(docs.title, docs.body, terms.q) \
+         ORDER BY terms.id, docs.id",
+    );
+    assert_eq!(
+        pairs(rows),
+        vec![
+            (1, None),
+            (2, Some(10)),
+            (2, Some(20)),
+            (3, None),
+            (4, Some(20)),
+        ],
+        "a non-matching outer row must not leak NULLs into following matching rows"
+    );
+}
+
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test]
 fn test_fts_order_by_and_limit(tmp_db: TempDatabase) {

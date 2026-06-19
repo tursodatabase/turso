@@ -126,6 +126,22 @@ pub trait IndexMethodCursor {
     /// Return column with given idx (zero-based) from current row
     fn query_column(&mut self, idx: usize) -> Result<IOResult<Value>>;
 
+    /// Records the outer-join "null row" flag for this cursor.
+    ///
+    /// In an outer join, when the nullable side produces no matching row the query must still
+    /// emit a row for the outer side with every column of the inner side set to NULL (see
+    /// [`crate::vdbe::insn::Insn::NullRow`]). The executor sets this flag and then consults
+    /// [`Self::get_null_flag`] before reading columns/rowids, substituting NULL instead of
+    /// calling [`Self::query_column`]/[`Self::query_rowid`]. The flag is cleared when the cursor
+    /// is repositioned by a new [`Self::query_start`].
+    ///
+    /// Implementations only need to store the flag; the NULL substitution itself happens in the
+    /// executor, mirroring how BTree and virtual-table cursors behave.
+    fn set_null_flag(&mut self, flag: bool);
+
+    /// Returns the outer-join "null row" flag previously recorded by [`Self::set_null_flag`].
+    fn get_null_flag(&self) -> bool;
+
     /// Return rowid of the original table row which corresponds to the current cursor row
     ///
     /// This method is used by tursodb core in order to "enrich" response from query pattern with additional fields from original table

@@ -1789,6 +1789,8 @@ pub struct FtsCursor {
     current_hits: Vec<(f32, DocAddress, i64)>,
     hit_pos: usize,
     current_pattern: i64,
+    /// Outer-join null-row flag. See [`IndexMethodCursor::set_null_flag`].
+    null_flag: bool,
 }
 
 impl FtsCursor {
@@ -1838,6 +1840,7 @@ impl FtsCursor {
             current_hits: Vec::new(),
             hit_pos: 0,
             current_pattern: FTS_PATTERN_SCORE,
+            null_flag: false,
         }
     }
 
@@ -3269,6 +3272,14 @@ impl IndexMethodCursor for FtsCursor {
         }
         let (_, _, rowid) = self.current_hits[self.hit_pos];
         Ok(IOResult::Done(Some(rowid)))
+    }
+
+    fn set_null_flag(&mut self, flag: bool) {
+        self.null_flag = flag;
+    }
+
+    fn get_null_flag(&self) -> bool {
+        self.null_flag
     }
 
     /// Flushes pending writes before transaction commit.
