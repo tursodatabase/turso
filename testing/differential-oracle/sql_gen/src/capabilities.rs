@@ -39,11 +39,14 @@ pub trait Capabilities: 'static + Clone {
     const PRAGMA: bool;
     const CREATE_TRIGGER: bool;
     const DROP_TRIGGER: bool;
+    const OPTIMIZE_INDEX: bool;
 
     // Transactions
     const BEGIN: bool;
     const COMMIT: bool;
     const ROLLBACK: bool;
+    const SAVEPOINT: bool;
+    const RELEASE: bool;
 
     // Expression features
     const SUBQUERY: bool;
@@ -57,8 +60,6 @@ pub trait Capabilities: 'static + Clone {
     const VACUUM: bool;
     const REINDEX: bool;
     const ANALYZE: bool;
-    const SAVEPOINT: bool;
-    const RELEASE: bool;
 }
 
 // =============================================================================
@@ -110,6 +111,7 @@ impl Capabilities for Full {
     const PRAGMA: bool = true;
     const CREATE_TRIGGER: bool = true;
     const DROP_TRIGGER: bool = true;
+    const OPTIMIZE_INDEX: bool = true;
     const BEGIN: bool = true;
     const COMMIT: bool = true;
     const ROLLBACK: bool = true;
@@ -152,6 +154,7 @@ impl Capabilities for DmlOnly {
     const PRAGMA: bool = false;
     const CREATE_TRIGGER: bool = false;
     const DROP_TRIGGER: bool = false;
+    const OPTIMIZE_INDEX: bool = false;
     const BEGIN: bool = false;
     const COMMIT: bool = false;
     const ROLLBACK: bool = false;
@@ -194,6 +197,7 @@ impl Capabilities for SelectOnly {
     const PRAGMA: bool = false;
     const CREATE_TRIGGER: bool = false;
     const DROP_TRIGGER: bool = false;
+    const OPTIMIZE_INDEX: bool = false;
     const BEGIN: bool = false;
     const COMMIT: bool = false;
     const ROLLBACK: bool = false;
@@ -233,6 +237,7 @@ impl Capabilities for NoSubquery {
     const PRAGMA: bool = true;
     const CREATE_TRIGGER: bool = true;
     const DROP_TRIGGER: bool = true;
+    const OPTIMIZE_INDEX: bool = true;
     const BEGIN: bool = true;
     const COMMIT: bool = true;
     const ROLLBACK: bool = true;

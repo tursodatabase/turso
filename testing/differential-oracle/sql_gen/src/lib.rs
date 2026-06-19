@@ -48,8 +48,8 @@ pub mod trace;
 // Re-export main types
 pub use ast::{
     BinOp, ConflictClause, CreateIndexKind, CteDefinition, CteMaterialization, Expr, Literal, Stmt,
-    TriggerBodyStmtKind, TriggerEvent, TriggerEventKind, TriggerStmt, TriggerTiming, UnaryOp,
-    WithClause,
+    OptimizeIndexStmt, TriggerBodyStmtKind, TriggerEvent, TriggerEventKind, TriggerStmt,
+    TriggerTiming, UnaryOp, WithClause,
 };
 pub use builder::SqlGenBuilder;
 pub use capabilities::{

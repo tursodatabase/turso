@@ -4,7 +4,7 @@ use crate::SqlGen;
 use crate::ast::{
     AlterTableAction, AlterTableActionKind, AlterTableStmt, BinOp, ColumnDefStmt, ConflictClause,
     CreateIndexKind, CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, DeleteStmt,
-    DropIndexStmt, DropTableStmt, DropTriggerStmt, Expr, InsertStmt, Literal,
+    DropIndexStmt, DropTableStmt, DropTriggerStmt, Expr, InsertStmt, Literal, OptimizeIndexStmt,
     PragmaForeignKeyListStmt, Stmt, TemporaryKeyword, TriggerBodyStmtKind, TriggerEvent,
     TriggerEventKind, TriggerStmt, TriggerTiming, UpdateStmt,
 };
@@ -92,6 +92,9 @@ fn collect_capability_allowed_stmts<C: Capabilities>() -> Vec<StmtKind> {
     }
     if C::DROP_INDEX {
         candidates.push(StmtKind::DropIndex);
+    }
+    if C::OPTIMIZE_INDEX {
+        candidates.push(StmtKind::OptimizeIndex);
     }
     if C::PRAGMA {
         candidates.push(StmtKind::PragmaForeignKeyList);
@@ -181,7 +184,7 @@ fn is_stmt_valid_for_schema(
         | StmtKind::CreateIndex
         | StmtKind::CreateTrigger => has_tables,
         // DROP INDEX requires indexes to exist
-        StmtKind::DropIndex => has_indexes,
+        StmtKind::DropIndex | StmtKind::OptimizeIndex => has_indexes,
         // DROP TRIGGER requires triggers to exist
         StmtKind::DropTrigger => has_triggers,
         // These are always valid
@@ -215,6 +218,7 @@ fn dispatch_stmt_generation<C: Capabilities>(
         StmtKind::AlterTable => generate_alter_table(generator, ctx),
         StmtKind::CreateIndex => generate_create_index(generator, ctx),
         StmtKind::DropIndex => generate_drop_index(generator, ctx),
+        StmtKind::OptimizeIndex => generate_optimize_index(generator, ctx),
         StmtKind::PragmaForeignKeyList => generate_pragma_foreign_key_list(generator, ctx),
         StmtKind::Begin => Ok(Stmt::Begin),
         StmtKind::Commit => Ok(Stmt::Commit),
@@ -1082,6 +1086,32 @@ pub fn generate_drop_index<C: Capabilities>(
         name: index_name,
         if_exists: ctx.gen_bool_with_prob(drop_index_config.if_exists_probability),
     }))
+}
+
+/// Generate an OPTIMIZE INDEX statement.
+pub fn generate_optimize_index<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<Stmt, GenError> {
+    let fts_indexes: Vec<_> = generator
+        .schema()
+        .indexes
+        .iter()
+        .filter(|idx| idx.is_fts())
+        .collect();
+    let selected = if fts_indexes.is_empty() {
+        ctx.choose(&generator.schema().indexes)
+    } else {
+        ctx.choose(&fts_indexes).copied()
+    };
+
+    let name = if ctx.gen_bool_with_prob(0.75) {
+        selected.map(|idx| idx.qualified_name())
+    } else {
+        None
+    };
+
+    Ok(Stmt::OptimizeIndex(OptimizeIndexStmt { name }))
 }
 
 /// Generate a PRAGMA foreign_key_list statement.

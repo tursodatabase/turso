@@ -524,6 +524,7 @@ impl Schema {
             | Stmt::Insert(_)
             | Stmt::Update(_)
             | Stmt::Delete(_)
+            | Stmt::OptimizeIndex(_)
             | Stmt::PragmaForeignKeyList(_)
             | Stmt::Begin
             | Stmt::Commit

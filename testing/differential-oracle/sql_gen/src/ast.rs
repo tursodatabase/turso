@@ -26,6 +26,7 @@ pub enum Stmt {
     AlterTable(AlterTableStmt),
     CreateIndex(CreateIndexStmt),
     DropIndex(DropIndexStmt),
+    OptimizeIndex(OptimizeIndexStmt),
     PragmaForeignKeyList(PragmaForeignKeyListStmt),
     CreateTrigger(CreateTriggerStmt),
     DropTrigger(DropTriggerStmt),
@@ -54,6 +55,7 @@ impl fmt::Display for Stmt {
             Stmt::AlterTable(s) => write!(f, "{s}"),
             Stmt::CreateIndex(s) => write!(f, "{s}"),
             Stmt::DropIndex(s) => write!(f, "{s}"),
+            Stmt::OptimizeIndex(s) => write!(f, "{s}"),
             Stmt::PragmaForeignKeyList(s) => write!(f, "{s}"),
             Stmt::CreateTrigger(s) => write!(f, "{s}"),
             Stmt::DropTrigger(s) => write!(f, "{s}"),
@@ -92,6 +94,7 @@ impl Stmt {
             | Stmt::AlterTable(_)
             | Stmt::CreateIndex(_)
             | Stmt::DropIndex(_)
+            | Stmt::OptimizeIndex(_)
             | Stmt::PragmaForeignKeyList(_)
             | Stmt::CreateTrigger(_)
             | Stmt::DropTrigger(_)
@@ -1346,6 +1349,22 @@ impl fmt::Display for DropIndexStmt {
     }
 }
 
+/// An OPTIMIZE INDEX statement.
+#[derive(Debug, Clone)]
+pub struct OptimizeIndexStmt {
+    pub name: Option<String>,
+}
+
+impl fmt::Display for OptimizeIndexStmt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "OPTIMIZE INDEX")?;
+        if let Some(name) = &self.name {
+            write!(f, " {name}")?;
+        }
+        Ok(())
+    }
+}
+
 /// A PRAGMA foreign_key_list statement.
 #[derive(Debug, Clone)]
 pub struct PragmaForeignKeyListStmt {
@@ -2220,6 +2239,21 @@ mod tests {
         assert_eq!(
             create_index.to_string(),
             "CREATE INDEX IF NOT EXISTS docs_fts ON docs USING fts (title, body) WITH (tokenizer = 'raw', weights = 'title=4.0,body=1.0')"
+        );
+    }
+
+    #[test]
+    fn test_optimize_index_display() {
+        assert_eq!(
+            OptimizeIndexStmt {
+                name: Some("docs_fts".to_string())
+            }
+            .to_string(),
+            "OPTIMIZE INDEX docs_fts"
+        );
+        assert_eq!(
+            OptimizeIndexStmt { name: None }.to_string(),
+            "OPTIMIZE INDEX"
         );
     }
 
