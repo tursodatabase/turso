@@ -334,10 +334,19 @@ jobs:
         run: make test
 
   concurrent-simulator:
+    name: "Concurrent simulator (${{ matrix.toolchain.label }}, ${{ matrix.profile.name }})"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 40
     strategy:
+      fail-fast: false
       matrix:
+        toolchain:
+          - label: stable
+            version: "1.88.0"
+            rustflags: ""
+          - label: nightly
+            version: "nightly-2025-12-17"
+            rustflags: "--cfg nightly"
         profile:
           - name: in-process
             iterations: 100
@@ -353,21 +362,28 @@ jobs:
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain.version }}
       - name: Setup mold linker
         uses: "./.github/shared/setup-mold"
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust"
+          prefix-key: "v1-rust-whopper-${{ matrix.toolchain.label }}"
           cache-on-failure: true
       - uses: "./.github/shared/setup-sccache"
       - name: Run turso_whopper regression tests
         if: matrix.profile.name == 'in-process'
-        run: cargo test -p turso_whopper --test regression_tests
+        env:
+          RUSTFLAGS: ${{ matrix.toolchain.rustflags }}
+        run: cargo +${{ matrix.toolchain.version }} test -p turso_whopper --test regression_tests
         timeout-minutes: 15
-      - name: Run turso_whopper (${{ matrix.profile.name }})
+      - name: Run turso_whopper (${{ matrix.toolchain.label }}, ${{ matrix.profile.name }})
+        env:
+          RUSTFLAGS: ${{ matrix.toolchain.rustflags }}
         run: |
-          cargo build -p turso_whopper --release
+          cargo +${{ matrix.toolchain.version }} build -p turso_whopper --release
           for i in $(seq 1 ${{ matrix.profile.iterations }}); do
             ./target/release/turso_whopper ${{ matrix.profile.args }} || exit 1
           done
