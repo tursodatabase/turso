@@ -1,7 +1,9 @@
 use crate::common::{ExecRows, TempDatabase};
 use std::path::Path;
 use std::sync::Arc;
-use turso_core::{Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, StepResult};
+use turso_core::{
+    Database, DatabaseOpts, EncryptionKey, EncryptionOpts, LimboError, OpenFlags, StepResult,
+};
 
 /// Create a new database file at `path` with MVCC journal mode enabled.
 /// This is needed because ATTACH requires the attached DB's journal mode
