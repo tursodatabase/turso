@@ -1254,14 +1254,20 @@ pub struct CreateIndexStmt {
     pub name: String,
     pub table: String,
     pub columns: Vec<String>,
-    pub unique: bool,
+    pub kind: CreateIndexKind,
     pub if_not_exists: bool,
+}
+
+/// Index method and method-specific options for `CREATE INDEX`.
+#[derive(Debug, Clone)]
+pub enum CreateIndexKind {
+    BTree { unique: bool },
 }
 
 impl fmt::Display for CreateIndexStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "CREATE ")?;
-        if self.unique {
+        if matches!(&self.kind, CreateIndexKind::BTree { unique: true }) {
             write!(f, "UNIQUE ")?;
         }
         write!(f, "INDEX ")?;

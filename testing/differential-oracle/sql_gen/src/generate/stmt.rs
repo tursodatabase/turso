@@ -3,9 +3,10 @@
 use crate::SqlGen;
 use crate::ast::{
     AlterTableAction, AlterTableActionKind, AlterTableStmt, BinOp, ColumnDefStmt, ConflictClause,
-    CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, DeleteStmt, DropIndexStmt, DropTableStmt,
-    DropTriggerStmt, Expr, InsertStmt, Literal, PragmaForeignKeyListStmt, Stmt, TemporaryKeyword,
-    TriggerBodyStmtKind, TriggerEvent, TriggerEventKind, TriggerStmt, TriggerTiming, UpdateStmt,
+    CreateIndexKind, CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, DeleteStmt,
+    DropIndexStmt, DropTableStmt, DropTriggerStmt, Expr, InsertStmt, Literal,
+    PragmaForeignKeyListStmt, Stmt, TemporaryKeyword, TriggerBodyStmtKind, TriggerEvent,
+    TriggerEventKind, TriggerStmt, TriggerTiming, UpdateStmt,
 };
 use crate::capabilities::Capabilities;
 use crate::context::Context;
@@ -1053,7 +1054,9 @@ pub fn generate_create_index<C: Capabilities>(
         name: qualified_index_name,
         table: table.unqualified_name().to_string(),
         columns,
-        unique: ctx.gen_bool_with_prob(create_index_config.unique_probability),
+        kind: CreateIndexKind::BTree {
+            unique: ctx.gen_bool_with_prob(create_index_config.unique_probability),
+        },
         if_not_exists: ctx.gen_bool_with_prob(create_index_config.if_not_exists_probability),
     }))
 }
