@@ -42,6 +42,17 @@ fn try_extend_accepts_iterators_without_upper_bounds() {
     assert_eq!(values.as_slice(), &[0, 1, 2]);
 }
 
+#[cfg(nightly)]
+#[test]
+fn vec_try_extend_reserves_before_mutation() {
+    let mut values = self::vec![1];
+
+    let result = values.try_extend(std::iter::repeat(2).take(usize::MAX));
+
+    assert!(result.is_err());
+    assert_eq!(values.as_slice(), &[1]);
+}
+
 #[test]
 fn hash_set_try_insert_and_extend_reserve_before_mutation() {
     let mut values: HashSet<usize> = HashSet::default();
