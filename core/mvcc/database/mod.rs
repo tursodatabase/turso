@@ -29,6 +29,7 @@ use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
+use crate::types::ImmutableRecordRef;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
 use crate::File;
@@ -650,8 +651,7 @@ fn portable_delete_op_extension_for_row_version<Clock: LogicalClock, A: Concurre
         let values = match &record_values {
             Some(values) => values,
             None => record_values.insert(
-                ImmutableRecord::from_bin_record(row_version.row.payload().to_vec())
-                    .get_values_owned()?,
+                ImmutableRecordRef::from_bin_record(row_version.row.payload()).get_values_owned()?,
             ),
         };
         let physical_column = table.logical_to_physical_column(logical_column);
@@ -7693,14 +7693,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     } if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID => {
                         let schema_rows_after =
                             schema_rows_after.get_or_insert_with(|| schema_rows.clone());
-                        let record = ImmutableRecord::from_bin_record(record_bytes.clone());
-                        if record.column_count() < 5 {
+                        let record = ImmutableRecordRef::from_bin_record(record_bytes);
+                        let column_count = record.column_count();
+                        if column_count < 5 {
                             return Err(LimboError::Corrupt(format!(
-                                "sqlite_schema row must have at least 5 columns, got {}",
-                                record.column_count()
+                                "sqlite_schema row must have at least 5 columns, got {column_count}",
                             )));
                         }
-                        schema_rows_after.insert(rowid.row_id.to_int_or_panic(), record);
+                        schema_rows_after.insert(
+                            rowid.row_id.to_int_or_panic(),
+                            ImmutableRecord::from_bin_record(record_bytes.clone()),
+                        );
                     }
                     ParsedOp::DeleteTable { rowid, .. }
                         if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID =>
@@ -7842,12 +7845,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             }
                             let is_schema_row = rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
                             if is_schema_row {
-                                let row_data = row.payload().to_vec();
-                                let record = ImmutableRecord::from_bin_record(row_data);
-                                if record.column_count() < 5 {
+                                let record = ImmutableRecordRef::from_bin_record(row.payload());
+                                let column_count = record.column_count();
+                                if column_count < 5 {
                                     return Err(LimboError::Corrupt(format!(
-                                        "sqlite_schema row must have at least 5 columns, got {}",
-                                        record.column_count()
+                                        "sqlite_schema row must have at least 5 columns, got {column_count}",
                                     )));
                                 }
                                 let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
@@ -7926,7 +7928,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     )));
                                 }
                                 let rowid_int = rowid.row_id.to_int_or_panic();
-                                schema_rows.insert(rowid_int, record);
+                                schema_rows.insert(
+                                    rowid_int,
+                                    ImmutableRecord::from_bin_record(row.payload().to_vec()),
+                                );
                             } else if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
                                 // Data row references a table_id not yet in the map. This can happen
                                 // with logs written before the schema-first serialization fix: in a

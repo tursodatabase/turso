@@ -3481,6 +3481,7 @@ impl StreamingLogicalLogReader {
             } => {
                 // Compute column_count from the serialized record so recovered rows keep
                 // the same shape metadata as non-recovered rows.
+                // Decode shape metadata by reference; ownership is only needed for the row payload.
                 let column_count =
                     crate::types::ImmutableRecordRef::from_bin_record(&record_bytes).column_count();
                 let row = Row::new_table_row(
