@@ -420,7 +420,7 @@ impl Property {
                     ));
                 }
 
-                let columns_for_assertion = columns.clone();
+                let columns_for_assertion = columns;
                 let table_for_assertion = table_name.clone();
                 let assertion = InteractionType::Assertion(Assertion::new(
                     format!("each column of {table_name} matches the simulator model"),
@@ -479,14 +479,13 @@ impl Property {
 
                             if db_counts != model_counts {
                                 return Ok(Err(format!(
-                                    "column {col_name} of {table_for_assertion} disagrees with model: db={:?} model={:?}",
-                                    db_counts, model_counts
+                                    "column {col_name} of {table_for_assertion} disagrees with model: db={db_counts:?} model={model_counts:?}"
                                 )));
                             }
                         }
                         Ok(Ok(()))
                     },
-                    vec![table_name.clone()],
+                    vec![table_name],
                 ));
                 builders.push(InteractionBuilder::with_interaction(assertion));
                 builders

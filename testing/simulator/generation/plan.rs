@@ -335,7 +335,7 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
                 None => {
                     // after we generated all interactions if some connection is still in a
                     // transaction, commit
-                    let commit = (0..env.connections.len())
+                    (0..env.connections.len())
                         .find(|idx| env.conn_in_transaction(*idx))
                         .map(|conn_index| {
                             let query = Query::Commit(Commit);
@@ -353,9 +353,7 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
                             self.plan.push_interactions(interactions);
 
                             interaction
-                        });
-
-                    commit
+                        })
                 }
             }
         };
