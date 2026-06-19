@@ -220,7 +220,7 @@ fn mv_store_skiplist_allocations_are_fallible() {
         btree_resident: false,
     };
     let result = store.insert_version(row_id, row_version);
-    assert!(matches!(result, Err(LimboError::OutOfMemory)));
+    assert!(matches!(result, Err(crate::alloc::TryReserveError)));
     assert!(store.rows.is_empty());
 }
 
@@ -8777,7 +8777,7 @@ fn test_gc_incremental_respects_held_snapshot() {
 
     // Close the snapshot; now incremental GC reclaims the superseded v1
     // without any checkpoint having run.
-    db.mvcc_store.remove_tx(tx2);
+    db.mvcc_store.remove_tx(tx2).unwrap();
     assert_eq!(
         db.mvcc_store
             .gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC),

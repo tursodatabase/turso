@@ -115,6 +115,8 @@ pub type RowVersions = Arc<RwLock<Vec<RowVersion>>>;
 type TableRowEntry<'a, A = TursoAllocator> = Entry<'a, RowID, RowVersions, BasicComparator, A>;
 type IndexRowEntry<'a, A = TursoAllocator> =
     Entry<'a, Arc<SortableIndexKey>, RowVersions, BasicComparator, A>;
+type IndexRowsEntry<'a, A = TursoAllocator> =
+    Entry<'a, MVTableId, IndexRowsMap<A>, BasicComparator, A>;
 type TableRowIterator<'a, A = TursoAllocator> =
     Box<dyn Iterator<Item = TableRowEntry<'a, A>> + Send + Sync + 'a>;
 type IndexRowIterator<'a, A = TursoAllocator> =
@@ -3908,7 +3910,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) -> Result<Self> {
         let table_id_to_rootpage = SkipMap::new_in(alloc.clone());
         // table id 1 / root page 1 is always sqlite_schema.
-        table_id_to_rootpage.try_insert(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1))?;
+        Self::insert_initial_rootpage_mapping(&table_id_to_rootpage)?;
         Ok(Self {
             rows: SkipMap::new_in(alloc.clone()),
             table_id_to_rootpage,
@@ -3941,6 +3943,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             gc_in_progress: AtomicBool::new(false),
             gc_last_lwm: AtomicU64::new(u64::MAX),
         })
+    }
+
+    #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::RootpageMappingInsert)]
+    fn insert_initial_rootpage_mapping(
+        table_id_to_rootpage: &SkipMap<MVTableId, Option<u64>, BasicComparator, A>,
+    ) -> Result<(), TryReserveError> {
+        table_id_to_rootpage.try_insert(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1))?;
+        Ok(())
     }
 
     /// Get the table ID from the root page.
@@ -4778,10 +4788,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tracing::trace!("delete(tx_id={}, id={:?})", tx_id, id);
         match maybe_index_id {
             Some(index_id) => {
-                let alloc = self.alloc.clone();
-                let rows = self
-                    .index_rows
-                    .try_get_or_insert_with(index_id, move || SkipMap::new_in(alloc))?;
+                let rows = self.get_or_create_index_rows(index_id)?;
                 let rows = rows.value();
                 let RowKey::Record(sortable_key) = id.row_id.clone() else {
                     panic!("Index deletes must have a record row_id");
@@ -4897,10 +4904,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         turso_assert_eq!(tx.state, TransactionState::Active);
         match maybe_index_id {
             Some(index_id) => {
-                let alloc = self.alloc.clone();
-                let rows = self
-                    .index_rows
-                    .try_get_or_insert_with(index_id, move || SkipMap::new_in(alloc))?;
+                let rows = self.get_or_create_index_rows(index_id)?;
                 let rows = rows.value();
                 let RowKey::Record(sortable_key) = &id.row_id else {
                     panic!("Index reads must have a record row_id");
@@ -5273,10 +5277,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tx_id: TxID,
         index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
     ) -> Result<Option<RowID>> {
-        let alloc = self.alloc.clone();
-        let index_rows = self
-            .index_rows
-            .try_get_or_insert_with(index_id, move || SkipMap::new_in(alloc))?;
+        let index_rows = self.get_or_create_index_rows(index_id)?;
         let index_rows = index_rows.value();
         let range = if eq_only {
             // An eq-only seek (point lookup, NoConflict, unique-constraint probe,
@@ -6826,14 +6827,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     /// Inserts a new row version into the database, while making sure that the row version
     /// is inserted in the correct order. Returns a reference to the modified version chain.
+    fn insert_version(
+        &self,
+        id: RowID,
+        row_version: RowVersion,
+    ) -> Result<RowVersions, TryReserveError> {
+        let row_versions = self.get_or_create_table_row_versions(id)?;
+        self.insert_version_raw(&mut row_versions.write(), row_version)?;
+        Ok(row_versions)
+    }
+
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TableRowsEntry)]
-    fn insert_version(&self, id: RowID, row_version: RowVersion) -> Result<RowVersions> {
+    fn get_or_create_table_row_versions(&self, id: RowID) -> Result<RowVersions, TryReserveError> {
         let versions = self
             .rows
             .try_get_or_insert_with(id, || Arc::new(RwLock::new(Vec::new())))?;
-        let row_versions = versions.value().clone();
-        self.insert_version_raw(&mut row_versions.write(), row_version)?;
-        Ok(row_versions)
+        Ok(versions.value().clone())
     }
 
     /// Gets an existing Arc<SortableIndexKey> from the index if the key exists,
@@ -6871,11 +6880,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::IndexRowsEntry)]
-    fn get_or_create_index_rows(
+    pub(crate) fn get_or_create_index_rows(
         &self,
         index_id: MVTableId,
-    ) -> Result<crate::skiplist::map::Entry<'_, MVTableId, IndexRowsMap<A>, BasicComparator, A>>
-    {
+    ) -> Result<IndexRowsEntry<'_, A>, TryReserveError> {
         let alloc = self.alloc.clone();
         let index = self
             .index_rows
@@ -6888,7 +6896,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         index: &'a IndexRowsMap<A>,
         key: Arc<SortableIndexKey>,
-    ) -> Result<IndexRowEntry<'a, A>> {
+    ) -> Result<IndexRowEntry<'a, A>, TryReserveError> {
         let entry = index.try_get_or_insert_with(key, || Arc::new(RwLock::new(Vec::new())))?;
         Ok(entry)
     }
@@ -7073,10 +7081,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tx_id: TxID,
         index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
     ) -> Result<Option<RowKey>> {
-        let alloc = self.alloc.clone();
-        let index = self
-            .index_rows
-            .try_get_or_insert_with(index_id, move || SkipMap::new_in(alloc))?;
+        let index = self.get_or_create_index_rows(index_id)?;
         let index = index.value();
         let iter_box = Box::new(index.iter().rev());
         *index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A));
@@ -7931,10 +7936,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             };
                             {
                                 let versions =
-                                    self.rows.try_get_or_insert_with(rowid.clone(), || {
-                                        Arc::new(RwLock::new(Vec::new()))
-                                    })?;
-                                let mut versions = versions.value().write();
+                                    self.get_or_create_table_row_versions(rowid.clone())?;
+                                let mut versions = versions.write();
                                 self.insert_version_raw(&mut versions, row_version)?;
                             }
                             let allocator = self.get_rowid_allocator(&rowid.table_id);
@@ -7977,21 +7980,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 // resident row not yet in memory), insert a tombstone instead.
                                 let mut versions = versions.value().write();
                                 if let Some(existing) = versions.iter_mut().rev().find(|rv| {
-                            rv.end().is_none()
-                                && matches!(rv.begin(), Some(TxTimestampOrID::Timestamp(b)) if b < commit_ts)
-                        }) {
-                            existing.set_end(Some(TxTimestampOrID::Timestamp(commit_ts)));
-                        } else {
-                            let version_id = self.get_version_id();
-                            let row_version = RowVersion {
-                                id: version_id,
-                                begin: crate::mvcc::database::PackedTs::pack(None),
-                                end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(commit_ts))),
-                                row: tombstone_row.clone(),
-                                btree_resident,
-                            };
-                            self.insert_version_raw(&mut versions, row_version)?;
-                        }
+                                    rv.end().is_none()
+                                        && matches!(rv.begin(), Some(TxTimestampOrID::Timestamp(b)) if b < commit_ts)
+                                }) {
+                                    existing.set_end(Some(TxTimestampOrID::Timestamp(commit_ts)));
+                                } else {
+                                    let version_id = self.get_version_id();
+                                    let row_version = RowVersion {
+                                        id: version_id,
+                                        begin: crate::mvcc::database::PackedTs::pack(None),
+                                        end: crate::mvcc::database::PackedTs::pack(Some(
+                                            TxTimestampOrID::Timestamp(commit_ts),
+                                        )),
+                                        row: tombstone_row.clone(),
+                                        btree_resident,
+                                    };
+                                    self.insert_version_raw(&mut versions, row_version)?;
+                                }
                             } else {
                                 let version_id = self.get_version_id();
                                 let row_version = RowVersion {
@@ -8004,10 +8009,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     btree_resident,
                                 };
                                 let versions =
-                                    self.rows.try_get_or_insert_with(rowid.clone(), || {
-                                        Arc::new(RwLock::new(Vec::new()))
-                                    })?;
-                                let mut versions = versions.value().write();
+                                    self.get_or_create_table_row_versions(rowid.clone())?;
+                                let mut versions = versions.write();
                                 self.insert_version_raw(&mut versions, row_version)?;
                             }
                             if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {

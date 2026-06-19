@@ -1,6 +1,5 @@
 use crate::alloc::TryReserveError;
 use crate::skiplist::map::Entry;
-use crate::skiplist::SkipMap;
 use crate::turso_assert;
 
 use crate::mvcc::clock::LogicalClock;
@@ -1116,10 +1115,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 self.table_iterator = Some(static_iterator_hack!(iter_box, RowID));
             }
             MvccCursorType::Index(_) => {
-                let index_rows = self
-                    .db
-                    .index_rows
-                    .try_get_or_insert_with(self.table_id, SkipMap::new)?;
+                let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
                 let index_rows = index_rows.value();
                 let iter_box: Box<
                     dyn Iterator<Item = Entry<'_, Arc<SortableIndexKey>, RowVersions>>
@@ -2058,10 +2054,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             }
             MvccCursorType::Index(_) => {
                 // For index cursors, initialize the iterator to the beginning
-                let index_rows = self
-                    .db
-                    .index_rows
-                    .try_get_or_insert_with(self.table_id, SkipMap::new)?;
+                let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
                 let index_rows = index_rows.value();
                 let iter_box: Box<
                     dyn Iterator<Item = Entry<'_, Arc<SortableIndexKey>, RowVersions>>
