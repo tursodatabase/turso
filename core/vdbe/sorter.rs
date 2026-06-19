@@ -9,6 +9,7 @@ use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::ptr::NonNull;
 use std::rc::Rc;
 
+use crate::alloc::vec;
 use crate::alloc::*;
 use crate::io::TempFile;
 use crate::types::{IOCompletions, ValueIterator};
@@ -120,12 +121,12 @@ impl Sorter {
             .try_collect()?;
         let this = Self {
             arena: Bump::new(),
-            records: Vec::new(),
+            records: vec![],
             current: None,
             key_len: order.len(),
             index_key_info: Rc::new(index_key_info),
             comparators: Rc::new(comparators),
-            chunks: Vec::new(),
+            chunks: vec![],
             chunk_heap: TursoAllocExt::new(),
             max_buffer_size: max_buffer_size_bytes,
             current_buffer_size: 0,
@@ -534,7 +535,7 @@ impl SortedChunk {
             chunk_size: 0,
             buffer: Arc::new(RwLock::new(try_vec![0; buffer_size]?)),
             buffer_len: Arc::new(atomic::AtomicUsize::new(0)),
-            records: Vec::new(),
+            records: vec![],
             io_state: Arc::new(RwLock::new(SortedChunkIOState::None)),
             total_bytes_read: Arc::new(atomic::AtomicUsize::new(0)),
             next_state: NextState::Start,
@@ -1086,7 +1087,7 @@ mod tests {
     }
 
     fn generate_value_types<R: RngCore>(rng: &mut R, num_values: usize) -> Vec<ValueType> {
-        let mut value_types = Vec::with_capacity(num_values);
+        let mut value_types = <Vec<ValueType> as TursoVecExt<ValueType>>::with_capacity(num_values);
 
         for _ in 0..num_values {
             let value_type: ValueType = match rng.next_u64() % 4 {
@@ -1103,7 +1104,7 @@ mod tests {
     }
 
     fn generate_values<R: RngCore>(rng: &mut R, value_types: &[ValueType]) -> Vec<Value> {
-        let mut values = Vec::with_capacity(value_types.len());
+        let mut values = <Vec<Value> as TursoVecExt<Value>>::with_capacity(value_types.len());
         for value_type in value_types {
             let value = match value_type {
                 ValueType::Integer => Value::from_i64(rng.next_u64() as i64),
