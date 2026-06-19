@@ -185,7 +185,8 @@ fn count_test_rows(whopper: &mut MultiprocessWhopper, worker_idx: usize) -> i64 
                 | LimboError::SchemaConflict
                 | LimboError::Busy
                 | LimboError::BusySnapshot
-                | LimboError::TableLocked,
+                | LimboError::TableLocked
+                | LimboError::OutOfMemory,
             ) => continue,
             Err(err) => panic!("count should succeed: {err}"),
         }
@@ -206,7 +207,8 @@ fn truncate_checkpoint_until_stable(whopper: &mut MultiprocessWhopper, connectio
                 | LimboError::BusySnapshot
                 | LimboError::SchemaUpdated
                 | LimboError::SchemaConflict
-                | LimboError::TableLocked,
+                | LimboError::TableLocked
+                | LimboError::OutOfMemory,
             ) => continue,
             Err(err) => panic!("TRUNCATE checkpoint should stabilize: {err}"),
         }
@@ -244,9 +246,12 @@ fn read_simple_kv_length(db_path: &Path, table_name: &str, key: &str) -> Option<
                     .expect("observer reparse after schema change");
                 continue;
             }
-            Err(LimboError::Busy | LimboError::BusySnapshot | LimboError::TableLocked) => {
-                continue;
-            }
+            Err(
+                LimboError::Busy
+                | LimboError::BusySnapshot
+                | LimboError::TableLocked
+                | LimboError::OutOfMemory,
+            ) => continue,
             Err(err) => panic!("observer prepare should succeed: {err}"),
         };
         let mut result = None;
@@ -261,9 +266,12 @@ fn read_simple_kv_length(db_path: &Path, table_name: &str, key: &str) -> Option<
                     .expect("observer reparse after schema change");
                 continue;
             }
-            Err(LimboError::Busy | LimboError::BusySnapshot | LimboError::TableLocked) => {
-                continue;
-            }
+            Err(
+                LimboError::Busy
+                | LimboError::BusySnapshot
+                | LimboError::TableLocked
+                | LimboError::OutOfMemory,
+            ) => continue,
             Err(err) => panic!("observer query should succeed: {err}"),
         }
     }
@@ -362,7 +370,8 @@ fn multiprocess_same_process_sibling_reader_keeps_shared_snapshot_live_until_las
             | LimboError::BusySnapshot
             | LimboError::SchemaUpdated
             | LimboError::SchemaConflict
-            | LimboError::TableLocked,
+            | LimboError::TableLocked
+            | LimboError::OutOfMemory,
         ) => {}
         Err(err) => panic!("unexpected TRUNCATE result while sibling reader is active: {err}"),
     }

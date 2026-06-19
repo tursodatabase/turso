@@ -81,6 +81,9 @@ struct Args {
     /// Probability of restarting the full worker cohort per step (multiprocess mode only)
     #[arg(long, default_value_t = 0.0)]
     restart_probability: f64,
+    /// Probability of failing a scoped Turso allocation while stepping a statement.
+    #[arg(long, default_value_t = 0.05)]
+    allocation_fault_probability: f64,
     /// Stream multiprocess operation/lifecycle history as JSONL for deterministic debugging
     #[arg(long)]
     history_output: Option<PathBuf>,
@@ -196,6 +199,13 @@ fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     if args.restart_probability > 0.0 {
         println!("restart_probability = {}", args.restart_probability);
     }
+    if args.allocation_fault_probability > 0.0 {
+        println!(
+            "allocation fault injection disabled in multiprocess mode \
+             (requested probability = {})",
+            args.allocation_fault_probability
+        );
+    }
     if let Some(path) = &args.history_output {
         println!("history_output = {}", path.display());
     }
@@ -249,6 +259,12 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     if opts.cosmic_ray_probability > 0.0 {
         println!("cosmic ray probability = {}", opts.cosmic_ray_probability);
     }
+    if opts.allocation_fault_probability > 0.0 {
+        println!(
+            "allocation fault probability = {}",
+            opts.allocation_fault_probability
+        );
+    }
 
     let reopen_probability = args.reopen_probability.unwrap_or(opts.reopen_probability);
 
@@ -301,6 +317,11 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         return Err(e);
     }
     prop_result?;
+
+    let allocation_faults = whopper.allocation_fault_count();
+    if allocation_faults > 0 {
+        println!("\n{allocation_faults} allocation faults injected");
+    }
 
     if args.elle.is_some() {
         println!("\nElle history exported to: {}", args.elle_output);
@@ -436,7 +457,8 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_elle_tables(elle_tables)
         .with_workloads(workloads)
         .with_properties(properties)
-        .with_chaotic_profiles(chaotic_profiles);
+        .with_chaotic_profiles(chaotic_profiles)
+        .with_allocation_fault_probability(args.allocation_fault_probability);
 
     Ok(opts)
 }
