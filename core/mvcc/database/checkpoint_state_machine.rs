@@ -1619,23 +1619,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn step_inner(&mut self, _context: &()) -> Result<TransitionResult<CheckpointResult>> {
         match &self.state {
             CheckpointState::PrepareCheckpoint => {
-                if self
-                    .mvstore
-                    .checkpoint_in_progress
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
-                    // Another checkpoint is already running: no-op (no work, no resources).
-                    self.state = CheckpointState::Finalize;
-                    return Ok(TransitionResult::Done(CheckpointResult::default()));
-                }
-                self.owns_checkpoint_in_progress = true;
-
-                if !self
+                let passive = self
                     .connection
-                    .experimental_mvcc_passive_checkpoint_enabled()
-                    && !self.lock_states.blocking_checkpoint_lock_held
-                {
+                    .experimental_mvcc_passive_checkpoint_enabled();
+                if passive {
+                    // The off-lock checkpoint acquires the blocking lock only after
+                    // collection, so it needs an explicit single-orchestrator gate. The
+                    // blocking (flag-off) path takes the lock up front and gets that
+                    // invariant — plus Busy-on-contention — from the lock itself, so it
+                    // must NOT use this gate, which would turn a contended explicit
+                    // TRUNCATE into a silent no-op.
+                    if self
+                        .mvstore
+                        .checkpoint_in_progress
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        // Another checkpoint is already running: no-op (no work, no resources).
+                        self.state = CheckpointState::Finalize;
+                        return Ok(TransitionResult::Done(CheckpointResult::default()));
+                    }
+                    self.owns_checkpoint_in_progress = true;
+                } else if !self.lock_states.blocking_checkpoint_lock_held {
                     if !self.checkpoint_lock.write() {
                         return Err(crate::LimboError::Busy);
                     }
@@ -1645,13 +1650,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 self.snapshot_ts = self.mvstore.last_committed_tx_ts.load(Ordering::Acquire);
 
                 // Checkpoint state machines can be created before they are run.
-                // Resample after serializing (via `checkpoint_in_progress`) so
-                // already-durable index deletes are not replayed.
+                // Resample after serializing so already-durable index deletes are not replayed.
                 self.refresh_checkpoint_bounds();
-                self.state = if self
-                    .connection
-                    .experimental_mvcc_passive_checkpoint_enabled()
-                {
+                self.state = if passive {
                     CheckpointState::BuildLocalSchemaView
                 } else {
                     CheckpointState::CollectTableRows

@@ -1962,6 +1962,64 @@ fn test_full_checkpoint_reopen_recovers_truncate_mode() {
     assert_eq!(rows[0][1].to_string(), "x");
 }
 
+/// Default (flag-off) mode must NOT use the passive `checkpoint_in_progress` gate: it is
+/// serialized by the blocking lock, not turned into a silent no-op. We pin the gate ON (as a
+/// concurrent off-lock checkpoint would) and confirm a flag-off TRUNCATE still does real work
+/// (truncates the logical log) and never claims/releases the gate it doesn't own.
+#[test]
+fn test_flag_off_truncate_ignores_passive_checkpoint_gate() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+
+    let store = db.get_mvcc_store();
+    assert!(
+        store.logical_log_offset() > 0,
+        "precondition: log has appended frames to truncate"
+    );
+
+    // Pin the passive single-orchestrator gate ON; flag-off must ignore it.
+    store.checkpoint_in_progress.store(true, Ordering::SeqCst);
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    assert_eq!(
+        store.logical_log_offset(),
+        0,
+        "flag-off TRUNCATE must do real work, not no-op on the passive gate"
+    );
+    assert!(
+        store.checkpoint_in_progress.load(Ordering::SeqCst),
+        "flag-off checkpoint must not claim or release the passive gate"
+    );
+    store.checkpoint_in_progress.store(false, Ordering::SeqCst);
+}
+
+/// In default (flag-off) mode an explicit TRUNCATE that loses the blocking-checkpoint lock to a
+/// concurrent reader/writer must report `Busy` (the pre-feature contract), never a false-success
+/// no-op. An open transaction holds the checkpoint lock for its lifetime.
+#[test]
+fn test_flag_off_truncate_busy_when_lock_contended() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let c1 = db.connect();
+    c1.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    // Open transaction on c1 pins the blocking checkpoint lock.
+    c1.execute("BEGIN").unwrap();
+    c1.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let c2 = db.connect();
+    let res = c2.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+    assert!(
+        matches!(res, Err(LimboError::Busy)),
+        "contended flag-off TRUNCATE must return Busy, got {res:?}"
+    );
+
+    c1.execute("COMMIT").unwrap();
+}
+
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
