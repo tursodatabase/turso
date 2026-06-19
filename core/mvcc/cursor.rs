@@ -1668,25 +1668,19 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         };
         let row = match &self.mv_cursor_type {
             MvccCursorType::Table => {
-                let record_buf = key
-                    .get_record()
-                    .ok_or_else(|| {
-                        LimboError::InternalError("BTreeKey should have a record".to_string())
-                    })?
-                    .get_payload()
-                    .to_vec();
                 let BTreeKey::TableRowId((_, record)) = key else {
                     return Err(LimboError::InternalError(
                         "Table cursor requires a TableRowId key".to_string(),
                     ));
                 };
-                let num_columns = record
-                    .as_ref()
-                    .ok_or_else(|| {
-                        LimboError::InternalError("TableRowId should have a record".to_string())
-                    })?
-                    .column_count();
-                Row::new_table_row(row_id, record_buf, num_columns)
+                let record = record.as_ref().ok_or_else(|| {
+                    LimboError::InternalError("TableRowId should have a record".to_string())
+                })?;
+                let num_columns = record.column_count();
+                crate::with_mv_store_allocation_site!(
+                    RowPayload,
+                    Row::new_table_row(row_id, record.get_payload(), num_columns)
+                )
             }
             MvccCursorType::Index(_) => {
                 let BTreeKey::IndexKey(record) = key else {
@@ -1694,9 +1688,9 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                         "Index cursor requires an IndexKey".to_string(),
                     ));
                 };
-                Row::new_index_row(row_id, record.column_count())
+                Ok(Row::new_index_row(row_id, record.column_count()))
             }
-        };
+        }?;
 
         // Check if the cursor is currently positioned at a B-tree row that matches
         // the row we're inserting. This indicates we're updating a B-tree-resident row
@@ -1800,11 +1794,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             let record = record.clone();
             let column_count = record.column_count();
             let row = match &self.mv_cursor_type {
-                MvccCursorType::Table => {
-                    Row::new_table_row(rowid.clone(), record.into_payload(), column_count)
-                }
-                MvccCursorType::Index(_) => Row::new_index_row(rowid.clone(), column_count),
-            };
+                MvccCursorType::Table => crate::with_mv_store_allocation_site!(
+                    RowPayload,
+                    Row::new_table_row(rowid.clone(), record.get_payload(), column_count)
+                ),
+                MvccCursorType::Index(_) => Ok(Row::new_index_row(rowid.clone(), column_count)),
+            }?;
             self.db
                 .insert_tombstone_to_table_or_index(self.tx_id, rowid, row, maybe_index_id)?;
         }
