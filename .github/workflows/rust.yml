@@ -271,6 +271,22 @@ jobs:
 
         # TODO: find out why this blows the stack so quickly every time..
         # e.g. https://github.com/tursodatabase/turso/actions/runs/22370904813/job/64749257476?pr=5588
+
+  simulator-fts:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - uses: "./.github/shared/setup-sccache"
+      - name: Native FTS simulator
+        run: cargo run -p limbo_sim --features fts --locked -- --disable-bugbase --io-backend=memory fts
   # simulator-windows:
   #   runs-on: windows-latest
   #   timeout-minutes: 120
