@@ -8120,6 +8120,568 @@ fn test_gc_active_reader_pins_lwm() {
     }
 }
 
+/// The live-version counter is the heuristic that gates inline GC. It must
+/// increment on every committed insert/update and decrement when GC reclaims a
+/// version. Exactness here is convenient for the test but only approximate
+/// accuracy is required by the engine.
+#[test]
+fn test_live_version_count_approx_tracks_inserts_and_gc() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+    let start = db.mvcc_store.live_version_count_approx();
+
+    // Insert a row + commit -> one live version.
+    let tx = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .insert(tx, generate_simple_string_row(table_id, 1, "v1"))
+        .unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+    assert_eq!(db.mvcc_store.live_version_count_approx(), start + 1);
+
+    // Update the row + commit -> a second version (old one superseded, not
+    // removed, so the count grows to two).
+    let tx = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .update(tx, generate_simple_string_row(table_id, 1, "v2"))
+        .unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+    assert_eq!(db.mvcc_store.live_version_count_approx(), start + 2);
+
+    // No active readers -> the superseded version is reclaimable. GC drops it
+    // and the counter follows.
+    let dropped = db.mvcc_store.drop_unused_row_versions();
+    assert_eq!(dropped, 1);
+    assert_eq!(db.mvcc_store.live_version_count_approx(), start + 1);
+}
+
+/// `should_gc` fires once live-version growth since the last pass crosses the
+/// threshold; a pass resets the baseline; -1 disables it entirely.
+#[test]
+fn test_should_gc_threshold_and_reset() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+
+    db.mvcc_store.set_gc_threshold(5);
+    assert_eq!(db.mvcc_store.gc_threshold(), 5);
+    assert!(!db.mvcc_store.should_gc());
+
+    // Insert 5 versions in a single open (uncommitted) transaction so we drive
+    // the counter directly without going through the commit path's own inline
+    // GC trigger.
+    let tx = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    for i in 1..=5 {
+        db.mvcc_store
+            .insert(tx, generate_simple_string_row(table_id, i, "x"))
+            .unwrap();
+    }
+    assert!(
+        db.mvcc_store.should_gc(),
+        "growth of 5 versions should reach the threshold"
+    );
+
+    // A pass resets the baseline (regardless of how much it reclaimed — the
+    // open txn pins the LWM, so nothing is reclaimable here).
+    db.mvcc_store
+        .gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC);
+    assert!(
+        !db.mvcc_store.should_gc(),
+        "baseline should reset after a GC pass"
+    );
+
+    // A negative threshold disables inline GC even past the old threshold.
+    db.mvcc_store.set_gc_threshold(-1);
+    for i in 6..=20 {
+        db.mvcc_store
+            .insert(tx, generate_simple_string_row(table_id, i, "x"))
+            .unwrap();
+    }
+    assert!(
+        !db.mvcc_store.should_gc(),
+        "negative threshold disables inline GC"
+    );
+}
+
+/// The `mvcc_gc_threshold` PRAGMA reads back the configured value and feeds
+/// `set_gc_threshold`, mirroring `mvcc_checkpoint_threshold`.
+#[test]
+fn test_mvcc_gc_threshold_pragma_roundtrip() {
+    let db = MvccTestDb::new();
+
+    // Default reads back the engine default.
+    let rows = get_rows(&db.conn, "PRAGMA mvcc_gc_threshold");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        MvStore::<MvccClock>::DEFAULT_GC_VERSION_THRESHOLD
+    );
+
+    // Setting it updates the store and reads back.
+    db.conn.execute("PRAGMA mvcc_gc_threshold = 1000").unwrap();
+    assert_eq!(db.mvcc_store.gc_threshold(), 1000);
+    let rows = get_rows(&db.conn, "PRAGMA mvcc_gc_threshold");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1000);
+
+    // -1 disables inline GC.
+    db.conn.execute("PRAGMA mvcc_gc_threshold = -1").unwrap();
+    assert_eq!(db.mvcc_store.gc_threshold(), -1);
+    assert!(!db.mvcc_store.should_gc());
+
+    // Values below -1 are rejected.
+    assert!(db.conn.execute("PRAGMA mvcc_gc_threshold = -2").is_err());
+}
+
+/// Incremental GC must reclaim exactly what the full sweep would, just spread
+/// across resumable bounded passes whose cursor wraps at the end.
+#[test]
+fn test_gc_incremental_reclaims_like_full_sweep() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+
+    // Build many chains, each with one reclaimable superseded version
+    // (insert+commit then update+commit).
+    let n: i64 = 20;
+    for i in 1..=n {
+        let tx = db
+            .mvcc_store
+            .begin_tx(db.conn.pager.load().clone())
+            .unwrap();
+        db.mvcc_store
+            .insert(tx, generate_simple_string_row(table_id, i, "v1"))
+            .unwrap();
+        commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+
+        let tx = db
+            .mvcc_store
+            .begin_tx(db.conn.pager.load().clone())
+            .unwrap();
+        db.mvcc_store
+            .update(tx, generate_simple_string_row(table_id, i, "v2"))
+            .unwrap();
+        commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+    }
+
+    // No active readers -> every superseded version is reclaimable.
+    assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
+
+    // Drive GC in tiny chunks (3 chains/pass) until it converges: no versions
+    // reclaimed AND the cursor has wrapped back to the start.
+    let mut total = 0;
+    let mut passes = 0;
+    loop {
+        let dropped = db.mvcc_store.gc_incremental(3);
+        total += dropped;
+        passes += 1;
+        if dropped == 0 && db.mvcc_store.gc_table_cursor.lock().is_none() {
+            break;
+        }
+        assert!(passes < 10_000, "incremental GC failed to converge");
+    }
+    assert!(
+        total >= n as usize,
+        "incremental GC should reclaim at least the {n} superseded versions, got {total}"
+    );
+
+    // A full sweep now finds nothing: incremental GC already reclaimed
+    // everything the full sweep would have.
+    assert_eq!(
+        db.mvcc_store.drop_unused_row_versions(),
+        0,
+        "full sweep should find nothing left after incremental GC converges"
+    );
+
+    // Each chain keeps exactly its surviving current version.
+    for i in 1..=n {
+        let entry = db
+            .mvcc_store
+            .rows
+            .get(&RowID::new(table_id, RowKey::Int(i)))
+            .unwrap();
+        assert_eq!(entry.value().read().len(), 1);
+    }
+}
+
+/// Concurrency safety. Many connections share one `MvStore` and each commit
+/// calls `gc_incremental` with no global lock held, so several threads can run
+/// GC at once. The single-flight gate keeps only one pass active, but the
+/// stronger guarantee is that concurrent passes can never corrupt a chain or
+/// the live-version counter. Hammer GC from many threads, then assert the
+/// outcome equals a single full sweep and that the (heuristic) counter still
+/// exactly matches the live versions — proving no double/missed decrement.
+#[test]
+fn test_gc_incremental_concurrent_is_safe() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+
+    // Each row: insert+commit (v1) then update+commit (v2) -> one reclaimable
+    // superseded version per chain. No readers stay open, so LWM = MAX.
+    let n: i64 = 200;
+    for i in 1..=n {
+        let tx = db
+            .mvcc_store
+            .begin_tx(db.conn.pager.load().clone())
+            .unwrap();
+        db.mvcc_store
+            .insert(tx, generate_simple_string_row(table_id, i, "v1"))
+            .unwrap();
+        commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+
+        let tx = db
+            .mvcc_store
+            .begin_tx(db.conn.pager.load().clone())
+            .unwrap();
+        db.mvcc_store
+            .update(tx, generate_simple_string_row(table_id, i, "v2"))
+            .unwrap();
+        commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+    }
+    assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
+
+    // 8 threads each run many small bounded passes concurrently.
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let store = db.mvcc_store.clone();
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..500 {
+                store.gc_incremental(8);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Drain anything the bounded passes didn't reach (single-threaded now).
+    while db
+        .mvcc_store
+        .gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC)
+        > 0
+    {}
+
+    // A full sweep finds nothing left, and each chain kept exactly its current
+    // version — concurrent GC reclaimed precisely what one sweep would.
+    assert_eq!(db.mvcc_store.drop_unused_row_versions(), 0);
+    for i in 1..=n {
+        let entry = db
+            .mvcc_store
+            .rows
+            .get(&RowID::new(table_id, RowKey::Int(i)))
+            .unwrap();
+        assert_eq!(entry.value().read().len(), 1);
+    }
+
+    // The heuristic counter exactly matches the live versions still in memory:
+    // no decrement was lost or double-applied under concurrency.
+    let table_live: usize = db
+        .mvcc_store
+        .rows
+        .iter()
+        .map(|e| e.value().read().len())
+        .sum();
+    let index_live: usize = db
+        .mvcc_store
+        .index_rows
+        .iter()
+        .map(|outer| {
+            outer
+                .value()
+                .iter()
+                .map(|inner| inner.value().read().len())
+                .sum::<usize>()
+        })
+        .sum();
+    assert_eq!(
+        db.mvcc_store.live_version_count_approx(),
+        table_live + index_live,
+        "live-version counter drifted from actual chain contents"
+    );
+}
+
+/// Index chains are swept by their own bounded, resumable cursor
+/// (`gc_index_cursor`), just like table rows — a single huge index can't force
+/// an unbounded pass. Aborted index garbage (Rule 1) is reclaimable
+/// unconditionally, so it lets us exercise the index sweep without depending on
+/// checkpoint timing. This asserts the sweep is resumable mid-pass and that
+/// driving it in tiny chunks reclaims exactly what a full sweep would.
+#[test]
+fn test_gc_incremental_reclaims_index_chains_resumably() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+    // Drive GC manually: disable both the checkpoint and the inline-GC trigger.
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_gc_threshold = -1").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'keep')").unwrap();
+
+    // Insert many indexed rows in one transaction, then roll back: each leaves
+    // aborted garbage in its own index chain.
+    conn.execute("BEGIN").unwrap();
+    for i in 100..200 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'g{i}')"))
+            .unwrap();
+    }
+    conn.execute("ROLLBACK").unwrap();
+
+    let count_index_versions = || -> usize {
+        db.mvcc_store
+            .index_rows
+            .iter()
+            .map(|outer| {
+                outer
+                    .value()
+                    .iter()
+                    .map(|inner| inner.value().read().len())
+                    .sum::<usize>()
+            })
+            .sum()
+    };
+    let before = count_index_versions();
+    assert!(
+        before > 8,
+        "expected accumulated index garbage chains, got {before}"
+    );
+    assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
+
+    // A single tiny pass is bounded and leaves the index sweep mid-flight —
+    // the cursor is parked partway through (there are far more than 4 chains).
+    db.mvcc_store.gc_incremental(4);
+    assert!(
+        db.mvcc_store.gc_index_cursor.lock().is_some(),
+        "index sweep should resume from a saved cursor, not restart each pass"
+    );
+
+    // Drive to convergence in 4-chain chunks: done when a pass reclaims nothing
+    // and both cursors have wrapped back to the start.
+    let mut passes = 0;
+    loop {
+        let dropped = db.mvcc_store.gc_incremental(4);
+        passes += 1;
+        if dropped == 0
+            && db.mvcc_store.gc_table_cursor.lock().is_none()
+            && db.mvcc_store.gc_index_cursor.lock().is_none()
+        {
+            break;
+        }
+        assert!(passes < 100_000, "incremental GC failed to converge");
+    }
+
+    // Everything the full sweep would reclaim is already gone (table + index).
+    assert_eq!(db.mvcc_store.drop_unused_row_versions(), 0);
+    let after = count_index_versions();
+    assert!(
+        after < before,
+        "index versions should shrink: before={before} after={after}"
+    );
+
+    // The surviving committed row is still correct and index-readable.
+    let rows = get_rows(conn, "SELECT id FROM t WHERE v = 'keep'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+}
+
+/// Inline GC must never run concurrently with a stop-the-world checkpoint:
+/// the checkpoint reads version chains to flush them to the B-tree and removes
+/// empty slots, so a concurrent GC mutating those chains would corrupt the
+/// on-disk image (e.g. drop an index version before the checkpoint flushed it,
+/// leaving a table row without its index entry). `gc_incremental` enforces this
+/// by holding the checkpoint read lock; if the checkpoint holds the write lock,
+/// GC must skip entirely. Regression test for the Antithesis integrity-check
+/// failure ("row N missing from index ...").
+#[test]
+fn test_gc_incremental_skips_while_checkpoint_holds_write_lock() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+
+    // One reclaimable superseded version (insert+commit, then update+commit).
+    let tx = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .insert(tx, generate_simple_string_row(table_id, 1, "v1"))
+        .unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+    let tx = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .update(tx, generate_simple_string_row(table_id, 1, "v2"))
+        .unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+    // No active txns -> all reader read-locks released, LWM = MAX.
+    assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
+
+    let row_id = RowID::new(table_id, RowKey::Int(1));
+
+    // Simulate a stop-the-world checkpoint by taking the write lock.
+    assert!(
+        db.mvcc_store.blocking_checkpoint_lock.write(),
+        "no readers should remain after commits, so write lock is acquirable"
+    );
+
+    // GC cannot take the read lock -> it must skip and reclaim nothing.
+    assert_eq!(
+        db.mvcc_store
+            .gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC),
+        0,
+        "GC must not run while a checkpoint holds the write lock"
+    );
+    assert_eq!(
+        db.mvcc_store
+            .rows
+            .get(&row_id)
+            .unwrap()
+            .value()
+            .read()
+            .len(),
+        2,
+        "superseded version must survive while the checkpoint holds the lock"
+    );
+
+    // Once the checkpoint releases, GC runs and reclaims the superseded version.
+    db.mvcc_store.blocking_checkpoint_lock.unlock();
+    assert_eq!(
+        db.mvcc_store
+            .gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC),
+        1,
+        "GC runs once the checkpoint lock is released"
+    );
+    assert_eq!(
+        db.mvcc_store
+            .rows
+            .get(&row_id)
+            .unwrap()
+            .value()
+            .read()
+            .len(),
+        1
+    );
+}
+
+/// Incremental GC uses the lazy path: it empties a chain's version vec but
+/// leaves the (now empty) SkipMap slot in place — slot removal is reserved for
+/// the checkpoint's blocking `_and_slots` sweep.
+#[test]
+fn test_gc_incremental_lazy_leaves_empty_slots() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+
+    // Aborted insert leaves aborted garbage (begin=None, end=None) behind.
+    let tx = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .insert(tx, generate_simple_string_row(table_id, 1, "rollback"))
+        .unwrap();
+    db.mvcc_store.rollback_tx(
+        tx,
+        db.conn.pager.load().clone(),
+        &db.conn,
+        crate::MAIN_DB_ID,
+    );
+
+    let row_id = RowID::new(table_id, RowKey::Int(1));
+    assert!(db.mvcc_store.rows.get(&row_id).is_some());
+
+    // Drive incremental GC to completion.
+    for _ in 0..4 {
+        db.mvcc_store
+            .gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC);
+    }
+
+    let entry = db.mvcc_store.rows.get(&row_id);
+    assert!(entry.is_some(), "lazy path keeps the SkipMap slot in place");
+    assert!(
+        entry.unwrap().value().read().is_empty(),
+        "but the version vec is emptied"
+    );
+}
+
+/// Overlapping transactions: a committed-and-superseded version is reclaimed by
+/// inline incremental GC (no checkpoint), but only after the snapshot that
+/// pinned the LWM ends. While the reader is open, GC must not touch its version.
+#[test]
+fn test_gc_incremental_respects_held_snapshot() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+    let row_id = RowID::new(table_id, RowKey::Int(1));
+
+    // T1 inserts and commits v1.
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let row_v1 = generate_simple_string_row(table_id, 1, "version_1");
+    db.mvcc_store.insert(tx1, row_v1.clone()).unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+
+    // T2 opens a read snapshot and pins the LWM.
+    let conn2 = db.db.connect().unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
+
+    // T3 updates and commits v2, superseding v1.
+    let conn3 = db.db.connect().unwrap();
+    let tx3 = db.mvcc_store.begin_tx(conn3.pager.load().clone()).unwrap();
+    db.mvcc_store
+        .update(tx3, generate_simple_string_row(table_id, 1, "version_2"))
+        .unwrap();
+    commit_tx(db.mvcc_store.clone(), &conn3, tx3).unwrap();
+
+    // Incremental GC while T2 is open must NOT reclaim v1.
+    assert_eq!(
+        db.mvcc_store
+            .gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC),
+        0,
+        "held snapshot pins the LWM; nothing reclaimable"
+    );
+    assert_eq!(
+        db.mvcc_store
+            .rows
+            .get(&row_id)
+            .unwrap()
+            .value()
+            .read()
+            .len(),
+        2
+    );
+    // T2 still sees its snapshot version.
+    assert_eq!(db.mvcc_store.read(tx2, &row_id).unwrap().unwrap(), row_v1);
+
+    // Close the snapshot; now incremental GC reclaims the superseded v1
+    // without any checkpoint having run.
+    db.mvcc_store.remove_tx(tx2);
+    assert_eq!(
+        db.mvcc_store
+            .gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC),
+        1,
+        "superseded version reclaimed by inline GC after snapshot ends"
+    );
+    assert_eq!(
+        db.mvcc_store
+            .rows
+            .get(&row_id)
+            .unwrap()
+            .value()
+            .read()
+            .len(),
+        1,
+        "only the current version remains"
+    );
+}
+
 /// Index rows live in a separate SkipMap from table rows and go through their own
 /// GC path (gc_index_row_versions). This SQL-level test creates an indexed table,
 /// checkpoints, updates the row (creating superseded index versions), checkpoints

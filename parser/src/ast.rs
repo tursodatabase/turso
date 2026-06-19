@@ -1867,6 +1867,10 @@ pub enum PragmaName {
     WalCheckpoint,
     /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
     MvccCheckpointThreshold,
+    /// Sets or queries the threshold (in newly inserted row versions since the
+    /// last GC pass) at which MVCC runs an inline, non-blocking garbage
+    /// collection pass on the commit path. -1 disables inline GC.
+    MvccGcThreshold,
     /// List all available types (built-in and custom)
     ListTypes,
     /// Deprecated no-op: control whether callback is invoked for empty result sets

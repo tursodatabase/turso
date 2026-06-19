@@ -4456,6 +4456,24 @@ impl Connection {
             None => Err(LimboError::InternalError("MVCC not enabled".into())),
         }
     }
+
+    pub(crate) fn set_mvcc_gc_threshold(&self, threshold: i64) -> Result<()> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => {
+                mv_store.set_gc_threshold(threshold);
+                self.bump_prepare_context_generation();
+                Ok(())
+            }
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn mvcc_gc_threshold(&self) -> Result<i64> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => Ok(mv_store.gc_threshold()),
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
 }
 
 pub type Row = vdbe::Row;

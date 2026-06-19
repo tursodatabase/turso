@@ -5,9 +5,9 @@ use clap::ValueEnum;
 use turso::Connection;
 use turso::params::Params;
 
-use crate::profile::{
+use super::profile::{
     Phase, Profile, WorkItem, checkpoint::Checkpoint, insert::InsertHeavy, mixed::Mixed,
-    read::ReadHeavy, scan::ScanHeavy, series_blob::SeriesBlob,
+    read::ReadHeavy, scan::ScanHeavy, series_blob::SeriesBlob, update_churn::UpdateChurn,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -32,6 +32,7 @@ pub enum WorkloadProfile {
     Mixed,
     ScanHeavy,
     SeriesBlob,
+    UpdateChurn,
 }
 
 impl std::fmt::Display for WorkloadProfile {
@@ -42,6 +43,7 @@ impl std::fmt::Display for WorkloadProfile {
             WorkloadProfile::Mixed => write!(f, "mixed"),
             WorkloadProfile::ScanHeavy => write!(f, "scan-heavy"),
             WorkloadProfile::SeriesBlob => write!(f, "series-blob"),
+            WorkloadProfile::UpdateChurn => write!(f, "update-churn"),
         }
     }
 }
@@ -62,6 +64,9 @@ pub struct WorkloadConfig {
     /// Only meaningful in MVCC mode; WAL's 1000-frame threshold is not
     /// configurable.
     pub mvcc_checkpoint_threshold: Option<i64>,
+    /// MVCC inline-GC trigger threshold in live-version growth (`PRAGMA
+    /// mvcc_gc_threshold`; -1 disables inline GC). Only meaningful in MVCC mode.
+    pub mvcc_gc_threshold: Option<i64>,
 }
 
 /// Hooks invoked at workload milestones so callers can take measurements.
@@ -87,6 +92,7 @@ pub fn create_profile(
         WorkloadProfile::Mixed => Box::new(Mixed::new(iterations, batch_size)),
         WorkloadProfile::ScanHeavy => Box::new(ScanHeavy::new(iterations, batch_size)),
         WorkloadProfile::SeriesBlob => Box::new(SeriesBlob::new(iterations, batch_size)),
+        WorkloadProfile::UpdateChurn => Box::new(UpdateChurn::new(iterations, batch_size)),
     };
 
     if checkpoint {
@@ -127,6 +133,12 @@ pub async fn run_workload(
     if let Some(threshold) = cfg.mvcc_checkpoint_threshold {
         setup_conn
             .pragma_update("mvcc_checkpoint_threshold", &threshold.to_string())
+            .await?;
+    }
+
+    if let Some(threshold) = cfg.mvcc_gc_threshold {
+        setup_conn
+            .pragma_update("mvcc_gc_threshold", &threshold.to_string())
             .await?;
     }
 
