@@ -8,6 +8,7 @@ use std::fmt;
 
 mod allocation_site;
 mod api;
+mod arc;
 mod backend;
 mod collections;
 
@@ -19,6 +20,7 @@ pub use allocation_site::{
 /// stable, `std::alloc::Allocator` on `--cfg nightly` builds.
 pub use api::ApiAllocator;
 pub use api::{AllocError, Global, Layout};
+pub use arc::{try_arc_slice_from_slice, ArcSlice};
 pub use backend::{set_allocator, SetAllocatorError, TursoAllocBackend};
 #[cfg(nightly)]
 pub use collections::TursoFromIteratorIn;

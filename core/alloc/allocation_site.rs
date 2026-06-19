@@ -16,6 +16,8 @@ pub enum MvStoreAllocationSite {
     IndexRowsEntry,
     IndexKeyEntry,
     RowVersionReserve,
+    RowPayload,
+    SchemaRowPayload,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -77,6 +79,16 @@ macro_rules! without_allocation_faults {
         #[cfg(feature = "allocation_metric")]
         let _turso_allocation_site_guard =
             $crate::alloc::enter_allocation_site($crate::alloc::AllocationSite::NoFaultInjection);
+        $expr
+    }};
+}
+
+#[macro_export]
+macro_rules! with_mv_store_allocation_site {
+    ($site:ident, $expr:expr) => {{
+        #[cfg(feature = "allocation_metric")]
+        let _turso_allocation_site_guard =
+            $crate::alloc::enter_allocation_site($crate::alloc::MvStoreAllocationSite::$site);
         $expr
     }};
 }
