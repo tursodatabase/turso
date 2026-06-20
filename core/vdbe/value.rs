@@ -791,17 +791,9 @@ impl Value {
         }
 
         let precision = if precision < 1.0 { 0.0 } else { precision };
-        let precision = precision.clamp(0.0, 30.0) as usize;
+        let precision = precision.clamp(0.0, 30.0) as i32;
 
-        if precision == 0 {
-            return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
-        }
-
-        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
-            .expect("formatted float should always parse successfully")
-            .into();
-
-        Value::from_f64(f)
+        Value::from_f64(round_half_away_from_zero(f, precision))
     }
 
     fn _exec_trim(&self, pattern: Option<&Value>, trim_type: TrimType) -> Value {
@@ -1361,6 +1353,20 @@ impl Value {
             .collect();
         Value::build_text(result)
     }
+}
+
+/// Round `f` to `precision` fractional digits, halves away from zero to match SQLite's ROUND().
+/// `mul_add` recovers the error of the scaling multiply so carries land like SQLite's printf.
+fn round_half_away_from_zero(f: f64, precision: i32) -> f64 {
+    let scale = 10f64.powi(precision);
+    let sign = if f < 0.0 { -1.0 } else { 1.0 };
+    let abs_f = f.abs();
+    let scaled = abs_f * scale;
+    let err = abs_f.mul_add(scale, -scaled);
+    let floor = scaled.floor();
+    let decision = (scaled - floor - 0.5) + err;
+    let rounded = if decision >= 0.0 { floor + 1.0 } else { floor };
+    sign * rounded / scale
 }
 
 /// Parse exactly `n` hex digits into a u32. Mirrors SQLite's isNHex().
@@ -2734,6 +2740,22 @@ mod tests {
         let input_val = Value::from_f64(100.123);
         let expected_val = Value::Null;
         assert_eq!(input_val.exec_round(Some(&Value::Null)), expected_val);
+
+        // SQLite rounds halves away from zero, not banker's rounding (#5748)
+        let precision_val = Value::from_i64(1);
+        assert_eq!(
+            Value::from_f64(2.25).exec_round(Some(&precision_val)),
+            Value::from_f64(2.3)
+        );
+        assert_eq!(
+            Value::from_f64(-2.25).exec_round(Some(&precision_val)),
+            Value::from_f64(-2.3)
+        );
+        assert_eq!(Value::from_f64(0.5).exec_round(None), Value::from_f64(1.0));
+        assert_eq!(
+            Value::from_f64(-0.5).exec_round(None),
+            Value::from_f64(-1.0)
+        );
     }
 
     #[test]
