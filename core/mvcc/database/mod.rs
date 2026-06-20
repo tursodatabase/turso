@@ -610,7 +610,7 @@ fn rootpage_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocator>(
     mvcc_store
         .table_id_to_rootpage
         .get(&table_id)
-        .and_then(|entry| *entry.value())
+        .and_then(|entry| entry.value().root_page)
         .map(|rootpage| rootpage as i64)
         .unwrap_or_else(|| i64::from(table_id))
 }
@@ -971,14 +971,26 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// Hekaton Section 2.7: "CommitDepSet, that stores transaction IDs of the
     /// transactions that depend on T."
     commit_dep_set: Mutex<HashSet<TxID>>,
+    /// `durable_txid_max` sampled when this transaction pinned its WAL read mark (at begin). A
+    /// checkpoint-materialized B-tree is physically readable by this transaction only if its
+    /// `visible_from <= observed_durable_boundary` — i.e. the materialization was already durable
+    /// (in the WAL) when this transaction's read mark was installed. See
+    /// [`MvStore::is_btree_readable_at`] / [`MvStore::compute_min_reader_boundary`].
+    observed_durable_boundary: u64,
 }
 
 impl<A: RowVersionAllocator> Transaction<A> {
-    fn new(tx_id: u64, begin_ts: u64, header: DatabaseHeader) -> Transaction<A> {
+    fn new(
+        tx_id: u64,
+        begin_ts: u64,
+        header: DatabaseHeader,
+        observed_durable_boundary: u64,
+    ) -> Transaction<A> {
         Transaction {
             state: TransactionState::Active.into(),
             tx_id,
             begin_ts,
+            observed_durable_boundary,
             write_set: Mutex::new(WriteSet::new()),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
@@ -2092,7 +2104,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 return;
             }
             if let Some(entry) = mvcc_store.table_id_to_rootpage.get(&table_id) {
-                if let Some(root_page) = *entry.value() {
+                if let Some(root_page) = entry.value().root_page {
                     let canonical = MVTableId::from(-(root_page as i64));
                     if canonical != table_id {
                         version.row.id.table_id = canonical;
@@ -2516,7 +2528,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 mvcc_store
                     .table_id_to_rootpage
                     .get(&table_id)
-                    .and_then(|entry| *entry.value())
+                    .and_then(|entry| entry.value().root_page)
                     .map(|rootpage| rootpage as i64)
                     .unwrap_or_else(|| i64::from(table_id))
             };
@@ -3804,6 +3816,51 @@ pub struct RecoverCtx {
     index_infos: HashMap<(MVTableId, IndexOpKind), Arc<IndexInfo>>,
 }
 
+/// A versioned `table_id -> root_page` binding. The root page is `None` while the object is
+/// uncheckpointed (created in the logical log, no B-tree allocated yet) and `Some(page)` once a
+/// checkpoint physically allocates it. `begin`/`end` bound the snapshot range over which the
+/// binding is visible: `begin` is the allocating checkpoint's snapshot ts (`0` for
+/// bootstrap/recovery bindings that predate every transaction) and `end` is the drop tombstone's
+/// commit ts (`u64::MAX` while live). See [`MvStore::table_id_to_rootpage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootEntry {
+    pub root_page: Option<u64>,
+    pub begin: u64,
+    pub end: u64,
+    /// Durable boundary (`durable_txid_max`) at which this binding's B-tree was *published* —
+    /// i.e. its pages were already committed to the WAL (after `CommitPagerTxn`). A transaction
+    /// may read this btree only once its own snapshot reflects this boundary
+    /// (`visible_from <= tx.observed_durable_boundary`), because only then do its WAL read marks
+    /// physically contain the materialized frames. `begin` is *logical* base-validity (the
+    /// checkpoint's `c_ts`); `visible_from` is *physical* visibility. `0` for bootstrap/recovery
+    /// bindings (always durable). See [`MvStore::is_btree_readable_at`].
+    pub visible_from: u64,
+}
+
+impl RootEntry {
+    /// A live binding visible to every snapshot (bootstrap/recovery/uncheckpointed-create).
+    pub fn live(root_page: Option<u64>) -> Self {
+        Self {
+            root_page,
+            begin: 0,
+            end: u64::MAX,
+            visible_from: 0,
+        }
+    }
+
+    /// Still live (not yet dropped).
+    pub fn is_live(&self) -> bool {
+        self.end == u64::MAX
+    }
+
+    /// Whether this binding is logically visible to a transaction at snapshot `ts`
+    /// (`begin <= ts` and, unless live, `ts < end`). This is base-validity only; for a btree
+    /// *read* also require physical visibility via [`Self::visible_from`].
+    pub fn covers(&self, ts: u64) -> bool {
+        self.begin <= ts && (self.end == u64::MAX || ts < self.end)
+    }
+}
+
 /// A multi-version concurrency control database.
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
@@ -3819,7 +3876,17 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// Hence, we store the mapping here.
     /// The value is Option because tables created in an MVCC commit that have not
     /// been checkpointed yet have no real root page assigned yet.
-    pub table_id_to_rootpage: SkipMap<MVTableId, Option<u64>, BasicComparator, A>,
+    ///
+    /// Each value is a [`RootEntry`] carrying the binding's physical root page plus its
+    /// versioned lifetime `[begin, end)`. A PASSIVE checkpoint mutates these off-lock — it
+    /// allocates an uncheckpointed object's real root page (`begin` = checkpoint snapshot ts)
+    /// and later drops it (`end` = tombstone commit ts) — while concurrent transactions hold
+    /// older snapshots. The lifetime lets every lookup resolve the binding as seen *at a
+    /// transaction's snapshot* rather than "now", so a tx whose snapshot predates an allocation
+    /// treats the object as version-store-only (never seeking the stale placeholder root), and
+    /// a reader before a drop still resolves the (read-mark-protected) page even after reuse.
+    /// Dropped entries are retained until `end <= lwm` (see `gc_rootpage_entries`).
+    pub table_id_to_rootpage: SkipMap<MVTableId, RootEntry, BasicComparator, A>,
     /// Unlike table rows which are stored in a single map, we have a separate map for every index
     /// because operations like last() on an index are much easier when we don't have to take the
     /// table identifier into account.
@@ -4030,7 +4097,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) -> Result<Self> {
         let table_id_to_rootpage = SkipMap::new_in(alloc.clone());
         // table id 1 / root page 1 is always sqlite_schema.
-        Self::insert_initial_rootpage_mapping(&table_id_to_rootpage)?;
+        table_id_to_rootpage.insert(SQLITE_SCHEMA_MVCC_TABLE_ID, RootEntry::live(Some(1)));
         Ok(Self {
             rows: SkipMap::new_in(alloc.clone()),
             table_id_to_rootpage,
@@ -4076,40 +4143,71 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
-    /// Get the table ID from the root page.
-    /// If the root page is negative, it is a non-checkpointed table and the table ID and root page are both the same negative value.
-    /// If the root page is positive, it is a checkpointed table and there should be a corresponding table ID.
+    /// Get the table ID from the root page, resolving against the current (live) mapping.
+    /// Equivalent to `get_table_id_from_root_page_at(root_page, u64::MAX)`.
     pub fn get_table_id_from_root_page(&self, root_page: i64) -> MVTableId {
-        if root_page < 0 {
-            // Not checkpointed table - table ID and root_page are both the same negative value
-            root_page.into()
-        } else {
-            // Root page is positive: it is a checkpointed table and there should be a corresponding table ID
-            let root_page = root_page as u64;
-            let table_id = self
-                .table_id_to_rootpage
-                .iter()
-                .find(|entry| entry.value().is_some_and(|value| value == root_page))
-                .map(|entry| *entry.key())
-                .unwrap_or_else(|| {
-                    panic!("Positive root page is not mapped to a table id: {root_page}")
-                });
-            table_id
-        }
+        self.get_table_id_from_root_page_at(root_page, u64::MAX)
     }
 
-    /// Insert a table ID and root page mapping.
-    /// Root page must be positive here, because we only invoke this method with Some() for checkpointed tables.
-    #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::RootpageMappingInsert)]
-    pub fn insert_table_id_to_rootpage(
-        &self,
-        table_id: MVTableId,
-        root_page: Option<u64>,
-    ) -> Result<(), TryReserveError> {
-        self.table_id_to_rootpage.try_insert(table_id, root_page)?;
+    /// Get the table ID for `root_page` as seen by a transaction at `snapshot_ts`.
+    ///
+    /// Negative root pages are non-checkpointed objects whose table ID equals the root page;
+    /// they are never reused or versioned, so the snapshot is irrelevant.
+    ///
+    /// For a positive (checkpointed) root page, a PASSIVE checkpoint may have dropped the
+    /// object — and possibly reused the page for a new btree — while this transaction still
+    /// references it at an older snapshot. Successive owners of a page hold disjoint,
+    /// back-to-back lifetimes; we return the owner whose binding has not yet ended at the
+    /// snapshot (smallest `end > ts`, live counting as `+inf`). We deliberately do NOT gate on
+    /// `begin` here: a transaction's *physical* schema (root pages) can run ahead of its *data*
+    /// snapshot, because a checkpoint allocating a root page is not a logical schema change.
+    /// Whether the btree should actually be read at the snapshot is decided separately by
+    /// [`Self::is_btree_allocated_at`] / [`Self::resolve_root_page_at`], which do gate on
+    /// `begin`. `u64::MAX` resolves the current live owner.
+    pub fn get_table_id_from_root_page_at(&self, root_page: i64, snapshot_ts: u64) -> MVTableId {
+        if root_page < 0 {
+            // Not checkpointed table - table ID and root_page are both the same negative value
+            return root_page.into();
+        }
+        let root_page = root_page as u64;
+        self.table_id_to_rootpage
+            .iter()
+            .filter(|entry| {
+                let e = entry.value();
+                e.root_page == Some(root_page) && (e.is_live() || snapshot_ts < e.end)
+            })
+            .min_by_key(|entry| entry.value().end)
+            .map(|entry| *entry.key())
+            .unwrap_or_else(|| {
+                panic!("Positive root page is not mapped to a table id: {root_page}")
+            })
+    }
+
+    /// Snapshot timestamp (`begin_ts`) of the given transaction, or `u64::MAX` if it is not
+    /// tracked (resolving the live root-page binding). Used to make a transaction's root-page
+    /// lookups snapshot-consistent.
+    pub fn read_snapshot_ts(&self, tx_id: TxID) -> u64 {
+        self.txs
+            .get(&tx_id)
+            .map(|tx| tx.value().begin_ts)
+            .unwrap_or(u64::MAX)
+    }
+
+    /// Durable boundary this transaction observed when it pinned its read mark, or `u64::MAX` if
+    /// untracked (so an unknown tx is treated as able to see everything — it cannot have an old
+    /// mark). The physical-visibility coordinate of the btree-read gate. See
+    /// [`Self::is_btree_readable_at`].
+    pub fn read_observed_boundary(&self, tx_id: TxID) -> u64 {
+        self.txs
+            .get(&tx_id)
+            .map(|tx| tx.value().observed_durable_boundary)
+            .unwrap_or(u64::MAX)
+    }
+
+    /// Bump `next_table_id` below `table_id` (and below `-root_page` for a checkpointed root) so
+    /// recovery's `table_id = -root_page` assignment can never collide with an existing id.
+    fn bump_next_table_id_below(&self, table_id: MVTableId, root_page: Option<u64>) {
         let minimum: i64 = if let Some(root_page) = root_page {
-            // On recovery, we assign table_id = -root_page. Let's make sure we don't get any clashes between checkpointed and non-checkpointed tables
-            // E.g. if we checkpoint a table that has physical root page 7, let's require the next table_id to be less than -7 (or if table_id is already smaller, then smaller than that.)
             let root_page_as_table_id = MVTableId::from(-(root_page as i64));
             table_id.min(root_page_as_table_id).into()
         } else {
@@ -4121,9 +4219,92 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
+    /// Insert a live `table_id -> root_page` binding (bootstrap/recovery, or an
+    /// uncheckpointed-create with `None`). Visible to every snapshot. Checkpoint-time
+    /// allocation of a real root page goes through [`Self::record_rootpage_alloc`] instead.
+    pub fn insert_table_id_to_rootpage(&self, table_id: MVTableId, root_page: Option<u64>) {
+        self.table_id_to_rootpage
+            .insert(table_id, RootEntry::live(root_page));
+        self.bump_next_table_id_below(table_id, root_page);
+    }
+
     pub fn remove_table_id_to_rootpage(&self, table_id: &MVTableId) {
         self.table_id_to_rootpage.remove(table_id);
         self.table_id_to_last_rowid.write().remove(table_id);
+    }
+
+    /// The current physical root page of `table_id`, if it is checkpointed and live.
+    pub fn current_root_page(&self, table_id: &MVTableId) -> Option<u64> {
+        self.table_id_to_rootpage
+            .get(table_id)
+            .and_then(|entry| entry.value().root_page)
+    }
+
+    /// Record that a PASSIVE checkpoint physically allocated `root_page` for `table_id`. `begin_ts`
+    /// is the checkpoint's snapshot ts (base-validity lower bound); `visible_from` is the durable
+    /// boundary at which the btree's pages are already committed to the WAL — only transactions
+    /// whose snapshot reflects that boundary may physically read it. MUST be called from the
+    /// post-`CommitPagerTxn` publish window, never at `btree_create` (the pages aren't durable yet).
+    pub fn record_rootpage_alloc(
+        &self,
+        table_id: MVTableId,
+        root_page: u64,
+        begin_ts: u64,
+        visible_from: u64,
+    ) {
+        self.table_id_to_rootpage.insert(
+            table_id,
+            RootEntry {
+                root_page: Some(root_page),
+                begin: begin_ts,
+                end: u64::MAX,
+                visible_from,
+            },
+        );
+        self.bump_next_table_id_below(table_id, Some(root_page));
+    }
+
+    /// Publish a staged root-page binding: lower its `visible_from` from the staged sentinel to
+    /// `visible_from` (the durable boundary after `CommitPagerTxn`), making the btree physically
+    /// readable by transactions whose snapshot reflects that boundary. Called in the checkpoint's
+    /// post-commit publish window. No-op if the entry is gone (e.g. dropped same checkpoint).
+    pub fn publish_rootpage_visible(&self, table_id: MVTableId, visible_from: u64) {
+        if let Some(entry) = self.table_id_to_rootpage.get(&table_id) {
+            let mut e = *entry.value();
+            e.visible_from = visible_from;
+            self.table_id_to_rootpage.insert(table_id, e);
+        }
+    }
+
+    /// Close `table_id`'s binding at `end_ts` (the drop tombstone commit ts) but keep it, so a
+    /// transaction whose snapshot predates the drop can still resolve the (read-mark-protected)
+    /// root page. Reclaimed by [`Self::gc_rootpage_entries`] once `end_ts <= lwm`.
+    pub fn retire_rootpage(&self, table_id: MVTableId, end_ts: u64) {
+        if let Some(entry) = self.table_id_to_rootpage.get(&table_id) {
+            let mut e = *entry.value();
+            e.end = end_ts;
+            self.table_id_to_rootpage.insert(table_id, e);
+        }
+    }
+
+    /// Drop closed (retired) bindings no transaction can still see (dropped, with
+    /// `end <= lwm`). Live bindings have `end == u64::MAX` and are never reclaimed — important
+    /// because `compute_lwm()` is `u64::MAX` when no transactions are active. Returns count.
+    pub fn gc_rootpage_entries(&self, lwm: u64) -> usize {
+        let stale: Vec<MVTableId> = self
+            .table_id_to_rootpage
+            .iter()
+            .filter(|entry| {
+                let e = entry.value();
+                !e.is_live() && e.end <= lwm
+            })
+            .map(|entry| *entry.key())
+            .collect();
+        for key in &stale {
+            self.table_id_to_rootpage.remove(key);
+            self.table_id_to_last_rowid.write().remove(key);
+        }
+        stale.len()
     }
 
     /// Acquire MVCC's stop-the-world gate for VACUUM.
@@ -4216,6 +4397,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 "post-VACUUM B-tree root page must be positive"
             );
         }
+        // Clears live and retired bindings alike: both reference pre-VACUUM root pages that
+        // would alias new objects after root-page reuse.
         self.table_id_to_rootpage.clear();
         self.table_id_to_last_rowid.write().clear();
         // TODO: vacuum related code, not handling alloc errors for now
@@ -5506,10 +5689,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // the error paths below remove this tx if begin fails. The real
             // header is set here, so the tail only flips `pager_commit_lock_held`.
             let header = self.get_new_transaction_database_header(&pager);
+            // Sample the durable boundary under the same `blocking_checkpoint_lock.read()` we
+            // hold for our lifetime: the checkpoint's publish window takes `.write()`, so this is
+            // atomic w.r.t. any materialization publish. See `observed_durable_boundary`.
+            let observed_durable_boundary = self.durable_txid_max.load(Ordering::Acquire);
             self.clock.get_timestamp(|ts| {
-                if let Err(err) = self.insert_tx_entry(tx_id, Transaction::new(tx_id, ts, header)) {
-                    insert_err = Some(err);
-                }
+                self.txs.insert(
+                    tx_id,
+                    Transaction::new(tx_id, ts, header, observed_durable_boundary),
+                );
             })
         };
         if let Some(err) = insert_err {
@@ -5657,11 +5845,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // violation. Publishing under the clock lock orders us strictly before
         // or after any commit timestamp (commits also take the clock lock), so
         // any GC that runs after a later commit already sees our begin_ts.
-        let mut insert_err = None;
+        // Sampled under `blocking_checkpoint_lock.read()` (held for our lifetime), so atomic
+        // w.r.t. the checkpoint's `.write()` publish window. See `observed_durable_boundary`.
+        let observed_durable_boundary = self.durable_txid_max.load(Ordering::Acquire);
         let begin_ts = self.clock.get_timestamp(|ts| {
-            if let Err(err) = self.insert_tx_entry(tx_id, Transaction::new(tx_id, ts, header)) {
-                insert_err = Some(err);
-            }
+            self.txs.insert(
+                tx_id,
+                Transaction::new(tx_id, ts, header, observed_durable_boundary),
+            );
         });
         tracing::trace!("begin_tx(tx_id={}, begin_ts={})", tx_id, begin_ts);
         if let Some(err) = insert_err {
@@ -6495,6 +6686,37 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.clock.get_timestamp(f)
     }
 
+    /// Snapshot timestamp for a checkpoint, clamped below any in-flight (`Preparing`)
+    /// commit. The published durable boundary (`durable_txid_max_new`) derives from this.
+    /// `last_committed_tx_ts` is a `fetch_max` high-water mark, so a transaction that
+    /// already assigned a *lower* `end_ts` and is still `Preparing` can sit below it; the
+    /// checkpoint would skip that transaction (not yet `Committed`) yet publish a boundary
+    /// above its `end_ts`, and a crash after it finalizes would discard its log frame
+    /// (`commit_ts <= boundary`) even though it was never written to the B-tree — silent
+    /// data loss. Clamping below the lowest `Preparing` end_ts prevents the straddle.
+    ///
+    /// Computed while holding the clock lock (via `get_timestamp`) so a transaction
+    /// mid-(end_ts assignment + `Preparing` publish, which happen together under that
+    /// lock) cannot be missed by the scan. Active transactions need no clamp: their future
+    /// `end_ts` is drawn from the monotonic clock and is therefore `> snapshot_ts`.
+    pub fn checkpoint_snapshot_ts(&self) -> u64 {
+        let mut snapshot_ts = 0;
+        self.clock.get_timestamp(|_now| {
+            let last_committed = self.last_committed_tx_ts.load(Ordering::Acquire);
+            let inflight_floor = self
+                .txs
+                .iter()
+                .filter_map(|entry| match entry.value().state.load() {
+                    TransactionState::Preparing(ts) => Some(ts),
+                    _ => None,
+                })
+                .min()
+                .unwrap_or(u64::MAX);
+            snapshot_ts = last_committed.min(inflight_floor.saturating_sub(1));
+        });
+        snapshot_ts
+    }
+
     /// Compute the low-water mark: the minimum begin_ts of all active or
     /// preparing transactions. Returns u64::MAX if no transactions are active.
     /// Used by GC to determine which row versions are safe to reclaim.
@@ -6667,6 +6889,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
 
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
+        let min_reader_boundary = self.compute_min_reader_boundary();
 
         let mut dropped = 0;
         let mut processed = 0;
@@ -6681,7 +6904,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if processed >= max_chains {
                 break;
             }
-            {
+            // GC floor: retain rows of a freshly-materialized btree not yet visible to all readers.
+            if !self.rootpage_gc_protected(&entry.key().table_id, min_reader_boundary) {
                 let mut versions = entry.value().write();
                 dropped += Self::gc_version_chain(
                     &mut versions,
@@ -6747,6 +6971,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut dropped = 0;
         let mut processed = 0;
         let mut last: Option<(MVTableId, Arc<SortableIndexKey>)> = None;
+        let min_reader_boundary = self.compute_min_reader_boundary();
 
         let cursor = self.gc_index_cursor.lock().clone();
         let outer_start = match &cursor {
@@ -6758,6 +6983,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 break;
             }
             let index_id = *outer.key();
+            // GC floor: retain a freshly-materialized index not yet visible to all readers.
+            if self.rootpage_gc_protected(&index_id, min_reader_boundary) {
+                continue;
+            }
             let inner = outer.value();
             // Resume after the saved key only within the index that the cursor
             // pointed into; every later index starts from its first key.
@@ -6822,8 +7051,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         remove_empty_slots: bool,
     ) -> usize {
         let mut dropped = 0;
+        let min_reader_boundary = self.compute_min_reader_boundary();
 
         for entry in self.rows.iter() {
+            // GC floor: retain rows of a freshly-materialized btree not yet visible to all readers.
+            if self.rootpage_gc_protected(&entry.key().table_id, min_reader_boundary) {
+                continue;
+            }
             let is_now_empty = {
                 let mut versions = entry.value().write();
                 dropped += Self::gc_version_chain(
@@ -6857,8 +7091,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         remove_empty_slots: bool,
     ) -> usize {
         let mut dropped = 0;
+        let min_reader_boundary = self.compute_min_reader_boundary();
 
         for outer_entry in self.index_rows.iter() {
+            // GC floor: retain a freshly-materialized index not yet visible to all readers.
+            if self.rootpage_gc_protected(outer_entry.key(), min_reader_boundary) {
+                continue;
+            }
             let inner_map = outer_entry.value();
 
             for inner_entry in inner_map.iter() {
@@ -7940,9 +8179,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         };
 
         let root_page_for_index = |index_id: MVTableId| -> i64 {
-            self.table_id_to_rootpage
-                .get(&index_id)
-                .and_then(|entry| *entry.value())
+            self.current_root_page(&index_id)
                 .map(|value| value as i64)
                 .unwrap_or_else(|| i64::from(index_id))
         };
@@ -8223,10 +8460,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                         if let Some(entry) =
                                             self.table_id_to_rootpage.get(&table_id)
                                         {
-                                            if let Some(value) = *entry.value() {
-                                                panic!(
-                                                    "Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}"
-                                                );
+                                            if let Some(value) = entry.value().root_page {
+                                                panic!("Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}");
                                             }
                                         }
                                         self.insert_table_id_to_rootpage(table_id, None)?;
@@ -8239,10 +8474,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                                 "Logical log contains root page reference {root_page} that does not exist in the table_id_to_rootpage map"
                                             );
                                         };
-                                        let Some(value) = *entry.value() else {
-                                            panic!(
-                                                "Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map"
-                                            );
+                                        let Some(value) = entry.value().root_page else {
+                                            panic!("Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map");
                                         };
                                         turso_assert_eq!(value, root_page as u64, "logical log root page does not match table_id_to_rootpage map", { "root_page": root_page, "map_value": value });
                                     }
@@ -8623,12 +8856,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     pub fn get_real_table_id(&self, table_id: i64) -> i64 {
-        let entry = self.table_id_to_rootpage.get(&MVTableId::from(table_id));
-        if let Some(entry) = entry {
-            entry.value().map_or(table_id, |value| value as i64)
-        } else {
-            table_id
-        }
+        self.current_root_page(&MVTableId::from(table_id))
+            .map_or(table_id, |root_page| root_page as i64)
     }
 
     pub fn get_rowid_allocator(&self, table_id: &MVTableId) -> Arc<RowidAllocator> {
@@ -8646,9 +8875,73 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
+    /// Whether `table_id` has a *currently live* checkpointed B-tree. Snapshot-agnostic; for
+    /// transaction reads use [`Self::is_btree_readable_at`].
     pub fn is_btree_allocated(&self, table_id: &MVTableId) -> bool {
-        let maybe_root_page = self.table_id_to_rootpage.get(table_id);
-        maybe_root_page.is_some_and(|entry| entry.value().is_some())
+        self.table_id_to_rootpage
+            .get(table_id)
+            .is_some_and(|entry| entry.value().root_page.is_some() && entry.value().is_live())
+    }
+
+    /// Whether a transaction may **read** `table_id`'s B-tree, given its logical snapshot
+    /// `begin_ts` and the durable boundary it observed when it pinned its WAL read mark
+    /// (`observed_boundary`). Requires BOTH:
+    /// - **logical (base validity):** the binding `covers(begin_ts)` — `begin <= begin_ts < end`; and
+    /// - **physical visibility:** `visible_from <= observed_boundary` — the btree's pages were
+    ///   already in the WAL when this transaction pinned its read mark, so its mark physically
+    ///   contains them. Without this a transaction that opened before an off-lock materialization
+    ///   would seek a page its snapshot cannot see (a torn/foreign-page read).
+    ///
+    /// When this is false the transaction stays version-store-only; the GC floor
+    /// ([`Self::compute_min_reader_boundary`]) guarantees the version-store copy is still present.
+    pub fn is_btree_readable_at(
+        &self,
+        table_id: &MVTableId,
+        begin_ts: u64,
+        observed_boundary: u64,
+    ) -> bool {
+        self.table_id_to_rootpage
+            .get(table_id)
+            .is_some_and(|entry| {
+                let e = entry.value();
+                // `visible_from == u64::MAX` is the "staged, not yet published" sentinel (pages
+                // allocated but not yet durable); never readable, even by an untracked observer.
+                e.root_page.is_some()
+                    && e.visible_from != u64::MAX
+                    && e.covers(begin_ts)
+                    && e.visible_from <= observed_boundary
+            })
+    }
+
+    /// Lowest `observed_durable_boundary` over all active/preparing transactions (`u64::MAX` if
+    /// none). A freshly-materialized object's version-store rows may be GC'd only once its
+    /// `visible_from <= this`, i.e. every live reader can now physically read it from the btree —
+    /// otherwise a reader at `begin_ts > c_ts` that can't yet see the btree would lose the rows.
+    pub fn compute_min_reader_boundary(&self) -> u64 {
+        self.txs
+            .iter()
+            .filter_map(|entry| {
+                let tx = entry.value();
+                match tx.state.load() {
+                    TransactionState::Active | TransactionState::Preparing(_) => {
+                        Some(tx.observed_durable_boundary)
+                    }
+                    _ => None,
+                }
+            })
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
+    /// GC floor: whether `table_id`'s version-store rows must be retained because its btree was
+    /// freshly materialized and is not yet physically visible to every active reader
+    /// (`visible_from > min_reader_boundary`). A reader at `begin_ts > c_ts` that cannot yet read
+    /// the btree (its read mark predates the materialization) still needs the version-store copy;
+    /// `lwm` alone does not protect it, because the materialized rows have `ts <= c_ts < lwm`.
+    fn rootpage_gc_protected(&self, table_id: &MVTableId, min_reader_boundary: u64) -> bool {
+        self.table_id_to_rootpage
+            .get(table_id)
+            .is_some_and(|e| e.value().visible_from > min_reader_boundary)
     }
 
     pub fn tx_should_abort(&self, tx_id: u64) -> bool {

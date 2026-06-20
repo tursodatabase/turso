@@ -554,7 +554,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             (&*btree_cursor as &dyn Any).is::<BTreeCursor>(),
             "BTreeCursor expected for mvcc cursor"
         );
-        let table_id = db.get_table_id_from_root_page(root_page_or_table_id);
+        // Resolve the root page against this reader's snapshot: a PASSIVE checkpoint may have
+        // dropped (and possibly reused) the page off-lock while we still reference it at an
+        // older snapshot. The WAL read mark keeps the pages readable; this keeps the in-memory
+        // root_page -> table_id reverse lookup snapshot-consistent. See `retired_rootpages`.
+        let table_id =
+            db.get_table_id_from_root_page_at(root_page_or_table_id, db.read_snapshot_ts(tx_id));
         #[cfg(not(any(test, injected_yields)))]
         let _ = connection;
         Ok(Self {
@@ -777,7 +782,16 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     fn is_btree_allocated(&self) -> bool {
-        self.db.is_btree_allocated(&self.table_id)
+        // Dual gate (logical base-validity AND physical visibility): a PASSIVE checkpoint may
+        // materialize this object's btree off-lock. This cursor may read it only if the binding
+        // covers our snapshot AND its pages were already durable when we pinned our read mark
+        // (`visible_from <= observed_boundary`). A cursor that opened before an off-lock
+        // materialization therefore stays version-store-only for its whole life and never seeks
+        // the page its read mark can't see. See `MvStore::is_btree_readable_at`.
+        let begin_ts = self.db.read_snapshot_ts(self.tx_id);
+        let observed = self.db.read_observed_boundary(self.tx_id);
+        self.db
+            .is_btree_readable_at(&self.table_id, begin_ts, observed)
     }
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> bool {

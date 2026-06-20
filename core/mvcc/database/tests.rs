@@ -446,27 +446,18 @@ fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
         77
     );
     assert_eq!(
-        *db.mvcc_store
-            .table_id_to_rootpage
-            .get(&SQLITE_SCHEMA_MVCC_TABLE_ID)
-            .expect("sqlite_schema mapping")
-            .value(),
+        db.mvcc_store
+            .current_root_page(&SQLITE_SCHEMA_MVCC_TABLE_ID),
         Some(1)
     );
     assert_eq!(
-        *db.mvcc_store
-            .table_id_to_rootpage
-            .get(&MVTableId::from(-(table_root)))
-            .expect("table root mapping")
-            .value(),
+        db.mvcc_store
+            .current_root_page(&MVTableId::from(-(table_root))),
         Some(table_root as u64)
     );
     assert_eq!(
-        *db.mvcc_store
-            .table_id_to_rootpage
-            .get(&MVTableId::from(-(index_root)))
-            .expect("index root mapping")
-            .value(),
+        db.mvcc_store
+            .current_root_page(&MVTableId::from(-(index_root))),
         Some(index_root as u64)
     );
     assert!(
@@ -476,6 +467,60 @@ fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
             .is_none(),
         "stale root-page entries must be cleared"
     );
+}
+
+/// The btree-read DUAL GATE. A PASSIVE checkpoint materializes an object's btree off-lock; a
+/// transaction may read it only when BOTH (a) the binding logically covers its snapshot
+/// (`begin <= begin_ts < end`) AND (b) it is physically visible — the pages were durable when the
+/// transaction pinned its read mark (`visible_from <= observed_durable_boundary`). The physical
+/// gate is what protects a tx with `begin_ts > c_ts` that opened before an off-lock
+/// materialization: it would otherwise seek a btree its read mark cannot see (torn/foreign read).
+#[test]
+fn mvcc_btree_read_dual_gate() {
+    let db = MvccTestDb::new();
+    let store = &db.mvcc_store;
+
+    let old_id = MVTableId::from(-50_i64);
+    let new_id = MVTableId::from(-900_i64);
+    let root: u64 = 286;
+    // c_ts = checkpoint snapshot (logical begin); vf = visible_from (durable boundary at publish).
+    let (c_ts, vf, drop) = (100u64, 130u64, 300u64);
+
+    // Uncheckpointed: not readable at any snapshot.
+    store.insert_table_id_to_rootpage(old_id, None);
+    assert!(!store.is_btree_readable_at(&old_id, 200, u64::MAX));
+
+    // STAGED at btree_create (visible_from = u64::MAX): the checkpoint can resolve the root...
+    store.record_rootpage_alloc(old_id, root, c_ts, u64::MAX);
+    assert_eq!(store.current_root_page(&old_id), Some(root));
+    // ...but NO transaction may read it yet, not even one that observed everything.
+    assert!(!store.is_btree_readable_at(&old_id, c_ts + 50, u64::MAX));
+
+    // PUBLISH (post-CommitPagerTxn): visible_from lowered to the durable boundary vf.
+    store.publish_rootpage_visible(old_id, vf);
+
+    // The hazard tx: begin_ts > c_ts (logical OK) but observed an OLD boundary (< vf) -> its read
+    // mark predates the materialization frames -> NOT readable; stays version-store-only.
+    assert!(!store.is_btree_readable_at(&old_id, c_ts + 50, vf - 1));
+    // A tx that observed the boundary at/after vf can read it.
+    assert!(store.is_btree_readable_at(&old_id, c_ts + 50, vf));
+    // Logical gate still required: a tx whose snapshot predates c_ts never reads it.
+    assert!(!store.is_btree_readable_at(&old_id, c_ts - 1, u64::MAX));
+
+    // Drop + reuse: reverse lookup is end-gated; a pre-drop snapshot still resolves the old owner.
+    store.retire_rootpage(old_id, drop);
+    store.record_rootpage_alloc(new_id, root, drop + 5, drop + 10);
+    store.publish_rootpage_visible(new_id, drop + 10);
+    assert_eq!(
+        store.get_table_id_from_root_page_at(root as i64, drop - 1),
+        old_id
+    );
+    assert!(!store.is_btree_readable_at(&old_id, drop + 1, u64::MAX)); // past its end
+    assert!(store.is_btree_readable_at(&new_id, drop + 20, drop + 20)); // new owner readable
+
+    // Once lwm passes the drop, the retired old binding is reclaimed; the live owner remains.
+    assert_eq!(store.gc_rootpage_entries(drop), 1);
+    assert_eq!(store.get_table_id_from_root_page(root as i64), new_id);
 }
 
 #[test]
@@ -2018,6 +2063,46 @@ fn test_flag_off_truncate_busy_when_lock_contended() {
     );
 
     c1.execute("COMMIT").unwrap();
+}
+
+/// `checkpoint_snapshot_ts` must clamp the published checkpoint boundary below any
+/// in-flight (Preparing) commit. `last_committed_tx_ts` is a fetch_max high-water mark,
+/// so a commit that assigned a LOWER end_ts and is still Preparing (commits finalize out
+/// of timestamp order) sits below it; a checkpoint that published a boundary above that
+/// end_ts and skipped the commit (not yet Committed) would lose it on reopen. Regression
+/// for the boundary-straddle data-loss path (review finding #1).
+#[test]
+fn test_checkpoint_snapshot_ts_clamps_below_inflight_preparing() {
+    let db = MvccTestDb::new();
+    let store = &db.mvcc_store;
+    let pager = db.conn.pager.load().clone();
+    let inflight = store.begin_tx(pager).unwrap();
+
+    // Out-of-order finalize: a higher-ts commit advanced the watermark to 1000 while
+    // `inflight` is still Preparing at the lower end_ts 500.
+    store.last_committed_tx_ts.store(1000, Ordering::SeqCst);
+    store
+        .txs
+        .get(&inflight)
+        .unwrap()
+        .value()
+        .state
+        .store(TransactionState::Preparing(500));
+    assert_eq!(
+        store.checkpoint_snapshot_ts(),
+        499,
+        "boundary must clamp below in-flight Preparing(500), not reach last_committed=1000"
+    );
+
+    // Once it commits, the clamp lifts back to the watermark.
+    store
+        .txs
+        .get(&inflight)
+        .unwrap()
+        .value()
+        .state
+        .store(TransactionState::Committed(500));
+    assert_eq!(store.checkpoint_snapshot_ts(), 1000);
 }
 
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
@@ -5801,6 +5886,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
+        observed_durable_boundary: 0,
     }
 }
 
@@ -7480,6 +7566,7 @@ fn transaction_display() {
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
+        observed_durable_boundary: 0,
     };
 
     let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }] }";
