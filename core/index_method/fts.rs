@@ -1465,14 +1465,26 @@ impl FtsIndexAttachment {
             "SELECT * FROM {} WHERE fts_match({}, ?)",
             cfg.table_name, cols
         );
+        // Pattern 7: combined + ORDER BY ASC + LIMIT
+        let combined_ordered_asc_limit = format!(
+            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) ORDER BY score ASC LIMIT ?",
+            cols, cfg.table_name, cols
+        );
+        // Pattern 8: combined + ORDER BY ASC (no LIMIT)
+        let combined_ordered_asc = format!(
+            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) ORDER BY score ASC",
+            cols, cfg.table_name, cols
+        );
         let patterns = parse_patterns(&[
-            &score_pattern,          // 0
-            &combined_ordered_limit, // 1
-            &combined_ordered,       // 2
-            &combined_limit,         // 3
-            &combined,               // 4
-            &match_limit,            // 5
-            &match_pattern,          // 6
+            &score_pattern,              // 0
+            &combined_ordered_limit,     // 1
+            &combined_ordered,           // 2
+            &combined_ordered_asc_limit, // 3
+            &combined_ordered_asc,       // 4
+            &combined_limit,             // 5
+            &combined,                   // 6
+            &match_limit,                // 7
+            &match_pattern,              // 8
         ])?;
         Ok(Self {
             cfg,
@@ -1639,10 +1651,12 @@ fn initialize_btree_storage_table(
 const FTS_PATTERN_SCORE: i64 = 0;
 const FTS_PATTERN_COMBINED_ORDERED_LIMIT: i64 = 1;
 const FTS_PATTERN_COMBINED_ORDERED: i64 = 2;
-const FTS_PATTERN_COMBINED_LIMIT: i64 = 3;
-const FTS_PATTERN_COMBINED: i64 = 4;
-const FTS_PATTERN_MATCH_LIMIT: i64 = 5;
-const FTS_PATTERN_MATCH: i64 = 6;
+const FTS_PATTERN_COMBINED_ORDERED_ASC_LIMIT: i64 = 3;
+const FTS_PATTERN_COMBINED_ORDERED_ASC: i64 = 4;
+const FTS_PATTERN_COMBINED_LIMIT: i64 = 5;
+const FTS_PATTERN_COMBINED: i64 = 6;
+const FTS_PATTERN_MATCH_LIMIT: i64 = 7;
+const FTS_PATTERN_MATCH: i64 = 8;
 const TANTIVY_META_FILE: &str = "meta.json";
 const TANTIVY_META_LOCK_FILE: &str = ".tantivy-meta.lock";
 
@@ -3107,14 +3121,16 @@ impl IndexMethodCursor for FtsCursor {
         // - Patterns WITH LIMIT: use the captured limit value from values[2]
         let limit_raw = match pattern_idx {
             // Patterns without LIMIT - fetch all matches
-            FTS_PATTERN_MATCH | FTS_PATTERN_COMBINED | FTS_PATTERN_COMBINED_ORDERED => {
-                Self::MAX_NO_LIMIT_RESULT as i64
-            }
+            FTS_PATTERN_MATCH
+            | FTS_PATTERN_COMBINED
+            | FTS_PATTERN_COMBINED_ORDERED
+            | FTS_PATTERN_COMBINED_ORDERED_ASC => Self::MAX_NO_LIMIT_RESULT as i64,
             // Patterns with LIMIT - use captured limit value
             FTS_PATTERN_SCORE
             | FTS_PATTERN_MATCH_LIMIT
             | FTS_PATTERN_COMBINED_LIMIT
-            | FTS_PATTERN_COMBINED_ORDERED_LIMIT => {
+            | FTS_PATTERN_COMBINED_ORDERED_LIMIT
+            | FTS_PATTERN_COMBINED_ORDERED_ASC_LIMIT => {
                 if values.len() > 2 {
                     match &values[2] {
                         Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
@@ -3212,6 +3228,12 @@ impl IndexMethodCursor for FtsCursor {
         // Re-sort by score since we grouped by segment (preserves original ranking order)
         self.current_hits
             .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        if self.current_pattern == FTS_PATTERN_COMBINED_ORDERED_ASC
+            || self.current_pattern == FTS_PATTERN_COMBINED_ORDERED_ASC_LIMIT
+        {
+            self.current_hits.reverse();
+        }
 
         Ok(IOResult::Done(!self.current_hits.is_empty()))
     }
