@@ -4910,6 +4910,29 @@ impl Column {
             self.affinity()
         }
     }
+
+    /// The column's declared type as reported by `PRAGMA table_info`/`table_xinfo`.
+    ///
+    /// SQLite reports the declared type including any parenthesized parameters
+    /// (e.g. `VARCHAR(100)`, `DECIMAL(10,2)`). The base type name and its
+    /// parameters are stored separately (`ty_str` and `ty_params`), so this
+    /// reconstructs the full declared type string.
+    pub fn declared_type(&self) -> String {
+        if self.ty_params.is_empty() {
+            return self.ty_str.clone();
+        }
+        let mut declared = self.ty_str.clone();
+        declared.push('(');
+        for (i, param) in self.ty_params.iter().enumerate() {
+            if i > 0 {
+                declared.push(',');
+            }
+            declared.push_str(&param.to_string());
+        }
+        declared.push(')');
+        declared
+    }
+
     pub fn new_default_text(
         name: Option<String>,
         ty_str: String,

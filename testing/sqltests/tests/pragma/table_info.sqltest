@@ -1,0 +1,43 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/5762
+# PRAGMA table_info / table_xinfo must report the declared column type including
+# its parenthesized parameters (e.g. VARCHAR(100), DECIMAL(10,2)), matching SQLite.
+
+@cross-check-integrity
+test pragma-table-info-preserves-type-params {
+    CREATE TABLE t(
+        a VARCHAR(100),
+        b CHAR(50),
+        c DECIMAL(10,2),
+        d NUMERIC(5,3),
+        e FLOAT(24),
+        f NVARCHAR(200),
+        g INTEGER,
+        h TEXT,
+        i
+    );
+    SELECT cid, name, type FROM pragma_table_info('t');
+}
+expect {
+    0|a|VARCHAR(100)
+    1|b|CHAR(50)
+    2|c|DECIMAL(10,2)
+    3|d|NUMERIC(5,3)
+    4|e|FLOAT(24)
+    5|f|NVARCHAR(200)
+    6|g|INTEGER
+    7|h|TEXT
+    8|i|
+}
+
+@cross-check-integrity
+test pragma-table-xinfo-preserves-type-params {
+    CREATE TABLE t(a VARCHAR(100), c DECIMAL(10,2), g INTEGER);
+    SELECT cid, name, type FROM pragma_table_xinfo('t');
+}
+expect {
+    0|a|VARCHAR(100)
+    1|c|DECIMAL(10,2)
+    2|g|INTEGER
+}
