@@ -273,6 +273,37 @@ expect {
 }
 
 @cross-check-integrity
+test alter-table-add-column-nullability {
+    CREATE TABLE t (a INTEGER);
+    ALTER TABLE t ADD COLUMN b BLOB NULL;
+    ALTER TABLE t ADD COLUMN c BLOB NOT NULL DEFAULT x'00';
+    ALTER TABLE t ADD COLUMN d BLOB;
+    INSERT INTO t (a) VALUES (1);
+
+    SELECT name, "notnull", dflt_value FROM pragma_table_info('t') WHERE name IN ('b', 'c', 'd') ORDER BY cid;
+    SELECT a, quote(b), quote(c), quote(d) FROM t;
+
+    CREATE TABLE u (a INTEGER, b BLOB NULL);
+    SELECT name, "notnull" FROM pragma_table_info('u') WHERE name = 'b';
+}
+expect {
+    b|0|
+    c|1|x'00'
+    d|0|
+    1|NULL|X'00'|NULL
+    b|0
+}
+
+@cross-check-integrity
+test alter-table-add-column-not-null-enforced {
+    CREATE TABLE t (a INTEGER);
+    ALTER TABLE t ADD COLUMN b BLOB NOT NULL DEFAULT x'00';
+    INSERT INTO t (a, b) VALUES (1, NULL);
+}
+expect error {
+}
+
+@cross-check-integrity
 test alter-table-add-column-invalid-multi-column-fk {
     CREATE TABLE t(a, c);
     CREATE TABLE s(a);
