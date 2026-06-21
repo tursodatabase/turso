@@ -12,7 +12,7 @@ The SQLAlchemy dialect is fully implemented with three dialects:
 ## Installation
 
 ```bash
-pip install pyturso[sqlalchemy]
+pip install 'pyturso[sqlalchemy]'
 ```
 
 ## Quick Start
