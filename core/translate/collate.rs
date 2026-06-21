@@ -47,6 +47,21 @@ static CUSTOM_COLLATION_NAMES: LazyLock<Mutex<CustomCollationNames>> =
     LazyLock::new(|| Mutex::new(CustomCollationNames::default()));
 
 impl CollationSeq {
+    const BUILTIN_SEQUENCES: [Self; 3] = [Self::Binary, Self::NoCase, Self::Rtrim];
+
+    pub fn builtin_sequences() -> &'static [Self] {
+        &Self::BUILTIN_SEQUENCES
+    }
+
+    pub const fn builtin_name(self) -> Option<&'static str> {
+        match self {
+            Self::Binary => Some("BINARY"),
+            Self::NoCase => Some("NOCASE"),
+            Self::Rtrim => Some("RTRIM"),
+            _ => None,
+        }
+    }
+
     pub fn new(collation: &str) -> crate::Result<Self> {
         match crate::util::normalize_ident(collation).as_str() {
             "binary" => return Ok(Self::Binary),

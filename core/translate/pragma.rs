@@ -20,6 +20,7 @@ use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::plan::BitSet;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
@@ -249,6 +250,7 @@ pub fn translate_pragma(
             PragmaName::IndexInfo
             | PragmaName::IndexXinfo
             | PragmaName::IndexList
+            | PragmaName::CollationList
             | PragmaName::ForeignKeyList
             | PragmaName::TableList
             | PragmaName::TableInfo
@@ -435,6 +437,16 @@ fn update_pragma(
             program,
         ),
         PragmaName::ModuleList => Ok(TransactionMode::None),
+        PragmaName::CollationList => query_pragma(
+            PragmaName::CollationList,
+            resolver,
+            Some(value),
+            pager,
+            connection,
+            database_id,
+            schema_was_explicit,
+            program,
+        ),
         PragmaName::PageCount => query_pragma(
             PragmaName::PageCount,
             resolver,
@@ -938,6 +950,41 @@ fn query_pragma(
             }
 
             program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::CollationList => {
+            let base_reg = register;
+            program.alloc_registers(1);
+
+            let mut seq = 0_i64;
+            for collation in CollationSeq::builtin_sequences() {
+                let name = collation
+                    .builtin_name()
+                    .expect("builtin collation sequence must have a PRAGMA name");
+                program.emit_int(seq, base_reg);
+                program.emit_string8(name.to_string(), base_reg + 1);
+                program.emit_result_row(base_reg, 2);
+                seq += 1;
+            }
+
+            for collation in connection.get_syms_collations() {
+                if CollationSeq::builtin_sequences().iter().any(|builtin| {
+                    builtin
+                        .builtin_name()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&collation))
+                }) {
+                    continue;
+                }
+                program.emit_int(seq, base_reg);
+                program.emit_string8(collation, base_reg + 1);
+                program.emit_result_row(base_reg, 2);
+                seq += 1;
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
             Ok(TransactionMode::None)
         }
         PragmaName::FunctionList => {
