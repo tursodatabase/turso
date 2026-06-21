@@ -2773,8 +2773,8 @@ impl Pager {
     ///
     /// This is a no-op when encryption is not configured.
     fn reset_page_size_in_encryption_ctx(&self, size: PageSize) {
-        let updated = self.io_ctx.write().reset_page_size_in_encryption_ctx(size);
-        if !updated {
+        self.io_ctx.write().reset_page_size_in_encryption_ctx(size);
+        if !self.is_encryption_ctx_set() {
             return;
         }
         if let Some(wal) = self.wal.as_ref() {

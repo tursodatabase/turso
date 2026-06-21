@@ -42,17 +42,9 @@ impl IOContext {
         self.encryption_or_checksum = EncryptionOrChecksum::Encryption(encryption_ctx);
     }
 
-    /// Set the page size stored in the encryption context, if one is installed.
-    ///
-    /// Returns true when the context was updated. The cipher mode and key are
-    /// unchanged.
-    pub(crate) fn reset_page_size_in_encryption_ctx(&mut self, page_size: PageSize) -> bool {
-        match &mut self.encryption_or_checksum {
-            EncryptionOrChecksum::Encryption(ctx) => {
-                ctx.set_page_size(page_size);
-                true
-            }
-            _ => false,
+    pub(crate) fn reset_page_size_in_encryption_ctx(&mut self, page_size: PageSize) {
+        if let EncryptionOrChecksum::Encryption(ctx) = &mut self.encryption_or_checksum {
+            ctx.set_page_size(page_size);
         }
     }
 
