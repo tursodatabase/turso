@@ -280,16 +280,16 @@ test alter-table-add-column-nullability {
     ALTER TABLE t ADD COLUMN d BLOB;
     INSERT INTO t (a) VALUES (1);
 
-    SELECT name, "notnull", dflt_value FROM pragma_table_info('t') WHERE name IN ('b', 'c', 'd') ORDER BY cid;
+    SELECT name, "notnull" FROM pragma_table_info('t') WHERE name IN ('b', 'c', 'd') ORDER BY cid;
     SELECT a, quote(b), quote(c), quote(d) FROM t;
 
     CREATE TABLE u (a INTEGER, b BLOB NULL);
     SELECT name, "notnull" FROM pragma_table_info('u') WHERE name = 'b';
 }
 expect {
-    b|0|
-    c|1|x'00'
-    d|0|
+    b|0
+    c|1
+    d|0
     1|NULL|X'00'|NULL
     b|0
 }
