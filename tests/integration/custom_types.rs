@@ -425,4 +425,96 @@ mod tests {
             "LEFT JOIN on custom type column should find matches and produce NULLs for non-matches"
         );
     }
+
+    #[test]
+    fn test_blob_base_builtin_custom_types_in_strict_tables() {
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_encryption(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+
+        conn.execute("CREATE TABLE jsonb_values (a jsonb) STRICT")
+            .unwrap();
+        conn.execute(r#"INSERT INTO jsonb_values VALUES (jsonb('{"a":"b"}'))"#)
+            .unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT a FROM jsonb_values");
+        assert_eq!(rows, vec![(r#"{"a":"b"}"#.to_string(),)]);
+
+        conn.execute("CREATE TABLE uuid_values (id uuid) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO uuid_values VALUES (uuid4())")
+            .unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT id FROM uuid_values");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.len(), 36);
+    }
+
+    #[test]
+    fn test_text_base_json_strict_type_check_still_rejects_blob() {
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_encryption(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+
+        conn.execute("CREATE TABLE json_values (a json) STRICT")
+            .unwrap();
+        conn.execute(r#"INSERT INTO json_values VALUES (json('{"a":"b"}'))"#)
+            .unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT a FROM json_values");
+        assert_eq!(rows, vec![(r#"{"a":"b"}"#.to_string(),)]);
+
+        let err = conn
+            .execute("INSERT INTO json_values VALUES (X'0102')")
+            .unwrap_err();
+        let err = err.to_string();
+        assert!(
+            err.contains("cannot store BLOB value in TEXT column json_values.a"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_builtin_custom_type_inserts_still_work_in_non_strict_tables() {
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_encryption(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+
+        conn.execute("CREATE TABLE non_strict_jsonb (a jsonb)")
+            .unwrap();
+        conn.execute(r#"INSERT INTO non_strict_jsonb VALUES (jsonb('{"a":"b"}'))"#)
+            .unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT typeof(a) FROM non_strict_jsonb");
+        assert_eq!(rows, vec![("blob".to_string(),)]);
+
+        conn.execute("CREATE TABLE non_strict_uuid (id uuid)")
+            .unwrap();
+        conn.execute("INSERT INTO non_strict_uuid VALUES (uuid4())")
+            .unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT typeof(id) FROM non_strict_uuid");
+        assert_eq!(rows, vec![("blob".to_string(),)]);
+    }
+
+    #[test]
+    fn test_strict_builtin_type_errors_are_unchanged() {
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_encryption(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+
+        conn.execute("CREATE TABLE strict_ints (a INTEGER) STRICT")
+            .unwrap();
+        let err = conn
+            .execute("INSERT INTO strict_ints VALUES ('not-int')")
+            .unwrap_err();
+        let err = err.to_string();
+        assert!(
+            err.contains("cannot store TEXT value in INTEGER column strict_ints.a"),
+            "{err}"
+        );
+    }
 }
