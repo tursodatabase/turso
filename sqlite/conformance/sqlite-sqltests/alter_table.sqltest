@@ -288,7 +288,7 @@ test alter-table-add-column-nullability {
 }
 expect {
     b|0|
-    c|1|x'00'
+    c|1|X'00'
     d|0|
     1|NULL|X'00'|NULL
     b|0
