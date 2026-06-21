@@ -261,6 +261,33 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
     assert!(savepoint.newly_added_to_write_set.is_empty());
 }
 
+#[test]
+fn mv_store_remove_committed_write_tx_does_not_allocate_finalized_state() {
+    let alloc = FailOnDemandAlloc::default();
+    let store = MvStore::new_in(
+        MvccClock::new(),
+        test_mvcc_storage("mv-store-remove-committed-write-no-alloc.db-log"),
+        alloc.clone(),
+    )
+    .unwrap();
+
+    let tx_id = 7;
+    let tx = new_tx(tx_id, 1, TransactionState::Committed(2));
+    let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(42));
+    let row_versions = Arc::new(RwLock::new(Vec::new()));
+    tx.insert_to_write_set(row_id, row_versions);
+    store.txs.try_insert(tx_id, tx).unwrap();
+
+    let reservation = store.reserve_finalized_tx_state().unwrap();
+    store.insert_reserved_finalized_tx_state(reservation, tx_id, 2);
+
+    assert!(store.blocking_checkpoint_lock.read());
+    alloc.fail_allocations(true);
+
+    store.remove_tx(tx_id).unwrap();
+    assert!(store.txs.get(&tx_id).is_none());
+}
+
 impl MvccTestDb {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());

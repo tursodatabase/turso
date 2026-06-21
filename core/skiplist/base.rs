@@ -4,7 +4,7 @@ use core::{
     alloc::Layout,
     cmp, fmt,
     marker::PhantomData,
-    mem,
+    mem::{self, ManuallyDrop},
     ops::{Bound, Deref, RangeBounds},
     ptr,
     ptr::NonNull,
@@ -178,6 +178,43 @@ impl<K, V> Copy for NodeRef<'_, K, V> {}
 // iterators built on them) `!Send + !Sync`.
 unsafe impl<K: Sync, V: Sync> Send for NodeRef<'_, K, V> {}
 unsafe impl<K: Sync, V: Sync> Sync for NodeRef<'_, K, V> {}
+
+/// A preallocated skip-list node for a future insertion.
+///
+/// The reservation owns node memory, but the key and value are not written
+/// until [`SkipList::insert_reserved`] consumes it.
+pub struct InsertReservation<K, V, C = BasicComparator, A: SkiplistAllocator = TursoAllocator> {
+    parent: *const SkipList<K, V, C, A>,
+    ptr: NonNull<Node<K, V>>,
+    alloc: A,
+    _marker: PhantomData<(K, V, C)>,
+}
+
+unsafe impl<K: Send, V: Send, C: Send, A: SkiplistAllocator> Send
+    for InsertReservation<K, V, C, A>
+{
+}
+
+impl<K, V, C, A: SkiplistAllocator> Drop for InsertReservation<K, V, C, A> {
+    fn drop(&mut self) {
+        // SAFETY: reservations allocate node memory without initializing key/value.
+        // If the reservation is dropped, ownership never reached the skip list.
+        unsafe { Node::dealloc(&self.alloc, self.ptr.as_ptr()) }
+    }
+}
+
+impl<K, V, C, A: SkiplistAllocator> InsertReservation<K, V, C, A> {
+    fn into_raw_parts(self) -> (*const SkipList<K, V, C, A>, NonNull<Node<K, V>>, A) {
+        let reservation = ManuallyDrop::new(self);
+        unsafe {
+            (
+                reservation.parent,
+                reservation.ptr,
+                ptr::read(&reservation.alloc),
+            )
+        }
+    }
+}
 
 impl<K, V> Node<K, V> {
     /// Allocates a node, returning the layout that could not be allocated on failure.
@@ -1139,7 +1176,7 @@ where
 
             // First try searching for the key.
             // Note that the `Ord` implementation for `K` may panic during the search.
-            let mut search = self.search_position(&key, guard);
+            let search = self.search_position(&key, guard);
             if let Some(r) = search.found {
                 let replace = replace(&r.value);
                 if !replace {
@@ -1154,21 +1191,71 @@ where
             // create value before creating node, so extra allocation doesn't happen if value() function panics
             let value = value();
             // Create a new node.
-            let height = self.random_height();
-            let (node, n) = {
-                // The reference count is initially two to account for:
-                // 1. The entry that will be returned.
-                // 2. The link at the level 0 of the tower.
-                let n = Node::<K, V>::try_alloc(&self.alloc, height, 2)?;
+            let reservation = self.reserve_insert_internal()?;
+            Ok(self.insert_reserved_with_position(reservation, key, value, replace, guard, search))
+        }
+    }
 
-                // Write the key and the value into the node.
-                ptr::addr_of_mut!((*n).key).write(key);
-                ptr::addr_of_mut!((*n).value).write(value);
+    fn reserve_insert_internal(&self) -> Result<InsertReservation<K, V, C, A>, Layout> {
+        let height = self.random_height();
+        // The reference count is initially two to account for:
+        // 1. The entry that will be returned.
+        // 2. The link at the level 0 of the tower.
+        let ptr = unsafe { Node::<K, V>::try_alloc(&self.alloc, height, 2)? };
+        Ok(InsertReservation {
+            parent: self as *const _,
+            ptr: NonNull::new(ptr).expect("Node::try_alloc returned a null pointer"),
+            alloc: self.alloc.clone(),
+            _marker: PhantomData,
+        })
+    }
 
-                (
-                    Shared::<Node<K, V>>::from(n as *const _),
-                    NodeRef::new(NonNull::new_unchecked(n)),
-                )
+    fn insert_reserved_with_position<'a, CompareF>(
+        &'a self,
+        reservation: InsertReservation<K, V, C, A>,
+        key: K,
+        value: V,
+        replace: CompareF,
+        guard: &'a Guard,
+        mut search: Position<'a, K, V>,
+    ) -> RefEntry<'a, K, V, C, A>
+    where
+        C: Comparator<K>,
+        CompareF: Fn(&V) -> bool,
+    {
+        let (parent, reserved_node, alloc) = reservation.into_raw_parts();
+        assert!(
+            ptr::eq(parent, self),
+            "SkipList insert reservation must be used with the list that created it"
+        );
+
+        unsafe {
+            let raw_node = reserved_node.as_ptr();
+            // Write the key and the value into the node.
+            ptr::addr_of_mut!((*raw_node).key).write(key);
+            ptr::addr_of_mut!((*raw_node).value).write(value);
+            let node = Shared::<Node<K, V>>::from(raw_node as *const _);
+            let n = NodeRef::new(reserved_node);
+
+            // Create a guard that destroys the new node in case search panics.
+            struct InitializedNodeGuard<'a, K, V, A: SkiplistAllocator> {
+                ptr: *mut Node<K, V>,
+                alloc: &'a A,
+                active: bool,
+            }
+
+            impl<K, V, A: SkiplistAllocator> Drop for InitializedNodeGuard<'_, K, V, A> {
+                fn drop(&mut self) {
+                    if self.active {
+                        unsafe { Node::finalize(self.alloc, self.ptr) }
+                    }
+                }
+            }
+
+            let mut initialized_guard = InitializedNodeGuard {
+                ptr: raw_node,
+                alloc: &alloc,
+                active: true,
             };
 
             // Optimistically increment `len`.
@@ -1191,6 +1278,7 @@ where
                     )
                     .is_ok()
                 {
+                    initialized_guard.active = false;
                     // This node has been abandoned
                     if let Some(r) = search.found {
                         if r.mark_tower() {
@@ -1201,18 +1289,7 @@ where
                 }
 
                 // We failed. Let's search for the key and try again.
-                {
-                    // Create a guard that destroys the new node in case search panics.
-                    struct ScopeGuard<'a, K, V, A: SkiplistAllocator>(*const Node<K, V>, &'a A);
-                    impl<K, V, A: SkiplistAllocator> Drop for ScopeGuard<'_, K, V, A> {
-                        fn drop(&mut self) {
-                            unsafe { Node::finalize(self.1, self.0 as *mut Node<K, V>) }
-                        }
-                    }
-                    let sg = ScopeGuard(node.as_raw(), &self.alloc);
-                    search = self.search_position(&n.key, guard);
-                    mem::forget(sg);
-                }
+                search = self.search_position(&n.key, guard);
 
                 if let Some(r) = search.found {
                     let replace = replace(&r.value);
@@ -1221,10 +1298,8 @@ where
                         // let's try returning it as an entry.
                         if let Some(e) = RefEntry::try_acquire(self, r) {
                             // Destroy the new node.
-                            Node::finalize(&self.alloc, node.as_raw() as *mut Node<K, V>);
                             self.hot_data.len.fetch_sub(1, Ordering::Relaxed);
-
-                            return Ok(e);
+                            return e;
                         }
 
                         // If we couldn't increment the reference count, that means someone has
@@ -1239,6 +1314,7 @@ where
                 node: n,
             };
 
+            let height = n.height();
             // Build the rest of the tower above level 0.
             'build: for level in 1..height {
                 loop {
@@ -1336,7 +1412,7 @@ where
             }
 
             // Finally, return the new entry.
-            Ok(entry)
+            entry
         }
     }
 }
@@ -1370,6 +1446,36 @@ where
     ) -> Result<RefEntry<'_, K, V, C, A>, TryReserveError> {
         self.insert_internal(key, || value, |_| true, guard)
             .map_err(|_| TryReserveError)
+    }
+
+    /// Preallocates the node needed by a future [`insert_reserved`](Self::insert_reserved).
+    ///
+    /// Dropping the reservation without inserting deallocates the reserved node.
+    pub fn try_reserve_insert(&self) -> Result<InsertReservation<K, V, C, A>, TryReserveError> {
+        self.reserve_insert_internal().map_err(|_| TryReserveError)
+    }
+
+    /// Inserts a `key`-`value` pair using a preallocated reservation.
+    ///
+    /// This operation performs no node allocation. The reservation must have
+    /// been created by this exact skip list.
+    pub fn insert_reserved(
+        &self,
+        reservation: InsertReservation<K, V, C, A>,
+        key: K,
+        value: V,
+        guard: &Guard,
+    ) -> RefEntry<'_, K, V, C, A> {
+        self.check_guard(guard);
+
+        unsafe {
+            // Rebind the guard to the lifetime of self. This matches the
+            // regular insert path and lets the returned entry outlive the
+            // stack-local guard borrow.
+            let guard = &*(guard as *const _);
+            let search = self.search_position(&key, guard);
+            self.insert_reserved_with_position(reservation, key, value, |_| true, guard, search)
+        }
     }
 
     /// Inserts a `key`-`value` pair into the skip list and returns the new entry.

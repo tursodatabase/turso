@@ -8,7 +8,7 @@ use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMar
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::{Schema, Sequence, Table};
 use crate::skiplist::comparator::BasicComparator;
-use crate::skiplist::map::Entry;
+use crate::skiplist::map::{Entry, InsertReservation as SkipMapInsertReservation};
 use crate::skiplist::SkipMap;
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -1442,6 +1442,8 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     pager: Arc<Pager>,
     /// Bytes appended to the logical log for this commit; applied to writer offset only after durability and before lock release.
     pending_log_append_bytes: Option<u64>,
+    finalized_tx_state_reservation:
+        Option<SkipMapInsertReservation<TxID, TransactionState, BasicComparator, A>>,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
     _phantom: PhantomData<Clock>,
@@ -1538,6 +1540,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             pager,
             header,
             pending_log_append_bytes: None,
+            finalized_tx_state_reservation: None,
             sync_mode,
             _phantom: PhantomData,
         }
@@ -2874,7 +2877,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 // going through CommitEnd. CommitEnd updates last_committed_tx_ts
                 // which would make a read-only transaction look like a write,
                 // causing spurious Busy errors from acquire_exclusive_tx.
-                if tx.write_set.lock().is_empty() && !tx.header_dirty.load(Ordering::Acquire) {
+                let write_set_is_empty = tx.write_set.lock().is_empty();
+                if write_set_is_empty && !tx.header_dirty.load(Ordering::Acquire) {
                     turso_assert!(
                         tx.commit_dep_set.lock().is_empty(),
                         "MVCC read-only transaction should not have other transactions depending on it"
@@ -2888,6 +2892,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
+                }
+
+                if !write_set_is_empty {
+                    turso_assert!(
+                        self.finalized_tx_state_reservation.is_none(),
+                        "finalized transaction state reservation should only be made once"
+                    );
+                    self.finalized_tx_state_reservation =
+                        Some(mvcc_store.reserve_finalized_tx_state()?);
                 }
 
                 // All dependencies resolved. Initialize an empty log record
@@ -3088,6 +3101,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 tx_unlocked
                     .state
                     .store(TransactionState::Committed(*end_ts));
+                if !tx_unlocked.write_set.lock().is_empty() {
+                    let reservation = self
+                        .finalized_tx_state_reservation
+                        .take()
+                        .expect("write tx must reserve finalized state before commit");
+                    mvcc_store.insert_reserved_finalized_tx_state(reservation, self.tx_id, *end_ts);
+                }
 
                 // Hand off to the chunked rewriter. Between chunks readers
                 // resolve any unwritten TxID refs via `txs[tx_id]` which now
@@ -5550,9 +5570,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // Read-only transactions cannot leave row versions with stale TxID
                 // references, so they do not need finalized-state caching.
                 if !tx.write_set.lock().is_empty() {
-                    crate::without_allocation_faults!(self
-                        .insert_finalized_tx_state(tx_id, commit_ts)
-                        .expect(ALLOC_ERR_MSG));
+                    self.assert_finalized_tx_state(tx_id, commit_ts);
                 }
             }
             let dep_set = std::mem::take(&mut *tx.commit_dep_set.lock());
@@ -5571,14 +5589,35 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::FinalizedTxStateInsert)]
-    fn insert_finalized_tx_state(
+    fn reserve_finalized_tx_state(
         &self,
+    ) -> Result<SkipMapInsertReservation<TxID, TransactionState, BasicComparator, A>, TryReserveError>
+    {
+        self.finalized_tx_states.try_reserve_insert()
+    }
+
+    fn insert_reserved_finalized_tx_state(
+        &self,
+        reservation: SkipMapInsertReservation<TxID, TransactionState, BasicComparator, A>,
         tx_id: TxID,
         commit_ts: u64,
-    ) -> Result<(), TryReserveError> {
-        self.finalized_tx_states
-            .try_insert(tx_id, TransactionState::Committed(commit_ts))?;
-        Ok(())
+    ) {
+        self.finalized_tx_states.insert_reserved(
+            reservation,
+            tx_id,
+            TransactionState::Committed(commit_ts),
+        );
+    }
+
+    fn assert_finalized_tx_state(&self, tx_id: TxID, commit_ts: u64) {
+        let finalized_state = self
+            .finalized_tx_states
+            .get(&tx_id)
+            .map(|entry| *entry.value());
+        turso_assert!(
+            matches!(finalized_state, Some(TransactionState::Committed(ts)) if ts == commit_ts),
+            "committed write tx {tx_id} missing finalized state for commit_ts {commit_ts}: {finalized_state:?}"
+        );
     }
 
     pub fn register_sequence_allocation(
