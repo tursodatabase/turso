@@ -3787,10 +3787,10 @@ mod tests {
                 Expr::InList {
                     lhs: Box::new(fn_call(
                         "hex",
-                        vec![Expr::Literal(ast::Literal::Blob("01".into()))],
+                        vec![Expr::Literal(ast::Literal::Blob("X'01'".into()))],
                     )),
                     not: false,
-                    rhs: vec![Box::new(Expr::Literal(ast::Literal::Blob("02".into())))],
+                    rhs: vec![Box::new(Expr::Literal(ast::Literal::Blob("X'02'".into())))],
                 },
             ],
         );

@@ -5522,7 +5522,7 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
-                                Box::new(Expr::Literal(Literal::Blob("ab".to_owned()))),
+                                Box::new(Expr::Literal(Literal::Blob("X'ab'".to_owned()))),
                                 None,
                             )],
                             from: None,
@@ -12719,7 +12719,7 @@ mod tests {
                     with_clause: vec![
                         (Name::exact("a".to_string()), Box::new(Expr::Literal(Literal::Numeric("1".to_string())))),
                         (Name::exact("b".to_string()), Box::new(Expr::Literal(Literal::String("'test'".to_string())))),
-                        (Name::exact("c".to_string()), Box::new(Expr::Literal(Literal::Blob("deadbeef".to_string())))),
+                        (Name::exact("c".to_string()), Box::new(Expr::Literal(Literal::Blob("x'deadbeef'".to_string())))),
                         (Name::exact("d".to_string()), Box::new(Expr::Literal(Literal::Null))),
                     ],
                 })],

@@ -1215,7 +1215,8 @@ pub fn resolve_index_method_parameters(
                 ast::Literal::Null => crate::Value::Null,
                 ast::Literal::String(s) => crate::Value::Text(s.into()),
                 ast::Literal::Blob(b) => crate::Value::Blob(
-                    b.as_bytes()
+                    ast::blob_literal_hex(&b)
+                        .as_bytes()
                         .chunks_exact(2)
                         .map(|pair| {
                             // We assume that sqlite3-parser has already validated that
