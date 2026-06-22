@@ -275,7 +275,10 @@ impl Arbitrary for ast::Literal {
                     }
                 }),
                 1 => ast::Literal::String(format!("'{}'", gen_random_text(rng))),
-                2 => ast::Literal::Blob(hex::encode(gen_random_text(rng).as_bytes())),
+                2 => ast::Literal::Blob(format!(
+                    "X'{}'",
+                    hex::encode(gen_random_text(rng).as_bytes())
+                )),
                 // TODO: skip Keyword
                 3 => continue,
                 4 => ast::Literal::Null,

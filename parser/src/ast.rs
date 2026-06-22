@@ -765,7 +765,7 @@ pub enum Literal {
     /// String
     // TODO Check that string is already quoted and correctly escaped
     String(String),
-    /// BLOB
+    /// BLOB literal text, including the `x`/`X` prefix and quotes.
     // TODO Check that string is valid (only hexa)
     Blob(String),
     /// Keyword
@@ -783,6 +783,14 @@ pub enum Literal {
     CurrentTime,
     /// `CURRENT_TIMESTAMP`
     CurrentTimestamp,
+}
+
+pub fn blob_literal_hex(blob: &str) -> &str {
+    debug_assert!(blob.len() >= 3);
+    debug_assert!(matches!(blob.as_bytes()[0], b'x' | b'X'));
+    debug_assert_eq!(blob.as_bytes()[1], b'\'');
+    debug_assert_eq!(blob.as_bytes()[blob.len() - 1], b'\'');
+    &blob[2..blob.len() - 1]
 }
 
 /// Textual comparison operator in an expression

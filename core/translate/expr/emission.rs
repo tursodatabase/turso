@@ -33,7 +33,7 @@ pub fn emit_literal(
             Ok(target_register)
         }
         ast::Literal::Blob(s) => {
-            let bytes = s
+            let bytes = ast::blob_literal_hex(s)
                 .as_bytes()
                 .chunks_exact(2)
                 .map(|pair| {

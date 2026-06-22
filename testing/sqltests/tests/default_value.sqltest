@@ -31,6 +31,17 @@ expect {
     3.14
 }
 
+test default-value-blob-preserves-prefix-case {
+    CREATE TABLE t_blob (a INTEGER);
+    ALTER TABLE t_blob ADD COLUMN lower_blob BLOB NOT NULL DEFAULT x'00';
+    ALTER TABLE t_blob ADD COLUMN upper_blob BLOB NOT NULL DEFAULT X'AB';
+    SELECT name, dflt_value FROM pragma_table_info('t_blob') WHERE name LIKE '%_blob' ORDER BY cid;
+}
+expect {
+    lower_blob|x'00'
+    upper_blob|X'AB'
+}
+
 @cross-check-integrity
 test default-value-null {
     CREATE TABLE t5 (x INTEGER PRIMARY KEY, y TEXT DEFAULT NULL);

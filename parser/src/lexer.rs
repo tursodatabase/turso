@@ -895,9 +895,8 @@ impl<'a> Lexer<'a> {
                                 offset: start,
                             });
                         }
-                        // do not include 'x' or 'X' and the last '
                         Ok(Token::new(
-                            &self.input[start + 2..self.offset - 1],
+                            &self.input[start..self.offset],
                             TokenType::TK_BLOB,
                         ))
                     }
@@ -1066,14 +1065,14 @@ mod tests {
             ),
             (
                 b"x'1234567890abcdef'".as_slice(),
-                Token::new(b"1234567890abcdef", TokenType::TK_BLOB), // hex payload only
+                Token::new(b"x'1234567890abcdef'", TokenType::TK_BLOB),
             ),
             (
                 b"X'1234567890abcdef'".as_slice(),
-                Token::new(b"1234567890abcdef", TokenType::TK_BLOB), // hex payload only
+                Token::new(b"X'1234567890abcdef'", TokenType::TK_BLOB),
             ),
-            (b"x''".as_slice(), Token::new(b"", TokenType::TK_BLOB)),
-            (b"X''".as_slice(), Token::new(b"", TokenType::TK_BLOB)),
+            (b"x''".as_slice(), Token::new(b"x''", TokenType::TK_BLOB)),
+            (b"X''".as_slice(), Token::new(b"X''", TokenType::TK_BLOB)),
             (
                 b"wHeRe".as_slice(),
                 Token::new(b"wHeRe", TokenType::TK_WHERE),

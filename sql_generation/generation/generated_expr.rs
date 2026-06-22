@@ -178,7 +178,7 @@ fn generate_literal<R: Rng + ?Sized>(rng: &mut R, target_type: &ColumnType) -> E
         ColumnType::Blob => {
             // Generate a simple blob literal
             let bytes: Vec<u8> = (0..4).map(|_| rng.random()).collect();
-            Expr::Literal(ast::Literal::Blob(hex::encode(bytes)))
+            Expr::Literal(ast::Literal::Blob(format!("X'{}'", hex::encode(bytes))))
         }
     }
 }
