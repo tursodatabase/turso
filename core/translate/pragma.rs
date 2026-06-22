@@ -14,7 +14,7 @@ use super::integrity_check::{
 };
 use crate::function::Func;
 use crate::pragma::pragma_for;
-use crate::schema::Schema;
+use crate::schema::{Schema, TURSO_INTERNAL_PREFIX};
 use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
@@ -62,6 +62,10 @@ fn visible_database_ids_for_table_list(connection: &crate::Connection) -> crate:
             .copied(),
     )?;
     Ok(ids)
+}
+
+fn is_turso_internal_name(name: &str) -> bool {
+    name.starts_with(TURSO_INTERNAL_PREFIX)
 }
 
 fn display_table_list_name(database_id: usize, name: &str) -> String {
@@ -158,6 +162,9 @@ fn emit_table_list_rows_for_schema(
 
     if let Some(filter_name) = filter_name {
         let lookup_name = normalize_table_pragma_lookup_name(database_id, filter_name);
+        if is_turso_internal_name(&lookup_name) {
+            return;
+        }
         if let Some(table) = schema.get_table(&lookup_name) {
             let (wr, strict) = match table.btree() {
                 Some(bt) => (!bt.has_rowid, bt.is_strict),
@@ -188,6 +195,9 @@ fn emit_table_list_rows_for_schema(
         let Some(bt) = table.btree() else {
             continue;
         };
+        if is_turso_internal_name(&bt.name) {
+            continue;
+        }
         emit_table_row(
             program,
             &bt.name,
@@ -198,6 +208,9 @@ fn emit_table_list_rows_for_schema(
         );
     }
     for view in schema.views.values() {
+        if is_turso_internal_name(&view.name) {
+            continue;
+        }
         emit_table_row(
             program,
             &view.name,
@@ -1120,6 +1133,13 @@ fn query_pragma(
             program.alloc_registers(4);
 
             if let Some(table_name) = table_name {
+                if is_turso_internal_name(&table_name) {
+                    let pragma_meta = pragma_for(&pragma);
+                    for col_name in pragma_meta.columns.iter() {
+                        program.add_pragma_result_column(col_name.to_string());
+                    }
+                    return Ok(TransactionMode::None);
+                }
                 let table_database_id = resolve_table_pragma_database_id(
                     resolver,
                     database_id,
@@ -1285,6 +1305,13 @@ fn query_pragma(
             // we need 6 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(5);
             if let Some(name) = name {
+                if is_turso_internal_name(&name) {
+                    let col_names = ["cid", "name", "type", "notnull", "dflt_value", "pk"];
+                    for name in col_names {
+                        program.add_pragma_result_column(name.into());
+                    }
+                    return Ok(TransactionMode::None);
+                }
                 let table_database_id = resolve_table_pragma_database_id(
                     resolver,
                     database_id,
@@ -1320,6 +1347,21 @@ fn query_pragma(
             // we need 7 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(6);
             if let Some(name) = name {
+                if is_turso_internal_name(&name) {
+                    let col_names = [
+                        "cid",
+                        "name",
+                        "type",
+                        "notnull",
+                        "dflt_value",
+                        "pk",
+                        "hidden",
+                    ];
+                    for name in col_names {
+                        program.add_pragma_result_column(name.into());
+                    }
+                    return Ok(TransactionMode::None);
+                }
                 let table_database_id = resolve_table_pragma_database_id(
                     resolver,
                     database_id,

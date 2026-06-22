@@ -3,7 +3,7 @@ use super::plan::{
     select_star, Distinctness, InSeekSource, JoinOrderMember, Operation, OuterQueryReference,
     QueryDestination, Search, TableReferences, Window,
 };
-use crate::schema::Table;
+use crate::schema::{Table, SCHEMA_TABLE_NAME};
 use crate::stack::trace_stack;
 use crate::sync::Arc;
 use crate::translate::emitter::{OperationMode, Resolver};
@@ -12,7 +12,9 @@ use crate::translate::expr::{
 };
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
-use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
+use crate::translate::plan::{
+    GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
+};
 use crate::translate::planner::{
     append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries, parse_from,
     parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
@@ -26,7 +28,7 @@ use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
 use std::borrow::Cow;
 use turso_parser::ast::ResultColumn;
-use turso_parser::ast::{self, CompoundSelect, Expr};
+use turso_parser::ast::{self, CompoundSelect, Expr, LikeOperator, Literal};
 
 /// Maximum number of columns in a result set.
 /// SQLite's default SQLITE_MAX_COLUMN is 2000, with a hard upper limit of 32767.
@@ -54,6 +56,41 @@ pub fn translate_select(
         }
     }
     emit_select_plan(plan, resolver, program, connection)
+}
+
+fn append_internal_schema_visibility_filters(plan: &mut SelectPlan) {
+    for joined_table in plan.table_references.joined_tables() {
+        if !joined_table
+            .table
+            .get_name()
+            .eq_ignore_ascii_case(SCHEMA_TABLE_NAME)
+        {
+            continue;
+        }
+        let Some((name_col_idx, _)) = joined_table.table.get_column_by_name("name") else {
+            continue;
+        };
+        let from_outer_join = joined_table
+            .join_info
+            .as_ref()
+            .and_then(|join_info| join_info.is_outer().then_some(joined_table.internal_id));
+        let mut term = WhereTerm::from(Expr::Like {
+            lhs: Box::new(Expr::Column {
+                database: Some(joined_table.database_id),
+                table: joined_table.internal_id,
+                column: name_col_idx,
+                is_rowid_alias: false,
+            }),
+            not: true,
+            op: LikeOperator::Like,
+            rhs: Box::new(Expr::Literal(Literal::String(
+                "'\\_\\_turso\\_internal\\_%'".to_string(),
+            ))),
+            escape: Some(Box::new(Expr::Literal(Literal::String("'\\'".to_string())))),
+        });
+        term.from_outer_join = from_outer_join;
+        plan.where_clause.push(term);
+    }
 }
 
 /// Optimize and emit bytecode for an already-prepared select plan.
@@ -543,6 +580,7 @@ fn prepare_one_select_plan(
                     &mut plan.where_clause,
                     resolver,
                 )?;
+                append_internal_schema_visibility_filters(&mut plan);
             }
 
             {
