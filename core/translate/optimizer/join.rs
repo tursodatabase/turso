@@ -6,22 +6,23 @@ use smallvec::SmallVec;
 use turso_parser::ast::{Expr, Operator, TableInternalId};
 
 use super::{
-    access_method::{find_best_access_method_for_join_order, AccessMethod},
+    AvailableIndexes, IndexMethodCandidate,
+    access_method::{AccessMethod, find_best_access_method_for_join_order},
     constraints::TableConstraints,
     cost_params::CostModelParams,
     order::OrderTarget,
-    AvailableIndexes, IndexMethodCandidate,
 };
 use crate::alloc::TursoIteratorExt;
 use crate::{
+    LimboError, Result,
     schema::Schema,
     stats::AnalyzeStats,
     translate::{
-        expr::{walk_expr, WalkControl},
+        expr::{WalkControl, walk_expr},
         optimizer::{
             access_method::{
-                estimate_hash_join_cost, try_hash_join_access_method, AccessMethodParams,
-                ResidualConstraintMode,
+                AccessMethodParams, ResidualConstraintMode, estimate_hash_join_cost,
+                try_hash_join_access_method,
             },
             cost::{Cost, RowCountEstimate},
             order::plan_satisfies_order_target,
@@ -32,7 +33,6 @@ use crate::{
         },
         planner::TableMask,
     },
-    LimboError, Result,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -675,11 +675,18 @@ pub fn join_lhs_and_rhs<'a>(
     }
 
     // Check if there's an index method candidate for this table (e.g., FTS)
-    // and compare its cost against the current best access method.
-    if let Some(candidate) = index_method_candidates
-        .iter()
-        .find(|c| c.table_idx == rhs_table_number)
-    {
+    // and compare its cost against the current best access method.  Captured
+    // index-method arguments may reference other joined tables; those tables
+    // must already be present on the left side because the arguments are
+    // evaluated before the index-method cursor is started.
+    let lhs_mask_for_index_method: TableMask = match lhs {
+        Some(l) => l.table_numbers().try_collect()?,
+        None => TableMask::default(),
+    };
+    if let Some(candidate) = index_method_candidates.iter().find(|c| {
+        c.table_idx == rhs_table_number
+            && lhs_mask_for_index_method.contains_all_set_bits_of(&c.argument_dependency_mask)
+    }) {
         if let Some(cost_estimate) = &candidate.cost_estimate {
             // FTS cost depends on whether it's the outer table (no LHS) or inner table
             let fts_cost = if lhs.is_none() {
@@ -1821,6 +1828,7 @@ mod tests {
     use super::*;
     use crate::alloc::TursoSliceExt;
     use crate::{
+        MAIN_DB_ID,
         schema::{
             BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table,
             Type,
@@ -1829,7 +1837,7 @@ mod tests {
         translate::{
             optimizer::{
                 access_method::AccessMethodParams,
-                constraints::{constraints_from_where_clause, BinaryExprSide, RangeConstraintRef},
+                constraints::{BinaryExprSide, RangeConstraintRef, constraints_from_where_clause},
                 cost_params::DEFAULT_PARAMS,
             },
             plan::{
@@ -1838,7 +1846,6 @@ mod tests {
             },
         },
         vdbe::builder::TableRefIdCounter,
-        MAIN_DB_ID,
     };
 
     fn default_base_rows(n: usize) -> Vec<RowCountEstimate> {

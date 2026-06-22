@@ -14,12 +14,13 @@ use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::TableMask;
 use crate::{
+    LimboError, Result,
     function::{AggFunc, Deterministic},
     index_method::IndexMethodCostEstimate,
     numeric::Numeric,
     schema::{
-        BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type,
-        ROWID_SENTINEL,
+        BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, ROWID_SENTINEL,
+        Schema, Table, Type,
     },
     translate::{
         insert::ROWID_COLUMN,
@@ -48,20 +49,19 @@ use crate::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, ProgramBuilder},
     },
-    LimboError, Result,
 };
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use constraints::{
-    can_use_partial_index, constraints_from_where_clause, partial_index,
-    partial_index_predicate_terms, usable_constraints_for_join_order, Constraint,
-    ConstraintOperator, ConstraintRef,
+    Constraint, ConstraintOperator, ConstraintRef, can_use_partial_index,
+    constraints_from_where_clause, partial_index, partial_index_predicate_terms,
+    usable_constraints_for_join_order,
 };
 use cost::Cost;
-use join::{compute_best_join_order_with_context, BestJoinOrderResult, JoinPlanningContext};
+use join::{BestJoinOrderResult, JoinPlanningContext, compute_best_join_order_with_context};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{
-    compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
-    EliminatesSortBy, OrderTargetPurpose,
+    EliminatesSortBy, OrderTargetPurpose, compute_order_target, plan_satisfies_order_target,
+    simple_aggregate_order_target,
 };
 use rustc_hash::FxHashMap as HashMap;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
@@ -179,6 +179,14 @@ impl AvailableIndexes {
 pub struct IndexMethodCandidate {
     /// Index of the table in the joined_tables list
     pub table_idx: usize,
+    /// Other tables referenced by the captured index-method arguments.
+    ///
+    /// Index-method query arguments are evaluated before opening the cursor, so
+    /// any table supplying an argument value must already be on the left side of
+    /// the join order.  For example, in
+    /// `docs JOIN terms ON fts_match(docs.body, terms.q)`, the FTS cursor for
+    /// `docs` cannot start until `terms.q` is available.
+    pub argument_dependency_mask: TableMask,
     /// The index that defines this index method
     pub index: Arc<Index>,
     /// Pattern index from the index method definition that matched
@@ -441,6 +449,38 @@ fn sorted_arguments_from_parameters(parameters: &HashMap<i32, ast::Expr>) -> Vec
     arguments.iter().map(|(_, e)| (*e).clone()).collect()
 }
 
+fn collect_table_dependencies_from_expr(
+    expr: &ast::Expr,
+    self_table: TableInternalId,
+) -> Result<TableMask> {
+    use super::expr::{WalkControl, walk_expr};
+
+    let mut deps = TableMask::default();
+    walk_expr(expr, &mut |e| -> Result<WalkControl> {
+        match e {
+            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. }
+                if table != &self_table =>
+            {
+                deps.set(usize::from(*table))?;
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(deps)
+}
+
+fn collect_table_dependencies_from_exprs<'a>(
+    exprs: impl IntoIterator<Item = &'a ast::Expr>,
+    self_table: TableInternalId,
+) -> Result<TableMask> {
+    let mut deps = TableMask::default();
+    for expr in exprs {
+        deps.union_with(&collect_table_dependencies_from_expr(expr, self_table)?)?;
+    }
+    Ok(deps)
+}
+
 /// Collect index method candidates for all tables that have custom index methods.
 /// This function performs pattern matching but does NOT apply the operations,
 /// allowing the DP join ordering algorithm to consider index methods as candidates.
@@ -514,9 +554,12 @@ fn collect_index_method_candidates(
 
                 // Sort and collect arguments
                 let arguments = sorted_arguments_from_parameters(&pattern_match.parameters);
+                let argument_dependency_mask =
+                    collect_table_dependencies_from_exprs(arguments.iter(), table.internal_id)?;
 
                 candidates.push(IndexMethodCandidate {
                     table_idx,
+                    argument_dependency_mask,
                     index: index.clone(),
                     pattern_idx: pattern_match.pattern_idx,
                     arguments,
@@ -567,7 +610,7 @@ fn transform_match_to_fts_match(
     table_references: &TableReferences,
 ) -> Result<()> {
     use super::ast::{FunctionTail, LikeOperator, Name, TableInternalId};
-    use super::expr::{walk_expr_mut, WalkControl};
+    use super::expr::{WalkControl, walk_expr_mut};
 
     // Helper to extract table ID from a column expression
     fn get_table_id_from_expr(expr: &Expr) -> Option<TableInternalId> {
@@ -811,11 +854,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
                     crate::types::Value::Numeric(Numeric::Integer(i)) if i >= 0 => Some(i as f64),
                     crate::types::Value::Numeric(Numeric::Float(f)) => {
                         let f: f64 = f.into();
-                        if f >= 0.0 {
-                            Some(f)
-                        } else {
-                            None
-                        }
+                        if f >= 0.0 { Some(f) } else { None }
                     }
                     _ => None,
                 };
@@ -1084,8 +1123,8 @@ fn update_write_set_reason(
 fn collect_subquery_ids_from_exprs<'a>(
     exprs: impl IntoIterator<Item = &'a ast::Expr>,
 ) -> Result<BitSet<turso_parser::ast::TableInternalId>> {
-    use crate::translate::expr::walk_expr;
     use crate::translate::expr::WalkControl;
+    use crate::translate::expr::walk_expr;
 
     let mut ids = BitSet::<turso_parser::ast::TableInternalId>::default();
     let mut collector = |e: &ast::Expr| -> Result<WalkControl> {
@@ -1661,7 +1700,7 @@ fn where_term_is_null_rejecting_for_table(
 
 /// Returns true if an expression references a column from `table_id`.
 fn expr_references_table(expr: &ast::Expr, table_id: ast::TableInternalId) -> bool {
-    use crate::translate::expr::{walk_expr, WalkControl};
+    use crate::translate::expr::{WalkControl, walk_expr};
     let mut found = false;
     let _ = walk_expr(expr, &mut |inner: &ast::Expr| -> Result<WalkControl> {
         match inner {
@@ -1699,7 +1738,7 @@ fn is_null_check_on_table(expr: &ast::Expr, table_id: ast::TableInternalId) -> b
 /// This includes NULL-masking functions (COALESCE, IFNULL) and CASE/IIF expressions
 /// that explicitly handle the NULL case for columns from the target table.
 fn expr_has_null_masking_for_table(expr: &ast::Expr, table_id: ast::TableInternalId) -> bool {
-    use crate::translate::expr::{walk_expr, WalkControl};
+    use crate::translate::expr::{WalkControl, walk_expr};
     let mut found = false;
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
@@ -3720,9 +3759,9 @@ fn build_seek_def(
 
 #[cfg(test)]
 mod tests {
-    use super::{where_term_is_null_rejecting_for_table, Optimizable};
+    use super::{Optimizable, where_term_is_null_rejecting_for_table};
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
-    use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
+    use crate::{DatabaseCatalog, RwLock, SymbolTable, schema::Schema};
     use rustc_hash::FxHashMap as HashMap;
     use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
 

@@ -960,3 +960,23 @@ expect {
     alice|hello world
 }
 
+
+@backend cli
+test fts-join-query-argument-dependency {
+    CREATE TABLE terms(id INTEGER PRIMARY KEY, q TEXT);
+    CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT);
+    CREATE INDEX docs_fts ON docs USING fts(title, body);
+    INSERT INTO terms VALUES(1,'database'),(2,'rust'),(3,'missing');
+    INSERT INTO docs VALUES(10,'database','x');
+    INSERT INTO docs VALUES(20,'rust','database');
+    INSERT INTO docs VALUES(30,'other','none');
+    SELECT terms.id, docs.id
+    FROM terms
+    JOIN docs ON fts_match(docs.title, docs.body, terms.q)
+    ORDER BY terms.id, docs.id;
+}
+expect {
+    1|10
+    1|20
+    2|20
+}
