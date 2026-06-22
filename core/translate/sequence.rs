@@ -41,11 +41,11 @@ pub fn sequence_backing_table_sql(seq_name: &str) -> String {
         "CREATE TABLE \"{table_name}\"(\
          value INTEGER PRIMARY KEY,\
          is_called INTEGER,\
-         start INTEGER,\
-         inc INTEGER,\
-         min INTEGER,\
-         max INTEGER,\
-         cycle INTEGER)"
+         start TEXT,\
+         inc TEXT,\
+         min TEXT,\
+         max TEXT,\
+         cycle TEXT)"
     )
 }
 
@@ -105,26 +105,11 @@ pub fn emit_sequence_backing_table(
         dest: base_reg + 1,
         value: 0, // is_called = false
     });
-    program.emit_insn(Insn::Integer {
-        dest: base_reg + 2,
-        value: start,
-    });
-    program.emit_insn(Insn::Integer {
-        dest: base_reg + 3,
-        value: increment,
-    });
-    program.emit_insn(Insn::Integer {
-        dest: base_reg + 4,
-        value: min_value,
-    });
-    program.emit_insn(Insn::Integer {
-        dest: base_reg + 5,
-        value: max_value,
-    });
-    program.emit_insn(Insn::Integer {
-        dest: base_reg + 6,
-        value: if cycle { 1 } else { 0 },
-    });
+    program.emit_string8(start.to_string(), base_reg + 2);
+    program.emit_string8(increment.to_string(), base_reg + 3);
+    program.emit_string8(min_value.to_string(), base_reg + 4);
+    program.emit_string8(max_value.to_string(), base_reg + 5);
+    program.emit_string8((if cycle { 1 } else { 0 }).to_string(), base_reg + 6);
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
@@ -763,7 +748,7 @@ pub(crate) fn emit_autoincrement_sqlite_sequence_sync(
     Ok(())
 }
 
-/// Emit five `Insn::Integer` literals — start, increment, min, max, cycle —
+/// Emit five TEXT literals — start, increment, min, max, cycle —
 /// to populate the immutable suffix of a backing-table row. Shared between
 /// `emit_disk_read_nextval`, `emit_disk_advance_past`, and the setval
 /// emitter in `translate/expr/functions.rs`.
@@ -772,26 +757,11 @@ pub(crate) fn emit_sequence_descriptor_literals(
     seq: &Sequence,
     dest_base: usize,
 ) {
-    program.emit_insn(Insn::Integer {
-        dest: dest_base,
-        value: seq.start_value,
-    });
-    program.emit_insn(Insn::Integer {
-        dest: dest_base + 1,
-        value: seq.increment_by,
-    });
-    program.emit_insn(Insn::Integer {
-        dest: dest_base + 2,
-        value: seq.min_value,
-    });
-    program.emit_insn(Insn::Integer {
-        dest: dest_base + 3,
-        value: seq.max_value,
-    });
-    program.emit_insn(Insn::Integer {
-        dest: dest_base + 4,
-        value: if seq.cycle { 1 } else { 0 },
-    });
+    program.emit_string8(seq.start_value.to_string(), dest_base);
+    program.emit_string8(seq.increment_by.to_string(), dest_base + 1);
+    program.emit_string8(seq.min_value.to_string(), dest_base + 2);
+    program.emit_string8(seq.max_value.to_string(), dest_base + 3);
+    program.emit_string8((if seq.cycle { 1 } else { 0 }).to_string(), dest_base + 4);
 }
 
 /// Translate CREATE SEQUENCE into bytecode that persists the definition in sqlite_schema.

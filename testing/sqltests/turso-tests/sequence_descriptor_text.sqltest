@@ -1,0 +1,44 @@
+@database :memory:
+@skip-if sqlite "Turso-specific internal sequence backing tables not present in SQLite"
+
+# Internal sequence descriptor bounds are exposed through ordinary SQL when
+# schema/introspection tools enumerate __turso_internal_* tables. Store the
+# immutable descriptor columns as TEXT so JavaScript clients in default number
+# mode do not have to materialize i64::MAX/i64::MIN as unsafe numbers.
+test autoincrement-sequence-descriptor-bounds-are-text {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
+    SELECT typeof(max), max FROM "__turso_internal_seq___turso_internal_autoincrement_t1";
+}
+expect {
+    text|9223372036854775807
+}
+
+test default-ascending-sequence-descriptor-max-is-text {
+    CREATE SEQUENCE s;
+    SELECT typeof(value), typeof(start), typeof(inc), typeof(min), typeof(max), typeof(cycle), max FROM "__turso_internal_seq_s";
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT typeof(value), typeof(start), typeof(inc), typeof(min), typeof(max), typeof(cycle), max FROM "__turso_internal_seq_s" ORDER BY value DESC LIMIT 1;
+}
+expect {
+    integer|text|text|text|text|text|9223372036854775807
+    1
+    2
+    integer|text|text|text|text|text|9223372036854775807
+}
+
+test default-descending-sequence-descriptor-min-is-text {
+    CREATE SEQUENCE d INCREMENT BY -1;
+    SELECT typeof(min), min FROM "__turso_internal_seq_d";
+    SELECT nextval('d');
+    SELECT nextval('d');
+    SELECT setval('d', -10);
+    SELECT typeof(value), typeof(start), typeof(inc), typeof(min), typeof(max), typeof(cycle), min FROM "__turso_internal_seq_d";
+}
+expect {
+    text|-9223372036854775808
+    -1
+    -2
+    -10
+    integer|text|text|text|text|text|-9223372036854775808
+}

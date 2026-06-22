@@ -212,7 +212,7 @@ enum ReparsePhase {
         /// In-flight descriptor `SELECT`, created lazily per backing table.
         stmt: Option<Box<Statement>>,
         /// Descriptor row `(start, inc, min, max, cycle)` captured from `stmt`.
-        meta: Option<(i64, i64, i64, i64, bool)>,
+        meta: Option<crate::schema::SequenceMetadata>,
         /// Sequence reconstructed from `meta`, retained while the watermark
         /// query yields IO.
         seq: Option<crate::schema::Sequence>,
@@ -248,7 +248,7 @@ pub enum LoadSequenceDescriptorsState {
         /// In-flight descriptor `SELECT`, created lazily per backing table.
         stmt: Option<Box<Statement>>,
         /// Descriptor row `(start, inc, min, max, cycle)` captured from `stmt`.
-        meta: Option<(i64, i64, i64, i64, bool)>,
+        meta: Option<crate::schema::SequenceMetadata>,
         /// Sequence reconstructed from `meta`, retained while the watermark
         /// query yields IO.
         seq: Option<crate::schema::Sequence>,
@@ -3543,7 +3543,7 @@ impl Connection {
         backing_table_name: &str,
         seq_name: &str,
         stmt: &mut Option<Box<Statement>>,
-        meta: &mut Option<(i64, i64, i64, i64, bool)>,
+        meta: &mut Option<crate::schema::SequenceMetadata>,
     ) -> Result<crate::types::IOResult<()>> {
         use crate::types::IOResult;
         if stmt.is_none() {
@@ -3562,14 +3562,25 @@ impl Connection {
             *meta = None;
         }
         let s = stmt.as_mut().expect("stmt set above");
+        fn descriptor_i64(row: &crate::Row, idx: usize) -> Result<i64> {
+            row.get::<i64>(idx).or_else(|_| {
+                let text = row.get::<String>(idx)?;
+                text.parse::<i64>().map_err(|err| {
+                    LimboError::ConversionError(format!(
+                        "invalid integer sequence descriptor value '{text}': {err}"
+                    ))
+                })
+            })
+        }
         match s.run_with_row_callback_nonblock(|row| {
-            *meta = Some((
-                row.get::<i64>(0)?,
-                row.get::<i64>(1)?,
-                row.get::<i64>(2)?,
-                row.get::<i64>(3)?,
-                row.get::<i64>(4)? != 0,
-            ));
+            let cycle = descriptor_i64(row, 4)?;
+            *meta = Some(crate::schema::SequenceMetadata {
+                start: descriptor_i64(row, 0)?,
+                increment: descriptor_i64(row, 1)?,
+                min: descriptor_i64(row, 2)?,
+                max: descriptor_i64(row, 3)?,
+                cycle: cycle != 0,
+            });
             Ok(())
         }) {
             Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
@@ -3587,9 +3598,15 @@ impl Connection {
     fn sequence_from_descriptor_meta(
         seq_name: &str,
         backing_table_name: &str,
-        meta: Option<(i64, i64, i64, i64, bool)>,
+        meta: Option<crate::schema::SequenceMetadata>,
     ) -> Result<crate::schema::Sequence> {
-        let (start, inc, min, max, cycle) = meta.ok_or_else(|| {
+        let crate::schema::SequenceMetadata {
+            start,
+            increment,
+            min,
+            max,
+            cycle,
+        } = meta.ok_or_else(|| {
             LimboError::Corrupt(format!(
                 "internal sequence backing table \"{backing_table_name}\" for sequence \
                  \"{seq_name}\" is empty; the descriptor metadata row must always be present"
@@ -3598,7 +3615,7 @@ impl Connection {
         crate::schema::Sequence::new(
             seq_name.to_string(),
             Some(start),
-            Some(inc),
+            Some(increment),
             Some(min),
             Some(max),
             cycle,
@@ -3797,14 +3814,14 @@ impl Connection {
                                 continue;
                             }
                             // Standard AUTOINCREMENT descriptor columns (start=1,
-                            // inc=1, min=1, max=i64::MAX, cycle=0) — mirror what
-                            // the translator emits when CREATE TABLE bytecode
+                            // inc=1, min=1, max=i64::MAX, cycle=0) as TEXT — mirror
+                            // what the translator emits when CREATE TABLE bytecode
                             // creates the backing table for an AUTOINCREMENT column.
                             let escaped = backing_table_name.replace('"', "\"\"");
                             let insert_sql = format!(
                                 "INSERT OR REPLACE INTO \"{escaped}\"\
                                  (value, is_called, start, inc, min, max, cycle) \
-                                 VALUES ({watermark}, 1, 1, 1, 1, {}, 0)",
+                                 VALUES ({watermark}, 1, '1', '1', '1', '{}', '0')",
                                 i64::MAX
                             );
                             let stmt = self.prepare_internal(insert_sql)?;

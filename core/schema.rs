@@ -197,15 +197,16 @@ struct SequenceBackingTableSource {
     num_columns: usize,
 }
 
-struct SequenceMetadata {
+#[derive(Debug, Clone, Copy)]
+pub struct SequenceMetadata {
     // is_called intentionally omitted from descriptor reconstruction —
     // the runtime watermark (including is_called) is always read from
     // the backing-table row at nextval time, not seeded from schema.
-    start: i64,
-    increment: i64,
-    min: i64,
-    max: i64,
-    cycle: bool,
+    pub(crate) start: i64,
+    pub(crate) increment: i64,
+    pub(crate) min: i64,
+    pub(crate) max: i64,
+    pub(crate) cycle: bool,
 }
 
 use crate::util::quote_identifier as quote_ident;
@@ -662,7 +663,8 @@ pub fn allow_user_dml(table_name: &str) -> bool {
 // Every sequence — user-created (CREATE SEQUENCE) and implicit
 // (AUTOINCREMENT) — is backed by a B-tree table
 // `__turso_internal_seq_<name>` with schema (value INTEGER PRIMARY KEY,
-// is_called, start, inc, min, max, cycle). The runtime watermark IS the
+// is_called INTEGER, start TEXT, inc TEXT, min TEXT, max TEXT, cycle TEXT).
+// The runtime watermark IS the
 // disk state: there is no in-memory counter. Every nextval/setval reads
 // the current watermark row inside the executing transaction, computes
 // the new value, and writes it back — nextval INSERTs a new row;
@@ -1712,9 +1714,8 @@ impl Schema {
                     })?;
                     let metadata = Self::read_sequence_metadata(record).ok_or_else(|| {
                         LimboError::Corrupt(format!(
-                            "internal sequence backing table for \"{}\" descriptor \
-                             row is malformed (expected integers for \
-                             start/inc/min/max/cycle)",
+                            "internal sequence backing table for \"{}\" descriptor row is malformed \
+                             (expected integer or integer-text values for start/inc/min/max/cycle)",
                             source.sequence_name
                         ))
                     })?;
@@ -1995,17 +1996,20 @@ impl Schema {
             .expect("TODO: fallible allocations")
     }
 
-    fn read_sequence_metadata(record: &ImmutableRecord) -> Option<SequenceMetadata> {
-        let mut values = [0i64; 6];
-        for (i, value) in values.iter_mut().enumerate() {
-            match record.get_value(i + 1) {
-                Ok(ValueRef::Numeric(crate::numeric::Numeric::Integer(v))) => {
-                    *value = v;
-                }
-                _ => return None,
-            }
+    fn sequence_metadata_i64(value: ValueRef<'_>) -> Option<i64> {
+        match value {
+            ValueRef::Numeric(crate::numeric::Numeric::Integer(v)) => Some(v),
+            ValueRef::Text(text) => text.as_str().parse::<i64>().ok(),
+            _ => None,
         }
-        let [_is_called, start, increment, min, max, cycle] = values;
+    }
+
+    fn read_sequence_metadata(record: &ImmutableRecord) -> Option<SequenceMetadata> {
+        let start = Self::sequence_metadata_i64(record.get_value(2).ok()?)?;
+        let increment = Self::sequence_metadata_i64(record.get_value(3).ok()?)?;
+        let min = Self::sequence_metadata_i64(record.get_value(4).ok()?)?;
+        let max = Self::sequence_metadata_i64(record.get_value(5).ok()?)?;
+        let cycle = Self::sequence_metadata_i64(record.get_value(6).ok()?)?;
         Some(SequenceMetadata {
             start,
             increment,
