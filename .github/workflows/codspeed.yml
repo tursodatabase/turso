@@ -238,7 +238,7 @@ jobs:
   #       run: cargo codspeed build --features codspeed --bench tpc_h_benchmark 
 
   #     - name: Run TPC-H benchmark
-  #       uses: CodSpeedHQ/action@v4.5.2
+  #       uses: CodSpeedHQ/action@v4.17.0
   #       with:
   #         mode: simulation
   #         run: cargo codspeed run --bench tpc_h_benchmark
