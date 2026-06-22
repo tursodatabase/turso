@@ -6327,10 +6327,7 @@ impl CursorTrait for BTreeCursor {
     /// valid_state stays Valid — only rewind/seek-style entry points are safe
     /// next; next/prev land on `current_page == -1` and return Done(false).
     fn invalidate_btree_cache(&mut self) {
-        for slot in self.stack.stack.iter_mut() {
-            *slot = None;
-        }
-        self.stack.current_page = -1;
+        self.stack.clear();
         self.has_record = false;
         self.move_to_right_state.1 = None;
         self.invalidate_count_cache();
