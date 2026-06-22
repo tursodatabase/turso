@@ -450,6 +450,20 @@ fn link_with_window(
     filter_clause: Option<&Expr>,
     distinctness: Distinctness,
 ) -> Result<()> {
+    // Extension (external) aggregates only expose a destructive `finalize` through the FFI —
+    // there is no non-destructive value callback (xValue) or inverse (xInverse). The window
+    // evaluator reads a running accumulator once per peer-group flush via `AggValue` and keeps
+    // stepping the same accumulator for later rows (RANGE UNBOUNDED PRECEDING .. CURRENT ROW).
+    // Finalizing an external aggregate frees its FFI state, so the next `AggStep`/`AggValue`
+    // dereferences a dangling pointer (use-after-free, see issue #7411). Reject the combination
+    // here instead of emitting bytecode that crashes.
+    if let AccumulatorFunc::Agg(AggFunc::External(_)) = &func {
+        let name = match expr {
+            Expr::FunctionCall { name, .. } | Expr::FunctionCallStar { name, .. } => name.as_str(),
+            _ => "extension function",
+        };
+        crate::bail_parse_error!("{} may not be used as a window function", name);
+    }
     if distinctness.is_distinct() {
         crate::bail_parse_error!("DISTINCT is not supported for window functions");
     }

@@ -437,6 +437,24 @@ expect error {
     no such function
 }
 
+test window-external-aggregate-order-by-rejected {
+    SELECT
+    median(price) OVER (ORDER BY price)
+    FROM products;
+}
+expect error {
+    may not be used as a window function
+}
+
+test window-external-aggregate-partition-rejected {
+    SELECT
+    stddev(price) OVER (PARTITION BY name)
+    FROM products;
+}
+expect error {
+    may not be used as a window function
+}
+
 test window-aggregate-in-partition-by {
     SELECT
     max(price) OVER (PARTITION BY count(*))
