@@ -797,11 +797,11 @@ impl Value {
             return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
         }
 
-        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
-            .expect("formatted float should always parse successfully")
-            .into();
-
-        Value::from_f64(f)
+        // SQLite rounds half away from zero (the printf "%!.*f" flag), but Rust
+        // formatting rounds half to even, so ROUND(2.25, 1) returned 2.2.
+        // Scale, round away from zero, then scale back to match SQLite.
+        let scale = 10f64.powi(precision as i32);
+        Value::from_f64((f * scale).round() / scale)
     }
 
     fn _exec_trim(&self, pattern: Option<&Value>, trim_type: TrimType) -> Value {
