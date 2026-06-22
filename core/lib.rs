@@ -1,6 +1,14 @@
 #![cfg_attr(
     nightly,
-    feature(allocator_api, btreemap_alloc, clone_from_ref, try_with_capacity)
+    feature(
+        allocator_api,
+        btreemap_alloc,
+        clone_from_ref,
+        min_specialization,
+        try_with_capacity,
+        trusted_len,
+        vec_push_within_capacity
+    )
 )]
 #![recursion_limit = "256"]
 

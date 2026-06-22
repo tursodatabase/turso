@@ -1,3 +1,5 @@
+#![cfg_attr(nightly, feature(allocator_api))]
+
 use divan::{black_box, AllocProfiler, Bencher};
 use mimalloc::MiMalloc;
 use rustc_hash::FxBuildHasher;
@@ -47,6 +49,7 @@ struct LowerBoundOnly<I> {
 }
 
 impl<I> LowerBoundOnly<I> {
+    #[inline(always)]
     fn new(iter: I) -> Self {
         Self { iter }
     }
@@ -58,10 +61,12 @@ where
 {
     type Item = I::Item;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         self.iter.next()
     }
 
+    #[inline(always)]
     fn size_hint(&self) -> (usize, Option<usize>) {
         let (lower, _) = self.iter.size_hint();
         (lower, None)
@@ -422,6 +427,17 @@ fn vec_collect_unknown_upper_turso(bencher: Bencher, len: usize) {
     });
 }
 
+#[cfg(nightly)]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_collect_unknown_upper_global_turso_traits(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let values = LowerBoundOnly::new((0..len).map(black_box))
+            .try_collect_in::<alloc::Vec<_, alloc::Global>, _>(alloc::Global)
+            .unwrap();
+        black_box(values)
+    });
+}
+
 #[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_extend_unknown_upper_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
@@ -436,6 +452,17 @@ fn vec_extend_unknown_upper_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
             <alloc::Vec<usize> as TursoTryWithCapacityExt>::try_with_capacity_ext(len).unwrap();
+        TursoFromIterator::try_extend(&mut values, LowerBoundOnly::new((0..len).map(black_box)))
+            .unwrap();
+        black_box(values)
+    });
+}
+
+#[cfg(nightly)]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_extend_unknown_upper_global_turso_traits(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let mut values = alloc::Vec::with_capacity_in(len, alloc::Global);
         TursoFromIterator::try_extend(&mut values, LowerBoundOnly::new((0..len).map(black_box)))
             .unwrap();
         black_box(values)

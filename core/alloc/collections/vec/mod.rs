@@ -1,8 +1,11 @@
+#[cfg(nightly)]
+mod nightly;
+
+#[cfg(not(nightly))]
 use super::{
     TryClone, TursoAllocExt, TursoFromIterator, TursoSliceExt, TursoTryWithCapacityExt, TursoVecExt,
 };
-#[cfg(nightly)]
-use crate::alloc::TursoAllocator;
+#[cfg(not(nightly))]
 use crate::alloc::{TryReserveError, Vec};
 
 #[cfg(not(nightly))]
@@ -10,21 +13,12 @@ pub(super) const fn vec<T>() -> Vec<T> {
     Vec::new()
 }
 
-#[cfg(nightly)]
-pub(super) const fn vec<T>() -> Vec<T> {
-    Vec::new_in(TursoAllocator)
-}
-
 #[cfg(not(nightly))]
 fn vec_with_capacity<T>(capacity: usize) -> Vec<T> {
     Vec::with_capacity(capacity)
 }
 
-#[cfg(nightly)]
-fn vec_with_capacity<T>(capacity: usize) -> Vec<T> {
-    Vec::with_capacity_in(capacity, TursoAllocator)
-}
-
+#[cfg(not(nightly))]
 impl<T> TursoAllocExt for Vec<T> {
     #[inline(always)]
     fn new() -> Self {
@@ -32,6 +26,7 @@ impl<T> TursoAllocExt for Vec<T> {
     }
 }
 
+#[cfg(not(nightly))]
 impl<T> TursoVecExt<T> for Vec<T> {
     #[inline(always)]
     fn with_capacity(capacity: usize) -> Self {
@@ -45,6 +40,7 @@ impl<T> TursoVecExt<T> for Vec<T> {
     }
 }
 
+#[cfg(not(nightly))]
 impl<T> TursoTryWithCapacityExt for Vec<T> {
     #[inline(always)]
     fn try_with_capacity_ext(capacity: usize) -> Result<Self, TryReserveError> {
@@ -52,22 +48,14 @@ impl<T> TursoTryWithCapacityExt for Vec<T> {
     }
 }
 
+#[cfg(not(nightly))]
 impl<T> TursoFromIterator<T> for Vec<T> {
     #[inline(always)]
     fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
     where
         I: IntoIterator<Item = T>,
     {
-        #[cfg(not(nightly))]
-        {
-            Ok(iter.into_iter().collect())
-        }
-        #[cfg(nightly)]
-        {
-            let mut values = vec();
-            values.extend(iter);
-            Ok(values)
-        }
+        Ok(iter.into_iter().collect())
     }
 
     #[inline(always)]
@@ -80,6 +68,7 @@ impl<T> TursoFromIterator<T> for Vec<T> {
     }
 }
 
+#[cfg(not(nightly))]
 impl<T: Clone> TursoSliceExt<T> for [T] {
     #[inline(always)]
     fn try_to_vec(&self) -> Result<Vec<T>, TryReserveError> {
@@ -89,18 +78,13 @@ impl<T: Clone> TursoSliceExt<T> for [T] {
     }
 }
 
+#[cfg(not(nightly))]
 impl<T: Clone> TryClone for Vec<T> {
     type Error = TryReserveError;
 
     #[inline(always)]
     fn try_clone(&self) -> Result<Self, Self::Error> {
-        #[cfg(not(nightly))]
         let mut cloned = <Self as TursoTryWithCapacityExt>::try_with_capacity_ext(self.len())?;
-        #[cfg(nightly)]
-        let mut cloned = {
-            let alloc = self.allocator().clone();
-            Self::try_with_capacity_in(self.len(), alloc).map_err(TryReserveError::from)?
-        };
         cloned.extend(self.iter().cloned());
         Ok(cloned)
     }

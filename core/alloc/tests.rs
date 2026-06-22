@@ -18,13 +18,35 @@ impl Iterator for LowerBoundOnly {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, None)
+        (self.end - self.next, None)
+    }
+}
+
+struct UnderreportedLowerBound {
+    next: usize,
+    end: usize,
+}
+
+impl Iterator for UnderreportedLowerBound {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.end {
+            return None;
+        }
+        let value = self.next;
+        self.next += 1;
+        Some(value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        ((self.end - self.next).saturating_sub(1), None)
     }
 }
 
 #[test]
 fn try_extend_accepts_exact_size_iterators() {
-    let mut values = Vec::new();
+    let mut values: Vec<_> = TursoAllocExt::new();
 
     values.try_extend([1, 2, 3]).unwrap();
 
@@ -33,13 +55,42 @@ fn try_extend_accepts_exact_size_iterators() {
 
 #[test]
 fn try_extend_accepts_iterators_without_upper_bounds() {
-    let mut values = Vec::new();
+    let mut values: Vec<_> = TursoAllocExt::new();
 
     values
         .try_extend(LowerBoundOnly { next: 0, end: 3 })
         .unwrap();
 
     assert_eq!(values.as_slice(), &[0, 1, 2]);
+}
+
+#[test]
+fn try_extend_accepts_underreported_lower_bound_iterators() {
+    let mut values = <Vec<usize> as TursoTryWithCapacityExt>::try_with_capacity_ext(4).unwrap();
+
+    values
+        .try_extend(UnderreportedLowerBound { next: 0, end: 4 })
+        .unwrap();
+
+    assert_eq!(values.as_slice(), &[0, 1, 2, 3]);
+}
+
+#[test]
+fn iterator_try_collect_accepts_iterators_without_upper_bounds() {
+    let values: Vec<_> = LowerBoundOnly { next: 0, end: 3 }.try_collect().unwrap();
+
+    assert_eq!(values.as_slice(), &[0, 1, 2]);
+}
+
+#[cfg(nightly)]
+#[test]
+fn vec_try_extend_reserves_before_mutation() {
+    let mut values = self::vec![1];
+
+    let result = values.try_extend(std::iter::repeat(2).take(usize::MAX));
+
+    assert!(result.is_err());
+    assert_eq!(values.as_slice(), &[1]);
 }
 
 #[test]
@@ -86,6 +137,14 @@ fn binary_heap_try_push_and_extend_reserve_before_mutation() {
 #[test]
 fn iterator_try_collect_builds_turso_vec() {
     let values: Vec<_> = [1, 2, 3].into_iter().try_collect().unwrap();
+
+    assert_eq!(values.as_slice(), &[1, 2, 3]);
+}
+
+#[cfg(nightly)]
+#[test]
+fn iterator_try_collect_in_builds_global_vec() {
+    let values: Vec<_, Global> = [1, 2, 3].into_iter().try_collect_in(Global).unwrap();
 
     assert_eq!(values.as_slice(), &[1, 2, 3]);
 }
@@ -165,7 +224,7 @@ fn iterator_try_collect_converts_result_error() {
 
 #[test]
 fn tuple_try_extend_extends_both_collections() {
-    let mut values: (Vec<_>, VecDeque<_>) = (Vec::new(), VecDeque::new());
+    let mut values: (Vec<_>, VecDeque<_>) = (TursoAllocExt::new(), VecDeque::new());
 
     values
         .try_extend([(1, "one"), (2, "two"), (3, "three")])

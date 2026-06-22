@@ -618,7 +618,7 @@ impl MakeFromBtreeState {
             cursor: None,
             accumulators: None,
             read_tx_active: false,
-            sequence_sources: Vec::new(),
+            sequence_sources: vec![],
             sequence_cursor: None,
         }
     }
@@ -1004,7 +1004,7 @@ impl Schema {
         &self,
         type_name: &str,
     ) -> crate::Result<(String, Vec<Arc<TypeDef>>)> {
-        let mut chain = Vec::new();
+        let mut chain = vec![];
         let mut visited = std::collections::HashSet::new();
         let mut current = type_name.to_lowercase();
 
@@ -1214,7 +1214,7 @@ impl Schema {
     /// Get all materialized views that depend on a given table
     pub fn get_dependent_materialized_views(&self, table_name: &str) -> Vec<String> {
         if self.table_to_materialized_views.is_empty() {
-            return Vec::new();
+            return vec![];
         }
         let table_name = normalize_ident(table_name);
         self.table_to_materialized_views
@@ -1939,7 +1939,7 @@ impl Schema {
                 name: view_name.clone(),
                 root_page: main_root,
                 columns: cols,
-                primary_key_columns: Vec::new(),
+                primary_key_columns: vec![],
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -3283,8 +3283,8 @@ impl BTreeTable {
             return Ok(());
         }
         // Collect new constraints and notnull flags to avoid borrowing issues
-        let mut new_checks = Vec::new();
-        let mut notnull_cols = Vec::new();
+        let mut new_checks = vec![];
+        let mut notnull_cols = vec![];
 
         for (col_idx, col) in self.columns.iter().enumerate() {
             let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) else {
@@ -4646,7 +4646,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         check_constraints,
         rowid_alias_conflict_clause,
         has_virtual_columns: false,
-        logical_to_physical_map: Vec::new(),
+        logical_to_physical_map: vec![],
         column_dependencies: Default::default(),
     };
     table.prepare_generated_columns()?;
@@ -6471,7 +6471,7 @@ mod tests {
             2,
             Some("CREATE TABLE t1(a INTEGER, b AS (a*2))"),
             &SymbolTable::default(),
-            &mut Vec::new(),
+            &mut vec![],
             &mut HashMap::default(),
             &mut HashMap::default(),
             &mut HashMap::default(),

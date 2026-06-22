@@ -20,6 +20,8 @@ pub use allocation_site::{
 pub use api::ApiAllocator;
 pub use api::{AllocError, Global, Layout};
 pub use backend::{set_allocator, SetAllocatorError, TursoAllocBackend};
+#[cfg(nightly)]
+pub use collections::TursoFromIteratorIn;
 pub use collections::{
     TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt, TursoFromIterator, TursoHashMapExt,
     TursoHashSetExt, TursoIteratorExt, TursoNewExt, TursoSliceExt, TursoTryNewExt,
@@ -81,7 +83,7 @@ pub type BoxedSlice<T> = std::boxed::Box<[T], TursoAllocator>;
 #[cfg(not(nightly))]
 pub type Vec<T> = std::vec::Vec<T>;
 #[cfg(nightly)]
-pub type Vec<T> = std::vec::Vec<T, TursoAllocator>;
+pub type Vec<T, A = TursoAllocator> = std::vec::Vec<T, A>;
 
 pub use crate::{__turso_alloc_try_vec as try_vec, __turso_alloc_vec as vec};
 

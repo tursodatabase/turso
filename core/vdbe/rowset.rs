@@ -69,7 +69,7 @@ impl RowSet {
     /// Creates a new empty RowSet.
     pub fn new() -> Self {
         Self {
-            fresh: Vec::new(),
+            fresh: vec![],
             mode: RowSetMode::Unset,
         }
     }
@@ -474,7 +474,7 @@ mod tests {
         let attempts = 10;
         for _ in 0..attempts {
             let mut rowset = RowSet::new();
-            let mut batches: Vec<(i32, Vec<i64>)> = Vec::new();
+            let mut batches: Vec<(i32, Vec<i64>)> = crate::alloc::vec![];
 
             // Create multiple batches: batch 0 (first), intermediate batches (>0), and batch -1 (final)
             let num_batches = 5 + (rng.next_u64() % 10) as usize;
@@ -488,7 +488,7 @@ mod tests {
                 };
 
                 // Insert values for this batch
-                let mut batch_values = Vec::new();
+                let mut batch_values = crate::alloc::vec![];
                 let num_values = 10 + (rng.next_u64() % 90) as usize;
 
                 for _ in 0..num_values {
@@ -588,7 +588,7 @@ mod tests {
         for attempt in 0..attempts {
             let mut rowset = RowSet::new();
             let mut reference = std::collections::BTreeSet::new();
-            let mut batches: Vec<(i32, Vec<i64>)> = Vec::new();
+            let mut batches: Vec<(i32, Vec<i64>)> = crate::alloc::vec![];
 
             // Generate random number of batches and total inserts
             let num_batches = 10 + (rng.next_u64() % 40) as usize;
@@ -608,7 +608,7 @@ mod tests {
 
                 // Calculate how many values to insert in this batch
                 // (distribute total_inserts across batches with some randomness)
-                let mut batch_values = Vec::new();
+                let mut batch_values = crate::alloc::vec![];
                 let already_inserted = batches.iter().map(|(_, v)| v.len()).sum::<usize>();
                 let batch_inserts = if batch_idx == num_batches - 1 {
                     // Last batch gets remaining values
