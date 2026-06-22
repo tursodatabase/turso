@@ -437,6 +437,7 @@ expect error {
     no such function
 }
 
+@skip-if sqlite "median/stddev are turso extension aggregates; rejecting them as window functions is turso-only behavior (SQLite has no such functions)"
 test window-external-aggregate-order-by-rejected {
     SELECT
     median(price) OVER (ORDER BY price)
@@ -446,6 +447,7 @@ expect error {
     may not be used as a window function
 }
 
+@skip-if sqlite "median/stddev are turso extension aggregates; rejecting them as window functions is turso-only behavior (SQLite has no such functions)"
 test window-external-aggregate-partition-rejected {
     SELECT
     stddev(price) OVER (PARTITION BY name)
