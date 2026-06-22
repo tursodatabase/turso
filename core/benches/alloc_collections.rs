@@ -49,6 +49,7 @@ struct LowerBoundOnly<I> {
 }
 
 impl<I> LowerBoundOnly<I> {
+    #[inline(always)]
     fn new(iter: I) -> Self {
         Self { iter }
     }
@@ -60,10 +61,12 @@ where
 {
     type Item = I::Item;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         self.iter.next()
     }
 
+    #[inline(always)]
     fn size_hint(&self) -> (usize, Option<usize>) {
         let (lower, _) = self.iter.size_hint();
         (lower, None)

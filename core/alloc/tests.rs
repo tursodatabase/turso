@@ -18,7 +18,29 @@ impl Iterator for LowerBoundOnly {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, None)
+        (self.end - self.next, None)
+    }
+}
+
+struct UnderreportedLowerBound {
+    next: usize,
+    end: usize,
+}
+
+impl Iterator for UnderreportedLowerBound {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.end {
+            return None;
+        }
+        let value = self.next;
+        self.next += 1;
+        Some(value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        ((self.end - self.next).saturating_sub(1), None)
     }
 }
 
@@ -38,6 +60,24 @@ fn try_extend_accepts_iterators_without_upper_bounds() {
     values
         .try_extend(LowerBoundOnly { next: 0, end: 3 })
         .unwrap();
+
+    assert_eq!(values.as_slice(), &[0, 1, 2]);
+}
+
+#[test]
+fn try_extend_accepts_underreported_lower_bound_iterators() {
+    let mut values = <Vec<usize> as TursoTryWithCapacityExt>::try_with_capacity_ext(4).unwrap();
+
+    values
+        .try_extend(UnderreportedLowerBound { next: 0, end: 4 })
+        .unwrap();
+
+    assert_eq!(values.as_slice(), &[0, 1, 2, 3]);
+}
+
+#[test]
+fn iterator_try_collect_accepts_iterators_without_upper_bounds() {
+    let values: Vec<_> = LowerBoundOnly { next: 0, end: 3 }.try_collect().unwrap();
 
     assert_eq!(values.as_slice(), &[0, 1, 2]);
 }

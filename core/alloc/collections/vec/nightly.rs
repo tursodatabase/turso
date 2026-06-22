@@ -70,7 +70,7 @@ impl<T, A> TursoFromIteratorIn<T, A> for Vec<T, A>
 where
     A: Allocator,
 {
-    #[inline]
+    #[inline(always)]
     fn try_from_iter_in<I>(iter: I, alloc: A) -> Result<Self, TryReserveError>
     where
         I: IntoIterator<Item = T>,
@@ -120,7 +120,7 @@ where
     I: Iterator<Item = T>,
     A: Allocator,
 {
-    #[inline]
+    #[inline(always)]
     default fn try_spec_extend(&mut self, iter: I) -> Result<(), TryReserveError> {
         self.try_extend_desugared(iter, true)
     }
@@ -131,7 +131,7 @@ where
     I: TrustedLen<Item = T>,
     A: Allocator,
 {
-    #[inline]
+    #[inline(always)]
     default fn try_spec_extend(&mut self, iter: I) -> Result<(), TryReserveError> {
         self.try_extend_trusted(iter)
     }
@@ -152,7 +152,7 @@ where
     I: Iterator<Item = &'a T>,
     A: Allocator,
 {
-    #[inline]
+    #[inline(always)]
     default fn try_spec_extend_ref(&mut self, iter: I) -> Result<(), TryReserveError> {
         self.try_spec_extend(iter.cloned())
     }
@@ -163,7 +163,7 @@ where
     T: Copy + 'a,
     A: Allocator,
 {
-    #[inline]
+    #[inline(always)]
     fn try_spec_extend_ref(&mut self, iter: slice::Iter<'a, T>) -> Result<(), TryReserveError> {
         self.try_copy_from_slice(iter.as_slice())
     }
@@ -186,15 +186,15 @@ where
     I: Iterator<Item = T>,
     A: Allocator,
 {
-    #[inline]
+    #[inline(always)]
     default fn try_from_iter_in(mut iter: I, alloc: A) -> Result<Self, TryReserveError> {
         let Some(first) = iter.next() else {
             return Ok(Vec::new_in(alloc));
         };
 
         let mut values = Vec::new_in(alloc);
-        let (lower, upper) = iter.size_hint();
-        let initial = upper.unwrap_or(lower).saturating_add(1);
+        let (lower, _) = iter.size_hint();
+        let initial = lower.saturating_add(1);
         values.try_reserve(initial).map_err(TryReserveError::from)?;
 
         unsafe {
@@ -202,6 +202,11 @@ where
             values.set_len(1);
         }
 
+        if lower != 0 {
+            unsafe {
+                extend_reserved_lower_bound(&mut values, &mut iter, lower);
+            }
+        }
         values.try_extend_desugared(iter, false)?;
         Ok(values)
     }
@@ -212,7 +217,7 @@ where
     I: TrustedLen<Item = T>,
     A: Allocator,
 {
-    #[inline]
+    #[inline(always)]
     fn try_from_iter_in(iter: I, alloc: A) -> Result<Self, TryReserveError> {
         let additional = trusted_len(iter.size_hint())?;
         if additional == 0 {
@@ -255,7 +260,7 @@ impl<T, A> TryVecInternal<T> for Vec<T, A>
 where
     A: Allocator,
 {
-    #[inline]
+    #[inline(always)]
     fn try_extend_desugared<I>(
         &mut self,
         mut iter: I,
@@ -273,9 +278,7 @@ where
         while let Some(element) = iter.next() {
             let len = self.len();
             if len == self.capacity() {
-                let (lower, _) = iter.size_hint();
-                self.try_reserve(lower.saturating_add(1))
-                    .map_err(TryReserveError::from)?;
+                try_reserve_for_extend(self, &iter)?;
             }
 
             unsafe {
@@ -287,7 +290,7 @@ where
         Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     fn try_extend_trusted<I>(&mut self, iter: I) -> Result<(), TryReserveError>
     where
         I: TrustedLen<Item = T>,
@@ -303,7 +306,7 @@ where
         Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     unsafe fn extend_trusted_unchecked<I>(&mut self, iter: I)
     where
         I: TrustedLen<Item = T>,
@@ -318,7 +321,7 @@ where
         });
     }
 
-    #[inline]
+    #[inline(always)]
     fn try_copy_from_slice(&mut self, slice: &[T]) -> Result<(), TryReserveError>
     where
         T: Copy,
@@ -346,6 +349,41 @@ fn trusted_len(size_hint: (usize, Option<usize>)) -> Result<usize, TryReserveErr
     };
     debug_assert_eq!(lower, additional);
     Ok(additional)
+}
+
+#[cold]
+#[inline(never)]
+fn try_reserve_for_extend<T, A, I>(values: &mut Vec<T, A>, iter: &I) -> Result<(), TryReserveError>
+where
+    A: Allocator,
+    I: Iterator<Item = T>,
+{
+    let (lower, _) = iter.size_hint();
+    values
+        .try_reserve(lower.saturating_add(1))
+        .map_err(TryReserveError::from)
+}
+
+#[inline(always)]
+unsafe fn extend_reserved_lower_bound<T, A, I>(
+    values: &mut Vec<T, A>,
+    iter: &mut I,
+    additional: usize,
+) where
+    A: Allocator,
+    I: Iterator<Item = T>,
+{
+    let ptr = values.as_mut_ptr();
+    let mut guard = SetLenOnDrop::new(values);
+    for _ in 0..additional {
+        let Some(element) = iter.next() else {
+            return;
+        };
+        unsafe {
+            ptr::write(ptr.add(guard.current_len()), element);
+        }
+        guard.increment_len();
+    }
 }
 
 /// Publishes the vector length for direct writes, including during unwinding.
