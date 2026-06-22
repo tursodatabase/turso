@@ -114,6 +114,7 @@ jobs:
 
           bench_args=$(jq -r '.[] | "--bench " + .' <<< "$BENCHMARKS_JSON" | tr '\n' ' ')
           cargo +${{ matrix.toolchain.version }} codspeed build $bench_args --features codspeed
+          touch target/codspeed/.build-success
 
   benchmarks:
     name: "Run benchmark (${{ matrix.toolchain.label }}, ${{ matrix.benchmark }})"
@@ -154,17 +155,32 @@ jobs:
           key: ${{ env.CODSPEED_STICKY_DISK_KEY }}-${{ matrix.toolchain.label }}
           path: target/codspeed
 
+      - name: Check build status
+        id: build-status
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f target/codspeed/.build-success ]; then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping benchmarks: ${{ matrix.toolchain.label }} build did not complete."
+          fi
+
       - name: Restore binary permissions
+        if: steps.build-status.outputs.built == 'true'
         run: find target/codspeed -type f -exec chmod +x {} +
 
       - name: Generate graph-queries DBs
-        if: matrix.benchmark == 'graph_queries_benchmark'
+        if: steps.build-status.outputs.built == 'true' && matrix.benchmark == 'graph_queries_benchmark'
         run: |
           python3 perf/graph-queries/generate_seed.py | sqlite3 perf/graph-queries/graph-queries.db
           cp perf/graph-queries/graph-queries.db perf/graph-queries/graph-queries-analyzed.db
           sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
 
       - name: Run benchmarks (excluding TPC-H)
+        if: steps.build-status.outputs.built == 'true'
         uses: CodSpeedHQ/action@v4.17.0
         env:
           RUSTFLAGS: ${{ matrix.toolchain.rustflags }}
