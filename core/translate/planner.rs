@@ -1096,9 +1096,7 @@ fn parse_table(
     if let Some(table) = table {
         if !connection.is_nested_stmt()
             && !connection.is_mvcc_bootstrap_connection()
-            && table_name
-                .as_str()
-                .starts_with(crate::schema::TURSO_INTERNAL_PREFIX)
+            && normalized_qualified_name.starts_with(crate::schema::TURSO_INTERNAL_PREFIX)
         {
             crate::bail_parse_error!("table {} may not be queried", table_name);
         }

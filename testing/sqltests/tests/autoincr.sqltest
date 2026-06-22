@@ -2,23 +2,49 @@
 @skip-file-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 
 # Test: Create an AUTOINCREMENT table and verify sqlite_sequence is also created.
-#
-# Turso-only: SQLite does not maintain the internal
-# `__turso_internal_seq___turso_internal_autoincrement_*` backing table
-# (Turso's disk-only sequence allocator) so the schema listing differs.
-# The `sqlite_sequence` row creation is exercised by every other
-# AUTOINCREMENT test in this file, so the SQLite cross-check coverage
-# is preserved.
-@skip-if sqlite "Turso-specific internal backing table not present in SQLite"
+# Turso keeps an internal `__turso_internal_seq___turso_internal_autoincrement_*`
+# backing table for its disk sequence allocator, but that table must not be
+# visible through user schema introspection. Exposing it leaks sequence metadata
+# such as i64::MAX, which JavaScript clients cannot represent safely as a
+# number.
 @cross-check-integrity
 test autoinc-create-sequence-table {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;
 }
 expect {
-    __turso_internal_seq___turso_internal_autoincrement_t1
     sqlite_sequence
     t1
+}
+
+# Test: Internal AUTOINCREMENT backing tables are hidden from sqlite_schema too.
+@cross-check-integrity
+test autoinc-internal-backing-table-hidden-from-sqlite-schema {
+    CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
+    SELECT count(*) FROM sqlite_schema WHERE name LIKE '__turso_internal_seq_%';
+}
+expect {
+    0
+}
+
+# Test: Schema introspection must not expose the internal sequence descriptor
+# value 9223372036854775807 (i64::MAX) stored by AUTOINCREMENT backing tables.
+@cross-check-integrity
+test autoinc-internal-max-value-hidden-from-schema-introspection {
+    CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
+    SELECT count(*) FROM sqlite_master WHERE sql LIKE '%9223372036854775807%';
+}
+expect {
+    0
+}
+
+# Test: Direct user reads of Turso's internal sequence backing table are denied.
+@skip-if sqlite "Turso-specific internal backing table not present in SQLite"
+test autoinc-internal-backing-table-direct-select-denied {
+    CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
+    SELECT * FROM __turso_internal_seq___turso_internal_autoincrement_t1;
+}
+expect error {
 }
 
 # Test: The sqlite_sequence table is initially empty after table creation.

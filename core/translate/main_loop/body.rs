@@ -145,18 +145,13 @@ fn emit_turso_internal_schema_row_filter(
     }
 
     let table = &plan.joined_tables()[0];
-    if table.database_id != crate::MAIN_DB_ID
-        || !table
-            .table
-            .get_name()
-            .eq_ignore_ascii_case(SCHEMA_TABLE_NAME)
+    if !table
+        .table
+        .get_name()
+        .eq_ignore_ascii_case(SCHEMA_TABLE_NAME)
     {
         return;
     }
-    if !matches!(table.op, Operation::Scan(_)) {
-        return;
-    }
-
     let cursor_id = program.resolve_cursor_id(&CursorKey::table(table.internal_id));
     let args_reg = program.alloc_registers(2);
     let pattern_reg = args_reg;
@@ -195,6 +190,15 @@ fn emit_loop_source<'a>(
     plan: &'a SelectPlan,
     emit_target: LoopEmitTarget,
 ) -> Result<()> {
+    let offset_jump_to = plan
+        .join_order
+        .first()
+        .and_then(|j| t_ctx.labels_main_loop.get(j.original_idx))
+        .map(|l| l.next)
+        .or(t_ctx.label_main_loop_end);
+
+    emit_turso_internal_schema_row_filter(program, plan, offset_jump_to);
+
     match emit_target {
         LoopEmitTarget::GroupBy => {
             let GroupByMetadata {
@@ -479,15 +483,6 @@ fn emit_loop_source<'a>(
                 plan.aggregates.is_empty(),
                 "QueryResult target should not have aggregates"
             );
-            let offset_jump_to = plan
-                .join_order
-                .first()
-                .and_then(|j| t_ctx.labels_main_loop.get(j.original_idx))
-                .map(|l| l.next)
-                .or(t_ctx.label_main_loop_end);
-
-            emit_turso_internal_schema_row_filter(program, plan, offset_jump_to);
-
             emit_select_result(
                 program,
                 &t_ctx.resolver,
