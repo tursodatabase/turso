@@ -3,6 +3,7 @@ use std::cell::Cell;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AllocationSite {
     MvStore(MvStoreAllocationSite),
+    MvccCheckpoint(MvccCheckpointAllocationSite),
     NoFaultInjection,
 }
 
@@ -17,9 +18,23 @@ pub enum MvStoreAllocationSite {
     RowVersionReserve,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MvccCheckpointAllocationSite {
+    CheckpointWriteSet,
+    CheckpointIndexWriteSet,
+    CheckpointMetadataPayload,
+    CheckpointSequenceCompactions,
+}
+
 impl From<MvStoreAllocationSite> for AllocationSite {
     fn from(site: MvStoreAllocationSite) -> Self {
         Self::MvStore(site)
+    }
+}
+
+impl From<MvccCheckpointAllocationSite> for AllocationSite {
+    fn from(site: MvccCheckpointAllocationSite) -> Self {
+        Self::MvccCheckpoint(site)
     }
 }
 

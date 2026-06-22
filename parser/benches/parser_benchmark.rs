@@ -10,6 +10,7 @@ use codspeed_criterion_compat::{
 
 use turso_parser::{lexer::Lexer, parser::Parser};
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_parser(criterion: &mut Criterion) {
     let queries = [
         "SELECT 1",
@@ -29,6 +30,7 @@ fn bench_parser(criterion: &mut Criterion) {
     }
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_parser_insert_batch(criterion: &mut Criterion) {
     for batch_size in [1, 10, 100] {
         let mut values = String::from("INSERT INTO test VALUES ");
@@ -50,6 +52,7 @@ fn bench_parser_insert_batch(criterion: &mut Criterion) {
     }
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_lexer(criterion: &mut Criterion) {
     let queries = [
         "SELECT 1",

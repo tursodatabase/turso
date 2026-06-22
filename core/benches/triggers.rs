@@ -82,6 +82,7 @@ fn setup_rusqlite(temp_dir: &TempDir, schema: &str) -> rusqlite::Connection {
 }
 
 /// Multi-row INSERT with AFTER INSERT trigger (tests statement caching + step_subprogram)
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_multirow_insert_with_trigger(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -168,6 +169,7 @@ fn bench_multirow_insert_with_trigger(criterion: &mut Criterion) {
 }
 
 /// Wide table where trigger references only a few columns (tests sparse parameter allocation)
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_wide_table_sparse_trigger(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -267,6 +269,7 @@ fn bench_wide_table_sparse_trigger(criterion: &mut Criterion) {
 }
 
 /// Multiple triggers on the same table (tests pre-trigger affinity emission)
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_multiple_triggers(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -394,6 +397,7 @@ fn bench_multiple_triggers(criterion: &mut Criterion) {
 }
 
 /// Baseline: INSERT with vs without triggers to isolate trigger overhead
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_trigger_overhead(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -488,6 +492,7 @@ fn bench_trigger_overhead(criterion: &mut Criterion) {
 }
 
 /// BEFORE INSERT trigger that modifies NEW values
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_before_trigger(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");

@@ -39,6 +39,7 @@ fn bench_db() -> BenchDb {
     }
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("mvcc-ops-throughput");
     group.throughput(Throughput::Elements(1));
@@ -356,6 +357,7 @@ fn run_to_completion(db: &Arc<Database>, stmt: &mut Statement) {
     }
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_huge_multi_write(c: &mut Criterion) {
     let idx1 = NonZeroUsize::new(1).unwrap();
     let sql = build_huge_multi_write(HUGE_WRITE_ROWS_PER_BATCH);

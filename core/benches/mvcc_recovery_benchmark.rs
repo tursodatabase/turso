@@ -116,6 +116,7 @@ fn single_frame_with_num_ops(num_ops: u64) -> RecoveryFixture {
     })
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_recovery(c: &mut Criterion) {
     {
         let mut group = c.benchmark_group("mvcc-recovery/small-frames");

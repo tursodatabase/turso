@@ -31,6 +31,7 @@ fn rusqlite_open(path: &str) -> rusqlite::Connection {
     conn
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_graph_queries(criterion: &mut Criterion) {
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
