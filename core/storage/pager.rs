@@ -435,6 +435,13 @@ impl PageInner {
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        // Bound-check the array entry: `idx` is the untrusted on-disk cell count.
+        crate::assert_or_bail_corrupt!(
+            self.offset() + cell_pointer + CELL_PTR_SIZE_BYTES <= buf.len(),
+            "cell pointer array index {} out of bounds for page size {}",
+            idx,
+            buf.len()
+        );
         let cell_pointer = self.read_u16(cell_pointer) as usize;
         let mut pos = cell_pointer;
         let (_, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(buf, pos..))?;
