@@ -461,15 +461,15 @@ pub enum DatabaseRowTransformResult {
 #[derive(Clone)]
 pub enum DatabaseTapeRowChangeType {
     Delete {
-        before: Vec<turso_core::Value>,
+        before: crate::alloc::Vec<turso_core::Value>,
     },
     Update {
-        before: Vec<turso_core::Value>,
-        after: Vec<turso_core::Value>,
-        updates: Option<Vec<turso_core::Value>>,
+        before: crate::alloc::Vec<turso_core::Value>,
+        after: crate::alloc::Vec<turso_core::Value>,
+        updates: Option<crate::alloc::Vec<turso_core::Value>>,
     },
     Insert {
-        after: Vec<turso_core::Value>,
+        after: crate::alloc::Vec<turso_core::Value>,
     },
 }
 
@@ -582,7 +582,9 @@ pub enum SyncEngineIoResult {
     IO,
 }
 
-pub fn parse_bin_record(bin_record: impl AsRef<[u8]>) -> Result<Vec<turso_core::Value>> {
+pub fn parse_bin_record(
+    bin_record: impl AsRef<[u8]>,
+) -> Result<crate::alloc::Vec<turso_core::Value>> {
     match turso_core::types::ImmutableRecordRef::from_bin_record(bin_record.as_ref())
         .get_values_owned()
     {

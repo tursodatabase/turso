@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use turso_parser::parser::Parser;
 
 use crate::{
+    alloc::{TursoAllocExt, TursoVecExt},
     database_tape::{run_stmt_once, DatabaseReplaySessionOpts},
     errors::Error,
     types::{
@@ -112,18 +113,18 @@ impl DatabaseReplayGenerator {
         info: &ReplayInfo,
         change: DatabaseChangeType,
         id: i64,
-        mut record: Vec<turso_core::Value>,
-        updates: Option<Vec<turso_core::Value>>,
-    ) -> Vec<turso_core::Value> {
+        mut record: crate::alloc::Vec<turso_core::Value>,
+        updates: Option<crate::alloc::Vec<turso_core::Value>>,
+    ) -> crate::alloc::Vec<turso_core::Value> {
         if info.is_ddl_replay {
-            return Vec::new();
+            return <crate::alloc::Vec<turso_core::Value> as TursoAllocExt>::new();
         }
         match change {
             DatabaseChangeType::Delete => {
                 if self.opts.use_implicit_rowid || info.pk_column_indices.is_none() {
-                    vec![turso_core::Value::from_i64(id)]
+                    crate::alloc::vec![turso_core::Value::from_i64(id)]
                 } else {
-                    let mut values = Vec::new();
+                    let mut values = <crate::alloc::Vec<turso_core::Value> as TursoAllocExt>::new();
                     let pk_column_indices = info.pk_column_indices.as_ref().unwrap();
                     for pk in pk_column_indices {
                         let value = std::mem::replace(&mut record[*pk], turso_core::Value::Null);
@@ -142,7 +143,10 @@ impl DatabaseReplayGenerator {
                 let mut updates = updates.unwrap();
                 assert!(updates.len() % 2 == 0);
                 let columns_cnt = updates.len() / 2;
-                let mut values = Vec::with_capacity(columns_cnt + 1);
+                let mut values =
+                    <crate::alloc::Vec<turso_core::Value> as TursoVecExt<_>>::with_capacity(
+                        columns_cnt + 1,
+                    );
                 for i in 0..columns_cnt {
                     let changed = match updates[i] {
                         turso_core::Value::Numeric(turso_core::Numeric::Integer(x @ (1 | 0))) => {
@@ -172,7 +176,7 @@ impl DatabaseReplayGenerator {
             }
             DatabaseChangeType::Commit => {
                 // COMMIT records are handled at the tape level, not here
-                Vec::new()
+                <crate::alloc::Vec<turso_core::Value> as TursoAllocExt>::new()
             }
         }
     }

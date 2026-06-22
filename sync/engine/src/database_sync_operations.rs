@@ -677,7 +677,9 @@ pub const TURSO_SYNC_UPDATE_LAST_CHANGE_ID: &str =
 const TURSO_SYNC_SELECT_LAST_CHANGE_ID: &str =
     "SELECT pull_gen, change_id FROM turso_sync_last_change_id WHERE client_id = ?";
 
-fn convert_to_args(values: Vec<turso_core::Value>) -> Vec<server_proto::Value> {
+fn convert_to_args(
+    values: impl IntoIterator<Item = turso_core::Value>,
+) -> Vec<server_proto::Value> {
     values
         .into_iter()
         .map(|value| match value {

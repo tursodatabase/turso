@@ -543,7 +543,7 @@ pub struct DatabaseReplaySession {
 async fn replay_stmt<Ctx>(
     coro: &Coro<Ctx>,
     stmt: &mut turso_core::Statement,
-    values: Vec<turso_core::Value>,
+    values: impl IntoIterator<Item = turso_core::Value>,
 ) -> Result<()> {
     stmt.reset()?;
     for (i, value) in values.into_iter().enumerate() {
