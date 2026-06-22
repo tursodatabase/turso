@@ -239,3 +239,7 @@ harness = false
 [[bench]]
 name = "struct_union_profile"
 harness = false
+
+[[bench]]
+name = "prepare_params_benchmark"
+harness = false
