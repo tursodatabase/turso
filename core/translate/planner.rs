@@ -1094,6 +1094,15 @@ fn parse_table(
     let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
 
     if let Some(table) = table {
+        if !connection.is_nested_stmt()
+            && !connection.is_mvcc_bootstrap_connection()
+            && table_name
+                .as_str()
+                .starts_with(crate::schema::TURSO_INTERNAL_PREFIX)
+        {
+            crate::bail_parse_error!("table {} may not be queried", table_name);
+        }
+
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
