@@ -222,7 +222,10 @@ mod tests {
         for i in 0..n {
             let expected: NonZero<usize> = (i + 1).try_into().unwrap();
             assert_eq!(parameters.index(format!(":p{i}")), Some(expected));
-            assert_eq!(parameters.name(expected).as_deref(), Some(format!(":p{i}").as_str()));
+            assert_eq!(
+                parameters.name(expected).as_deref(),
+                Some(format!(":p{i}").as_str())
+            );
             assert!(parameters.has_index(expected));
             assert!(!parameters.is_indexed(expected));
         }
@@ -253,7 +256,11 @@ mod tests {
         assert!(!parameters.is_indexed(idx));
         assert_eq!(parameters.name(idx).as_deref(), Some(":x"));
         assert_eq!(parameters.index(":x"), Some(idx));
-        assert_eq!(parameters.list.len(), 1, "indexed slot replaced, not duplicated");
+        assert_eq!(
+            parameters.list.len(),
+            1,
+            "indexed slot replaced, not duplicated"
+        );
     }
 
     #[test]
