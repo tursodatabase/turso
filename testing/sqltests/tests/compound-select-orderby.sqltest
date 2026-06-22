@@ -897,3 +897,32 @@ test union-order-by-expr-no-match {
 expect error {
     1st ORDER BY term does not match any column in the result set
 }
+
+# ===== ORDER BY with COLLATE =====
+
+@setup schema
+test union-all-order-by-collate-nocase {
+    SELECT 'a' AS x UNION ALL SELECT 'B' ORDER BY 1 COLLATE NOCASE;
+}
+expect {
+    a
+    B
+}
+
+@setup schema
+test union-all-order-by-collate-nocase-name {
+    SELECT 'b' AS x UNION ALL SELECT 'A' ORDER BY x COLLATE NOCASE;
+}
+expect {
+    A
+    b
+}
+
+@setup schema
+test union-all-order-by-collate-nocase-desc {
+    SELECT 'a' AS x UNION ALL SELECT 'B' ORDER BY 1 COLLATE NOCASE DESC;
+}
+expect {
+    B
+    a
+}

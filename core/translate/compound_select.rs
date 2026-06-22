@@ -8,7 +8,7 @@ use crate::translate::emitter::{
 };
 use crate::translate::expr::translate_expr;
 use crate::translate::order_by::{custom_type_comparator, sorter_insert};
-use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
+use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_columns_to_destination;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
@@ -830,7 +830,7 @@ fn create_collection_index(
 #[allow(clippy::too_many_arguments)]
 fn emit_compound_order_by(
     program: &mut ProgramBuilder,
-    order_by: &[(usize, SortOrder, Option<turso_parser::ast::NullsOrder>)],
+    order_by: &[CompoundOrderByKey],
     collection_cursor_id: usize,
     collection_index: &Index,
     num_result_cols: usize,
@@ -853,11 +853,13 @@ fn emit_compound_order_by(
         Option<turso_parser::ast::NullsOrder>,
     )> = order_by
         .iter()
-        .map(|(col_idx, order, nulls)| {
-            let collation = collection_index
-                .columns
-                .get(*col_idx)
-                .and_then(|c| c.collation);
+        .map(|(col_idx, order, nulls, explicit_collation)| {
+            let collation = (*explicit_collation).or_else(|| {
+                collection_index
+                    .columns
+                    .get(*col_idx)
+                    .and_then(|c| c.collation)
+            });
             (*order, collation, *nulls)
         })
         .try_collect()
@@ -875,7 +877,7 @@ fn emit_compound_order_by(
         if let Some((sort_key_idx, _)) = order_by
             .iter()
             .enumerate()
-            .find(|(_, (ob_col, _, _))| *ob_col == col_idx)
+            .find(|(_, (ob_col, _, _, _))| *ob_col == col_idx)
         {
             // This result column is also a sort key - deduplicate
             remappings.push((sort_key_idx, true));
@@ -892,7 +894,7 @@ fn emit_compound_order_by(
     let mut comparators: crate::alloc::Vec<Option<crate::vdbe::insn::SortComparatorType>> =
         order_by
             .iter()
-            .map(|(col_idx, _, _)| {
+            .map(|(col_idx, _, _, _)| {
                 program.result_columns.get(*col_idx).and_then(|rc| {
                     custom_type_comparator(
                         &rc.expr,
@@ -945,7 +947,7 @@ fn emit_compound_order_by(
     // Build sorter record: [sort_keys..., sequence, non-dedup result cols...]
     let sorter_regs = program.alloc_registers(sorter_column_count);
     // First emit sort keys
-    for (sort_key_idx, (col_idx, _, _)) in order_by.iter().enumerate() {
+    for (sort_key_idx, (col_idx, _, _, _)) in order_by.iter().enumerate() {
         program.emit_insn(Insn::Copy {
             src_reg: read_regs + col_idx,
             dst_reg: sorter_regs + sort_key_idx,
