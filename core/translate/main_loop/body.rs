@@ -1,3 +1,5 @@
+use crate::function::{Func, FuncCtx, ScalarFunc};
+use crate::schema::{SCHEMA_TABLE_NAME, TURSO_INTERNAL_PREFIX};
 use crate::translate::plan::SimpleAggregate;
 use crate::translate::{
     aggregation::emit_collseq_if_needed,
@@ -122,6 +124,66 @@ impl<'prog, 'ctx, 'plan> LoopBody<'prog, 'ctx, 'plan> {
             self.select_emit_target(),
         )
     }
+}
+
+/// Emit a filter for user-visible sqlite_schema/sqlite_master introspection so
+/// Turso-owned internal objects remain persisted and usable internally, but do
+/// not appear in ordinary schema scans.
+fn emit_turso_internal_schema_row_filter(
+    program: &mut ProgramBuilder,
+    plan: &SelectPlan,
+    label_next_row: Option<BranchOffset>,
+) {
+    let Some(label_next_row) = label_next_row else {
+        return;
+    };
+    if !matches!(plan.query_destination, QueryDestination::ResultRows) {
+        return;
+    }
+    if plan.joined_tables().len() != 1 {
+        return;
+    }
+
+    let table = &plan.joined_tables()[0];
+    if table.database_id != crate::MAIN_DB_ID
+        || !table
+            .table
+            .get_name()
+            .eq_ignore_ascii_case(SCHEMA_TABLE_NAME)
+    {
+        return;
+    }
+    if !matches!(table.op, Operation::Scan(_)) {
+        return;
+    }
+
+    let cursor_id = program.resolve_cursor_id(&CursorKey::table(table.internal_id));
+    let args_reg = program.alloc_registers(2);
+    let pattern_reg = args_reg;
+    let name_reg = args_reg + 1;
+    let like_result_reg = program.alloc_register();
+
+    // sqlite_schema column 1 is `name`. The LIKE Function instruction expects
+    // arguments as pattern first, value second.
+    program.emit_insn(Insn::String8 {
+        value: format!("{TURSO_INTERNAL_PREFIX}%"),
+        dest: pattern_reg,
+    });
+    program.emit_column_or_rowid(cursor_id, 1, name_reg);
+    program.emit_insn(Insn::Function {
+        constant_mask: 1,
+        start_reg: args_reg,
+        dest: like_result_reg,
+        func: FuncCtx {
+            func: Func::Scalar(ScalarFunc::Like),
+            arg_count: 2,
+        },
+    });
+    program.emit_insn(Insn::If {
+        reg: like_result_reg,
+        target_pc: label_next_row,
+        jump_if_null: false,
+    });
 }
 
 /// This is a helper function for inner_loop_emit,
@@ -423,6 +485,8 @@ fn emit_loop_source<'a>(
                 .and_then(|j| t_ctx.labels_main_loop.get(j.original_idx))
                 .map(|l| l.next)
                 .or(t_ctx.label_main_loop_end);
+
+            emit_turso_internal_schema_row_filter(program, plan, offset_jump_to);
 
             emit_select_result(
                 program,
