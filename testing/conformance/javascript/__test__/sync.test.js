@@ -573,6 +573,36 @@ test.serial("Statement.all() [statement safe integers]", async (t) => {
 });
 
 // ==========================================================================
+// Big integers
+//
+// Coverage for the area around tursodatabase/turso#7556. Integers outside the
+// JS safe-integer range (notably i64::MAX = 9223372036854775807, the value
+// Turso's internal sequence metadata stores) must round-trip losslessly when
+// safe integers are enabled. The default number mode is intentionally lossy
+// above 2^53, matching better-sqlite3.
+// ==========================================================================
+
+test.serial("Big integers [round-trip with safe integers]", async (t) => {
+  const db = t.context.db;
+  db.exec("DROP TABLE IF EXISTS bigints");
+  db.exec("CREATE TABLE bigints (id INTEGER PRIMARY KEY, v INTEGER)");
+
+  const values = [
+    [1, 9223372036854775807n], // i64::MAX
+    [2, -9223372036854775808n], // i64::MIN
+    [3, 9007199254740993n], // 2^53 + 1, first integer Number cannot represent
+  ];
+  const insert = db.prepare("INSERT INTO bigints (id, v) VALUES (?, ?)");
+  for (const [id, v] of values) {
+    insert.run(id, v);
+  }
+
+  const stmt = db.prepare("SELECT v FROM bigints ORDER BY id");
+  stmt.safeIntegers();
+  t.deepEqual(stmt.pluck().all(), values.map(([, v]) => v));
+});
+
+// ==========================================================================
 // Statement.raw()
 // ==========================================================================
 
