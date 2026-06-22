@@ -15616,6 +15616,52 @@ fn test_checkpoint_after_create_and_drop_sequence() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+/// Sequence descriptor bounds are stored as text in backing tables so generic
+/// JavaScript clients can introspect these internal tables without receiving
+/// i64::MAX as an unsafe number. Runtime nextval/autoincrement behavior still
+/// uses parsed integer descriptors.
+#[test]
+fn test_internal_sequence_descriptor_bounds_are_text_for_js_introspection() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE autoinc_js(id INTEGER PRIMARY KEY AUTOINCREMENT)")
+        .unwrap();
+    conn.execute("INSERT INTO autoinc_js DEFAULT VALUES").unwrap();
+    conn.execute("CREATE SEQUENCE user_js_seq").unwrap();
+
+    let autoinc_rows = get_rows(
+        &conn,
+        "SELECT typeof(start), start, typeof(inc), inc, typeof(min), min, typeof(max), max \
+         FROM __turso_internal_seq___turso_internal_autoincrement_autoinc_js",
+    );
+    assert_eq!(autoinc_rows.len(), 1);
+    assert_eq!(autoinc_rows[0][0].to_string(), "text");
+    assert_eq!(autoinc_rows[0][1].to_string(), "1");
+    assert_eq!(autoinc_rows[0][2].to_string(), "text");
+    assert_eq!(autoinc_rows[0][3].to_string(), "1");
+    assert_eq!(autoinc_rows[0][4].to_string(), "text");
+    assert_eq!(autoinc_rows[0][5].to_string(), "1");
+    assert_eq!(autoinc_rows[0][6].to_string(), "text");
+    assert_eq!(autoinc_rows[0][7].to_string(), i64::MAX.to_string());
+    assert!(
+        autoinc_rows[0][7].as_int().is_none(),
+        "default AUTOINCREMENT max must not be exposed as an INTEGER value"
+    );
+
+    let user_seq_rows = get_rows(
+        &conn,
+        "SELECT typeof(max), max FROM __turso_internal_seq_user_js_seq",
+    );
+    assert_eq!(user_seq_rows.len(), 1);
+    assert_eq!(user_seq_rows[0][0].to_string(), "text");
+    assert_eq!(user_seq_rows[0][1].to_string(), i64::MAX.to_string());
+    assert!(user_seq_rows[0][1].as_int().is_none());
+
+    let nextval = get_rows(&conn, "SELECT nextval('user_js_seq')");
+    assert_eq!(nextval[0][0].as_int().unwrap(), 1);
+}
+
 /// Descending sequence compaction must keep the most-advanced (lowest) value.
 ///
 /// A descending sequence (INCREMENT BY -1, START WITH 100) produces values 100, 99, 98...
@@ -15632,6 +15678,21 @@ fn test_descending_sequence_compaction() {
         .unwrap();
     conn.execute("CREATE SEQUENCE desc_seq START WITH 100 INCREMENT BY -1 MINVALUE 1 MAXVALUE 100")
         .unwrap();
+
+    let descriptor = get_rows(
+        &conn,
+        "SELECT typeof(start), start, typeof(inc), inc, typeof(min), min, typeof(max), max \
+         FROM __turso_internal_seq_desc_seq",
+    );
+    assert_eq!(descriptor.len(), 1);
+    assert_eq!(descriptor[0][0].to_string(), "text");
+    assert_eq!(descriptor[0][1].to_string(), "100");
+    assert_eq!(descriptor[0][2].to_string(), "text");
+    assert_eq!(descriptor[0][3].to_string(), "-1");
+    assert_eq!(descriptor[0][4].to_string(), "text");
+    assert_eq!(descriptor[0][5].to_string(), "1");
+    assert_eq!(descriptor[0][6].to_string(), "text");
+    assert_eq!(descriptor[0][7].to_string(), "100");
 
     // Call nextval 5 times across separate transactions.
     // Descending: produces 100, 99, 98, 97, 96

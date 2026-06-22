@@ -3548,7 +3548,11 @@ impl Connection {
         use crate::types::IOResult;
         if stmt.is_none() {
             let escaped = backing_table_name.replace('"', "\"\"");
-            let sql = format!("SELECT start, inc, min, max, cycle FROM \"{escaped}\" LIMIT 1");
+            let sql = format!(
+                "SELECT CAST(start AS INTEGER), CAST(inc AS INTEGER), \
+                 CAST(min AS INTEGER), CAST(max AS INTEGER), cycle \
+                 FROM \"{escaped}\" LIMIT 1"
+            );
             let prepared = self.prepare_internal(sql).map_err(|err| {
                 LimboError::Corrupt(format!(
                     "internal sequence backing table \"{backing_table_name}\" for sequence \

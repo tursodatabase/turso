@@ -662,9 +662,12 @@ pub fn allow_user_dml(table_name: &str) -> bool {
 // Every sequence — user-created (CREATE SEQUENCE) and implicit
 // (AUTOINCREMENT) — is backed by a B-tree table
 // `__turso_internal_seq_<name>` with schema (value INTEGER PRIMARY KEY,
-// is_called, start, inc, min, max, cycle). The runtime watermark IS the
-// disk state: there is no in-memory counter. Every nextval/setval reads
-// the current watermark row inside the executing transaction, computes
+// is_called, start TEXT, inc TEXT, min TEXT, max TEXT, cycle). Descriptor
+// bounds are text to keep i64::MAX/i64::MIN from surfacing as unsafe numbers
+// through JavaScript clients that introspect these internal tables; runtime
+// arithmetic uses the parsed in-memory `Sequence` descriptor. The runtime
+// watermark IS the disk state: there is no in-memory counter. Every
+// nextval/setval reads the current watermark row inside the executing transaction, computes
 // the new value, and writes it back — nextval INSERTs a new row;
 // setval DELETEs every row then INSERTs one at the requested value.
 //
@@ -1996,16 +1999,14 @@ impl Schema {
     }
 
     fn read_sequence_metadata(record: &ImmutableRecord) -> Option<SequenceMetadata> {
-        let mut values = [0i64; 6];
-        for (i, value) in values.iter_mut().enumerate() {
-            match record.get_value(i + 1) {
-                Ok(ValueRef::Numeric(crate::numeric::Numeric::Integer(v))) => {
-                    *value = v;
-                }
-                _ => return None,
-            }
-        }
-        let [_is_called, start, increment, min, max, cycle] = values;
+        let start = Self::read_sequence_i64_metadata_value(record, 2)?;
+        let increment = Self::read_sequence_i64_metadata_value(record, 3)?;
+        let min = Self::read_sequence_i64_metadata_value(record, 4)?;
+        let max = Self::read_sequence_i64_metadata_value(record, 5)?;
+        let cycle = match record.get_value(6) {
+            Ok(ValueRef::Numeric(crate::numeric::Numeric::Integer(v))) => v,
+            _ => return None,
+        };
         Some(SequenceMetadata {
             start,
             increment,
@@ -2013,6 +2014,14 @@ impl Schema {
             max,
             cycle: cycle != 0,
         })
+    }
+
+    fn read_sequence_i64_metadata_value(record: &ImmutableRecord, idx: usize) -> Option<i64> {
+        match record.get_value(idx).ok()? {
+            ValueRef::Numeric(crate::numeric::Numeric::Integer(v)) => Some(v),
+            ValueRef::Text(text) => text.as_str().parse::<i64>().ok(),
+            _ => None,
+        }
     }
 
     fn install_sequence_descriptor(
