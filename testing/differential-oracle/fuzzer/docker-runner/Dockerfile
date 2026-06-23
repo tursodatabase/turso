@@ -17,7 +17,7 @@ COPY bindings ./bindings/
 COPY extensions ./extensions/
 COPY macros ./macros/
 COPY sync ./sync
-COPY parser ./parser/
+COPY sqlite/parser ./sqlite/parser/
 COPY perf/encryption ./perf/encryption
 COPY perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY perf/throughput/turso ./perf/throughput/turso
@@ -42,7 +42,7 @@ RUN cargo chef cook --bin differential_fuzzer --recipe-path recipe.json
 COPY --from=planner /app/core ./core/
 COPY --from=planner /app/extensions ./extensions/
 COPY --from=planner /app/macros ./macros/
-COPY --from=planner /app/parser ./parser/
+COPY --from=planner /app/sqlite/parser ./sqlite/parser/
 COPY --from=planner /app/perf/encryption ./perf/encryption
 COPY --from=planner /app/perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso

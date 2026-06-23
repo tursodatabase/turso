@@ -24,7 +24,8 @@ scripts/diff.sh "SQL" [label]  # compare sqlite3 vs tursodb output
 ```
 limbo/
 ├── core/           # Database engine (translate/, storage/, vdbe/, io/, mvcc/)
-├── parser/         # SQL parser (lexer, AST, grammar)
+├── sqlite/
+│   └── parser/     # SQL parser (lexer, AST, grammar)
 ├── cli/            # tursodb CLI (REPL, MCP server, sync server)
 ├── bindings/       # Python, JS, Java, .NET, Go, Rust
 ├── extensions/     # crypto, regexp, csv, fuzzy, ipaddr, percentile
@@ -42,7 +43,7 @@ limbo/
 | SQL compilation | `core/translate/` | AST → bytecode, optimizer in `optimizer/` |
 | B-tree/pages | `core/storage/btree.rs` | 10k LOC, SQLite-compatible format |
 | WAL/durability | `core/storage/wal.rs` | Write-ahead log, checkpointing |
-| SQL parsing | `parser/src/parser.rs` | 11k LOC recursive descent |
+| SQL parsing | `sqlite/parser/src/parser.rs` | 11k LOC recursive descent |
 | Add extension | `extensions/core/` | ExtensionApi, scalar/aggregate/vtab traits |
 | Add binding | `bindings/` | PyO3, NAPI, JNI, FRB, CGO patterns |
 | Deterministic tests | `testing/simulator/` | Fault injection, differential testing |
