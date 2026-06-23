@@ -423,6 +423,19 @@ impl TursoRwLock {
     }
 
     #[inline]
+    /// The embedded read-mark value, but only if a reader currently holds this slot
+    /// (otherwise the value is stale from a past holder). Lock-free single-load; used to
+    /// find the minimum frame any active reader is pinned at without mutating the slot.
+    pub fn held_value(&self) -> Option<u32> {
+        let cur = self.0.load(Ordering::Acquire);
+        if Self::has_readers(cur) {
+            Some((cur >> Self::VALUE_SHIFT) as u32)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     /// Set the embedded value while holding the write lock.
     pub fn set_value_exclusive(&self, v: u32) {
         // Must be called only while WRITER bit is set
@@ -545,6 +558,9 @@ trait WalCoordination: Debug + Send + Sync {
 
     /// Compute the highest frame a checkpoint may safely backfill and refresh read marks.
     fn determine_max_safe_checkpoint_frame(&self, max_frame: u64) -> u64;
+
+    /// Lowest read-mark frame any reader is currently pinned at, or `None` if none. Read-only.
+    fn min_pinned_read_frame(&self) -> Option<u64>;
 
     /// Begin a restart while the caller holds the required external checkpoint/write guards.
     fn begin_restart(&self, io: &dyn IO) -> Result<WalSnapshot>;
@@ -732,7 +748,23 @@ pub trait Wal: Debug + Send + Sync {
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_checkpoint_seq(&self) -> u32;
     fn get_max_frame(&self) -> u64;
+    /// This connection's frozen `(checkpoint_seq, max_frame)`: for a reader it is the WAL read
+    /// mark installed at `begin_read_tx`; for a writer it is the position after its last commit.
+    /// Used by MVCC to gate btree reads on physical reachability (a materialization at WAL
+    /// position `P` is reachable iff `P <= this`, lexicographically). See `RootEntry`.
+    fn connection_wal_pos(&self) -> (u32, u64);
+    /// The lowest WAL frame any active reader is currently pinned at (across the read-mark
+    /// slots), or `None` if no reader holds a slot. This is the authoritative set of pinned
+    /// readers — it includes a reader that has called `begin_read_tx` but not yet published an
+    /// MVCC transaction — so the MVCC checkpoint uses it as the version-store GC floor (a row
+    /// whose btree page was materialized past a pinned reader's frame is invisible in that
+    /// reader's snapshot, so its version-store copy must be retained).
+    fn min_pinned_read_frame(&self) -> Option<u64>;
     fn get_min_frame(&self) -> u64;
+    /// The shared backfill boundary: WAL frames at or below this are durably copied into the DB
+    /// file, so a version materialized there is reachable by EVERY snapshot (including a db-file
+    /// reader pinned at the boundary). Used as the MVCC off-lock GC floor.
+    fn backfill_frame(&self) -> u64;
     fn rollback(&self, rollback_to: Option<RollbackTo>);
     fn abort_checkpoint(&self);
     fn get_last_checksum(&self) -> (u32, u32);
@@ -820,6 +852,22 @@ impl InProcessWalCoordination {
 
     fn read_mark_value(&self, slot: usize) -> u32 {
         self.shared.read().runtime.read_locks[slot].get_value()
+    }
+
+    /// Lowest read-mark frame across slots currently held by a reader (1..5; slot 0 is the
+    /// db-file read mark), or `None` if no reader holds a slot. Read-only / lock-free.
+    fn min_pinned_read_frame_inner(&self) -> Option<u64> {
+        let shared = self.shared.read();
+        let mut min: Option<u64> = None;
+        for slot in 1..5 {
+            if let Some(v) = shared.runtime.read_locks[slot].held_value() {
+                if v != READMARK_NOT_USED {
+                    let f = v as u64;
+                    min = Some(min.map_or(f, |m: u64| m.min(f)));
+                }
+            }
+        }
+        min
     }
 
     fn set_read_mark_value_exclusive(&self, slot: usize, value: u32) {
@@ -1119,6 +1167,10 @@ impl WalCoordination for InProcessWalCoordination {
             }
         }
         max_safe_frame
+    }
+
+    fn min_pinned_read_frame(&self) -> Option<u64> {
+        self.min_pinned_read_frame_inner()
     }
 
     fn begin_restart(&self, io: &dyn IO) -> Result<WalSnapshot> {
@@ -2168,6 +2220,17 @@ impl WalCoordination for ShmWalCoordination {
         match self.authority.min_active_reader_frame() {
             Some(shared_min) => max_safe_frame.min(shared_min),
             None => max_safe_frame,
+        }
+    }
+
+    fn min_pinned_read_frame(&self) -> Option<u64> {
+        // Combine this process's local read marks with cross-process readers tracked by the
+        // shared authority.
+        let local = self.fallback.min_pinned_read_frame_inner();
+        match (local, self.authority.min_active_reader_frame()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
         }
     }
 
@@ -3893,8 +3956,23 @@ impl Wal for WalFile {
         self.max_frame.load(Ordering::Acquire)
     }
 
+    fn connection_wal_pos(&self) -> (u32, u64) {
+        (
+            self.checkpoint_seq.load(Ordering::Acquire),
+            self.max_frame.load(Ordering::Acquire),
+        )
+    }
+
+    fn min_pinned_read_frame(&self) -> Option<u64> {
+        self.coordination.min_pinned_read_frame()
+    }
+
     fn get_min_frame(&self) -> u64 {
         self.min_frame.load(Ordering::Acquire)
+    }
+
+    fn backfill_frame(&self) -> u64 {
+        self.load_coordination_snapshot().nbackfills
     }
 
     fn get_last_checksum(&self) -> (u32, u32) {
