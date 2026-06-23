@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::alloc::TursoSliceExt;
 
 use rustc_hash::FxHashMap as HashMap;
-use turso_parser::ast::{self, SortOrder, SubqueryType};
+use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
 
 use crate::{
     alloc::TursoIteratorExt,
@@ -17,7 +17,8 @@ use crate::{
             emit_program_for_select_with_resolver, emit_query,
         },
         expr::{
-            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr_mut, WalkControl,
+            compare_affinity, expr_references_subquery_id, get_expr_affinity_info, unwrap_parens,
+            walk_expr_mut, WalkControl,
         },
         optimizer::optimize_select_plan,
         plan::{
@@ -1990,13 +1991,40 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         .group_by
         .as_ref()
         .is_some_and(|group_by| !group_by.exprs.is_empty());
+    let aggregate_step_subquery_ids: Vec<TableInternalId> = plan
+        .non_from_clause_subqueries
+        .iter()
+        .filter_map(|subquery| {
+            aggregate_step_references_subquery(&plan.aggregates, subquery.internal_id)
+                .then_some(subquery.internal_id)
+        })
+        .collect();
 
     for subquery in plan.non_from_clause_subqueries.iter_mut() {
+        let referenced_by_aggregate_step =
+            aggregate_step_subquery_ids.contains(&subquery.internal_id);
         subquery.eval_phase = match subquery.origin {
-            SubqueryOrigin::SelectHaving | SubqueryOrigin::SelectOrderBy if has_grouped_output => {
+            SubqueryOrigin::SelectHaving | SubqueryOrigin::SelectOrderBy
+                if has_grouped_output && !referenced_by_aggregate_step =>
+            {
                 SubqueryEvalPhase::GroupedOutput
             }
             _ => subquery.origin.phase_floor(),
         };
     }
+}
+
+fn aggregate_step_references_subquery(
+    aggregates: &[Aggregate],
+    subquery_id: TableInternalId,
+) -> bool {
+    aggregates.iter().any(|agg| {
+        agg.args
+            .iter()
+            .any(|arg| expr_references_subquery_id(arg, subquery_id))
+            || agg
+                .filter_expr
+                .as_ref()
+                .is_some_and(|expr| expr_references_subquery_id(expr, subquery_id))
+    })
 }

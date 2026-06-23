@@ -366,7 +366,11 @@ fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Resu
                 }
                 Ok(WalkControl::SkipChildren)
             }
-            ast::Expr::SubqueryResult { subquery_id, .. } => {
+            ast::Expr::SubqueryResult {
+                subquery_id,
+                query_type,
+                ..
+            } => {
                 let is_correlated = plan
                     .non_from_clause_subqueries
                     .iter()
@@ -374,8 +378,13 @@ fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Resu
                     .is_some_and(|s| s.correlated);
                 if is_correlated && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr)) {
                     leaf_columns.push(expr.clone());
+                    return Ok(WalkControl::SkipChildren);
                 }
-                Ok(WalkControl::SkipChildren)
+                if matches!(query_type, ast::SubqueryType::In { .. }) {
+                    Ok(WalkControl::Continue)
+                } else {
+                    Ok(WalkControl::SkipChildren)
+                }
             }
             _ => Ok(WalkControl::Continue),
         }
