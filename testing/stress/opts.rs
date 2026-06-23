@@ -73,6 +73,9 @@ pub struct Opts {
     #[clap(long, help = "Reference DB to take schema and initial state")]
     pub db_ref: Option<PathBuf>,
 
+    #[clap(long, help = "Path to a YAML workload profile")]
+    pub workload: Option<PathBuf>,
+
     #[clap(
         long,
         help = "If true, this will run a modified minimal version of turso_stress that ensure the DB is deterministic (no sources of randomness that are not controlled by the seed)"

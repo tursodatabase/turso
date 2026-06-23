@@ -24,10 +24,13 @@ path = "main.rs"
 default = []
 
 [dependencies]
+chrono = { workspace = true, features = ["std"] }
 clap = { workspace = true, features = ["derive"] }
 hex = { workspace = true }
 indicatif = { workspace = true }
 rand = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_yaml = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing-appender = { workspace = true }
@@ -42,4 +45,3 @@ serde_json = { workspace = true }
 
 [target.'cfg(shuttle)'.dependencies]
 shuttle = { workspace = true }
-
