@@ -19,7 +19,6 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
   CARGO_TERM_COLOR: always
-  CODSPEED_STICKY_DISK_KEY: ${{ github.repository }}-codspeed-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   discover:
@@ -88,12 +87,6 @@ jobs:
         with:
           tool: cargo-codspeed
 
-      - name: Mount benchmark sticky disk
-        uses: useblacksmith/stickydisk@v1
-        with:
-          key: ${{ env.CODSPEED_STICKY_DISK_KEY }}-${{ env.TOOLCHAIN_LABEL }}
-          path: target/codspeed
-
       - name: Generate graph-queries DBs
         run: |
           python3 perf/graph-queries/generate_seed.py | sqlite3 perf/graph-queries/graph-queries.db
@@ -110,12 +103,22 @@ jobs:
           set -euo pipefail
 
           bench_args=$(jq -r '.[] | "--bench " + .' <<< "$BENCHMARKS_JSON" | tr '\n' ' ')
-          cargo +${{ env.TOOLCHAIN_VERSION }} codspeed build $bench_args --features codspeed
+          cargo +${{ env.TOOLCHAIN_VERSION }} codspeed build -m simulation $bench_args --features codspeed
+
+      - name: Upload benchmark binaries
+        id: upload_artifact
+        if: steps.build_benchmarks.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: codspeed-benchmarks-${{ env.TOOLCHAIN_LABEL }}
+          path: target/codspeed
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Record build status
         id: build_status
         if: always()
-        run: echo "built=${{ steps.build_benchmarks.outcome == 'success' }}" >> "$GITHUB_OUTPUT"
+        run: echo "built=${{ steps.build_benchmarks.outcome == 'success' && steps.upload_artifact.outcome == 'success' }}" >> "$GITHUB_OUTPUT"
 
   build-nightly:
     name: "Build benchmarks (nightly)"
@@ -153,12 +156,6 @@ jobs:
         with:
           tool: cargo-codspeed
 
-      - name: Mount benchmark sticky disk
-        uses: useblacksmith/stickydisk@v1
-        with:
-          key: ${{ env.CODSPEED_STICKY_DISK_KEY }}-${{ env.TOOLCHAIN_LABEL }}
-          path: target/codspeed
-
       - name: Generate graph-queries DBs
         run: |
           python3 perf/graph-queries/generate_seed.py | sqlite3 perf/graph-queries/graph-queries.db
@@ -175,12 +172,22 @@ jobs:
           set -euo pipefail
 
           bench_args=$(jq -r '.[] | "--bench " + .' <<< "$BENCHMARKS_JSON" | tr '\n' ' ')
-          cargo +${{ env.TOOLCHAIN_VERSION }} codspeed build $bench_args --features codspeed
+          cargo +${{ env.TOOLCHAIN_VERSION }} codspeed build -m simulation $bench_args --features codspeed
+
+      - name: Upload benchmark binaries
+        id: upload_artifact
+        if: steps.build_benchmarks.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: codspeed-benchmarks-${{ env.TOOLCHAIN_LABEL }}
+          path: target/codspeed
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Record build status
         id: build_status
         if: always()
-        run: echo "built=${{ steps.build_benchmarks.outcome == 'success' }}" >> "$GITHUB_OUTPUT"
+        run: echo "built=${{ steps.build_benchmarks.outcome == 'success' && steps.upload_artifact.outcome == 'success' }}" >> "$GITHUB_OUTPUT"
 
   benchmarks-stable:
     name: "Run benchmark (stable, ${{ matrix.benchmark }})"
@@ -213,10 +220,10 @@ jobs:
         with:
           tool: cargo-codspeed
 
-      - name: Mount benchmark sticky disk
-        uses: useblacksmith/stickydisk@v1
+      - name: Download benchmark binaries
+        uses: actions/download-artifact@v4
         with:
-          key: ${{ env.CODSPEED_STICKY_DISK_KEY }}-${{ env.TOOLCHAIN_LABEL }}
+          name: codspeed-benchmarks-${{ env.TOOLCHAIN_LABEL }}
           path: target/codspeed
 
       - name: Restore binary permissions
@@ -268,10 +275,10 @@ jobs:
         with:
           tool: cargo-codspeed
 
-      - name: Mount benchmark sticky disk
-        uses: useblacksmith/stickydisk@v1
+      - name: Download benchmark binaries
+        uses: actions/download-artifact@v4
         with:
-          key: ${{ env.CODSPEED_STICKY_DISK_KEY }}-${{ env.TOOLCHAIN_LABEL }}
+          name: codspeed-benchmarks-${{ env.TOOLCHAIN_LABEL }}
           path: target/codspeed
 
       - name: Restore binary permissions
@@ -291,27 +298,6 @@ jobs:
         with:
           mode: simulation
           run: cargo +${{ env.TOOLCHAIN_VERSION }} codspeed run --bench ${{ matrix.benchmark }}
-
-  cleanup:
-    name: "Delete benchmark sticky disk (${{ matrix.toolchain }})"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    needs:
-      - build-stable
-      - build-nightly
-      - benchmarks-stable
-      - benchmarks-nightly
-    if: always()
-    strategy:
-      fail-fast: false
-      matrix:
-        toolchain:
-          - stable
-          - nightly
-    steps:
-      - name: Delete benchmark sticky disk
-        uses: useblacksmith/stickydisk-delete@v1
-        with:
-          delete-key: ${{ env.CODSPEED_STICKY_DISK_KEY }}-${{ matrix.toolchain }}
 
   # tpc-h:
   #   runs-on: ubuntu-latest
