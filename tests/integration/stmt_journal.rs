@@ -97,6 +97,18 @@ fn insert_or_ignore_multi_row_unique(tmp_db: TempDatabase) -> anyhow::Result<()>
     Ok(())
 }
 
+/// UPSERT DO UPDATE can run an UPDATE arm after the INSERT conflict and then
+/// fail, so it keeps statement rollback enabled.
+#[turso_macros::test(init_sql = "CREATE TABLE t (a UNIQUE, b);")]
+fn insert_upsert_do_update_needs_stmt_journal(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    assert!(needs_stmt_journal(
+        &conn,
+        "INSERT INTO t VALUES (1, 2) ON CONFLICT(a) DO UPDATE SET b = excluded.b"
+    ));
+    Ok(())
+}
+
 /// INSERT OR REPLACE is multi-write (REPLACE may delete conflicting rows).
 /// But may_abort=false (conflict resolution is not OE_Abort).
 /// needs_stmt = true && false = false.

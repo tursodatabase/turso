@@ -1883,6 +1883,190 @@ fn test_commit_phase_non_replace_index_integrity(tmp_db: TempDatabase) -> anyhow
     Ok(())
 }
 
+/// UPSERT DO UPDATE always uses ABORT semantics for errors raised by the
+/// update arm. A statement-level OR FAIL must not preserve partial index
+/// maintenance from the failed DO UPDATE.
+#[turso_macros::test]
+fn test_upsert_do_update_failure_rolls_back_index_maintenance(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    let label = "upsert_do_update_failure_rolls_back_index_maintenance";
+    let limbo_db = TempDatabase::builder()
+        .with_db_name(format!("{label}.db"))
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    let setup = "\
+        CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE, b INT, c INT UNIQUE);\
+        CREATE INDEX idx_b ON t(b);\
+        INSERT INTO t VALUES(1,1,10,10);\
+        INSERT INTO t VALUES(2,2,20,20);\
+        BEGIN;\
+    ";
+    limbo_conn.execute(setup).unwrap();
+    sqlite_conn.execute_batch(setup).unwrap();
+
+    let failing_upsert = "\
+        INSERT OR FAIL INTO t VALUES(3,1,30,30)\
+        ON CONFLICT(u) DO UPDATE SET b=99,c=20;\
+    ";
+    assert!(limbo_try_exec(&limbo_conn, failing_upsert).is_err());
+    assert!(sqlite_try_exec(&sqlite_conn, failing_upsert).is_err());
+
+    if let Some(e) = compare_tables(
+        label,
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT id,u,b,c FROM t ORDER BY id",
+    ) {
+        panic!("{e}");
+    }
+
+    let limbo_idx_rows = limbo_exec_rows(
+        &limbo_conn,
+        "SELECT id,u,b,c FROM t INDEXED BY idx_b ORDER BY b",
+    );
+    let sqlite_idx_rows = sqlite_exec_rows(
+        &sqlite_conn,
+        "SELECT id,u,b,c FROM t INDEXED BY idx_b ORDER BY b",
+    );
+    assert_eq!(
+        limbo_idx_rows, sqlite_idx_rows,
+        "[{label}] idx_b scan diverged after failed UPSERT DO UPDATE"
+    );
+
+    limbo_conn.execute("COMMIT").unwrap();
+    sqlite_conn.execute_batch("COMMIT").unwrap();
+
+    let db_path = limbo_db.path.clone();
+    drop(limbo_conn);
+    drop(limbo_db);
+    let ic = sqlite_integrity_check(&db_path);
+    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_upsert_do_update_expression_index_error_keeps_indexes_intact(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    let label = "upsert_do_update_expression_index_error_keeps_indexes_intact";
+    let limbo_db = TempDatabase::builder()
+        .with_db_name(format!("{label}.db"))
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    let setup = "\
+        CREATE TABLE t(id INTEGER PRIMARY KEY, b INT);\
+        CREATE INDEX idx ON t(\
+            CASE \
+                WHEN b=2 THEN 'x' LIKE 'x' ESCAPE 'yy' \
+                ELSE b \
+            END\
+        );\
+        INSERT INTO t VALUES(1,1);\
+        BEGIN;\
+    ";
+    limbo_conn.execute(setup).unwrap();
+    sqlite_conn.execute_batch(setup).unwrap();
+
+    let failing_upsert = "\
+        INSERT OR FAIL INTO t(id,b) VALUES(1,2)\
+        ON CONFLICT(id) DO UPDATE SET b=excluded.b;\
+    ";
+    assert!(limbo_try_exec(&limbo_conn, failing_upsert).is_err());
+    assert!(sqlite_try_exec(&sqlite_conn, failing_upsert).is_err());
+
+    if let Some(e) = compare_tables(label, &sqlite_conn, &limbo_conn, "SELECT id,b FROM t") {
+        panic!("{e}");
+    }
+
+    let limbo_idx_rows = limbo_exec_rows(&limbo_conn, "SELECT id,b FROM t INDEXED BY idx");
+    let sqlite_idx_rows = sqlite_exec_rows(&sqlite_conn, "SELECT id,b FROM t INDEXED BY idx");
+    assert_eq!(
+        limbo_idx_rows, sqlite_idx_rows,
+        "[{label}] expression index scan diverged after failed UPSERT DO UPDATE"
+    );
+
+    limbo_conn.execute("COMMIT").unwrap();
+    sqlite_conn.execute_batch("COMMIT").unwrap();
+
+    let db_path = limbo_db.path.clone();
+    drop(limbo_conn);
+    drop(limbo_db);
+    let ic = sqlite_integrity_check(&db_path);
+    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_upsert_do_update_skips_unique_check_when_new_partial_predicate_false(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    let label = "upsert_do_update_skips_unique_check_when_new_partial_predicate_false";
+    let limbo_db = TempDatabase::builder()
+        .with_db_name(format!("{label}.db"))
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = "\
+        CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, k TEXT, c0 INT, c1 INT);\
+        CREATE UNIQUE INDEX idx_k_active ON t(k) WHERE c0 <= 11;\
+        INSERT INTO t(id,k,c0,c1) VALUES(1,'kk',4,0);\
+        INSERT INTO t(id,k,c0,c1) VALUES(2,'dd',4,0);\
+    ";
+    limbo_conn.execute(setup).unwrap();
+    sqlite_conn.execute_batch(setup).unwrap();
+
+    let upsert = "\
+        INSERT INTO t(k,c0,c1) VALUES('kk',4,0)\
+        ON CONFLICT DO UPDATE SET c0 = 14, k = 'dd', c1 = 6;\
+    ";
+    limbo_conn.execute(upsert).unwrap();
+    sqlite_conn.execute_batch(upsert).unwrap();
+
+    if let Some(e) = compare_tables(
+        label,
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT id,k,c0,c1 FROM t ORDER BY id",
+    ) {
+        panic!("{e}");
+    }
+
+    let limbo_idx_rows = limbo_exec_rows(
+        &limbo_conn,
+        "SELECT id,k,c0,c1 FROM t INDEXED BY idx_k_active WHERE c0 <= 11 ORDER BY id",
+    );
+    let sqlite_idx_rows = sqlite_exec_rows(
+        &sqlite_conn,
+        "SELECT id,k,c0,c1 FROM t INDEXED BY idx_k_active WHERE c0 <= 11 ORDER BY id",
+    );
+    assert_eq!(
+        limbo_idx_rows, sqlite_idx_rows,
+        "[{label}] partial index scan diverged after UPSERT DO UPDATE"
+    );
+
+    let db_path = limbo_db.path.clone();
+    drop(limbo_conn);
+    drop(limbo_db);
+    let ic = sqlite_integrity_check(&db_path);
+    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+
+    Ok(())
+}
+
 /// Test that partial indexes with REPLACE don't corrupt when another index has ABORT.
 /// This specifically tests the three-phase separation: Phase 1 checks the partial index
 /// constraint BEFORE Phase 2/3 mutate any index entries.

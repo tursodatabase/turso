@@ -441,6 +441,9 @@ pub fn translate_insert(
         database_id,
     )?;
     let has_upsert = !upsert_actions.is_empty();
+    let has_upsert_do_update = upsert_actions
+        .iter()
+        .any(|(_, _, upsert)| matches!(&upsert.do_clause, UpsertDo::Set { .. }));
 
     // Set up the program to return result columns if RETURNING is specified
     if !result_columns.is_empty() {
@@ -1186,7 +1189,7 @@ pub fn translate_insert(
             inserting_multiple_rows,
             has_triggers,
             has_fks,
-            has_upsert,
+            has_upsert_do_update,
             btree_table.has_autoincrement,
             notnull_col_exists,
             has_unique,
