@@ -7,13 +7,17 @@ use opts::{Opts, TxMode};
 use rand::rngs::StdRng;
 #[cfg(not(antithesis))]
 use rand::{Rng, SeedableRng};
+use rusqlite::fallible_iterator::{FallibleIterator, IteratorExt};
 #[cfg(shuttle)]
 use shuttle::scheduler::Scheduler;
 use std::collections::HashSet;
+use std::error::Error;
 use std::fs::File;
+use std::future::{poll_fn, Future};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::task::Poll;
 use tokio::sync::Mutex;
 
 type SqlLog = Arc<std::sync::Mutex<BufWriter<File>>>;
@@ -31,7 +35,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use turso::Builder;
+use turso::{Builder, Connection};
+use turso_macros::turso_assert_reachable;
 
 /// Represents a column in a SQLite table
 #[derive(Debug, Clone)]
@@ -424,9 +429,7 @@ fn map_sqlite_type(type_str: &str) -> DataType {
 }
 
 /// Load full schema from SQLite database
-pub fn load_schema(
-    db_path: &Path,
-) -> Result<ArbitrarySchema, Box<dyn std::error::Error + Send + Sync>> {
+pub fn load_schema(db_path: &Path) -> Result<ArbitrarySchema, Box<dyn Error + Send + Sync>> {
     let conn = rusqlite::Connection::open(db_path)?;
 
     // Fetch user tables (ignore sqlite internal tables)
@@ -563,9 +566,7 @@ pub fn spawn_log_level_watcher(reload_handle: LogLevelReloadHandle) {
     });
 }
 
-fn sqlite_integrity_check(
-    db_path: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn sqlite_integrity_check(db_path: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
     turso_macros::turso_assert!(db_path.exists(), "database path must exist", { "path": db_path });
     let conn = rusqlite::Connection::open(db_path)?;
     let mut stmt = conn.prepare_cached("SELECT * FROM pragma_integrity_check;")?;
@@ -588,7 +589,7 @@ fn sqlite_integrity_check(
 }
 
 #[cfg(not(shuttle))]
-fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -598,7 +599,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 #[cfg(shuttle)]
-fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     use shuttle::scheduler::{RandomScheduler, UncontrolledNondeterminismCheckScheduler};
 
     let config = turso_stress::shuttle_config();
@@ -623,7 +624,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn async_main(opts: Opts) -> Result<(), Box<dyn Error + Send + Sync>> {
     #[cfg(antithesis)]
     let global_seed: u64 = {
         if opts.seed.is_some() {
@@ -824,14 +825,10 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
                 }
 
-                let tx = if rng.get_random() % 2 == 0 {
-                    match tx_mode {
-                        TxMode::SQLite => Some("BEGIN;"),
-                        TxMode::Concurrent => Some("BEGIN CONCURRENT;"),
-                    }
-                } else {
-                    None
-                };
+                let tx = (rng.get_random() % 2 == 0).then(|| match tx_mode {
+                    TxMode::Concurrent if rng.get_random() % 2 == 0 => "BEGIN CONCURRENT;",
+                    _ => "BEGIN;",
+                });
 
                 if let Some(tx_stmt) = tx {
                     match conn.execute(tx_stmt, ()).await {
@@ -940,14 +937,14 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                 }
 
                 if tx.is_some() {
-                    let end_tx = if rng.get_random() % 2 == 0 {
-                        "COMMIT;"
+                    let tx_end_result = if rng.get_random() % 2 == 0 {
+                        (commit_with_faults(&mut rng, &mut conn).await, "COMMIT")
                     } else {
-                        "ROLLBACK;"
+                        (conn.execute("ROLLBACK", ()).await.map(Some), "ROLLBACK")
                     };
-                    match conn.execute(end_tx, ()).await {
-                        Ok(_) => log_sql(&sql_log, thread, end_tx, "OK"),
-                        Err(e) => log_sql(&sql_log, thread, end_tx, &format!("ERROR: {e}")),
+                    match tx_end_result {
+                        (Ok(_), sql) => log_sql(&sql_log, thread, sql, "OK"),
+                        (Err(e), sql) => log_sql(&sql_log, thread, sql, &format!("ERROR: {e}")),
                     }
                 }
 
@@ -1028,5 +1025,33 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         sqlite_integrity_check(std::path::Path::new(&db_file))?;
     }
 
+    turso_assert_reachable!("test completed successfully");
+
     Ok(())
+}
+
+/// Returns `None` if the commit was abandoned in-flight.
+async fn commit_with_faults(
+    rng: &mut ThreadRng,
+    conn: &mut Connection,
+) -> turso::connection::Result<Option<u64>> {
+    let mut commit = std::pin::pin!(conn.execute("COMMIT;", ()));
+
+    let mut should_abandon_in_flight_commit = || -> bool { rng.get_random() % 5 != 0 };
+
+    poll_fn(|cx| match commit.as_mut().poll(cx) {
+        Poll::Ready(result) => Poll::Ready(Some(result)),
+        Poll::Pending => {
+            turso_assert_reachable!("yield intercepted during commit");
+            if should_abandon_in_flight_commit() {
+                Poll::Ready(None)
+            } else {
+                Poll::Pending
+            }
+        }
+    })
+    .await
+    .into_iter()
+    .transpose_into_fallible()
+    .next()
 }
