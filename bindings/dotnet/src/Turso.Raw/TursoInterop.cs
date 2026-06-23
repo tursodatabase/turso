@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Runtime.InteropServices;
 using Turso.Raw.Public;
 using Turso.Raw.Public.Handles;
@@ -47,6 +48,24 @@ internal struct TursoDatabaseConfig
 internal static class TursoInterop
 {
     private const string DllName = "turso_sdk_kit";
+
+    static TursoInterop()
+    {
+        if (OperatingSystem.IsIOS())
+        {
+            NativeLibrary.SetDllImportResolver(typeof(TursoInterop).Assembly, ResolveDllImport);
+        }
+    }
+
+    private static IntPtr ResolveDllImport(
+        string libraryName,
+        Assembly assembly,
+        DllImportSearchPath? searchPath)
+    {
+        return libraryName == DllName
+            ? NativeLibrary.Load($"Frameworks/lib{libraryName}.framework/lib{libraryName}", assembly, searchPath)
+            : IntPtr.Zero;
+    }
 
     [DllImport(DllName, EntryPoint = "turso_database_new", CallingConvention = CallingConvention.Cdecl)]
     public static extern TursoStatusCode DatabaseNew(

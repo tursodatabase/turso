@@ -12,7 +12,7 @@ dotnet add package Turso.Data.Sqlite
 
 Application code only needs to reference `Turso.Data.Sqlite`.
 
-The package targets `net8.0`, `net9.0`, and `net10.0`.
+The package targets `net8.0`, `net9.0`, and `net10.0`. It includes native runtime assets for Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and `android-x86`), and iOS as an XCFramework with device and simulator slices.
 
 ## Getting started
 
