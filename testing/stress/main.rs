@@ -1,5 +1,6 @@
 mod logging;
 mod opts;
+mod sql_logging;
 
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -11,25 +12,13 @@ use rand::{Rng, SeedableRng};
 #[cfg(shuttle)]
 use shuttle::scheduler::Scheduler;
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-
-type SqlLog = Arc<std::sync::Mutex<BufWriter<File>>>;
-
-fn log_sql(log: &SqlLog, thread: usize, sql: &str, result: &str) {
-    let sql = sql.trim().trim_end_matches(';');
-    let mut w = log.lock().unwrap();
-    writeln!(w, "{sql}; -- [thread:{thread}] {result}").unwrap();
-    if result.starts_with("ERROR") {
-        w.flush().unwrap();
-    }
-}
 use turso::Builder;
 
 use crate::logging::Tracer;
+use crate::sql_logging::SqlLogger;
 
 /// Represents a column in a SQLite table
 #[derive(Debug, Clone)]
@@ -611,9 +600,8 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     println!("db_file={db_file}");
 
     let sql_log_path = format!("{db_file}.sql");
-    let sql_log_file = File::create(&sql_log_path)?;
-    let sql_log: SqlLog = Arc::new(std::sync::Mutex::new(BufWriter::new(sql_log_file)));
     println!("sql_log={sql_log_path}");
+    let sql_logger = Arc::new(SqlLogger::new(&sql_log_path)?);
 
     let tracing_log_path = format!("{db_file}.jsonl");
     println!("tracing_log={tracing_log_path}");
@@ -651,54 +639,39 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
             while retry_counter < 10 {
                 match conn.execute(stmt, ()).await {
                     Ok(_) => {
-                        log_sql(&sql_log, thread, stmt, "OK");
+                        sql_logger.log(thread, stmt, "OK");
                         break;
                     }
                     Err(turso::Error::Busy(e)) => {
-                        log_sql(&sql_log, thread, stmt, &format!("ERROR(busy): {e}"));
+                        sql_logger.log(thread, stmt, &format!("ERROR(busy): {e}"));
                         println!("Error (busy) creating table: {e}");
                         retry_counter += 1;
                     }
                     Err(turso::Error::DatabaseFull(e)) => {
-                        log_sql(
-                            &sql_log,
-                            thread,
-                            stmt,
-                            &format!("ERROR(database_full): {e}"),
-                        );
+                        sql_logger.log(thread, stmt, &format!("ERROR(database_full): {e}"));
                         eprintln!("Database full, stopping: {e}");
                         stop = true;
                         break;
                     }
                     Err(turso::Error::IoError(std::io::ErrorKind::StorageFull, _)) => {
-                        log_sql(&sql_log, thread, stmt, "ERROR(io): StorageFull");
+                        sql_logger.log(thread, stmt, "ERROR(io): StorageFull");
                         eprintln!("No storage space, stopping");
                         stop = true;
                         break;
                     }
                     Err(turso::Error::BusySnapshot(e)) => {
-                        log_sql(
-                            &sql_log,
-                            thread,
-                            stmt,
-                            &format!("ERROR(busy_snapshot): {e}"),
-                        );
+                        sql_logger.log(thread, stmt, &format!("ERROR(busy_snapshot): {e}"));
                         println!("Error (busy snapshot): {e}");
                         retry_counter += 1;
                     }
                     Err(turso::Error::IoError(kind, op)) => {
-                        log_sql(
-                            &sql_log,
-                            thread,
-                            stmt,
-                            &format!("ERROR(io): {op}: {kind:?}"),
-                        );
+                        sql_logger.log(thread, stmt, &format!("ERROR(io): {op}: {kind:?}"));
                         eprintln!("I/O error ({op}: {kind:?}), stopping");
                         stop = true;
                         break;
                     }
                     Err(e) => {
-                        log_sql(&sql_log, thread, stmt, &format!("ERROR(fatal): {e}"));
+                        sql_logger.log(thread, stmt, &format!("ERROR(fatal): {e}"));
                         turso_macros::turso_assert_unreachable!("fatal error creating table", { "thread": thread, "stmt": stmt, "error": e });
                     }
                 }
@@ -719,7 +692,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         let schema_for_task = schema.clone();
         let busy_timeout = opts.busy_timeout;
         let tx_mode = opts.tx_mode;
-        let sql_log = sql_log.clone();
+        let sql_logger = sql_logger.clone();
 
         let progress_bar = multi_progress.add(ProgressBar::new(nr_iterations as u64));
         progress_bar.set_style(progress_style.clone());
@@ -765,8 +738,8 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
                 if let Some(tx_stmt) = tx {
                     match conn.execute(tx_stmt, ()).await {
-                        Ok(_) => log_sql(&sql_log, thread, tx_stmt, "OK"),
-                        Err(e) => log_sql(&sql_log, thread, tx_stmt, &format!("ERROR: {e}")),
+                        Ok(_) => sql_logger.log(thread, tx_stmt, "OK"),
+                        Err(e) => sql_logger.log(thread, tx_stmt, &format!("ERROR: {e}")),
                     }
                 }
 
@@ -775,52 +748,37 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                 progress_bar.set_position(i as u64);
                 match conn.execute(&sql, ()).await {
                     Ok(_) => {
-                        log_sql(&sql_log, thread, &sql, "OK");
+                        sql_logger.log(thread, &sql, "OK");
                     }
                     Err(e) => match e {
                         turso::Error::Corrupt(e) => {
-                            log_sql(&sql_log, thread, &sql, &format!("ERROR(corrupt): {e}"));
+                            sql_logger.log(thread, &sql, &format!("ERROR(corrupt): {e}"));
                             turso_macros::turso_assert_unreachable!("corrupt error executing query", { "thread": thread, "error": e, "sql": sql });
                         }
                         turso::Error::Constraint(e) => {
-                            log_sql(&sql_log, thread, &sql, &format!("ERROR(constraint): {e}"));
+                            sql_logger.log(thread, &sql, &format!("ERROR(constraint): {e}"));
                         }
                         turso::Error::Busy(e) => {
-                            log_sql(&sql_log, thread, &sql, &format!("ERROR(busy): {e}"));
+                            sql_logger.log(thread, &sql, &format!("ERROR(busy): {e}"));
                             println!("thread#{thread} Error[WARNING] executing query: {e}");
                         }
                         turso::Error::BusySnapshot(e) => {
-                            log_sql(
-                                &sql_log,
-                                thread,
-                                &sql,
-                                &format!("ERROR(busy_snapshot): {e}"),
-                            );
+                            sql_logger.log(thread, &sql, &format!("ERROR(busy_snapshot): {e}"));
                             println!("thread#{thread} Error[WARNING] busy snapshot: {e}");
                         }
                         turso::Error::Error(e) => {
-                            log_sql(&sql_log, thread, &sql, &format!("ERROR: {e}"));
+                            sql_logger.log(thread, &sql, &format!("ERROR: {e}"));
                         }
                         turso::Error::DatabaseFull(e) => {
-                            log_sql(
-                                &sql_log,
-                                thread,
-                                &sql,
-                                &format!("ERROR(database_full): {e}"),
-                            );
+                            sql_logger.log(thread, &sql, &format!("ERROR(database_full): {e}"));
                             eprintln!("thread#{thread} Database full: {e}");
                         }
                         turso::Error::IoError(kind, op) => {
-                            log_sql(
-                                &sql_log,
-                                thread,
-                                &sql,
-                                &format!("ERROR(io): {op}: {kind:?}"),
-                            );
+                            sql_logger.log(thread, &sql, &format!("ERROR(io): {op}: {kind:?}"));
                             eprintln!("thread#{thread} I/O error ({op}: {kind:?}), continuing...");
                         }
                         _ => {
-                            log_sql(&sql_log, thread, &sql, &format!("ERROR(fatal): {e}"));
+                            sql_logger.log(thread, &sql, &format!("ERROR(fatal): {e}"));
                             turso_macros::turso_assert_unreachable!("fatal error executing query", { "thread": thread, "error": e, "sql": sql });
                         }
                     },
@@ -834,8 +792,8 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     let sp_name = format!("sp_{}", rng.get_random() % 100);
                     let savepoint_sql = format!("SAVEPOINT {sp_name};");
                     match conn.execute(&savepoint_sql, ()).await {
-                        Ok(_) => log_sql(&sql_log, thread, &savepoint_sql, "OK"),
-                        Err(e) => log_sql(&sql_log, thread, &savepoint_sql, &format!("ERROR: {e}")),
+                        Ok(_) => sql_logger.log(thread, &savepoint_sql, "OK"),
+                        Err(e) => sql_logger.log(thread, &savepoint_sql, &format!("ERROR: {e}")),
                     }
 
                     // Execute 1-3 DML statements inside the savepoint.
@@ -843,12 +801,12 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     for _ in 0..sp_stmts {
                         let sp_sql = generate_random_statement(&mut rng, &schema_for_task);
                         match conn.execute(&sp_sql, ()).await {
-                            Ok(_) => log_sql(&sql_log, thread, &sp_sql, "OK"),
+                            Ok(_) => sql_logger.log(thread, &sp_sql, "OK"),
                             Err(turso::Error::Corrupt(e)) => {
-                                log_sql(&sql_log, thread, &sp_sql, &format!("ERROR(corrupt): {e}"));
+                                sql_logger.log(thread, &sp_sql, &format!("ERROR(corrupt): {e}"));
                                 turso_macros::turso_assert_unreachable!("corrupt error in savepoint", { "thread": thread, "error": e, "sql": sp_sql });
                             }
-                            Err(e) => log_sql(&sql_log, thread, &sp_sql, &format!("ERROR: {e}")),
+                            Err(e) => sql_logger.log(thread, &sp_sql, &format!("ERROR: {e}")),
                         }
                     }
 
@@ -856,16 +814,14 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     if rng.get_random() % 2 == 0 {
                         let rollback_sql = format!("ROLLBACK TO {sp_name};");
                         match conn.execute(&rollback_sql, ()).await {
-                            Ok(_) => log_sql(&sql_log, thread, &rollback_sql, "OK"),
-                            Err(e) => {
-                                log_sql(&sql_log, thread, &rollback_sql, &format!("ERROR: {e}"))
-                            }
+                            Ok(_) => sql_logger.log(thread, &rollback_sql, "OK"),
+                            Err(e) => sql_logger.log(thread, &rollback_sql, &format!("ERROR: {e}")),
                         }
                     }
                     let release_sql = format!("RELEASE {sp_name};");
                     match conn.execute(&release_sql, ()).await {
-                        Ok(_) => log_sql(&sql_log, thread, &release_sql, "OK"),
-                        Err(e) => log_sql(&sql_log, thread, &release_sql, &format!("ERROR: {e}")),
+                        Ok(_) => sql_logger.log(thread, &release_sql, "OK"),
+                        Err(e) => sql_logger.log(thread, &release_sql, &format!("ERROR: {e}")),
                     }
                 }
 
@@ -876,8 +832,8 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         "ROLLBACK;"
                     };
                     match conn.execute(end_tx, ()).await {
-                        Ok(_) => log_sql(&sql_log, thread, end_tx, "OK"),
-                        Err(e) => log_sql(&sql_log, thread, end_tx, &format!("ERROR: {e}")),
+                        Ok(_) => sql_logger.log(thread, end_tx, "OK"),
+                        Err(e) => sql_logger.log(thread, end_tx, &format!("ERROR: {e}")),
                     }
                 }
 
@@ -888,23 +844,21 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         Ok(Some(row)) => {
                             let value = row.get_value(0).unwrap();
                             if value != "ok".into() {
-                                log_sql(
-                                    &sql_log,
+                                sql_logger.log(
                                     thread,
                                     "PRAGMA integrity_check",
                                     &format!("ERROR: {value:?}"),
                                 );
                                 turso_macros::turso_assert_unreachable!("integrity check failed", { "thread": thread, "value": value });
                             }
-                            log_sql(&sql_log, thread, "PRAGMA integrity_check", "OK");
+                            sql_logger.log(thread, "PRAGMA integrity_check", "OK");
                         }
                         Ok(None) => {
-                            log_sql(&sql_log, thread, "PRAGMA integrity_check", "ERROR: no rows");
+                            sql_logger.log(thread, "PRAGMA integrity_check", "ERROR: no rows");
                             turso_macros::turso_assert_unreachable!("integrity check returned no rows", { "thread": thread });
                         }
                         Err(e) => {
-                            log_sql(
-                                &sql_log,
+                            sql_logger.log(
                                 thread,
                                 "PRAGMA integrity_check",
                                 &format!("ERROR: {e}"),
@@ -923,8 +877,8 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
             }
             // In case this thread is running an exclusive transaction, commit it so that it doesn't block other threads.
             match conn.execute("COMMIT", ()).await {
-                Ok(_) => log_sql(&sql_log, thread, "COMMIT", "OK"),
-                Err(e) => log_sql(&sql_log, thread, "COMMIT", &format!("ERROR: {e}")),
+                Ok(_) => sql_logger.log(thread, "COMMIT", "OK"),
+                Err(e) => sql_logger.log(thread, "COMMIT", &format!("ERROR: {e}")),
             }
             progress_bar.finish_with_message("done");
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
@@ -935,8 +889,6 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     for handle in handles {
         handle.await??;
     }
-    // Flush SQL log before exit
-    sql_log.lock().unwrap().flush().unwrap();
     println!("Database file: {db_file}");
 
     // Switch back to WAL mode before SQLite integrity check if we were in MVCC mode.
