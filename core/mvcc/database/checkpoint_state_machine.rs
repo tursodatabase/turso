@@ -2561,8 +2561,14 @@ mod tests {
         let conn = db.connect();
         let mvstore = db.get_mvcc_store();
         let pager = conn.pager.load().clone();
-        let mut checkpoint =
-            CheckpointStateMachine::new(pager, mvstore, conn.clone(), true, conn.get_sync_mode());
+        let mut checkpoint = CheckpointStateMachine::new(
+            pager,
+            mvstore,
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
+        );
 
         let table_id = MVTableId::from(-2);
         checkpoint
