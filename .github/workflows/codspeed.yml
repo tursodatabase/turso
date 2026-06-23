@@ -52,37 +52,33 @@ jobs:
           json=$(printf '%s\n' "${benchmarks[@]}" | jq -R . | jq -cs .)
           echo "benchmarks=$json" >> "$GITHUB_OUTPUT"
 
-  build:
-    name: "Build benchmarks (${{ matrix.toolchain.label }})"
+  build-stable:
+    name: "Build benchmarks (stable)"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: discover
     timeout-minutes: 60
     # Allow this job to fail without failing the entire CI run
     continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        toolchain:
-          - label: stable
-            version: "1.88.0"
-            rustflags: ""
-          - label: nightly
-            version: "nightly-2025-12-17"
-            rustflags: "--cfg nightly"
+    outputs:
+      built: ${{ steps.build_status.outputs.built }}
+    env:
+      TOOLCHAIN_LABEL: stable
+      TOOLCHAIN_VERSION: "1.88.0"
+      TOOLCHAIN_RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.toolchain.version }}
+          toolchain: ${{ env.TOOLCHAIN_VERSION }}
 
       - name: Setup mold linker
         uses: rui314/setup-mold@v1
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-codspeed-${{ matrix.toolchain.label }}"
+          prefix-key: "v1-rust-codspeed-${{ env.TOOLCHAIN_LABEL }}"
           cache-on-failure: true
 
       - uses: "./.github/shared/setup-sccache"
@@ -95,7 +91,7 @@ jobs:
       - name: Mount benchmark sticky disk
         uses: useblacksmith/stickydisk@v1
         with:
-          key: ${{ env.CODSPEED_STICKY_DISK_KEY }}-${{ matrix.toolchain.label }}
+          key: ${{ env.CODSPEED_STICKY_DISK_KEY }}-${{ env.TOOLCHAIN_LABEL }}
           path: target/codspeed
 
       - name: Generate graph-queries DBs
@@ -105,43 +101,52 @@ jobs:
           sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
 
       - name: Build benchmarks (excluding TPC-H)
+        id: build_benchmarks
         env:
           BENCHMARKS_JSON: ${{ needs.discover.outputs.benchmarks }}
-          RUSTFLAGS: ${{ matrix.toolchain.rustflags }}
+          RUSTFLAGS: ${{ env.TOOLCHAIN_RUSTFLAGS }}
         shell: bash
         run: |
           set -euo pipefail
 
           bench_args=$(jq -r '.[] | "--bench " + .' <<< "$BENCHMARKS_JSON" | tr '\n' ' ')
-          cargo +${{ matrix.toolchain.version }} codspeed build $bench_args --features codspeed
+          cargo +${{ env.TOOLCHAIN_VERSION }} codspeed build $bench_args --features codspeed
 
-  benchmarks:
-    name: "Run benchmark (${{ matrix.toolchain.label }}, ${{ matrix.benchmark }})"
+      - name: Record build status
+        id: build_status
+        if: always()
+        run: echo "built=${{ steps.build_benchmarks.outcome == 'success' }}" >> "$GITHUB_OUTPUT"
+
+  build-nightly:
+    name: "Build benchmarks (nightly)"
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    needs:
-      - discover
-      - build
-    timeout-minutes: 30
+    needs: discover
+    timeout-minutes: 60
     # Allow this job to fail without failing the entire CI run
     continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        toolchain:
-          - label: stable
-            version: "1.88.0"
-            rustflags: ""
-          - label: nightly
-            version: "nightly-2025-12-17"
-            rustflags: "--cfg nightly"
-        benchmark: ${{ fromJson(needs.discover.outputs.benchmarks) }}
+    outputs:
+      built: ${{ steps.build_status.outputs.built }}
+    env:
+      TOOLCHAIN_LABEL: nightly
+      TOOLCHAIN_VERSION: "nightly-2025-12-17"
+      TOOLCHAIN_RUSTFLAGS: "--cfg nightly"
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.toolchain.version }}
+          toolchain: ${{ env.TOOLCHAIN_VERSION }}
+
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-codspeed-${{ env.TOOLCHAIN_LABEL }}"
+          cache-on-failure: true
+
+      - uses: "./.github/shared/setup-sccache"
 
       - name: Install cargo-codspeed
         uses: taiki-e/install-action@v2
@@ -151,7 +156,67 @@ jobs:
       - name: Mount benchmark sticky disk
         uses: useblacksmith/stickydisk@v1
         with:
-          key: ${{ env.CODSPEED_STICKY_DISK_KEY }}-${{ matrix.toolchain.label }}
+          key: ${{ env.CODSPEED_STICKY_DISK_KEY }}-${{ env.TOOLCHAIN_LABEL }}
+          path: target/codspeed
+
+      - name: Generate graph-queries DBs
+        run: |
+          python3 perf/graph-queries/generate_seed.py | sqlite3 perf/graph-queries/graph-queries.db
+          cp perf/graph-queries/graph-queries.db perf/graph-queries/graph-queries-analyzed.db
+          sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
+
+      - name: Build benchmarks (excluding TPC-H)
+        id: build_benchmarks
+        env:
+          BENCHMARKS_JSON: ${{ needs.discover.outputs.benchmarks }}
+          RUSTFLAGS: ${{ env.TOOLCHAIN_RUSTFLAGS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bench_args=$(jq -r '.[] | "--bench " + .' <<< "$BENCHMARKS_JSON" | tr '\n' ' ')
+          cargo +${{ env.TOOLCHAIN_VERSION }} codspeed build $bench_args --features codspeed
+
+      - name: Record build status
+        id: build_status
+        if: always()
+        run: echo "built=${{ steps.build_benchmarks.outcome == 'success' }}" >> "$GITHUB_OUTPUT"
+
+  benchmarks-stable:
+    name: "Run benchmark (stable, ${{ matrix.benchmark }})"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs:
+      - discover
+      - build-stable
+    if: needs.build-stable.outputs.built == 'true'
+    timeout-minutes: 30
+    # Allow this job to fail without failing the entire CI run
+    continue-on-error: true
+    env:
+      TOOLCHAIN_VERSION: "1.88.0"
+      TOOLCHAIN_LABEL: stable
+      TOOLCHAIN_RUSTFLAGS: ""
+    strategy:
+      fail-fast: false
+      matrix:
+        benchmark: ${{ fromJson(needs.discover.outputs.benchmarks) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN_VERSION }}
+
+      - name: Install cargo-codspeed
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed
+
+      - name: Mount benchmark sticky disk
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ env.CODSPEED_STICKY_DISK_KEY }}-${{ env.TOOLCHAIN_LABEL }}
           path: target/codspeed
 
       - name: Restore binary permissions
@@ -167,17 +232,74 @@ jobs:
       - name: Run benchmarks (excluding TPC-H)
         uses: CodSpeedHQ/action@v4.17.0
         env:
-          RUSTFLAGS: ${{ matrix.toolchain.rustflags }}
+          RUSTFLAGS: ${{ env.TOOLCHAIN_RUSTFLAGS }}
         with:
           mode: simulation
-          run: cargo +${{ matrix.toolchain.version }} codspeed run --bench ${{ matrix.benchmark }}
+          run: cargo +${{ env.TOOLCHAIN_VERSION }} codspeed run --bench ${{ matrix.benchmark }}
+
+  benchmarks-nightly:
+    name: "Run benchmark (nightly, ${{ matrix.benchmark }})"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs:
+      - discover
+      - build-nightly
+    if: needs.build-nightly.outputs.built == 'true'
+    timeout-minutes: 30
+    # Allow this job to fail without failing the entire CI run
+    continue-on-error: true
+    env:
+      TOOLCHAIN_VERSION: "nightly-2025-12-17"
+      TOOLCHAIN_LABEL: nightly
+      TOOLCHAIN_RUSTFLAGS: "--cfg nightly"
+    strategy:
+      fail-fast: false
+      matrix:
+        benchmark: ${{ fromJson(needs.discover.outputs.benchmarks) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN_VERSION }}
+
+      - name: Install cargo-codspeed
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed
+
+      - name: Mount benchmark sticky disk
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: ${{ env.CODSPEED_STICKY_DISK_KEY }}-${{ env.TOOLCHAIN_LABEL }}
+          path: target/codspeed
+
+      - name: Restore binary permissions
+        run: find target/codspeed -type f -exec chmod +x {} +
+
+      - name: Generate graph-queries DBs
+        if: matrix.benchmark == 'graph_queries_benchmark'
+        run: |
+          python3 perf/graph-queries/generate_seed.py | sqlite3 perf/graph-queries/graph-queries.db
+          cp perf/graph-queries/graph-queries.db perf/graph-queries/graph-queries-analyzed.db
+          sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
+
+      - name: Run benchmarks (excluding TPC-H)
+        uses: CodSpeedHQ/action@v4.17.0
+        env:
+          RUSTFLAGS: ${{ env.TOOLCHAIN_RUSTFLAGS }}
+        with:
+          mode: simulation
+          run: cargo +${{ env.TOOLCHAIN_VERSION }} codspeed run --bench ${{ matrix.benchmark }}
 
   cleanup:
     name: "Delete benchmark sticky disk (${{ matrix.toolchain }})"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     needs:
-      - build
-      - benchmarks
+      - build-stable
+      - build-nightly
+      - benchmarks-stable
+      - benchmarks-nightly
     if: always()
     strategy:
       fail-fast: false
