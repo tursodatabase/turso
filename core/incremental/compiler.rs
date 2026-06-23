@@ -1692,7 +1692,7 @@ impl DbspCompiler {
                         let escaped = t.to_string().replace('\'', "''");
                         ast::Literal::String(format!("'{escaped}'"))
                     }
-                    Value::Blob(b) => ast::Literal::Blob(format!("{b:?}")),
+                    Value::Blob(b) => ast::Literal::Blob(hex::encode_upper(b)),
                     Value::Null => ast::Literal::Null,
                 };
                 Ok(ast::Expr::Literal(lit))

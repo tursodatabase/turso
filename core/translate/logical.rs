@@ -1931,7 +1931,13 @@ impl<'a> LogicalPlanBuilder<'a> {
                 };
                 Ok(Value::Text(unquoted.to_string().into()))
             }
-            ast::Literal::Blob(b) => Ok(Value::Blob(b.clone().into())),
+            // The lexer guarantees a valid even-length hex string; decode it to the
+            // actual bytes instead of storing the hex text's UTF-8.
+            ast::Literal::Blob(b) => {
+                Ok(Value::Blob(hex::decode(b).map_err(|_| {
+                    LimboError::ParseError(format!("invalid blob literal: {b}"))
+                })?))
+            }
             ast::Literal::CurrentDate
             | ast::Literal::CurrentTime
             | ast::Literal::CurrentTimestamp => Err(LimboError::ParseError(
