@@ -1,3 +1,5 @@
+use futures::task::AtomicWaker;
+
 use crate::turso_assert_eq;
 use core::fmt::{self, Debug};
 use std::{
@@ -8,8 +10,6 @@ use std::{
     },
     task::{Poll, Waker},
 };
-
-use crate::sync::Mutex;
 
 use crate::{Buffer, CompletionError};
 
@@ -33,49 +33,44 @@ impl Future for Completion {
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         self.set_waker(cx.waker());
-        if self.finished() {
-            self.wake();
-            let res = self
-                .get_error()
-                .map_or(Ok(()), |err| Err(crate::LimboError::CompletionError(err)));
-            return Poll::Ready(res);
+        if !self.finished() {
+            return Poll::Pending;
         }
-        Poll::Pending
+        self.wake();
+        let res = self
+            .get_error()
+            .map_or(Ok(()), |err| Err(crate::LimboError::CompletionError(err)));
+
+        Poll::Ready(res)
     }
 }
 
 #[derive(Debug, Default)]
 struct ContextInner {
-    waker: Option<Waker>,
+    waker: AtomicWaker,
     // TODO: add abort signal
 }
 
 #[derive(Debug, Clone)]
 pub struct Context {
-    inner: Arc<Mutex<ContextInner>>,
+    inner: Arc<ContextInner>,
 }
 
 impl ContextInner {
     pub fn new() -> Self {
-        Self { waker: None }
+        Self {
+            waker: AtomicWaker::new(),
+        }
     }
 
-    pub fn wake(&mut self) {
+    pub fn wake(&self) {
         if let Some(waker) = self.waker.take() {
             waker.wake();
         }
     }
 
-    pub fn set_waker(&mut self, waker: &Waker) {
-        if let Some(curr_waker) = self.waker.as_mut() {
-            // only call and change waker if it would awake a different task
-            if !curr_waker.will_wake(waker) {
-                let prev_waker = std::mem::replace(curr_waker, waker.clone());
-                prev_waker.wake();
-            }
-        } else {
-            self.waker = Some(waker.clone());
-        }
+    pub fn set_waker(&self, waker: &Waker) {
+        self.waker.register(waker);
     }
 }
 
@@ -88,16 +83,16 @@ impl Default for Context {
 impl Context {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(ContextInner::new())),
+            inner: Arc::new(ContextInner::new()),
         }
     }
 
     pub fn wake(&self) {
-        self.inner.lock().wake();
+        self.inner.wake();
     }
 
     pub fn set_waker(&self, waker: &Waker) {
-        self.inner.lock().set_waker(waker);
+        self.inner.set_waker(waker);
     }
 }
 
