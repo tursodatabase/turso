@@ -3568,6 +3568,7 @@ dependencies = [
  "criterion",
  "memory-benchmark",
  "tokio",
+ "turso_macros",
 ]
 
 [[package]]
@@ -4467,6 +4468,7 @@ dependencies = [
  "rusqlite",
  "tokio",
  "turso",
+ "turso_macros",
 ]
 
 [[package]]
