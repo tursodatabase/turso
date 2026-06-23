@@ -4830,6 +4830,10 @@ impl BTreeCursor {
     /// resumed from last point after IO interruption
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn clear_overflow_pages(&mut self, cell: &BTreeCell) -> Result<IOResult<()>> {
+        // `database_size` is invariant for the duration of this invocation, so
+        // read the page-1 header at most once and reuse it for every overflow
+        // page validation below instead of re-reading it per `ReadNext`.
+        let mut database_size: Option<u32> = None;
         loop {
             match self.overflow_state.clone() {
                 OverflowState::Start => {
@@ -4843,7 +4847,9 @@ impl BTreeCursor {
                     };
 
                     if let Some(next_page) = first_overflow_page {
-                        if unlikely(!return_if_io!(self.valid_overflow_page_id(next_page))) {
+                        let database_size =
+                            return_if_io!(self.overflow_database_size(&mut database_size));
+                        if unlikely(!Self::valid_overflow_page_id(next_page, database_size)) {
                             self.overflow_state = OverflowState::Start;
                             return Err(LimboError::Corrupt("Invalid overflow page number".into()));
                         }
@@ -4877,7 +4883,9 @@ impl BTreeCursor {
                     }
                 }
                 OverflowState::ReadNext { next } => {
-                    if unlikely(!return_if_io!(self.valid_overflow_page_id(next))) {
+                    let database_size =
+                        return_if_io!(self.overflow_database_size(&mut database_size));
+                    if unlikely(!Self::valid_overflow_page_id(next, database_size)) {
                         self.overflow_state = OverflowState::Start;
                         return Err(LimboError::Corrupt("Invalid overflow page number".into()));
                     }
@@ -4895,11 +4903,20 @@ impl BTreeCursor {
         }
     }
 
-    fn valid_overflow_page_id(&self, page_id: u32) -> Result<IOResult<bool>> {
-        let database_size = return_if_io!(self.pager.with_header(|header| header.database_size));
-        Ok(IOResult::Done(
-            page_id >= 2 && page_id <= database_size.get(),
-        ))
+    /// Read `database_size` from the page-1 header at most once per
+    /// `clear_overflow_pages` invocation, memoizing it in `cache`.
+    fn overflow_database_size(&self, cache: &mut Option<u32>) -> Result<IOResult<u32>> {
+        if let Some(database_size) = cache {
+            return Ok(IOResult::Done(*database_size));
+        }
+        let database_size =
+            return_if_io!(self.pager.with_header(|header| header.database_size)).get();
+        *cache = Some(database_size);
+        Ok(IOResult::Done(database_size))
+    }
+
+    fn valid_overflow_page_id(page_id: u32, database_size: u32) -> bool {
+        page_id >= 2 && page_id <= database_size
     }
 
     /// Deletes all contents of the B-tree by freeing all its pages in an iterative depth-first order.

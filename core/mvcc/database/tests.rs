@@ -10167,6 +10167,92 @@ fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
     observer.close().unwrap();
 }
 
+/// `PRAGMA journal_mode=mvcc` installs the shared `MvStore` and demotes the
+/// connection in `Finalize`, then yields repeatedly while the store bootstraps
+/// (reparse, checkpoint, log recovery). If the statement is dropped while
+/// parked at one of those bootstrap yields, the abandonment guard must
+/// re-promote the connection and uninstall the un-bootstrapped store. Without
+/// the guard, `is_mvcc_bootstrap_connection` would stay set forever (silently
+/// bypassing MVCC) and other connections on the same `Database` could trip an
+/// assertion on the un-bootstrapped store (`global_header = None`) at commit.
+///
+/// Gated on `io_memory_yield`: the test needs [`crate::MemoryYieldIO`] to defer
+/// completions so the bootstrap yields are observable. CI exercises it via the
+/// `--all-features` test job.
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn test_abandoned_journal_mode_mvcc_bootstrap_restores_connection() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}", rand::random::<u64>()));
+    // `MemoryYieldIO` defers every completion until the next `io.step()`, so
+    // each bootstrap read/write surfaces as a real `StepResult::IO` between
+    // `stmt.step()` calls and we can abandon the statement precisely while it
+    // is parked at a bootstrap yield (with `PlatformIO` the completions finish
+    // synchronously and the whole PRAGMA runs in a single step).
+    let io = Arc::new(crate::MemoryYieldIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        path.as_os_str().to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    // Give the bootstrap real schema/WAL work to span several yields.
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    assert!(
+        db.get_mv_store().is_none(),
+        "database should start in WAL mode"
+    );
+    assert!(!conn.is_mvcc_bootstrap_connection());
+
+    let mut stmt = conn.prepare("PRAGMA journal_mode=mvcc").unwrap();
+    let mut reached_bootstrap_window = false;
+    for _ in 0..10_000 {
+        match stmt.step().unwrap() {
+            StepResult::IO => {
+                // Once `Finalize` has run, the connection is demoted and the
+                // store is installed: we are now parked at a bootstrap yield.
+                // Abandon here, leaving the IO completion undriven.
+                if conn.is_mvcc_bootstrap_connection() {
+                    reached_bootstrap_window = true;
+                    break;
+                }
+                db.io.step().unwrap();
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert!(
+        reached_bootstrap_window,
+        "expected to observe the demoted mid-bootstrap window",
+    );
+    assert!(
+        db.get_mv_store().is_some(),
+        "store should be installed during bootstrap",
+    );
+
+    // Abandon the statement mid-bootstrap; dropping it drops the
+    // `MvccBootstrapGuard` held in its `active_op_state`.
+    drop(stmt);
+
+    assert!(
+        !conn.is_mvcc_bootstrap_connection(),
+        "abandonment guard must re-promote the connection",
+    );
+    assert!(
+        db.get_mv_store().is_none(),
+        "abandonment guard must uninstall the un-bootstrapped store",
+    );
+}
+
 /// `step_build_log_record` chunks the commit's write_set into batches of
 /// `MVCC_COMMIT_BATCH_SIZE` rowids and yields between batches so that a
 /// large commit (e.g. CREATE INDEX over millions of rows) can't monopolize

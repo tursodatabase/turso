@@ -1889,11 +1889,9 @@ impl Connection {
             return Ok(false);
         };
         match self.get_pager().io.wait_for_completion(c) {
-            #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
-            Err(LimboError::CompletionError(crate::error::CompletionError::IOError(
-                std::io::ErrorKind::UnexpectedEof,
-                _,
-            ))) => {
+            Err(LimboError::CompletionError(err))
+                if Self::wal_watermark_read_error_is_absent_page(&err) =>
+            {
                 return Ok(false);
             }
             Err(e) => return Err(e),
@@ -1901,6 +1899,28 @@ impl Connection {
         }
 
         self.try_wal_watermark_read_page_end(page, page_ref)
+    }
+
+    /// Classify a completion error raised while reading a page at a fixed WAL
+    /// watermark. On Windows under `experimental_win_iocp`, an absent /
+    /// zero-length page read surfaces as `UnexpectedEof` (see
+    /// `core/io/win_iocp.rs`); every watermark-read site must treat that as
+    /// "page absent" (size 0) rather than a hard error. Centralized here so the
+    /// platform handling cannot drift across the (now four) call sites.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn wal_watermark_read_error_is_absent_page(err: &crate::error::CompletionError) -> bool {
+        #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+        {
+            matches!(
+                err,
+                crate::error::CompletionError::IOError(std::io::ErrorKind::UnexpectedEof, _)
+            )
+        }
+        #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+        {
+            let _ = err;
+            false
+        }
     }
 
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
