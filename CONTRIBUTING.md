@@ -74,11 +74,14 @@ sudo dnf install mold
 
 # Ubuntu/Debian
 sudo apt install mold
+
+# macOS
+brew install mold
 ```
 
 Then configure Cargo to use mold by creating `.cargo/config.toml`:
 
-**For Linux:**
+**For Linux / macOS:**
 
 ```toml
 [target.x86_64-unknown-linux-gnu]
