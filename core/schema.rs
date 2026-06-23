@@ -6,7 +6,7 @@ use crate::incremental::view::IncrementalView;
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, operator::create_dbsp_state_index};
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::return_if_io;
-use crate::stats::AnalyzeStats;
+use crate::stats::SharedAnalyzeStats;
 use crate::sync::RwLock;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
@@ -781,8 +781,10 @@ pub struct Schema {
     pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
     pub has_indexes: HashSet<String>,
     pub schema_version: u32,
-    /// Statistics collected via ANALYZE for regular B-tree tables and indexes.
-    pub analyze_stats: AnalyzeStats,
+    /// Statistics collected via ANALYZE, behind a shared interior-mutable cell
+    /// so they can be refreshed without deep-cloning the schema and are observed
+    /// by every connection sharing this schema lineage. See [`SharedAnalyzeStats`].
+    pub analyze_stats: Arc<SharedAnalyzeStats>,
 
     /// Mapping from table names to the materialized views that depend on them
     pub table_to_materialized_views: HashMap<String, Vec<String>>,
@@ -933,7 +935,7 @@ impl Schema {
             indexes,
             has_indexes,
             schema_version: 0,
-            analyze_stats: AnalyzeStats::default(),
+            analyze_stats: Arc::new(SharedAnalyzeStats::default()),
             table_to_materialized_views,
             incompatible_views,
             broken_views: HashSet::default(),

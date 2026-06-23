@@ -302,7 +302,8 @@ fn estimate_selectivity(
     is_rowid: bool,
 ) -> f64 {
     // Get ANALYZE stats for this table if available
-    let table_stats = schema.analyze_stats.table_stats(table_name);
+    let analyze_stats = schema.analyze_stats.snapshot();
+    let table_stats = analyze_stats.table_stats(table_name);
     let row_count = table_stats.and_then(|s| s.row_count).unwrap_or(0);
 
     match op {
@@ -392,9 +393,8 @@ fn selectivity_index_for_column<'a>(
     available_indexes: &'a AvailableIndexes,
     column_pos: usize,
 ) -> Option<&'a Index> {
-    let table_stats = schema
-        .analyze_stats
-        .table_stats(table_reference.table.get_name());
+    let analyze_stats = schema.analyze_stats.snapshot();
+    let table_stats = analyze_stats.table_stats(table_reference.table.get_name());
     available_indexes
         .btree_indexes_for_column(table_reference.internal_id, column_pos)
         .find(|index| {
@@ -710,9 +710,8 @@ pub fn constraints_from_where_clause(
                         subqueries,
                     )?)?;
                 }
-                let table_stats = schema
-                    .analyze_stats
-                    .table_stats(table_reference.table.get_name());
+                let analyze_stats = schema.analyze_stats.snapshot();
+                let table_stats = analyze_stats.table_stats(table_reference.table.get_name());
                 let row_count = table_stats
                     .and_then(|s| s.row_count)
                     .unwrap_or(params.rows_per_table_fallback as u64)
@@ -780,9 +779,8 @@ pub fn constraints_from_where_clause(
                 // Only use as constraint if NOT correlated
                 if !subquery.correlated {
                     let estimated_values = params.in_subquery_rows;
-                    let table_stats = schema
-                        .analyze_stats
-                        .table_stats(table_reference.table.get_name());
+                    let analyze_stats = schema.analyze_stats.snapshot();
+                    let table_stats = analyze_stats.table_stats(table_reference.table.get_name());
                     let row_count = table_stats
                         .and_then(|s| s.row_count)
                         .unwrap_or(params.rows_per_table_fallback as u64)

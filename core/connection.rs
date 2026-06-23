@@ -485,6 +485,19 @@ pub struct Connection {
     /// MUST be incremented whenever any setting that affects PrepareContext changes,
     /// and this is not currently centralized; each setter bumps the generation individually.
     pub(crate) prepare_context_generation: AtomicU64,
+    /// `prepare_context_generation` value at which ANALYZE stats were last
+    /// (re)checked. Under MVCC the user tables — including `sqlite_stat1` —
+    /// only arrive in this connection's schema when it adopts the shared
+    /// schema, after the connect()-time stats refresh has already run and
+    /// loaded nothing. Comparing against the generation lets prepare lazily
+    /// load stats exactly once per adopted schema instead of on every call.
+    pub(crate) analyze_stats_attempt_generation: AtomicU64,
+    /// Last [`SharedAnalyzeStats`](crate::stats::SharedAnalyzeStats) epoch this
+    /// connection planned against. When the shared stats are refreshed (by this
+    /// or another connection) the epoch moves ahead of this value, and the next
+    /// statement compilation bumps `prepare_context_generation` so cached
+    /// statements recompile with the new statistics.
+    pub(crate) analyze_stats_seen_epoch: AtomicU64,
     /// Per-connection last-returned value for each sequence (for currval()).
     pub(crate) sequence_currvals: RwLock<HashMap<String, i64>>,
 }
@@ -881,6 +894,7 @@ impl Connection {
         input: &str,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
         self.maybe_update_schema();
+        crate::stats::maybe_lazy_load_analyze_stats(self);
 
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
@@ -1023,6 +1037,7 @@ impl Connection {
         }
         let result = (|| {
             self.maybe_update_schema();
+            crate::stats::maybe_lazy_load_analyze_stats(self);
             let syms = self.syms.read();
             let pager = self.pager.load().clone();
             let mode = QueryMode::Normal;

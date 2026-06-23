@@ -1284,6 +1284,42 @@ fn test_recovery_clock_monotonicity() {
 /// What this test checks: Recovery stops cleanly at a torn/incomplete tail and keeps all previously validated frames.
 /// Why this matters: Crashes can leave partial writes at EOF; we need durable-prefix recovery, not all-or-nothing failure.
 #[test]
+fn test_analyze_stats_lazily_loaded_after_mvcc_reopen() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t (a INTEGER, b TEXT, c TEXT, PRIMARY KEY (a, b))")
+            .unwrap();
+        conn.execute("CREATE INDEX t_b_c_idx ON t (b, c)").unwrap();
+        // Every row shares the same (b, c), so without stats the optimizer
+        // cannot tell that the secondary index prefix is non-selective.
+        for i in 0..100 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'const', 'const')"))
+                .unwrap();
+        }
+        conn.execute("ANALYZE").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    // Under MVCC the user tables (and sqlite_stat1) reach the connection's
+    // schema only when statement compilation adopts the recovered shared
+    // schema — after the connect()-time stats refresh has already run and
+    // loaded nothing. Compiling a statement must lazily load the stats so
+    // the optimizer does not plan with empty statistics.
+    conn.prepare("SELECT * FROM t WHERE a = 1 AND b = 'const'")
+        .unwrap();
+    let schema = conn.schema.read().clone();
+    let analyze_stats = schema.analyze_stats.snapshot();
+    let table_stats = analyze_stats.table_stats("t");
+    assert!(
+        table_stats.is_some_and(|stats| !stats.index_stats.is_empty()),
+        "ANALYZE stats must be loaded after reopening an MVCC database"
+    );
+}
+
+#[test]
 fn test_recover_logical_log_short_file_ignored() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
