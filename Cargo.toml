@@ -207,6 +207,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'c
 unstable_name_collisions = "allow"
 
 [workspace.lints.clippy]
+await_holding_lock = "deny"
 or_fun_call = "deny"
 clear_with_drain = "deny"
 collection_is_never_read = "deny"

@@ -1,7 +1,8 @@
 use crate::sql_logging::SqlLogger;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use turso::{Builder, Connection, IntoParams, Row, Rows};
+use turso_stress::sync::Arc;
+use turso_stress::sync::AsyncMutex as Mutex;
+use turso_stress::ThreadId;
 
 /// A wrapper around `Database` that simplifies dropping the db.
 pub struct StressDb {
@@ -41,7 +42,7 @@ impl StressDb {
 
     pub async fn connect(
         this: &Arc<Mutex<Self>>,
-        thread: usize,
+        thread: ThreadId,
         busy_timeout: u64,
     ) -> turso::Result<StressConn> {
         let conn = {
@@ -57,13 +58,13 @@ impl StressDb {
 }
 
 pub struct StressConn {
-    thread: usize,
+    thread: ThreadId,
     sql_logger: Arc<SqlLogger>,
     conn: Connection,
 }
 
 impl StressConn {
-    fn new(sql_logger: Arc<SqlLogger>, thread: usize, conn: Connection) -> Self {
+    fn new(sql_logger: Arc<SqlLogger>, thread: ThreadId, conn: Connection) -> Self {
         Self {
             thread,
             sql_logger,
@@ -77,7 +78,7 @@ impl StressConn {
         params: impl IntoParams,
     ) -> turso::connection::Result<u64> {
         let result = self.conn.execute(sql, params).await;
-        self.sql_logger.log_result(self.thread, sql, &result);
+        self.sql_logger.log_result(&self.thread, sql, &result);
         result
     }
 

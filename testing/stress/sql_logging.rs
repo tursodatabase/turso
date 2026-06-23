@@ -1,9 +1,13 @@
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::BufWriter;
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use turso_stress::sync::{Arc, StdMutex};
+use turso_stress::ThreadId;
 
-type SqlLog = Arc<Mutex<BufWriter<File>>>;
+/// SqlLog uses [StdMutex] instead of [AsyncMutex] (shuttle-instrumented) because
+/// we don't care about Shuttle intercepting invocations on the logger.
+type SqlLog = Arc<StdMutex<RefCell<BufWriter<File>>>>;
 
 #[derive(Clone)]
 pub struct SqlLogger {
@@ -13,20 +17,21 @@ pub struct SqlLogger {
 impl SqlLogger {
     pub(crate) fn new(sql_log_path: &str) -> Result<Self, std::io::Error> {
         let file = File::create(sql_log_path)?;
-        let log: SqlLog = Arc::new(Mutex::new(BufWriter::new(file)));
+        let log: SqlLog = Arc::new(StdMutex::new(RefCell::new(BufWriter::new(file))));
         Ok(Self { log })
     }
 
-    pub fn log(&self, thread: usize, sql: &str, result: &str) {
+    pub fn log(&self, thread: &ThreadId, sql: &str, result: &str) {
         let sql = sql.trim().trim_end_matches(';');
-        let mut w = self.log.lock().unwrap();
+        let w = self.log.lock().unwrap();
+        let mut w = w.borrow_mut();
         writeln!(w, "{sql}; -- [thread:{thread}] {result}").unwrap();
         if result.starts_with("ERROR") {
             w.flush().unwrap();
         }
     }
 
-    pub fn log_result<T>(&self, thread: usize, sql: &str, result: &Result<T, turso::Error>) {
+    pub fn log_result<T>(&self, thread: &ThreadId, sql: &str, result: &Result<T, turso::Error>) {
         match result {
             Ok(_) => {
                 self.log(thread, sql, "OK");
@@ -66,7 +71,7 @@ impl SqlLogger {
 
 impl Drop for SqlLogger {
     fn drop(&mut self) {
-        let mut w = self.log.lock().unwrap();
-        w.flush().unwrap();
+        let log = self.log.lock().unwrap();
+        log.borrow_mut().flush().unwrap();
     }
 }

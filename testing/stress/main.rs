@@ -1,4 +1,5 @@
 mod conn;
+mod counter;
 mod logging;
 mod opts;
 mod progress;
@@ -14,14 +15,19 @@ use rand::{Rng, SeedableRng};
 use shuttle::scheduler::Scheduler;
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use turso::Builder;
+use turso_stress::sync::atomic::{AtomicBool, Ordering};
+use turso_stress::sync::Arc;
+use turso_stress::sync::AsyncBarrier as Barrier;
+use turso_stress::sync::AsyncMutex as Mutex;
 
 use crate::conn::StressDb;
+use crate::counter::StressCounter;
 use crate::logging::Tracer;
 use crate::progress::ProgressBars;
 use crate::sql_logging::SqlLogger;
+use turso::core::clear_database_registry;
+use turso::Builder;
+use turso_stress::ThreadId;
 
 /// Represents a column in a SQLite table
 #[derive(Debug, Clone)]
@@ -578,7 +584,6 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     let ddl_statements = schema.to_sql();
     let schema = Arc::new(schema);
 
-    let mut handles = Vec::with_capacity(opts.nr_threads);
     let mut stop = false;
 
     let progress_bars = ProgressBars::new(opts.nr_iterations);
@@ -612,7 +617,19 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         vfs_option.clone(),
     )));
 
-    let conn = StressDb::connect(&db, usize::MAX, opts.busy_timeout).await?;
+    let mut stress_counter = StressCounter::new(opts.nr_threads, opts.nr_iterations);
+
+    let threads: Vec<_> = (0..opts.nr_threads)
+        .map(ThreadId::new)
+        .enumerate()
+        .collect();
+
+    let progress_bars: Vec<_> = threads
+        .iter()
+        .map(|(_, thread)| progress_bars.add(thread.to_string()))
+        .collect();
+
+    let conn = StressDb::connect(&db, ThreadId::new(usize::MAX), opts.busy_timeout).await?;
     'stmts: for stmt in &ddl_statements {
         let mut retry_counter = 0;
         while retry_counter < 10 {
@@ -653,139 +670,175 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         }
     };
 
-    for thread in 0..opts.nr_threads {
-        if stop {
-            break;
-        }
-        let nr_iterations = opts.nr_iterations;
-        let db = db.clone();
-        let schema_for_task = schema.clone();
-        let busy_timeout = opts.busy_timeout;
-        let tx_mode = opts.tx_mode;
-        let sql_logger = sql_logger.clone();
+    while !stop && !stress_counter.all_done() {
+        let mut handles = Vec::with_capacity(opts.nr_threads);
+        let reopen_requested = Arc::new(AtomicBool::new(false));
+        let all_threads_ready = Arc::new(Barrier::new(stress_counter.incomplete_threads()));
 
-        let mut progress_bar = progress_bars.add(format!("Thread {thread}"));
-
-        let handle = turso_stress::future::spawn(async move {
-            let mut conn = StressDb::connect(&db, thread, busy_timeout).await?;
-
-            let mut rng = ThreadRng::new(global_seed.wrapping_add(thread as u64));
-
-            for i in 0..nr_iterations {
-                if gen_bool(&mut rng, 0.01) {
-                    // Reopen the database
-                    db.lock().await.reset();
-                    conn = StressDb::connect(&db, thread, busy_timeout).await?;
-                } else if gen_bool(&mut rng, 0.02) {
-                    // Reconnect to the database
-                    conn = StressDb::connect(&db, thread, busy_timeout).await?;
-                }
-
-                let tx = if rng.get_random() % 2 == 0 {
-                    match tx_mode {
-                        TxMode::SQLite => Some("BEGIN;"),
-                        TxMode::Concurrent => Some("BEGIN CONCURRENT;"),
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(tx_stmt) = tx {
-                    let _ = conn.execute(tx_stmt, ()).await;
-                }
-
-                let sql = generate_random_statement(&mut rng, &schema_for_task);
-
-                progress_bar.tick();
-                if let Err(turso::Error::Corrupt(e)) = conn.execute(&sql, ()).await {
-                    turso_macros::turso_assert_unreachable!("corrupt error executing query", { "thread": thread, "error": e, "sql": sql });
-                }
-
-                // When inside a transaction, 30% chance to exercise savepoints.
-                // This generates the pattern that exposed the pager rollback bug
-                // in tursodatabase/turso#6176: SAVEPOINT → DML (possibly with
-                // large blobs that allocate new pages) → ROLLBACK TO / RELEASE.
-                if tx.is_some() && rng.get_random() % 100 < 30 {
-                    let sp_name = format!("sp_{}", rng.get_random() % 100);
-                    let savepoint_sql = format!("SAVEPOINT {sp_name};");
-                    let _ = conn.execute(&savepoint_sql, ()).await;
-
-                    // Execute 1-3 DML statements inside the savepoint.
-                    let sp_stmts = 1 + (rng.get_random() % 3) as usize;
-                    for _ in 0..sp_stmts {
-                        let sp_sql = generate_random_statement(&mut rng, &schema_for_task);
-                        if let Err(turso::Error::Corrupt(e)) = conn.execute(&sp_sql, ()).await {
-                            turso_macros::turso_assert_unreachable!("corrupt error in savepoint", { "thread": thread, "error": e, "sql": sp_sql });
-                        }
-                    }
-
-                    // 50% ROLLBACK TO (partial undo), 50% RELEASE (keep changes).
-                    if rng.get_random() % 2 == 0 {
-                        let rollback_sql = format!("ROLLBACK TO {sp_name};");
-                        let _ = conn.execute(&rollback_sql, ()).await;
-                    }
-                    let release_sql = format!("RELEASE {sp_name};");
-                    let _ = conn.execute(&release_sql, ()).await;
-                }
-
-                if tx.is_some() {
-                    let end_tx = if rng.get_random() % 2 == 0 {
-                        "COMMIT;"
-                    } else {
-                        "ROLLBACK;"
-                    };
-                    let _ = conn.execute(end_tx, ()).await;
-                }
-
-                const INTEGRITY_CHECK_INTERVAL: usize = 100;
-                if i % INTEGRITY_CHECK_INTERVAL == 0 {
-                    let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
-                    match res.next().await {
-                        Ok(Some(row)) => {
-                            let value = row.get_value(0).unwrap();
-                            if value != "ok".into() {
-                                sql_logger.log(
-                                    thread,
-                                    "PRAGMA integrity_check",
-                                    &format!("ERROR: {value:?}"),
-                                );
-                                turso_macros::turso_assert_unreachable!("integrity check failed", { "thread": thread, "value": value });
-                            }
-                            sql_logger.log(thread, "PRAGMA integrity_check", "OK");
-                        }
-                        Ok(None) => {
-                            sql_logger.log(thread, "PRAGMA integrity_check", "ERROR: no rows");
-                            turso_macros::turso_assert_unreachable!("integrity check returned no rows", { "thread": thread });
-                        }
-                        Err(e) => {
-                            sql_logger.log(
-                                thread,
-                                "PRAGMA integrity_check",
-                                &format!("ERROR: {e}"),
-                            );
-                            println!("thread#{thread} Error performing integrity check: {e}");
-                        }
-                    }
-                    match res.next().await {
-                        Ok(Some(_)) => {
-                            turso_macros::turso_assert_unreachable!("integrity check returned more than 1 row", { "thread": thread });
-                        }
-                        Err(e) => println!("thread#{thread} Error performing integrity check: {e}"),
-                        _ => {}
-                    }
-                }
+        for (iteration_idx, ((thread_idx, thread), mut progress_bar)) in threads
+            .iter()
+            .cloned()
+            .zip(progress_bars.iter().cloned())
+            .enumerate()
+        {
+            if stress_counter.done(thread_idx) {
+                continue;
+            } else if stop {
+                break;
             }
-            // In case this thread is running an exclusive transaction, commit it so that it doesn't block other threads.
-            let _ = conn.execute("COMMIT", ()).await;
-            progress_bar.finish();
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-        });
-        handles.push(handle);
+
+            let reopen_requested = reopen_requested.clone();
+            let db = db.clone();
+            let schema_for_task = schema.clone();
+            let sql_logger = sql_logger.clone();
+            let all_threads_ready = all_threads_ready.clone();
+            let stress_counter = stress_counter.clone();
+
+            let handle = turso_stress::future::spawn(async move {
+                let mut conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
+                let mut rng = ThreadRng::new(
+                    global_seed
+                        .wrapping_add(thread_idx as u64)
+                        .wrapping_add(iteration_idx as u64 * 1000),
+                );
+                let mut iteration_count_this_batch = 0;
+
+                all_threads_ready.wait().await;
+                for interaction_idx in stress_counter.iteration_idx(thread_idx)..opts.nr_iterations
+                {
+                    if gen_bool(&mut rng, 0.02) {
+                        // Reconnect to the database
+                        conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
+                    }
+
+                    let tx = match opts.tx_mode {
+                        TxMode::SQLite => gen_bool(&mut rng, 0.5).then_some("BEGIN;"),
+                        TxMode::Concurrent => {
+                            gen_bool(&mut rng, 0.9).then_some("BEGIN CONCURRENT;")
+                        }
+                    };
+
+                    if let Some(tx_stmt) = tx {
+                        let _ = conn.execute(tx_stmt, ()).await;
+                    }
+
+                    let sql = generate_random_statement(&mut rng, &schema_for_task);
+
+                    if let Err(turso::Error::Corrupt(e)) = conn.execute(&sql, ()).await {
+                        turso_macros::turso_assert_unreachable!("corrupt error executing query", { "thread": thread, "error": e, "sql": sql });
+                    }
+
+                    // When inside a transaction, 30% chance to exercise savepoints.
+                    // This generates the pattern that exposed the pager rollback bug
+                    // in tursodatabase/turso#6176: SAVEPOINT → DML (possibly with
+                    // large blobs that allocate new pages) → ROLLBACK TO / RELEASE.
+                    if tx.is_some() && rng.get_random() % 100 < 30 {
+                        let sp_name = format!("sp_{}", rng.get_random() % 100);
+                        let savepoint_sql = format!("SAVEPOINT {sp_name};");
+                        let _ = conn.execute(&savepoint_sql, ()).await;
+
+                        // Execute 1-3 DML statements inside the savepoint.
+                        let sp_stmts = 1 + (rng.get_random() % 3) as usize;
+                        for _ in 0..sp_stmts {
+                            let sp_sql = generate_random_statement(&mut rng, &schema_for_task);
+                            if let Err(turso::Error::Corrupt(e)) = conn.execute(&sp_sql, ()).await {
+                                turso_macros::turso_assert_unreachable!("corrupt error in savepoint", { "thread": thread, "error": e, "sql": sp_sql });
+                            }
+                        }
+
+                        // 50% ROLLBACK TO (partial undo), 50% RELEASE (keep changes).
+                        if rng.get_random() % 2 == 0 {
+                            let rollback_sql = format!("ROLLBACK TO {sp_name};");
+                            let _ = conn.execute(&rollback_sql, ()).await;
+                        }
+                        let release_sql = format!("RELEASE {sp_name};");
+                        let _ = conn.execute(&release_sql, ()).await;
+                    }
+
+                    if tx.is_some() {
+                        let end_tx = if rng.get_random() % 2 == 0 {
+                            "COMMIT;"
+                        } else {
+                            "ROLLBACK;"
+                        };
+                        let _ = conn.execute(end_tx, ()).await;
+                    }
+
+                    const INTEGRITY_CHECK_INTERVAL: usize = 100;
+                    if interaction_idx % INTEGRITY_CHECK_INTERVAL == 0 {
+                        let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
+                        match res.next().await {
+                            Ok(Some(row)) => {
+                                let value = row.get_value(0).unwrap();
+                                if value != "ok".into() {
+                                    sql_logger.log(
+                                        &thread,
+                                        "PRAGMA integrity_check",
+                                        &format!("ERROR: {value:?}"),
+                                    );
+                                    turso_macros::turso_assert_unreachable!("integrity check failed", { "thread": thread, "value": value });
+                                }
+                                sql_logger.log(&thread, "PRAGMA integrity_check", "OK");
+                            }
+                            Ok(None) => {
+                                sql_logger.log(&thread, "PRAGMA integrity_check", "ERROR: no rows");
+                                turso_macros::turso_assert_unreachable!("integrity check returned no rows", { "thread": thread });
+                            }
+                            Err(e) => {
+                                sql_logger.log(
+                                    &thread,
+                                    "PRAGMA integrity_check",
+                                    &format!("ERROR: {e}"),
+                                );
+                                println!("thread#{thread} Error performing integrity check: {e}");
+                            }
+                        }
+                        match res.next().await {
+                            Ok(Some(_)) => {
+                                turso_macros::turso_assert_unreachable!("integrity check returned more than 1 row", { "thread": thread });
+                            }
+                            Err(e) => {
+                                println!("thread#{thread} Error performing integrity check: {e}")
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if gen_bool(&mut rng, 0.01 / stress_counter.incomplete_threads() as f64) {
+                        reopen_requested.store(true, Ordering::Release);
+                    }
+                    if reopen_requested.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    progress_bar.tick();
+                    iteration_count_this_batch += 1;
+                }
+
+                // In case this thread is running an exclusive transaction, commit it so that it doesn't block other threads.
+                let _ = conn.execute("COMMIT", ()).await;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                    thread_idx,
+                    iteration_count_this_batch,
+                ))
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let (thread_idx, completed_iteration_count) = handle.await??;
+            stress_counter.register_iterations(thread_idx, completed_iteration_count);
+        }
+
+        // This is what triggers MVCC recovery
+        db.lock().await.reset();
+        clear_database_registry();
     }
 
-    for handle in handles {
-        handle.await??;
-    }
+    progress_bars
+        .into_iter()
+        .for_each(|mut progress_bar| progress_bar.finish());
+
     println!("Database file: {db_file}");
 
     // Switch back to WAL mode before SQLite integrity check if we were in MVCC mode.
