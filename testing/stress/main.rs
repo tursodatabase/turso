@@ -1,9 +1,9 @@
 mod logging;
 mod opts;
+mod progress;
 mod sql_logging;
 
 use clap::Parser;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use opts::{Opts, TxMode};
 #[cfg(not(antithesis))]
 use rand::rngs::StdRng;
@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 use turso::Builder;
 
 use crate::logging::Tracer;
+use crate::progress::ProgressBars;
 use crate::sql_logging::SqlLogger;
 
 /// Represents a column in a SQLite table
@@ -578,13 +579,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     let mut handles = Vec::with_capacity(opts.nr_threads);
     let mut stop = false;
 
-    let multi_progress = MultiProgress::new();
-    let progress_style = ProgressStyle::default_bar()
-        .template(
-            "[{elapsed_precise}] {prefix} {bar:40.cyan/blue} {pos:>7}/{len:7} ({percent}%) {msg}",
-        )
-        .unwrap()
-        .progress_chars("##-");
+    let progress_bars = ProgressBars::new(opts.nr_iterations);
 
     let tempfile = tempfile::NamedTempFile::new()?;
     let (_, path) = tempfile.keep().unwrap();
@@ -694,9 +689,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         let tx_mode = opts.tx_mode;
         let sql_logger = sql_logger.clone();
 
-        let progress_bar = multi_progress.add(ProgressBar::new(nr_iterations as u64));
-        progress_bar.set_style(progress_style.clone());
-        progress_bar.set_prefix(format!("Thread {thread}"));
+        let mut progress_bar = progress_bars.add(format!("Thread {thread}"));
 
         let handle = turso_stress::future::spawn(async move {
             let mut conn = db.lock().await.connect()?;
@@ -704,8 +697,6 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
             conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
 
             conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
-
-            progress_bar.set_message("executing queries...");
 
             let mut rng = ThreadRng::new(global_seed.wrapping_add(thread as u64));
 
@@ -745,7 +736,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
                 let sql = generate_random_statement(&mut rng, &schema_for_task);
 
-                progress_bar.set_position(i as u64);
+                progress_bar.tick();
                 match conn.execute(&sql, ()).await {
                     Ok(_) => {
                         sql_logger.log(thread, &sql, "OK");
@@ -880,7 +871,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                 Ok(_) => sql_logger.log(thread, "COMMIT", "OK"),
                 Err(e) => sql_logger.log(thread, "COMMIT", &format!("ERROR: {e}")),
             }
-            progress_bar.finish_with_message("done");
+            progress_bar.finish();
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         });
         handles.push(handle);
