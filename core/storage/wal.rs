@@ -437,8 +437,8 @@ pub struct PreparedFrames {
     pub offset: u64,
     /// Serialized frame buffers
     pub bufs: Vec<Arc<Buffer>>,
-    /// Per-frame metadata: (page_ref, frame_id, cumulative_checksum)
-    pub metadata: Vec<(PageRef, u64, (u32, u32))>,
+    /// Per-frame metadata: (page_ref, serialized_page_id, frame_id, cumulative_checksum)
+    pub metadata: Vec<(PageRef, u64, u64, (u32, u32))>,
     /// Checksum after all frames in this batch
     pub final_checksum: (u32, u32),
     /// Max frame ID after this batch
@@ -4150,7 +4150,7 @@ impl Wal for WalFile {
                 &data,
             );
             bufs.push(frame_buf);
-            metadata.push((page.clone(), next_frame_id, checksum));
+            metadata.push((page.clone(), page_id as u64, next_frame_id, checksum));
             rolling_checksum = checksum;
             next_frame_id += 1;
         }
@@ -4169,9 +4169,9 @@ impl Wal for WalFile {
     /// and advance max_frame to make frames visible to readers.
     fn commit_prepared_frames(&self, batches: &[PreparedFrames]) {
         for batch in batches {
-            for (page, frame_id, checksum) in &batch.metadata {
+            for (_page, page_id, frame_id, checksum) in &batch.metadata {
                 // Update WAL index mapping page -> frame
-                self.complete_append_frame(page.get().id as u64, *frame_id, *checksum);
+                self.complete_append_frame(*page_id, *frame_id, *checksum);
             }
             // Update rolling checksum
             *self.last_checksum.write() = batch.final_checksum;
@@ -4184,7 +4184,7 @@ impl Wal for WalFile {
     /// Mark pages clean and set WAL tags after durable commit.
     fn finalize_committed_pages(&self, prepared: &[PreparedFrames]) {
         for batch in prepared {
-            for (page, frame_id, _) in &batch.metadata {
+            for (page, _page_id, frame_id, _) in &batch.metadata {
                 page.clear_dirty();
                 page.set_wal_tag(*frame_id, batch.epoch);
             }
@@ -4223,7 +4223,7 @@ impl Wal for WalFile {
 
         // Prepare write buffers and bookkeeping
         let mut iovecs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
-        let mut page_frame_and_checksum: Vec<(PageRef, u64, (u32, u32))> =
+        let mut page_frame_and_checksum: Vec<(PageRef, u64, u64, (u32, u32))> =
             Vec::with_capacity(pages.len());
 
         // Rolling checksum input to each frame build
@@ -4263,7 +4263,12 @@ impl Wal for WalFile {
             iovecs.push(frame_bytes);
 
             // (page, assigned_frame_id, cumulative_checksum_at_this_frame)
-            page_frame_and_checksum.push((page.clone(), next_frame_id, new_checksum));
+            page_frame_and_checksum.push((
+                page.clone(),
+                page_id as u64,
+                next_frame_id,
+                new_checksum,
+            ));
 
             // Advance for the next frame
             rolling_checksum = new_checksum;
@@ -4286,7 +4291,7 @@ impl Wal for WalFile {
                 { "bytes_written": bytes_written, "expected": total_len }
             );
 
-            for (page, fid, _csum) in &page_frame_for_cb {
+            for (page, _page_id, fid, _csum) in &page_frame_for_cb {
                 page.clear_dirty();
                 page.set_wal_tag(*fid, epoch);
             }
@@ -4299,8 +4304,8 @@ impl Wal for WalFile {
 
         self.io.drain_completions(std::slice::from_ref(&c))?;
 
-        for (page, fid, csum) in &page_frame_and_checksum {
-            self.complete_append_frame(page.get().id as u64, *fid, *csum);
+        for (_page, page_id, fid, csum) in &page_frame_and_checksum {
+            self.complete_append_frame(*page_id, *fid, *csum);
         }
 
         Ok(c)
@@ -4434,6 +4439,35 @@ impl WalFile {
         WAL_HEADER_SIZE as u64 + page_offset
     }
 
+    fn scan_latest_frames_for_checkpoint(
+        &self,
+        min_frame: u64,
+        max_frame: u64,
+    ) -> Result<Vec<(u64, u64)>> {
+        if min_frame > max_frame {
+            return Ok(Vec::new());
+        }
+
+        let mut latest = FxHashMap::default();
+        let mut frame = vec![0u8; self.page_size() as usize + WAL_FRAME_HEADER_SIZE];
+        for frame_id in min_frame..=max_frame {
+            let c = self.read_frame_raw(frame_id, &mut frame)?;
+            self.io.wait_for_completion(c)?;
+            let (header, _) = sqlite3_ondisk::parse_wal_frame_header(&frame);
+            if header.page_number == 0 {
+                mark_unlikely();
+                return Err(LimboError::Corrupt(format!(
+                    "WAL frame {frame_id} has page number 0"
+                )));
+            }
+            latest.insert(header.page_number as u64, frame_id);
+        }
+
+        let mut frames: Vec<(u64, u64)> = latest.into_iter().collect();
+        frames.sort_unstable_by_key(|&(page_id, _)| page_id);
+        Ok(frames)
+    }
+
     fn increment_checkpoint_epoch(&self) {
         let prev = self.coordination.bump_checkpoint_epoch();
         tracing::debug!("increment checkpoint epoch: prev={}", prev);
@@ -4537,9 +4571,8 @@ impl WalFile {
                     tracing::debug!(
                         "checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}"
                     );
-                    let mut to_checkpoint = self
-                        .coordination
-                        .iter_latest_frames(oc_min_frame, oc_max_frame);
+                    let mut to_checkpoint =
+                        self.scan_latest_frames_for_checkpoint(oc_min_frame, oc_max_frame)?;
                     // sort by frame_id for read locality
                     to_checkpoint.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
                     {
@@ -5561,7 +5594,9 @@ pub mod test {
             buffer_pool::BufferPool,
             database::{DatabaseFile, DatabaseStorage},
             pager::{allocate_new_page, PageRef},
-            sqlite3_ondisk::{self, PageSize, WAL_HEADER_SIZE},
+            sqlite3_ondisk::{
+                self, DatabaseHeader, PageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
+            },
             wal::READMARK_NOT_USED,
         },
         types::IOResult,
@@ -5569,6 +5604,7 @@ pub mod test {
         Buffer, CheckpointMode, CheckpointResult, Completion, CompletionError, Connection,
         Database, File, LimboError, MemoryIO, OpenFlags, PlatformIO, SyncMode, WalFileShared, IO,
     };
+    use rustc_hash::FxHashSet;
     use std::num::NonZeroUsize;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -5608,6 +5644,16 @@ pub mod test {
         )
         .unwrap();
         // db + tmp directory
+        (db, dbpath)
+    }
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn get_in_process_database() -> (Arc<Database>, std::path::PathBuf) {
+        let mut path = tempfile::tempdir().unwrap().keep();
+        let dbpath = path.clone();
+        path.push("test.db");
+        let io = shared_wal_test_io();
+        let db = Database::open_file(io, path.to_str().unwrap()).unwrap();
         (db, dbpath)
     }
 
@@ -5814,6 +5860,104 @@ pub mod test {
                 Err(err) => panic!("checkpoint should succeed: {err:?}"),
             }
         }
+    }
+
+    fn table_interior_child_pages(page: &[u8], page_id: u32) -> Vec<u64> {
+        let offset = if page_id == 1 {
+            DatabaseHeader::SIZE
+        } else {
+            0
+        };
+        assert_eq!(
+            page[offset], 0x05,
+            "page {page_id} must be a table interior page"
+        );
+        let cell_count = u16::from_be_bytes(page[offset + 3..offset + 5].try_into().unwrap());
+        let mut children = Vec::with_capacity(cell_count as usize + 1);
+        for cell_idx in 0..cell_count as usize {
+            let ptr_offset = offset + 12 + cell_idx * 2;
+            let cell_offset =
+                u16::from_be_bytes(page[ptr_offset..ptr_offset + 2].try_into().unwrap()) as usize;
+            children.push(
+                u32::from_be_bytes(page[cell_offset..cell_offset + 4].try_into().unwrap()) as u64,
+            );
+        }
+        children.push(u32::from_be_bytes(page[offset + 8..offset + 12].try_into().unwrap()) as u64);
+        children
+    }
+
+    #[test]
+    fn test_checkpoint_scans_wal_when_frame_cache_misses_parent_child_page() {
+        let (db, path) = get_in_process_database();
+        let conn = db.connect().unwrap();
+        conn.wal_auto_actions_disable();
+        conn.execute("PRAGMA page_size=512; PRAGMA journal_mode=WAL")
+            .unwrap();
+        conn.execute("CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB NOT NULL)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for k in 1..=360 {
+            conn.execute(format!("INSERT INTO t VALUES({k}, zeroblob(300))"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+
+        let pager = conn.pager.load();
+        let wal = pager.wal.as_ref().unwrap();
+        let wal_file = wal
+            .as_any()
+            .downcast_ref::<crate::WalFile>()
+            .expect("test database uses WalFile");
+        let snapshot = wal_file.load_coordination_snapshot();
+        let frames = wal_file
+            .coordination
+            .iter_latest_frames(0, snapshot.max_frame);
+        let root_frame = frames
+            .iter()
+            .find_map(|&(page_id, frame_id)| (page_id == 2).then_some(frame_id))
+            .expect("table root page must be in the WAL");
+        let mut root_frame_bytes = vec![0u8; wal_file.page_size() as usize + WAL_FRAME_HEADER_SIZE];
+        let read = wal_file
+            .read_frame_raw(root_frame, &mut root_frame_bytes)
+            .unwrap();
+        wal_file.io.wait_for_completion(read).unwrap();
+        let (_, root_page) = sqlite3_ondisk::parse_wal_frame_header(&root_frame_bytes);
+        let frame_pages: FxHashSet<u64> = frames.iter().map(|&(page_id, _)| page_id).collect();
+        let omitted_child = table_interior_child_pages(root_page, 2)
+            .into_iter()
+            .find(|child| frame_pages.contains(child))
+            .expect("at least one root child page must be in the WAL");
+
+        // This is the synthetic part of the regression: Antithesis left us with
+        // a parent page in a later WAL generation pointing at a child page whose
+        // frame had not been backfilled. Model that volatile state by removing
+        // the child from the process-local frame cache; the SQL flow and the
+        // checkpoint/integrity-check calls around it are normal user APIs.
+        {
+            let shared = wal_file.coordination.shared_wal_state();
+            let shared = shared.read();
+            let removed = shared.runtime.frame_cache.lock().remove(&omitted_child);
+            assert!(
+                removed.is_some(),
+                "setup must remove a child frame from the process-local frame cache"
+            );
+        }
+
+        run_checkpoint_until_done(
+            &pager,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        );
+
+        let rows = conn
+            .prepare("PRAGMA integrity_check")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(&rows[0][0].to_string(), "ok");
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

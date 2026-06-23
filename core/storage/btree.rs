@@ -3841,44 +3841,17 @@ impl BTreeCursor {
                     let parent_contents = parent_page.get_contents();
                     let mut sibling_count_new = *sibling_count_new;
                     let is_table_leaf = matches!(page_type, PageType::TableLeaf);
-                    // Reassign page numbers in increasing order
+                    #[cfg(debug_assertions)]
                     {
-                        let mut page_numbers: [usize; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE] =
-                            [0; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE];
-                        for (i, page) in pages_to_balance_new
-                            .iter()
-                            .take(sibling_count_new)
-                            .enumerate()
-                        {
-                            page_numbers[i] = page.as_ref().unwrap().get().id;
-                        }
-                        page_numbers.sort_unstable();
-                        for (page, new_id) in pages_to_balance_new
-                            .iter()
-                            .take(sibling_count_new)
-                            .rev()
-                            .zip(page_numbers.iter().rev().take(sibling_count_new))
-                        {
-                            let page = page.as_ref().unwrap();
-                            if *new_id != page.get().id {
-                                page.get().id = *new_id;
-                                self.pager
-                                    .upsert_page_in_cache(*new_id, page.0.clone(), true)?;
-                            }
-                        }
-
-                        #[cfg(debug_assertions)]
-                        {
+                        tracing::debug!(
+                            "balance_non_root(parent page_id={})",
+                            parent_page.get().id
+                        );
+                        for page in pages_to_balance_new.iter().take(sibling_count_new) {
                             tracing::debug!(
-                                "balance_non_root(parent page_id={})",
-                                parent_page.get().id
+                                "balance_non_root(new_sibling page_id={})",
+                                page.as_ref().unwrap().get().id
                             );
-                            for page in pages_to_balance_new.iter().take(sibling_count_new) {
-                                tracing::debug!(
-                                    "balance_non_root(new_sibling page_id={})",
-                                    page.as_ref().unwrap().get().id
-                                );
-                            }
                         }
                     }
 

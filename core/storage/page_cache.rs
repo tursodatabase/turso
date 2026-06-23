@@ -236,6 +236,25 @@ impl PageCache {
     ) -> Result<(), CacheError> {
         trace!("insert(key={:?})", key);
 
+        #[cfg(debug_assertions)]
+        {
+            for (existing_key, &entry_ptr) in &self.map {
+                if *existing_key == key {
+                    continue;
+                }
+                let entry = unsafe { &*entry_ptr };
+                turso_assert!(
+                    !Arc::ptr_eq(&entry.page, &value),
+                    "same page ref cannot be cached under multiple page ids",
+                    {
+                        "existing_page_id": existing_key.0,
+                        "new_page_id": key.0,
+                        "actual_page_id": value.get().id
+                    }
+                );
+            }
+        }
+
         if let Some(&entry_ptr) = self.map.get(&key) {
             let entry = unsafe { &mut *entry_ptr };
             let p = &entry.page;

@@ -110,6 +110,126 @@ fn test_savepoint_rollback_after_cache_spill_preserves_wal_pages(
     Ok(())
 }
 
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_non_root_balance_reused_freelist_page_persists_in_wal(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA page_size=512;")?;
+    conn.execute("PRAGMA journal_mode=WAL;")?;
+    conn.execute("PRAGMA cache_size=50;")?;
+    conn.execute("CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB NOT NULL);")?;
+
+    for k in 1..=360 {
+        conn.execute(&format!("INSERT INTO t(k, v) VALUES ({k}, zeroblob(80));"))?;
+    }
+
+    execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
+    conn.execute("DELETE FROM t WHERE k BETWEEN 80 AND 170;")?;
+    execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
+
+    conn.execute("BEGIN;")?;
+    for k in 80..=170 {
+        conn.execute(&format!("INSERT INTO t(k, v) VALUES ({k}, zeroblob(300));"))?;
+    }
+    conn.execute("COMMIT;")?;
+
+    // Use a separate database handle so the check reads the committed WAL
+    // instead of the writer connection's page cache.
+    let verify_db = TempDatabase::new_with_existent(&tmp_db.path);
+    let verify_conn = verify_db.connect_limbo();
+    let res = execute_and_get_strings(&verify_conn, "PRAGMA integrity_check;")?;
+    assert_eq!(res, vec!["ok"]);
+
+    Ok(())
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_antithesis_like_savepoint_rebalance_does_not_persist_invalid_page_type(
+    tmp_db: TempDatabase,
+) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA page_size=512;")?;
+    conn.execute("PRAGMA journal_mode=WAL;")?;
+    conn.execute("PRAGMA cache_size=50;")?;
+    conn.execute(
+        "CREATE TABLE calm_roof_888 (
+            cold_door_963 BLOB,
+            big_bird_239 REAL,
+            wet_stone_286 INTEGER NOT NULL PRIMARY KEY,
+            hot_door_96 INTEGER,
+            brave_lake_630 INTEGER
+        );",
+    )?;
+
+    for k in 1..=360 {
+        conn.execute(&format!(
+            "INSERT INTO calm_roof_888
+             (cold_door_963, big_bird_239, wet_stone_286, hot_door_96, brave_lake_630)
+             VALUES (zeroblob(80), 1.25, {k}, {k}, {k});"
+        ))?;
+    }
+
+    execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
+    conn.execute("DELETE FROM calm_roof_888 WHERE wet_stone_286 BETWEEN 80 AND 170;")?;
+    execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
+
+    conn.execute("BEGIN;")?;
+    for k in 80..94 {
+        conn.execute(&format!(
+            "INSERT INTO calm_roof_888
+             (cold_door_963, big_bird_239, wet_stone_286, hot_door_96, brave_lake_630)
+             VALUES (zeroblob(300), 2.50, {k}, {k}, {k});"
+        ))?;
+    }
+    let duplicate = conn.execute(
+        "INSERT INTO calm_roof_888
+         (cold_door_963, big_bird_239, wet_stone_286, hot_door_96, brave_lake_630)
+         VALUES (zeroblob(2296), 8.15, 60, 255, 261);",
+    );
+    assert!(matches!(duplicate, Err(LimboError::Constraint(_))));
+    conn.execute("SAVEPOINT sp_59;")?;
+    for k in 94..=97 {
+        conn.execute(&format!(
+            "INSERT INTO calm_roof_888
+             (cold_door_963, big_bird_239, wet_stone_286, hot_door_96, brave_lake_630)
+             VALUES (zeroblob(300), 2.50, {k}, {k}, {k});"
+        ))?;
+    }
+    conn.execute("ROLLBACK TO sp_59;")?;
+    conn.execute("RELEASE sp_59;")?;
+    conn.execute("ROLLBACK;")?;
+
+    conn.execute(
+        "UPDATE calm_roof_888
+         SET cold_door_963 = x'6269675f646f6f725f333239',
+             big_bird_239 = 2.24,
+             hot_door_96 = 449,
+             brave_lake_630 = 512
+         WHERE wet_stone_286 = 777;",
+    )?;
+    conn.execute("BEGIN;")?;
+    conn.execute(
+        "UPDATE calm_roof_888
+         SET cold_door_963 = x'626c75655f626972645f3230',
+             big_bird_239 = 6.64,
+             hot_door_96 = 980,
+             brave_lake_630 = 642
+         WHERE wet_stone_286 = 848;",
+    )?;
+    conn.execute("COMMIT;")?;
+
+    let verify_db = TempDatabase::new_with_existent(&tmp_db.path);
+    let verify_conn = verify_db.connect_limbo();
+    let res = execute_and_get_strings(&verify_conn, "PRAGMA integrity_check;")?;
+    assert_eq!(res, vec!["ok"]);
+
+    Ok(())
+}
 #[test]
 #[ignore = "ignored for now because it's flaky"]
 fn test_wal_1_writer_1_reader() -> Result<()> {
