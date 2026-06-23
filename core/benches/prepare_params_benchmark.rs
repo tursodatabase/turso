@@ -79,6 +79,7 @@ fn build_insert(rows: usize) -> String {
     sql
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_prepare_params(c: &mut Criterion) {
     let mut group = c.benchmark_group("prepare_multirow_insert");
 

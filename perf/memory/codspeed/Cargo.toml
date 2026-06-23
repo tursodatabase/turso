@@ -10,6 +10,9 @@ edition = "2024"
 license.workspace = true
 publish = false
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)'] }
+
 [features]
 codspeed = []
 
@@ -18,6 +21,7 @@ memory-benchmark = { path = ".." }
 tokio = { workspace = true, default-features = true, features = ["full"] }
 criterion = { workspace = true }
 codspeed-criterion-compat = { workspace = true }
+turso_macros = { workspace = true }
 
 [[bench]]
 name = "memory_profiles"

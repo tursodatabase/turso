@@ -63,6 +63,7 @@ fn base_workload_size(workload: WorkloadProfile) -> (usize, usize) {
     }
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_memory_profiles(c: &mut Criterion) {
     let work_dir = std::env::temp_dir().join(format!("turso-memory-bench-{}", std::process::id()));
     std::fs::create_dir_all(&work_dir).expect("failed to create bench work dir");
@@ -89,6 +90,7 @@ fn bench_memory_profiles(c: &mut Criterion) {
     }
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_workload(
     c: &mut Criterion,
     work_dir: &std::path::Path,

@@ -62,6 +62,11 @@ limbo/
 - **[Async I/O Model](docs/agent-guides/async-io-model.md)** - IOResult, state machines, re-entrancy
 - **[MVCC](docs/agent-guides/mvcc.md)** - experimental multi-version concurrency (WIP)
 
+## Benchmark Naming
+
+- Criterion benchmark functions must use `#[turso_macros::codspeed_criterion_benchmark]` so stable and nightly CodSpeed runs get distinct benchmark names.
+- Divan benchmark functions must use `#[turso_macros::divan_bench]` for the same stable/nightly naming behavior.
+
 ## Core Principles
 
 1. **Correctness paramount.** Production DB, not a toy. Crash > corrupt
