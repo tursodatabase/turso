@@ -414,7 +414,8 @@ pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
         ast::Literal::Numeric(val) => parse_numeric_literal(val),
         ast::Literal::String(s) => Ok(Value::from_text(crate::translate::expr::sanitize_string(s))),
         ast::Literal::Blob(s) => Ok(Value::Blob(
-            s.as_bytes()
+            ast::blob_literal_hex(s)
+                .as_bytes()
                 .chunks_exact(2)
                 .map(|pair| {
                     let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
