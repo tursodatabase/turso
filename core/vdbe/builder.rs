@@ -1491,6 +1491,36 @@ impl ProgramBuilder {
         self.cursor_overrides.insert(table_ref_id.into(), cursor_id);
     }
 
+    /// Run `f` while reads for this table use `cursor_id`.
+    ///
+    /// The caller must already control where `cursor_id` is positioned. The
+    /// main use is automatic-index construction for virtual generated columns:
+    /// the ephemeral index entry is still being assembled, so generated-column
+    /// expressions cannot read their same-table dependencies from that index.
+    /// They must read from the source table cursor that the auto-index loop has
+    /// positioned with `Rewind` and `Next`.
+    ///
+    /// A register-backed generated-column context could avoid this override,
+    /// but it would also have to model dependencies between generated columns.
+    /// Keeping this scoped lets us reuse the normal expression emitter while
+    /// restoring the previous cursor choice after `f` returns.
+    pub fn with_cursor_override<T>(
+        &mut self,
+        table_ref_id: TableInternalId,
+        cursor_id: CursorID,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let table_id = table_ref_id.into();
+        let previous = self.cursor_overrides.insert(table_id, cursor_id);
+        let result = f(self);
+        if let Some(previous) = previous {
+            self.cursor_overrides.insert(table_id, previous);
+        } else {
+            self.cursor_overrides.remove(&table_id);
+        }
+        result
+    }
+
     /// Clear the cursor override for a table.
     pub fn clear_cursor_override(&mut self, table_ref_id: TableInternalId) {
         self.cursor_overrides.remove(&table_ref_id.into());

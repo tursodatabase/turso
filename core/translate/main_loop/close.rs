@@ -493,30 +493,47 @@ pub(super) fn emit_autoindex(
         pc_if_empty: label_ephemeral_build_loop_start,
     });
     program.preassign_label_to_next_insn(label_ephemeral_build_loop_start);
-    // Emit all columns from source table that are needed in the ephemeral index.
+    let contains_virtual_column = table_columns.is_some_and(|columns| {
+        index.columns.iter().any(|col| {
+            columns
+                .get(col.pos_in_table)
+                .is_some_and(crate::schema::Column::is_virtual_generated)
+        })
+    });
+
     // Also reserve a register for the rowid if the source table has rowids.
     let num_regs_to_reserve = index.columns.len() + table_has_rowid as usize;
     let ephemeral_cols_start_reg = program.alloc_registers(num_regs_to_reserve);
-    for (i, col) in index.columns.iter().enumerate() {
-        let reg = ephemeral_cols_start_reg + i;
-        if let Some(columns) = table_columns {
-            if let Some(column_def) = columns.get(col.pos_in_table) {
-                if column_def.is_virtual_generated() {
-                    crate::translate::expr::emit_table_column(
-                        program,
-                        table_cursor_id,
-                        table_ref_id,
-                        table_references,
-                        column_def,
-                        col.pos_in_table,
-                        reg,
-                        resolver,
-                    )?;
-                    continue;
-                }
-            }
-        }
-        program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, reg);
+    if contains_virtual_column {
+        // A virtual generated column is computed by running the expression
+        // stored in the schema. If that expression mentions another column from
+        // the same table, normal SELECT code may try to fetch that other column
+        // from the index chosen for the query. While this automatic index is
+        // being filled, that index is empty/in-progress, so those reads must
+        // come from the source table row instead.
+        program.with_cursor_override(table_ref_id, table_cursor_id, |program| {
+            emit_autoindex_columns(
+                program,
+                index,
+                table_cursor_id,
+                table_columns,
+                table_ref_id,
+                table_references,
+                resolver,
+                ephemeral_cols_start_reg,
+            )
+        })?;
+    } else {
+        emit_autoindex_columns(
+            program,
+            index,
+            table_cursor_id,
+            table_columns,
+            table_ref_id,
+            table_references,
+            resolver,
+            ephemeral_cols_start_reg,
+        )?;
     }
     if table_has_rowid {
         program.emit_insn(Insn::RowId {
@@ -557,4 +574,44 @@ pub(super) fn emit_autoindex(
     });
     program.preassign_label_to_next_insn(label_ephemeral_build_end);
     Ok(AutoIndexResult { use_bloom_filter })
+}
+
+/// Fill registers with the values that will become one automatic-index entry.
+///
+/// Ordinary columns are copied directly from the current table row. Virtual
+/// generated columns are recomputed here because their values are not stored in
+/// the table row; their expression may read other columns from that same row.
+#[expect(clippy::too_many_arguments)]
+fn emit_autoindex_columns(
+    program: &mut ProgramBuilder,
+    index: &Index,
+    table_cursor_id: CursorID,
+    table_columns: Option<&[crate::schema::Column]>,
+    table_ref_id: turso_parser::ast::TableInternalId,
+    table_references: &TableReferences,
+    resolver: &Resolver<'_>,
+    ephemeral_cols_start_reg: usize,
+) -> Result<()> {
+    for (i, col) in index.columns.iter().enumerate() {
+        let reg = ephemeral_cols_start_reg + i;
+        if let Some(columns) = table_columns {
+            if let Some(column_def) = columns.get(col.pos_in_table) {
+                if column_def.is_virtual_generated() {
+                    crate::translate::expr::emit_table_column(
+                        program,
+                        table_cursor_id,
+                        table_ref_id,
+                        table_references,
+                        column_def,
+                        col.pos_in_table,
+                        reg,
+                        resolver,
+                    )?;
+                    continue;
+                }
+            }
+        }
+        program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, reg);
+    }
+    Ok(())
 }
