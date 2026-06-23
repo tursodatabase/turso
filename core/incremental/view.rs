@@ -1446,6 +1446,7 @@ mod tests {
                 None,
                 ColDef {
                     primary_key: true,
+                    primary_key_is_inline: true,
                     rowid_alias: true,
                     notnull: true,
                     explicit_notnull: false,
@@ -1479,6 +1480,7 @@ mod tests {
                 None,
                 ColDef {
                     primary_key: true,
+                    primary_key_is_inline: true,
                     rowid_alias: true,
                     notnull: true,
                     explicit_notnull: false,
@@ -1525,6 +1527,7 @@ mod tests {
                 None,
                 ColDef {
                     primary_key: true,
+                    primary_key_is_inline: true,
                     rowid_alias: true,
                     notnull: true,
                     explicit_notnull: false,

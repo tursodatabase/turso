@@ -11465,7 +11465,7 @@ pub fn op_reset_sorter(
     let cursor = state.get_cursor(*cursor_id);
 
     match cursor_type {
-        CursorType::BTreeTable(_) => {
+        CursorType::BTreeTable(_) | CursorType::BTreeIndex(_) => {
             let cursor = cursor.as_btree_mut();
             return_if_io!(cursor.clear_btree());
         }
@@ -14487,6 +14487,9 @@ pub fn op_alter_column(
                     } else if ic.name.eq_ignore_ascii_case(&existing_column_name) {
                         ic.name.clone_from(&new_name);
                     }
+                    if let Some(expr) = ic.expr.as_mut() {
+                        rename_identifiers(expr, &old_column_name, &new_name);
+                    }
                 }
                 // Update partial index WHERE clause column references
                 if let Some(ref mut wc) = idx.where_clause {
@@ -14518,6 +14521,35 @@ pub fn op_alter_column(
                 }
             }
         } else {
+            let old_col_normalized = normalize_ident(&old_column_name);
+            let drops_inline_primary_key = btree.columns()[*column_index].primary_key_is_inline();
+            let drops_inline_unique = btree.columns()[*column_index].unique();
+
+            if drops_inline_primary_key {
+                btree
+                    .primary_key_columns
+                    .retain(|(name, _)| !name.eq_ignore_ascii_case(&old_col_normalized));
+                btree.unique_sets.retain(|unique_set| {
+                    !(unique_set.is_primary_key
+                        && unique_set.columns.len() == 1
+                        && unique_set.columns[0]
+                            .0
+                            .eq_ignore_ascii_case(&old_col_normalized))
+                });
+                btree.has_autoincrement = false;
+                btree.rowid_alias_conflict_clause = None;
+            }
+
+            if drops_inline_unique {
+                btree.unique_sets.retain(|unique_set| {
+                    !(!unique_set.is_primary_key
+                        && unique_set.columns.len() == 1
+                        && unique_set.columns[0]
+                            .0
+                            .eq_ignore_ascii_case(&old_col_normalized))
+                });
+            }
+
             btree.columns_mut()[*column_index] = new_column.clone();
         }
 
