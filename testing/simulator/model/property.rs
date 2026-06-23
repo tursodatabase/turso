@@ -162,7 +162,7 @@ pub enum Property {
     /// implementation in the database. It relies on the fact that `SELECT * FROM <t
     /// > WHERE <predicate> UNION ALL SELECT * FROM <t> WHERE <predicate>`
     /// should return the same number of rows as `SELECT <predicate> FROM <t> WHERE <predicate>`.
-    /// > The property is succesfull when the UNION ALL of 2 select queries returns the same number of rows
+    /// > The property is successful when the UNION ALL of 2 select queries returns the same number of rows
     /// > as the sum of the two select queries.
     UnionAllPreservesCardinality {
         select: Select,

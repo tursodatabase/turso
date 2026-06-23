@@ -1063,7 +1063,7 @@ pub(crate) struct SimulatorEnv {
     ///
     /// E.g Select, Insert, Create
     /// and not Begin, Commit, Rollback \
-    /// Has max size of 64 to accomodate 64 connections
+    /// Has max size of 64 to accommodate 64 connections
     connection_last_query: Bitmap<64>,
     // Table data that is committed into the database or wal
     pub committed_tables: Vec<Table>,

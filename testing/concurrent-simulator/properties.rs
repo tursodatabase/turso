@@ -75,8 +75,8 @@ pub struct SimpleKeysDoNotDisappear {
     pub txn_started_at: HashMap<u64, u64>,
     /// map of simple keys addition moment: TxnId -> (Table, Key) -> AdditionMoment
     /// For every transaction we put information about key addition moment which equals to end of successful INSERT operation
-    /// We use None key to represent "commited" state of the database
-    /// The "commited" state modified by operations in auto-commit mode (txn_id is None) or after successful COMMIT operation
+    /// We use None key to represent "committed" state of the database
+    /// The "committed" state modified by operations in auto-commit mode (txn_id is None) or after successful COMMIT operation
     pub simple_keys_added_at: HashMap<Option<u64>, HashMap<(String, String), u64>>,
 }
 
@@ -119,7 +119,7 @@ impl Property for SimpleKeysDoNotDisappear {
             self.simple_keys_added_at.remove(&txn_id);
         }
 
-        // on successful COMMIT we move information about current transaction keys to the "commited" state (None key in the map)
+        // on successful COMMIT we move information about current transaction keys to the "committed" state (None key in the map)
         // note, that we use end_exec_id of current COMMIT operation as AdditionMoment of moved keys
         if let Operation::Commit = &op {
             if let Some(keys) = self.simple_keys_added_at.remove(&txn_id) {
@@ -183,9 +183,9 @@ impl Property for SimpleKeysDoNotDisappear {
             }
         }
 
-        // on successful SELECT get information about the key AdditionMoment from the "commited" state: key_exec_id
+        // on successful SELECT get information about the key AdditionMoment from the "committed" state: key_exec_id
         // calculate our current ViewMoment as start_exec_id (in auto-commit mode) or start moment of the current transaction: view_exec_id
-        // if we have information about key in the "commited" state and key_exec_id < view_exec_id -> then key MUST be visible
+        // if we have information about key in the "committed" state and key_exec_id < view_exec_id -> then key MUST be visible
         if let Operation::SimpleSelect { table_name, key } = &op {
             let search_key = (table_name.clone(), key.clone());
             let key_exec_id = self

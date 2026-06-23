@@ -140,7 +140,7 @@ fn test_hermitage_g0_write_cycles_prevented() {
 /// If a transaction T1 updates a row but then aborts, another transaction T2 should never see
 /// T1's uncommitted changes, even if T2 reads the same row before T1 aborts.
 ///
-/// Since we don't allow reading uncommited data ever, we prevent g1a and also dirty update phenomena
+/// Since we don't allow reading uncommitted data ever, we prevent g1a and also dirty update phenomena
 /// (mentioned in the jepsen page)
 ///
 /// Turso: T2 never sees T1's uncommitted write

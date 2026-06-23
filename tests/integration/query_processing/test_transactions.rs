@@ -8,7 +8,7 @@ use crate::common::{assert_checkpoint_preserves_content, ExecRows, TempDatabase}
 // Test a scenario where there are two concurrent deferred transactions:
 //
 // 1. Both transactions T1 and T2 start at the same time.
-// 2. T1 writes to the database succesfully, but does not commit.
+// 2. T1 writes to the database successfully, but does not commit.
 // 3. T2 attempts to write to the database, but gets busy error.
 // 4. T1 commits
 // 5. T2 attempts to write again and succeeds. This is because the transaction

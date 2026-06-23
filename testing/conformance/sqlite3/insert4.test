@@ -132,7 +132,7 @@ xferopt_test insert4-2.4.4 0
 # The TESTID argument is the symbolic name for this test.  The XFER-USED
 # argument is true if the transfer optimization should be employed and
 # false if not.  INIT-DATA is a single row of data that is to be 
-# transfered.  DEST-SCHEMA and SRC-SCHEMA are table declarations for
+# transferred.  DEST-SCHEMA and SRC-SCHEMA are table declarations for
 # the destination and source tables.
 #
 proc xfer_check {testid xferused initdata destschema srcschema} {

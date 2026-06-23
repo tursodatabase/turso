@@ -330,7 +330,7 @@ impl Property {
                         let sim_table = conn_tables
                             .iter()
                             .find(|t| t.name == table)
-                            .expect("table should be in enviroment");
+                            .expect("table should be in environment");
                         let expected: Vec<Vec<SimValue>> = sim_table
                             .rows
                             .iter()
@@ -987,7 +987,7 @@ impl Property {
                 // then when IO is called the fault triggers. It may happen that a fault is injected
                 // but no IO happens right after it
                 let assert = Assertion::new(
-                    "fault occured".to_string(),
+                    "fault occurred".to_string(),
                     move |stack, env: &mut SimulatorEnv| {
                         let last = stack.last().unwrap();
                         match last {
