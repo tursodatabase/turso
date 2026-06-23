@@ -24,7 +24,7 @@ members = [
     "testing/stress",
     "testing/sqlite_test_ext",
     "tests",
-    "parser",
+    "sqlite/parser",
     "sync/engine",
     "sync/sdk-kit",
     "sql_generation",
@@ -67,7 +67,7 @@ default-members = [
     "testing/stress",
     "testing/sqlite_test_ext",
     "tests",
-    "parser",
+    "sqlite/parser",
     "sync/engine",
     "sync/sdk-kit",
     "sql_generation",
@@ -102,7 +102,7 @@ turso_core = { path = "core", version = "0.7.0-pre.10" }
 turso_sync_engine = { path = "sync/engine", version = "0.7.0-pre.10" }
 turso_ext = { path = "extensions/core", version = "0.7.0-pre.10" }
 turso_macros = { path = "macros", version = "0.7.0-pre.10" }
-turso_parser = { path = "parser", version = "0.7.0-pre.10" }
+turso_parser = { path = "sqlite/parser", version = "0.7.0-pre.10" }
 sql_generation = { path = "sql_generation" }
 turso-dbhash = { path = "tools/dbhash" }
 strum = { version = "0.26", features = ["derive"] }
