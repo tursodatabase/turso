@@ -25,9 +25,9 @@ use crate::{
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
     BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
-    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
-    Parser, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
-    Trigger, Value, VirtualTable, WalAutoActions,
+    EncryptionKey, EncryptionOpts, IOResult, IndexMethod, LimboError, MvStore, OpenFlags, PageSize,
+    Pager, Parser, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode,
+    TransactionMode, Trigger, Value, VirtualTable, WalAutoActions,
 };
 use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
@@ -230,6 +230,48 @@ enum ReparsePhase {
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
     },
+}
+
+#[cfg(not(feature = "fs"))]
+#[derive(Default)]
+pub(crate) enum AttachDatabaseState {
+    #[default]
+    Start,
+}
+
+#[cfg(feature = "fs")]
+#[derive(Default)]
+pub(crate) enum AttachDatabaseState {
+    #[default]
+    Start,
+    Init(Box<AttachDatabaseInitState>),
+    Bootstrap(Box<AttachDatabaseBootstrapState>),
+    Publish {
+        alias: String,
+        db: Arc<Database>,
+        pager: Arc<Pager>,
+    },
+    Done,
+}
+
+#[cfg(feature = "fs")]
+pub(crate) struct AttachDatabaseInitState {
+    alias: String,
+    reserved_space: Option<u8>,
+    db: Arc<Database>,
+    attached_is_fresh: bool,
+    encryption_key: Option<EncryptionKey>,
+    init_st: crate::InitState,
+}
+
+#[cfg(feature = "fs")]
+pub(crate) struct AttachDatabaseBootstrapState {
+    alias: String,
+    db: Arc<Database>,
+    pager: Arc<Pager>,
+    encryption_key: Option<EncryptionKey>,
+    bootstrap_conn: Option<Arc<Connection>>,
+    bootstrap_st: crate::mvcc::database::BootstrapState,
 }
 
 /// Re-entrant driver state for
@@ -1847,11 +1889,9 @@ impl Connection {
             return Ok(false);
         };
         match self.get_pager().io.wait_for_completion(c) {
-            #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
-            Err(LimboError::CompletionError(crate::error::CompletionError::IOError(
-                std::io::ErrorKind::UnexpectedEof,
-                _,
-            ))) => {
+            Err(LimboError::CompletionError(err))
+                if Self::wal_watermark_read_error_is_absent_page(&err) =>
+            {
                 return Ok(false);
             }
             Err(e) => return Err(e),
@@ -1859,6 +1899,28 @@ impl Connection {
         }
 
         self.try_wal_watermark_read_page_end(page, page_ref)
+    }
+
+    /// Classify a completion error raised while reading a page at a fixed WAL
+    /// watermark. On Windows under `experimental_win_iocp`, an absent /
+    /// zero-length page read surfaces as `UnexpectedEof` (see
+    /// `core/io/win_iocp.rs`); every watermark-read site must treat that as
+    /// "page absent" (size 0) rather than a hard error. Centralized here so the
+    /// platform handling cannot drift across the (now four) call sites.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn wal_watermark_read_error_is_absent_page(err: &crate::error::CompletionError) -> bool {
+        #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+        {
+            matches!(
+                err,
+                crate::error::CompletionError::IOError(std::io::ErrorKind::UnexpectedEof, _)
+            )
+        }
+        #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+        {
+            let _ = err;
+            false
+        }
     }
 
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -2914,10 +2976,15 @@ impl Connection {
 
     /// Attach a database file with the given alias name
     #[cfg(not(feature = "fs"))]
-    pub(crate) fn attach_database(&self, _path: &str, _alias: &str) -> Result<()> {
-        return Err(LimboError::InvalidArgument(format!(
-            "attach not available in this build (no-fs)"
-        )));
+    pub(crate) fn attach_database(
+        &self,
+        _path: &str,
+        _alias: &str,
+        _state: &mut AttachDatabaseState,
+    ) -> Result<IOResult<()>> {
+        Err(LimboError::InvalidArgument(
+            "attach not available in this build (no-fs)".to_string(),
+        ))
     }
 
     #[cfg(not(feature = "fs"))]
@@ -2926,16 +2993,22 @@ impl Connection {
         _path: &str,
         _alias: &str,
         _reserved_space: Option<u8>,
-    ) -> Result<()> {
+        _state: &mut AttachDatabaseState,
+    ) -> Result<IOResult<()>> {
         // File-backed ATTACH is unavailable without `fs`, so pre-initialization
         // page-layout overrides are also unsupported in this build.
-        self.attach_database(_path, _alias)
+        self.attach_database(_path, _alias, _state)
     }
 
     /// Attach a database file with the given alias name
     #[cfg(feature = "fs")]
-    pub(crate) fn attach_database(&self, path: &str, alias: &str) -> Result<()> {
-        self.attach_database_inner(path, alias, None)
+    pub(crate) fn attach_database(
+        &self,
+        path: &str,
+        alias: &str,
+        state: &mut AttachDatabaseState,
+    ) -> Result<IOResult<()>> {
+        self.attach_database_with_config(path, alias, None, state)
     }
 
     /// Attach a database file with an optional pre-initialization reserved-space override.
@@ -2946,102 +3019,175 @@ impl Connection {
         path: &str,
         alias: &str,
         reserved_space: Option<u8>,
-    ) -> Result<()> {
-        self.attach_database_inner(path, alias, reserved_space)
-    }
+        state: &mut AttachDatabaseState,
+    ) -> Result<IOResult<()>> {
+        loop {
+            match state {
+                AttachDatabaseState::Start => {
+                    if self.is_closed() {
+                        return Err(LimboError::InternalError("Connection closed".to_string()));
+                    }
 
-    #[cfg(feature = "fs")]
-    fn attach_database_inner(
-        &self,
-        path: &str,
-        alias: &str,
-        reserved_space: Option<u8>,
-    ) -> Result<()> {
-        if self.is_closed() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+                    if self.is_attached(alias) {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "database {alias} is already in use"
+                        )));
+                    }
+
+                    if alias.eq_ignore_ascii_case("main") || alias.eq_ignore_ascii_case("temp") {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "reserved name {alias} is already in use"
+                        )));
+                    }
+
+                    let db_opts = DatabaseOpts::new()
+                        .with_views(self.db.experimental_views_enabled())
+                        .with_custom_types(self.db.experimental_custom_types_enabled())
+                        .with_index_method(self.db.experimental_index_method_enabled())
+                        .with_vacuum(self.db.experimental_vacuum_enabled())
+                        .with_generated_columns(self.db.experimental_generated_columns_enabled())
+                        .with_without_rowid(self.db.experimental_without_rowid_enabled());
+                    let is_memory_db = is_memory_like(path);
+                    let io: Arc<dyn IO> = if is_memory_db {
+                        Arc::new(MemoryIO::new())
+                    } else if self.db.is_in_memory_db() {
+                        Database::io_for_path(path)?
+                    } else {
+                        self.db.io.clone()
+                    };
+                    let main_db_flags = self.db.open_flags;
+                    let (db, encryption_opts) =
+                        Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
+                    let attached_is_fresh = !db.initialized();
+                    if !is_memory_db {
+                        Self::validate_attach_target(&db, attached_is_fresh, alias)?;
+                    }
+                    self.reject_unsupported_fresh_mvcc_attach_durable_storage(
+                        alias,
+                        &db,
+                        attached_is_fresh,
+                    )?;
+
+                    let encryption_key = if let Some(ref enc) = encryption_opts {
+                        Some(EncryptionKey::from_hex_string(&enc.hexkey)?)
+                    } else {
+                        None
+                    };
+
+                    *state = AttachDatabaseState::Init(Box::new(AttachDatabaseInitState {
+                        alias: alias.to_string(),
+                        reserved_space,
+                        db,
+                        attached_is_fresh,
+                        encryption_key,
+                        init_st: crate::InitState::default(),
+                    }));
+                }
+                AttachDatabaseState::Init(init) => {
+                    let mut pager = Arc::new(crate::return_if_io!(init
+                        .db
+                        ._init_nonblock(&mut init.init_st, init.encryption_key.as_ref(),)));
+
+                    if !init.attached_is_fresh {
+                        self.reject_initialized_attach_mismatches(&init.alias, &init.db, &pager)?;
+                        *state = AttachDatabaseState::Publish {
+                            alias: init.alias.clone(),
+                            db: init.db.clone(),
+                            pager,
+                        };
+                        continue;
+                    }
+
+                    self.apply_page_layout_to_fresh_attach_db(
+                        &init.alias,
+                        &pager,
+                        init.reserved_space,
+                    )?;
+
+                    if self.mvcc_enabled() && !init.db.mvcc_enabled() {
+                        Self::set_mvcc_journal_mode_fresh_db(&pager)?;
+                        Self::install_database_wal_on_pager(&init.db, &mut pager);
+                        let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
+                        let mv_store = journal_mode::open_mv_store(
+                            init.db.io.clone(),
+                            &init.db.path,
+                            init.db.open_flags,
+                            init.db.durable_storage.clone(),
+                            enc_ctx,
+                        )?;
+                        init.db.mv_store.store(Some(mv_store));
+                        *state = AttachDatabaseState::Bootstrap(Box::new(
+                            AttachDatabaseBootstrapState {
+                                alias: init.alias.clone(),
+                                db: init.db.clone(),
+                                pager,
+                                encryption_key: init.encryption_key.take(),
+                                bootstrap_conn: None,
+                                bootstrap_st: crate::mvcc::database::BootstrapState::default(),
+                            },
+                        ));
+                    } else {
+                        *state = AttachDatabaseState::Publish {
+                            alias: init.alias.clone(),
+                            db: init.db.clone(),
+                            pager,
+                        };
+                    }
+                }
+                AttachDatabaseState::Bootstrap(bootstrap) => {
+                    if bootstrap.bootstrap_conn.is_none() {
+                        let default_cache_size = match bootstrap
+                            .pager
+                            .with_header(|header| header.default_page_cache_size)
+                        {
+                            Ok(IOResult::Done(default_cache_size)) => default_cache_size.get(),
+                            Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                            Err(_) => 0,
+                        };
+                        bootstrap.bootstrap_conn =
+                            Some(bootstrap.db._connect_with_pager_and_default_cache_size(
+                                true,
+                                bootstrap.pager.clone(),
+                                bootstrap.encryption_key.take(),
+                                default_cache_size,
+                            )?);
+                    }
+
+                    let mv_store_guard = bootstrap.db.get_mv_store();
+                    let Some(mv_store) = mv_store_guard.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "fresh MVCC attach missing MV store".to_string(),
+                        ));
+                    };
+                    crate::return_if_io!(mv_store.bootstrap_nonblock(
+                        bootstrap
+                            .bootstrap_conn
+                            .as_ref()
+                            .expect("bootstrap connection initialized above"),
+                        &mut bootstrap.bootstrap_st,
+                    ));
+
+                    *state = AttachDatabaseState::Publish {
+                        alias: bootstrap.alias.clone(),
+                        db: bootstrap.db.clone(),
+                        pager: bootstrap.pager.clone(),
+                    };
+                }
+                AttachDatabaseState::Publish { alias, db, pager } => {
+                    self.attached_databases
+                        .write()
+                        .insert(alias.as_str(), (db.clone(), pager.clone()));
+                    self.bump_prepare_context_generation();
+                    *state = AttachDatabaseState::Done;
+                    return Ok(IOResult::Done(()));
+                }
+                AttachDatabaseState::Done => {
+                    return Err(LimboError::InternalError(
+                        "attach_database called after completion".to_string(),
+                    ));
+                }
+            }
         }
-
-        if self.is_attached(alias) {
-            return Err(LimboError::InvalidArgument(format!(
-                "database {alias} is already in use"
-            )));
-        }
-
-        // Check for reserved database names
-        if alias.eq_ignore_ascii_case("main") || alias.eq_ignore_ascii_case("temp") {
-            return Err(LimboError::InvalidArgument(format!(
-                "reserved name {alias} is already in use"
-            )));
-        }
-
-        let db_opts = DatabaseOpts::new()
-            .with_views(self.db.experimental_views_enabled())
-            .with_custom_types(self.db.experimental_custom_types_enabled())
-            .with_index_method(self.db.experimental_index_method_enabled())
-            .with_vacuum(self.db.experimental_vacuum_enabled())
-            .with_generated_columns(self.db.experimental_generated_columns_enabled())
-            .with_without_rowid(self.db.experimental_without_rowid_enabled());
-        // Select the IO layer for the attached database:
-        // - :memory: databases always get a fresh MemoryIO
-        // - File-based databases reuse the parent's IO when the parent is also
-        //   file-based (important for simulator fault injection and WAL coordination)
-        // - If the parent is :memory: (MemoryIO) but the attached DB is file-based,
-        //   we need a file-capable IO layer since MemoryIO can't read real files
-        let is_memory_db = is_memory_like(path);
-        let io: Arc<dyn IO> = if is_memory_db {
-            Arc::new(MemoryIO::new())
-        } else if self.db.is_in_memory_db() {
-            Database::io_for_path(path)?
-        } else {
-            self.db.io.clone()
-        };
-        let main_db_flags = self.db.open_flags;
-        let (db, encryption_opts) = Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
-        let attached_is_fresh = !db.initialized();
-        if !is_memory_db {
-            Self::validate_attach_target(&db, attached_is_fresh, alias)?;
-        }
-        self.reject_unsupported_fresh_mvcc_attach_durable_storage(alias, &db, attached_is_fresh)?;
-
-        // Build encryption key from URI opts to pass to _init for decrypting page 1.
-        let encryption_key = if let Some(ref enc) = encryption_opts {
-            Some(EncryptionKey::from_hex_string(&enc.hexkey)?)
-        } else {
-            None
-        };
-        let mut pager = Arc::new(db._init(encryption_key.as_ref())?);
-
-        if !attached_is_fresh {
-            self.reject_initialized_attach_mismatches(alias, &db, &pager)?;
-            self.attached_databases.write().insert(alias, (db, pager));
-            self.bump_prepare_context_generation();
-            return Ok(());
-        }
-
-        self.apply_page_layout_to_fresh_attach_db(alias, &pager, reserved_space)?;
-
-        // Fresh attached databases inherit the main connection's journal mode.
-        // The header must be normalized before page 1 allocation so the first
-        // write and MVCC bootstrap agree on the target mode.
-        if self.mvcc_enabled() && !db.mvcc_enabled() {
-            Self::set_mvcc_journal_mode_fresh_db(&pager)?;
-            Self::install_database_wal_on_pager(&db, &mut pager);
-            let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
-            let mv_store = journal_mode::open_mv_store(
-                db.io.clone(),
-                &db.path,
-                db.open_flags,
-                db.durable_storage.clone(),
-                enc_ctx,
-            )?;
-            db.mv_store.store(Some(mv_store.clone()));
-            let bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;
-            mv_store.bootstrap(bootstrap_conn)?;
-        }
-        self.attached_databases.write().insert(alias, (db, pager));
-        self.bump_prepare_context_generation();
-
-        Ok(())
     }
 
     // Detach a database by alias name
@@ -4594,6 +4740,31 @@ mod tests {
         open_connection_with_opts(path, DatabaseOpts::new())
     }
 
+    fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) -> Result<()> {
+        let mut state = AttachDatabaseState::default();
+        loop {
+            match conn.attach_database(path, alias, &mut state)? {
+                IOResult::Done(()) => return Ok(()),
+                IOResult::IO(io) => io.wait(conn.db.io.as_ref())?,
+            }
+        }
+    }
+
+    fn drive_attach_with_config(
+        conn: &Arc<Connection>,
+        path: &str,
+        alias: &str,
+        reserved_space: Option<u8>,
+    ) -> Result<()> {
+        let mut state = AttachDatabaseState::default();
+        loop {
+            match conn.attach_database_with_config(path, alias, reserved_space, &mut state)? {
+                IOResult::Done(()) => return Ok(()),
+                IOResult::IO(io) => io.wait(conn.db.io.as_ref())?,
+            }
+        }
+    }
+
     fn query_single_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
         let mut stmt = conn.prepare(sql).unwrap();
         match stmt.step().unwrap() {
@@ -4711,8 +4882,7 @@ mod tests {
         let aux_path = temp_dir.path().join("aux.db");
         let conn = open_connection(&main_path);
 
-        conn.attach_database_with_config(aux_path.to_str().unwrap(), "aux", Some(48))
-            .unwrap();
+        drive_attach_with_config(&conn, aux_path.to_str().unwrap(), "aux", Some(48)).unwrap();
 
         let (attached_db, pager) = attached_entry(&conn, "aux");
         assert!(!attached_db.initialized());
@@ -4728,8 +4898,7 @@ mod tests {
         let aux_path = temp_dir.path().join("aux.db");
         let conn = open_connection(&main_path);
 
-        let err = conn
-            .attach_database_with_config(aux_path.to_str().unwrap(), "aux", Some(0))
+        let err = drive_attach_with_config(&conn, aux_path.to_str().unwrap(), "aux", Some(0))
             .unwrap_err()
             .to_string();
         assert_eq!(
@@ -4748,8 +4917,7 @@ mod tests {
         let conn = open_connection(&main_path);
 
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        conn.attach_database(aux_path.to_str().unwrap(), "aux")
-            .unwrap();
+        drive_attach(&conn, aux_path.to_str().unwrap(), "aux").unwrap();
 
         let (attached_db, pager) = attached_entry(&conn, "aux");
         assert!(attached_db.get_mv_store().as_ref().is_some());
@@ -4768,8 +4936,7 @@ mod tests {
         let conn = open_connection(&main_path);
 
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        conn.attach_database(aux_path.to_str().unwrap(), "aux")
-            .unwrap();
+        drive_attach(&conn, aux_path.to_str().unwrap(), "aux").unwrap();
         conn.execute("CREATE TABLE aux.t(x INTEGER)").unwrap();
         conn.execute("INSERT INTO aux.t VALUES(1)").unwrap();
 

@@ -4603,19 +4603,6 @@ impl WalFile {
                                 .as_ref()
                                 .expect("buffer missing")
                                 .clone();
-                            // We debug assert that the cached page has the
-                            // exact contents as one read from the WAL.
-                            #[cfg(debug_assertions)]
-                            {
-                                let mut raw =
-                                    vec![0u8; self.page_size() as usize + WAL_FRAME_HEADER_SIZE];
-                                self.io.wait_for_completion(
-                                    self.read_frame_raw(target_frame, &mut raw)?,
-                                )?;
-                                let (_, wal_page) = sqlite3_ondisk::parse_wal_frame_header(&raw);
-                                let cached = buffer.as_slice();
-                                turso_assert!(wal_page == cached, "cached page content differs from WAL read", { "page_id": page_id, "frame_id": target_frame });
-                            }
                             {
                                 ongoing_chkpt
                                     .pending_writes

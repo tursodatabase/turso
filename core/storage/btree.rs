@@ -491,11 +491,10 @@ enum OverflowState {
         next_page: PageRef,
     },
     /// Transitional state used to make `OverflowState::ProcessPage`
-    /// re-entry-safe across spill yields. Once `free_page` has returned
-    /// `Done` for the current page, we move to this state so that a
-    /// subsequent spill yield on the read of the next page does NOT cause
-    /// `free_page` to be invoked a second time on a page that is already in
-    /// the freelist.
+    /// re-entry-safe across yields. Once `free_page` has returned `Done` for
+    /// the current page, we move to this state before validating or reading
+    /// the next page so `free_page` cannot be invoked a second time on a page
+    /// that is already in the freelist.
     ReadNext {
         next: u32,
     },
@@ -4831,6 +4830,10 @@ impl BTreeCursor {
     /// resumed from last point after IO interruption
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn clear_overflow_pages(&mut self, cell: &BTreeCell) -> Result<IOResult<()>> {
+        // `database_size` is invariant for the duration of this invocation, so
+        // read the page-1 header at most once and reuse it for every overflow
+        // page validation below instead of re-reading it per `ReadNext`.
+        let mut database_size: Option<u32> = None;
         loop {
             match self.overflow_state.clone() {
                 OverflowState::Start => {
@@ -4844,17 +4847,9 @@ impl BTreeCursor {
                     };
 
                     if let Some(next_page) = first_overflow_page {
-                        if unlikely(
-                            next_page < 2
-                                || next_page
-                                    > self
-                                        .pager
-                                        .io
-                                        .block(|| {
-                                            self.pager.with_header(|header| header.database_size)
-                                        })?
-                                        .get(),
-                        ) {
+                        let database_size =
+                            return_if_io!(self.overflow_database_size(&mut database_size));
+                        if unlikely(!Self::valid_overflow_page_id(next_page, database_size)) {
                             self.overflow_state = OverflowState::Start;
                             return Err(LimboError::Corrupt("Invalid overflow page number".into()));
                         }
@@ -4879,31 +4874,21 @@ impl BTreeCursor {
                     return_if_io!(self.pager.free_page(Some(page), next_page_id));
 
                     // free_page returned `Done` — commit `next` to state
-                    // BEFORE the next read so that a spill yield from the
-                    // read does not cause re-entry into `ProcessPage` with
-                    // the now-freed page, which would re-invoke `free_page`
-                    // and corrupt the freelist.
+                    // BEFORE any fallible IO so re-entry cannot invoke
+                    // `free_page` again on the now-freed page.
                     if next != 0 {
-                        if unlikely(
-                            next < 2
-                                || next
-                                    > self
-                                        .pager
-                                        .io
-                                        .block(|| {
-                                            self.pager.with_header(|header| header.database_size)
-                                        })?
-                                        .get(),
-                        ) {
-                            self.overflow_state = OverflowState::Start;
-                            return Err(LimboError::Corrupt("Invalid overflow page number".into()));
-                        }
                         self.overflow_state = OverflowState::ReadNext { next };
                     } else {
                         self.overflow_state = OverflowState::Done;
                     }
                 }
                 OverflowState::ReadNext { next } => {
+                    let database_size =
+                        return_if_io!(self.overflow_database_size(&mut database_size));
+                    if unlikely(!Self::valid_overflow_page_id(next, database_size)) {
+                        self.overflow_state = OverflowState::Start;
+                        return Err(LimboError::Corrupt("Invalid overflow page number".into()));
+                    }
                     let (page, c) = return_if_io!(self.pager.read_page(next as i64));
                     self.overflow_state = OverflowState::ProcessPage { next_page: page };
                     if let Some(c) = c {
@@ -4916,6 +4901,22 @@ impl BTreeCursor {
                 }
             };
         }
+    }
+
+    /// Read `database_size` from the page-1 header at most once per
+    /// `clear_overflow_pages` invocation, memoizing it in `cache`.
+    fn overflow_database_size(&self, cache: &mut Option<u32>) -> Result<IOResult<u32>> {
+        if let Some(database_size) = cache {
+            return Ok(IOResult::Done(*database_size));
+        }
+        let database_size =
+            return_if_io!(self.pager.with_header(|header| header.database_size)).get();
+        *cache = Some(database_size);
+        Ok(IOResult::Done(database_size))
+    }
+
+    fn valid_overflow_page_id(page_id: u32, database_size: u32) -> bool {
+        page_id >= 2 && page_id <= database_size
     }
 
     /// Deletes all contents of the B-tree by freeing all its pages in an iterative depth-first order.

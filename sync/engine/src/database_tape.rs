@@ -39,6 +39,35 @@ pub struct DatabaseTapeOpts {
     pub disable_auto_checkpoint: bool,
 }
 
+/// Async, coro-threaded counterpart to
+/// [`turso_core::Connection::try_wal_watermark_read_page`]. It drives the
+/// begin / wait-for-completion / end sequence in one place so the Windows-IOCP
+/// `UnexpectedEof -> absent page` handling cannot drift across the watermark
+/// read call sites. Returns `Ok(false)` when the page is absent at
+/// `frame_watermark` (i.e. allocated only in the WAL portion past it).
+pub(crate) async fn try_wal_watermark_read_page<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &turso_core::Connection,
+    page_idx: u32,
+    page: &mut [u8],
+    frame_watermark: Option<u64>,
+) -> Result<bool> {
+    let Some((page_ref, c)) = conn.try_wal_watermark_read_page_begin(page_idx, frame_watermark)?
+    else {
+        return Ok(false);
+    };
+    while !c.finished() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    if let Some(err) = c.get_error() {
+        if turso_core::Connection::wal_watermark_read_error_is_absent_page(&err) {
+            return Ok(false);
+        }
+        return Err(LimboError::CompletionError(err).into());
+    }
+    Ok(conn.try_wal_watermark_read_page_end(page, page_ref)?)
+}
+
 pub(crate) async fn run_stmt_once<'a, Ctx>(
     coro: &'_ Coro<Ctx>,
     stmt: &'a mut turso_core::Statement,
@@ -310,17 +339,14 @@ impl DatabaseWalSession {
 
         let conn = self.wal_session.conn();
         let mut frame = vec![0u8; WAL_FRAME_HEADER + self.page_size];
-        let begin_read_result =
-            conn.try_wal_watermark_read_page_begin(page_no, Some(frame_watermark))?;
-        let end_read_result = match begin_read_result {
-            Some((page_ref, c)) => {
-                while !c.succeeded() {
-                    let _ = coro.yield_(SyncEngineIoResult::IO).await;
-                }
-                conn.try_wal_watermark_read_page_end(&mut frame[WAL_FRAME_HEADER..], page_ref)?
-            }
-            None => false,
-        };
+        let end_read_result = try_wal_watermark_read_page(
+            coro,
+            conn,
+            page_no,
+            &mut frame[WAL_FRAME_HEADER..],
+            Some(frame_watermark),
+        )
+        .await?;
         if end_read_result {
             tracing::trace!("rollback page {}", page_no);
             self.prepared_frame = Some((page_no, frame));
@@ -347,15 +373,6 @@ impl DatabaseWalSession {
             self.rollback_page(coro, page_no, frame_watermark).await?;
         }
         Ok(pages_cnt)
-    }
-
-    pub fn db_size(&self) -> Result<u32> {
-        let frames_count = self.frames_count()?;
-        let conn = self.wal_session.conn();
-        let mut page = vec![0u8; self.page_size];
-        assert!(conn.try_wal_watermark_read_page(1, &mut page, Some(frames_count))?);
-        let db_size = u32::from_be_bytes(page[28..32].try_into().unwrap());
-        Ok(db_size)
     }
 
     pub fn commit(&mut self, db_size: u32) -> Result<()> {

@@ -3,7 +3,7 @@ use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
-use crate::mvcc::database::{CheckpointStateMachine, TxID};
+use crate::mvcc::database::{BootstrapState, CheckpointStateMachine, TxID};
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
@@ -8088,9 +8088,11 @@ pub fn op_function(
                     ));
                 };
 
-                program
-                    .connection
-                    .attach_database(filename_str.as_str(), dbname_str.as_str())?;
+                return_if_io!(program.connection.attach_database(
+                    filename_str.as_str(),
+                    dbname_str.as_str(),
+                    state.active_op_state.attach(),
+                ));
                 // Sequence descriptors for the attached database are
                 // loaded lazily by `maybe_reparse_schema` on the next
                 // statement (ATTACH bumps the schema cookie, so the
@@ -8099,6 +8101,7 @@ pub fn op_function(
                 // would drive `pager.io.step()` synchronously and break
                 // the vdbe async contract.
 
+                state.active_op_state.clear();
                 state.registers[*dest].set_null();
             }
             ScalarFunc::Detach => {
@@ -9534,6 +9537,8 @@ pub fn op_function(
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
+
+pub(crate) type OpAttachState = crate::connection::AttachDatabaseState;
 
 pub fn op_sequence(
     _program: &Program,
@@ -15822,6 +15827,8 @@ pub enum OpJournalModeSubState {
     WritePage,
     /// Finalize - clear cache and setup new mode
     Finalize,
+    /// Bootstrap the MV store after switching to MVCC mode
+    BootstrapMvStore,
 }
 
 /// Holds the state for the journal mode change operation
@@ -15834,8 +15841,60 @@ pub struct OpJournalModeState {
     pub new_mode: Option<journal_mode::JournalMode>,
     /// Checkpoint state machine for MVCC mode
     pub checkpoint_sm: Option<StateMachine<Box<CheckpointStateMachine<MvccClock>>>>,
+    /// Bootstrap state machine when switching into MVCC mode
+    pub bootstrap_state: BootstrapState,
     /// Page reference for writing header
     pub page_ref: Option<PageRef>,
+    /// Abandonment guard for the WAL→MVCC switch. Armed in `Finalize` once the
+    /// store is installed and the connection demoted; disarmed only on
+    /// successful bootstrap. If the statement is reset/dropped while parked at a
+    /// bootstrap yield, dropping this guard restores in-memory state.
+    pub bootstrap_guard: Option<MvccBootstrapGuard>,
+}
+
+/// Restores in-memory MVCC state if a `PRAGMA journal_mode=mvcc` bootstrap is
+/// abandoned (statement reset/dropped) or errors after the connection has been
+/// demoted and the shared `MvStore` installed.
+///
+/// Without this, `ProgramState::reset()` would clear `active_op_state` while
+/// leaving `is_mvcc_bootstrap_connection` set forever (silently bypassing MVCC)
+/// and the DB-wide `mv_store` installed but un-bootstrapped (`global_header =
+/// None`), which other connections can trip an assertion on at commit. Mirrors
+/// `MvccVacuumGuard` in `vacuum.rs`.
+pub struct MvccBootstrapGuard {
+    connection: Arc<Connection>,
+    completed: bool,
+}
+
+impl MvccBootstrapGuard {
+    fn new(connection: Arc<Connection>) -> Self {
+        Self {
+            connection,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for MvccBootstrapGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        // Bootstrap did not finish: re-promote the connection if it is still
+        // demoted (bootstrap promotes itself only at `Recover`) and uninstall
+        // the un-bootstrapped store so neither this connection nor others on
+        // the same `Database` observe a demoted-but-unbootstrapped MVCC store.
+        // The on-disk header already reads MVCC, so the database recovers on
+        // the next fresh open via the regular MVCC bootstrap path.
+        if self.connection.is_mvcc_bootstrap_connection() {
+            self.connection.promote_to_regular_connection();
+        }
+        self.connection.db.mv_store.store(None);
+    }
 }
 
 pub fn op_journal_mode(
@@ -16041,9 +16100,18 @@ fn op_journal_mode_inner(
                         program.connection.db.durable_storage.clone(),
                         enc_ctx,
                     )?;
+                    // Arm the abandonment guard *before* the irreversible
+                    // store install + demote so a reset/drop at any subsequent
+                    // bootstrap yield restores in-memory state.
+                    let guard = MvccBootstrapGuard::new(program.connection.clone());
                     program.connection.db.mv_store.store(Some(mv_store.clone()));
                     program.connection.demote_to_mvcc_connection();
-                    mv_store.bootstrap(program.connection.clone())?;
+                    state.active_op_state.journal_mode().bootstrap_guard = Some(guard);
+                    state.active_op_state.journal_mode().bootstrap_state =
+                        BootstrapState::default();
+                    state.active_op_state.journal_mode().sub_state =
+                        OpJournalModeSubState::BootstrapMvStore;
+                    continue;
                 }
 
                 if matches!(new_mode, journal_mode::JournalMode::Wal) {
@@ -16052,6 +16120,36 @@ fn op_journal_mode_inner(
 
                 // Return result
                 let ret: &'static str = new_mode.into();
+                state.registers[*dest].set_text(Text::new(ret))?;
+                state.pc += 1;
+
+                return Ok(InsnFunctionStepResult::Step);
+            }
+
+            OpJournalModeSubState::BootstrapMvStore => {
+                let mv_store_guard = program.connection.db.get_mv_store();
+                let Some(mv_store) = mv_store_guard.as_ref() else {
+                    return Err(LimboError::InternalError(
+                        "MVCC journal mode bootstrap missing MV store".to_string(),
+                    ));
+                };
+                return_if_io!(mv_store.bootstrap_nonblock(
+                    &program.connection,
+                    &mut state.active_op_state.journal_mode().bootstrap_state
+                ));
+
+                // Bootstrap finished: disarm the abandonment guard so it does
+                // not roll back the now-published MVCC store on drop.
+                if let Some(guard) = state
+                    .active_op_state
+                    .journal_mode()
+                    .bootstrap_guard
+                    .as_mut()
+                {
+                    guard.complete();
+                }
+
+                let ret: &'static str = journal_mode::JournalMode::Mvcc.into();
                 state.registers[*dest].set_text(Text::new(ret))?;
                 state.pc += 1;
 

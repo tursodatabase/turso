@@ -4876,7 +4876,7 @@ impl Pager {
         // Number of reserved slots in trunk header (next pointer + leaf count)
         const RESERVED_SLOTS: usize = 2;
 
-        let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
+        let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
 
         let mut state = self.free_page_state.write();
@@ -4890,16 +4890,20 @@ impl Pager {
                         )));
                     }
 
-                    // The non-blocking read fork here is safe: if the caller
-                    // passes `Some(page)`, no IO occurs and the mutations
-                    // below run synchronously. If the caller passes `None`
-                    // and `read_page_nonblock` yields for spill, we leave
-                    // `state` at `Start` so re-entry re-takes either branch
-                    // (the pager's `pending_reads` memoization returns the
-                    // same `PageRef` the next time). Crucially, the
-                    // non-idempotent mutations (`freelist_pages` increment,
-                    // `page.pin()`, state advance) all happen AFTER both
-                    // branches converge.
+                    // The first yield point is the `HeaderRefMut::from_pager`
+                    // acquisition above the loop, not this read fork: if it
+                    // yields for the page-1 read, re-entry re-runs that prefix
+                    // (it is idempotent — the pager cache returns the same
+                    // header page) before reaching `Start` again, where `state`
+                    // is still `Start`. The read fork below is likewise safe:
+                    // if the caller passes `Some(page)`, no IO occurs and the
+                    // mutations below run synchronously. If the caller passes
+                    // `None` and `read_page` yields for spill, we leave `state`
+                    // at `Start` so re-entry re-takes either branch (the
+                    // pager's `pending_reads` memoization returns the same
+                    // `PageRef` the next time). Crucially, the non-idempotent
+                    // mutations (`freelist_pages` increment, `page.pin()`,
+                    // state advance) all happen AFTER both branches converge.
                     let (page, c) = match page.take() {
                         Some(page) => {
                             turso_assert_eq!(
@@ -5105,7 +5109,7 @@ impl Pager {
         // Ensure cache has room before allocating (we may spill dirty pages first)
         return_if_io!(self.ensure_cache_space());
 
-        let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
+        let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
 
         loop {
