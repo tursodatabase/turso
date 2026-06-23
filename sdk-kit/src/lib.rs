@@ -25,6 +25,33 @@ macro_rules! assert_sync {
     };
 }
 
+#[derive(Debug, Clone, Default)]
+pub enum IoBackend {
+    #[default]
+    Default,
+    /// In-memory backend
+    Memory,
+    /// Generic syscall backend
+    Syscall,
+    /// IO uring (supported only on Linux)
+    IoUring,
+    /// Experimental iocp (supported only on windows)
+    IOCP,
+    Other(String),
+}
+
+impl From<&str> for IoBackend {
+    fn from(vfs: &str) -> Self {
+        match vfs {
+            "memory" => IoBackend::Memory,
+            "syscall" => IoBackend::Syscall,
+            "io_uring" => IoBackend::IoUring,
+            "experimental_win_iocp" => IoBackend::IOCP,
+            _ => IoBackend::Other(vfs.to_string()),
+        }
+    }
+}
+
 /// simple helper which return MISUSE error in case of concurrent access to some operation
 struct ConcurrentGuard {
     in_use: AtomicU32,
