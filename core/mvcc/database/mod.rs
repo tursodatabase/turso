@@ -469,6 +469,15 @@ pub struct RowVersion {
     /// This flag helps the checkpoint logic determine if a delete should be
     /// checkpointed to the B-tree file.
     pub btree_resident: bool,
+    /// The WAL position at which this version's *current* (begin, end) state was last
+    /// materialized to the B-tree by a checkpoint. [`WalPos::ORIGIN`] means "not yet in the
+    /// B-tree" — either never checkpointed, or its state changed (e.g. a delete set `end`) and
+    /// the new state is not materialized yet. The version-store GC (`gc_version_chain` Rules 2/3)
+    /// may only reclaim a version once its state is materialized (`!= ORIGIN`) AND every reader's
+    /// read mark has reached that position — otherwise a reader pinned below it reads the stale
+    /// B-tree and the version it needed is gone. Set by the checkpoint at materialization
+    /// ([`MvStore::stamp_materialized`]); reset to ORIGIN when a delete supersedes the row.
+    pub(crate) materialized_at: WalPos,
 }
 
 #[derive(Debug)]
@@ -920,12 +929,12 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// Hekaton Section 2.7: "CommitDepSet, that stores transaction IDs of the
     /// transactions that depend on T."
     commit_dep_set: Mutex<HashSet<TxID>>,
-    /// `durable_txid_max` sampled when this transaction pinned its WAL read mark (at begin). A
-    /// checkpoint-materialized B-tree is physically readable by this transaction only if its
-    /// `visible_from <= observed_durable_boundary` — i.e. the materialization was already durable
-    /// (in the WAL) when this transaction's read mark was installed. See
-    /// [`MvStore::is_btree_readable_at`] / [`MvStore::compute_min_reader_boundary`].
-    observed_durable_boundary: u64,
+    /// This transaction's frozen WAL read mark `(checkpoint_seq, max_frame)`, captured when it
+    /// pinned its read transaction at begin. A checkpoint-materialized B-tree is physically
+    /// reachable by this transaction only if `materialized_at <= read_mark` — i.e. the
+    /// materialization's frames are at-or-below this read mark (or in an earlier, backfilled WAL
+    /// epoch). See [`MvStore::is_btree_readable_at`] / [`MvStore::compute_min_reader_mark`].
+    read_mark: WalPos,
 }
 
 impl<A: RowVersionAllocator> Transaction<A> {
@@ -933,13 +942,13 @@ impl<A: RowVersionAllocator> Transaction<A> {
         tx_id: u64,
         begin_ts: u64,
         header: DatabaseHeader,
-        observed_durable_boundary: u64,
+        read_mark: WalPos,
     ) -> Transaction<A> {
         Transaction {
             state: TransactionState::Active.into(),
             tx_id,
             begin_ts,
-            observed_durable_boundary,
+            read_mark,
             write_set: Mutex::new(WriteSet::new()),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
@@ -3800,19 +3809,52 @@ pub struct RecoverCtx {
 /// binding is visible: `begin` is the allocating checkpoint's snapshot ts (`0` for
 /// bootstrap/recovery bindings that predate every transaction) and `end` is the drop tombstone's
 /// commit ts (`u64::MAX` while live). See [`MvStore::table_id_to_rootpage`].
+/// A position in the WAL as `(checkpoint_seq, frame)`. Lexicographic ordering (derived) is exactly
+/// physical reachability: a materialization at WAL position `m` is reachable by a reader whose read
+/// mark is `r` iff `m <= r`. A lower `checkpoint_seq` is an earlier WAL epoch whose frames were
+/// backfilled into the DB file before the epoch bumped (a TRUNCATE/restart backfills everything
+/// first), so it is reachable via the base regardless of frame; within an epoch the frame numbers
+/// compare directly. This mirrors the pager's `find_frame` rule, so the read gate can never claim a
+/// page is readable that a physical read cannot reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WalPos {
+    pub checkpoint_seq: u32,
+    pub frame: u64,
+}
+
+impl WalPos {
+    /// In the durable base from the very beginning — reachable by every reader.
+    pub const ORIGIN: WalPos = WalPos {
+        checkpoint_seq: 0,
+        frame: 0,
+    };
+    /// Staged / not-yet-committed sentinel: greater than any real reader's mark, so unreachable.
+    pub const STAGED: WalPos = WalPos {
+        checkpoint_seq: u32::MAX,
+        frame: u64::MAX,
+    };
+
+    pub fn from_pair((checkpoint_seq, frame): (u32, u64)) -> Self {
+        Self {
+            checkpoint_seq,
+            frame,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RootEntry {
     pub root_page: Option<u64>,
     pub begin: u64,
     pub end: u64,
-    /// Durable boundary (`durable_txid_max`) at which this binding's B-tree was *published* —
-    /// i.e. its pages were already committed to the WAL (after `CommitPagerTxn`). A transaction
-    /// may read this btree only once its own snapshot reflects this boundary
-    /// (`visible_from <= tx.observed_durable_boundary`), because only then do its WAL read marks
-    /// physically contain the materialized frames. `begin` is *logical* base-validity (the
-    /// checkpoint's `c_ts`); `visible_from` is *physical* visibility. `0` for bootstrap/recovery
-    /// bindings (always durable). See [`MvStore::is_btree_readable_at`].
-    pub visible_from: u64,
+    /// WAL position at which this binding's B-tree pages became durable (the checkpoint
+    /// connection's position right after `CommitPagerTxn`). A transaction may physically read this
+    /// btree only once its own read mark reaches this position (`materialized_at <= tx.read_mark`).
+    /// `begin` is *logical* base-validity (the checkpoint's `c_ts`); `materialized_at` is *physical*
+    /// reachability. [`WalPos::ORIGIN`] for bootstrap/recovery bindings (always in the base);
+    /// [`WalPos::STAGED`] while pages are allocated but not yet committed.
+    /// See [`MvStore::is_btree_readable_at`].
+    pub materialized_at: WalPos,
 }
 
 impl RootEntry {
@@ -3822,7 +3864,7 @@ impl RootEntry {
             root_page,
             begin: 0,
             end: u64::MAX,
-            visible_from: 0,
+            materialized_at: WalPos::ORIGIN,
         }
     }
 
@@ -3833,7 +3875,7 @@ impl RootEntry {
 
     /// Whether this binding is logically visible to a transaction at snapshot `ts`
     /// (`begin <= ts` and, unless live, `ts < end`). This is base-validity only; for a btree
-    /// *read* also require physical visibility via [`Self::visible_from`].
+    /// *read* also require physical reachability via [`Self::materialized_at`].
     pub fn covers(&self, ts: u64) -> bool {
         self.begin <= ts && (self.end == u64::MAX || ts < self.end)
     }
@@ -3912,6 +3954,13 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// The highest transaction ID that has been made durable in the WAL.
     /// Used to skip checkpointing transactions from mv store to WAL that have already been processed.
     durable_txid_max: AtomicU64,
+    /// The WAL backfill boundary published by the most recent checkpoint: a version materialized at
+    /// or below this `WalPos` is durably in the DB file, so reachable by EVERY snapshot (including
+    /// a db-file reader pinned at the boundary). The off-lock GC reclaims a materialized version
+    /// only once its `materialized_at <= backfill_floor` — otherwise a low-frame reader that
+    /// cannot reach the un-backfilled WAL frame still needs the version-store copy. See
+    /// `gc_version_chain` / `gc_floor_reader_mark`. `RwLock<WalPos>` mirrors `global_header`.
+    backfill_floor: Arc<RwLock<WalPos>>,
     /// The timestamp of the last committed schema change.
     /// Schema changes always cause a [SchemaUpdated] error.
     last_committed_schema_change_ts: AtomicU64,
@@ -4084,6 +4133,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             exclusive_tx: AtomicU64::new(NO_EXCLUSIVE_TX),
             commit_coordinator: Arc::new(CommitCoordinator::new()),
             global_header: Arc::new(RwLock::new(None)),
+            backfill_floor: Arc::new(RwLock::new(WalPos::ORIGIN)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
             checkpoint_in_progress: AtomicBool::new(false),
             durable_txid_max: AtomicU64::new(0),
@@ -4134,9 +4184,29 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// [`Self::is_btree_allocated_at`] / [`Self::resolve_root_page_at`], which do gate on
     /// `begin`. `u64::MAX` resolves the current live owner.
     pub fn get_table_id_from_root_page_at(&self, root_page: i64, snapshot_ts: u64) -> MVTableId {
+        self.try_get_table_id_from_root_page_at(root_page, snapshot_ts)
+            .unwrap_or_else(|| {
+                panic!("Positive root page is not mapped to a table id: {root_page}")
+            })
+    }
+
+    /// Fallible variant of [`Self::get_table_id_from_root_page_at`]: returns `None` when a
+    /// positive root page has no binding that covers `snapshot_ts`. Under a PASSIVE checkpoint
+    /// this is not an invariant violation but a stale-schema read: the transaction captured an
+    /// older `schema_cookie` (the commit that dropped this object published its cookie after the
+    /// transaction read the header, even though the drop's commit ts precedes the transaction's
+    /// begin ts) and compiled a cursor against a table its own snapshot already sees dropped.
+    /// The caller turns this into [`LimboError::SchemaUpdated`] so the statement reprepares
+    /// against the current schema. See the begin/commit schema-coherence note in the passive
+    /// checkpoint design.
+    pub fn try_get_table_id_from_root_page_at(
+        &self,
+        root_page: i64,
+        snapshot_ts: u64,
+    ) -> Option<MVTableId> {
         if root_page < 0 {
             // Not checkpointed table - table ID and root_page are both the same negative value
-            return root_page.into();
+            return Some(root_page.into());
         }
         let root_page = root_page as u64;
         self.table_id_to_rootpage
@@ -4147,9 +4217,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             })
             .min_by_key(|entry| entry.value().end)
             .map(|entry| *entry.key())
-            .unwrap_or_else(|| {
-                panic!("Positive root page is not mapped to a table id: {root_page}")
-            })
     }
 
     /// Snapshot timestamp (`begin_ts`) of the given transaction, or `u64::MAX` if it is not
@@ -4162,15 +4229,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .unwrap_or(u64::MAX)
     }
 
-    /// Durable boundary this transaction observed when it pinned its read mark, or `u64::MAX` if
-    /// untracked (so an unknown tx is treated as able to see everything — it cannot have an old
-    /// mark). The physical-visibility coordinate of the btree-read gate. See
+    /// This transaction's frozen WAL read mark, or [`WalPos::STAGED`] (sees everything published)
+    /// if untracked. The physical-reachability coordinate of the btree-read gate. See
     /// [`Self::is_btree_readable_at`].
-    pub fn read_observed_boundary(&self, tx_id: TxID) -> u64 {
+    pub fn read_tx_mark(&self, tx_id: TxID) -> WalPos {
         self.txs
             .get(&tx_id)
-            .map(|tx| tx.value().observed_durable_boundary)
-            .unwrap_or(u64::MAX)
+            .map(|tx| tx.value().read_mark)
+            .unwrap_or(WalPos::STAGED)
     }
 
     /// Bump `next_table_id` below `table_id` (and below `-root_page` for a checkpointed root) so
@@ -4209,17 +4275,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .and_then(|entry| entry.value().root_page)
     }
 
-    /// Record that a PASSIVE checkpoint physically allocated `root_page` for `table_id`. `begin_ts`
-    /// is the checkpoint's snapshot ts (base-validity lower bound); `visible_from` is the durable
-    /// boundary at which the btree's pages are already committed to the WAL — only transactions
-    /// whose snapshot reflects that boundary may physically read it. MUST be called from the
-    /// post-`CommitPagerTxn` publish window, never at `btree_create` (the pages aren't durable yet).
+    /// Record that a PASSIVE checkpoint allocated `root_page` for `table_id`. `begin_ts` is the
+    /// checkpoint's snapshot ts (base-validity lower bound); `materialized_at` is the WAL position
+    /// the pages reach durability at — [`WalPos::STAGED`] at `btree_create` (pages not committed
+    /// yet), lowered to the real position by [`Self::publish_rootpage_visible`] in the
+    /// post-`CommitPagerTxn` publish window.
     pub fn record_rootpage_alloc(
         &self,
         table_id: MVTableId,
         root_page: u64,
         begin_ts: u64,
-        visible_from: u64,
+        materialized_at: WalPos,
     ) {
         self.table_id_to_rootpage.insert(
             table_id,
@@ -4227,20 +4293,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 root_page: Some(root_page),
                 begin: begin_ts,
                 end: u64::MAX,
-                visible_from,
+                materialized_at,
             },
         );
         self.bump_next_table_id_below(table_id, Some(root_page));
     }
 
-    /// Publish a staged root-page binding: lower its `visible_from` from the staged sentinel to
-    /// `visible_from` (the durable boundary after `CommitPagerTxn`), making the btree physically
-    /// readable by transactions whose snapshot reflects that boundary. Called in the checkpoint's
-    /// post-commit publish window. No-op if the entry is gone (e.g. dropped same checkpoint).
-    pub fn publish_rootpage_visible(&self, table_id: MVTableId, visible_from: u64) {
+    /// Publish a staged root-page binding: set its `materialized_at` from [`WalPos::STAGED`] to the
+    /// WAL position the pages were committed at, making the btree physically readable by any
+    /// transaction whose read mark reaches that position. Called in the checkpoint's post-commit
+    /// publish window. No-op if the entry is gone (e.g. dropped same checkpoint).
+    pub fn publish_rootpage_visible(&self, table_id: MVTableId, materialized_at: WalPos) {
         if let Some(entry) = self.table_id_to_rootpage.get(&table_id) {
             let mut e = *entry.value();
-            e.visible_from = visible_from;
+            e.materialized_at = materialized_at;
             self.table_id_to_rootpage.insert(table_id, e);
         }
     }
@@ -4826,6 +4892,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     end: crate::mvcc::database::PackedTs::pack(None),
                     row: row.clone(),
                     btree_resident: false,
+                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
                 let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
@@ -4856,6 +4923,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     end: crate::mvcc::database::PackedTs::pack(None),
                     row,
                     btree_resident: false,
+                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
                 let row_versions = self.insert_version(id.clone(), row_version)?;
                 let allocator = self.get_rowid_allocator(&id.table_id);
@@ -4885,6 +4953,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(tx_id))),
             row: row.clone(),
             btree_resident: true,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         let tx = self
             .txs
@@ -4946,6 +5015,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     end: crate::mvcc::database::PackedTs::pack(None),
                     row: row.clone(),
                     btree_resident: true,
+                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
                 let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
@@ -4968,6 +5038,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     end: crate::mvcc::database::PackedTs::pack(None),
                     row,
                     btree_resident: true,
+                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
                 let row_versions = self.insert_version(id.clone(), row_version)?;
                 tx.record_created_table_version(id.clone(), version_id);
@@ -5658,15 +5729,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // the error paths below remove this tx if begin fails. The real
             // header is set here, so the tail only flips `pager_commit_lock_held`.
             let header = self.get_new_transaction_database_header(&pager);
-            // Sample the durable boundary under the same `blocking_checkpoint_lock.read()` we
-            // hold for our lifetime: the checkpoint's publish window takes `.write()`, so this is
-            // atomic w.r.t. any materialization publish. See `observed_durable_boundary`.
-            let observed_durable_boundary = self.durable_txid_max.load(Ordering::Acquire);
+            // Capture the frozen WAL read mark this transaction will read against. It was pinned by
+            // `pager.begin_read_tx()` just before us and does not move for our lifetime, so reading
+            // it here is consistent (unlike a moving global boundary). See `read_mark`.
+            let read_mark = WalPos::from_pair(pager.wal_pos());
             self.clock.get_timestamp(|ts| {
-                self.txs.insert(
-                    tx_id,
-                    Transaction::new(tx_id, ts, header, observed_durable_boundary),
-                );
+                self.txs
+                    .insert(tx_id, Transaction::new(tx_id, ts, header, read_mark));
             })
         };
         if let Some(err) = insert_err {
@@ -5814,14 +5883,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // violation. Publishing under the clock lock orders us strictly before
         // or after any commit timestamp (commits also take the clock lock), so
         // any GC that runs after a later commit already sees our begin_ts.
-        // Sampled under `blocking_checkpoint_lock.read()` (held for our lifetime), so atomic
-        // w.r.t. the checkpoint's `.write()` publish window. See `observed_durable_boundary`.
-        let observed_durable_boundary = self.durable_txid_max.load(Ordering::Acquire);
+        // Refresh the WAL read snapshot to the current committed frame NOW, while holding
+        // `blocking_checkpoint_lock.read()`, so `read_mark` is captured atomically with the
+        // `begin_ts` assigned just below under the clock lock. The caller pinned the snapshot
+        // (`pager.begin_read_tx()`) BEFORE we took the checkpoint read lock; under true thread
+        // concurrency a checkpoint can publish (advance the WAL + GC the version store) in that
+        // gap, leaving a `read_mark` that predates a `begin_ts` already past the checkpoint — a
+        // torn snapshot where the reader can reach neither the materialized B-tree (frame too
+        // low) nor the GC'd version-store rows. Holding `.read()` excludes the checkpoint's
+        // publish `.write()`, so this refresh and the `begin_ts` read are atomic w.r.t. any
+        // checkpoint.
+        pager.mvcc_refresh_if_db_changed();
+        let read_mark = WalPos::from_pair(pager.wal_pos());
         let begin_ts = self.clock.get_timestamp(|ts| {
-            self.txs.insert(
-                tx_id,
-                Transaction::new(tx_id, ts, header, observed_durable_boundary),
-            );
+            self.txs
+                .insert(tx_id, Transaction::new(tx_id, ts, header, read_mark));
         });
         tracing::trace!("begin_tx(tx_id={}, begin_ts={})", tx_id, begin_ts);
         if let Some(err) = insert_err {
@@ -6827,7 +6903,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
 
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
-        let min_reader_boundary = self.compute_min_reader_boundary();
+        // Bound by the backfill boundary: never reclaim a version materialized in un-backfilled
+        // WAL frames — a db-file reader (present or future) needs the version-store copy.
+        let min_reader_mark = self
+            .compute_min_reader_mark()
+            .min(*self.backfill_floor.read());
 
         let mut dropped = 0;
         let mut processed = 0;
@@ -6843,13 +6923,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 break;
             }
             // GC floor: retain rows of a freshly-materialized btree not yet visible to all readers.
-            if !self.rootpage_gc_protected(&entry.key().table_id, min_reader_boundary) {
+            if !self.rootpage_gc_protected(&entry.key().table_id, min_reader_mark) {
                 let mut versions = entry.value().write();
                 dropped += Self::gc_version_chain(
                     &mut versions,
                     lwm,
                     ckpt_max,
                     self.experimental_mvcc_passive_checkpoint,
+                    min_reader_mark,
                 );
             }
             last_key = Some(entry.key().clone());
@@ -6909,7 +6990,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut dropped = 0;
         let mut processed = 0;
         let mut last: Option<(MVTableId, Arc<SortableIndexKey>)> = None;
-        let min_reader_boundary = self.compute_min_reader_boundary();
+        // Bound by the backfill boundary: never reclaim a version materialized in un-backfilled
+        // WAL frames — a db-file reader (present or future) needs the version-store copy.
+        let min_reader_mark = self
+            .compute_min_reader_mark()
+            .min(*self.backfill_floor.read());
 
         let cursor = self.gc_index_cursor.lock().clone();
         let outer_start = match &cursor {
@@ -6922,7 +7007,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             let index_id = *outer.key();
             // GC floor: retain a freshly-materialized index not yet visible to all readers.
-            if self.rootpage_gc_protected(&index_id, min_reader_boundary) {
+            if self.rootpage_gc_protected(&index_id, min_reader_mark) {
                 continue;
             }
             let inner = outer.value();
@@ -6943,6 +7028,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         lwm,
                         ckpt_max,
                         self.experimental_mvcc_passive_checkpoint,
+                        min_reader_mark,
                     );
                 }
                 last = Some((index_id, inner_entry.key().clone()));
@@ -6989,11 +7075,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         remove_empty_slots: bool,
     ) -> usize {
         let mut dropped = 0;
-        let min_reader_boundary = self.compute_min_reader_boundary();
+        // Bound by the backfill boundary: never reclaim a version materialized in un-backfilled
+        // WAL frames — a db-file reader (present or future) needs the version-store copy.
+        let min_reader_mark = self
+            .compute_min_reader_mark()
+            .min(*self.backfill_floor.read());
 
         for entry in self.rows.iter() {
             // GC floor: retain rows of a freshly-materialized btree not yet visible to all readers.
-            if self.rootpage_gc_protected(&entry.key().table_id, min_reader_boundary) {
+            if self.rootpage_gc_protected(&entry.key().table_id, min_reader_mark) {
                 continue;
             }
             let is_now_empty = {
@@ -7003,6 +7093,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     lwm,
                     ckpt_max,
                     self.experimental_mvcc_passive_checkpoint,
+                    min_reader_mark,
                 );
                 Self::collect_referenced_txids(&versions, referenced_tx_ids);
                 versions.is_empty()
@@ -7029,11 +7120,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         remove_empty_slots: bool,
     ) -> usize {
         let mut dropped = 0;
-        let min_reader_boundary = self.compute_min_reader_boundary();
+        // Bound by the backfill boundary: never reclaim a version materialized in un-backfilled
+        // WAL frames — a db-file reader (present or future) needs the version-store copy.
+        let min_reader_mark = self
+            .compute_min_reader_mark()
+            .min(*self.backfill_floor.read());
 
         for outer_entry in self.index_rows.iter() {
             // GC floor: retain a freshly-materialized index not yet visible to all readers.
-            if self.rootpage_gc_protected(outer_entry.key(), min_reader_boundary) {
+            if self.rootpage_gc_protected(outer_entry.key(), min_reader_mark) {
                 continue;
             }
             let inner_map = outer_entry.value();
@@ -7046,6 +7141,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         lwm,
                         ckpt_max,
                         self.experimental_mvcc_passive_checkpoint,
+                        min_reader_mark,
                     );
                     Self::collect_referenced_txids(&versions, referenced_tx_ids);
                     versions.is_empty()
@@ -7092,19 +7188,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         to_remove.len()
     }
 
-    /// Apply GC rules to a single version chain. Returns number of versions removed.
+    /// Apply GC rules to a single version chain. Returns the number removed.
     ///
-    /// Rule 1: Aborted garbage (begin=None, end=None) — always remove.
-    /// Rule 2: Superseded (end=Timestamp(e)) — remove once no reader can see it
-    ///         (e <= lwm) AND its supersession is durable (e <= ckpt_max).
-    /// Rule 3: Current checkpointed sole-survivor (end=None, b <= ckpt_max,
-    ///         b < lwm, no other versions remain) — remove.
+    /// Rule 1: aborted garbage (begin=None, end=None) — always remove.
+    /// Rule 2: superseded (end=Timestamp(e)) — remove once no reader can see it.
+    /// Rule 3: checkpointed sole-survivor (end=None) — remove.
     ///
+    /// Passive gates Rules 2/3 on `materialized_at` + `min_reader_mark`: reclaim only once the
+    /// version is in the B-tree AND every reader's mark has reached that frame, so a reader
+    /// pinned at an older frame never loses a version it can still see. The blocking path is
+    /// stop-the-world and uses the logical `ckpt_max` proxy instead.
     fn gc_version_chain(
         versions: &mut RowVersionChain<A>,
         lwm: u64,
         ckpt_max: u64,
         passive: bool,
+        min_reader_mark: WalPos,
     ) -> usize {
         let before = versions.len();
 
@@ -7115,17 +7214,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             matches!(rv.begin(), Some(TxTimestampOrID::Timestamp(_))) && rv.end().is_none()
         });
 
-        // Rule 2: a superseded version (end=Timestamp(e)) is removable only when no
-        // reader can see it (e <= lwm) AND its supersession is durable (e <= ckpt_max).
-        // The ckpt_max condition holds even with a newer current version: under off-lock
-        // checkpoint the boundary can be published < e, and this version's begin <=
-        // boundary is the chain's only proof (exists_in_db_file) that the B-tree holds the
-        // row. Dropping it strands the B-tree copy — a later DELETE is then skipped as
-        // "never durably existed", desyncing the table from its indexes.
+        // A version's current state is reclaimable iff it is materialized in the B-tree and no
+        // active reader is pinned below that materialization frame.
+        let materialized_for_readers = |rv: &RowVersion| {
+            rv.materialized_at() != WalPos::ORIGIN && min_reader_mark >= rv.materialized_at()
+        };
+
+        // Rule 2: superseded version (end=Timestamp(e)) no reader can see (e <= lwm).
         versions.retain(|rv| match &rv.end() {
             Some(TxTimestampOrID::Timestamp(e)) if *e <= lwm => {
                 if passive {
-                    *e > ckpt_max
+                    // Keep until this delete is in the B-tree and reachable by every reader.
+                    !materialized_for_readers(rv)
                 } else {
                     !has_current && *e > ckpt_max
                 }
@@ -7133,15 +7233,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             _ => true,
         });
 
-        // Rule 3: checkpointed sole-survivor current version.
-        // Safe to remove only when the B-tree has the data (b <= ckpt_max),
-        // no reader needs the MVCC copy (b < lwm), and no superseded versions
-        // remain that would poison is_btree_invalidating_version.
+        // Rule 3: checkpointed sole-survivor current version (end=None).
         if versions.len() == 1 {
             if let (Some(TxTimestampOrID::Timestamp(b)), None) =
                 (&versions[0].begin(), &versions[0].end())
             {
-                if *b <= ckpt_max && *b < lwm {
+                let removable = if passive {
+                    materialized_for_readers(&versions[0]) && *b < lwm
+                } else {
+                    *b <= ckpt_max && *b < lwm
+                };
+                if removable {
                     versions.clear();
                 }
             }
@@ -7150,6 +7252,40 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Self::shrink_version_chain_allocation(versions);
 
         before - versions.len()
+    }
+
+    /// Stamp each version this checkpoint materialized with the WAL `frame` it became durable at.
+    /// A version's current state is in the B-tree iff its terminal event (delete `end`, else
+    /// insert `begin`) committed at or before `snapshot_ts`. `gc_version_chain` then reclaims it
+    /// only once every reader's mark reaches `frame`.
+    fn stamp_chain_materialized(
+        &self,
+        versions: &mut [RowVersion],
+        frame: WalPos,
+        snapshot_ts: u64,
+    ) {
+        let resolve = |t: Option<TxTimestampOrID>| -> Option<u64> {
+            match t {
+                Some(TxTimestampOrID::Timestamp(ts)) => Some(ts),
+                Some(TxTimestampOrID::TxID(id)) => {
+                    match lookup_tx_state(&self.txs, &self.finalized_tx_states, id) {
+                        Some(TransactionState::Committed(ts)) => Some(ts),
+                        _ => None,
+                    }
+                }
+                None => None,
+            }
+        };
+        for v in versions.iter_mut() {
+            let terminal = if v.end().is_some() {
+                resolve(v.end())
+            } else {
+                resolve(v.begin())
+            };
+            if terminal.is_some_and(|t| t <= snapshot_ts) {
+                v.set_materialized_at(frame);
+            }
+        }
     }
 
     /// Chains with capacity at or below this are never shrunk — the
@@ -8444,6 +8580,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 end: crate::mvcc::database::PackedTs::pack(None),
                                 row: row.clone(),
                                 btree_resident,
+                                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                             };
                             {
                                 let versions =
@@ -8519,6 +8656,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                         )),
                                         row: tombstone_row.clone(),
                                         btree_resident: if passive { true } else { btree_resident },
+                                        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                                     };
                                     self.insert_version_raw(&mut versions, row_version)?;
                                 }
@@ -8532,6 +8670,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     )),
                                     row: tombstone_row,
                                     btree_resident: if passive { true } else { btree_resident },
+                                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                                 };
                                 let versions =
                                     self.get_or_create_table_row_versions(rowid.clone())?;
@@ -8587,6 +8726,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 end: crate::mvcc::database::PackedTs::pack(None),
                                 row: row.clone(),
                                 btree_resident,
+                                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                             };
                             let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
                                 panic!("Index writes must be to a record");
@@ -8629,6 +8769,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 )),
                                 row: row.clone(),
                                 btree_resident: if passive { true } else { btree_resident },
+                                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                             };
                             self.insert_index_version(rowid.table_id, sortable_key, row_version)?;
                         }
@@ -8818,64 +8959,60 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Whether a transaction may **read** `table_id`'s B-tree, given its logical snapshot
-    /// `begin_ts` and the durable boundary it observed when it pinned its WAL read mark
-    /// (`observed_boundary`). Requires BOTH:
+    /// `begin_ts` and its frozen WAL `read_mark`. Requires BOTH:
     /// - **logical (base validity):** the binding `covers(begin_ts)` — `begin <= begin_ts < end`; and
-    /// - **physical visibility:** `visible_from <= observed_boundary` — the btree's pages were
-    ///   already in the WAL when this transaction pinned its read mark, so its mark physically
-    ///   contains them. Without this a transaction that opened before an off-lock materialization
-    ///   would seek a page its snapshot cannot see (a torn/foreign-page read).
+    /// - **physical reachability:** `materialized_at <= read_mark` — the btree's pages are at-or-below
+    ///   this transaction's read mark (same WAL epoch and frame ≤ mark, or an earlier backfilled
+    ///   epoch). Without this a transaction that opened before an off-lock materialization would
+    ///   seek a page its read mark cannot reach (a torn/foreign/zeroed-page read).
     ///
     /// When this is false the transaction stays version-store-only; the GC floor
-    /// ([`Self::compute_min_reader_boundary`]) guarantees the version-store copy is still present.
+    /// ([`Self::compute_min_reader_mark`]) guarantees the version-store copy is still present.
     pub fn is_btree_readable_at(
         &self,
         table_id: &MVTableId,
         begin_ts: u64,
-        observed_boundary: u64,
+        read_mark: WalPos,
     ) -> bool {
         self.table_id_to_rootpage
             .get(table_id)
             .is_some_and(|entry| {
                 let e = entry.value();
-                // `visible_from == u64::MAX` is the "staged, not yet published" sentinel (pages
-                // allocated but not yet durable); never readable, even by an untracked observer.
+                // A not-yet-committed binding (materialized_at == STAGED) is never readable, even
+                // by an untracked/no-WAL reader whose mark is also STAGED.
                 e.root_page.is_some()
-                    && e.visible_from != u64::MAX
+                    && e.materialized_at != WalPos::STAGED
                     && e.covers(begin_ts)
-                    && e.visible_from <= observed_boundary
+                    && e.materialized_at <= read_mark
             })
     }
 
-    /// Lowest `observed_durable_boundary` over all active/preparing transactions (`u64::MAX` if
-    /// none). A freshly-materialized object's version-store rows may be GC'd only once its
-    /// `visible_from <= this`, i.e. every live reader can now physically read it from the btree —
-    /// otherwise a reader at `begin_ts > c_ts` that can't yet see the btree would lose the rows.
-    pub fn compute_min_reader_boundary(&self) -> u64 {
+    /// Lexicographic minimum WAL read mark over all active/preparing transactions
+    /// ([`WalPos::STAGED`] if none). A freshly-materialized object's version-store rows may be GC'd
+    /// only once `materialized_at <= this`, i.e. every live reader can now physically reach it —
+    /// otherwise a reader whose read mark predates the materialization would lose the rows.
+    pub fn compute_min_reader_mark(&self) -> WalPos {
         self.txs
             .iter()
             .filter_map(|entry| {
                 let tx = entry.value();
                 match tx.state.load() {
-                    TransactionState::Active | TransactionState::Preparing(_) => {
-                        Some(tx.observed_durable_boundary)
-                    }
+                    TransactionState::Active | TransactionState::Preparing(_) => Some(tx.read_mark),
                     _ => None,
                 }
             })
             .min()
-            .unwrap_or(u64::MAX)
+            .unwrap_or(WalPos::STAGED)
     }
 
-    /// GC floor: whether `table_id`'s version-store rows must be retained because its btree was
-    /// freshly materialized and is not yet physically visible to every active reader
-    /// (`visible_from > min_reader_boundary`). A reader at `begin_ts > c_ts` that cannot yet read
-    /// the btree (its read mark predates the materialization) still needs the version-store copy;
-    /// `lwm` alone does not protect it, because the materialized rows have `ts <= c_ts < lwm`.
-    fn rootpage_gc_protected(&self, table_id: &MVTableId, min_reader_boundary: u64) -> bool {
+    /// GC floor for a freshly *created* btree: while a reader's read mark predates the binding's
+    /// `materialized_at` (the creation frame) it cannot reach the btree and relies on the version
+    /// store. Incremental re-materialization of existing rows is handled precisely per-version via
+    /// [`RowVersion::materialized_at`] in [`Self::gc_version_chain`], not here.
+    fn rootpage_gc_protected(&self, table_id: &MVTableId, min_reader_mark: WalPos) -> bool {
         self.table_id_to_rootpage
             .get(table_id)
-            .is_some_and(|e| e.value().visible_from > min_reader_boundary)
+            .is_some_and(|e| e.value().materialized_at > min_reader_mark)
     }
 }
 
@@ -9039,7 +9176,20 @@ impl RowVersion {
             end: crate::mvcc::database::PackedTs::pack(end),
             row,
             btree_resident,
+            materialized_at: WalPos::ORIGIN,
         }
+    }
+
+    /// WAL position at which this version's current state is materialized in the B-tree
+    /// ([`WalPos::ORIGIN`] = not materialized). See the field doc.
+    #[inline]
+    pub(crate) fn materialized_at(&self) -> WalPos {
+        self.materialized_at
+    }
+
+    #[inline]
+    pub(crate) fn set_materialized_at(&mut self, pos: WalPos) {
+        self.materialized_at = pos;
     }
 
     /// The begin timestamp/tx-id, or `None`.
@@ -9057,11 +9207,17 @@ impl RowVersion {
     #[inline]
     pub fn set_begin(&mut self, value: Option<TxTimestampOrID>) {
         self.begin = crate::mvcc::database::PackedTs::pack(value);
+        // The version's state changed, so any prior B-tree materialization no longer reflects
+        // it (over-resetting to ORIGIN is safe: it only delays GC, never reclaims early).
+        self.materialized_at = WalPos::ORIGIN;
     }
 
     #[inline]
     pub fn set_end(&mut self, value: Option<TxTimestampOrID>) {
         self.end = crate::mvcc::database::PackedTs::pack(value);
+        // A delete (or any end change) means the B-tree no longer reflects this version's current
+        // state until a checkpoint re-materializes it; the GC must not reclaim it before then.
+        self.materialized_at = WalPos::ORIGIN;
     }
 
     /// A row is visible to a transaction if:

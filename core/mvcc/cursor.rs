@@ -548,10 +548,19 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         // dropped (and possibly reused) the page off-lock while we still reference it at an
         // older snapshot. The WAL read mark keeps the pages readable; this keeps the in-memory
         // root_page -> table_id reverse lookup snapshot-consistent. See `retired_rootpages`.
-        let table_id =
-            db.get_table_id_from_root_page_at(root_page_or_table_id, db.read_snapshot_ts(tx_id));
-        #[cfg(not(any(test, injected_yields)))]
-        let _ = connection;
+        let snapshot_ts = db.read_snapshot_ts(tx_id);
+        let table_id = if connection.experimental_mvcc_passive_checkpoint_enabled() {
+            // Under PASSIVE checkpointing a transaction can capture a schema cookie older than
+            // the drop committed within its own snapshot (the drop publishes its cookie after
+            // the transaction reads the header, even though the drop's commit ts precedes the
+            // transaction's begin ts). The compiled cursor then points at a positive root page
+            // its snapshot already sees dropped. That is a stale-schema read, not an invariant
+            // violation: reprepare against the current schema instead of panicking.
+            db.try_get_table_id_from_root_page_at(root_page_or_table_id, snapshot_ts)
+                .ok_or(LimboError::SchemaUpdated)?
+        } else {
+            db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot_ts)
+        };
         Ok(Self {
             db,
             #[cfg(any(test, injected_yields))]
@@ -770,9 +779,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         // materialization therefore stays version-store-only for its whole life and never seeks
         // the page its read mark can't see. See `MvStore::is_btree_readable_at`.
         let begin_ts = self.db.read_snapshot_ts(self.tx_id);
-        let observed = self.db.read_observed_boundary(self.tx_id);
+        let read_mark = self.db.read_tx_mark(self.tx_id);
         self.db
-            .is_btree_readable_at(&self.table_id, begin_ts, observed)
+            .is_btree_readable_at(&self.table_id, begin_ts, read_mark)
     }
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> bool {

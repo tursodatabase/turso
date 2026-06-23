@@ -2859,6 +2859,31 @@ impl Pager {
         self.with_header(|header| header.schema_cookie.get())
     }
 
+    /// This connection's frozen WAL position `(checkpoint_seq, max_frame)` — the read mark for a
+    /// reader, or the post-commit position for a writer. `(u32::MAX, u64::MAX)` when there is no
+    /// WAL (no off-lock materialization hazard). See `Wal::connection_wal_pos`.
+    pub fn wal_pos(&self) -> (u32, u64) {
+        self.wal
+            .as_ref()
+            .map_or((u32::MAX, u64::MAX), |wal| wal.connection_wal_pos())
+    }
+
+    /// Lowest WAL frame any active reader is pinned at, or `None` if none / no WAL. Used as the
+    /// MVCC off-lock checkpoint GC floor (it sees readers pinned via `begin_read_tx` even before
+    /// they publish an MVCC transaction). See `MvStore::rootpage_gc_protected`.
+    pub fn min_pinned_read_frame(&self) -> Option<u64> {
+        self.wal
+            .as_ref()
+            .and_then(|wal| wal.min_pinned_read_frame())
+    }
+
+    /// The WAL backfill boundary (frames at or below this are durable in the DB file). The MVCC
+    /// off-lock GC floor: a materialized version may be reclaimed from the version store only once
+    /// its materialization frame is backfilled here, so every snapshot can read it from the btree.
+    pub fn wal_backfill_frame(&self) -> Option<u64> {
+        self.wal.as_ref().map(|wal| wal.backfill_frame())
+    }
+
     #[inline(always)]
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn begin_read_tx(&self) -> Result<()> {

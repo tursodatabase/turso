@@ -4018,6 +4018,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row: row.clone(),
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tx.push_row_version_for_test(&version);
         let c = log.log_tx(tx).unwrap();
@@ -4123,6 +4124,7 @@ mod tests {
             }),
             row,
             btree_resident,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         let tx = crate::mvcc::database::LogRecord::for_test(commit_ts, &[row_version], None);
         let c = log.log_tx(tx).unwrap();
@@ -4248,6 +4250,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row: generate_simple_string_row(table_id, rowid, data),
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
     }
 
@@ -4860,6 +4863,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row: row.clone(),
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         });
         let c = log.log_tx(tx1).unwrap();
         io.wait_for_completion(c).unwrap();
@@ -4873,6 +4877,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         });
         let c = log.log_tx(tx2).unwrap();
         io.wait_for_completion(c).unwrap();
@@ -5028,6 +5033,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 row: row3,
                 btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             }],
             None,
         );
@@ -5089,6 +5095,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 row: generate_simple_string_row((-2).into(), 1, "first"),
                 btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             }],
             None,
         );
@@ -5106,6 +5113,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 row: generate_simple_string_row((-2).into(), 2, "second"),
                 btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             }],
             None,
         );
@@ -5165,6 +5173,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tx.push_row_version_for_test(&version);
         let c = log.log_tx(tx).unwrap();
@@ -5639,6 +5648,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row: generate_simple_string_row((-2).into(), 42, "flip"),
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         });
         let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
@@ -5721,6 +5731,7 @@ mod tests {
                         )
                         .unwrap(),
                         btree_resident,
+                        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                     });
                     expected.push(ExpectedTableOp::Delete {
                         rowid,
@@ -5738,6 +5749,7 @@ mod tests {
                         end: crate::mvcc::database::PackedTs::pack(None),
                         row: row.clone(),
                         btree_resident,
+                        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                     });
                     expected.push(ExpectedTableOp::Upsert {
                         rowid,
@@ -5773,6 +5785,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 row,
                 btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             });
         }
         let c = log.log_tx(large_tx).unwrap();
@@ -5814,6 +5827,7 @@ mod tests {
                 }),
                 row: row.clone(),
                 btree_resident,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             };
             expected.push(if is_delete {
                 ExpectedTableOp::Delete {
@@ -5919,6 +5933,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: true,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tx.push_row_version_for_test(&version);
         let c = log.log_tx(tx).unwrap();
@@ -5980,6 +5995,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tx.push_row_version_for_test(&version);
         let c = log.log_tx(tx).unwrap();
@@ -6275,6 +6291,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
     }
 
@@ -6303,6 +6320,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
     }
 
@@ -6352,6 +6370,7 @@ mod tests {
             }),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
     }
 
@@ -6379,6 +6398,7 @@ mod tests {
             }),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
     }
 
