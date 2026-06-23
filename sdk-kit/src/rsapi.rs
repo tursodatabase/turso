@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    ffi::CString,
+    ffi::{CStr, CString},
     fmt::Display,
     ops::Deref,
     sync::{
@@ -20,8 +20,8 @@ use tracing_subscriber::{
 };
 use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, QueryMode,
-    Statement, StepResult, IO,
+    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, PageCodec,
+    PageCodecHeaderInfo, PageCodecLocation, QueryMode, Statement, StepResult, IO,
 };
 
 use crate::{
@@ -147,6 +147,184 @@ pub struct TursoDatabaseConfig {
     /// optional custom DatabaseStorage provided by the caller
     /// if provided, caller must guarantee that IO used by the TursoDatabase will be consistent with underlying DatabaseStorage IO
     pub db_file: Option<Arc<dyn DatabaseStorage>>,
+
+    /// optional external page codec provided by the caller
+    pub page_codec: Option<Arc<dyn PageCodec>>,
+
+    /// database open flags
+    pub open_flags: OpenFlags,
+}
+
+#[derive(Clone)]
+struct CApiPageCodec {
+    inner: Arc<CApiPageCodecInner>,
+}
+
+struct CApiPageCodecInner {
+    raw: c::turso_page_codec_v1_t,
+}
+
+// SAFETY: external page codecs are an FFI contract. Callers that install a codec must keep the
+// context and callbacks valid and thread-safe for the database lifetime.
+unsafe impl Send for CApiPageCodecInner {}
+// SAFETY: see the Send impl; Turso may read/write pages through shared database state.
+unsafe impl Sync for CApiPageCodecInner {}
+
+impl std::fmt::Debug for CApiPageCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CApiPageCodec")
+            .field("abi_version", &self.inner.raw.abi_version)
+            .field("ctx", &"<opaque>")
+            .finish()
+    }
+}
+
+impl Drop for CApiPageCodecInner {
+    fn drop(&mut self) {
+        if let Some(destroy) = self.raw.destroy {
+            unsafe { destroy(self.raw.ctx) };
+        }
+    }
+}
+
+impl CApiPageCodec {
+    unsafe fn from_capi(codec: *const c::turso_page_codec_v1_t) -> Result<Self, TursoError> {
+        if codec.is_null() {
+            return Err(TursoError::Misuse(
+                "page codec pointer must be not null".to_string(),
+            ));
+        }
+        let raw = unsafe { *codec };
+        if raw.abi_version != 1 {
+            return Err(TursoError::Misuse(format!(
+                "unsupported page codec ABI version {}",
+                raw.abi_version
+            )));
+        }
+        if raw.decode_page.is_none() || raw.encode_page.is_none() {
+            return Err(TursoError::Misuse(
+                "page codec decode_page and encode_page callbacks are required".to_string(),
+            ));
+        }
+        Ok(Self {
+            inner: Arc::new(CApiPageCodecInner { raw }),
+        })
+    }
+
+    fn callback_error(error: *const std::ffi::c_char, operation: &str) -> LimboError {
+        if error.is_null() {
+            return LimboError::InvalidArgument(format!("page codec {operation} failed"));
+        }
+        let message = unsafe { CStr::from_ptr(error) }.to_string_lossy();
+        LimboError::InvalidArgument(format!("page codec {operation} failed: {message}"))
+    }
+
+    fn location_to_c(location: PageCodecLocation) -> c::turso_codec_location_t {
+        match location {
+            PageCodecLocation::Database => c::turso_codec_location_t_TURSO_CODEC_LOCATION_DATABASE,
+            PageCodecLocation::Wal => c::turso_codec_location_t_TURSO_CODEC_LOCATION_WAL,
+        }
+    }
+
+    fn transform(
+        &self,
+        operation: &str,
+        callback: c::turso_page_codec_transform_t,
+        page: &[u8],
+        page_idx: usize,
+        location: PageCodecLocation,
+    ) -> Result<Vec<u8>, LimboError> {
+        let Some(callback) = callback else {
+            return Err(LimboError::InvalidArgument(format!(
+                "page codec {operation} callback is not configured"
+            )));
+        };
+        let page_no = u32::try_from(page_idx).map_err(|_| LimboError::IntegerOverflow)?;
+        let mut output = vec![0; page.len()];
+        let mut error = std::ptr::null();
+        let status = unsafe {
+            callback(
+                self.inner.raw.ctx,
+                page_no,
+                Self::location_to_c(location),
+                page.as_ptr(),
+                page.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut error,
+            )
+        };
+        if status != 0 {
+            return Err(Self::callback_error(error, operation));
+        }
+        Ok(output)
+    }
+}
+
+impl PageCodec for CApiPageCodec {
+    fn probe_header(
+        &self,
+        raw_page1_prefix: &[u8],
+    ) -> Result<Option<PageCodecHeaderInfo>, LimboError> {
+        let Some(probe_header) = self.inner.raw.probe_header else {
+            return Ok(None);
+        };
+        let mut out = c::turso_page_codec_header_info_t::default();
+        let mut error = std::ptr::null();
+        let status = unsafe {
+            probe_header(
+                self.inner.raw.ctx,
+                raw_page1_prefix.as_ptr(),
+                raw_page1_prefix.len(),
+                &mut out,
+                &mut error,
+            )
+        };
+        if status != 0 {
+            return Err(Self::callback_error(error, "probe_header"));
+        }
+        if out.is_supported == 0 {
+            return Ok(None);
+        }
+        Ok(Some(PageCodecHeaderInfo {
+            page_size: out.page_size as usize,
+            reserved_space: out.reserved_space,
+        }))
+    }
+
+    fn required_reserved_bytes(&self) -> u8 {
+        self.inner.raw.reserved_space
+    }
+
+    fn encode_page(
+        &self,
+        page: &[u8],
+        page_idx: usize,
+        location: PageCodecLocation,
+    ) -> Result<Vec<u8>, LimboError> {
+        self.transform(
+            "encode_page",
+            self.inner.raw.encode_page,
+            page,
+            page_idx,
+            location,
+        )
+    }
+
+    fn decode_page(
+        &self,
+        page: &[u8],
+        page_idx: usize,
+        location: PageCodecLocation,
+    ) -> Result<Vec<u8>, LimboError> {
+        self.transform(
+            "decode_page",
+            self.inner.raw.decode_page,
+            page,
+            page_idx,
+            location,
+        )
+    }
 }
 
 impl TursoDatabaseConfig {
@@ -301,6 +479,12 @@ impl TursoDatabaseConfig {
                 "either both encryption cipher and key must be set or no".to_string(),
             ));
         }
+        if encryption_cipher.is_some() && !config.page_codec.is_null() {
+            return Err(TursoError::Misuse(
+                "built-in encryption cannot be combined with an external page codec".to_string(),
+            ));
+        }
+        let open_flags = open_flags_from_capi(config.open_flags)?;
         Ok(Self {
             path: str_from_c_str(config.path)?.to_string(),
             experimental_features: if !config.experimental_features.is_null() {
@@ -320,7 +504,28 @@ impl TursoDatabaseConfig {
             },
             io: None,
             db_file: None,
+            page_codec: if !config.page_codec.is_null() {
+                Some(Arc::new(CApiPageCodec::from_capi(config.page_codec)?))
+            } else {
+                None
+            },
+            open_flags,
         })
+    }
+}
+
+fn open_flags_from_capi(flags: u32) -> Result<OpenFlags, TursoError> {
+    const READONLY: u32 = c::turso_database_open_flags_t_TURSO_DATABASE_OPEN_READONLY;
+    if flags & !READONLY != 0 {
+        return Err(TursoError::Misuse(format!(
+            "unknown database open flags: 0x{flags:x}"
+        )));
+    }
+
+    if flags & READONLY != 0 {
+        Ok(OpenFlags::ReadOnly)
+    } else {
+        Ok(OpenFlags::default())
     }
 }
 
@@ -346,6 +551,7 @@ pub struct TursoDatabaseOpenState {
     io: Option<Arc<dyn IO>>,
     db_file: Option<Arc<dyn DatabaseStorage>>,
     opts: Option<DatabaseOpts>,
+    open_flags: OpenFlags,
     open_db_state: OpenDbAsyncState,
 }
 
@@ -362,6 +568,7 @@ impl TursoDatabaseOpenState {
             io: None,
             db_file: None,
             opts: None,
+            open_flags: OpenFlags::default(),
             open_db_state: OpenDbAsyncState::new(),
         }
     }
@@ -696,7 +903,7 @@ impl TursoDatabase {
                         ));
                     }
 
-                    let mut open_flags = OpenFlags::default();
+                    let mut open_flags = self.config.open_flags;
                     if opts.enable_multiprocess_wal {
                         open_flags |= OpenFlags::NoLock;
                     }
@@ -710,6 +917,7 @@ impl TursoDatabase {
                     state.io = Some(io);
                     state.db_file = Some(db_file);
                     state.opts = Some(opts);
+                    state.open_flags = open_flags;
                     state.phase = TursoDatabaseOpenPhase::Opening;
                 }
 
@@ -725,17 +933,34 @@ impl TursoDatabase {
                         .expect("db_file must be initialized in Init phase")
                         .clone();
                     let opts = state.opts.expect("opts must be initialized in Init phase");
+                    let open_flags = state.open_flags;
 
-                    match Database::open_with_flags_async(
-                        &mut state.open_db_state,
-                        io.clone(),
-                        &self.config.path,
-                        db_file,
-                        OpenFlags::default(),
-                        opts,
-                        self.config.encryption.clone(),
-                        None,
-                    )? {
+                    let open_result = if let Some(page_codec) = self.config.page_codec.clone() {
+                        Database::open_with_flags_and_page_codec_async(
+                            &mut state.open_db_state,
+                            io.clone(),
+                            &self.config.path,
+                            db_file,
+                            open_flags,
+                            opts,
+                            self.config.encryption.clone(),
+                            None,
+                            page_codec,
+                        )
+                    } else {
+                        Database::open_with_flags_async(
+                            &mut state.open_db_state,
+                            io.clone(),
+                            &self.config.path,
+                            db_file,
+                            open_flags,
+                            opts,
+                            self.config.encryption.clone(),
+                            None,
+                        )
+                    }?;
+
+                    match open_result {
                         IOResult::Done(db) => {
                             let mut inner_db = self.db.lock().unwrap();
                             *inner_db = Some(db);
@@ -1440,7 +1665,7 @@ impl TursoStatement {
 #[cfg(test)]
 mod tests {
     use crate::rsapi::{
-        TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR,
+        OpenFlags, TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR,
     };
     use turso_core::Value;
 
@@ -1453,6 +1678,8 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         }
     }
 
@@ -1503,6 +1730,8 @@ mod tests {
                 vfs: None,
                 io: None,
                 db_file: None,
+                page_codec: None,
+                open_flags: OpenFlags::default(),
             });
             let result = db.open().unwrap();
             assert!(!result.is_io());
@@ -1564,6 +1793,8 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1584,6 +1815,8 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1614,6 +1847,8 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1637,6 +1872,8 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1687,6 +1924,8 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1746,6 +1985,8 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1778,6 +2019,8 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1807,6 +2050,8 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1832,6 +2077,8 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1858,6 +2105,8 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1908,6 +2157,8 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1996,6 +2247,8 @@ mod tests {
                     vfs: None,
                     io: None,
                     db_file: None,
+                    page_codec: None,
+                    open_flags: OpenFlags::default(),
                 });
                 let result = db.open().unwrap();
                 assert!(!result.is_io());
@@ -2036,6 +2289,8 @@ mod tests {
                     vfs: None,
                     io: None,
                     db_file: None,
+                    page_codec: None,
+                    open_flags: OpenFlags::default(),
                 });
                 let result = db.open().unwrap();
                 assert!(!result.is_io());
@@ -2062,6 +2317,8 @@ mod tests {
                     vfs: None,
                     io: None,
                     db_file: None,
+                    page_codec: None,
+                    open_flags: OpenFlags::default(),
                 });
                 assert!(db.open().is_err(), "Opening with wrong key should fail");
             }
@@ -2076,6 +2333,8 @@ mod tests {
                     vfs: None,
                     io: None,
                     db_file: None,
+                    page_codec: None,
+                    open_flags: OpenFlags::default(),
                 });
                 let result = db.open();
                 println!("result: {result:?}");
@@ -2111,6 +2370,8 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let _ = db_a.open().unwrap();
         let conn_a = db_a.connect().unwrap();
@@ -2148,6 +2409,8 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let _ = db_a2.open().unwrap();
         let conn_a2 = db_a2.connect().unwrap();
@@ -2182,6 +2445,8 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2216,6 +2481,8 @@ mod tests {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());

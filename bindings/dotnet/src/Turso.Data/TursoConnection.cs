@@ -12,6 +12,8 @@ public class TursoConnection : DbConnection
     private TursoConnectionOptions _connectionOptions;
     private bool _disposed;
     private bool _readUncommitted;
+    private ITursoPageCodec? _pageCodec;
+    private byte _pageCodecReservedSpace;
 
     [AllowNull]
     public override string ConnectionString
@@ -36,6 +38,30 @@ public class TursoConnection : DbConnection
 
     protected override DbProviderFactory DbProviderFactory => TursoFactory.Instance;
 
+    public ITursoPageCodec? PageCodec
+    {
+        get => _pageCodec;
+        set
+        {
+            if (State == ConnectionState.Open)
+                throw new InvalidOperationException("PageCodec cannot be set while the connection is open.");
+
+            _pageCodec = value;
+        }
+    }
+
+    public byte PageCodecReservedSpace
+    {
+        get => _pageCodecReservedSpace;
+        set
+        {
+            if (State == ConnectionState.Open)
+                throw new InvalidOperationException("PageCodecReservedSpace cannot be set while the connection is open.");
+
+            _pageCodecReservedSpace = value;
+        }
+    }
+
     public TursoConnection() : this("")
     {
     }
@@ -54,8 +80,18 @@ public class TursoConnection : DbConnection
         var filename = _connectionOptions["Data Source"] ?? ":memory:";
         var cipher = _connectionOptions.GetEncryptionCipher();
         var hexkey = _connectionOptions["Encryption Key"];
+        var readOnly = IsReadOnlyMode(_connectionOptions["Mode"]);
 
-        if (cipher.HasValue)
+        if (_pageCodec is not null)
+        {
+            if (cipher.HasValue)
+                throw new InvalidOperationException("PageCodec cannot be combined with Encryption Cipher.");
+
+            _turso = readOnly
+                ? TursoBindings.OpenDatabaseReadOnlyWithPageCodec(filename, _pageCodec, _pageCodecReservedSpace)
+                : TursoBindings.OpenDatabaseWithPageCodec(filename, _pageCodec, _pageCodecReservedSpace);
+        }
+        else if (cipher.HasValue)
         {
             if (string.IsNullOrWhiteSpace(hexkey))
                 throw new InvalidOperationException("Encryption Key is required when Encryption Cipher is specified.");
@@ -66,6 +102,14 @@ public class TursoConnection : DbConnection
         {
             _turso = TursoBindings.OpenDatabase(filename);
         }
+    }
+
+    private static bool IsReadOnlyMode(string? mode)
+    {
+        return mode is not null
+            && (mode.Equals("ReadOnly", StringComparison.OrdinalIgnoreCase)
+                || mode.Equals("Read Only", StringComparison.OrdinalIgnoreCase)
+                || mode.Equals("ro", StringComparison.OrdinalIgnoreCase));
     }
 
     public override void Close()

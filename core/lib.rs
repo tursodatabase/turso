@@ -161,7 +161,7 @@ pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
 pub use storage::{
     buffer_pool::BufferPool,
-    database::{DatabaseStorage, IOContext},
+    database::{DatabaseStorage, IOContext, PageCodec, PageCodecHeaderInfo, PageCodecLocation},
     encryption::{CipherMode, EncryptionContext, EncryptionKey},
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
@@ -623,6 +623,7 @@ pub struct Database {
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
+    page_codec: Option<Arc<dyn PageCodec>>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -682,23 +683,36 @@ impl fmt::Debug for Database {
     }
 }
 
+struct DatabaseNewArgs<'a> {
+    opts: DatabaseOpts,
+    flags: OpenFlags,
+    path: &'a str,
+    wal_path: &'a str,
+    io: &'a Arc<dyn IO>,
+    db_file: Arc<dyn DatabaseStorage>,
+    encryption_opts: Option<EncryptionOpts>,
+    page_codec: Option<Arc<dyn PageCodec>>,
+}
+
 impl Database {
     /// Returns true if this database is backed by MemoryIO.
     pub fn is_in_memory_db(&self) -> bool {
         is_memory_like(&self.path)
     }
 
-    fn new(
-        opts: DatabaseOpts,
-        flags: OpenFlags,
-        path: impl Into<String>,
-        wal_path: impl Into<String>,
-        io: &Arc<dyn IO>,
-        db_file: Arc<dyn DatabaseStorage>,
-        encryption_opts: Option<EncryptionOpts>,
-    ) -> Result<Self> {
-        let path = path.into();
-        let wal_path = wal_path.into();
+    fn new(args: DatabaseNewArgs<'_>) -> Result<Self> {
+        let DatabaseNewArgs {
+            opts,
+            flags,
+            path,
+            wal_path,
+            io,
+            db_file,
+            encryption_opts,
+            page_codec,
+        } = args;
+        let path = path.to_string();
+        let wal_path = wal_path.to_string();
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
 
@@ -753,6 +767,7 @@ impl Database {
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
             ),
+            page_codec,
 
             durable_storage: None,
         };
@@ -1085,6 +1100,60 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     ) -> Result<IOResult<Arc<Database>>> {
+        Self::open_with_flags_async_with_optional_page_codec(
+            state,
+            io,
+            path,
+            db_file,
+            flags,
+            opts,
+            encryption_opts,
+            durable_storage,
+            None,
+        )
+    }
+
+    /// async flow of opening the database with an external page codec.
+    ///
+    /// Uses the database registry to ensure single Database instance per file within a process.
+    /// Caller must drive the IO loop and pass state between calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_flags_and_page_codec_async(
+        state: &mut OpenDbAsyncState,
+        io: Arc<dyn IO>,
+        path: &str,
+        db_file: Arc<dyn DatabaseStorage>,
+        flags: OpenFlags,
+        opts: DatabaseOpts,
+        encryption_opts: Option<EncryptionOpts>,
+        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        page_codec: Arc<dyn PageCodec>,
+    ) -> Result<IOResult<Arc<Database>>> {
+        Self::open_with_flags_async_with_optional_page_codec(
+            state,
+            io,
+            path,
+            db_file,
+            flags,
+            opts,
+            encryption_opts,
+            durable_storage,
+            Some(page_codec),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_with_flags_async_with_optional_page_codec(
+        state: &mut OpenDbAsyncState,
+        io: Arc<dyn IO>,
+        path: &str,
+        db_file: Arc<dyn DatabaseStorage>,
+        flags: OpenFlags,
+        opts: DatabaseOpts,
+        encryption_opts: Option<EncryptionOpts>,
+        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        page_codec: Option<Arc<dyn PageCodec>>,
+    ) -> Result<IOResult<Arc<Database>>> {
         let result = Self::open_with_flags_async_internal(
             state,
             io,
@@ -1094,6 +1163,7 @@ impl Database {
             opts,
             encryption_opts,
             durable_storage,
+            page_codec,
         );
         if result.is_err() {
             // On error, remove the Opening sentinel so other callers can proceed.
@@ -1115,7 +1185,14 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        page_codec: Option<Arc<dyn PageCodec>>,
     ) -> Result<IOResult<Arc<Database>>> {
+        if encryption_opts.is_some() && page_codec.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "built-in encryption cannot be combined with an external page codec".to_string(),
+            ));
+        }
+
         // turso-sync-engine creates 2 databases with different names in the same IO if MemoryIO is used
         // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
         // so, we bypass registry for all in memory dbs (i.e. db paths which starts with ":memory:")
@@ -1139,6 +1216,12 @@ impl Database {
                                 return Err(LimboError::InvalidArgument(
                                     "Database is encrypted but no encryption options provided"
                                         .to_string(),
+                                ));
+                            }
+                            let cached_has_page_codec = db.page_codec.is_some();
+                            if cached_has_page_codec || page_codec.is_some() {
+                                return Err(LimboError::InvalidArgument(
+                                    "Database is already open and external page codec options cannot be verified for cached databases".to_string(),
                                 ));
                             }
                             return Ok(IOResult::Done(db));
@@ -1165,7 +1248,7 @@ impl Database {
         }
 
         // Open the database asynchronously (no registry lock held).
-        let result = Self::open_with_flags_bypass_registry_async(
+        let result = Self::open_with_flags_bypass_registry_async_with_optional_page_codec(
             state,
             io.clone(),
             path,
@@ -1175,6 +1258,7 @@ impl Database {
             opts,
             encryption_opts,
             durable_storage,
+            page_codec,
         )?;
 
         if let IOResult::Done(ref db) = result {
@@ -1235,6 +1319,62 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     ) -> Result<IOResult<Arc<Database>>> {
+        Self::open_with_flags_bypass_registry_async_with_optional_page_codec(
+            state,
+            io,
+            path,
+            wal_path,
+            db_file,
+            flags,
+            opts,
+            encryption_opts,
+            durable_storage,
+            None,
+        )
+    }
+
+    /// Async version of database opening with an external page codec.
+    /// Caller must drive the IO loop and pass state between calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_flags_bypass_registry_and_page_codec_async(
+        state: &mut OpenDbAsyncState,
+        io: Arc<dyn IO>,
+        path: &str,
+        wal_path: Option<&str>,
+        db_file: Arc<dyn DatabaseStorage>,
+        flags: OpenFlags,
+        opts: DatabaseOpts,
+        encryption_opts: Option<EncryptionOpts>,
+        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        page_codec: Arc<dyn PageCodec>,
+    ) -> Result<IOResult<Arc<Database>>> {
+        Self::open_with_flags_bypass_registry_async_with_optional_page_codec(
+            state,
+            io,
+            path,
+            wal_path,
+            db_file,
+            flags,
+            opts,
+            encryption_opts,
+            durable_storage,
+            Some(page_codec),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_with_flags_bypass_registry_async_with_optional_page_codec(
+        state: &mut OpenDbAsyncState,
+        io: Arc<dyn IO>,
+        path: &str,
+        wal_path: Option<&str>,
+        db_file: Arc<dyn DatabaseStorage>,
+        flags: OpenFlags,
+        opts: DatabaseOpts,
+        encryption_opts: Option<EncryptionOpts>,
+        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        page_codec: Option<Arc<dyn PageCodec>>,
+    ) -> Result<IOResult<Arc<Database>>> {
         let result = Self::open_with_flags_bypass_registry_async_internal(
             state,
             io,
@@ -1245,6 +1385,7 @@ impl Database {
             opts,
             encryption_opts,
             durable_storage,
+            page_codec,
         );
         if result.is_err() {
             // schema_guard is set by the open_with_flags_bypass_registry_async_internal - so we release it in case of error
@@ -1265,6 +1406,7 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        page_codec: Option<Arc<dyn PageCodec>>,
     ) -> Result<IOResult<Arc<Database>>> {
         loop {
             tracing::debug!(
@@ -1285,15 +1427,16 @@ impl Database {
                     } else {
                         &format!("{path}-wal")
                     };
-                    let mut db = Self::new(
+                    let mut db = Self::new(DatabaseNewArgs {
                         opts,
                         flags,
                         path,
                         wal_path,
-                        &io,
-                        db_file.clone(),
-                        encryption_opts.clone(),
-                    )?;
+                        io: &io,
+                        db_file: db_file.clone(),
+                        encryption_opts: encryption_opts.clone(),
+                        page_codec: page_codec.clone(),
+                    })?;
                     db.durable_storage.clone_from(&durable_storage);
 
                     // Header validation + WAL recovery runs as a sub state
@@ -1537,6 +1680,8 @@ impl Database {
                     if let Some(key) = encryption_key {
                         let cipher_mode = self.encryption_cipher_mode.get();
                         pager.set_encryption_context(cipher_mode, key)?;
+                    } else if let Some(codec) = &self.page_codec {
+                        pager.set_page_codec(codec.clone())?;
                     }
 
                     // Start a read transaction before reading page 1 to prevent a concurrent
@@ -2550,10 +2695,33 @@ impl Database {
         // on-disk page size from it.
         let (header_reserved_bytes, header_page_size) = if self.initialized() {
             let buf = return_if_io!(self.read_db_header_buf(hdr_st));
-            let reserved = u8::from_be_bytes(buf.as_slice()[20..21].try_into().unwrap());
-            let ps_raw = u16::from_be_bytes(buf.as_slice()[16..18].try_into().unwrap());
-            let page_size = PageSize::new_from_header_u16(ps_raw)?;
-            (Some(reserved), Some(page_size))
+            if let Some(codec) = &self.page_codec {
+                if let Some(header_info) = codec.probe_header(buf.as_slice())? {
+                    let page_size_u32 = u32::try_from(header_info.page_size).map_err(|_| {
+                        LimboError::InvalidArgument(format!(
+                            "page codec reported invalid page size {}",
+                            header_info.page_size
+                        ))
+                    })?;
+                    let Some(page_size) = PageSize::new(page_size_u32) else {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "page codec reported invalid page size {}",
+                            header_info.page_size
+                        )));
+                    };
+                    (Some(header_info.reserved_space), Some(page_size))
+                } else {
+                    let reserved = u8::from_be_bytes(buf.as_slice()[20..21].try_into().unwrap());
+                    let ps_raw = u16::from_be_bytes(buf.as_slice()[16..18].try_into().unwrap());
+                    let page_size = PageSize::new_from_header_u16(ps_raw)?;
+                    (Some(reserved), Some(page_size))
+                }
+            } else {
+                let reserved = u8::from_be_bytes(buf.as_slice()[20..21].try_into().unwrap());
+                let ps_raw = u16::from_be_bytes(buf.as_slice()[16..18].try_into().unwrap());
+                let page_size = PageSize::new_from_header_u16(ps_raw)?;
+                (Some(reserved), Some(page_size))
+            }
         } else {
             (None, None)
         };

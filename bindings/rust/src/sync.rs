@@ -340,6 +340,8 @@ impl Builder {
             vfs: None,
             io: None,
             db_file: None,
+            page_codec: None,
+            open_flags: Default::default(),
         };
 
         let url = if let Some(remote_url) = &self.remote_url {

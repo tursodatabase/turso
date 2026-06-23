@@ -34,6 +34,13 @@ internal enum TursoNativeValueType : uint
     Null = 5,
 }
 
+[Flags]
+internal enum TursoDatabaseOpenFlags : uint
+{
+    None = 0,
+    ReadOnly = 1,
+}
+
 [StructLayout(LayoutKind.Sequential)]
 internal struct TursoDatabaseConfig
 {
@@ -43,6 +50,8 @@ internal struct TursoDatabaseConfig
     public IntPtr Vfs;
     public IntPtr EncryptionCipher;
     public IntPtr EncryptionHexKey;
+    public IntPtr PageCodec;
+    public TursoDatabaseOpenFlags OpenFlags;
 }
 
 internal static class TursoInterop
@@ -51,20 +60,85 @@ internal static class TursoInterop
 
     static TursoInterop()
     {
-        if (OperatingSystem.IsIOS())
-        {
-            NativeLibrary.SetDllImportResolver(typeof(TursoInterop).Assembly, ResolveDllImport);
-        }
+        NativeLibrary.SetDllImportResolver(typeof(TursoInterop).Assembly, ResolveNativeLibrary);
     }
 
-    private static IntPtr ResolveDllImport(
+    private static IntPtr ResolveNativeLibrary(
         string libraryName,
         Assembly assembly,
         DllImportSearchPath? searchPath)
     {
-        return libraryName == DllName
-            ? NativeLibrary.Load($"Frameworks/lib{libraryName}.framework/lib{libraryName}", assembly, searchPath)
-            : IntPtr.Zero;
+        if (!string.Equals(libraryName, DllName, StringComparison.Ordinal))
+        {
+            return IntPtr.Zero;
+        }
+
+        if (OperatingSystem.IsIOS())
+        {
+            return NativeLibrary.Load($"Frameworks/lib{libraryName}.framework/lib{libraryName}", assembly, searchPath);
+        }
+
+        var rid = GetRuntimeIdentifier();
+        if (rid is null)
+        {
+            return IntPtr.Zero;
+        }
+
+        var libraryPath = Path.Combine(
+            AppContext.BaseDirectory,
+            "runtimes",
+            rid,
+            "native",
+            GetNativeLibraryFileName());
+
+        return File.Exists(libraryPath) ? NativeLibrary.Load(libraryPath) : IntPtr.Zero;
+    }
+
+    private static string? GetRuntimeIdentifier()
+    {
+        var architecture = RuntimeInformation.ProcessArchitecture switch
+        {
+            Architecture.X64 => "x64",
+            Architecture.Arm64 => "arm64",
+            _ => null,
+        };
+
+        if (architecture is null)
+        {
+            return null;
+        }
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return $"win-{architecture}";
+        }
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+        {
+            return $"linux-{architecture}";
+        }
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            return $"osx-{architecture}";
+        }
+
+        return null;
+    }
+
+    private static string GetNativeLibraryFileName()
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return "turso_sdk_kit.dll";
+        }
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            return "libturso_sdk_kit.dylib";
+        }
+
+        return "libturso_sdk_kit.so";
     }
 
     [DllImport(DllName, EntryPoint = "turso_database_new", CallingConvention = CallingConvention.Cdecl)]

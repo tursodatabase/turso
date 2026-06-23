@@ -196,6 +196,55 @@ typedef struct
     const char *log_level;
 } turso_config_t;
 
+typedef enum
+{
+    TURSO_CODEC_LOCATION_DATABASE = 0,
+    TURSO_CODEC_LOCATION_WAL = 1,
+} turso_codec_location_t;
+
+typedef enum
+{
+    TURSO_DATABASE_OPEN_DEFAULT = 0,
+    TURSO_DATABASE_OPEN_READONLY = 1,
+} turso_database_open_flags_t;
+
+typedef struct
+{
+    uint32_t page_size;
+    uint8_t reserved_space;
+    uint8_t is_supported;
+} turso_page_codec_header_info_t;
+
+typedef int32_t (*turso_page_codec_probe_header_t)(
+    void *ctx,
+    const uint8_t *raw_page1_prefix,
+    size_t raw_len,
+    turso_page_codec_header_info_t *out,
+    const char **error);
+
+typedef int32_t (*turso_page_codec_transform_t)(
+    void *ctx,
+    uint32_t page_no,
+    turso_codec_location_t location,
+    const uint8_t *input,
+    size_t input_len,
+    uint8_t *output,
+    size_t output_len,
+    const char **error);
+
+typedef void (*turso_page_codec_destroy_t)(void *ctx);
+
+typedef struct
+{
+    uint32_t abi_version;
+    void *ctx;
+    uint8_t reserved_space;
+    turso_page_codec_destroy_t destroy;
+    turso_page_codec_probe_header_t probe_header;
+    turso_page_codec_transform_t decode_page;
+    turso_page_codec_transform_t encode_page;
+} turso_page_codec_v1_t;
+
 /**
  * Database description.
  */
@@ -227,6 +276,10 @@ typedef struct
      * as encryption is experimental - experimental_features must have "encryption" in the list
      */
     const char *encryption_hexkey;
+    /** optional external page codec; callback context must remain valid and thread-safe until destroy is called */
+    const turso_page_codec_v1_t *page_codec;
+    /** optional bitmask of turso_database_open_flags_t values */
+    uint32_t open_flags;
 } turso_database_config_t;
 
 /** Setup global database info */

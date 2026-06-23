@@ -27,7 +27,7 @@ use crate::{
     io::CompletionGroup, return_if_io, types::WalFrameInfo, Completion, Connection, IOResult,
     LimboError, Result, TransactionState,
 };
-use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, SyncMode, IO};
+use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, PageCodec, SyncMode, IO};
 #[allow(unused_imports)]
 use crate::{
     turso_assert, turso_assert_eq, turso_assert_greater_than, turso_assert_greater_than_or_equal,
@@ -5468,7 +5468,7 @@ impl Pager {
     }
 
     pub fn is_encryption_ctx_set(&self) -> bool {
-        self.io_ctx.read().encryption_context().is_some()
+        self.io_ctx.read().has_page_codec()
     }
 
     pub fn is_encryption_enabled(&self) -> bool {
@@ -5504,6 +5504,21 @@ impl Pager {
         // clear the cache.
         self.clear_page_cache(false);
         // Also invalidate cached schema cookie to force re-read of page 1 with encryption
+        self.set_schema_cookie(None);
+        Ok(())
+    }
+
+    pub fn set_page_codec(&self, codec: Arc<dyn PageCodec>) -> Result<()> {
+        {
+            let mut io_ctx = self.io_ctx.write();
+            io_ctx.set_page_codec(codec);
+        }
+        let Some(wal) = self.wal.as_ref() else {
+            return Ok(());
+        };
+        let io_ctx = self.io_ctx.read().clone();
+        wal.set_io_context(io_ctx);
+        self.clear_page_cache(false);
         self.set_schema_cookie(None);
         Ok(())
     }
@@ -6160,7 +6175,9 @@ mod ptrmap_tests {
 #[cfg(all(test, feature = "fs", host_shared_wal))]
 mod checkpoint_phase_tests {
     use super::*;
-    use crate::io::{PlatformIO, IO};
+    #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+    use crate::io::PlatformIO;
+    use crate::io::IO;
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::storage::wal::CheckpointMode;
     use crate::sync::atomic::Ordering;

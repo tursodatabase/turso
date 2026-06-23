@@ -3,6 +3,7 @@ use std::io::{self, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::time::Duration;
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TerminalTheme {
     Light,
@@ -224,11 +225,9 @@ impl TerminalDetector {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[cfg(unix)]
     mod unix_tests {
-        use super::*;
+        use super::super::*;
 
         #[test]
         fn test_hex_color_parsing() {
