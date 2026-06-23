@@ -612,55 +612,51 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         vfs_option.clone(),
     )));
 
+    let conn = StressDb::connect(&db, usize::MAX, opts.busy_timeout).await?;
+    'stmts: for stmt in &ddl_statements {
+        let mut retry_counter = 0;
+        while retry_counter < 10 {
+            match conn.execute(stmt, ()).await {
+                Ok(_) => {
+                    break;
+                }
+                Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {
+                    retry_counter += 1;
+                }
+                Err(
+                    turso::Error::DatabaseFull(_)
+                    | turso::Error::IoError(std::io::ErrorKind::StorageFull, _)
+                    | turso::Error::IoError(_, _),
+                ) => {
+                    stop = true;
+                    break 'stmts;
+                }
+                Err(e) => {
+                    turso_macros::turso_assert_unreachable!("fatal error creating table", { "stmt": stmt, "error": e });
+                }
+            }
+        }
+        if retry_counter == 10 {
+            eprintln!(
+                "WARNING: Could not execute statement [{stmt}] after {retry_counter} attempts."
+            );
+        }
+    }
+
+    match opts.tx_mode {
+        TxMode::SQLite => {
+            conn.pragma_update("journal_mode", "WAL").await?;
+            conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
+        }
+        TxMode::Concurrent => {
+            conn.pragma_update("journal_mode", "mvcc").await?;
+        }
+    };
+
     for thread in 0..opts.nr_threads {
         if stop {
             break;
         }
-        let conn = StressDb::connect(&db, thread, opts.busy_timeout).await?;
-
-        match opts.tx_mode {
-            TxMode::SQLite => {
-                conn.pragma_update("journal_mode", "WAL").await?;
-                conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
-            }
-            TxMode::Concurrent => {
-                conn.pragma_update("journal_mode", "mvcc").await?;
-            }
-        };
-
-        for stmt in &ddl_statements {
-            let mut retry_counter = 0;
-            while retry_counter < 10 {
-                match conn.execute(stmt, ()).await {
-                    Ok(_) => {
-                        break;
-                    }
-                    Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {
-                        retry_counter += 1;
-                    }
-                    Err(
-                        turso::Error::DatabaseFull(_)
-                        | turso::Error::IoError(std::io::ErrorKind::StorageFull, _)
-                        | turso::Error::IoError(_, _),
-                    ) => {
-                        stop = true;
-                        break;
-                    }
-                    Err(e) => {
-                        turso_macros::turso_assert_unreachable!("fatal error creating table", { "thread": thread, "stmt": stmt, "error": e });
-                    }
-                }
-            }
-            if stop {
-                break;
-            }
-            if retry_counter == 10 {
-                eprintln!(
-                    "WARNING: Could not execute statement [{stmt}] after {retry_counter} attempts."
-                );
-            }
-        }
-
         let nr_iterations = opts.nr_iterations;
         let db = db.clone();
         let schema_for_task = schema.clone();
