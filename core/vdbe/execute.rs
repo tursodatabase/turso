@@ -6409,6 +6409,43 @@ fn op_window_step(
             };
             *counter += 1;
         }
+        // rank() — mirrors SQLite's CallCount-based rankStepFunc.
+        //
+        // State (payload):
+        //   [0] = current rank value (what AggValue returns; cleared to 0 by
+        //         AggValue so the next step can detect that AggValue just ran).
+        //   [1] = rows-seen counter for the partition (always increments).
+        //
+        // The "latch on zero" trick: AggValue clears payload[0] every time it
+        // runs, and a flush only happens at peer-group / partition boundaries.
+        // So when this step observes payload[0] == 0, it knows AggValue just
+        // fired on the prior peer group — meaning this row begins a fresh peer
+        // group, and the current row position (rows_seen) is the new rank.
+        // Subsequent rows in the same peer group see payload[0] != 0 and leave
+        // the rank value untouched, so every peer reads the same rank.
+        WindowFunc::Rank => {
+            if let Register::Value(Value::Null) = state.registers[acc_reg] {
+                state.registers[acc_reg] = Register::Aggregate(AggContext::Builtin(vec![
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                ]));
+            }
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                unreachable!("rank accumulator must be a Builtin payload");
+            };
+            let Value::Numeric(Numeric::Integer(rows_seen)) = &mut payload[1] else {
+                unreachable!("rank rows_seen counter must be Integer");
+            };
+            *rows_seen += 1;
+            let rows_seen = *rows_seen;
+            let Value::Numeric(Numeric::Integer(rank)) = &mut payload[0] else {
+                unreachable!("rank current value must be Integer");
+            };
+            if *rank == 0 {
+                *rank = rows_seen;
+            }
+        }
         other => {
             return Err(LimboError::InternalError(format!(
                 "window function {other} reached runtime dispatch but has no handler"
@@ -6435,6 +6472,18 @@ fn op_window_value(
                 )))
             }
         },
+        WindowFunc::Rank => {
+            // Read current rank, then clear it so the next peer group's first
+            // AggStep latches a fresh value (matches SQLite's rankValueFunc).
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                return Err(LimboError::InternalError(format!(
+                    "rank accumulator in unexpected register state: {:?}",
+                    state.registers[acc_reg]
+                )));
+            };
+            std::mem::replace(&mut payload[0], Value::from_i64(0))
+        }
         other => {
             return Err(LimboError::InternalError(format!(
                 "window function {other} reached runtime dispatch but has no handler"
