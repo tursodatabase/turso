@@ -2508,3 +2508,25 @@ test matview-reserved-prefix-sqlite {
 expect error {
     object name reserved for internal use: sqlite_matview
 }
+
+# A hex blob literal in a materialized view definition must round-trip to the
+# correct bytes (not panic, and not the UTF-8 of the hex text). See issue #7355.
+test matview-blob-literal {
+    CREATE TABLE t_blob(id INTEGER);
+    INSERT INTO t_blob VALUES (1);
+    CREATE MATERIALIZED VIEW mv_blob AS SELECT x'FF' AS b FROM t_blob;
+    SELECT typeof(b), quote(b), hex(b) FROM mv_blob;
+}
+expect {
+    blob|X'FF'|FF
+}
+
+test matview-blob-literal-multibyte-and-empty {
+    CREATE TABLE t_blob2(id INTEGER);
+    INSERT INTO t_blob2 VALUES (1);
+    CREATE MATERIALIZED VIEW mv_blob2 AS SELECT x'DEADBEEF' AS b, x'' AS e FROM t_blob2;
+    SELECT hex(b), length(b), quote(e), length(e) FROM mv_blob2;
+}
+expect {
+    DEADBEEF|4|X''|0
+}
