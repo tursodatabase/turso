@@ -1,5 +1,6 @@
 use crate::alloc::{
     ConcurrentAllocator, TryReserveError, TursoAllocator, TursoIteratorExt, TursoVecExt, Vec,
+    ALLOC_ERR_MSG,
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
@@ -575,35 +576,42 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 .and_then(|entry| entry.value().map(|rp| rp as i64))
         };
         let db_id = crate::MAIN_DB_ID;
-        Ok(self.connection.with_schema(db_id, |schema| {
-            with_mvcc_checkpoint_allocation_site!(
-                CheckpointSequenceCompactions,
-                schema
-                    .sequences
-                    .values()
-                    .filter(|seq| !seq.cycle)
-                    .filter_map(|seq| {
-                        let backing_name =
-                            crate::translate::sequence::sequence_backing_table_name(&seq.name);
-                        let bt = schema.get_btree_table(&backing_name)?;
-                        let backing_root = resolve_root(bt.root_page)?;
-                        // Resolve the MVCC table_id once per sequence so the
-                        // per-row purge in `ScanDelete` doesn't re-scan
-                        // `table_id_to_rootpage` on every deletion. Uses the
-                        // schema-side root (pre-resolve) because
-                        // `get_table_id_from_root_page` already understands
-                        // the negative uncheckpointed-sentinel encoding.
-                        let table_id = self.mvstore.get_table_id_from_root_page(bt.root_page);
-                        Some(SeqCompaction {
-                            backing_root,
-                            backing_num_cols: bt.columns().len(),
-                            table_id,
-                            increment_positive: seq.increment_by >= 0,
+        Ok(self
+            .connection
+            .with_schema(db_id, |schema| {
+                crate::without_allocation_faults!(
+                    // Checkpoint has already written table/index rows by the time sequence
+                    // compaction setup runs. An injected fault here can abort before the
+                    // checkpoint reaches its normal pager cleanup/retry path.
+                    // TODO: make sequence compaction setup resumable before re-enabling
+                    // fault injection for this collection.
+                    schema
+                        .sequences
+                        .values()
+                        .filter(|seq| !seq.cycle)
+                        .filter_map(|seq| {
+                            let backing_name =
+                                crate::translate::sequence::sequence_backing_table_name(&seq.name);
+                            let bt = schema.get_btree_table(&backing_name)?;
+                            let backing_root = resolve_root(bt.root_page)?;
+                            // Resolve the MVCC table_id once per sequence so the
+                            // per-row purge in `ScanDelete` doesn't re-scan
+                            // `table_id_to_rootpage` on every deletion. Uses the
+                            // schema-side root (pre-resolve) because
+                            // `get_table_id_from_root_page` already understands
+                            // the negative uncheckpointed-sentinel encoding.
+                            let table_id = self.mvstore.get_table_id_from_root_page(bt.root_page);
+                            Some(SeqCompaction {
+                                backing_root,
+                                backing_num_cols: bt.columns().len(),
+                                table_id,
+                                increment_positive: seq.increment_by >= 0,
+                            })
                         })
-                    })
-                    .try_collect()
-            )
-        })?)
+                        .try_collect()
+                )
+            })
+            .expect(ALLOC_ERR_MSG))
     }
 
     fn refresh_checkpoint_bounds(&mut self) {
