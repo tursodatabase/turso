@@ -58,7 +58,7 @@ cli:
 
 sqlite3:
   - changed-files:
-      - any-glob-to-any-file: "sqlite3/**/*"
+      - any-glob-to-any-file: "bindings/c/**/*"
 
 core:
   - changed-files:

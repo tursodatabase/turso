@@ -21,7 +21,7 @@
 ROOT_DIR  := $(shell cd ../.. && pwd)
 TURSO_LIB := $(ROOT_DIR)/target/debug
 SRC       := $(ROOT_DIR)/bindings/tcl/turso_tcl.c
-INCLUDE   := $(ROOT_DIR)/sqlite3/include
+INCLUDE   := $(ROOT_DIR)/bindings/c/include
 
 # Default target — local build (no Docker required).
 .PHONY: all
@@ -43,7 +43,7 @@ docker-build:
 	    cargo build -p turso_sqlite3 2>&1 && \
 	    gcc -shared -fPIC -o bindings/tcl/libturso_tcl.so \
 	        bindings/tcl/turso_tcl.c \
-	        -I sqlite3/include \
+	        -I bindings/c/include \
 	        -I /usr/include/tcl8.6 \
 	        -L target/debug \
 	        -lturso_sqlite3 \
@@ -66,7 +66,7 @@ docker-test:
 	    cargo build -p turso_sqlite3 2>&1 && \
 	    gcc -shared -fPIC -o bindings/tcl/libturso_tcl.so \
 	        bindings/tcl/turso_tcl.c \
-	        -I sqlite3/include \
+	        -I bindings/c/include \
 	        -I /usr/include/tcl8.6 \
 	        -L target/debug \
 	        -lturso_sqlite3 \
