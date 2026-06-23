@@ -22,11 +22,13 @@
 //! into this module to set them to `false` when safe.
 
 use crate::translate::emitter::Resolver;
+use crate::translate::expr::WalkControl;
 use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
+use crate::util::walk_expr_with_subqueries;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::{sync::Arc, Connection, Result};
-use turso_parser::ast::{ResolveType, TriggerEvent};
+use turso_parser::ast::{Expr, ResolveType, TriggerEvent};
 
 /// Check whether any DDL-level constraint (IPK or index) uses REPLACE.
 pub(crate) fn any_index_or_ipk_has_replace(
@@ -64,6 +66,48 @@ fn table_has_fks(
     connection.foreign_keys_enabled()
         && (resolver.with_schema(database_id, |s| s.has_child_fks(table_name))
             || resolver.with_schema(database_id, |s| s.any_resolved_fks_referencing(table_name)))
+}
+
+/// Conservative test for "this expression's value can change row-to-row".
+///
+/// Per-row expression evaluation can fail mid-loop (bad LIKE ESCAPE, malformed
+/// datetime, type cast overflow, etc.), and a multi-row DML that has already
+/// written earlier rows then needs a statement journal to roll those writes back.
+///
+/// DML expressions reach us bound (`Id`/`Qualified` rewritten to `Column`), but
+/// schema-stored index `expr`/`where_clause` are unbound — we match both forms.
+fn expr_is_row_dependent(expr: &Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr_with_subqueries(expr, &mut |e| -> Result<WalkControl> {
+        if matches!(
+            e,
+            Expr::Column { .. }
+                | Expr::RowId { .. }
+                | Expr::Register(_)
+                | Expr::SubqueryResult { .. }
+                | Expr::Id(_)
+                | Expr::Name(_)
+                | Expr::Qualified(..)
+                | Expr::DoublyQualified(..)
+        ) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
+fn index_has_row_dependent_expr(index: &Arc<crate::schema::Index>) -> bool {
+    index
+        .columns
+        .iter()
+        .filter_map(|column| column.expr.as_deref())
+        .any(expr_is_row_dependent)
+        || index
+            .where_clause
+            .as_deref()
+            .is_some_and(expr_is_row_dependent)
 }
 
 /// Determine whether any constraint's effective resolution can trigger an
@@ -241,9 +285,22 @@ pub(crate) fn set_update_stmt_journal_flags(
     let has_check = !btree_table.check_constraints.is_empty();
     let has_unique =
         !btree_table.unique_sets.is_empty() || plan.indexes_to_update.iter().any(|idx| idx.unique);
+    let row_expr_may_abort = plan
+        .where_clause
+        .iter()
+        .any(|term| expr_is_row_dependent(&term.expr))
+        || plan
+            .set_clauses
+            .iter()
+            .any(|set_clause| expr_is_row_dependent(&set_clause.expr))
+        || plan
+            .indexes_to_update
+            .iter()
+            .any(index_has_row_dependent_expr);
 
     let may_abort = has_triggers
         || has_fks
+        || row_expr_may_abort
         || constraint_may_abort(
             has_statement_conflict,
             or_conflict,
@@ -286,7 +343,12 @@ pub(crate) fn set_delete_stmt_journal_flags(
 
     // DELETE has no ON CONFLICT clause, so NOT NULL/CHECK/UNIQUE don't apply —
     // only triggers (RAISE(ABORT)) or FK violations can abort.
-    if !has_triggers && !has_fks {
+    let row_expr_may_abort = plan
+        .where_clause
+        .iter()
+        .any(|term| expr_is_row_dependent(&term.expr))
+        || plan.indexes.iter().any(index_has_row_dependent_expr);
+    if !has_triggers && !has_fks && !row_expr_may_abort {
         program.set_may_abort(false);
     }
     Ok(())
