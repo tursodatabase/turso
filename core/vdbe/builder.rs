@@ -1944,14 +1944,13 @@ impl ProgramBuilder {
 
         self.parameters.list.dedup();
 
-        // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
-        // Statement journals are only needed when a statement writes multiple rows AND could
-        // abort midway (e.g. constraint violation). Single-row writes are atomic and don't
-        // need statement-level rollback. Both flags default to true; specific translate paths
-        // (e.g., single-row INSERT) set is_multi_write=false to opt out.
-        let needs_stmt_subtransactions = matches!(self.txn_mode, TransactionMode::Write)
-            && self.flags.is_multi_write()
-            && self.flags.may_abort();
+        // SQLite's constraint-abort rule is `isMultiWrite && mayAbort`, but Turso
+        // can yield cooperative I/O mid-statement. A caller may then reset/drop
+        // the statement before it reaches Halt, so any multi-write statement in an
+        // explicit transaction needs a statement savepoint to roll back abandoned
+        // partial changes.
+        let needs_stmt_subtransactions =
+            matches!(self.txn_mode, TransactionMode::Write) && self.flags.is_multi_write();
 
         let contains_trigger_subprograms = self
             .insns

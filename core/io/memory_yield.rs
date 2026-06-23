@@ -545,4 +545,48 @@ mod tests {
             "overflow DELETE should yield while clearing overflow pages"
         );
     }
+
+    #[test]
+    fn abandoned_wal_delete_after_io_yield_preserves_integrity() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io = Arc::new(MemoryYieldIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            "pager_savepoint_yield_repro.db",
+            OpenFlags::Create,
+            crate::DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("PRAGMA page_size = 1024").unwrap();
+        conn.execute("PRAGMA journal_mode = WAL").unwrap();
+        conn.execute("PRAGMA cache_size = 12").unwrap();
+        conn.execute("PRAGMA cache_spill = ON").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x BLOB)")
+            .unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        for id in 1..=32 {
+            let size = 6000 + (id % 7) * 733;
+            conn.execute(format!("INSERT INTO t VALUES ({id}, zeroblob({size}))"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        let mut stmt = conn
+            .prepare("DELETE FROM t WHERE id BETWEEN 1 AND 16")
+            .unwrap();
+        match stmt.step().unwrap() {
+            StepResult::IO | StepResult::Yield => drop(stmt),
+            other => panic!("expected IO/Yield, got {other:?}"),
+        }
+        conn.execute("COMMIT").unwrap();
+
+        let mut check = conn.query("PRAGMA integrity_check").unwrap().unwrap();
+        let rows = check.run_collect_rows().unwrap();
+        assert_eq!(rows, vec![vec![crate::Value::build_text("ok")]]);
+    }
 }
