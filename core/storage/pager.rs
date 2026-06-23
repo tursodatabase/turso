@@ -3343,8 +3343,12 @@ impl Pager {
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id as u32);
         // Notify cache before marking dirty (page was evictable, now it won't be)
-        // Only notify if page wasn't already dirty
-        if !page.is_dirty() {
+        // Only notify if page wasn't already dirty, or if it was spilled
+        // State before set_dirty():
+        // - clean page: evictable -> set_dirty() makes it dirty and unevictable
+        // - dirty + spilled page: evictable -> set_dirty() clears spilled and makes it unevictable
+        // - dirty + not spilled page: already unevictable -> no cache accounting change
+        if !page.is_dirty() || page.is_spilled() {
             let key = PageCacheKey::new(page.get().id);
             self.page_cache.write().notify_page_dirty(key);
         }
