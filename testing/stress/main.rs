@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use turso::Builder;
 
-use crate::conn::StressConn;
+use crate::conn::StressDb;
 use crate::logging::Tracer;
 use crate::progress::ProgressBars;
 use crate::sql_logging::SqlLogger;
@@ -606,18 +606,17 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
     let vfs_option = opts.vfs.clone();
 
-    let mut builder = Builder::new_local(&db_file);
-    if let Some(ref vfs) = vfs_option {
-        builder = builder.with_io(vfs.clone());
-    }
-    let db = Arc::new(Mutex::new(builder.build().await?));
+    let db = Arc::new(Mutex::new(StressDb::new(
+        db_file.clone(),
+        sql_logger.clone(),
+        vfs_option.clone(),
+    )));
 
     for thread in 0..opts.nr_threads {
         if stop {
             break;
         }
-        let db_file = db_file.clone();
-        let conn = StressConn::new(sql_logger.clone(), thread, db.lock().await.connect()?);
+        let conn = StressDb::connect(&db, thread, opts.busy_timeout).await?;
 
         match opts.tx_mode {
             TxMode::SQLite => {
@@ -628,8 +627,6 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                 conn.pragma_update("journal_mode", "mvcc").await?;
             }
         };
-
-        conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
 
         for stmt in &ddl_statements {
             let mut retry_counter = 0;
@@ -666,7 +663,6 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
         let nr_iterations = opts.nr_iterations;
         let db = db.clone();
-        let vfs_for_task = vfs_option.clone();
         let schema_for_task = schema.clone();
         let busy_timeout = opts.busy_timeout;
         let tx_mode = opts.tx_mode;
@@ -675,30 +671,18 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         let mut progress_bar = progress_bars.add(format!("Thread {thread}"));
 
         let handle = turso_stress::future::spawn(async move {
-            let mut conn = StressConn::new(sql_logger.clone(), thread, db.lock().await.connect()?);
-
-            conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
-
-            conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
+            let mut conn = StressDb::connect(&db, thread, busy_timeout).await?;
 
             let mut rng = ThreadRng::new(global_seed.wrapping_add(thread as u64));
 
             for i in 0..nr_iterations {
                 if gen_bool(&mut rng, 0.01) {
                     // Reopen the database
-                    let mut db_guard = db.lock().await;
-                    let mut builder = Builder::new_local(&db_file);
-                    if let Some(ref vfs) = vfs_for_task {
-                        builder = builder.with_io(vfs.clone());
-                    }
-                    *db_guard = builder.build().await?;
-                    conn = StressConn::new(sql_logger.clone(), thread, db_guard.connect()?);
-                    conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
+                    db.lock().await.reset();
+                    conn = StressDb::connect(&db, thread, busy_timeout).await?;
                 } else if gen_bool(&mut rng, 0.02) {
                     // Reconnect to the database
-                    let db_guard = db.lock().await;
-                    conn = StressConn::new(sql_logger.clone(), thread, db_guard.connect()?);
-                    conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
+                    conn = StressDb::connect(&db, thread, busy_timeout).await?;
                 }
 
                 let tx = if rng.get_random() % 2 == 0 {
