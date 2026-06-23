@@ -1,3 +1,4 @@
+mod logging;
 mod opts;
 
 use clap::Parser;
@@ -26,12 +27,9 @@ fn log_sql(log: &SqlLog, thread: usize, sql: &str, result: &str) {
         w.flush().unwrap();
     }
 }
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::reload;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 use turso::Builder;
+
+use crate::logging::Tracer;
 
 /// Represents a column in a SQLite table
 #[derive(Debug, Clone)]
@@ -497,72 +495,6 @@ pub fn load_schema(
     Ok(ArbitrarySchema { tables })
 }
 
-pub type LogLevelReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
-
-pub fn init_tracing(log_path: &str) -> Result<(WorkerGuard, LogLevelReloadHandle), std::io::Error> {
-    let log_file = std::fs::File::create(log_path)?;
-    let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let (filter_layer, reload_handle) = reload::Layer::new(filter);
-
-    if let Err(e) = tracing_subscriber::registry()
-        .with(filter_layer)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(non_blocking)
-                .with_ansi(false)
-                .with_line_number(true)
-                .with_thread_ids(true)
-                .json(),
-        )
-        .try_init()
-    {
-        println!("Unable to setup tracing appender: {e:?}");
-    }
-    Ok((guard, reload_handle))
-}
-
-const LOG_LEVEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-
-const LOG_LEVEL_FILE: &str = "RUST_LOG";
-
-/// Spawns a background thread that watches for a RUST_LOG file and dynamically
-/// updates the log level when the file contents change.
-pub fn spawn_log_level_watcher(reload_handle: LogLevelReloadHandle) {
-    std::thread::spawn(move || {
-        let mut last_content: Option<String> = None;
-
-        loop {
-            std::thread::sleep(LOG_LEVEL_POLL_INTERVAL);
-
-            let content = match std::fs::read_to_string(LOG_LEVEL_FILE) {
-                Ok(content) => content.trim().to_string(),
-                Err(_) => {
-                    continue;
-                }
-            };
-
-            if last_content.as_ref() == Some(&content) {
-                continue;
-            }
-
-            match content.parse::<EnvFilter>() {
-                Ok(new_filter) => {
-                    if let Err(e) = reload_handle.reload(new_filter) {
-                        eprintln!("Failed to reload log filter: {e}");
-                    } else {
-                        last_content = Some(content);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Invalid log filter in {LOG_LEVEL_FILE}: {e}");
-                    last_content = Some(content);
-                }
-            }
-        }
-    });
-}
-
 fn sqlite_integrity_check(
     db_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -684,10 +616,8 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     println!("sql_log={sql_log_path}");
 
     let tracing_log_path = format!("{db_file}.jsonl");
-    // This may cause torn writes if payloads are > 4KB, but for now let's ignore the issue.
-    let (_guard, reload_handle) = init_tracing(&tracing_log_path)?;
-    spawn_log_level_watcher(reload_handle);
     println!("tracing_log={tracing_log_path}");
+    let _tracer = Tracer::new(&tracing_log_path)?;
 
     let vfs_option = opts.vfs.clone();
 
