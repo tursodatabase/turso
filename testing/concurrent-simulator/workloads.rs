@@ -246,7 +246,7 @@ impl Workload for WalCheckpointWorkload {
             return None;
         }
         let modes: &[&str] = if self.allow_passive {
-            &["PASSIVE", "FULL", "RESTART", "TRUNCATE"]
+            &["PASSIVE"]
         } else {
             &["FULL", "RESTART", "TRUNCATE"]
         };

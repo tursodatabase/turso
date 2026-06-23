@@ -2455,9 +2455,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
             }
             CheckpointState::CommitPagerTxn => {
-                // Serialize only the publish window against readers (brief write lock).
+                // Serialize only the publish window against readers (brief write lock). Acquire
+                // it with writer-preference so in-flight readers drain and the publish COMPLETES;
+                // `Busy` here is transient contention, not a real failure, so we only fall back
+                // (and retry on a later commit) if readers don't drain within the bounded wait.
                 if !self.lock_states.blocking_checkpoint_lock_held {
-                    if !self.checkpoint_lock.write() {
+                    if !self.mvstore.acquire_publish_lock() {
                         return Err(crate::LimboError::Busy);
                     }
                     self.lock_states.blocking_checkpoint_lock_held = true;
