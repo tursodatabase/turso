@@ -51,7 +51,7 @@ void test_sqlite3_changes()
     char *err_msg = NULL;
     int rc;
 
-    rc = sqlite3_open("../../testing/testing.db", &db);
+    rc = sqlite3_open("../../../testing/testing.db", &db);
     assert(rc == SQLITE_OK);
 
     rc = sqlite3_exec(db,
@@ -65,7 +65,7 @@ void test_sqlite3_changes()
     if (err_msg) { sqlite3_free(err_msg); err_msg = NULL; }
     
     sqlite3_close(db);
-    rc = sqlite3_open("../../testing/testing.db", &db);
+    rc = sqlite3_open("../../../testing/testing.db", &db);
     assert(rc == SQLITE_OK);
 
     assert(sqlite3_changes(db) == 0);
@@ -99,7 +99,7 @@ void test_sqlite3_bind_int64()
     char *err_msg = NULL;
     int rc;
 
-    rc = sqlite3_open("../../testing/testing.db", &db);
+    rc = sqlite3_open("../../../testing/testing.db", &db);
     assert(rc == SQLITE_OK);
 
     rc = sqlite3_exec(db,
@@ -147,7 +147,7 @@ void test_sqlite3_bind_double()
     char *err_msg = NULL;
     int rc;
 
-    rc = sqlite3_open("../../testing/testing.db", &db);
+    rc = sqlite3_open("../../../testing/testing.db", &db);
     assert(rc == SQLITE_OK);
 
     rc = sqlite3_exec(db,

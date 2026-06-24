@@ -751,7 +751,7 @@ static int TursoOpenCmd(ClientData cd, Tcl_Interp *interp,
 /* Extension initialisation                                             */
 /* ------------------------------------------------------------------ */
 
-/* Defined in the sqlite3 Rust crate (sqlite3/src/lib.rs) */
+/* Defined in the sqlite3 Rust crate (bindings/c/src/lib.rs) */
 extern int sqlite3_search_count;
 
 int Tursotcl_Init(Tcl_Interp *interp)
