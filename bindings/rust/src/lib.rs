@@ -241,8 +241,8 @@ impl Builder {
         self
     }
 
-    pub fn with_io(mut self, vfs: IoBackend) -> Self {
-        self.vfs = vfs;
+    pub fn with_io(mut self, vfs: impl Into<IoBackend>) -> Self {
+        self.vfs = vfs.into();
         self
     }
 

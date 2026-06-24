@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::{
+    fmt,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use crate::rsapi::TursoError;
 
@@ -25,7 +28,7 @@ macro_rules! assert_sync {
     };
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub enum IoBackend {
     #[default]
     Default,
@@ -40,14 +43,27 @@ pub enum IoBackend {
     Other(String),
 }
 
-impl From<&str> for IoBackend {
-    fn from(vfs: &str) -> Self {
-        match vfs {
+impl fmt::Display for IoBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Memory => write!(f, "memory"),
+            Self::Syscall => write!(f, "syscall"),
+            Self::IoUring => write!(f, "io_uring"),
+            Self::IOCP => write!(f, "experimental_win_iocp"),
+            Self::Other(other) => write!(f, "{other}"),
+            Self::Default => write!(f, "default"),
+        }
+    }
+}
+
+impl<T: AsRef<str>> From<T> for IoBackend {
+    fn from(vfs: T) -> Self {
+        match vfs.as_ref() {
             "memory" => IoBackend::Memory,
             "syscall" => IoBackend::Syscall,
             "io_uring" => IoBackend::IoUring,
             "experimental_win_iocp" => IoBackend::IOCP,
-            _ => IoBackend::Other(vfs.to_string()),
+            vfs => IoBackend::Other(vfs.to_string()),
         }
     }
 }

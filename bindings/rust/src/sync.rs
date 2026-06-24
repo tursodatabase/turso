@@ -351,7 +351,7 @@ impl Builder {
             // IMPORTANT: async IO must be turned on to delegate IO to this layer.
             async_io: true,
             encryption: None,
-            vfs: None,
+            vfs: Default::default(),
             io: None,
             db_file: None,
         };
