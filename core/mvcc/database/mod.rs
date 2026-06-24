@@ -5227,18 +5227,33 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         start: RowID,
         inclusive: bool,
+        eq_only: bool,
         direction: IterationDirection,
         tx_id: TxID,
         table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
     ) -> Option<RowID> {
         let table_id = start.table_id;
         let iter_box = {
-            let start = if inclusive {
-                Bound::Included(start)
+            let range = if eq_only {
+                // An eq-only rowid seek (point lookup, NotExists / rowid-uniqueness
+                // probe) only cares about the single key `start`. Bound BOTH ends of
+                // the range to that key so the skiplist walk stops immediately instead
+                // of scanning forward over every invisible neighbor until it happens to
+                // find the next visible row. Without this bound a single probe costs
+                // O(pending invisible versions), which compounds into quadratic work
+                // when each row of a concurrent batch insert pays it. This mirrors the
+                // eq-only bound in `seek_index`. The cursor's final position is still
+                // decided by `PickWinner` from the merged MVCC/B-tree peeks, so bounding
+                // the range here does not change where the cursor lands.
+                (Bound::Included(start.clone()), Bound::Included(start))
             } else {
-                Bound::Excluded(start)
+                let start = if inclusive {
+                    Bound::Included(start)
+                } else {
+                    Bound::Excluded(start)
+                };
+                create_seek_range(start, direction)
             };
-            let range = create_seek_range(start, direction);
             match direction {
                 IterationDirection::Forwards => {
                     Box::new(self.rows.range(range)) as TableRowIterator<'_, A>
