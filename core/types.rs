@@ -1368,6 +1368,15 @@ mod immutable_record {
             two_values(self.payload, idx1, idx2)
         }
 
+        pub fn get_three_values(
+            &self,
+            idx1: usize,
+            idx2: usize,
+            idx3: usize,
+        ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
+            three_values(self.get_payload(), idx1, idx2, idx3)
+        }
+
         pub fn get_values_owned(&self) -> Result<Vec<Value>> {
             values_owned(self.payload)
         }

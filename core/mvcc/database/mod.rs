@@ -29,6 +29,7 @@ use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
+use crate::types::ImmutableRecordRef;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
 use crate::File;
@@ -110,8 +111,9 @@ struct YieldContext;
 #[repr(transparent)]
 pub struct MVTableId(i64);
 
-/// The versions of a single row
-pub type RowVersions = Arc<RwLock<Vec<RowVersion>>>;
+/// The versions of a single row.
+pub type RowVersionChain = crate::alloc::Vec<RowVersion>;
+pub type RowVersions = Arc<RwLock<RowVersionChain>>;
 type TableRowEntry<'a, A = TursoAllocator> = Entry<'a, RowID, RowVersions, BasicComparator, A>;
 type IndexRowEntry<'a, A = TursoAllocator> =
     Entry<'a, Arc<SortableIndexKey>, RowVersions, BasicComparator, A>;
@@ -327,17 +329,21 @@ impl RowID {
 pub struct Row {
     pub id: RowID,
     /// Data is None for index rows because the key holds all the data.
-    pub data: Option<Arc<[u8]>>,
+    pub data: Option<crate::alloc::ArcSlice<u8>>,
     pub column_count: usize,
 }
 
 impl Row {
-    pub fn new_table_row(id: RowID, data: Vec<u8>, column_count: usize) -> Self {
-        Self {
+    pub fn new_table_row(
+        id: RowID,
+        data: &[u8],
+        column_count: usize,
+    ) -> Result<Self, TryReserveError> {
+        Ok(Self {
             id,
-            data: Some(Arc::from(data)),
+            data: Some(crate::alloc::try_arc_slice_from_slice(data)?),
             column_count,
-        }
+        })
     }
 
     pub fn new_index_row(id: RowID, column_count: usize) -> Self {
@@ -650,7 +656,7 @@ fn portable_delete_op_extension_for_row_version<Clock: LogicalClock, A: Concurre
         let values = match &record_values {
             Some(values) => values,
             None => record_values.insert(
-                ImmutableRecord::from_bin_record(row_version.row.payload().to_vec())
+                ImmutableRecordRef::from_bin_record(row_version.row.payload())
                     .get_values_owned()?,
             ),
         };
@@ -1990,7 +1996,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             }
         };
 
-        let collect_versions = |row_versions: &Arc<RwLock<Vec<RowVersion>>>,
+        let collect_versions = |row_versions: &RowVersions,
                                 log_record: &mut LogRecord|
          -> Result<()> {
             // `log_record.row_versions` is the logical transaction log. Recovery
@@ -3710,7 +3716,7 @@ pub struct RecoverCtx {
 /// A multi-version concurrency control database.
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
-    pub rows: SkipMap<RowID, Arc<RwLock<Vec<RowVersion>>>, BasicComparator, A>,
+    pub rows: SkipMap<RowID, RowVersions, BasicComparator, A>,
     /// Table ID is an opaque identifier that is only meaningful to the MV store.
     /// Each checkpointed MVCC table corresponds to a single B-tree on the pager,
     /// which naturally has a root page.
@@ -5094,7 +5100,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// (O(log N)) per scanned row with an amortized-O(1) merge step.
     pub(crate) fn index_chain_invalidates_btree(
         &self,
-        versions: &RwLock<Vec<RowVersion>>,
+        versions: &RwLock<RowVersionChain>,
         tx_id: TxID,
     ) -> bool {
         let tx = self
@@ -6750,7 +6756,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Rule 3: Current checkpointed sole-survivor (end=None, b <= ckpt_max,
     ///         b < lwm, no other versions remain) — remove.
     ///
-    fn gc_version_chain(versions: &mut Vec<RowVersion>, lwm: u64, ckpt_max: u64) -> usize {
+    fn gc_version_chain(versions: &mut RowVersionChain, lwm: u64, ckpt_max: u64) -> usize {
         let before = versions.len();
 
         // Rule 1: aborted garbage
@@ -6806,7 +6812,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// peak allocation forever. Capacity drops to a quarter of its current
     /// value — deliberately not to fit — when the survivors occupy less than
     /// a quarter of it, so steady-state chains keep slack for new versions.
-    fn shrink_version_chain_allocation(versions: &mut Vec<RowVersion>) {
+    fn shrink_version_chain_allocation(versions: &mut RowVersionChain) {
         let capacity = versions.capacity();
         if capacity > Self::CHAIN_SHRINK_MIN_CAPACITY && versions.len() < capacity / 4 {
             versions.shrink_to(capacity / 4);
@@ -6854,7 +6860,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     fn get_or_create_table_row_versions(&self, id: RowID) -> Result<RowVersions, TryReserveError> {
         let versions = self
             .rows
-            .try_get_or_insert_with(id, || Arc::new(RwLock::new(Vec::new())))?;
+            .try_get_or_insert_with(id, || Arc::new(RwLock::new(crate::alloc::vec![])))?;
         Ok(versions.value().clone())
     }
 
@@ -6910,7 +6916,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         index: &'a IndexRowsMap<A>,
         key: Arc<SortableIndexKey>,
     ) -> Result<IndexRowEntry<'a, A>, TryReserveError> {
-        let entry = index.try_get_or_insert_with(key, || Arc::new(RwLock::new(Vec::new())))?;
+        let entry =
+            index.try_get_or_insert_with(key, || Arc::new(RwLock::new(crate::alloc::vec![])))?;
         Ok(entry)
     }
 
@@ -6919,7 +6926,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::RowVersionReserve)]
     pub fn insert_version_raw(
         &self,
-        versions: &mut Vec<RowVersion>,
+        versions: &mut RowVersionChain,
         row_version: RowVersion,
     ) -> Result<(), TryReserveError> {
         // NOTICE: this is an insert a'la insertion sort, with pessimistic linear complexity.
@@ -7693,14 +7700,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     } if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID => {
                         let schema_rows_after =
                             schema_rows_after.get_or_insert_with(|| schema_rows.clone());
-                        let record = ImmutableRecord::from_bin_record(record_bytes.clone());
-                        if record.column_count() < 5 {
+                        let record = ImmutableRecordRef::from_bin_record(record_bytes);
+                        let column_count = record.column_count();
+                        if column_count < 5 {
                             return Err(LimboError::Corrupt(format!(
-                                "sqlite_schema row must have at least 5 columns, got {}",
-                                record.column_count()
+                                "sqlite_schema row must have at least 5 columns, got {column_count}",
                             )));
                         }
-                        schema_rows_after.insert(rowid.row_id.to_int_or_panic(), record);
+                        crate::with_mv_store_allocation_site!(SchemaRowPayload, {
+                            schema_rows_after.insert(
+                                rowid.row_id.to_int_or_panic(),
+                                ImmutableRecord::from_bin_record(record_bytes.clone()),
+                            );
+                        });
                     }
                     ParsedOp::DeleteTable { rowid, .. }
                         if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID =>
@@ -7842,12 +7854,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             }
                             let is_schema_row = rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
                             if is_schema_row {
-                                let row_data = row.payload().to_vec();
-                                let record = ImmutableRecord::from_bin_record(row_data);
-                                if record.column_count() < 5 {
+                                let record = ImmutableRecordRef::from_bin_record(row.payload());
+                                let column_count = record.column_count();
+                                if column_count < 5 {
                                     return Err(LimboError::Corrupt(format!(
-                                        "sqlite_schema row must have at least 5 columns, got {}",
-                                        record.column_count()
+                                        "sqlite_schema row must have at least 5 columns, got {column_count}",
+
                                     )));
                                 }
                                 let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
@@ -7926,7 +7938,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     )));
                                 }
                                 let rowid_int = rowid.row_id.to_int_or_panic();
-                                schema_rows.insert(rowid_int, record);
+                                crate::with_mv_store_allocation_site!(SchemaRowPayload, {
+                                    schema_rows.insert(
+                                        rowid_int,
+                                        ImmutableRecord::from_bin_record(row.payload().to_vec()),
+                                    );
+                                });
                             } else if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
                                 // Data row references a table_id not yet in the map. This can happen
                                 // with logs written before the schema-first serialization fix: in a
@@ -7970,22 +7987,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 // serialized before the schema INSERT that registers the table_id.
                                 self.insert_table_id_to_rootpage(rowid.table_id, None)?;
                             }
-                            let tombstone_row = if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                let rowid_int = rowid.row_id.to_int_or_panic();
-                                if let Some(record) = schema_rows.get(&rowid_int) {
-                                    // Preserve the pre-delete sqlite_schema record in recovered
-                                    // tombstones so checkpoint can still recover B-tree identity.
-                                    Row::new_table_row(
-                                        rowid.clone(),
-                                        record.as_blob().clone(),
-                                        record.column_count(),
-                                    )
+                            let tombstone_row = crate::with_mv_store_allocation_site!(
+                                RowPayload,
+                                if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                                    let rowid_int = rowid.row_id.to_int_or_panic();
+                                    if let Some(record) = schema_rows.get(&rowid_int) {
+                                        // Preserve the pre-delete sqlite_schema record in recovered
+                                        // tombstones so checkpoint can still recover B-tree identity.
+                                        Row::new_table_row(
+                                            rowid.clone(),
+                                            record.as_blob(),
+                                            record.column_count(),
+                                        )?
+                                    } else {
+                                        Row::new_table_row(rowid.clone(), &[], 0)?
+                                    }
                                 } else {
-                                    Row::new_table_row(rowid.clone(), Vec::new(), 0)
+                                    Row::new_table_row(rowid.clone(), &[], 0)?
                                 }
-                            } else {
-                                Row::new_table_row(rowid.clone(), Vec::new(), 0)
-                            };
+                            );
                             if let Some(versions) = self.rows.get(&rowid) {
                                 // Row exists in memory — try to find the current (non-ended) version
                                 // that was committed before this delete, and mark it as ended. If no
