@@ -209,12 +209,25 @@ impl FtsPlanState {
 
                     if step_idx >= self.program_steps {
                         self.phase = FtsPlanPhase::Done;
+                        if fts_final_oracle_due(step_idx, self.verify_interval)
+                            && sqlgen_schema_has_fts(&self.schema)
+                            && let Some(check) = generate_sqlgen_fts_oracle(
+                                self.seed,
+                                step_idx,
+                                &self.schema,
+                                &self.tx_state,
+                                &mut self.ctx,
+                                &self.tags,
+                            )
+                        {
+                            return Some(self.emit_oracle(check));
+                        }
                         return None;
                     }
 
                     let next_phase = FtsPlanPhase::Program {
                         step_idx: step_idx + 1,
-                        oracle_due: step_idx % self.verify_interval == 0,
+                        oracle_due: fts_oracle_due_after_step(step_idx, self.verify_interval),
                     };
                     let Some(stmt) = generate_sqlgen_program_stmt(
                         &self.schema,
@@ -290,6 +303,14 @@ enum FtsPlanPhase {
 struct FtsPendingSql {
     stmt: sg::Stmt,
     next_phase: FtsPlanPhase,
+}
+
+fn fts_oracle_due_after_step(step_idx: usize, verify_interval: usize) -> bool {
+    (step_idx + 1).is_multiple_of(verify_interval)
+}
+
+fn fts_final_oracle_due(step_idx: usize, verify_interval: usize) -> bool {
+    step_idx > 0 && !step_idx.is_multiple_of(verify_interval)
 }
 
 fn sqlgen_stmt_tables(schema: &sg::Schema, stmt: &sg::Stmt) -> Vec<String> {
@@ -1048,6 +1069,22 @@ mod tests {
                 .count()
                 >= 2
         );
+    }
+
+    #[test]
+    fn verify_interval_is_checked_after_completed_steps() {
+        assert!(!fts_oracle_due_after_step(0, 2));
+        assert!(fts_oracle_due_after_step(1, 2));
+        assert!(!fts_oracle_due_after_step(2, 2));
+        assert!(fts_oracle_due_after_step(3, 2));
+    }
+
+    #[test]
+    fn final_oracle_runs_for_unchecked_tail() {
+        assert!(!fts_final_oracle_due(0, 2));
+        assert!(fts_final_oracle_due(1, 2));
+        assert!(!fts_final_oracle_due(2, 2));
+        assert!(fts_final_oracle_due(3, 2));
     }
 
     #[test]
