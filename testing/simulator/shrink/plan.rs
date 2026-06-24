@@ -231,6 +231,7 @@ impl InteractionPlan {
             }
         }
 
+        ret_plan.refresh_fts_oracle_tags();
         ret_plan
     }
 
@@ -378,7 +379,29 @@ impl InteractionPlan {
             idx += 1;
             retain
         });
+
+        self.refresh_fts_oracle_tags();
     }
+
+    #[cfg(feature = "fts")]
+    fn refresh_fts_oracle_tags(&mut self) {
+        let mut program_tags = std::collections::BTreeSet::new();
+        self.retain_mut(|interaction| {
+            match &mut interaction.interaction {
+                InteractionType::FtsSql(sql) => {
+                    program_tags.extend(sql.tags.iter().copied());
+                }
+                InteractionType::FtsOracle(check) => {
+                    check.refresh_tags(&program_tags);
+                }
+                _ => {}
+            }
+            true
+        });
+    }
+
+    #[cfg(not(feature = "fts"))]
+    fn refresh_fts_oracle_tags(&mut self) {}
 }
 
 #[cfg(test)]
@@ -400,7 +423,10 @@ mod tests {
     use std::{collections::BTreeSet, num::NonZeroUsize};
 
     use crate::model::{
-        fts::{FtsOracleCheck, FtsSchemaSnapshot, FtsSql, FtsTableRename, FtsTableSnapshot},
+        fts::{
+            FtsFeatureTag, FtsOracleCheck, FtsSchemaSnapshot, FtsSql, FtsTableRename,
+            FtsTableSnapshot,
+        },
         interactions::{InteractionBuilder, InteractionType},
     };
 
@@ -412,12 +438,23 @@ mod tests {
         read_only: bool,
         table_rename: Option<(&str, &str)>,
     ) -> InteractionType {
+        fts_sql_with_tags(sql, tables, read_only, table_rename, &[])
+    }
+
+    fn fts_sql_with_tags(
+        sql: &str,
+        tables: &[&str],
+        read_only: bool,
+        table_rename: Option<(&str, &str)>,
+        tags: &[FtsFeatureTag],
+    ) -> InteractionType {
         let transaction = ["BEGIN", "COMMIT", "ROLLBACK"]
             .iter()
             .any(|stmt| sql.eq_ignore_ascii_case(stmt));
         InteractionType::FtsSql(FtsSql {
             sql: sql.to_string(),
             tables: tables.iter().map(|table| table.to_string()).collect(),
+            tags: tags.iter().copied().collect(),
             ignore_error: false,
             transaction,
             read_only,
@@ -434,6 +471,7 @@ mod tests {
             step: 1,
             verification_sql: "SELECT * FROM new_t".to_string(),
             tags: BTreeSet::new(),
+            query_tags: BTreeSet::new(),
             schema: FtsSchemaSnapshot {
                 tables: vec![FtsTableSnapshot {
                     qualified_name: table.to_string(),
@@ -469,7 +507,13 @@ mod tests {
         ));
         plan.push(interaction(
             2,
-            fts_sql("SELECT * FROM old_t", &["old_t"], true, None),
+            fts_sql_with_tags(
+                "SELECT * FROM old_t",
+                &["old_t"],
+                true,
+                None,
+                &[FtsFeatureTag::FtsScoreProjection],
+            ),
         ));
         plan.push(interaction(
             3,
@@ -490,6 +534,17 @@ mod tests {
         assert!(!sql.contains("SELECT * FROM old_t"));
         assert!(sql.contains("ALTER TABLE old_t RENAME TO new_t"));
         assert!(sql.contains("FTS_ORACLE"));
+        let oracle = shrunk
+            .interactions_list()
+            .iter()
+            .find_map(|interaction| match &interaction.interaction {
+                InteractionType::FtsOracle(check) => Some(check),
+                _ => None,
+            })
+            .expect("shrunk plan keeps FTS oracle");
+
+        assert!(oracle.tags.contains(&FtsFeatureTag::RebuildOracle));
+        assert!(!oracle.tags.contains(&FtsFeatureTag::FtsScoreProjection));
     }
 
     #[test]

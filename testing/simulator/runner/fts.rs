@@ -238,13 +238,16 @@ impl FtsPlanState {
         ignore_error: bool,
         next_phase: FtsPlanPhase,
     ) -> Interactions {
-        record_sqlgen_stmt_tags(&mut self.tags, &stmt, &self.schema);
+        let mut stmt_tags = BTreeSet::new();
+        record_sqlgen_stmt_tags(&mut stmt_tags, &stmt, &self.schema);
+        self.tags.extend(stmt_tags.iter().copied());
         let tables = sqlgen_stmt_tables(&self.schema, &stmt);
         let read_only = matches!(stmt, sg::Stmt::Select(_));
         let table_rename = sqlgen_stmt_table_rename(&stmt);
         let sql = FtsSql {
             sql: stmt.to_string(),
             tables,
+            tags: stmt_tags,
             ignore_error,
             transaction: matches!(
                 stmt,
@@ -599,10 +602,8 @@ fn generate_sqlgen_fts_oracle(
     program_tags: &BTreeSet<FtsFeatureTag>,
 ) -> Option<FtsOracleCheck> {
     let query = generate_sqlgen_verification_select(schema, ctx)?;
-    let mut tags = program_tags.clone();
     let mut query_tags = BTreeSet::new();
     record_sqlgen_stmt_tags(&mut query_tags, &query, schema);
-    tags.extend(query_tags.iter().copied());
 
     let deterministic = sqlgen_tags_are_deterministic(&query_tags);
     let stable_order = sqlgen_query_has_stable_row_order(schema, &query);
@@ -620,30 +621,20 @@ fn generate_sqlgen_fts_oracle(
         return None;
     }
 
-    if limit_prefix.is_some() {
-        tags.insert(FtsFeatureTag::LimitPrefixOracle);
-    }
-    if rebuild {
-        tags.insert(FtsFeatureTag::RebuildOracle);
-    }
-    if scalar {
-        tags.insert(FtsFeatureTag::ScalarOracle);
-    }
-    if reopen {
-        tags.insert(FtsFeatureTag::ReopenOracle);
-    }
-
-    Some(FtsOracleCheck {
+    let mut check = FtsOracleCheck {
         seed,
         step,
         verification_sql: query.to_string(),
-        tags,
+        tags: BTreeSet::new(),
+        query_tags,
         schema: sqlgen_schema_snapshot(schema),
         limit_prefix,
         rebuild,
         scalar,
         reopen,
-    })
+    };
+    check.refresh_tags(program_tags);
+    Some(check)
 }
 
 fn generate_sqlgen_verification_select(

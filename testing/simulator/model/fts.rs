@@ -64,6 +64,8 @@ pub(crate) struct FtsTableRename {
 pub(crate) struct FtsSql {
     pub(crate) sql: String,
     pub(crate) tables: Vec<String>,
+    #[serde(default)]
+    pub(crate) tags: BTreeSet<FtsFeatureTag>,
     pub(crate) ignore_error: bool,
     pub(crate) transaction: bool,
     pub(crate) read_only: bool,
@@ -162,6 +164,8 @@ pub(crate) struct FtsOracleCheck {
     pub(crate) step: usize,
     pub(crate) verification_sql: String,
     pub(crate) tags: BTreeSet<FtsFeatureTag>,
+    #[serde(default)]
+    pub(crate) query_tags: BTreeSet<FtsFeatureTag>,
     pub(crate) schema: FtsSchemaSnapshot,
     pub(crate) limit_prefix: Option<FtsLimitPrefixOracle>,
     pub(crate) rebuild: bool,
@@ -190,6 +194,27 @@ impl FtsOracleCheck {
         }
         kinds
     }
+
+    pub(crate) fn local_tags(&self) -> BTreeSet<FtsFeatureTag> {
+        let mut tags = self.query_tags.clone();
+        if self.limit_prefix.is_some() {
+            tags.insert(FtsFeatureTag::LimitPrefixOracle);
+        }
+        if self.rebuild {
+            tags.insert(FtsFeatureTag::RebuildOracle);
+        }
+        if self.scalar {
+            tags.insert(FtsFeatureTag::ScalarOracle);
+        }
+        if self.reopen {
+            tags.insert(FtsFeatureTag::ReopenOracle);
+        }
+        tags
+    }
+
+    pub(crate) fn refresh_tags(&mut self, program_tags: &BTreeSet<FtsFeatureTag>) {
+        self.tags = program_tags.union(&self.local_tags()).copied().collect();
+    }
 }
 
 impl Display for FtsOracleCheck {
@@ -206,6 +231,8 @@ impl Display for FtsOracleCheck {
             "-- FTS_ORACLE seed={} step={} oracles={} tags={}",
             self.seed, self.step, kinds, tags
         )?;
+        let payload = serde_json::to_string(self).map_err(|_| std::fmt::Error)?;
+        writeln!(f, "-- FTS_ORACLE_JSON {payload}")?;
         write!(f, "{}", self.verification_sql)
     }
 }
