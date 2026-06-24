@@ -102,3 +102,39 @@ Supported common connection string keywords include:
 - `SqliteBlob` preserves fixed-length blob stream behavior through SQL reads and writes. It is not yet backed by a native incremental-blob storage handle.
 - SQLite virtual-table modules such as FTS3/FTS5 are not built in unless provided by a Turso extension/module.
 - Async methods currently use the base ADO.NET behavior rather than a dedicated async native path.
+
+## Entity Framework Core
+
+`Turso.EntityFrameworkCore.Sqlite` adds a `UseTurso` provider hook for local and embedded Turso databases. It reuses EF Core SQLite's LINQ translation pipeline and executes generated SQL through `Turso.Data.Sqlite`.
+
+```bash
+dotnet add package Turso.EntityFrameworkCore.Sqlite
+```
+
+```C#
+using Microsoft.EntityFrameworkCore;
+
+public sealed class AppDbContext : DbContext
+{
+    public DbSet<Customer> Customers => Set<Customer>();
+
+    protected override void OnConfiguring(DbContextOptionsBuilder options)
+        => options.UseTurso("Data Source=app.db");
+}
+```
+
+You can also pass an existing Turso SQLite-compatible connection:
+
+```C#
+using Microsoft.EntityFrameworkCore;
+using Turso.Data.Sqlite;
+
+await using var connection = new SqliteConnection("Data Source=app.db");
+var options = new DbContextOptionsBuilder<AppDbContext>()
+    .UseTurso(connection)
+    .Options;
+```
+
+The local provider supports the normal EF Core SQLite query pipeline, including composed `IQueryable<T>` filters, navigation-property joins, ordering, paging, grouping, aggregates, async materialization, and `SaveChangesAsync`. Schema creation can use the standard EF Core SQLite mechanisms such as `EnsureCreated`, `EnsureCreatedAsync`, and migrations against local database files.
+
+Remote `libsql://`/auth-token EF Core support is not part of the local provider. Use the local/embedded provider for EF Core today; remote/serverless EF support needs a separate connection, batching, retry, and transaction design.

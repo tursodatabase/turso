@@ -17,6 +17,7 @@
     <Configuration Solution="Release|x86" Project="Release|Any CPU" />
   </Project>
   <Project Path="src\Turso.Data.Sqlite\Turso.Data.Sqlite.csproj" />
+  <Project Path="src\Turso.EntityFrameworkCore.Sqlite\Turso.EntityFrameworkCore.Sqlite.csproj" />
   <Project Path="src\Turso.Data\Turso.Data.csproj" />
   <Project Path="src\Turso.Raw\Turso.Raw.csproj" Type="Classic C#" />
 </Solution>

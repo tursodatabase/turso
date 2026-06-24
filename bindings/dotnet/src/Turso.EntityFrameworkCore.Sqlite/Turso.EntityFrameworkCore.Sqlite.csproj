@@ -1,0 +1,30 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFrameworks>$(TursoTargetFrameworks)</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Turso.EntityFrameworkCore.Sqlite</RootNamespace>
+
+    <PackageId>Turso.EntityFrameworkCore.Sqlite</PackageId>
+    <Title>Turso Entity Framework Core SQLite Provider</Title>
+    <Description>Entity Framework Core integration for Turso local databases using EF Core SQLite translation and Turso.Data.Sqlite execution.</Description>
+    <Authors>Turso authors</Authors>
+    <PackageTags>turso;sqlite;database;entity-framework-core;efcore;linq</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/tursodatabase/turso</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/tursodatabase/turso</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591;EF1001</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite.Core" Version="9.0.9" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Turso.Data.Sqlite\Turso.Data.Sqlite.csproj" />
+  </ItemGroup>
+</Project>
