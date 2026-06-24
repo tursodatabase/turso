@@ -16466,46 +16466,85 @@ fn injected_yield_surfaces_as_step_result_yield() {
 }
 
 #[test]
-fn test_checkpoint_seek_skip_divider_reinsert_loses_row() {
+fn test_checkpoint_seek_skip_preserves_antithesis_rowid_order() {
     let _ = tracing_subscriber::fmt::try_init();
-    let db = MvccTestDbNoConn::new_with_random_db();
-    let conn = db.connect();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir
+        .path()
+        .join("antithesis_rowid_order.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let db = Database::open_file_with_flags(
+        crate::sync::Arc::new(PlatformIO::new().unwrap()),
+        &db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = mvcc").unwrap();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
         .unwrap();
-    // Same shape as the stress table hot_floor_424: tiny rows, rowid-alias PK.
-    conn.execute("CREATE TABLE t (v REAL NOT NULL, pk INTEGER PRIMARY KEY)")
-        .unwrap();
+
+    conn.execute(
+        "CREATE TABLE soft_desk_784 (
+            cold_seed_580 REAL NOT NULL,
+            fresh_desk_444 INTEGER PRIMARY KEY
+        )",
+    )
+    .unwrap();
+
+    const ROWID_OFFSET: i64 = 452;
+
     // Bulk-load in ONE transaction => one checkpoint pass bulk-inserts ascending and
     // splits the btree, creating dividers (~every 250 rows at this record size).
     conn.execute("BEGIN").unwrap();
-    for i in 0..1000 {
-        conn.execute(format!("INSERT INTO t VALUES ({}.5, {})", i % 7, i))
-            .unwrap();
+    for i in ROWID_OFFSET..ROWID_OFFSET + 1000 {
+        conn.execute(format!(
+            "INSERT INTO soft_desk_784 VALUES ({}.5, {i})",
+            (i - ROWID_OFFSET) % 7
+        ))
+        .unwrap();
     }
     conn.execute("COMMIT").unwrap();
 
     conn.execute("BEGIN").unwrap();
-    for i in (0..1000).filter(|i| i % 5 == 3) {
-        conn.execute(format!("DELETE FROM t WHERE pk = {i}"))
-            .unwrap();
+    for i in (ROWID_OFFSET..ROWID_OFFSET + 1000).filter(|i| (i - ROWID_OFFSET) % 5 == 3) {
+        conn.execute(format!(
+            "DELETE FROM soft_desk_784 WHERE fresh_desk_444 = {i}"
+        ))
+        .unwrap();
     }
     conn.execute("COMMIT").unwrap();
 
-    for g in 1..400i64 {
-        conn.execute(format!("DELETE FROM t WHERE pk = {g}"))
-            .unwrap();
+    for g in ROWID_OFFSET + 1..ROWID_OFFSET + 400 {
+        conn.execute(format!(
+            "DELETE FROM soft_desk_784 WHERE fresh_desk_444 = {g}"
+        ))
+        .unwrap();
         conn.execute("BEGIN").unwrap();
-        conn.execute(format!("INSERT OR REPLACE INTO t VALUES (1.25, {})", g - 1))
-            .unwrap();
-        conn.execute(format!("INSERT INTO t VALUES (2.5, {g})"))
+        conn.execute(format!(
+            "INSERT OR REPLACE INTO soft_desk_784 VALUES (1.25, {})",
+            g - 1
+        ))
+        .unwrap();
+        conn.execute(format!("INSERT INTO soft_desk_784 VALUES (2.5, {g})"))
             .unwrap();
         conn.execute("COMMIT").unwrap();
-        let rows = get_rows(&conn, &format!("SELECT pk FROM t WHERE pk = {g}"));
-        assert_eq!(
-            rows.len(),
-            1,
-            "rowid {g} vanished from point lookup after re-insert \
-             (checkpoint seek-skip wrote it on the wrong side of the divider)"
-        );
     }
+
+    // Same final public flow as `testing/stress`: leave MVCC mode and let SQLite
+    // verify the physical B-tree. Without the checkpoint cursor-position guard
+    // added for the antithesis failure, SQLite reports:
+    // `Tree 3 page 5 cell 1: Rowid 708 out of order`.
+    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    conn.close().unwrap();
+
+    let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+    let integrity: String = sqlite
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
 }

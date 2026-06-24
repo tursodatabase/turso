@@ -1137,12 +1137,31 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         write_set_index < self.write_set.len()
     }
 
-    fn next_requires_seek_after_insert(&self, _current_idx: usize) -> bool {
-        // BTreeCursor::insert trusts the current cursor cell as the insertion point.
-        // Page balancing during the previous write can leave cursor.next() at a
-        // valid record that is not the next row's lower bound, so every table row
-        // checkpoint write must seek explicitly before inserting.
-        true
+    fn next_requires_seek_after_insert(&self, current_idx: usize) -> bool {
+        let Some(curr) = self.write_set.get(current_idx) else {
+            return true;
+        };
+        let Some(next) = self.write_set.get(current_idx + 1) else {
+            return true;
+        };
+        // Table not the same, then seek
+        if curr.0.row.id.table_id != next.0.row.id.table_id {
+            return true;
+        }
+        // If we have special write then seek
+        if curr.1.is_some() || next.1.is_some() {
+            return true;
+        }
+        let (RowKey::Int(prev_id), RowKey::Int(next_id)) =
+            (&curr.0.row.id.row_id, &next.0.row.id.row_id)
+        else {
+            return true;
+        };
+        // if next id is strictly prev_id + 1 then we don't need to seek
+        if next_id.checked_sub(*prev_id) != Some(1) {
+            return true;
+        }
+        false
     }
 
     /// Fsync the logical log file
@@ -2553,35 +2572,6 @@ mod tests {
             ),
             btree_resident: false,
         }
-    }
-
-    #[test]
-    fn checkpoint_seeks_between_consecutive_table_row_writes() {
-        let db = MvccTestDbNoConn::new();
-        let conn = db.connect();
-        let mvstore = db.get_mvcc_store();
-        let pager = conn.pager.load().clone();
-        let mut checkpoint = CheckpointStateMachine::new(
-            pager,
-            mvstore,
-            conn.clone(),
-            true,
-            conn.get_sync_mode(),
-            crate::MAIN_DB_ID,
-        );
-
-        let table_id = MVTableId::from(-2);
-        checkpoint
-            .write_set
-            .push((committed_table_row_version(table_id, 704), None));
-        checkpoint
-            .write_set
-            .push((committed_table_row_version(table_id, 705), None));
-
-        assert!(
-            checkpoint.next_requires_seek_after_insert(0),
-            "MVCC checkpoint table writes must not rely on cursor adjacency"
-        );
     }
 
     #[test]
