@@ -2586,19 +2586,89 @@ mod tests {
     }
 
     fn committed_table_row_version(table_id: MVTableId, rowid: i64) -> RowVersion {
+        table_row_version(table_id, rowid, 1, Some(5), None, false)
+    }
+
+    fn table_row_version(
+        table_id: MVTableId,
+        rowid: i64,
+        version_id: u64,
+        begin: Option<u64>,
+        end: Option<u64>,
+        btree_resident: bool,
+    ) -> RowVersion {
         let record = ImmutableRecord::from_values(&[Value::from_i64(rowid)], 1).unwrap();
         RowVersion {
-            id: 1,
-            begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(5))),
-            end: crate::mvcc::database::PackedTs::pack(None),
+            id: version_id,
+            begin: crate::mvcc::database::PackedTs::pack(begin.map(TxTimestampOrID::Timestamp)),
+            end: crate::mvcc::database::PackedTs::pack(end.map(TxTimestampOrID::Timestamp)),
             row: Row::new_table_row(
                 RowID::new(table_id, RowKey::Int(rowid)),
                 record.as_blob(),
                 1,
             )
             .unwrap(),
-            btree_resident: false,
+            btree_resident,
         }
+    }
+
+    fn checkpoint_for_collect_tests() -> CheckpointStateMachine<crate::mvcc::clock::MvccClock> {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        let mvstore = db.get_mvcc_store();
+        let pager = conn.pager.load().clone();
+        let mut checkpoint = CheckpointStateMachine::new(
+            pager,
+            mvstore,
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
+        );
+        checkpoint.durable_txid_max_old = NonZeroU64::new(2);
+        checkpoint
+    }
+
+    #[test]
+    fn checkpoint_collection_uses_btree_marker_for_existence_but_writes_surviving_replacement() {
+        let checkpoint = checkpoint_for_collect_tests();
+        let table_id = MVTableId::from(-2);
+        let btree_tombstone = table_row_version(table_id, 1, 1, None, Some(5), true);
+        let replacement = table_row_version(table_id, 1, 2, Some(5), None, false);
+
+        let checkpointable =
+            checkpoint.maybe_get_checkpointable_versions(&[btree_tombstone, replacement], table_id);
+
+        assert_eq!(checkpointable.len(), 1);
+        assert_eq!(checkpointable[0].id, 2);
+        assert_eq!(checkpointable[0].end(), None);
+    }
+
+    #[test]
+    fn checkpoint_collection_uses_btree_marker_for_later_delete_of_replacement() {
+        let checkpoint = checkpoint_for_collect_tests();
+        let table_id = MVTableId::from(-2);
+        let btree_tombstone = table_row_version(table_id, 1, 1, None, Some(5), true);
+        let deleted_replacement = table_row_version(table_id, 1, 2, Some(5), Some(6), false);
+
+        let checkpointable = checkpoint
+            .maybe_get_checkpointable_versions(&[btree_tombstone, deleted_replacement], table_id);
+
+        assert_eq!(checkpointable.len(), 1);
+        assert_eq!(checkpointable[0].id, 2);
+        assert_eq!(checkpointable[0].end(), Some(TxTimestampOrID::Timestamp(6)));
+    }
+
+    #[test]
+    fn checkpoint_collection_skips_delete_of_never_checkpointed_replacement_without_btree_marker() {
+        let checkpoint = checkpoint_for_collect_tests();
+        let table_id = MVTableId::from(-2);
+        let deleted_replacement = table_row_version(table_id, 1, 2, Some(5), Some(6), false);
+
+        let checkpointable =
+            checkpoint.maybe_get_checkpointable_versions(&[deleted_replacement], table_id);
+
+        assert!(checkpointable.is_empty());
     }
 
     #[test]

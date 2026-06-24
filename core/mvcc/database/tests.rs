@@ -7277,6 +7277,91 @@ fn test_sql_checkpoint_reinsert_existing_interior_index_key_keeps_sqlite_integri
     assert_eq!(integrity, "ok");
 }
 
+fn assert_integrity_ok(conn: &Arc<Connection>) {
+    let rows = get_rows(conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1, "integrity_check rows: {rows:?}");
+    assert_eq!(rows[0][0].to_string(), "ok");
+}
+
+fn setup_mvcc_checkpointed_indexed_table(conn: &Arc<Connection>, with_b_index: bool) {
+    conn.execute("PRAGMA mvcc_gc_threshold = 1").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a, b)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_a ON t(a)").unwrap();
+    if with_b_index {
+        conn.execute("CREATE INDEX t_b ON t(b)").unwrap();
+    }
+    conn.execute(
+        "INSERT INTO t VALUES
+            (1,10,100),(2,20,200),(3,30,300),(4,40,400),(5,50,500)",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+}
+
+fn assert_checkpointed_replace_delete_result(conn: &Arc<Connection>) {
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_integrity_ok(conn);
+
+    let rows = get_rows(conn, "SELECT id,a,b FROM t ORDER BY id");
+    assert_eq!(rows.len(), 4);
+    for (idx, row) in rows.iter().enumerate() {
+        let id = (idx as i64) + 1;
+        assert_eq!(
+            row,
+            &vec![
+                Value::from_i64(id),
+                Value::from_i64(id * 10),
+                Value::from_i64(id * 100)
+            ]
+        );
+    }
+}
+
+#[test]
+fn test_mvcc_checkpoint_insert_or_replace_then_delete_removes_checkpointed_index_entries() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    setup_mvcc_checkpointed_indexed_table(&conn, false);
+
+    conn.execute("INSERT OR REPLACE INTO t(id,a,b) VALUES(5,25,325)")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE id=5").unwrap();
+
+    assert_checkpointed_replace_delete_result(&conn);
+}
+
+#[test]
+fn test_mvcc_checkpoint_update_or_replace_then_delete_removes_checkpointed_index_entries() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    setup_mvcc_checkpointed_indexed_table(&conn, true);
+
+    conn.execute("UPDATE OR REPLACE t SET a=25,b=325 WHERE id=5")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE id=5").unwrap();
+
+    assert_checkpointed_replace_delete_result(&conn);
+}
+
+#[test]
+fn test_mvcc_repeated_delete_after_replace_delete_checkpoint_is_noop() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    setup_mvcc_checkpointed_indexed_table(&conn, false);
+
+    conn.execute("INSERT OR REPLACE INTO t(id,a,b) VALUES(5,25,325)")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE id=5").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    conn.execute("DELETE FROM t WHERE id=5").unwrap();
+
+    assert_integrity_ok(&conn);
+    let rows = get_rows(&conn, "SELECT id,a,b FROM t ORDER BY id");
+    assert_eq!(rows.len(), 4);
+}
+
 #[test]
 fn test_mvcc_checkpoint_integrity_after_upsert_with_secondary_indexes() {
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -7913,9 +7998,9 @@ fn test_gc_rule2_pending_insert_does_not_disable_tombstone_guard() {
 /// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
 #[test]
 /// When a committed current version exists (begin=Timestamp, end=None), it takes
-/// over B-tree invalidation from the superseded version. The tombstone guard is
-/// no longer needed, so the superseded version can be safely removed.
-fn test_gc_rule2_committed_current_disables_tombstone_guard() {
+/// over MVCC visibility from a non-B-tree superseded version. The tombstone guard
+/// is no longer needed, so the superseded version can be safely removed.
+fn test_gc_rule2_committed_current_disables_non_btree_tombstone_guard() {
     // A committed current version (begin=Timestamp, end=None) means the row
     // has a live successor — the tombstone can safely be removed.
     let mut versions = crate::alloc::vec![
@@ -7927,6 +8012,40 @@ fn test_gc_rule2_committed_current_disables_tombstone_guard() {
     assert_eq!(dropped, 1);
     assert_eq!(versions.len(), 1);
     assert!(versions[0].end().is_none());
+}
+
+/// A B-tree-resident version whose ending timestamp has not been checkpointed
+/// still records a required physical B-tree delete or overwrite. A committed
+/// replacement can hide it from readers but cannot make it GC-eligible until
+/// checkpoint makes that physical change durable.
+#[test]
+fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() {
+    let mut tombstone = make_rv(None, ts(5));
+    tombstone.btree_resident = true;
+    let current = make_rv(ts(5), None);
+    let mut versions = crate::alloc::vec![tombstone, current.clone()];
+
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 2);
+    assert_eq!(dropped, 0);
+    assert_eq!(versions.len(), 2);
+    assert!(versions[0].btree_resident);
+
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 5);
+    assert_eq!(dropped, 2);
+    assert!(versions.is_empty());
+
+    let mut rewritten_btree_row = make_rv(ts(3), ts(5));
+    rewritten_btree_row.btree_resident = true;
+    let mut versions = crate::alloc::vec![rewritten_btree_row, current];
+
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 2);
+    assert_eq!(dropped, 0);
+    assert_eq!(versions.len(), 2);
+    assert!(versions[0].btree_resident);
+
+    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 5);
+    assert_eq!(dropped, 2);
+    assert!(versions.is_empty());
 }
 
 /// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
