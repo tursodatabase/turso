@@ -1,4 +1,11 @@
 use super::*;
+use std::{
+    ptr::NonNull,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc as StdArc,
+    },
+};
 
 struct LowerBoundOnly {
     next: usize,
@@ -42,6 +49,72 @@ impl Iterator for UnderreportedLowerBound {
     fn size_hint(&self) -> (usize, Option<usize>) {
         ((self.end - self.next).saturating_sub(1), None)
     }
+}
+
+struct CountingAlloc {
+    allocations: StdArc<AtomicUsize>,
+}
+
+unsafe impl ApiAllocator for CountingAlloc {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        self.allocations.fetch_add(1, Ordering::Relaxed);
+        <Global as ApiAllocator>::allocate(&Global, layout)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        unsafe {
+            <Global as ApiAllocator>::deallocate(&Global, ptr, layout);
+        }
+    }
+}
+
+#[test]
+fn dyn_allocator_delegates_skiplist_allocations() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let alloc = DynAllocator::new(CountingAlloc {
+        allocations: allocations.clone(),
+    });
+    let map: crate::skiplist::SkipMap<i32, i32, _, DynAllocator> =
+        crate::skiplist::SkipMap::new_in(alloc);
+
+    map.try_insert(1, 2).unwrap();
+
+    assert!(allocations.load(Ordering::Relaxed) > 0);
+}
+
+#[test]
+fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let alloc = DynAllocator::new(CountingAlloc {
+        allocations: allocations.clone(),
+    });
+    let io = StdArc::new(crate::MemoryIO::new());
+    let file = crate::IO::open_file(
+        io.as_ref(),
+        "open-with-allocator.db",
+        crate::OpenFlags::Create,
+        true,
+    )
+    .unwrap();
+    let db_file = StdArc::new(crate::storage::database::DatabaseFile::new(file));
+    let db = crate::Database::open_with_flags_with_allocator(
+        io,
+        "open-with-allocator.db",
+        db_file,
+        crate::OpenFlags::default(),
+        crate::DatabaseOpts::new(),
+        None,
+        None,
+        alloc,
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+
+    allocations.store(0, Ordering::Relaxed);
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+    assert!(db.get_mv_store().is_some());
+    assert!(allocations.load(Ordering::Relaxed) > 0);
 }
 
 #[test]

@@ -47,7 +47,7 @@ pub(crate) struct MvccTestDbNoConn {
     _temp_dir: Option<tempfile::TempDir>,
 }
 pub(crate) struct MvccTestDb {
-    pub(crate) mvcc_store: Arc<MvStore<MvccClock>>,
+    pub(crate) mvcc_store: Arc<crate::MvStore>,
     pub(crate) db: Arc<Database>,
     pub(crate) conn: Arc<Connection>,
 }
@@ -713,7 +713,7 @@ impl MvccTestDbNoConn {
         self.get_db().connect_with_encryption(enc_key).unwrap()
     }
 
-    pub fn get_mvcc_store(&self) -> Arc<MvStore<MvccClock>> {
+    pub fn get_mvcc_store(&self) -> Arc<crate::MvStore> {
         self.get_db().get_mv_store().clone().unwrap()
     }
 }
@@ -729,7 +729,7 @@ pub(crate) fn generate_simple_string_record(data: &str) -> ImmutableRecord {
 }
 
 fn advance_checkpoint_until_wal_has_commit_frame(
-    mvcc_store: Arc<MvStore<MvccClock>>,
+    mvcc_store: Arc<crate::MvStore>,
     conn: &Arc<Connection>,
 ) {
     let pager = conn.pager.load().clone();
@@ -4200,7 +4200,7 @@ fn test_mvcc_cursor_next_yields_with_injected_yield() {
 }
 
 pub(crate) fn commit_tx(
-    mv_store: Arc<MvStore<MvccClock>>,
+    mv_store: Arc<crate::MvStore>,
     conn: &Arc<Connection>,
     tx_id: u64,
 ) -> Result<()> {
@@ -5244,8 +5244,8 @@ fn test_index_finger_no_spurious_dep_on_stepped_over_key() {
         btree_resident: false,
     };
     store
-        .index_rows
-        .get_or_insert_with(table_id, SkipMap::new)
+        .get_or_create_index_rows(table_id)
+        .unwrap()
         .value()
         .insert(key20, Arc::new(RwLock::new(crate::alloc::vec![tombstone])));
 
@@ -10287,7 +10287,7 @@ fn test_concurrent_commit_yield_spin() {
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
 }
 
-fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<MvStore<MvccClock>>) {
+fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<crate::MvStore>) {
     let lock = &mv_store.commit_coordinator.pager_commit_lock;
     assert!(lock.write(), "should acquire commit lock");
 
@@ -15684,7 +15684,7 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
         .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
 
-    let mv_store: Arc<MvStore<MvccClock>> = db.get_mv_store().clone().unwrap();
+    let mv_store: Arc<crate::MvStore> = db.get_mv_store().clone().unwrap();
 
     // Step 3: open a CONCURRENT tx, do an INSERT, then arm log_tx Busy.
     conn_a.execute("BEGIN CONCURRENT").unwrap();

@@ -1,5 +1,5 @@
-use crate::alloc::TryReserveError;
-use crate::skiplist::map::Entry;
+use crate::alloc::{ConcurrentAllocator, TryReserveError, TursoAllocator};
+use crate::skiplist::{comparator::BasicComparator, map::Entry};
 use crate::turso_assert;
 
 use crate::mvcc::clock::LogicalClock;
@@ -136,7 +136,9 @@ impl YieldPointMarker for CursorYieldPoint {
 }
 
 #[cfg(any(test, injected_yields))]
-impl<Clock: LogicalClock + 'static> ProvidesYieldContext for MvccLazyCursor<Clock> {
+impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> ProvidesYieldContext
+    for MvccLazyCursor<Clock, A>
+{
     fn yield_context(&self) -> YieldContext {
         YieldContext::new(
             self.connection.yield_injector(),
@@ -301,11 +303,11 @@ pub enum MvccCursorType {
     Index(Arc<IndexInfo>),
 }
 
-pub(crate) type MvccIterator<'l, T, A = crate::alloc::TursoAllocator> = Box<
-    dyn Iterator<Item = Entry<'l, T, RowVersions, crate::skiplist::comparator::BasicComparator, A>>
-        + Send
-        + Sync,
->;
+pub(crate) type MvccEntry<'l, T, A = TursoAllocator> =
+    Entry<'l, T, RowVersions, BasicComparator, A>;
+
+pub(crate) type MvccIterator<'l, T, A = TursoAllocator> =
+    Box<dyn Iterator<Item = MvccEntry<'l, T, A>> + Send + Sync>;
 
 /// Extends the lifetime of a SkipMap iterator to `'static`.
 ///
@@ -336,27 +338,13 @@ macro_rules! static_iterator_hack {
         unsafe {
             std::mem::transmute::<
                 Box<
-                    dyn Iterator<
-                            Item = Entry<
-                                '_,
-                                $key_type,
-                                RowVersions,
-                                crate::skiplist::comparator::BasicComparator,
-                                $alloc,
-                            >,
-                        > + Send
+                    dyn Iterator<Item = crate::mvcc::cursor::MvccEntry<'_, $key_type, $alloc>>
+                        + Send
                         + Sync,
                 >,
                 Box<
-                    dyn Iterator<
-                            Item = Entry<
-                                'static,
-                                $key_type,
-                                RowVersions,
-                                crate::skiplist::comparator::BasicComparator,
-                                $alloc,
-                            >,
-                        > + Send
+                    dyn Iterator<Item = crate::mvcc::cursor::MvccEntry<'static, $key_type, $alloc>>
+                        + Send
                         + Sync,
                 >,
             >($iter)
@@ -372,14 +360,14 @@ pub(crate) use static_iterator_hack;
 /// Forward index cursors only; [`reset`](Self::reset) on any reposition, since
 /// the finger is monotonic.
 #[derive(Default)]
-pub(crate) enum IndexShadowFinger {
+pub(crate) enum IndexShadowFinger<A: ConcurrentAllocator = TursoAllocator> {
     /// Not yet created; built lazily on the next shadow check.
     #[default]
     Uninitialized,
     /// Positioned at `key`, holding its version chain. The shadow bit is resolved
     /// lazily (only when a B-tree row matches this key exactly)
     Peeked {
-        iter: MvccIterator<'static, Arc<SortableIndexKey>>,
+        iter: MvccIterator<'static, Arc<SortableIndexKey>, A>,
         key: Arc<SortableIndexKey>,
         versions: RowVersions,
     },
@@ -387,7 +375,7 @@ pub(crate) enum IndexShadowFinger {
     Exhausted,
 }
 
-impl IndexShadowFinger {
+impl<A: ConcurrentAllocator> IndexShadowFinger<A> {
     /// Reset so the next shadow check rebuilds the finger. Required on any B-tree
     /// reposition (seek/rewind): a finger left ahead of the new position would
     /// report a shadowed row as valid.
@@ -398,7 +386,7 @@ impl IndexShadowFinger {
     /// Advance `iter` to its next entry, cloning the key and version-chain `Arc`
     /// (both cheap) so no borrowed skiplist `Entry` is held afterward. The shadow
     /// bit is deliberately not resolved here — see [`Self::Peeked`].
-    fn advance(mut iter: MvccIterator<'static, Arc<SortableIndexKey>>) -> Self {
+    fn advance(mut iter: MvccIterator<'static, Arc<SortableIndexKey>, A>) -> Self {
         match iter.next() {
             Some(entry) => Self::Peeked {
                 key: entry.key().clone(),
@@ -414,7 +402,7 @@ impl IndexShadowFinger {
     /// [`MvStore::query_btree_version_is_valid`] for index keys.
     pub(crate) fn btree_row_is_valid<Clock: LogicalClock>(
         &mut self,
-        db: &MvStore<Clock>,
+        db: &MvStore<Clock, A>,
         table_id: MVTableId,
         tx_id: u64,
         key: &Arc<SortableIndexKey>,
@@ -428,9 +416,7 @@ impl IndexShadowFinger {
                 // than at the start of `index_rows`, so a seek-initiated scan does
                 // not re-walk every preceding version on its first row check.
                 let iter_box: Box<
-                    dyn Iterator<Item = Entry<'_, Arc<SortableIndexKey>, RowVersions>>
-                        + Send
-                        + Sync,
+                    dyn Iterator<Item = MvccEntry<'_, Arc<SortableIndexKey>, A>> + Send + Sync,
                 > = match index_rows {
                     Some(index_rows) => {
                         Box::new(index_rows.value().range::<SortableIndexKey, _>((
@@ -440,7 +426,7 @@ impl IndexShadowFinger {
                     }
                     None => Box::new(std::iter::empty()),
                 };
-                static_iterator_hack!(iter_box, Arc<SortableIndexKey>)
+                static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A)
             };
             *self = Self::advance(iter);
         }
@@ -474,17 +460,17 @@ impl IndexShadowFinger {
     }
 }
 
-pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
-    pub db: Arc<MvStore<Clock>>,
+pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator = TursoAllocator> {
+    pub db: Arc<MvStore<Clock, A>>,
     #[cfg(any(test, injected_yields))]
     connection: Arc<Connection>,
     #[cfg(any(test, injected_yields))]
     yield_instance_id: u64,
     current_pos: CursorPosition,
     /// Stateful MVCC table iterator if this is a table cursor.
-    table_iterator: Option<MvccIterator<'static, RowID>>,
+    table_iterator: Option<MvccIterator<'static, RowID, A>>,
     /// Stateful MVCC index iterator if this is an index cursor.
-    index_iterator: Option<MvccIterator<'static, Arc<SortableIndexKey>>>,
+    index_iterator: Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
     mv_cursor_type: MvccCursorType,
     table_id: MVTableId,
     tx_id: u64,
@@ -500,7 +486,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
     /// Dual-cursor peek state for proper iteration
     dual_peek: DualCursorPeek,
     /// Forward-scan finger over `index_rows`; see [`IndexShadowFinger`].
-    index_finger: IndexShadowFinger,
+    index_finger: IndexShadowFinger<A>,
 }
 
 pub enum NextRowidResult {
@@ -515,15 +501,15 @@ pub enum NextRowidResult {
     FindRandom,
 }
 
-impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
+impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock, A> {
     pub fn new(
-        db: Arc<MvStore<Clock>>,
+        db: Arc<MvStore<Clock, A>>,
         connection: &Arc<Connection>,
         tx_id: u64,
         root_page_or_table_id: i64,
         mv_cursor_type: MvccCursorType,
         btree_cursor: Box<dyn CursorTrait>,
-    ) -> Result<MvccLazyCursor<Clock>> {
+    ) -> Result<MvccLazyCursor<Clock, A>> {
         turso_assert!(
             (&*btree_cursor as &dyn Any).is::<BTreeCursor>(),
             "BTreeCursor expected for mvcc cursor"
@@ -1112,24 +1098,23 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 let range =
                     create_seek_range(Bound::Included(start_rowid), IterationDirection::Forwards);
                 let iter_box = Box::new(self.db.rows.range(range));
-                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID));
+                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
             }
             MvccCursorType::Index(_) => {
                 let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
                 let index_rows = index_rows.value();
                 let iter_box: Box<
-                    dyn Iterator<Item = Entry<'_, Arc<SortableIndexKey>, RowVersions>>
-                        + Send
-                        + Sync,
+                    dyn Iterator<Item = MvccEntry<'_, Arc<SortableIndexKey>, A>> + Send + Sync,
                 > = Box::new(index_rows.iter());
-                self.index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>));
+                self.index_iterator =
+                    Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A));
             }
         }
         Ok(())
     }
 }
 
-impl<Clock: LogicalClock + 'static> Drop for MvccLazyCursor<Clock> {
+impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Drop for MvccLazyCursor<Clock, A> {
     fn drop(&mut self) {
         // Release the per-table RowidAllocator lock if a Statement was dropped
         // while paused at an op_new_rowid IO yield. end_new_rowid is a no-op
@@ -1138,7 +1123,9 @@ impl<Clock: LogicalClock + 'static> Drop for MvccLazyCursor<Clock> {
     }
 }
 
-impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
+impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
+    for MvccLazyCursor<Clock, A>
+{
     fn last(&mut self) -> Result<IOResult<()>> {
         // A cursor may be NullRow'd during outer-join unmatched emission.
         // Repositioning to a real row must clear that synthetic NULL state.
@@ -2049,18 +2036,17 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     std::ops::Bound::Unbounded,
                 );
                 let iter_box = Box::new(self.db.rows.range(range));
-                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID));
+                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
             }
             MvccCursorType::Index(_) => {
                 // For index cursors, initialize the iterator to the beginning
                 let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
                 let index_rows = index_rows.value();
                 let iter_box: Box<
-                    dyn Iterator<Item = Entry<'_, Arc<SortableIndexKey>, RowVersions>>
-                        + Send
-                        + Sync,
+                    dyn Iterator<Item = MvccEntry<'_, Arc<SortableIndexKey>, A>> + Send + Sync,
                 > = Box::new(index_rows.iter());
-                self.index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>));
+                self.index_iterator =
+                    Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A));
             }
         }
 
@@ -2134,7 +2120,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 }
 
-impl<Clock: LogicalClock> Debug for MvccLazyCursor<Clock> {
+impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for MvccLazyCursor<Clock, A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MvccLazyCursor")
             .field("current_pos", &self.current_pos)

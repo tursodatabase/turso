@@ -1,4 +1,4 @@
-use crate::alloc::{TursoSliceExt, TursoTryWithCapacityExt};
+use crate::alloc::{DynAllocator, TursoSliceExt, TursoTryWithCapacityExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
@@ -138,6 +138,8 @@ use super::{make_record, Program, ProgramState, Register};
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
 use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
+
+type MvccCheckpointStateMachine = CheckpointStateMachine<MvccClock, DynAllocator>;
 
 /// Macro to destructure an Insn enum variant, only to be used when it
 /// is *impossible* to be another variant.
@@ -15840,7 +15842,7 @@ pub struct OpJournalModeState {
     /// The new journal mode we're changing to
     pub new_mode: Option<journal_mode::JournalMode>,
     /// Checkpoint state machine for MVCC mode
-    pub checkpoint_sm: Option<StateMachine<Box<CheckpointStateMachine<MvccClock>>>>,
+    pub checkpoint_sm: Option<StateMachine<Box<MvccCheckpointStateMachine>>>,
     /// Bootstrap state machine when switching into MVCC mode
     pub bootstrap_state: BootstrapState,
     /// Page reference for writing header
@@ -16099,6 +16101,7 @@ fn op_journal_mode_inner(
                         program.connection.db.open_flags,
                         program.connection.db.durable_storage.clone(),
                         enc_ctx,
+                        program.connection.db.mv_store_allocator.clone(),
                     )?;
                     // Arm the abandonment guard *before* the irreversible
                     // store install + demote so a reset/drop at any subsequent

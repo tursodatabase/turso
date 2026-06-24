@@ -2623,7 +2623,8 @@ mod tests {
         }
     }
 
-    fn checkpoint_for_collect_tests() -> CheckpointStateMachine<crate::mvcc::clock::MvccClock> {
+    fn checkpoint_for_collect_tests(
+    ) -> CheckpointStateMachine<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator> {
         let db = MvccTestDbNoConn::new();
         let conn = db.connect();
         let mvstore = db.get_mvcc_store();
