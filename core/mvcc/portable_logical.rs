@@ -79,11 +79,7 @@ pub(crate) fn portable_schema_row_from_record(record_bytes: &[u8]) -> Result<Por
             "sqlite_schema record must have at least 5 columns, got {column_count}",
         )));
     }
-    let value = |idx: usize, field: &str| -> Result<ValueRef<'_>> {
-        record.get_value_opt(idx).ok_or_else(|| {
-            LimboError::Corrupt(format!("sqlite_schema record missing {field} column"))
-        })
-    };
+
     let text = |value: ValueRef<'_>, field: &str| -> Result<String> {
         match value {
             ValueRef::Text(text) => Ok(text.as_str().to_string()),
@@ -100,13 +96,16 @@ pub(crate) fn portable_schema_row_from_record(record_bytes: &[u8]) -> Result<Por
             ))),
         }
     };
+    let (row_type, name, rootpage) = record.get_three_values(0, 1, 3)?;
+    let (row_type, name, rootpage) = (
+        text(row_type, "sqlite_schema.type")?,
+        text(name, "sqlite_schema.name")?,
+        integer(rootpage, "sqlite_schema.rootpage")?,
+    );
     Ok(PortableSchemaRow {
-        row_type: text(value(0, "sqlite_schema.type")?, "sqlite_schema.type")?,
-        name: text(value(1, "sqlite_schema.name")?, "sqlite_schema.name")?,
-        rootpage: integer(
-            value(3, "sqlite_schema.rootpage")?,
-            "sqlite_schema.rootpage",
-        )?,
+        row_type,
+        name,
+        rootpage,
     })
 }
 
