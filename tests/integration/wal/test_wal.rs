@@ -110,6 +110,84 @@ fn test_savepoint_rollback_after_cache_spill_preserves_wal_pages(
     Ok(())
 }
 
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_wal_cacheflush_savepoint_rollback_preserves_pre_savepoint_indexed_rows(
+    tmp_db: TempDatabase,
+) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA page_size=512;")?;
+    conn.execute("PRAGMA journal_mode=WAL;")?;
+    conn.execute("PRAGMA cache_size=200;")?;
+    conn.execute("PRAGMA data_sync_retry=1;")?;
+
+    conn.execute(
+        "CREATE TABLE shy_rain_806 (
+            hot_cave_669 BLOB NOT NULL,
+            blue_wind_834 TEXT,
+            hard_star_751 NUMERIC UNIQUE,
+            angry_stone_202 INTEGER,
+            slow_sun_632 NUMERIC NOT NULL,
+            fast_fish_819 REAL PRIMARY KEY,
+            happy_lake_980 REAL NOT NULL,
+            brave_fish_935 NUMERIC NOT NULL
+        );",
+    )?;
+
+    for i in 0..260 {
+        conn.execute(format!(
+            "INSERT INTO shy_rain_806
+             (hot_cave_669, blue_wind_834, hard_star_751, angry_stone_202,
+              slow_sun_632, fast_fish_819, happy_lake_980, brave_fish_935)
+             VALUES (x'73656564', 'seed_{i}', {}, {}, {}, {:.2}, {:.2}, {});",
+            10_000 + i,
+            20_000 + i,
+            30_000 + i,
+            i as f64 + 0.25,
+            i as f64 + 0.75,
+            40_000 + i,
+        ))?;
+    }
+
+    conn.execute("BEGIN;")?;
+    conn.execute(
+        "UPDATE shy_rain_806
+         SET hot_cave_669 = x'75706461746564',
+             blue_wind_834 = 'updated',
+             hard_star_751 = hard_star_751 + 100000,
+             angry_stone_202 = angry_stone_202 + 1,
+             happy_lake_980 = happy_lake_980 + 1.0
+         WHERE fast_fish_819 BETWEEN 180.25 AND 240.25;",
+    )?;
+    conn.execute("SAVEPOINT sp_55;")?;
+    for completion in conn.cacheflush()? {
+        tmp_db.io.wait_for_completion(completion)?;
+    }
+    conn.execute(
+        "UPDATE shy_rain_806
+         SET blue_wind_834 = 'rolled_back',
+             hard_star_751 = hard_star_751 + 50000
+         WHERE fast_fish_819 = 204.25;",
+    )?;
+    conn.execute("ROLLBACK TO sp_55;")?;
+    conn.execute("RELEASE sp_55;")?;
+    conn.execute("COMMIT;")?;
+
+    let res = execute_and_get_strings(&conn, "PRAGMA integrity_check;")?;
+    assert_eq!(res, vec!["ok"]);
+    let count = execute_and_get_ints(&conn, "SELECT COUNT(*) FROM shy_rain_806;")?;
+    assert_eq!(count, vec![260]);
+    let updated = execute_and_get_ints(
+        &conn,
+        "SELECT COUNT(*) FROM shy_rain_806 WHERE hard_star_751 >= 110000;",
+    )?;
+    assert_eq!(updated, vec![61]);
+
+    Ok(())
+}
+
 #[test]
 #[ignore = "ignored for now because it's flaky"]
 fn test_wal_1_writer_1_reader() -> Result<()> {

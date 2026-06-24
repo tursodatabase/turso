@@ -4287,7 +4287,6 @@ impl Wal for WalFile {
             );
 
             for (page, fid, _csum) in &page_frame_for_cb {
-                page.clear_dirty();
                 page.set_wal_tag(*fid, epoch);
             }
         };
