@@ -1137,31 +1137,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         write_set_index < self.write_set.len()
     }
 
-    fn next_requires_seek_after_insert(&self, current_idx: usize) -> bool {
-        let Some(curr) = self.write_set.get(current_idx) else {
-            return true;
-        };
-        let Some(next) = self.write_set.get(current_idx + 1) else {
-            return true;
-        };
-        // Table not the same, then seek
-        if curr.0.row.id.table_id != next.0.row.id.table_id {
-            return true;
-        }
-        // If we have special write then seek
-        if curr.1.is_some() || next.1.is_some() {
-            return true;
-        }
-        let (RowKey::Int(prev_id), RowKey::Int(next_id)) =
-            (&curr.0.row.id.row_id, &next.0.row.id.row_id)
-        else {
-            return true;
-        };
-        // if next id is strictly prev_id + 1 then we don't need to seek
-        if next_id.checked_sub(*prev_id) != Some(1) {
-            return true;
-        }
-        false
+    fn next_requires_seek_after_insert(&self, _current_idx: usize) -> bool {
+        // BTreeCursor::insert trusts the current cursor cell as the insertion point.
+        // Page balancing during the previous write can leave cursor.next() at a
+        // valid record that is not the next row's lower bound, so every table row
+        // checkpoint write must seek explicitly before inserting.
+        true
     }
 
     /// Fsync the logical log file
