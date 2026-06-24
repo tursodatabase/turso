@@ -3,6 +3,7 @@ using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Text;
+using System.Text.RegularExpressions;
 using Turso.Raw.Public;
 using Turso.Raw.Public.Handles;
 
@@ -139,6 +140,7 @@ public class SqliteCommand : DbCommand
         {
         }
 
+        reader.Close();
         if (IsTransactionControlCommand(CommandText))
             Connection?.Transaction?.MarkCompletedExternally(IsRollbackCommand(CommandText));
 
@@ -187,6 +189,24 @@ public class SqliteCommand : DbCommand
     public new SqliteDataReader ExecuteReader(CommandBehavior behavior) => Execute("ExecuteReader", behavior);
 
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) => Execute("ExecuteReader", behavior);
+
+    public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(ExecuteNonQuery());
+    }
+
+    public override Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(ExecuteScalar());
+    }
+
+    protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult<DbDataReader>(Execute("ExecuteReader", behavior));
+    }
 
     protected override void Dispose(bool disposing)
     {
@@ -382,12 +402,11 @@ public class SqliteCommand : DbCommand
     }
 
     private static bool IsWriteCommand(string commandText)
-    {
-        var firstStatement = SplitStatements(commandText).FirstOrDefault();
-        if (firstStatement is null)
-            return false;
+        => SplitStatements(commandText).Any(IsWriteStatement);
 
-        var trimmed = firstStatement.TrimStart();
+    private static bool IsWriteStatement(string statement)
+    {
+        var trimmed = statement.TrimStart();
         return trimmed.StartsWith("CREATE", StringComparison.OrdinalIgnoreCase)
                || trimmed.StartsWith("DROP", StringComparison.OrdinalIgnoreCase)
                || trimmed.StartsWith("ALTER", StringComparison.OrdinalIgnoreCase)
@@ -395,7 +414,8 @@ public class SqliteCommand : DbCommand
                || trimmed.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
                || trimmed.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase)
                || trimmed.StartsWith("REPLACE", StringComparison.OrdinalIgnoreCase)
-                || trimmed.StartsWith("VACUUM", StringComparison.OrdinalIgnoreCase);
+               || trimmed.StartsWith("VACUUM", StringComparison.OrdinalIgnoreCase)
+               || IsWithDmlStatement(trimmed);
     }
 
     internal bool TryHandleFacadeStatement(string sql, out string rewrittenSql)
@@ -482,8 +502,13 @@ public class SqliteCommand : DbCommand
         return trimmed.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase)
                || trimmed.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
                || trimmed.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("REPLACE", StringComparison.OrdinalIgnoreCase);
+               || trimmed.StartsWith("REPLACE", StringComparison.OrdinalIgnoreCase)
+               || IsWithDmlStatement(trimmed);
     }
+
+    private static bool IsWithDmlStatement(string trimmedStatement)
+        => trimmedStatement.StartsWith("WITH", StringComparison.OrdinalIgnoreCase)
+           && Regex.IsMatch(trimmedStatement, @"\)\s*(INSERT|UPDATE|DELETE|REPLACE)\b", RegexOptions.IgnoreCase | RegexOptions.Singleline);
 
     private static List<string> SplitStatements(string commandText)
     {

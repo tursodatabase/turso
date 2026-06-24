@@ -43,6 +43,13 @@ public class SqliteTransaction : DbTransaction
         Complete();
     }
 
+    public override Task CommitAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Commit();
+        return Task.CompletedTask;
+    }
+
     public override void Rollback()
     {
         ThrowIfCompleted();
@@ -57,11 +64,25 @@ public class SqliteTransaction : DbTransaction
         }
     }
 
+    public override Task RollbackAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Rollback();
+        return Task.CompletedTask;
+    }
+
     public override void Save(string savepointName)
     {
         ArgumentNullException.ThrowIfNull(savepointName);
         ThrowIfCompleted();
         Execute("SAVEPOINT " + QuoteIdentifier(savepointName) + ";");
+    }
+
+    public override Task SaveAsync(string savepointName, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Save(savepointName);
+        return Task.CompletedTask;
     }
 
     public override void Rollback(string savepointName)
@@ -71,11 +92,25 @@ public class SqliteTransaction : DbTransaction
         Execute("ROLLBACK TO SAVEPOINT " + QuoteIdentifier(savepointName) + ";");
     }
 
+    public override Task RollbackAsync(string savepointName, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Rollback(savepointName);
+        return Task.CompletedTask;
+    }
+
     public override void Release(string savepointName)
     {
         ArgumentNullException.ThrowIfNull(savepointName);
         ThrowIfCompleted();
         Execute("RELEASE SAVEPOINT " + QuoteIdentifier(savepointName) + ";");
+    }
+
+    public override Task ReleaseAsync(string savepointName, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Release(savepointName);
+        return Task.CompletedTask;
     }
 
     protected override void Dispose(bool disposing)
