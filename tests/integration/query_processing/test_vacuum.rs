@@ -3947,6 +3947,186 @@ fn test_vacuum_into_preserves_vector_blobs(tmp_db: TempDatabase) -> anyhow::Resu
     Ok(())
 }
 
+/// Test VACUUM INTO preserves vector64 (Float64Dense) blobs.
+/// Mirrors test_vacuum_into_preserves_vector_blobs but uses vector64() encoding.
+#[turso_macros::test]
+fn test_vacuum_into_preserves_vector64_blobs(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, label TEXT, embedding BLOB)")?;
+    conn.execute("INSERT INTO vectors VALUES (1, 'cat', vector64('[1.0, 0.0, 0.0, 0.0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (2, 'dog', vector64('[0.0, 1.0, 0.0, 0.0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (3, 'fish', vector64('[0.0, 0.0, 1.0, 0.0]'))")?;
+    let source_hash = compute_dbhash(&tmp_db);
+
+    let source_dist: Vec<(f64,)> = conn.exec_rows(
+        "SELECT vector_distance_cos(
+            (SELECT embedding FROM vectors WHERE id = 1),
+            (SELECT embedding FROM vectors WHERE id = 2)
+        )",
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vectors64.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+
+    let count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM vectors");
+    assert_eq!(count[0].0, 3);
+
+    // vector_distance_cos on Float64Dense blobs must match source
+    let dest_dist: Vec<(f64,)> = dest_conn.exec_rows(
+        "SELECT vector_distance_cos(
+            (SELECT embedding FROM vectors WHERE id = 1),
+            (SELECT embedding FROM vectors WHERE id = 2)
+        )",
+    );
+    assert_eq!(source_dist, dest_dist);
+
+    Ok(())
+}
+
+/// VACUUM INTO must preserve 1-D array columns (text[] and integer[]) on STRICT tables.
+/// Verifies text representation, 1-based subscript access, array_length, array_contains,
+/// and empty-array rows all survive the round-trip.
+#[test]
+fn test_vacuum_into_preserves_arrays() -> anyhow::Result<()> {
+    let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE arr_test (
+            id      INTEGER PRIMARY KEY,
+            tags    text[],
+            scores  integer[]
+        ) STRICT",
+    )?;
+    conn.execute("INSERT INTO arr_test VALUES (1, ARRAY['a','b','c'], ARRAY[10, 20, 30])")?;
+    conn.execute("INSERT INTO arr_test VALUES (2, ARRAY['x','y'], ARRAY[1, 2])")?;
+    conn.execute("INSERT INTO arr_test VALUES (3, '{}', '{}')")?;
+
+    let source_rows: Vec<(i64, String, String)> =
+        conn.exec_rows("SELECT id, tags, scores FROM arr_test ORDER BY id");
+    let hash_opts = turso_dbhash::DbHashOptions {
+        table_filter: Some("arr_test".to_string()),
+        ..Default::default()
+    };
+    let source_hash = compute_dbhash_with_options_and_database_opts(&tmp_db, &hash_opts, opts);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("arrays.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(
+        source_hash.hash,
+        compute_dbhash_with_options_and_database_opts(&dest_db, &hash_opts, opts).hash
+    );
+
+    // Full row comparison (text representation)
+    let dest_rows: Vec<(i64, String, String)> =
+        dest_conn.exec_rows("SELECT id, tags, scores FROM arr_test ORDER BY id");
+    assert_eq!(dest_rows, source_rows);
+
+    // 1-based subscript access survives
+    let first_tag: Vec<(String,)> =
+        dest_conn.exec_rows("SELECT tags[1] FROM arr_test WHERE id = 1");
+    assert_eq!(first_tag[0].0, "a");
+
+    // array_length survives
+    let len: Vec<(i64,)> =
+        dest_conn.exec_rows("SELECT array_length(scores) FROM arr_test WHERE id = 1");
+    assert_eq!(len[0].0, 3);
+
+    // array_contains survives
+    let contains: Vec<(i64,)> =
+        dest_conn.exec_rows("SELECT array_contains(tags, 'b') FROM arr_test WHERE id = 1");
+    assert_eq!(contains[0].0, 1);
+
+    // empty-array rows are preserved
+    let empty: Vec<(String,)> = dest_conn.exec_rows("SELECT tags FROM arr_test WHERE id = 3");
+    assert_eq!(empty[0].0, "{}");
+
+    Ok(())
+}
+
+/// VACUUM INTO must preserve multidimensional array columns (INTEGER[][]) on STRICT tables.
+/// Verifies text representation and dimension length survive the round-trip.
+///
+/// Currently ignored: VACUUM's SELECT emits ArrayDecode (blob → text) and the
+/// INSERT re-encodes it, but for multidim arrays the inner array blobs become
+/// text strings that ArrayEncode cannot recover. Tracked in:
+/// https://github.com/tursodatabase/turso/issues/5898
+#[test]
+#[ignore = "multidim array VACUUM INTO round-trip is lossy — see issue #5898"]
+fn test_vacuum_into_preserves_multidim_arrays() -> anyhow::Result<()> {
+    let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE md_test (
+            id     INTEGER PRIMARY KEY,
+            matrix INTEGER[][]
+        ) STRICT",
+    )?;
+    conn.execute("INSERT INTO md_test VALUES (1, ARRAY[ARRAY[1,2], ARRAY[3,4]])")?;
+    conn.execute("INSERT INTO md_test VALUES (2, ARRAY[ARRAY[5,6,7], ARRAY[8,9,10]])")?;
+
+    let source_rows: Vec<(i64, String)> =
+        conn.exec_rows("SELECT id, matrix FROM md_test ORDER BY id");
+    let hash_opts = turso_dbhash::DbHashOptions {
+        table_filter: Some("md_test".to_string()),
+        ..Default::default()
+    };
+    let source_hash = compute_dbhash_with_options_and_database_opts(&tmp_db, &hash_opts, opts);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("multidim.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(
+        source_hash.hash,
+        compute_dbhash_with_options_and_database_opts(&dest_db, &hash_opts, opts).hash
+    );
+
+    // Full row comparison (text representation)
+    let dest_rows: Vec<(i64, String)> =
+        dest_conn.exec_rows("SELECT id, matrix FROM md_test ORDER BY id");
+    assert_eq!(dest_rows, source_rows);
+
+    // Outer dimension length survives
+    let outer_len: Vec<(i64,)> =
+        dest_conn.exec_rows("SELECT array_length(matrix) FROM md_test WHERE id = 1");
+    assert_eq!(outer_len[0].0, 2);
+
+    // First sub-array text representation survives
+    let sub_array: Vec<(String,)> =
+        dest_conn.exec_rows("SELECT matrix[1] FROM md_test WHERE id = 1");
+    assert_eq!(sub_array[0].0, "{1,2}");
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Plain VACUUM tests
 // ---------------------------------------------------------------------------
