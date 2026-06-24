@@ -1511,6 +1511,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                             let mvcc_rowid = self.db.seek_rowid(
                                 rowid.clone(),
                                 inclusive,
+                                op.eq_only(),
                                 direction,
                                 self.tx_id,
                                 &mut self.table_iterator,
@@ -1828,13 +1829,16 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             };
             let inclusive = true;
 
-            // Check MVCC first
+            // Check MVCC first. This is a point existence probe, so it is
+            // eq-only: bound the skiplist walk to the single rowid instead of
+            // scanning forward over invisible concurrent rows.
             let rowid = self.db.seek_rowid(
                 RowID {
                     table_id: self.table_id,
                     row_id: RowKey::Int(*int_key),
                 },
                 inclusive,
+                true,
                 IterationDirection::Forwards,
                 self.tx_id,
                 &mut self.table_iterator,
