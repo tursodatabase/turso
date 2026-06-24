@@ -9,8 +9,25 @@ Key ideas:
 - Clear status codes: Done/Row/Io/Error/etc. No hidden blocking or exceptions.
 - Minimal surface: open database, connect, prepare, bind, step/execute, read rows, finalize.
 - Ownership model and lifetimes are explicit for C consumers.
+- Optional page codecs: callers can provide a synchronous page transform callback table to decode/encode legacy encrypted database pages without linking that crypto into Turso core.
 
 Note: turso.h is the single C header exported by the crate and can be translated to bindings.rs with rust-bindgen.
+
+## External page codecs
+
+`turso_database_config_t.page_codec` accepts a versioned `turso_page_codec_v1_t` callback table. The callbacks transform complete page images between on-disk bytes and plaintext SQLite pages. They are intended for compatibility layers such as legacy SQLite codec formats where the application supplies the crypto implementation.
+
+Codec rules:
+
+- callbacks are synchronous and must not perform Turso I/O or re-enter the same database;
+- `probe_header` may inspect the raw first 512 bytes and report page size/reserved bytes before Turso parses page 1;
+- `decode_page` and `encode_page` receive a page number and location (`DATABASE` or `WAL`) and must write exactly one page to the output buffer;
+- the callback context and function pointers must remain valid until `turso_database_deinit`;
+- callback failures are surfaced as database open/read/write errors.
+
+The .NET binding exposes this through `ITursoPageCodec`, `TursoBindings.OpenDatabaseWithPageCodec`, and `TursoConnection.PageCodec`.
+
+The .NET tests include compatibility codecs that exercise this generic surface against legacy encrypted SQLite formats. Those codecs are examples of consumer-supplied page transforms and are intentionally not part of the Turso core or C ABI.
 
 ## Rust example
 

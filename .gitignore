@@ -46,6 +46,7 @@ perf/mobibench/plot/uv.lock
 **/node_modules/
 
 # .NET build outputs
+examples/dotnet/bin/
 examples/dotnet/obj/
 
 # testing

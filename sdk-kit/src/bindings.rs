@@ -307,6 +307,62 @@ impl Default for turso_config_t {
         }
     }
 }
+pub const turso_codec_location_t_TURSO_CODEC_LOCATION_DATABASE: turso_codec_location_t = 0;
+pub const turso_codec_location_t_TURSO_CODEC_LOCATION_WAL: turso_codec_location_t = 1;
+pub type turso_codec_location_t = ::std::os::raw::c_uint;
+pub const turso_database_open_flags_t_TURSO_DATABASE_OPEN_DEFAULT: turso_database_open_flags_t = 0;
+pub const turso_database_open_flags_t_TURSO_DATABASE_OPEN_READONLY: turso_database_open_flags_t = 1;
+pub type turso_database_open_flags_t = ::std::os::raw::c_uint;
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct turso_page_codec_header_info_t {
+    pub page_size: u32,
+    pub reserved_space: u8,
+    pub is_supported: u8,
+}
+pub type turso_page_codec_probe_header_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        ctx: *mut ::std::os::raw::c_void,
+        raw_page1_prefix: *const u8,
+        raw_len: usize,
+        out: *mut turso_page_codec_header_info_t,
+        error: *mut *const ::std::os::raw::c_char,
+    ) -> i32,
+>;
+pub type turso_page_codec_transform_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        ctx: *mut ::std::os::raw::c_void,
+        page_no: u32,
+        location: turso_codec_location_t,
+        input: *const u8,
+        input_len: usize,
+        output: *mut u8,
+        output_len: usize,
+        error: *mut *const ::std::os::raw::c_char,
+    ) -> i32,
+>;
+pub type turso_page_codec_destroy_t =
+    ::std::option::Option<unsafe extern "C" fn(ctx: *mut ::std::os::raw::c_void)>;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct turso_page_codec_v1_t {
+    pub abi_version: u32,
+    pub ctx: *mut ::std::os::raw::c_void,
+    pub reserved_space: u8,
+    pub destroy: turso_page_codec_destroy_t,
+    pub probe_header: turso_page_codec_probe_header_t,
+    pub decode_page: turso_page_codec_transform_t,
+    pub encode_page: turso_page_codec_transform_t,
+}
+impl Default for turso_page_codec_v1_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 #[doc = " Database description."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -323,6 +379,10 @@ pub struct turso_database_config_t {
     pub encryption_cipher: *const ::std::os::raw::c_char,
     #[doc = " optional encryption hexkey\n as encryption is experimental - experimental_features must have \"encryption\" in the list"]
     pub encryption_hexkey: *const ::std::os::raw::c_char,
+    #[doc = " optional external page codec; callback context must remain valid and thread-safe until destroy is called"]
+    pub page_codec: *const turso_page_codec_v1_t,
+    #[doc = " optional bitmask of turso_database_open_flags_t values"]
+    pub open_flags: u32,
 }
 impl Default for turso_database_config_t {
     fn default() -> Self {

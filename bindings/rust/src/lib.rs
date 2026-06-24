@@ -292,6 +292,8 @@ impl Builder {
                 vfs: self.vfs,
                 io: self.io,
                 db_file: None,
+                page_codec: None,
+                open_flags: Default::default(),
             });
         while let Some(io_c) = db.open()?.io() {
             // At this point IO must already be created

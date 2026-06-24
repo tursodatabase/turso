@@ -28,7 +28,7 @@ use crate::fast_lock::SpinLock;
 use crate::io::clock::MonotonicInstant;
 use crate::io::CompletionGroup;
 use crate::io::{File, IO};
-use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
+use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum, PageCodecLocation};
 #[cfg(host_shared_wal)]
 use crate::storage::shared_wal_coordination::SharedWalCoordinationOpenMode;
 #[cfg(host_shared_wal)]
@@ -3366,13 +3366,14 @@ impl Wal for WalFile {
         // important not to hold shared state locks beyond this point to avoid deadlock with
         // completions that re-enter WAL state while a writer is waiting.
         let file = self.coordination.wal_file()?;
+        let io_ctx = self.io_ctx.read().clone();
         begin_read_wal_frame(
             file.as_ref(),
             offset + WAL_FRAME_HEADER_SIZE as u64,
             buffer_pool,
             complete,
             page_idx,
-            &self.io_ctx.read(),
+            &io_ctx,
         )
     }
 
@@ -3500,6 +3501,22 @@ impl Wal for WalFile {
                             }
                         }
                     }
+                    EncryptionOrChecksum::PageCodec(ctx) => {
+                        match ctx.decode_page(body_slice, expected_page_id, PageCodecLocation::Wal)
+                        {
+                            Ok(decoded) => body_slice.copy_from_slice(&decoded),
+                            Err(e) => {
+                                mark_unlikely();
+                                tracing::error!(
+                                    "Failed to decode WAL batch frame for page_idx={expected_page_id}: {e}"
+                                );
+                                clear_slots_on_err(&slots);
+                                return Some(CompletionError::DecryptionError {
+                                    page_idx: expected_page_id,
+                                });
+                            }
+                        }
+                    }
                     EncryptionOrChecksum::Checksum(ctx) => {
                         if let Err(e) = ctx.verify_checksum(body_slice, expected_page_id) {
                             mark_unlikely();
@@ -3542,6 +3559,13 @@ impl Wal for WalFile {
             let io_ctx = self.io_ctx.read();
             io_ctx.encryption_context().cloned()
         };
+        let page_codec = {
+            let io_ctx = self.io_ctx.read();
+            match io_ctx.encryption_or_checksum() {
+                EncryptionOrChecksum::PageCodec(ctx) => Some(ctx.clone()),
+                _ => None,
+            }
+        };
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 return None; // IO error already captured in completion
@@ -3582,6 +3606,24 @@ impl Wal for WalFile {
                     }
                     Err(_) => {
                         tracing::debug!("Failed to decrypt page data for frame_id={frame_id}");
+                    }
+                }
+            } else if let Some(ctx) = page_codec.clone() {
+                match ctx.decode_page(
+                    raw_page,
+                    header.page_number as usize,
+                    PageCodecLocation::Wal,
+                ) {
+                    Ok(decoded_data) => {
+                        turso_assert!(
+                            (frame_len - WAL_FRAME_HEADER_SIZE) == decoded_data.len(),
+                            "frame_len minus header_size does not equal expected decoded data length",
+                            { "frame_len_minus_header": frame_len - WAL_FRAME_HEADER_SIZE, "decoded_data_len": decoded_data.len() }
+                        );
+                        frame_ref[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&decoded_data);
+                    }
+                    Err(_) => {
+                        tracing::debug!("Failed to decode page data for frame_id={frame_id}");
                     }
                 }
             }
@@ -3659,13 +3701,14 @@ impl Wal for WalFile {
                 }
             });
             let file = self.coordination.wal_file()?;
+            let io_ctx = self.io_ctx.read().clone();
             let c = begin_read_wal_frame(
                 file.as_ref(),
                 offset + WAL_FRAME_HEADER_SIZE as u64,
                 buffer_pool,
                 complete,
                 page_id as usize,
-                &self.io_ctx.read(),
+                &io_ctx,
             )?;
             self.io.wait_for_completion(c)?;
             return if *conflict.lock() {
@@ -4114,23 +4157,24 @@ impl Wal for WalFile {
 
         let mut bufs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
         let mut metadata = Vec::with_capacity(pages.len());
+        let enc_or_csum = self.io_ctx.read().encryption_or_checksum().clone();
 
         for (idx, page) in pages.iter().enumerate() {
             let page_id = page.get().id;
             let plain = page.get_contents().as_ptr();
 
-            let data: Cow<[u8]> = {
-                let io_ctx = self.io_ctx.read();
-                match io_ctx.encryption_or_checksum() {
-                    EncryptionOrChecksum::Encryption(ctx) => {
-                        Cow::Owned(ctx.encrypt_page(plain, page_id)?)
-                    }
-                    EncryptionOrChecksum::Checksum(ctx) => {
-                        ctx.add_checksum_to_page(plain, page_id)?;
-                        Cow::Borrowed(plain)
-                    }
-                    EncryptionOrChecksum::None => Cow::Borrowed(plain),
+            let data: Cow<[u8]> = match &enc_or_csum {
+                EncryptionOrChecksum::Encryption(ctx) => {
+                    Cow::Owned(ctx.encrypt_page(plain, page_id)?)
                 }
+                EncryptionOrChecksum::PageCodec(ctx) => {
+                    Cow::Owned(ctx.encode_page(plain, page_id, PageCodecLocation::Wal)?)
+                }
+                EncryptionOrChecksum::Checksum(ctx) => {
+                    ctx.add_checksum_to_page(plain, page_id)?;
+                    Cow::Borrowed(plain)
+                }
+                EncryptionOrChecksum::None => Cow::Borrowed(plain),
             };
 
             // if DB size is included for commit frame, it will need to be included only in the last frame of the batch.
@@ -4225,6 +4269,7 @@ impl Wal for WalFile {
         let mut iovecs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
         let mut page_frame_and_checksum: Vec<(PageRef, u64, (u32, u32))> =
             Vec::with_capacity(pages.len());
+        let enc_or_csum = self.io_ctx.read().encryption_or_checksum().clone();
 
         // Rolling checksum input to each frame build
         let mut rolling_checksum: (u32, u32) = *self.last_checksum.read();
@@ -4236,18 +4281,18 @@ impl Wal for WalFile {
             let page_id = page.get().id;
             let plain = page.get_contents().as_ptr();
 
-            let data_to_write: std::borrow::Cow<[u8]> = {
-                let io_ctx = self.io_ctx.read();
-                match &io_ctx.encryption_or_checksum() {
-                    EncryptionOrChecksum::Encryption(ctx) => {
-                        Cow::Owned(ctx.encrypt_page(plain, page_id)?)
-                    }
-                    EncryptionOrChecksum::Checksum(ctx) => {
-                        ctx.add_checksum_to_page(plain, page_id)?;
-                        Cow::Borrowed(plain)
-                    }
-                    EncryptionOrChecksum::None => Cow::Borrowed(plain),
+            let data_to_write: std::borrow::Cow<[u8]> = match &enc_or_csum {
+                EncryptionOrChecksum::Encryption(ctx) => {
+                    Cow::Owned(ctx.encrypt_page(plain, page_id)?)
                 }
+                EncryptionOrChecksum::PageCodec(ctx) => {
+                    Cow::Owned(ctx.encode_page(plain, page_id, PageCodecLocation::Wal)?)
+                }
+                EncryptionOrChecksum::Checksum(ctx) => {
+                    ctx.add_checksum_to_page(plain, page_id)?;
+                    Cow::Borrowed(plain)
+                }
+                EncryptionOrChecksum::None => Cow::Borrowed(plain),
             };
 
             let frame_db_size = 0; // this method is not used for the commit path
@@ -4964,13 +5009,14 @@ impl WalFile {
         };
         // schedule read of the page payload
         let file = self.coordination.wal_file()?;
+        let io_ctx = self.io_ctx.read().clone();
         let c = begin_read_wal_frame(
             file.as_ref(),
             offset + WAL_FRAME_HEADER_SIZE as u64,
             self.buffer_pool.clone(),
             complete,
             page_id,
-            &self.io_ctx.read(),
+            &io_ctx,
         )?;
 
         Ok(InflightRead {

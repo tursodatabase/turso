@@ -10,7 +10,13 @@ public static class TursoBindings
     public static TursoDatabaseHandle OpenDatabase(string path)
     {
         ArgumentNullException.ThrowIfNull(path);
-        return OpenDatabase(path, cipher: null, hexkey: null);
+        return OpenDatabase(path, cipher: null, hexkey: null, pageCodec: null, readOnly: false);
+    }
+
+    public static TursoDatabaseHandle OpenDatabaseReadOnly(string path)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        return OpenDatabase(path, cipher: null, hexkey: null, pageCodec: null, readOnly: true);
     }
 
     /// <summary>
@@ -25,7 +31,45 @@ public static class TursoBindings
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(hexkey);
 
-        return OpenDatabase(path, cipher.ToRustString(), hexkey);
+        return OpenDatabase(path, cipher.ToRustString(), hexkey, pageCodec: null, readOnly: false);
+    }
+
+    private static TursoDatabaseHandle OpenDatabaseWithPageCodec(string path, TursoPageCodec pageCodec)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        ArgumentNullException.ThrowIfNull(pageCodec);
+
+        return OpenDatabase(path, cipher: null, hexkey: null, pageCodec, readOnly: false);
+    }
+
+    private static TursoDatabaseHandle OpenDatabaseReadOnlyWithPageCodec(string path, TursoPageCodec pageCodec)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        ArgumentNullException.ThrowIfNull(pageCodec);
+
+        return OpenDatabase(path, cipher: null, hexkey: null, pageCodec, readOnly: true);
+    }
+
+    public static TursoDatabaseHandle OpenDatabaseWithPageCodec(
+        string path,
+        ITursoPageCodec pageCodec,
+        byte reservedSpace = 0)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        ArgumentNullException.ThrowIfNull(pageCodec);
+
+        return OpenDatabaseWithPageCodec(path, new TursoPageCodec(pageCodec, reservedSpace));
+    }
+
+    public static TursoDatabaseHandle OpenDatabaseReadOnlyWithPageCodec(
+        string path,
+        ITursoPageCodec pageCodec,
+        byte reservedSpace = 0)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        ArgumentNullException.ThrowIfNull(pageCodec);
+
+        return OpenDatabaseReadOnlyWithPageCodec(path, new TursoPageCodec(pageCodec, reservedSpace));
     }
 
     public static TursoStatementHandle PrepareStatement(TursoDatabaseHandle db, string sql)
@@ -286,7 +330,12 @@ public static class TursoBindings
         }
     }
 
-    private static TursoDatabaseHandle OpenDatabase(string path, string? cipher, string? hexkey)
+    private static TursoDatabaseHandle OpenDatabase(
+        string path,
+        string? cipher,
+        string? hexkey,
+        TursoPageCodec? pageCodec,
+        bool readOnly)
     {
         using var pathString = NativeUtf8String.From(path);
         using var featuresString = NativeUtf8String.From(cipher is null ? null : "encryption");
@@ -301,14 +350,20 @@ public static class TursoBindings
             Vfs = IntPtr.Zero,
             EncryptionCipher = cipherString.Pointer,
             EncryptionHexKey = hexkeyString.Pointer,
+            PageCodec = pageCodec?.NativePointer ?? IntPtr.Zero,
+            OpenFlags = readOnly ? TursoDatabaseOpenFlags.ReadOnly : TursoDatabaseOpenFlags.None,
         };
 
-        var status = TursoInterop.DatabaseNew(ref config, out var databasePtr, out var errorPtr);
-        ThrowIfError(status, errorPtr);
-
+        var databasePtr = IntPtr.Zero;
         var connectionPtr = IntPtr.Zero;
         try
         {
+            var status = TursoInterop.DatabaseNew(ref config, out databasePtr, out var errorPtr);
+            ThrowIfError(status, errorPtr);
+            pageCodec?.TransferNativeOwnership();
+            pageCodec?.Dispose();
+            pageCodec = null;
+
             status = TursoInterop.DatabaseOpen(databasePtr, out errorPtr);
             ThrowIfError(status, errorPtr);
 
@@ -323,6 +378,7 @@ public static class TursoBindings
                 TursoInterop.ConnectionDeinit(connectionPtr);
             if (databasePtr != IntPtr.Zero)
                 TursoInterop.DatabaseDeinit(databasePtr);
+            pageCodec?.Dispose();
             throw;
         }
     }
