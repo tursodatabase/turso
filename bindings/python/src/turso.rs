@@ -4,6 +4,7 @@ use pyo3::{
 };
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::{self, EncryptionOpts, Numeric, TursoError, TursoStatusCode, Value};
+pub use turso_sdk_kit::IoBackend;
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -126,7 +127,7 @@ pub struct PyTursoDatabaseConfig {
     /// - "memory": in-memory backend
     /// - "syscall": generic syscall backend
     /// - "io_uring": IO uring (supported only on Linux)
-    pub vfs: Option<String>,
+    pub vfs: IoBackend,
 
     /// optional encryption parameters
     /// as encryption is experimental - experimental_features must have "encryption" in the list
@@ -146,7 +147,7 @@ impl PyTursoDatabaseConfig {
         Self {
             path,
             experimental_features,
-            vfs,
+            vfs: vfs.map_or(IoBackend::Default, IoBackend::from),
             encryption: encryption.cloned(),
         }
     }

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
-use turso::{Builder, Database, Result};
+use turso::{Builder, Database, IoBackend, Result};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum TransactionMode {
@@ -149,7 +149,7 @@ async fn setup_database(
 
     let builder = if let Some(io) = io {
         match io {
-            IoOption::IoUring => builder.with_io("io_uring".to_string()),
+            IoOption::IoUring => builder.with_io(IoBackend::IoUring),
         }
     } else {
         builder
