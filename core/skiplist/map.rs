@@ -41,8 +41,13 @@ impl<K, V> SkipMap<K, V> {
     /// let map: SkipMap<i32, &str> = SkipMap::new();
     /// ```
     pub fn new() -> Self {
+        Self::with_collector(epoch::default_collector().clone())
+    }
+
+    /// Returns a new, empty map with the default comparator and `collector`.
+    pub fn with_collector(collector: epoch::Collector) -> Self {
         Self {
-            inner: base::SkipList::new(epoch::default_collector().clone()),
+            inner: base::SkipList::new(collector),
         }
     }
 }
@@ -60,8 +65,14 @@ impl<K, V, A: SkiplistAllocator> SkipMap<K, V, BasicComparator, A> {
     /// let map: SkipMap<i32, &str, _, TursoAllocator> = SkipMap::new_in(TursoAllocator);
     /// ```
     pub fn new_in(alloc: A) -> Self {
+        Self::with_collector_in(epoch::default_collector().clone(), alloc)
+    }
+
+    /// Returns a new, empty map with the default comparator and `collector`
+    /// that allocates its nodes in `alloc`.
+    pub fn with_collector_in(collector: epoch::Collector, alloc: A) -> Self {
         Self {
-            inner: base::SkipList::new_in(epoch::default_collector().clone(), alloc),
+            inner: base::SkipList::new_in(collector, alloc),
         }
     }
 }
@@ -77,8 +88,13 @@ impl<K, V, C> SkipMap<K, V, C> {
     /// let map: SkipMap<i32, &str> = SkipMap::with_comparator(BasicComparator);
     /// ```
     pub fn with_comparator(comparator: C) -> Self {
+        Self::with_collector_and_comparator(epoch::default_collector().clone(), comparator)
+    }
+
+    /// Returns a new, empty map with `collector` and the given comparator.
+    pub fn with_collector_and_comparator(collector: epoch::Collector, comparator: C) -> Self {
         Self {
-            inner: base::SkipList::with_comparator(epoch::default_collector().clone(), comparator),
+            inner: base::SkipList::with_comparator(collector, comparator),
         }
     }
 }
@@ -97,12 +113,18 @@ impl<K, V, C, A: SkiplistAllocator> SkipMap<K, V, C, A> {
     ///     SkipMap::with_comparator_in(BasicComparator, TursoAllocator);
     /// ```
     pub fn with_comparator_in(comparator: C, alloc: A) -> Self {
+        Self::with_collector_comparator_in(epoch::default_collector().clone(), comparator, alloc)
+    }
+
+    /// Returns a new, empty map with `collector` and the given comparator that
+    /// allocates its nodes in `alloc`.
+    pub fn with_collector_comparator_in(
+        collector: epoch::Collector,
+        comparator: C,
+        alloc: A,
+    ) -> Self {
         Self {
-            inner: base::SkipList::with_comparator_in(
-                epoch::default_collector().clone(),
-                comparator,
-                alloc,
-            ),
+            inner: base::SkipList::with_comparator_in(collector, comparator, alloc),
         }
     }
 
@@ -166,7 +188,7 @@ where
     /// assert_eq!(*numbers.front().unwrap().value(), "five");
     /// ```
     pub fn front(&self) -> Option<Entry<'_, K, V, C, A>> {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         try_pin_loop(|| self.inner.front(guard)).map(Entry::new)
     }
 
@@ -186,7 +208,7 @@ where
     /// assert_eq!(*numbers.back().unwrap().value(), "six");
     /// ```
     pub fn back(&self) -> Option<Entry<'_, K, V, C, A>> {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         try_pin_loop(|| self.inner.back(guard)).map(Entry::new)
     }
 
@@ -208,7 +230,7 @@ where
     /// assert_eq!(*jobs_age.value(), 65);
     /// ```
     pub fn get_or_insert(&self, key: K, value: V) -> Entry<'_, K, V, C, A> {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         Entry::new(self.inner.get_or_insert(key, value, guard))
     }
 
@@ -230,7 +252,7 @@ where
         key: K,
         value: V,
     ) -> Result<Entry<'_, K, V, C, A>, TryReserveError> {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         self.inner
             .try_get_or_insert(key, value, guard)
             .map(Entry::new)
@@ -263,7 +285,7 @@ where
     where
         F: FnOnce() -> V,
     {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         Entry::new(self.inner.get_or_insert_with(key, value_fn, guard))
     }
 
@@ -289,7 +311,7 @@ where
     where
         F: FnOnce() -> V,
     {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         self.inner
             .try_get_or_insert_with(key, value_fn, guard)
             .map(Entry::new)
@@ -345,7 +367,7 @@ where
         C: Comparator<K, Q>,
         Q: ?Sized,
     {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         self.inner.contains_key(key, guard)
     }
 
@@ -369,7 +391,7 @@ where
         C: Comparator<K, Q>,
         Q: ?Sized,
     {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         try_pin_loop(|| self.inner.get(key, guard)).map(Entry::new)
     }
 
@@ -404,7 +426,7 @@ where
         C: Comparator<K, Q>,
         Q: ?Sized,
     {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         try_pin_loop(|| self.inner.lower_bound(bound, guard)).map(Entry::new)
     }
 
@@ -436,7 +458,7 @@ where
         C: Comparator<K, Q>,
         Q: ?Sized,
     {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         try_pin_loop(|| self.inner.upper_bound(bound, guard)).map(Entry::new)
     }
 
@@ -497,7 +519,7 @@ where
     /// assert_eq!(*map.get("key").unwrap().value(), "value");
     /// ```
     pub fn insert(&self, key: K, value: V) -> Entry<'_, K, V, C, A> {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         Entry::new(self.inner.insert(key, value, guard))
     }
 
@@ -516,7 +538,7 @@ where
     /// assert_eq!(*map.get("key").unwrap().value(), "value");
     /// ```
     pub fn try_insert(&self, key: K, value: V) -> Result<Entry<'_, K, V, C, A>, TryReserveError> {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         self.inner.try_insert(key, value, guard).map(Entry::new)
     }
 
@@ -546,7 +568,7 @@ where
     where
         F: Fn(&V) -> bool,
     {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         Entry::new(self.inner.compare_insert(key, value, compare_fn, guard))
     }
 
@@ -573,7 +595,7 @@ where
     where
         F: Fn(&V) -> bool,
     {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         self.inner
             .try_compare_insert(key, value, compare_fn, guard)
             .map(Entry::new)
@@ -602,7 +624,7 @@ where
         C: Comparator<K, Q>,
         Q: ?Sized,
     {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         self.inner.remove(key, guard).map(Entry::new)
     }
 
@@ -629,7 +651,7 @@ where
     /// assert!(numbers.is_empty());
     /// ```
     pub fn pop_front(&self) -> Option<Entry<'_, K, V, C, A>> {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         self.inner.pop_front(guard).map(Entry::new)
     }
 
@@ -656,7 +678,7 @@ where
     /// assert!(numbers.is_empty());
     /// ```
     pub fn pop_back(&self) -> Option<Entry<'_, K, V, C, A>> {
-        let guard = &epoch::pin();
+        let guard = &self.inner.pin();
         self.inner.pop_back(guard).map(Entry::new)
     }
 
@@ -674,7 +696,7 @@ where
     /// assert!(people.is_empty());
     /// ```
     pub fn clear(&self) {
-        let guard = &mut epoch::pin();
+        let guard = &mut self.inner.pin();
         self.inner.clear(guard);
     }
 }
@@ -768,7 +790,9 @@ impl<'a, K, V, C, A: SkiplistAllocator> Entry<'a, K, V, C, A> {
 impl<K, V, C, A: SkiplistAllocator> Drop for Entry<'_, K, V, C, A> {
     fn drop(&mut self) {
         unsafe {
-            ManuallyDrop::into_inner(ptr::read(&self.inner)).release_with_pin(epoch::pin);
+            let entry = ManuallyDrop::into_inner(ptr::read(&self.inner));
+            let skiplist = entry.skiplist();
+            entry.release_with_pin(|| skiplist.pin());
         }
     }
 }
@@ -779,25 +803,25 @@ where
 {
     /// Moves to the next entry in the map.
     pub fn move_next(&mut self) -> bool {
-        let guard = &epoch::pin();
+        let guard = &self.inner.skiplist().pin();
         self.inner.move_next(guard)
     }
 
     /// Moves to the previous entry in the map.
     pub fn move_prev(&mut self) -> bool {
-        let guard = &epoch::pin();
+        let guard = &self.inner.skiplist().pin();
         self.inner.move_prev(guard)
     }
 
     /// Returns the next entry in the map.
     pub fn next(&self) -> Option<Self> {
-        let guard = &epoch::pin();
+        let guard = &self.inner.skiplist().pin();
         self.inner.next(guard).map(Entry::new)
     }
 
     /// Returns the previous entry in the map.
     pub fn prev(&self) -> Option<Self> {
-        let guard = &epoch::pin();
+        let guard = &self.inner.skiplist().pin();
         self.inner.prev(guard).map(Entry::new)
     }
 }
@@ -812,7 +836,7 @@ where
     ///
     /// Returns `true` if this call removed the entry and `false` if it was already removed.
     pub fn remove(&self) -> bool {
-        let guard = &epoch::pin();
+        let guard = &self.inner.skiplist().pin();
         self.inner.remove(guard)
     }
 }
@@ -869,7 +893,7 @@ where
     type Item = Entry<'a, K, V, C, A>;
 
     fn next(&mut self) -> Option<Entry<'a, K, V, C, A>> {
-        let guard = &epoch::pin();
+        let guard = &self.inner.skiplist().pin();
         self.inner.next(guard).map(Entry::new)
     }
 }
@@ -879,7 +903,7 @@ where
     C: Comparator<K>,
 {
     fn next_back(&mut self) -> Option<Entry<'a, K, V, C, A>> {
-        let guard = &epoch::pin();
+        let guard = &self.inner.skiplist().pin();
         self.inner.next_back(guard).map(Entry::new)
     }
 }
@@ -892,7 +916,7 @@ impl<K, V, C, A: SkiplistAllocator> fmt::Debug for Iter<'_, K, V, C, A> {
 
 impl<K, V, C, A: SkiplistAllocator> Drop for Iter<'_, K, V, C, A> {
     fn drop(&mut self) {
-        let guard = &epoch::pin();
+        let guard = &self.inner.skiplist().pin();
         self.inner.drop_impl(guard);
     }
 }
@@ -916,7 +940,7 @@ where
     type Item = Entry<'a, K, V, C, A>;
 
     fn next(&mut self) -> Option<Entry<'a, K, V, C, A>> {
-        let guard = &epoch::pin();
+        let guard = &self.inner.skiplist().pin();
         self.inner.next(guard).map(Entry::new)
     }
 }
@@ -928,7 +952,7 @@ where
     Q: ?Sized,
 {
     fn next_back(&mut self) -> Option<Entry<'a, K, V, C, A>> {
-        let guard = &epoch::pin();
+        let guard = &self.inner.skiplist().pin();
         self.inner.next_back(guard).map(Entry::new)
     }
 }
@@ -957,7 +981,7 @@ where
     Q: ?Sized,
 {
     fn drop(&mut self) {
-        let guard = &epoch::pin();
+        let guard = &self.inner.skiplist().pin();
         self.inner.drop_impl(guard);
     }
 }
