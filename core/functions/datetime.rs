@@ -1712,8 +1712,7 @@ mod tests {
                     Value::build_text(modifier),
                 ]),
                 Value::Null,
-                "modifier: {}",
-                modifier
+                "modifier: {modifier}"
             );
         }
     }
@@ -1873,8 +1872,7 @@ mod tests {
                     Value::build_text(modifier),
                 ]),
                 Value::Null,
-                "modifier: {}",
-                modifier
+                "modifier: {modifier}"
             );
         }
 
@@ -1892,8 +1890,7 @@ mod tests {
                     Value::build_text(modifier),
                 ]),
                 Value::Null,
-                "modifier: {}",
-                modifier
+                "modifier: {modifier}"
             );
         }
     }
@@ -1938,8 +1935,7 @@ mod tests {
             assert_eq!(
                 result,
                 Value::Null,
-                "modifier: {}",
-                modifier
+                "modifier: {modifier}"
             );
         }
     }
