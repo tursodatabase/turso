@@ -4,25 +4,20 @@
 # no token), `verify` validates intent annotations against the canon and needs
 # the ARETTA_TOKEN secret.
 #
-# For now this is a manual workflow so we can opt in to runs while we evaluate
-# cost and signal. To exercise it from a PR, the `pull_request` trigger below is
-# enabled temporarily — note `workflow_dispatch` alone can't be triggered from a
-# PR branch, it only dispatches workflows already on the default branch. Once
-# we're happy, drop the `pull_request` trigger and/or enable the nightly cron.
+# For now this is a manual-only workflow (workflow_dispatch) so we can opt in to
+# runs while we evaluate cost and signal. Note this means it must be merged to
+# the default branch before it can be triggered. Enable the nightly cron once
+# verify is proven out in CI.
 name: Aristo verify
 
 on:
   workflow_dispatch:
-  # Temporary: lets us trigger verify from a PR to test it. Remove once merged.
-  pull_request:
-    branches:
-      - main
   # Nightly run — enable once verify is proven out in CI.
   # schedule:
   #   - cron: '0 7 * * *' # nightly at 07:00 UTC
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
