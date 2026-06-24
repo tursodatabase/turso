@@ -1651,16 +1651,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         .get(sortable_key)
                         .expect("index row from write set must exist in inner map");
                     let mut versions = inner_entry.value().write();
-<<<<<<< HEAD
-                    MvStore::<Clock, A>::gc_version_chain(
-=======
                     self.mvstore.stamp_chain_materialized(
                         &mut versions,
                         materialized_frame,
                         snapshot_ts,
                     );
-                    MvStore::<Clock>::gc_version_chain(
->>>>>>> 0490ad273 (some more work on passive ckpt)
+                    MvStore::<Clock, A>::gc_version_chain(
                         &mut versions,
                         lwm,
                         ckpt_max,

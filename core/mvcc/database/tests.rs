@@ -215,6 +215,7 @@ fn mv_store_skiplist_allocations_are_fallible() {
         MvccClock::new(),
         test_mvcc_storage("mv-store-oom-new.db-log"),
         alloc.clone(),
+        false,
     );
     assert!(matches!(store, Err(LimboError::OutOfMemory)));
 
@@ -223,6 +224,7 @@ fn mv_store_skiplist_allocations_are_fallible() {
         MvccClock::new(),
         test_mvcc_storage("mv-store-oom-insert.db-log"),
         alloc.clone(),
+        false,
     )
     .unwrap();
     alloc.fail_allocations(true);
@@ -234,6 +236,7 @@ fn mv_store_skiplist_allocations_are_fallible() {
         end: PackedTs::pack(None),
         row: Row::new_table_row(row_id.clone(), &[], 0).unwrap(),
         btree_resident: false,
+        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
     let result = store.insert_version(row_id, row_version);
     assert!(matches!(result, Err(crate::alloc::TryReserveError)));
@@ -262,6 +265,7 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
         MvccClock::new(),
         test_mvcc_storage("mv-store-oom-insert-ordering.db-log"),
         alloc.clone(),
+        false,
     )
     .unwrap();
 
@@ -432,8 +436,7 @@ fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
         .write()
         .replace(DatabaseHeader::default());
     db.mvcc_store
-        .insert_table_id_to_rootpage(MVTableId::from(-999_i64), Some(999))
-        .unwrap();
+        .insert_table_id_to_rootpage(MVTableId::from(-999_i64), Some(999));
 
     db.mvcc_store.try_begin_vacuum_gate().unwrap();
     db.mvcc_store.reset_after_vacuum(header, schema.as_ref());
