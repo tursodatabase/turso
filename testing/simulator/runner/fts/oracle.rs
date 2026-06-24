@@ -31,6 +31,7 @@ enum FuzzerStatementRun<T> {
 enum FtsQueryOutcome {
     Rows(Vec<Vec<SqlValue>>),
     Error,
+    SetupError(String),
 }
 
 struct FtsTempDatabase {
@@ -182,9 +183,9 @@ fn reopen_outcome(path: &Path, io: Arc<dyn IO>, sql: &str) -> FtsQueryOutcome {
     })) {
         Ok(Ok(db)) => match db.connect() {
             Ok(conn) => query_outcome(&conn, sql),
-            Err(_) => FtsQueryOutcome::Error,
+            Err(err) => FtsQueryOutcome::SetupError(format!("reopen connect failed: {err}")),
         },
-        Ok(Err(_)) => FtsQueryOutcome::Error,
+        Ok(Err(err)) => FtsQueryOutcome::SetupError(format!("reopen failed: {err}")),
         Err(payload) => std::panic::resume_unwind(payload),
     }
 }
@@ -195,18 +196,28 @@ fn rebuild_outcome(
     include_fts_indexes: bool,
     verification_sql: &str,
 ) -> FtsQueryOutcome {
-    let Ok(rebuild_db) = FtsTempDatabase::new() else {
-        return FtsQueryOutcome::Error;
+    let rebuild_db = match FtsTempDatabase::new() {
+        Ok(db) => db,
+        Err(err) => {
+            return FtsQueryOutcome::SetupError(format!(
+                "temporary database creation failed: {err}"
+            ));
+        }
     };
-    let Ok(rebuild_conn) = rebuild_db.connect() else {
-        return FtsQueryOutcome::Error;
+    let rebuild_conn = match rebuild_db.connect() {
+        Ok(conn) => conn,
+        Err(err) => {
+            return FtsQueryOutcome::SetupError(format!(
+                "temporary database connect failed: {err}"
+            ));
+        }
     };
 
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rebuild_schema(schema, source_conn, &rebuild_conn, include_fts_indexes)
     })) {
         Ok(Ok(())) => {}
-        Ok(Err(_)) => return FtsQueryOutcome::Error,
+        Ok(Err(err)) => return FtsQueryOutcome::SetupError(format!("rebuild failed: {err}")),
         Err(payload) => std::panic::resume_unwind(payload),
     }
 
@@ -415,6 +426,12 @@ fn outcome_signature(outcome: &FtsQueryOutcome) -> String {
     match outcome {
         FtsQueryOutcome::Rows(rows) => format!("rows:{}:{:016x}", rows.len(), rows_digest(rows)),
         FtsQueryOutcome::Error => "error".to_string(),
+        FtsQueryOutcome::SetupError(err) => {
+            format!(
+                "setup-error:{:016x}",
+                fnv1a(0xcbf2_9ce4_8422_2325, err.as_bytes())
+            )
+        }
     }
 }
 
@@ -441,6 +458,7 @@ fn outcome_summary(outcome: &FtsQueryOutcome) -> String {
             )
         }
         FtsQueryOutcome::Error => "Error".to_string(),
+        FtsQueryOutcome::SetupError(err) => format!("SetupError({err})"),
     }
 }
 
@@ -519,5 +537,13 @@ mod tests {
         }));
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn setup_error_is_not_a_query_error() {
+        assert_ne!(
+            FtsQueryOutcome::Error,
+            FtsQueryOutcome::SetupError("rebuild failed".to_string())
+        );
     }
 }
