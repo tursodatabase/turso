@@ -16593,11 +16593,10 @@ fn injected_yield_surfaces_as_step_result_yield() {
     assert_eq!(rows.len(), 1);
 }
 
-#[test]
-fn test_checkpoint_seek_skip_divider_reinsert_loses_row() {
-    let _ = tracing_subscriber::fmt::try_init();
-    let db = MvccTestDbNoConn::new_with_random_db();
-    let conn = db.connect();
+fn run_checkpoint_seek_skip_divider_reinsert_flow(
+    conn: &Arc<Connection>,
+    check_point_lookup: bool,
+) {
     conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
         .unwrap();
     // Same shape as the stress table hot_floor_424: tiny rows, rowid-alias PK.
@@ -16628,12 +16627,42 @@ fn test_checkpoint_seek_skip_divider_reinsert_loses_row() {
         conn.execute(format!("INSERT INTO t VALUES (2.5, {g})"))
             .unwrap();
         conn.execute("COMMIT").unwrap();
-        let rows = get_rows(&conn, &format!("SELECT pk FROM t WHERE pk = {g}"));
-        assert_eq!(
-            rows.len(),
-            1,
-            "rowid {g} vanished from point lookup after re-insert \
-             (checkpoint seek-skip wrote it on the wrong side of the divider)"
-        );
+        if check_point_lookup {
+            let rows = get_rows(conn, &format!("SELECT pk FROM t WHERE pk = {g}"));
+            assert_eq!(
+                rows.len(),
+                1,
+                "rowid {g} vanished from point lookup after re-insert \
+                 (checkpoint seek-skip wrote it on the wrong side of the divider)"
+            );
+        }
     }
+}
+
+#[test]
+fn test_checkpoint_seek_skip_divider_reinsert_loses_row() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    run_checkpoint_seek_skip_divider_reinsert_flow(&conn, true);
+}
+
+#[test]
+fn test_checkpoint_wal_switch_after_divider_reinsert_preserves_sqlite_rowid_order() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    run_checkpoint_seek_skip_divider_reinsert_flow(&conn, false);
+
+    let journal_mode = get_rows(&conn, "PRAGMA journal_mode = 'wal'");
+    assert_eq!(journal_mode.len(), 1);
+    assert_eq!(&journal_mode[0][0].to_string(), "wal");
+
+    let sqlite_integrity = sqlite_file_integrity_check(
+        db.path
+            .as_ref()
+            .expect("regression database should be file-backed"),
+    );
+    assert_eq!(sqlite_integrity, "ok");
 }
