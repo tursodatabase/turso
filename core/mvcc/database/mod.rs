@@ -4123,7 +4123,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) -> Result<Self> {
         let table_id_to_rootpage = SkipMap::new_in(alloc.clone());
         // table id 1 / root page 1 is always sqlite_schema.
-        table_id_to_rootpage.insert(SQLITE_SCHEMA_MVCC_TABLE_ID, RootEntry::live(Some(1)));
+        table_id_to_rootpage.try_insert(SQLITE_SCHEMA_MVCC_TABLE_ID, RootEntry::live(Some(1)))?;
         Ok(Self {
             rows: SkipMap::new_in(alloc.clone()),
             table_id_to_rootpage,
@@ -4160,14 +4160,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             gc_last_lwm: AtomicU64::new(u64::MAX),
             experimental_mvcc_passive_checkpoint,
         })
-    }
-
-    #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::RootpageMappingInsert)]
-    fn insert_initial_rootpage_mapping(
-        table_id_to_rootpage: &SkipMap<MVTableId, Option<u64>, BasicComparator, A>,
-    ) -> Result<(), TryReserveError> {
-        table_id_to_rootpage.try_insert(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1))?;
-        Ok(())
     }
 
     /// Get the table ID from the root page, resolving against the current (live) mapping.
@@ -4259,7 +4251,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if minimum <= self.next_table_id.load(Ordering::SeqCst) {
             self.next_table_id.store(minimum - 1, Ordering::SeqCst);
         }
-        Ok(())
     }
 
     /// Insert a live `table_id -> root_page` binding (bootstrap/recovery, or an
@@ -4445,14 +4436,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.table_id_to_rootpage.clear();
         self.table_id_to_last_rowid.write().clear();
         // TODO: vacuum related code, not handling alloc errors for now
-        crate::without_allocation_faults!(self
-            .insert_table_id_to_rootpage(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1))
-            .expect(ALLOC_ERR_MSG));
+        self.insert_table_id_to_rootpage(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1));
         for root_page in root_pages {
             let table_id = MVTableId::from(-root_page);
-            crate::without_allocation_faults!(self
-                .insert_table_id_to_rootpage(table_id, Some(root_page as u64))
-                .expect(ALLOC_ERR_MSG));
+            self.insert_table_id_to_rootpage(table_id, Some(root_page as u64));
         }
         self.global_header.write().replace(header);
     }
@@ -4842,7 +4829,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         for root_page in sqlite_schema_root_pages {
             turso_assert!(root_page > 0, "root_page={root_page} must be positive");
             let root_page_as_table_id = MVTableId::from(-(root_page));
-            self.insert_table_id_to_rootpage(root_page_as_table_id, Some(root_page as u64))?;
+            self.insert_table_id_to_rootpage(root_page_as_table_id, Some(root_page as u64));
         }
         Ok(())
     }
@@ -5718,7 +5705,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
         };
         let tx_id = maybe_existing_tx_id.unwrap_or_else(|| self.get_tx_id());
-        let mut insert_err = None;
         let begin_ts = if let Some(tx_id) = maybe_existing_tx_id {
             // Upgrade path: the transaction is already published in `txs`
             // (from begin_tx), so it is already visible to compute_lwm().
@@ -5746,10 +5732,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .insert(tx_id, Transaction::new(tx_id, ts, header, read_mark));
             })
         };
-        if let Some(err) = insert_err {
-            unlock_checkpoint_guard();
-            return Err(err.into());
-        }
         #[cfg(any(test, injected_yields))]
         let exclusive_yield_context = YieldContext::new(
             connection.yield_injector(),
@@ -5961,10 +5943,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .insert(tx_id, Transaction::new(tx_id, ts, header, read_mark));
         });
         tracing::trace!("begin_tx(tx_id={}, begin_ts={})", tx_id, begin_ts);
-        if let Some(err) = insert_err {
-            self.blocking_checkpoint_lock.unlock();
-            return Err(err.into());
-        }
 
         Ok(tx_id)
     }
@@ -8595,7 +8573,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                                 panic!("Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}");
                                             }
                                         }
-                                        self.insert_table_id_to_rootpage(table_id, None)?;
+                                        self.insert_table_id_to_rootpage(table_id, None);
                                     } else {
                                         dropped_root_pages.remove(&root_page);
                                         let table_id = self.get_table_id_from_root_page(root_page);
@@ -8629,7 +8607,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 // serialized before the schema INSERT that registers the table_id.
                                 // The schema INSERT (or DELETE) for this table will follow later in
                                 // this transaction frame, so we register the table_id now.
-                                self.insert_table_id_to_rootpage(rowid.table_id, None)?;
+                                self.insert_table_id_to_rootpage(rowid.table_id, None);
                             }
 
                             let version_id = self.get_version_id();
@@ -8664,7 +8642,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
                                 // See comment in UpsertTableRow: old logs may have data rows
                                 // serialized before the schema INSERT that registers the table_id.
-                                self.insert_table_id_to_rootpage(rowid.table_id, None)?;
+                                self.insert_table_id_to_rootpage(rowid.table_id, None);
                             }
                             let tombstone_row = crate::with_mv_store_allocation_site!(
                                 RowPayload,
