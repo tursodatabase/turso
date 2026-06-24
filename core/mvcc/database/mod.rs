@@ -3951,13 +3951,6 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// contend on it; only one wins. Needed because the lock no longer guards the start
     /// of the checkpoint (it's acquired after the pager-write phase, not before).
     checkpoint_in_progress: AtomicBool,
-    /// Writer-preference flag for the passive checkpoint publish window. A passive checkpoint
-    /// sets this while acquiring its brief exclusive publish lock so new `begin_tx` calls defer
-    /// (without yet holding a read lock), letting in-flight readers drain to zero. This lets the
-    /// publish acquire the lock and *complete* under concurrent read load instead of losing the
-    /// `write()` race and aborting (a transient `Busy` is not a real failure). Cleared as soon as
-    /// the publish lock is acquired (the WRITER flag then excludes readers) or the attempt gives up.
-    publish_intent: AtomicBool,
     /// The highest transaction ID that has been made durable in the WAL.
     /// Used to skip checkpointing transactions from mv store to WAL that have already been processed.
     durable_txid_max: AtomicU64,
@@ -4143,7 +4136,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             backfill_floor: Arc::new(RwLock::new(WalPos::ORIGIN)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
             checkpoint_in_progress: AtomicBool::new(false),
-            publish_intent: AtomicBool::new(false),
             durable_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
@@ -5852,60 +5844,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// This function starts a new transaction in the database and returns a `TxID` value
     /// that you can use to perform operations within the transaction. All changes made within the
     /// transaction are isolated from other transactions until you commit the transaction.
-    /// Spins a `begin_tx` waits while a checkpoint publish is pending before giving up and
-    /// proceeding anyway (a safety bound; the publish clears the flag well within this).
-    const PUBLISH_INTENT_DEFER_SPINS: u32 = 1 << 22;
-    /// Spin attempts the publish makes to acquire the exclusive lock (with periodic yields)
-    /// before falling back to `Busy`. Sized to comfortably outlast a short reader drain while
-    /// never burning a core indefinitely behind a long-pinned reader.
-    const PUBLISH_ACQUIRE_SPINS: u32 = 1 << 22;
-
-    /// Acquire the passive checkpoint's brief exclusive publish lock with writer-preference.
-    ///
-    /// Sets `publish_intent` so new `begin_tx` calls defer (holding no read lock), letting the
-    /// existing readers drain to zero, then takes the exclusive `write()`. Returns `true` once
-    /// acquired (caller must release `blocking_checkpoint_lock`), or `false` if readers did not
-    /// drain within the bounded wait (e.g. a long-pinned reader) — the caller then falls back to
-    /// `Busy` and the checkpoint retries on a later commit. A transient contention is never a
-    /// hard failure: in the common case (short transactions) the publish always completes.
-    fn acquire_publish_lock(&self) -> bool {
-        self.publish_intent.store(true, Ordering::Release);
-        let mut acquired = false;
-        let mut spins = 0u32;
-        while spins < Self::PUBLISH_ACQUIRE_SPINS {
-            if self.blocking_checkpoint_lock.write() {
-                acquired = true;
-                break;
-            }
-            std::hint::spin_loop();
-            spins += 1;
-            if spins % 256 == 0 {
-                std::thread::yield_now();
-            }
-        }
-        // Either we hold WRITER now (which already excludes new readers) or we gave up — in both
-        // cases the intent has done its job and must be cleared so deferring `begin_tx`s proceed.
-        self.publish_intent.store(false, Ordering::Release);
-        acquired
-    }
-
     pub fn begin_tx(&self, pager: Arc<Pager>) -> Result<TxID> {
-        // Writer-preference for a passive checkpoint's publish window: while a checkpoint is
-        // acquiring its brief exclusive publish lock, defer here WITHOUT taking a read lock, so
-        // in-flight readers can drain to zero and the publish completes instead of aborting on
-        // `Busy`. We hold no lock while spinning, so this cannot block the publish; bounded so a
-        // stuck publish can never wedge new transactions (it clears the flag when it gives up).
-        let mut spins = 0u32;
-        while self.publish_intent.load(Ordering::Acquire) {
-            std::hint::spin_loop();
-            spins += 1;
-            if spins >= Self::PUBLISH_INTENT_DEFER_SPINS {
-                break;
-            }
-            if spins % 256 == 0 {
-                std::thread::yield_now();
-            }
-        }
         if !self.blocking_checkpoint_lock.read() {
             // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
             return Err(LimboError::Busy);
