@@ -3315,3 +3315,24 @@ test json-remove-null {
 expect {
   null
 }
+
+test json_set_array_append_at_root {
+    SELECT json_set('[1,2,3]', '$[#]', 4);
+}
+expect {
+    [1,2,3,4]
+}
+
+test json_set_array_append_after_array_index {
+    SELECT json_set('[[1,2,3]]', '$[0][#]', 4);
+}
+expect {
+    [[1,2,3,4]]
+}
+
+test json_set_array_append_after_object_key {
+    SELECT json_set('{"a":[1,2,3]}', '$.a[#]', 4);
+}
+expect {
+    {"a":[1,2,3,4]}
+}
