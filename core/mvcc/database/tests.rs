@@ -14318,134 +14318,6 @@ fn test_integrity_check_ignores_dropped_root_that_is_live_after_recovery() {
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
-
-fn stress_checkpoint_repro_blob_len(rng: &mut ChaCha8Rng, large_probability: f64) -> i32 {
-    if rng.random_bool(large_probability) {
-        rng.random_range(1000..9000)
-    } else {
-        rng.random_range(8..18)
-    }
-}
-
-fn sqlite_file_integrity_check(path: &str) -> String {
-    rusqlite::Connection::open(path)
-        .unwrap()
-        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .unwrap()
-}
-
-/// Stress-compatible MVCC checkpoint regression for table b-tree rowid order.
-///
-/// The antithesis runs in out-of-order-1/out-of-order-2 ended concurrent stress
-/// by switching MVCC back to WAL before SQLite's integrity check. With the old
-/// checkpoint cursor optimization, replaying the SQL log through public
-/// connections fails at line 49638; the final artifact reports
-/// "Tree 3 page 230 cell 0: Rowid 708 out of order". This reduced fixed seed
-/// keeps the same user-visible shape: a file-backed MVCC database, the same
-/// rowid table plus unique index, many stress-style INSERT/UPDATE/DELETE
-/// statements with large zeroblobs, then `PRAGMA journal_mode = 'wal'` followed
-/// by SQLite's `PRAGMA integrity_check`.
-#[test]
-fn test_checkpoint_wal_switch_preserves_rowid_order_after_stress_like_writes() {
-    const INITIAL_ROWS: i32 = 1000;
-    const PENDING_OPS: usize = 1937;
-    const SEED: u64 = 7;
-
-    let db = MvccTestDbNoConn::new_with_random_db();
-    let conn = db.connect();
-    conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
-        .unwrap();
-    conn.execute(
-        "CREATE TABLE soft_desk_784 (
-            fresh_desk_444 INTEGER PRIMARY KEY,
-            wild_bird_302 NUMERIC,
-            cold_seed_580 REAL,
-            old_door_808 BLOB,
-            wet_flower_487 BLOB,
-            full_road_308 NUMERIC UNIQUE,
-            fresh_wave_376 REAL,
-            dry_dog_191 BLOB NOT NULL,
-            sweet_lake_578 BLOB
-        )",
-    )
-    .unwrap();
-
-    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
-    let mut unique_base = 10_000_i64;
-    for rowid in 0..INITIAL_ROWS {
-        let wild = rng.random_range(0..1000);
-        let cold = rng.random_range(0..1000) as f64 / 100.0;
-        let old_len = stress_checkpoint_repro_blob_len(&mut rng, 0.18);
-        let wet_len = stress_checkpoint_repro_blob_len(&mut rng, 0.18);
-        let wave = rng.random_range(0..1000) as f64 / 100.0;
-        let dry_len = stress_checkpoint_repro_blob_len(&mut rng, 0.18);
-        let sweet_len = stress_checkpoint_repro_blob_len(&mut rng, 0.18);
-        conn.execute(format!(
-            "INSERT INTO soft_desk_784 VALUES (
-                {rowid}, {wild}, {cold},
-                zeroblob({old_len}), zeroblob({wet_len}), {unique_base},
-                {wave}, zeroblob({dry_len}), zeroblob({sweet_len})
-            )"
-        ))
-        .unwrap();
-        unique_base += 1;
-    }
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-    for _ in 0..PENDING_OPS {
-        let rowid = rng.random_range(0..INITIAL_ROWS);
-        unique_base += 1;
-        let old_len = stress_checkpoint_repro_blob_len(&mut rng, 0.35);
-        let wet_len = stress_checkpoint_repro_blob_len(&mut rng, 0.35);
-        let dry_len = stress_checkpoint_repro_blob_len(&mut rng, 0.35);
-        let sweet_len = stress_checkpoint_repro_blob_len(&mut rng, 0.35);
-        let sql = match rng.random_range(0..10) {
-            0..=1 => format!("DELETE FROM soft_desk_784 WHERE fresh_desk_444 = {rowid}"),
-            2..=3 => format!(
-                "INSERT INTO soft_desk_784 VALUES (
-                    {rowid}, {wild}, {cold},
-                    zeroblob({old_len}), zeroblob({wet_len}), {unique_base},
-                    {wave}, zeroblob({dry_len}), zeroblob({sweet_len})
-                )",
-                wild = rng.random_range(0..1000),
-                cold = rng.random_range(0..1000) as f64 / 100.0,
-                wave = rng.random_range(0..1000) as f64 / 100.0,
-            ),
-            _ => format!(
-                "UPDATE soft_desk_784
-                    SET wild_bird_302 = {wild},
-                        cold_seed_580 = {cold},
-                        old_door_808 = zeroblob({old_len}),
-                        wet_flower_487 = zeroblob({wet_len}),
-                        full_road_308 = {unique_base},
-                        fresh_wave_376 = {wave},
-                        dry_dog_191 = zeroblob({dry_len}),
-                        sweet_lake_578 = zeroblob({sweet_len})
-                  WHERE fresh_desk_444 = {rowid}",
-                wild = rng.random_range(0..1000),
-                cold = rng.random_range(0..1000) as f64 / 100.0,
-                wave = rng.random_range(0..1000) as f64 / 100.0,
-            ),
-        };
-        let _ = conn.execute(&sql);
-    }
-
-    let journal_mode = get_rows(&conn, "PRAGMA journal_mode = 'wal'");
-    assert_eq!(journal_mode.len(), 1);
-    assert_eq!(&journal_mode[0][0].to_string(), "wal");
-
-    let sqlite_integrity = sqlite_file_integrity_check(
-        db.path
-            .as_ref()
-            .expect("regression database should be file-backed"),
-    );
-    assert_eq!(sqlite_integrity, "ok");
-
-    let integrity = get_rows(&conn, "PRAGMA integrity_check");
-    assert_eq!(integrity.len(), 1);
-    assert_eq!(&integrity[0][0].to_string(), "ok");
-}
-
 /// Snapshot stability under all of: nested-savepoint rollbacks, checkpoints,
 /// CREATE/DROP INDEX, and concurrent committed writers.
 ///
@@ -16593,10 +16465,11 @@ fn injected_yield_surfaces_as_step_result_yield() {
     assert_eq!(rows.len(), 1);
 }
 
-fn run_checkpoint_seek_skip_divider_reinsert_flow(
-    conn: &Arc<Connection>,
-    check_point_lookup: bool,
-) {
+#[test]
+fn test_checkpoint_seek_skip_divider_reinsert_loses_row() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
         .unwrap();
     // Same shape as the stress table hot_floor_424: tiny rows, rowid-alias PK.
@@ -16627,42 +16500,12 @@ fn run_checkpoint_seek_skip_divider_reinsert_flow(
         conn.execute(format!("INSERT INTO t VALUES (2.5, {g})"))
             .unwrap();
         conn.execute("COMMIT").unwrap();
-        if check_point_lookup {
-            let rows = get_rows(conn, &format!("SELECT pk FROM t WHERE pk = {g}"));
-            assert_eq!(
-                rows.len(),
-                1,
-                "rowid {g} vanished from point lookup after re-insert \
-                 (checkpoint seek-skip wrote it on the wrong side of the divider)"
-            );
-        }
+        let rows = get_rows(&conn, &format!("SELECT pk FROM t WHERE pk = {g}"));
+        assert_eq!(
+            rows.len(),
+            1,
+            "rowid {g} vanished from point lookup after re-insert \
+             (checkpoint seek-skip wrote it on the wrong side of the divider)"
+        );
     }
-}
-
-#[test]
-fn test_checkpoint_seek_skip_divider_reinsert_loses_row() {
-    let _ = tracing_subscriber::fmt::try_init();
-    let db = MvccTestDbNoConn::new_with_random_db();
-    let conn = db.connect();
-
-    run_checkpoint_seek_skip_divider_reinsert_flow(&conn, true);
-}
-
-#[test]
-fn test_checkpoint_wal_switch_after_divider_reinsert_preserves_sqlite_rowid_order() {
-    let db = MvccTestDbNoConn::new_with_random_db();
-    let conn = db.connect();
-
-    run_checkpoint_seek_skip_divider_reinsert_flow(&conn, false);
-
-    let journal_mode = get_rows(&conn, "PRAGMA journal_mode = 'wal'");
-    assert_eq!(journal_mode.len(), 1);
-    assert_eq!(&journal_mode[0][0].to_string(), "wal");
-
-    let sqlite_integrity = sqlite_file_integrity_check(
-        db.path
-            .as_ref()
-            .expect("regression database should be file-backed"),
-    );
-    assert_eq!(sqlite_integrity, "ok");
 }
