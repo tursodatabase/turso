@@ -224,8 +224,6 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     staged_checkpoint_header: Option<DatabaseHeader>,
     /// Guard to avoid restaging page 1 across CommitPagerTxn async retries.
     header_staged_for_commit: bool,
-    /// EXPERIMENT: passive took the brief publish lock at CommitPagerTxn.
-    passive_publish_lock: bool,
     /// Root-map (`table_id_to_rootpage`) mutations staged by this checkpoint's off-lock write
     /// phase, applied to the shared map ONLY inside the locked publish window (CommitPagerTxn).
     /// The shared map is concurrently read by live transactions (cursor + RowidAllocator root
@@ -766,7 +764,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             durable_mvcc_metadata,
             staged_checkpoint_header: None,
             header_staged_for_commit: false,
-            passive_publish_lock: false,
             pending_rootmap_ops: Vec::new(),
             pending_alloc_roots: std::collections::HashMap::new(),
             collect_table_cursor: None,
@@ -2462,16 +2459,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
             }
             CheckpointState::CommitPagerTxn => {
-                // Serialize only the publish window against readers (brief write lock). Acquire
-                // it with writer-preference so in-flight readers drain and the publish COMPLETES;
-                // `Busy` here is transient contention, not a real failure, so we only fall back
-                // (and retry on a later commit) if readers don't drain within the bounded wait.
+                // Serialize only the publish window against readers (brief write lock). If a
+                // reader holds the lock we return Busy and the checkpoint retries on a later
+                // commit (passive: a missed checkpoint is harmless; the log just grows until one
+                // succeeds).
                 if !self.lock_states.blocking_checkpoint_lock_held {
-                    if !self.mvstore.acquire_publish_lock() {
+                    if !self.checkpoint_lock.write() {
                         return Err(crate::LimboError::Busy);
                     }
                     self.lock_states.blocking_checkpoint_lock_held = true;
-                    self.passive_publish_lock = true;
                 }
                 if !self.header_staged_for_commit {
                     let mut checkpoint_header =
@@ -2562,10 +2558,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         crate::without_allocation_faults!(self
                             .publish_checkpointed_schema_roots()
                             .expect(crate::alloc::ALLOC_ERR_MSG));
-                        if self.passive_publish_lock {
+                        // Passive releases the brief publish lock right after publishing; the
+                        // blocking path holds it from PrepareCheckpoint through Finalize.
+                        if matches!(self.mode, CheckpointMode::Passive { .. }) {
                             self.checkpoint_lock.unlock();
                             self.lock_states.blocking_checkpoint_lock_held = false;
-                            self.passive_publish_lock = false;
                         }
                         inject_transition_failure!(
                             self,
