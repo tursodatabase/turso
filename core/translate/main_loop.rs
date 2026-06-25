@@ -58,6 +58,13 @@ pub struct LeftJoinMetadata {
     pub label_match_flag_check_value: BranchOffset,
 }
 
+// Metadata for handling FULL OUTER JOIN operations
+#[derive(Debug)]
+pub struct FullJoinMetadata {
+    // cursor to an ephemeral index that tracks the rowids of the right table that have been matched
+    pub ephemeral_cursor_id: CursorID,
+}
+
 /// Jump labels for each loop in the query's main execution loop
 #[derive(Debug, Clone, Copy)]
 pub struct LoopLabels {
@@ -170,6 +177,34 @@ pub fn init_loop(
                     label_match_flag_check_value: program.allocate_label(),
                 };
                 t_ctx.meta_left_joins[table_index] = Some(lj_metadata);
+            }
+            if join_info.is_full {
+                let ephemeral_index = std::sync::Arc::new(crate::schema::Index {
+                    columns: vec![crate::schema::IndexColumn {
+                        name: "rowid".to_string(),
+                        order: turso_parser::ast::SortOrder::Asc,
+                        pos_in_table: 0,
+                        collation: None,
+                        default: None,
+                        expr: None,
+                    }],
+                    ephemeral: true,
+                    table_name: String::new(),
+                    name: String::new(),
+                    root_page: 0,
+                    unique: false,
+                    has_rowid: false,
+                    where_clause: None,
+                    index_method: None,
+                });
+                let ephemeral_cursor_id = program.alloc_cursor_id(crate::vdbe::builder::CursorType::BTreeIndex(ephemeral_index));
+                program.emit_insn(Insn::OpenEphemeral {
+                    cursor_id: ephemeral_cursor_id,
+                    is_table: false, // index to track matched rowids
+                });
+                t_ctx.meta_full_joins[table_index] = Some(FullJoinMetadata {
+                    ephemeral_cursor_id,
+                });
             }
         }
         let (table_cursor_id, index_cursor_id) =
@@ -1434,6 +1469,7 @@ pub fn open_loop(
                     hash_table_id,
                 )?;
 
+
                 let num_keys = hash_join_op.join_keys.len();
 
                 // Hash Table Probe Phase
@@ -1611,6 +1647,7 @@ pub fn open_loop(
             join_index,
             condition_fail_target,
             true,
+            true, // evaluate_join_conditions = true
             subqueries,
             SubqueryRefFilter::All,
         )?;
@@ -1628,6 +1665,35 @@ pub fn open_loop(
                     dest: lj_meta.reg_match_flag,
                 });
             }
+            if join_info.is_full {
+                let fj_meta = t_ctx.meta_full_joins[joined_table_index].as_ref().unwrap();
+                let table_cursor_id = program
+                    .resolve_cursor_id_safe(&crate::vdbe::builder::CursorKey::table(table.internal_id))
+                    .expect("table cursor should be open");
+                
+                let reg_rowid = program.alloc_register();
+                program.emit_insn(Insn::RowId {
+                    cursor_id: table_cursor_id,
+                    dest: reg_rowid,
+                });
+                
+                let record_reg = program.alloc_register();
+                program.emit_insn(Insn::MakeRecord {
+                    start_reg: reg_rowid as u16,
+                    count: 1,
+                    dest_reg: record_reg as u16,
+                    index_name: None,
+                    affinity_str: None,
+                });
+
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: fj_meta.ephemeral_cursor_id,
+                    record_reg,
+                    unpacked_start: Some(reg_rowid),
+                    unpacked_count: Some(1),
+                    flags: crate::vdbe::insn::IdxInsertFlags::default(),
+                });
+            }
         }
 
         // emit conditions that do not reference subquery results
@@ -1640,6 +1706,7 @@ pub fn open_loop(
             join_index,
             condition_fail_target,
             false,
+            true, // evaluate_join_conditions = true
             subqueries,
             SubqueryRefFilter::WithoutSubqueryRefs,
         )?;
@@ -1674,6 +1741,7 @@ pub fn open_loop(
             join_index,
             condition_fail_target,
             false,
+            true, // evaluate_join_conditions = true
             subqueries,
             SubqueryRefFilter::WithSubqueryRefs,
         )?;
@@ -1708,18 +1776,15 @@ fn condition_references_subquery(expr: &Expr, subqueries: &[NonFromClauseSubquer
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SubqueryRefFilter {
-    /// Emit all conditions regardless of subquery references
+pub enum SubqueryRefFilter {
     All,
-    /// Only emit conditions that do NOT reference subqueries (for early evaluation)
-    WithoutSubqueryRefs,
-    /// Only emit conditions that DO reference subqueries (for late evaluation)
     WithSubqueryRefs,
+    WithoutSubqueryRefs,
 }
 
 #[allow(clippy::too_many_arguments)]
 /// Emits WHERE/ON predicates that must be evaluated at the current join loop.
-fn emit_conditions(
+pub fn emit_conditions(
     program: &mut ProgramBuilder,
     t_ctx: &&mut TranslateCtx,
     table_references: &TableReferences,
@@ -1728,11 +1793,13 @@ fn emit_conditions(
     join_index: usize,
     next: BranchOffset,
     from_outer_join: bool,
+    evaluate_join_conditions: bool,
     subqueries: &[NonFromClauseSubquery],
     subquery_ref_filter: SubqueryRefFilter,
 ) -> Result<()> {
     for cond in predicates
         .iter()
+        .filter(|cond| evaluate_join_conditions || !cond.is_join_condition)
         .filter(|cond| cond.from_outer_join.is_some() == from_outer_join)
         .filter(|cond| {
             cond.should_eval_at_loop(join_index, join_order, subqueries, Some(table_references))

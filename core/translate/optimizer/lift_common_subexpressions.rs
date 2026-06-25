@@ -125,6 +125,7 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
             where_clause.push(WhereTerm {
                 expr: common_expr_to_add,
                 from_outer_join: term_from_outer_join,
+                is_join_condition: false,
                 consumed: false,
             });
         }
@@ -258,6 +259,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
             from_outer_join: None,
+            is_join_condition: false,
             consumed: false,
         }];
 
@@ -360,6 +362,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
             from_outer_join: None,
+            is_join_condition: false,
             consumed: false,
         }];
 
@@ -427,6 +430,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr.clone(),
             from_outer_join: None,
+            is_join_condition: false,
             consumed: false,
         }];
 
@@ -496,6 +500,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
             from_outer_join: Some(TableInternalId::default()), // Set from_outer_join
+            is_join_condition: false,
             consumed: false,
         }];
 
@@ -548,6 +553,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: single_expr.clone(),
             from_outer_join: None,
+            is_join_condition: false,
             consumed: false,
         }];
 
@@ -597,6 +603,7 @@ mod tests {
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
             from_outer_join: None,
+            is_join_condition: false,
             consumed: false,
         }];
 

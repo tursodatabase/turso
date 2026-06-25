@@ -17,7 +17,8 @@ use super::group_by::{
     group_by_agg_phase, group_by_emit_row_phase, init_group_by, GroupByMetadata, GroupByRowSource,
 };
 use super::main_loop::{
-    close_loop, emit_loop, init_distinct, init_loop, open_loop, LeftJoinMetadata, LoopLabels,
+    close_loop, emit_loop, init_distinct, init_loop, open_loop,
+    FullJoinMetadata, LeftJoinMetadata, LoopLabels,
 };
 use super::order_by::{emit_order_by, init_order_by, SortMetadata};
 use super::plan::{
@@ -279,6 +280,9 @@ pub struct TranslateCtx<'a> {
     /// mapping between table loop index and associated metadata (for left joins only)
     /// this metadata exists for the right table in a given left join
     pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
+    /// mapping between table loop index and associated metadata (for full outer joins)
+    /// this metadata exists for the right table in a given full outer join
+    pub meta_full_joins: Vec<Option<FullJoinMetadata>>,
     pub resolver: Resolver<'a>,
     /// Hash table contexts for hash joins, keyed by build table index.
     pub hash_table_contexts: HashMap<usize, HashCtx>,
@@ -320,6 +324,7 @@ impl<'a> TranslateCtx<'a> {
             reg_result_cols_start: None,
             meta_group_by: None,
             meta_left_joins: (0..table_count).map(|_| None).collect(),
+            meta_full_joins: (0..table_count).map(|_| None).collect(),
             meta_sort: None,
             hash_table_contexts: HashMap::default(),
             materialized_build_inputs: HashMap::default(),
@@ -1297,6 +1302,81 @@ pub fn emit_query<'a>(
         &plan.join_order,
         OperationMode::SELECT,
     )?;
+
+    // Handle FULL OUTER JOIN secondary loops to emit unmatched rows from the right tables
+    for (table_index, table) in plan.table_references.joined_tables().iter().enumerate() {
+        if let Some(join_info) = table.join_info.as_ref() {
+            if join_info.is_full {
+                let fj_meta = t_ctx.meta_full_joins[table_index].as_ref().unwrap();
+                let loop_start = program.allocate_label();
+                let loop_end = program.allocate_label();
+
+                // 1. For all tables before this one, emit NullRow so they output NULLs
+                for i in 0..table_index {
+                    let prior_table = &plan.table_references.joined_tables()[i];
+                    let cursor_id = program.resolve_cursor_id_safe(&crate::vdbe::builder::CursorKey::table(prior_table.internal_id)).unwrap();
+                    program.emit_insn(Insn::NullRow { cursor_id });
+                }
+
+                // 2. Rewind the right table cursor
+                let rhs_cursor_id = program.resolve_cursor_id_safe(&crate::vdbe::builder::CursorKey::table(table.internal_id)).unwrap();
+                program.emit_insn(Insn::Rewind {
+                    cursor_id: rhs_cursor_id,
+                    pc_if_empty: loop_end,
+                });
+
+                // 3. Loop start
+                program.preassign_label_to_next_insn(loop_start);
+
+                // 4. Check if the rowid is in the ephemeral cursor
+                let reg_rowid = program.alloc_register();
+                program.emit_insn(Insn::RowId {
+                    cursor_id: rhs_cursor_id,
+                    dest: reg_rowid,
+                });
+                
+                let label_next = program.allocate_label();
+                program.emit_insn(Insn::Found {
+                    cursor_id: fj_meta.ephemeral_cursor_id,
+                    target_pc: label_next,
+                    record_reg: reg_rowid,
+                    num_regs: 1,
+                });
+
+                // 5. Evaluate WHERE clause!
+                // We evaluate ALL predicates for this row, but SKIP inner join conditions
+                // since the left side of the join is completely missing (we are generating NULLs for them).
+                for j_idx in 0..plan.join_order.len() {
+                    crate::translate::main_loop::emit_conditions(
+                        program,
+                        &t_ctx,
+                        &plan.table_references,
+                        &plan.join_order,
+                        &plan.where_clause,
+                        j_idx,
+                        label_next,
+                        false,
+                        false, // evaluate_join_conditions = false
+                        &mut [],
+                        crate::translate::main_loop::SubqueryRefFilter::All,
+                    )?;
+                }
+
+                // 6. Emit the result row (projection / aggregate / sorter)
+                crate::translate::main_loop::emit_loop(program, t_ctx, plan)?;
+
+                // 7. Advance right table loop
+                program.preassign_label_to_next_insn(label_next);
+                program.emit_insn(Insn::Next {
+                    cursor_id: rhs_cursor_id,
+                    pc_if_next: loop_start,
+                });
+                
+                // 8. End of loop
+                program.preassign_label_to_next_insn(loop_end);
+            }
+        }
+    }
 
     program.preassign_label_to_next_insn(after_main_loop_label);
 

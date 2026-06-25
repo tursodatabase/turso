@@ -14,6 +14,7 @@ pub(crate) mod attach;
 pub(crate) mod collate;
 mod compound_select;
 pub(crate) mod delete;
+pub(crate) mod desugar;
 pub(crate) mod display;
 pub(crate) mod emitter;
 pub(crate) mod expr;

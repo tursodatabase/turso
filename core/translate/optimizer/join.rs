@@ -2031,7 +2031,7 @@ mod tests {
             _create_table_reference(
                 t2,
                 Some(JoinInfo {
-                    outer: false,
+                    outer: false, is_full: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2154,7 +2154,7 @@ mod tests {
             _create_table_reference(
                 table_customers,
                 Some(JoinInfo {
-                    outer: false,
+                    outer: false, is_full: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2162,7 +2162,7 @@ mod tests {
             _create_table_reference(
                 table_order_items,
                 Some(JoinInfo {
-                    outer: false,
+                    outer: false, is_full: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2364,7 +2364,7 @@ mod tests {
             _create_table_reference(
                 t2,
                 Some(JoinInfo {
-                    outer: false,
+                    outer: false, is_full: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2372,7 +2372,7 @@ mod tests {
             _create_table_reference(
                 t3,
                 Some(JoinInfo {
-                    outer: false,
+                    outer: false, is_full: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2487,7 +2487,7 @@ mod tests {
                 _create_table_reference(
                     t.clone(),
                     Some(JoinInfo {
-                        outer: false,
+                        outer: false, is_full: false,
                         using: vec![],
                     }),
                     table_id_counter.next(),
@@ -2496,7 +2496,7 @@ mod tests {
             refs.push(_create_table_reference(
                 fact_table,
                 Some(JoinInfo {
-                    outer: false,
+                    outer: false, is_full: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2759,6 +2759,7 @@ mod tests {
                 Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
             ),
             from_outer_join: None,
+            is_join_condition: false,
             consumed: false,
         }];
 
@@ -2875,6 +2876,7 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
                 ),
                 from_outer_join: None,
+            is_join_condition: false,
                 consumed: false,
             },
             WhereTerm {
@@ -2889,6 +2891,7 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
                 ),
                 from_outer_join: None,
+            is_join_condition: false,
                 consumed: false,
             },
         ];
@@ -3010,6 +3013,7 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
                 ),
                 from_outer_join: None,
+            is_join_condition: false,
                 consumed: false,
             },
             WhereTerm {
@@ -3024,6 +3028,7 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(10.to_string()))),
                 ),
                 from_outer_join: None,
+            is_join_condition: false,
                 consumed: false,
             },
             WhereTerm {
@@ -3038,6 +3043,7 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
                 ),
                 from_outer_join: None,
+            is_join_condition: false,
                 consumed: false,
             },
         ];
@@ -3178,6 +3184,7 @@ mod tests {
         WhereTerm {
             expr: Expr::Binary(Box::new(lhs), op, Box::new(rhs)),
             from_outer_join: None,
+            is_join_condition: false,
             consumed: false,
         }
     }
@@ -3224,7 +3231,7 @@ mod tests {
             _create_table_reference(
                 t2,
                 Some(JoinInfo {
-                    outer: false,
+                    outer: false, is_full: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),

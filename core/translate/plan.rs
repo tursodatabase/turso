@@ -134,6 +134,10 @@ pub struct WhereTerm {
     /// right-side table of the OUTER JOIN (in this case, s). When evaluating conditions, if [WhereTerm::from_outer_join]
     /// is set, we force evaluation to happen during that table's loop.
     pub from_outer_join: Option<TableInternalId>,
+    /// Whether the condition came from a JOIN constraint (ON or USING) as opposed to a WHERE clause.
+    /// This is used during FULL OUTER JOIN unmatched row emission to avoid filtering out unmatched rows
+    /// using inner join constraints that were intended for the left side of the join.
+    pub is_join_condition: bool,
     /// Whether the condition has been consumed by the optimizer in some way, and it should not be evaluated
     /// in the normal place where WHERE terms are evaluated.
     /// A term may have been consumed e.g. if:
@@ -189,6 +193,7 @@ impl From<Expr> for WhereTerm {
         Self {
             expr: value,
             from_outer_join: None,
+            is_join_condition: false,
             consumed: false,
         }
     }
@@ -660,6 +665,8 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
 pub struct JoinInfo {
     /// Whether this is an OUTER JOIN.
     pub outer: bool,
+    /// Whether this is a FULL OUTER JOIN.
+    pub is_full: bool,
     /// The USING clause for the join, if any. NATURAL JOIN is transformed into USING (col1, col2, ...).
     pub using: Vec<ast::Name>,
 }

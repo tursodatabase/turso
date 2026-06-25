@@ -91,13 +91,14 @@ pub fn translate_select(
 }
 
 pub fn prepare_select_plan(
-    select: ast::Select,
+    mut select: ast::Select,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
+    crate::translate::desugar::desugar_outer_joins(&mut select)?;
     let compounds = select.body.compounds;
     match compounds.is_empty() {
         true => Ok(Plan::Select(prepare_one_select_plan(
@@ -741,6 +742,7 @@ fn add_vtab_predicates_to_where_clause(
         plan.where_clause.push(WhereTerm {
             expr,
             from_outer_join,
+            is_join_condition: false,
             consumed: false,
         });
     }

@@ -1638,19 +1638,20 @@ fn parse_join(
         connection,
     )?;
 
-    let (outer, natural) = match join_operator {
+    let (outer, is_full, natural) = match join_operator {
         ast::JoinOperator::TypedJoin(Some(join_type)) => {
-            if join_type.contains(JoinType::RIGHT) {
+            let is_outer = join_type.contains(JoinType::OUTER);
+            let is_full = join_type.contains(JoinType::LEFT | JoinType::RIGHT);
+            if join_type.contains(JoinType::RIGHT) && !is_full {
                 crate::bail_parse_error!("RIGHT JOIN is not supported");
             }
             if join_type.contains(JoinType::CROSS) {
                 crate::bail_parse_error!("CROSS JOIN is not supported");
             }
-            let is_outer = join_type.contains(JoinType::OUTER);
             let is_natural = join_type.contains(JoinType::NATURAL);
-            (is_outer, is_natural)
+            (is_outer, is_full, is_natural)
         }
-        _ => (false, false),
+        _ => (false, false, false),
     };
 
     if natural && constraint.is_some() {
@@ -1727,6 +1728,7 @@ fn parse_join(
                     } else {
                         None
                     };
+                    predicate.is_join_condition = true;
                     bind_and_rewrite_expr(
                         &mut predicate.expr,
                         Some(table_references),
@@ -1813,6 +1815,7 @@ fn parse_join(
                         } else {
                             None
                         },
+                        is_join_condition: true,
                         consumed: false,
                     });
                 }
@@ -1827,7 +1830,7 @@ fn parse_join(
         .joined_tables_mut()
         .get_mut(last_idx)
         .unwrap();
-    rightmost_table.join_info = Some(JoinInfo { outer, using });
+    rightmost_table.join_info = Some(JoinInfo { outer, is_full, using });
 
     Ok(())
 }
