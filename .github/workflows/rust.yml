@@ -127,8 +127,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-pc-windows-msvc
+      - name: Add Windows ARM64 Rust target
+        run: rustup target add aarch64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-windows-arm64-cli"
