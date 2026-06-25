@@ -737,3 +737,106 @@ async fn begin_publish_window_gc_scenario(num_readers: usize, rounds: i64) {
         "Observed a row, and then no row. This violates Snapshot Isolation"
     );
 }
+
+/// Run a statement that may transiently fail with Busy under checkpoint/commit
+/// contention, retrying until it succeeds. Any other error is a real failure.
+async fn exec_retry(conn: &turso::Connection, sql: &str) {
+    loop {
+        match conn.execute(sql, ()).await {
+            Ok(_) => return,
+            Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {
+                shuttle::future::yield_now().await;
+            }
+            Err(e) => panic!("unexpected error running `{sql}`: {e:?}"),
+        }
+    }
+}
+
+/// Run a single TRUNCATE checkpoint and drain its result rows. A Busy here means
+/// this schedule simply lost the lock race (not the bug), so it is tolerated;
+/// the bug manifests as a *panic* inside the checkpoint, which propagates.
+async fn checkpoint_once_tolerate_busy(conn: &turso::Connection) {
+    match conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await {
+        Ok(mut rows) => while let Ok(Some(_)) = rows.next().await {},
+        Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {}
+        Err(e) => panic!("unexpected checkpoint error: {e:?}"),
+    }
+}
+
+/// Reproduces the MVCC checkpoint panic seen in production:
+///   "Index struct for index_id MVTableId(-N) must exist when checkpointing
+///    index rows" (CheckpointState::WriteIndexRow), and/or its sibling
+///   "checkpoint index struct missing before BTreeCreateIndex".
+///
+/// A `CheckpointStateMachine` builds its `index_id -> Index` map ONCE, in
+/// `new()`, from a snapshot of the shared schema; the index rows it writes come
+/// from the MVCC version store. The two are sampled at different instants, so a
+/// background checkpoint that starts before a concurrent CREATE INDEX publishes
+/// the new index captures a schema snapshot lacking it, yet can still observe
+/// that index's committed (and made-durable) row-versions when it later collects
+/// -- and panics because it has no Index struct for them.
+///
+/// This needs no yield injection: shuttle's scheduler explores the interleaving
+/// of the writer (CREATE INDEX -> make durable -> fresh INSERT) against the
+/// background checkpoint, instrumented through `core/sync.rs`'s shuttle-aware
+/// locks. The blocking checkpoint lock is a try-lock that Busy-aborts rather
+/// than waiting, so the racing schedule is precise: the checkpoint snapshots the
+/// schema, the writer's whole sequence then runs, and only then does the
+/// checkpoint take its lock and collect. `PctScheduler` (a few well-placed
+/// priority changes) finds it; a fixed seed pins it deterministically. When the
+/// schedule is hit, the checkpoint thread panics and the test fails.
+async fn checkpoint_missing_index_struct_scenario() {
+    let (db, _dir) = setup_mvcc_db(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+         INSERT INTO t VALUES (1, 'a');",
+    )
+    .await;
+
+    let barrier = Arc::new(Barrier::new(2));
+
+    // Application writer: create an index, make it durable (advancing the
+    // durable watermark past its creation), then write a fresh, not-yet-
+    // checkpointed indexed row. When the racing background checkpoint resamples
+    // the watermark, the index's own CREATE INDEX schema row is no longer
+    // re-collected, so it reaches the WriteIndexRow site (the production panic)
+    // rather than the sibling BTreeCreateIndex assertion.
+    let writer = db.connect().unwrap();
+    let wb = barrier.clone();
+    let h_writer = turso_stress::future::spawn(async move {
+        writer
+            .execute("PRAGMA mvcc_checkpoint_threshold = 1000000", ())
+            .await
+            .unwrap();
+        wb.wait();
+        exec_retry(&writer, "CREATE INDEX idx ON t(v)").await;
+        checkpoint_once_tolerate_busy(&writer).await;
+        exec_retry(&writer, "INSERT INTO t VALUES (2, 'b')").await;
+    });
+
+    // Background checkpoint task racing the writer.
+    let checkpointer = db.connect().unwrap();
+    let cb = barrier.clone();
+    let h_ckpt = turso_stress::future::spawn(async move {
+        checkpointer
+            .execute("PRAGMA mvcc_checkpoint_threshold = 1000000", ())
+            .await
+            .unwrap();
+        cb.wait();
+        checkpoint_once_tolerate_busy(&checkpointer).await;
+    });
+
+    h_writer.await.unwrap();
+    h_ckpt.await.unwrap();
+}
+
+#[test]
+#[ignore = "known-bug reproducer: MVCC checkpoint WriteIndexRow divergence panic; \
+            deterministically fails today, remove #[ignore] once fixed"]
+fn shuttle_test_checkpoint_missing_index_struct() {
+    // Fixed seed + PctScheduler reproduces the production panic deterministically
+    // (typically within seconds). Drop the seed (use `PctScheduler::new`) to
+    // re-search if a code change shifts the schedule.
+    let scheduler = PctScheduler::new_from_seed(0xC4EC_9011, 3, 20000);
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+    runner.run(|| shuttle::future::block_on(checkpoint_missing_index_struct_scenario()));
+}
