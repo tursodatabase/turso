@@ -3297,14 +3297,18 @@ fn begin_mvcc_tx(
     mode: &TransactionMode,
     existing_tx_id: Option<u64>,
     connection: &Connection,
+    expected_schema_generation: Option<u64>,
 ) -> Result<u64> {
     match mode {
         TransactionMode::None | TransactionMode::Read | TransactionMode::Concurrent => {
-            mv_store.begin_tx(pager.clone())
+            mv_store.begin_tx_with_schema_generation(pager.clone(), expected_schema_generation)
         }
-        TransactionMode::Write => {
-            mv_store.begin_exclusive_tx(pager.clone(), existing_tx_id, connection)
-        }
+        TransactionMode::Write => mv_store.begin_exclusive_tx(
+            pager.clone(),
+            existing_tx_id,
+            connection,
+            expected_schema_generation,
+        ),
     }
 }
 
@@ -3591,7 +3595,14 @@ pub fn op_transaction_inner(
                             // applies to all databases uniformly.
                             let effective_mode =
                                 conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or(*tx_mode);
-                            match begin_mvcc_tx(mv_store, &pager, &effective_mode, None, &conn) {
+                            match begin_mvcc_tx(
+                                mv_store,
+                                &pager,
+                                &effective_mode,
+                                None,
+                                &conn,
+                                None,
+                            ) {
                                 Ok(tx_id) => {
                                     conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
                                     started_secondary_tx = true;
@@ -3609,9 +3620,14 @@ pub fn op_transaction_inner(
                             if matches!(current_mode, TransactionMode::None | TransactionMode::Read)
                                 && matches!(tx_mode, TransactionMode::Write)
                             {
-                                if let Err(err) =
-                                    begin_mvcc_tx(mv_store, &pager, tx_mode, Some(tx_id), &conn)
-                                {
+                                if let Err(err) = begin_mvcc_tx(
+                                    mv_store,
+                                    &pager,
+                                    tx_mode,
+                                    Some(tx_id),
+                                    &conn,
+                                    None,
+                                ) {
                                     pager.end_read_tx();
                                     return Err(err);
                                 }
@@ -3656,21 +3672,35 @@ pub fn op_transaction_inner(
                         }
 
                         if !has_existing_mv_tx {
-                            match begin_mvcc_tx(mv_store, &pager, tx_mode, None, &conn) {
-                                Ok(tx_id) => {
-                                    // Check again in case checkpoint published roots after the
-                                    // previous check and before this transaction was protected.
-                                    if conn.mvcc_schema_requires_reprepare_before_tx() {
-                                        tracing::debug!(
-                                            "MVCC shared schema changed while starting transaction; force reprepare"
-                                        );
-                                        mv_store.rollback_tx(tx_id, pager.clone(), &conn, *db);
+                            // Gate the begin on the connection's prepared schema generation,
+                            // captured here (atomically with the connection.schema == db.schema
+                            // check) and re-checked inside begin_tx's clock callback. A passive
+                            // checkpoint publish runs under the same clock and bumps the
+                            // generation, so one that orders into the begin window is detected
+                            // there and forces a reprepare against the published roots — without
+                            // the old non-atomic post-begin recheck (which also tripped on
+                            // publishes strictly after our snapshot).
+                            let expected_schema_generation =
+                                match conn.mvcc_begin_schema_generation() {
+                                    Ok(generation) => generation,
+                                    Err(err) => {
                                         if started_read_tx {
                                             pager.end_read_tx();
+                                            conn.set_tx_state(TransactionState::None);
                                             state.auto_txn_cleanup = TxnCleanup::None;
                                         }
-                                        return Err(LimboError::SchemaUpdated);
+                                        return Err(err);
                                     }
+                                };
+                            match begin_mvcc_tx(
+                                mv_store,
+                                &pager,
+                                tx_mode,
+                                None,
+                                &conn,
+                                expected_schema_generation,
+                            ) {
+                                Ok(tx_id) => {
                                     program
                                         .connection
                                         .set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
@@ -3705,6 +3735,7 @@ pub fn op_transaction_inner(
                                     &actual_tx_mode,
                                     Some(tx_id),
                                     &conn,
+                                    None,
                                 ) {
                                     if started_read_tx {
                                         pager.end_read_tx();
@@ -13756,6 +13787,9 @@ pub enum OpIntegrityCheckState {
     CheckingBTreeStructure {
         errors: Vec<IntegrityCheckError>,
         current_root_idx: usize,
+        /// Index into `dropped_roots`, processed after `roots`. Each is walked only if its page is
+        /// not already accounted for (reused/freed); see Insn::IntegrityCk::dropped_roots.
+        current_dropped_idx: usize,
         state: IntegrityCheckState,
     },
 }
@@ -13771,6 +13805,7 @@ pub fn op_integrity_check(
             db,
             max_errors,
             roots,
+            dropped_roots,
             message_register,
         },
         insn
@@ -13783,11 +13818,22 @@ pub fn op_integrity_check(
     } else {
         program.get_pager_from_database_index(db)?
     };
+    // PASSIVE-ONLY: source the physical header fields (freelist_trunk_page, freelist_pages,
+    // database_size) from the pager's live page 1 instead of the MVCC snapshot header, so they
+    // match the pages walked below at the same read frame. The MVCC header lags the pager's
+    // freelist across the off-lock checkpoint's commits, which would otherwise make the freelist
+    // walk read a freed-and-reused page as a trunk. Other modes keep the MVCC header path; passing
+    // `None` here routes `with_header` through `pager.with_header`.
+    let passive = mv_store.is_some()
+        && program
+            .connection
+            .experimental_mvcc_passive_checkpoint_enabled();
+    let physical_header_store = if passive { None } else { mv_store.as_ref() };
     match state.active_op_state.integrity_check() {
         OpIntegrityCheckState::Start => {
             let (freelist_trunk_page, db_size) = return_if_io!(with_header(
                 &target_pager,
-                mv_store.as_ref(),
+                physical_header_store,
                 program,
                 *db,
                 |header| (header.freelist_trunk_page.get(), header.database_size.get())
@@ -13799,7 +13845,7 @@ pub fn op_integrity_check(
             if freelist_trunk_page > 0 {
                 let expected_freelist_count = return_if_io!(with_header(
                     &target_pager,
-                    mv_store.as_ref(),
+                    physical_header_store,
                     program,
                     *db,
                     |header| { header.freelist_pages.get() }
@@ -13820,11 +13866,13 @@ pub fn op_integrity_check(
                     errors,
                     state: integrity_check_state,
                     current_root_idx,
+                    current_dropped_idx: 0,
                 };
         }
         OpIntegrityCheckState::CheckingBTreeStructure {
             errors,
             current_root_idx,
+            current_dropped_idx,
             state: integrity_check_state,
         } => {
             return_if_io!(integrity_check(
@@ -13849,6 +13897,24 @@ pub fn op_integrity_check(
             if *current_root_idx < roots.len() {
                 integrity_check_state.start(roots[*current_root_idx], PageCategory::Normal, errors);
                 *current_root_idx += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+
+            // Dropped roots are walked after every live root (and the freelist) has populated
+            // `page_reference`, so a dropped page that was freed and reused — as another btree's
+            // child or a freelist entry — is already present and skipped here rather than
+            // double-referenced. A genuinely-orphaned dropped page (a drop not yet checkpointed)
+            // is absent, so it is still walked to account for its pages.
+            while *current_dropped_idx < dropped_roots.len() {
+                let dropped_root = dropped_roots[*current_dropped_idx];
+                *current_dropped_idx += 1;
+                if integrity_check_state
+                    .page_reference
+                    .contains_key(&dropped_root)
+                {
+                    continue;
+                }
+                integrity_check_state.start(dropped_root, PageCategory::Normal, errors);
                 return Ok(InsnFunctionStepResult::Step);
             }
 

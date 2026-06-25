@@ -224,6 +224,9 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     staged_checkpoint_header: Option<DatabaseHeader>,
     /// Guard to avoid restaging page 1 across CommitPagerTxn async retries.
     header_staged_for_commit: bool,
+    /// Set after `pager.commit_tx` succeeds; the publish window may still be pending (auto passive
+    /// retries acquiring the brief write lock without re-committing).
+    pager_commit_done: bool,
     /// Root-map (`table_id_to_rootpage`) mutations staged by this checkpoint's off-lock write
     /// phase, applied to the shared map ONLY inside the locked publish window (CommitPagerTxn).
     /// The shared map is concurrently read by live transactions (cursor + RowidAllocator root
@@ -242,6 +245,11 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// Async driver for `CheckpointState::CompactSequences`. Lazily set
     /// on first entry to that state; cleared when the driver completes.
     seq_compact: Option<SeqCompactDriver<Clock, A>>,
+    /// Passive-mode sequence rows recorded by `SeqCompactDriver` for deletion.
+    /// Turned into end-stamped deletes (`seqcompact_commit_delete`) in the
+    /// clock-ordered publish window. Empty in blocking mode (it uses the raw
+    /// purge). See `docs/internals/mvcc/sequence-compaction-passive.md`.
+    pending_seq_deletes: Vec<(RowID, usize)>,
     /// Upper-bound timestamp for collection (`= mvstore.last_committed_tx_ts` at the
     /// start of the off-lock prepare phase). Versions inserted after it are deferred and
     /// tombstones after it are clamped to "live" so concurrent commits never strand a row
@@ -345,6 +353,17 @@ struct SeqCompactDriver<Clock: LogicalClock, A: ConcurrentAllocator = TursoAlloc
     /// MVCC store used to purge version-chain entries paired with each
     /// B-tree delete. See the struct-level comment for the invariant.
     mvstore: Arc<MvStore<Clock, A>>,
+    /// Passive (off-lock) mode: the raw purge contract does not hold (no
+    /// `pager_commit_lock`), so instead of deleting the B-tree row + purging
+    /// the chain in the sweep, the driver only *records* each non-watermark
+    /// `(RowID, num_cols)` here. The publish window turns them into proper
+    /// end-stamped deletes via `seqcompact_commit_delete`; a later checkpoint
+    /// materializes the physical B-tree delete. See
+    /// `docs/internals/mvcc/sequence-compaction-passive.md`.
+    passive: bool,
+    /// Rows recorded for deletion in passive mode (drained by the checkpoint
+    /// state machine into its publish window).
+    compacted: Vec<(RowID, usize)>,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -537,15 +556,30 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> SeqCompactDriver<Clock, A> {
                             self.phase = SeqCompactPhase::ScanNext;
                         }
                         Some(k) => {
-                            // Stash the key for the paired MVCC purge that
-                            // ScanDelete performs after `cursor.delete()`
-                            // returns Done. This branch and the transition
-                            // are synchronous (no yield between them), so
-                            // ScanDelete is guaranteed to observe
-                            // `pending_delete_rowid = Some(k)` on the
-                            // current iteration.
-                            self.pending_delete_rowid = Some(k);
-                            self.phase = SeqCompactPhase::ScanDelete;
+                            if self.passive {
+                                // Off-lock: don't touch the B-tree or purge the chain here (the
+                                // purge contract needs the lock). Record the row; the publish
+                                // window turns it into a proper end-stamped delete and a later
+                                // checkpoint materializes the physical delete.
+                                self.compacted.push((
+                                    RowID {
+                                        table_id: seq.table_id,
+                                        row_id: RowKey::Int(k),
+                                    },
+                                    seq.backing_num_cols,
+                                ));
+                                self.phase = SeqCompactPhase::ScanNext;
+                            } else {
+                                // Stash the key for the paired MVCC purge that
+                                // ScanDelete performs after `cursor.delete()`
+                                // returns Done. This branch and the transition
+                                // are synchronous (no yield between them), so
+                                // ScanDelete is guaranteed to observe
+                                // `pending_delete_rowid = Some(k)` on the
+                                // current iteration.
+                                self.pending_delete_rowid = Some(k);
+                                self.phase = SeqCompactPhase::ScanDelete;
+                            }
                         }
                         None => {
                             self.advance_to_next_sequence();
@@ -764,12 +798,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             durable_mvcc_metadata,
             staged_checkpoint_header: None,
             header_staged_for_commit: false,
+            pager_commit_done: false,
             pending_rootmap_ops: Vec::new(),
             pending_alloc_roots: std::collections::HashMap::new(),
             collect_table_cursor: None,
             collect_index_tableid_cursor: None,
             collect_index_key_cursor: None,
             seq_compact: None,
+            pending_seq_deletes: Vec::new(),
             // Set in PrepareCheckpoint once the off-lock snapshot is taken; until
             // then `u64::MAX` disables the upper-bound filter (collect everything).
             snapshot_ts: u64::MAX,
@@ -1130,7 +1166,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 // CREATE INDEX (root page is negative so the index has not been checkpointed yet).
                                 let index_id = MVTableId::from(root_page);
                                 let sqlite_schema_rowid = version.row.id.row_id.to_int_or_panic();
-
                                 special_write = Some(SpecialWrite::BTreeCreateIndex {
                                     index_id,
                                     sqlite_schema_rowid,
@@ -1502,6 +1537,86 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         drop(schema_ref);
         *self.connection.schema.write() = self.connection.db.clone_schema();
         self.connection.bump_prepare_context_generation();
+        self.mvstore.bump_schema_generation();
+        Ok(())
+    }
+
+    /// Apply deferred root-map mutations, advance `durable_txid_max`, and publish the staged
+    /// page-1 header + schema roots. Caller must either hold `blocking_checkpoint_lock` write
+    /// (truncate / explicit passive) or run inside `MvStore::finish_passive_publish_window`.
+    fn apply_checkpoint_publish_window(
+        &mut self,
+        materialized_at: WalPos,
+        seq_delete_ts: Option<u64>,
+    ) -> Result<()> {
+        // PASSIVE sequence compaction (Option B): turn the rows the sweep recorded into proper
+        // end-stamped deletes, using the publish-window timestamp. It is allocated under the same
+        // clock as concurrent `begin_tx`, so it is > every concurrent reader's begin (they see the
+        // row live and conflict, never re-synthesize a tombstone) and > durable_txid_max_new (the
+        // boundary stored below), so the next checkpoint still materializes the physical delete.
+        if let Some(ts) = seq_delete_ts {
+            for (rowid, num_cols) in std::mem::take(&mut self.pending_seq_deletes) {
+                self.mvstore.seqcompact_commit_delete(rowid, num_cols, ts);
+            }
+        }
+        let ops = std::mem::take(&mut self.pending_rootmap_ops);
+        for op in &ops {
+            match op {
+                RootMapOp::Retire { id, end_ts } => self.mvstore.retire_rootpage(*id, *end_ts),
+                RootMapOp::Remove { id } => self.mvstore.remove_table_id_to_rootpage(id),
+                RootMapOp::Alloc { .. } => {}
+            }
+        }
+        for op in &ops {
+            if let RootMapOp::Alloc { id, root } = op {
+                self.mvstore
+                    .record_rootpage_alloc(*id, *root, self.snapshot_ts, WalPos::STAGED);
+            }
+        }
+        self.pending_alloc_roots.clear();
+        for table_id in std::mem::take(&mut self.staged_roots) {
+            self.mvstore
+                .publish_rootpage_visible(table_id, materialized_at);
+        }
+        self.mvstore
+            .durable_txid_max
+            .store(self.durable_txid_max_new, Ordering::SeqCst);
+        self.state = CheckpointState::CheckpointWal;
+        self.lock_states.pager_read_tx = false;
+        self.lock_states.pager_write_tx = false;
+        let header = self.staged_checkpoint_header.take().ok_or_else(|| {
+            LimboError::InternalError(
+                "checkpoint header was not staged before pager commit".to_string(),
+            )
+        })?;
+        self.mvstore.global_header.write().replace(header);
+        crate::without_allocation_faults!(self
+            .publish_checkpointed_schema_roots()
+            .expect(crate::alloc::ALLOC_ERR_MSG));
+        Ok(())
+    }
+
+    /// Passive auto-checkpoint publish: clock-ordered apply (no RW lock). Caller must have
+    /// already acquired the publish drain bit via `try_begin_passive_publish_window`.
+    fn apply_passive_publish_window_ordered(&mut self, materialized_at: WalPos) -> Result<()> {
+        let mut publish_err = None;
+        // SAFETY: `apply_checkpoint_publish_window` mutates only this state machine and the
+        // mvstore. The clock lock excludes concurrent `begin_tx` publication; the publish
+        // drain bit excludes new begins before they reach the clock lock.
+        let sm = self as *mut Self;
+        self.mvstore.clock.get_timestamp(|ts| {
+            // SAFETY: see above. `ts` is this publish's clock timestamp; pass it as the commit ts
+            // for passive sequence-compaction deletes (see apply_checkpoint_publish_window).
+            if let Err(err) =
+                unsafe { (*sm).apply_checkpoint_publish_window(materialized_at, Some(ts)) }
+            {
+                publish_err = Some(err);
+            }
+        });
+        self.mvstore.end_passive_publish_window();
+        if let Some(err) = publish_err {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -2435,136 +2550,108 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         pending_delete_rowid: None,
                         pager: self.pager.clone(),
                         mvstore: self.mvstore.clone(),
+                        passive: matches!(self.mode, CheckpointMode::Passive { .. }),
+                        compacted: Vec::new(),
                     });
                 }
                 let driver = self.seq_compact.as_mut().expect("seq_compact set above");
                 match driver.step()? {
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
                     IOResult::Done(()) => {
-                        self.seq_compact = None;
+                        // Passive recorded its deletes instead of applying them; carry them to the
+                        // clock-ordered publish window. Blocking applied them directly (empty).
+                        let driver = self.seq_compact.take().expect("seq_compact set above");
+                        self.pending_seq_deletes = driver.compacted;
                         self.state = CheckpointState::CommitPagerTxn;
                         Ok(TransitionResult::Continue)
                     }
                 }
             }
             CheckpointState::CommitPagerTxn => {
-                // Serialize only the publish window against readers (brief write lock). If a
-                // reader holds the lock we return Busy and the checkpoint retries on a later
-                // commit (passive: a missed checkpoint is harmless; the log just grows until one
-                // succeeds).
-                if !self.lock_states.blocking_checkpoint_lock_held {
+                let passive = matches!(self.mode, CheckpointMode::Passive { .. });
+                let passive_auto_publish_retry = passive && !self.update_transaction_state;
+                // Passive: btree commit and publish run off the RW lock (drain bit only).
+                let lock_before_commit = !passive;
+                if lock_before_commit && !self.lock_states.blocking_checkpoint_lock_held {
                     if !self.checkpoint_lock.write() {
                         return Err(crate::LimboError::Busy);
                     }
                     self.lock_states.blocking_checkpoint_lock_held = true;
                 }
-                if !self.header_staged_for_commit {
-                    let mut checkpoint_header =
-                        *self.mvstore.global_header.read().as_ref().ok_or_else(|| {
-                            LimboError::InternalError(
-                                "global_header not initialized during checkpoint".to_string(),
-                            )
+                if !self.pager_commit_done {
+                    if !self.header_staged_for_commit {
+                        let mut checkpoint_header =
+                            *self.mvstore.global_header.read().as_ref().ok_or_else(|| {
+                                LimboError::InternalError(
+                                    "global_header not initialized during checkpoint".to_string(),
+                                )
+                            })?;
+                        checkpoint_header.schema_cookie =
+                            self.connection.db.schema.lock().schema_version.into();
+                        let staged_header = self.pager.io.block(|| {
+                            self.pager.with_header_mut(|header| {
+                                // Keep pager-maintained fields (for example database_size/change_counter)
+                                // intact, and apply only MVCC header mutations that are authored via
+                                // SetCookie/PRAGMA paths.
+                                header.schema_cookie = checkpoint_header.schema_cookie;
+                                header.user_version = checkpoint_header.user_version;
+                                header.application_id = checkpoint_header.application_id;
+                                header.vacuum_mode_largest_root_page =
+                                    checkpoint_header.vacuum_mode_largest_root_page;
+                                header.incremental_vacuum_enabled =
+                                    checkpoint_header.incremental_vacuum_enabled;
+                                *header
+                            })
                         })?;
-                    checkpoint_header.schema_cookie =
-                        self.connection.db.schema.lock().schema_version.into();
-                    let staged_header = self.pager.io.block(|| {
-                        self.pager.with_header_mut(|header| {
-                            // Keep pager-maintained fields (for example database_size/change_counter)
-                            // intact, and apply only MVCC header mutations that are authored via
-                            // SetCookie/PRAGMA paths.
-                            header.schema_cookie = checkpoint_header.schema_cookie;
-                            header.user_version = checkpoint_header.user_version;
-                            header.application_id = checkpoint_header.application_id;
-                            header.vacuum_mode_largest_root_page =
-                                checkpoint_header.vacuum_mode_largest_root_page;
-                            header.incremental_vacuum_enabled =
-                                checkpoint_header.incremental_vacuum_enabled;
-                            *header
-                        })
-                    })?;
-                    self.staged_checkpoint_header = Some(staged_header);
-                    self.header_staged_for_commit = true;
-                }
-                // On commit_tx failure the `?` rolls back the pager txn; durable_txid_max and
-                // the log offset stay put, so a retry re-stages from the previous boundary.
-                tracing::debug!("Committing pager transaction");
-                let result = self
-                    .pager
-                    .commit_tx(&self.connection, self.update_transaction_state)?;
-                match result {
-                    IOResult::Done(_) => {
-                        // Publish window: the pages are now staged in the WAL. Stamp each staged
-                        // root with that WAL position so a txn reads the btree only once its read
-                        // mark reaches it (else it falls back to the version chain / DB file).
-                        let materialized_at = WalPos::from_pair(self.pager.wal_pos());
-                        // Apply deferred root-map ops now that the B-tree changes are durable.
-                        // Lock-free: each SkipMap op is atomic and `RootEntry` is snapshot-versioned
-                        // (`covers(ts)`). Retires/removes before allocs so a page freed and reused
-                        // within this checkpoint is never owned by two live bindings at once.
-                        let ops = std::mem::take(&mut self.pending_rootmap_ops);
-                        for op in &ops {
-                            match op {
-                                RootMapOp::Retire { id, end_ts } => {
-                                    self.mvstore.retire_rootpage(*id, *end_ts)
-                                }
-                                RootMapOp::Remove { id } => {
-                                    self.mvstore.remove_table_id_to_rootpage(id)
-                                }
-                                RootMapOp::Alloc { .. } => {}
-                            }
-                        }
-                        for op in &ops {
-                            if let RootMapOp::Alloc { id, root } = op {
-                                self.mvstore.record_rootpage_alloc(
-                                    *id,
-                                    *root,
-                                    self.snapshot_ts,
-                                    WalPos::STAGED,
-                                );
-                            }
-                        }
-                        self.pending_alloc_roots.clear();
-                        for table_id in std::mem::take(&mut self.staged_roots) {
-                            self.mvstore
-                                .publish_rootpage_visible(table_id, materialized_at);
-                        }
-                        // Advance the durable boundary now so a retry after a later-phase
-                        // failure re-stages from this prefix, not from older versions.
-                        self.mvstore
-                            .durable_txid_max
-                            .store(self.durable_txid_max_new, Ordering::SeqCst);
-                        self.state = CheckpointState::CheckpointWal;
-                        self.lock_states.pager_read_tx = false;
-                        self.lock_states.pager_write_tx = false;
-                        // Publish the exact page-1 snapshot that was staged into the pager txn.
-                        let header = self.staged_checkpoint_header.take().ok_or_else(|| {
-                            LimboError::InternalError(
-                                "checkpoint header was not staged before pager commit".to_string(),
-                            )
-                        })?;
-                        self.mvstore.global_header.write().replace(header);
-                        // TODO: not sure what is the error handling supposed to be here for alloc error
-                        crate::without_allocation_faults!(self
-                            .publish_checkpointed_schema_roots()
-                            .expect(crate::alloc::ALLOC_ERR_MSG));
-                        // Passive releases the brief publish lock right after publishing; the
-                        // blocking path holds it from PrepareCheckpoint through Finalize.
-                        if matches!(self.mode, CheckpointMode::Passive { .. }) {
-                            self.checkpoint_lock.unlock();
-                            self.lock_states.blocking_checkpoint_lock_held = false;
-                        }
-                        inject_transition_failure!(
-                            self,
-                            CheckpointYieldPoint::AfterDurableBoundaryAdvanced
-                        );
-                        inject_transition_yield!(
-                            self,
-                            CheckpointYieldPoint::AfterDurableBoundaryAdvanced
-                        );
-                        Ok(TransitionResult::Continue)
+                        self.staged_checkpoint_header = Some(staged_header);
+                        self.header_staged_for_commit = true;
                     }
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                    // On commit_tx failure the `?` rolls back the pager txn; durable_txid_max and
+                    // the log offset stay put, so a retry re-stages from the previous boundary.
+                    tracing::debug!("Committing pager transaction");
+                    match self
+                        .pager
+                        .commit_tx(&self.connection, self.update_transaction_state)?
+                    {
+                        IOResult::Done(_) => {
+                            self.pager_commit_done = true;
+                        }
+                        IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
+                    }
                 }
+                if passive {
+                    if !self.mvstore.try_begin_passive_publish_window() {
+                        if passive_auto_publish_retry {
+                            tracing::debug!(
+                                "passive checkpoint publish contended; yielding for retry"
+                            );
+                            return Ok(TransitionResult::Io(IOCompletions::Single(
+                                Completion::new_yield(),
+                            )));
+                        }
+                        return Err(crate::LimboError::Busy);
+                    }
+                    let materialized_at = WalPos::from_pair(self.pager.wal_pos());
+                    self.apply_passive_publish_window_ordered(materialized_at)?;
+                } else if !self.lock_states.blocking_checkpoint_lock_held {
+                    if !self.checkpoint_lock.write() {
+                        return Err(crate::LimboError::Busy);
+                    }
+                    self.lock_states.blocking_checkpoint_lock_held = true;
+                    let materialized_at = WalPos::from_pair(self.pager.wal_pos());
+                    // Blocking holds the lock: SeqCompact applied its deletes+purge directly under
+                    // the contract, so there are no recorded passive deletes to publish (None).
+                    self.apply_checkpoint_publish_window(materialized_at, None)?;
+                } else {
+                    let materialized_at = WalPos::from_pair(self.pager.wal_pos());
+                    self.apply_checkpoint_publish_window(materialized_at, None)?;
+                }
+                inject_transition_failure!(
+                    self,
+                    CheckpointYieldPoint::AfterDurableBoundaryAdvanced
+                );
+                inject_transition_yield!(self, CheckpointYieldPoint::AfterDurableBoundaryAdvanced);
+                Ok(TransitionResult::Continue)
             }
 
             CheckpointState::TruncateLogicalLog => {
@@ -2673,9 +2760,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
                 // Passive leaves the WAL non-empty; the logical log is already truncated, so
                 // recovery sees NoLog + committed WAL — the normal passive steady state.
+                // Scope to THIS checkpoint's own staged work: a no-op (nothing-to-write) pass
+                // staged nothing, and a real publish drains both. A global schema scan would
+                // false-trip on owned-negative leftovers from an earlier checkpoint that mapped
+                // a root positive but couldn't patch the (not-yet-adopted) live schema — benign,
+                // since cursors resolve negative->positive via table_id_to_rootpage.
                 turso_assert!(
-                    !self.has_pending_root_publication(),
-                    "checkpoint finalized after pager writes without publishing schema changes"
+                    self.created_btrees.is_empty() && self.staged_roots.is_empty(),
+                    "checkpoint finalized with un-published staged schema roots"
                 );
                 self.mvstore
                     .durable_txid_max
