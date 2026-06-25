@@ -14071,46 +14071,84 @@ fn test_checkpoint_recovers_after_crash_restart_drop_recreate_index() {
     assert_eq!(rows[1][1].to_string(), "post_2");
 }
 
+/// Custom yield injector used by the checkpoint-panic reproducer below.
+///
+/// When the background checkpoint reaches `CheckpointYieldPoint::BeforeAcquireLock`
+/// -- i.e. it has already captured its `index_id -> Index` schema snapshot (built
+/// in `CheckpointStateMachine::new()`), but has not yet taken its checkpoint lock
+/// or collected any rows -- this injector runs, on a *different* application
+/// connection and entirely through user-facing SQL:
+///   * `CREATE INDEX idx` (which the captured snapshot will never see),
+///   * `PRAGMA wal_checkpoint(TRUNCATE)` to make the index durable and advance
+///     the durable watermark past its creation,
+///   * a fresh `INSERT` that produces a not-yet-checkpointed index row-version.
+/// It then lets the checkpoint proceed. No threads, no sleeps -- the inline work
+/// at the yield point is what makes the interleaving deterministic.
+struct CreateIndexThenMakeDurableAtCheckpointStart {
+    point: YieldPoint,
+    writer: Arc<Connection>,
+    fired: AtomicBool,
+}
+
+impl std::fmt::Debug for CreateIndexThenMakeDurableAtCheckpointStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateIndexThenMakeDurableAtCheckpointStart")
+            .field("fired", &self.fired.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+impl YieldInjector for CreateIndexThenMakeDurableAtCheckpointStart {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        if point != self.point || self.fired.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        // The checkpoint has captured its index-less schema snapshot already.
+        self.writer
+            .execute("CREATE INDEX idx ON t(v)")
+            .expect("CREATE INDEX should succeed");
+        self.writer
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("durability checkpoint should succeed");
+        self.writer
+            .execute("INSERT INTO t VALUES (2, 'b')")
+            .expect("fresh insert should succeed");
+        true
+    }
+}
+
 /// Reproducer for the production panic:
 ///   "Index struct for index_id MVTableId(-N) must exist when checkpointing
 ///    index rows" (checkpoint_state_machine.rs, CheckpointState::WriteIndexRow).
 ///
-/// Uses only user-facing APIs (SQL, `PRAGMA wal_checkpoint`, prepare/step) plus
-/// yield injection to make the interleaving deterministic. It mirrors the
-/// production stack: a background checkpoint task driving a checkpoint on the
-/// main database while application connections write.
+/// Uses only user-facing APIs (SQL + `PRAGMA wal_checkpoint`); yield injection is
+/// used solely to make the writer/checkpoint interleaving deterministic. It
+/// mirrors the production stack -- a background checkpoint task checkpointing the
+/// main database while an application connection writes -- and does NOT change
+/// the journal mode.
 ///
 /// Root cause: a checkpoint builds its `index_id -> Index` map ONCE, when it
 /// starts, from a snapshot of the shared schema. The index rows it later writes
-/// come from the MVCC version store. The two are sampled at different instants:
-///   * the shared schema gains a new index only when the CREATE INDEX commit
-///     reaches its `EndCommitLogicalLog` step (`update_schema_if_newer`);
-///   * an index row-version becomes checkpointable only once a later commit step
-///     rewrites its begin TxID into a commit Timestamp.
-/// A checkpoint that snapshots the schema before the publish, yet collects the
-/// index's now-stamped rows, holds index rows with no Index struct.
+/// come from the MVCC version store. The two are sampled at different instants,
+/// so a checkpoint that started before an index was published can still observe
+/// that index's (later-committed, later-made-durable) row-versions in the version
+/// store while having no Index struct for it in its captured snapshot.
 ///
 /// To land on the WriteIndexRow site (not the sibling BTreeCreateIndex assert)
-/// the index must already be durable by the time this checkpoint collects: a
-/// checkpoint resamples the durable watermark after taking its lock, so once a
-/// concurrent checkpoint has made the index durable and advanced the watermark,
-/// the index's own sqlite_schema CREATE INDEX row is no longer recollected --
-/// only its fresh, post-durability row-versions are. `MVTableId` is always
-/// negative for MVCC objects, so the negative id in the panic does not imply
-/// "never checkpointed".
+/// the index must be durable by the time the checkpoint collects: a checkpoint
+/// resamples the durable watermark after taking its lock, so once the index has
+/// been made durable and the watermark advanced, its own sqlite_schema CREATE
+/// INDEX row is no longer recollected -- only its fresh, post-durability
+/// row-versions are. `MVTableId` is always negative for MVCC objects, so the
+/// negative id in the panic does not imply "never checkpointed".
 ///
-/// Interleaving (no threads, no sleeps):
-///   1. conn_a's CREATE INDEX is frozen mid-commit at `LogRecordPrepared`,
-///      before it publishes `idx` into the shared schema.
-///   2. The "background checkpoint" (conn_b) is driven via `PRAGMA
-///      wal_checkpoint` and frozen at `BeforeAcquireLock` -- after it has
-///      already captured its (idx-less) schema snapshot, before it collects.
-///   3. conn_a's CREATE INDEX finishes (publishes idx, stamps its rows).
-///   4. A full checkpoint makes idx durable and advances the durable watermark.
-///   5. A fresh INSERT adds a not-yet-checkpointed index row-version.
-///   6. The frozen checkpoint resumes: it resamples the watermark past idx, so
-///      it skips idx's CREATE INDEX row but collects the fresh index row -- with
-///      idx absent from its captured snapshot, WriteIndexRow panics.
+/// Interleaving (single threaded, no sleeps): the background checkpoint
+/// (`PRAGMA wal_checkpoint`) is started when the index does NOT yet exist, so it
+/// captures an index-less schema snapshot in `new()`. A custom yield injector
+/// then, at `BeforeAcquireLock`, creates the index, checkpoints it durable, and
+/// inserts a fresh indexed row -- all before the original checkpoint collects.
+/// When it resumes, it resamples the watermark past the index, skips its CREATE
+/// INDEX row, but collects the fresh index row with no Index struct -> panic.
 ///
 /// This is a KNOWN-BUG reproducer: it is `#[should_panic]` today. When the
 /// underlying divergence is fixed, this test will start to FAIL -- at which
@@ -14121,7 +14159,7 @@ fn repro_checkpoint_missing_index_struct_write_index_row() {
     let _ = tracing_subscriber::fmt::try_init();
     let db = MvccTestDbNoConn::new_with_random_db();
 
-    // Application connection.
+    // Application connection (the writer).
     let conn_a = db.connect();
     conn_a
         .execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
@@ -14137,75 +14175,20 @@ fn repro_checkpoint_missing_index_struct_write_index_row() {
         .execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
         .unwrap();
 
-    // (1) Freeze conn_a's CREATE INDEX mid-commit at LogRecordPrepared: end_ts
-    // is assigned and the log record built, but the later EndCommitLogicalLog
-    // state (which runs `update_schema_if_newer`) has NOT run, so the shared
-    // schema does not yet contain `idx`.
-    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
-        CommitYieldPoint::LogRecordPrepared.point(),
-    ])));
-    let mut create_idx = conn_a.prepare("CREATE INDEX idx ON t(v)").unwrap();
-    let mut create_idx_yielded = false;
-    for _ in 0..1000 {
-        match create_idx.step().unwrap() {
-            StepResult::Yield => {
-                create_idx_yielded = true;
-                break;
-            }
-            StepResult::Done => break,
-            _ => {}
-        }
-    }
-    conn_a.set_yield_injector(None);
-    assert!(
-        create_idx_yielded,
-        "CREATE INDEX should yield at LogRecordPrepared"
-    );
+    // Arm the injector on the checkpoint connection: it fires once, at the very
+    // start of the checkpoint (after the schema snapshot is captured, before the
+    // checkpoint lock is taken), and performs the racing writes on conn_a.
+    let injector = Arc::new(CreateIndexThenMakeDurableAtCheckpointStart {
+        point: CheckpointYieldPoint::BeforeAcquireLock.point(),
+        writer: conn_a.clone(),
+        fired: AtomicBool::new(false),
+    });
+    conn_b.set_yield_injector(Some(injector));
 
-    // (2) Drive the background checkpoint via a user-facing PRAGMA and freeze it
-    // at BeforeAcquireLock. The checkpoint's schema snapshot is captured when it
-    // starts (before this yield point), so it captures the still-idx-less schema.
-    // `PRAGMA journal_mode = 'wal'` drives a full MVCC checkpoint whose yields
-    // surface through `step()`; we panic during the checkpoint, before the mode
-    // actually changes, so the database stays in MVCC mode throughout.
-    conn_b.set_yield_injector(Some(FixedYieldInjector::new([
-        CheckpointYieldPoint::BeforeAcquireLock.point(),
-    ])));
-    let mut delayed_ckpt = conn_b.prepare("PRAGMA journal_mode = 'wal'").unwrap();
-    let mut ckpt_yielded = false;
-    for _ in 0..1000 {
-        match delayed_ckpt.step().unwrap() {
-            StepResult::Yield => {
-                ckpt_yielded = true;
-                break;
-            }
-            StepResult::Done => break,
-            _ => {}
-        }
-    }
-    conn_b.set_yield_injector(None);
-    assert!(
-        ckpt_yielded,
-        "checkpoint should yield at BeforeAcquireLock with its snapshot captured"
-    );
-
-    // (3) conn_a's CREATE INDEX finishes: publishes idx into the shared schema
-    // (too late for the captured snapshot) and stamps its index row-versions.
-    create_idx.run_ignore_rows().unwrap();
-    drop(create_idx);
-
-    // (4) A full checkpoint makes idx DURABLE and advances the durable watermark
-    // past idx's creation. The frozen checkpoint holds no lock yet, so this runs.
-    conn_a.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-    // (5) A fresh, not-yet-checkpointed index row-version for the now-durable idx.
-    conn_a.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
-
-    // (6) Resume the frozen checkpoint. After acquiring its lock it resamples the
-    // durable watermark (now past idx), so idx's sqlite_schema CREATE INDEX row
-    // is not recollected (no BTreeCreateIndex), but its fresh index row IS. With
-    // idx absent from the captured schema snapshot, WriteIndexRow panics.
-    delayed_ckpt.run_ignore_rows().unwrap();
+    // The production trigger: a plain checkpoint of the main database. It panics
+    // mid-flight at the WriteIndexRow site -- exactly the production crash.
+    let result = conn_b.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+    panic!("checkpoint unexpectedly completed without panic: {result:?}");
 }
 
 /// Reproducer for recovery of a dropped checkpointed index.
