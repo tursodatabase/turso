@@ -235,6 +235,21 @@ fn mv_store_skiplist_allocations_are_fallible() {
     assert!(store.rows.is_empty());
 }
 
+#[cfg(nightly)]
+#[test]
+fn row_payload_allocation_uses_passed_allocator() {
+    let alloc = FailOnDemandAlloc::default();
+    let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
+
+    alloc.fail_allocations(true);
+    let result = Row::new_table_row_in(row_id.clone(), &[1, 2, 3], 1, alloc.clone());
+    assert!(matches!(result, Err(crate::alloc::TryReserveError)));
+
+    alloc.fail_allocations(false);
+    let row = Row::new_table_row_in(row_id, &[1, 2, 3], 1, alloc).unwrap();
+    assert_eq!(row.payload(), &[1, 2, 3]);
+}
+
 #[test]
 fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
     let alloc = FailOnDemandAlloc::default();

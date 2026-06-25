@@ -354,9 +354,18 @@ impl Row {
         data: &[u8],
         column_count: usize,
     ) -> Result<Self, TryReserveError> {
+        Self::new_table_row_in(id, data, column_count, TursoAllocator)
+    }
+
+    pub fn new_table_row_in<A: ConcurrentAllocator>(
+        id: RowID,
+        data: &[u8],
+        column_count: usize,
+        alloc: A,
+    ) -> Result<Self, TryReserveError> {
         Ok(Self {
             id,
-            data: Some(crate::alloc::try_arc_slice_from_slice(data)?),
+            data: Some(crate::alloc::try_arc_slice_from_slice_in(data, alloc)?),
             column_count,
         })
     }
@@ -3902,6 +3911,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 }
 
 impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
+    pub(crate) fn allocator(&self) -> A {
+        self.alloc.clone()
+    }
+
     fn uses_durable_mvcc_metadata(&self, connection: &Arc<Connection>) -> bool {
         !connection.db.is_in_memory_db()
     }
@@ -7892,9 +7905,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         continue;
                     }
 
-                    let next_rec = ctx
-                        .reader
-                        .parsed_op_to_streaming(parsed_op, &mut get_index_info)?;
+                    let next_rec = ctx.reader.parsed_op_to_streaming_in(
+                        parsed_op,
+                        &mut get_index_info,
+                        self.alloc.clone(),
+                    )?;
 
                     tracing::trace!("next_rec {next_rec:?}");
 
@@ -8051,16 +8066,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     if let Some(record) = schema_rows.get(&rowid_int) {
                                         // Preserve the pre-delete sqlite_schema record in recovered
                                         // tombstones so checkpoint can still recover B-tree identity.
-                                        Row::new_table_row(
+                                        Row::new_table_row_in(
                                             rowid.clone(),
                                             record.as_blob(),
                                             record.column_count(),
+                                            self.alloc.clone(),
                                         )?
                                     } else {
-                                        Row::new_table_row(rowid.clone(), &[], 0)?
+                                        Row::new_table_row_in(
+                                            rowid.clone(),
+                                            &[],
+                                            0,
+                                            self.alloc.clone(),
+                                        )?
                                     }
                                 } else {
-                                    Row::new_table_row(rowid.clone(), &[], 0)?
+                                    Row::new_table_row_in(
+                                        rowid.clone(),
+                                        &[],
+                                        0,
+                                        self.alloc.clone(),
+                                    )?
                                 }
                             );
                             if let Some(versions) = self.rows.get(&rowid) {

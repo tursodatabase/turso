@@ -236,6 +236,7 @@ use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::turso_assert;
 use crate::{
+    alloc::{ConcurrentAllocator, TursoAllocator},
     io::{CompletionGroup, ReadComplete},
     io_yield_one,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
@@ -3471,6 +3472,15 @@ impl StreamingLogicalLogReader {
         parsed_op: ParsedOp,
         get_index_info: &mut impl FnMut(MVTableId, IndexOpKind) -> Result<Arc<IndexInfo>>,
     ) -> Result<StreamingResult> {
+        self.parsed_op_to_streaming_in(parsed_op, get_index_info, TursoAllocator)
+    }
+
+    pub(crate) fn parsed_op_to_streaming_in<A: ConcurrentAllocator>(
+        &self,
+        parsed_op: ParsedOp,
+        get_index_info: &mut impl FnMut(MVTableId, IndexOpKind) -> Result<Arc<IndexInfo>>,
+        alloc: A,
+    ) -> Result<StreamingResult> {
         match parsed_op {
             ParsedOp::UpsertTable {
                 table_id,
@@ -3486,10 +3496,11 @@ impl StreamingLogicalLogReader {
                     crate::types::ImmutableRecordRef::from_bin_record(&record_bytes).column_count();
                 let row = crate::with_mv_store_allocation_site!(
                     RowPayload,
-                    Row::new_table_row(
+                    Row::new_table_row_in(
                         RowID::new(table_id, rowid.row_id.clone()),
                         &record_bytes,
                         column_count,
+                        alloc,
                     )?
                 );
                 Ok(StreamingResult::UpsertTableRow {

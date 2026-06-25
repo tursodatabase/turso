@@ -20,7 +20,7 @@ pub use allocation_site::{
 /// stable, `std::alloc::Allocator` on `--cfg nightly` builds.
 pub use api::ApiAllocator;
 pub use api::{AllocError, Global, Layout};
-pub use arc::{try_arc_slice_from_slice, ArcSlice};
+pub use arc::{try_arc_slice_from_slice, try_arc_slice_from_slice_in, ArcSlice};
 pub use backend::{set_allocator, SetAllocatorError, TursoAllocBackend};
 #[cfg(nightly)]
 pub use collections::TursoFromIteratorIn;

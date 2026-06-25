@@ -1696,7 +1696,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 let num_columns = record.column_count();
                 crate::with_mv_store_allocation_site!(
                     RowPayload,
-                    Row::new_table_row(row_id, record.get_payload(), num_columns)
+                    Row::new_table_row_in(
+                        row_id,
+                        record.get_payload(),
+                        num_columns,
+                        self.db.allocator(),
+                    )
                 )
             }
             MvccCursorType::Index(_) => {
@@ -1813,7 +1818,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             let row = match &self.mv_cursor_type {
                 MvccCursorType::Table => crate::with_mv_store_allocation_site!(
                     RowPayload,
-                    Row::new_table_row(rowid.clone(), record.get_payload(), column_count)
+                    Row::new_table_row_in(
+                        rowid.clone(),
+                        record.get_payload(),
+                        column_count,
+                        self.db.allocator(),
+                    )
                 ),
                 MvccCursorType::Index(_) => Ok(Row::new_index_row(rowid.clone(), column_count)),
             }?;

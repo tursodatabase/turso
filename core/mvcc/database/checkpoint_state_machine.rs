@@ -1466,10 +1466,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         );
         let row = with_mvcc_checkpoint_allocation_site!(
             CheckpointMetadataPayload,
-            Row::new_table_row(
+            Row::new_table_row_in(
                 RowID::new(table_id, RowKey::Int(1)),
                 record.get_payload(),
                 num_columns,
+                self.mvstore.allocator(),
             )?
         );
         with_mvcc_checkpoint_allocation_site!(CheckpointWriteSet, {
@@ -1793,6 +1794,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             .expect("Table ID does not have a root page")
                     };
                     let row_version = {
+                        let alloc = self.mvstore.allocator();
                         let (row_version, _) = self
                             .get_current_row_version_mut(write_set_index)
                             .ok_or_else(|| {
@@ -1810,7 +1812,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         // a durable btree and a stale rootpage=0 schema row.
                         // TODO: make this rewrite resumable before re-enabling fault injection.
                         row_version.row.data = Some(crate::without_allocation_faults!(
-                            crate::alloc::try_arc_slice_from_slice(record.get_payload())?
+                            crate::alloc::try_arc_slice_from_slice_in(record.get_payload(), alloc)?
                         ));
                         row_version.clone()
                     };
@@ -1833,6 +1835,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             .expect("Index ID does not have a root page")
                     };
                     let row_version = {
+                        let alloc = self.mvstore.allocator();
                         let (row_version, _) = self
                             .get_current_row_version_mut(write_set_index)
                             .ok_or_else(|| {
@@ -1849,7 +1852,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         // a durable btree and a stale rootpage=0 schema row.
                         // TODO: make this rewrite resumable before re-enabling fault injection.
                         row_version.row.data = Some(crate::without_allocation_faults!(
-                            crate::alloc::try_arc_slice_from_slice(record.get_payload())?
+                            crate::alloc::try_arc_slice_from_slice_in(record.get_payload(), alloc)?
                         ));
                         row_version.clone()
                     };
