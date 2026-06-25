@@ -159,6 +159,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     mvstore: Arc<MvStore<Clock, A>>,
     /// Connection to the database
     connection: Arc<Connection>,
+    /// Database whose pager and schema this checkpoint is writing.
+    database_id: usize,
     #[cfg(any(test, injected_yields))]
     yield_instance_id: u64,
     /// Lock used to block other transactions from running during the checkpoint
@@ -620,6 +622,38 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         self.durable_txid_max_new = durable_tx_max;
     }
 
+    fn refresh_schema_metadata(&mut self) {
+        // Use the shared DB schema (not the per-connection cache, which may be
+        // stale) for the database whose pager we're checkpointing. Unlike WAL
+        // mode, MVCC checkpoint writes from the mv store back to the pager, so
+        // the schema must match the pager being checkpointed.
+        let schema = self.connection.clone_shared_schema(self.database_id);
+        self.index_id_to_index = schema
+            .indexes
+            .values()
+            .flatten()
+            .map(|index| {
+                turso_assert!(index.root_page != 0, "index root_page must be non-zero");
+                (
+                    self.mvstore.get_table_id_from_root_page(index.root_page),
+                    index.clone(),
+                )
+            })
+            .collect();
+        self.mvcc_meta_table = schema.get_btree_table(MVCC_META_TABLE_NAME).map(|table| {
+            turso_assert!(
+                table.root_page != 0,
+                "mvcc meta table root_page must be non-zero"
+            );
+            (
+                self.mvstore.get_table_id_from_root_page(table.root_page),
+                table.columns().len(),
+            )
+        });
+        self.durable_mvcc_metadata =
+            !self.connection.db.is_in_memory_db() && self.mvcc_meta_table.is_some();
+    }
+
     pub fn new(
         pager: Arc<Pager>,
         mvstore: Arc<MvStore<Clock, A>>,
@@ -629,39 +663,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         database_id: usize,
     ) -> Self {
         let checkpoint_lock = mvstore.blocking_checkpoint_lock.clone();
-        // Use the shared DB schema (not the per-connection cache, which may be
-        // stale) for the database whose pager we're checkpointing. Unlike WAL
-        // mode, MVCC checkpoint writes from the mv store back to the pager —
-        // so the schema must match the pager being checkpointed.
-        let schema = connection.clone_shared_schema(database_id);
-        let index_id_to_index = schema
-            .indexes
-            .values()
-            .flatten()
-            .map(|index| {
-                turso_assert!(index.root_page != 0, "index root_page must be non-zero");
-                (
-                    mvstore.get_table_id_from_root_page(index.root_page),
-                    index.clone(),
-                )
-            })
-            .collect();
-        let mvcc_meta_table = schema.get_btree_table(MVCC_META_TABLE_NAME).map(|table| {
-            turso_assert!(
-                table.root_page != 0,
-                "mvcc meta table root_page must be non-zero"
-            );
-            (
-                mvstore.get_table_id_from_root_page(table.root_page),
-                table.columns().len(),
-            )
-        });
-        let durable_mvcc_metadata = !connection.db.is_in_memory_db() && mvcc_meta_table.is_some();
         let durable_tx_max = mvstore.durable_txid_max.load(Ordering::SeqCst);
         let durable_txid_max_old = NonZeroU64::new(durable_tx_max);
         #[cfg(any(test, injected_yields))]
         let yield_instance_id = connection.next_yield_instance_id();
-        Self {
+        let mut checkpoint = Self {
             state: CheckpointState::AcquireLock,
             lock_states: LockStates {
                 blocking_checkpoint_lock_held: false,
@@ -673,6 +679,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             durable_txid_max_new: durable_tx_max,
             mvstore,
             connection,
+            database_id,
             #[cfg(any(test, injected_yields))]
             yield_instance_id,
             checkpoint_lock,
@@ -684,19 +691,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             destroyed_tables: HashSet::default(),
             destroyed_indexes: HashSet::default(),
             index_write_set: crate::alloc::vec![],
-            index_id_to_index,
+            index_id_to_index: HashMap::default(),
             checkpoint_result: None,
             update_transaction_state,
             sync_mode,
-            mvcc_meta_table,
-            durable_mvcc_metadata,
+            mvcc_meta_table: None,
+            durable_mvcc_metadata: false,
             staged_checkpoint_header: None,
             header_staged_for_commit: false,
             collect_table_cursor: None,
             collect_index_tableid_cursor: None,
             collect_index_key_cursor: None,
             seq_compact: None,
-        }
+        };
+        checkpoint.refresh_schema_metadata();
+        checkpoint
     }
 
     #[cfg(test)]
@@ -1494,8 +1503,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
                 // Checkpoint state machines can be created before they are run.
                 // Resample after serializing with other checkpoints so already-durable
-                // index deletes are not replayed.
+                // index deletes are not replayed, and keep schema-derived index metadata
+                // aligned with the refreshed durable boundary.
                 self.refresh_checkpoint_bounds();
+                self.refresh_schema_metadata();
                 self.state = CheckpointState::CollectTableRows;
                 Ok(TransitionResult::Continue)
             }

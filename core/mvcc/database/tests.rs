@@ -14071,6 +14071,94 @@ fn test_checkpoint_recovers_after_crash_restart_drop_recreate_index() {
     assert_eq!(rows[1][1].to_string(), "post_2");
 }
 
+/// Regression for the production panic:
+/// "Index struct for index_id ... must exist when checkpointing index rows".
+///
+/// The delayed checkpoint comes from the normal MVCC auto-checkpoint-on-commit
+/// path:
+/// 1. An INSERT commits with `mvcc_checkpoint_threshold = 0` and yields at the
+///    checkpoint's `BeforeAcquireLock` point, after the checkpoint has captured
+///    the schema but before it has collected rows.
+/// 2. A second connection creates a new index while auto-checkpointing remains
+///    enabled, making the index schema row durable after the delayed checkpoint's
+///    schema snapshot.
+/// 3. A later INSERT writes a fresh index row version for that now-durable index.
+/// 4. The background connection observes the new schema through normal SQL, so
+///    the resumed checkpoint no longer fails early as a stale-schema write.
+/// 5. Resuming the delayed checkpoint refreshes its durable watermark, skips the
+///    durable CREATE INDEX schema row, but still collects the fresh index row.
+///    The checkpoint-local `index_id_to_index` map must have been refreshed
+///    alongside the durable watermark so `WriteIndexRow` can open the index.
+#[test]
+fn test_auto_checkpoint_refreshes_index_metadata_after_schema_change() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let conn_a = db.connect();
+    conn_a
+        .execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+        .unwrap();
+    conn_a
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    let conn_b = db.connect();
+    conn_b
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    conn_b.set_yield_injector(Some(FixedYieldInjector::new([
+        CheckpointYieldPoint::BeforeAcquireLock.point(),
+    ])));
+
+    let mut delayed_ckpt = conn_b
+        .prepare("INSERT INTO t VALUES (10, 'pre_idx')")
+        .unwrap();
+    let mut ckpt_yielded = false;
+    for _ in 0..1000 {
+        match delayed_ckpt.step().unwrap() {
+            StepResult::Yield => {
+                ckpt_yielded = true;
+                break;
+            }
+            StepResult::Done => break,
+            StepResult::IO => conn_b.db.io.step().unwrap(),
+            StepResult::Row | StepResult::Busy | StepResult::Interrupt => {}
+        }
+    }
+    conn_b.set_yield_injector(None);
+    assert!(
+        ckpt_yielded,
+        "auto-checkpoint should yield at BeforeAcquireLock with its schema snapshot captured"
+    );
+
+    conn_a.execute("CREATE INDEX idx ON t(v)").unwrap();
+    conn_a
+        .execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+        .unwrap();
+    conn_a.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    let rows = get_rows(
+        &conn_b,
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'idx'",
+    );
+    assert_eq!(rows.len(), 1);
+
+    delayed_ckpt.run_ignore_rows().unwrap();
+
+    let rows = get_rows(&conn_a, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "a");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "b");
+    assert_eq!(rows[2][0].as_int().unwrap(), 10);
+    assert_eq!(rows[2][1].to_string(), "pre_idx");
+
+    let rows = get_rows(&conn_a, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
 /// Reproducer for recovery of a dropped checkpointed index.
 ///
 /// Sequence:
