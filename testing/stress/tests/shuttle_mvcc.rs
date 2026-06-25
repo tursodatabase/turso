@@ -648,6 +648,99 @@ fn shuttle_test_speculative_abort_delete_slow() {
     runner.run(|| shuttle::future::block_on(speculative_abort_delete_scenario(30, 60)));
 }
 
+/// Checkpoint stale schema snapshot (regression test for the
+/// "Index struct for index_id MVTableId(...) must exist when checkpointing
+/// index rows" panic in `checkpoint_state_machine.rs`).
+///
+/// A `CheckpointStateMachine` freezes its schema -> index map
+/// (`index_id_to_index`) in `new()`, but resamples its durable boundary later in
+/// `refresh_checkpoint_bounds()` at `AcquireLock` (whose comment notes
+/// "Checkpoint state machines can be created before they are run"). The two are
+/// captured at different times and can disagree about which indexes exist.
+///
+/// The interleaving (which the scheduler discovers on its own — no yield
+/// injection) is: a background checkpoint snapshots the schema before `idx`
+/// exists; a writer then creates `idx`, makes it durable with a *separate*
+/// checkpoint (advancing `durable_txid_max` past the CREATE INDEX commit so the
+/// stale checkpoint emits no `BTreeCreateIndex` for it), and inserts new index
+/// rows; the stale checkpoint then resumes, collects those index rows, fails to
+/// find `idx` in its frozen snapshot, and panics.
+///
+/// `t1` runs the writer + its durability checkpoint; `t2` is the background
+/// checkpointer. The shuttle scheduler explores thread interleavings to surface
+/// the panic; the fix (resample `index_id_to_index` with the durable bounds)
+/// makes every interleaving safe.
+/// Execute `sql`, retrying while the engine reports a transient `Busy` (which is
+/// expected when a concurrent checkpoint holds the checkpoint lock). Any other
+/// error is unexpected and fails the test. The checkpoint panic we are hunting
+/// for unwinds the checkpointer task directly, so it never surfaces here.
+async fn exec_retry(conn: &turso::Connection, sql: &str) {
+    loop {
+        match conn.execute(sql, ()).await {
+            Ok(_) => return,
+            Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {
+                shuttle::future::yield_now().await;
+            }
+            Err(e) => panic!("unexpected error running `{sql}`: {e:?}"),
+        }
+    }
+}
+
+async fn checkpoint_stale_schema_snapshot_scenario(checkpointer_rounds: i64) {
+    let (db, _dir) = setup_mvcc_db("CREATE TABLE t(x INTEGER)").await;
+    // Only the explicit checkpoints below should run.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1", ())
+            .await
+            .unwrap();
+    }
+
+    const NUM_CHECKPOINTERS: usize = 2;
+    let barrier = Arc::new(Barrier::new(NUM_CHECKPOINTERS + 1));
+    let mut handles = Vec::new();
+
+    // Writer. Create `idx`, make it durable with its own checkpoint, then add new
+    // index rows above that durable boundary.
+    {
+        let conn = db.connect().unwrap();
+        let barrier = barrier.clone();
+        handles.push(turso_stress::future::spawn(async move {
+            barrier.wait();
+            exec_retry(&conn, "CREATE INDEX idx ON t(x)").await;
+            let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", ()).await;
+            exec_retry(&conn, "INSERT INTO t VALUES (1), (2), (3)").await;
+        }));
+    }
+
+    // Background checkpointers (model the server's checkpoint task). Running more
+    // than one keeps the checkpoint lock contended, so a checkpoint that
+    // snapshotted the schema before `idx` existed is likely to be parked waiting
+    // for the lock while the writer makes `idx` durable and inserts new rows —
+    // then it resumes with a stale snapshot and trips the panic.
+    for _ in 0..NUM_CHECKPOINTERS {
+        let conn = db.connect().unwrap();
+        let barrier = barrier.clone();
+        handles.push(turso_stress::future::spawn(async move {
+            barrier.wait();
+            for _ in 0..checkpointer_rounds {
+                let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", ()).await;
+            }
+        }));
+    }
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+}
+
+#[test]
+fn shuttle_test_checkpoint_stale_schema_snapshot() {
+    let scheduler = PctScheduler::new(5, 3000);
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+    runner.run(|| shuttle::future::block_on(checkpoint_stale_schema_snapshot_scenario(3)));
+}
+
 #[test]
 fn shuttle_test_begin_publish_window_gc_hazard() {
     let scheduler = PctScheduler::new(5, 10000);
