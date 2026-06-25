@@ -76,6 +76,19 @@ public class TursoRemoteTests
     }
 
     [Test]
+    public void TestCanCreateBatchIsRemoteOnly()
+    {
+        using var localConnection = new TursoConnection("Data Source=:memory:");
+        localConnection.CanCreateBatch.Should().BeFalse();
+        localConnection.Invoking(x => x.CreateBatch())
+            .Should().Throw<NotSupportedException>()
+            .WithMessage("Turso batch execution is currently supported only for remote connections.");
+
+        using var remoteConnection = new TursoConnection("Data Source=https://example.com");
+        remoteConnection.CanCreateBatch.Should().BeTrue();
+    }
+
+    [Test]
     public void TestRemoteOpenCloseStateDoesNotRequireNetwork()
     {
         using var connection = new TursoConnection("Data Source=http://localhost:8080;Read Your Writes=False");
@@ -88,17 +101,6 @@ public class TursoRemoteTests
 
         connection.Close();
         connection.State.Should().Be(System.Data.ConnectionState.Closed);
-    }
-
-    [Test]
-    public void TestRemoteTransactionsAreUnsupportedBeforeNetworkAccess()
-    {
-        using var connection = new TursoConnection("Data Source=http://localhost:8080");
-        connection.Open();
-
-        connection.Invoking(x => x.BeginTransaction())
-            .Should().Throw<NotSupportedException>()
-            .WithMessage("Remote transactions are not supported yet by the .NET provider.");
     }
 
     [Test]
@@ -214,7 +216,6 @@ public class TursoRemoteTests
         request.GetProperty("stmt").GetProperty("named_args")[0].GetProperty("name").GetString().Should().Be("$value");
         request.GetProperty("stmt").GetProperty("want_rows").GetBoolean().Should().BeTrue();
     }
-
     [Test]
     public void TestRemoteReaderDoesNotConvertNullToEmptyString()
     {
@@ -406,6 +407,792 @@ public class TursoRemoteTests
             .WithMessage("Auth Token requires an HTTPS remote Turso URL unless the host is localhost or loopback.");
     }
 
+    [Test]
+    public void TestRemoteTransactionsUseBaton()
+    {
+        const string beginResponseJson = """
+            {
+              "baton": "stream.1",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        const string commitResponseJson = """
+            {
+              "baton": "stream.2",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        const string closeResponseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": { "type": "close" }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(beginResponseJson, commitResponseJson, closeResponseJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=False");
+        connection.Open();
+
+        using var transaction = connection.BeginTransaction();
+        transaction.Commit();
+
+        server.RequestBodies.Should().HaveCount(3);
+        using var beginDocument = JsonDocument.Parse(server.RequestBodies[0]);
+        beginDocument.RootElement.TryGetProperty("baton", out _).Should().BeFalse();
+        beginDocument.RootElement.GetProperty("requests").GetArrayLength().Should().Be(1);
+        beginDocument.RootElement.GetProperty("requests")[0].GetProperty("stmt").GetProperty("sql").GetString().Should().Be("BEGIN");
+
+        using var commitDocument = JsonDocument.Parse(server.RequestBodies[1]);
+        commitDocument.RootElement.GetProperty("baton").GetString().Should().Be("stream.1");
+        var commitRequests = commitDocument.RootElement.GetProperty("requests");
+        commitRequests.GetArrayLength().Should().Be(1);
+        commitRequests[0].GetProperty("stmt").GetProperty("sql").GetString().Should().Be("COMMIT");
+
+        using var closeDocument = JsonDocument.Parse(server.RequestBodies[2]);
+        closeDocument.RootElement.GetProperty("baton").GetString().Should().Be("stream.2");
+        closeDocument.RootElement.GetProperty("requests").GetArrayLength().Should().Be(1);
+        closeDocument.RootElement.GetProperty("requests")[0].GetProperty("type").GetString().Should().Be("close");
+    }
+
+    [Test]
+    public void TestRemoteCommandAndBatchRejectTransactionFromDifferentConnection()
+    {
+        const string beginResponseJson = """
+            {
+              "baton": "stream.1",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        const string rollbackResponseJson = """
+            {
+              "baton": "stream.2",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        const string closeResponseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": { "type": "close" }
+                }
+              ]
+            }
+            """;
+
+        using var server1 = new TestRemoteServer(beginResponseJson, rollbackResponseJson, closeResponseJson);
+        using var connection1 = new TursoConnection($"Data Source={server1.Url};Read Your Writes=False");
+        connection1.Open();
+        using var transaction = connection1.BeginTransaction();
+
+        using var server2 = new TestRemoteServer();
+        using var connection2 = new TursoConnection($"Data Source={server2.Url};Read Your Writes=True");
+        connection2.Open();
+
+        using var command = connection2.CreateCommand();
+        command.CommandText = "SELECT 1";
+        command.Transaction = transaction;
+        command.Invoking(x => x.ExecuteScalar())
+            .Should().Throw<InvalidOperationException>()
+            .WithMessage("The transaction is not associated with the command's connection.");
+
+        using var batch = (TursoBatch)connection2.CreateBatch();
+        batch.Transaction = transaction;
+        var batchCommand = batch.CreateBatchCommand();
+        batchCommand.CommandText = "SELECT 1";
+        batch.BatchCommands.Add(batchCommand);
+        batch.Invoking(x => x.ExecuteNonQuery())
+            .Should().Throw<InvalidOperationException>()
+            .WithMessage("The transaction is not associated with the batch's connection.");
+
+        server2.RequestBodies.Should().BeEmpty();
+    }
+
+    [Test]
+    public void TestRemoteTransactionRollbackUsesErrorResponseBaton()
+    {
+        const string beginResponseJson = """
+            {
+              "baton": "stream.1",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        const string commandErrorResponseJson = """
+            {
+              "baton": "stream.2",
+              "results": [
+                {
+                  "type": "error",
+                  "error": {
+                    "message": "no such table: missing",
+                    "code": "SQLITE_ERROR"
+                  }
+                }
+              ]
+            }
+            """;
+
+        const string rollbackResponseJson = """
+            {
+              "baton": "stream.3",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        const string closeResponseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": { "type": "close" }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(beginResponseJson, commandErrorResponseJson, rollbackResponseJson, closeResponseJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=False");
+        connection.Open();
+
+        using var transaction = connection.BeginTransaction();
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT * FROM missing";
+        command.Invoking(x => x.ExecuteNonQuery())
+            .Should().Throw<TursoException>()
+            .WithMessage("Remote SQL execution failed: no such table: missing (SQLITE_ERROR)");
+
+        transaction.Rollback();
+
+        server.RequestBodies.Should().HaveCount(4);
+        using var rollbackDocument = JsonDocument.Parse(server.RequestBodies[2]);
+        rollbackDocument.RootElement.GetProperty("baton").GetString().Should().Be("stream.2");
+        var rollbackRequests = rollbackDocument.RootElement.GetProperty("requests");
+        rollbackRequests.GetArrayLength().Should().Be(1);
+        rollbackRequests[0].GetProperty("stmt").GetProperty("sql").GetString().Should().Be("ROLLBACK");
+
+        using var closeDocument = JsonDocument.Parse(server.RequestBodies[3]);
+        closeDocument.RootElement.GetProperty("baton").GetString().Should().Be("stream.3");
+        closeDocument.RootElement.GetProperty("requests").GetArrayLength().Should().Be(1);
+        closeDocument.RootElement.GetProperty("requests")[0].GetProperty("type").GetString().Should().Be("close");
+    }
+
+    [Test]
+    public void TestRemoteCommitDoesNotThrowWhenPostCommitCloseFails()
+    {
+        const string beginResponseJson = """
+            {
+              "baton": "stream.1",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        const string commitResponseJson = """
+            {
+              "baton": "stream.2",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        const string closeErrorResponseJson = """
+            {
+              "results": [
+                {
+                  "type": "error",
+                  "error": {
+                    "message": "close failed",
+                    "code": "CLOSE_FAILED"
+                  }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(beginResponseJson, commitResponseJson, closeErrorResponseJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=False");
+        connection.Open();
+
+        using var transaction = connection.BeginTransaction();
+        transaction.Invoking(x => x.Commit()).Should().NotThrow();
+        connection.State.Should().Be(System.Data.ConnectionState.Closed);
+    }
+
+    [Test]
+    public void TestRemoteCommitSqlErrorKeepsBatonForRollback()
+    {
+        const string beginResponseJson = """
+            {
+              "baton": "stream.1",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        const string commitErrorResponseJson = """
+            {
+              "baton": "stream.2",
+              "results": [
+                {
+                  "type": "error",
+                  "error": {
+                    "message": "FOREIGN KEY constraint failed",
+                    "code": "SQLITE_CONSTRAINT_FOREIGNKEY"
+                  }
+                }
+              ]
+            }
+            """;
+
+        const string rollbackResponseJson = """
+            {
+              "baton": "stream.3",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        const string closeResponseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": { "type": "close" }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(beginResponseJson, commitErrorResponseJson, rollbackResponseJson, closeResponseJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=False");
+        connection.Open();
+
+        using var transaction = connection.BeginTransaction();
+        transaction.Invoking(x => x.Commit())
+            .Should().Throw<TursoException>()
+            .WithMessage("Remote SQL execution failed: FOREIGN KEY constraint failed (SQLITE_CONSTRAINT_FOREIGNKEY)");
+
+        transaction.Rollback();
+
+        using var rollbackDocument = JsonDocument.Parse(server.RequestBodies[2]);
+        rollbackDocument.RootElement.GetProperty("baton").GetString().Should().Be("stream.2");
+        rollbackDocument.RootElement.GetProperty("requests")[0].GetProperty("stmt").GetProperty("sql").GetString().Should().Be("ROLLBACK");
+    }
+
+    [Test]
+    public void TestRemoteCommitTransportFailureInvalidatesConnection()
+    {
+        const string beginResponseJson = """
+            {
+              "baton": "stream.1",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(beginResponseJson, "not json");
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=False");
+        connection.Open();
+
+        using var transaction = connection.BeginTransaction();
+        transaction.Invoking(x => x.Commit())
+            .Should().Throw<TursoException>()
+            .WithMessage("Unable to parse remote response:*");
+        connection.State.Should().Be(System.Data.ConnectionState.Closed);
+    }
+
+    [Test]
+    public void TestRemoteBeginTransportFailureInvalidatesConnection()
+    {
+        using var server = new TestRemoteServer("not json");
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=True");
+        connection.Open();
+
+        connection.Invoking(x => x.BeginTransaction())
+            .Should().Throw<TursoException>()
+            .WithMessage("Unable to parse remote response:*");
+        connection.State.Should().Be(System.Data.ConnectionState.Closed);
+    }
+
+    [Test]
+    public void TestRemoteInTransactionTransportFailureInvalidatesConnection()
+    {
+        const string beginResponseJson = """
+            {
+              "baton": "stream.1",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(beginResponseJson, "not json");
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=True");
+        connection.Open();
+
+        var transaction = connection.BeginTransaction();
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "INSERT INTO t VALUES (1)";
+
+        command.Invoking(x => x.ExecuteNonQuery())
+            .Should().Throw<TursoException>()
+            .WithMessage("Unable to parse remote response:*");
+        connection.State.Should().Be(System.Data.ConnectionState.Closed);
+        transaction.Invoking(x => x.Dispose()).Should().NotThrow();
+    }
+
+    [Test]
+    public void TestRemoteRollbackFailureInvalidatesConnection()
+    {
+        const string beginResponseJson = """
+            {
+              "baton": "stream.1",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        const string rollbackErrorResponseJson = """
+            {
+              "baton": "stream.2",
+              "results": [
+                {
+                  "type": "error",
+                  "error": {
+                    "message": "rollback failed",
+                    "code": "ROLLBACK_FAILED"
+                  }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(beginResponseJson, rollbackErrorResponseJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=False");
+        connection.Open();
+
+        using var transaction = connection.BeginTransaction();
+        transaction.Invoking(x => x.Rollback())
+            .Should().Throw<TursoException>()
+            .WithMessage("Remote SQL execution failed: rollback failed (ROLLBACK_FAILED)");
+        connection.State.Should().Be(System.Data.ConnectionState.Closed);
+    }
+
+    [Test]
+    public void TestRemoteBatchSerializesStatementsAndReadsMultipleResults()
+    {
+        const string responseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "batch",
+                    "result": {
+                      "step_results": [
+                        {
+                          "cols": [
+                            { "name": "n", "decltype": "INTEGER" }
+                          ],
+                          "rows": [
+                            [
+                              { "type": "integer", "value": "7" }
+                            ]
+                          ],
+                          "affected_row_count": 0,
+                          "last_insert_rowid": null
+                        },
+                        {
+                          "cols": [],
+                          "rows": [],
+                          "affected_row_count": 2,
+                          "last_insert_rowid": "3"
+                        }
+                      ],
+                      "step_errors": [null, null]
+                    }
+                  }
+                },
+                {
+                  "type": "ok",
+                  "response": { "type": "close" }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(responseJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=False");
+        connection.Open();
+
+        using var batch = (TursoBatch)connection.CreateBatch();
+        var select = (TursoBatchCommand)batch.CreateBatchCommand();
+        select.CommandText = "SELECT ?";
+        select.Parameters.Add(7);
+        batch.BatchCommands.Add(select);
+
+        var insert = (TursoBatchCommand)batch.CreateBatchCommand();
+        insert.CommandText = "INSERT INTO t VALUES (:name), (:other)";
+        insert.Parameters.AddWithValue(":name", "alice");
+        insert.Parameters.AddWithValue(":other", "bob");
+        batch.BatchCommands.Add(insert);
+
+        using var reader = batch.ExecuteReader();
+        reader.Read().Should().BeTrue();
+        reader.GetInt64(0).Should().Be(7);
+        reader.NextResult().Should().BeTrue();
+        reader.Read().Should().BeFalse();
+        reader.RecordsAffected.Should().Be(2);
+        select.RecordsAffected.Should().Be(0);
+        insert.RecordsAffected.Should().Be(2);
+
+        using var document = JsonDocument.Parse(server.RequestBody);
+        var requests = document.RootElement.GetProperty("requests");
+        requests.GetArrayLength().Should().Be(2);
+        requests[0].GetProperty("type").GetString().Should().Be("batch");
+        var steps = requests[0].GetProperty("batch").GetProperty("steps");
+        steps.GetArrayLength().Should().Be(2);
+        steps[0].GetProperty("stmt").GetProperty("sql").GetString().Should().Be("SELECT ?");
+        steps[0].GetProperty("stmt").GetProperty("args")[0].GetProperty("value").GetString().Should().Be("7");
+        steps[1].GetProperty("stmt").GetProperty("named_args")[0].GetProperty("name").GetString().Should().Be(":name");
+        requests[1].GetProperty("type").GetString().Should().Be("close");
+    }
+
+    [Test]
+    public void TestRemoteBatchNonQueryUsesNoRowsAndIgnoresTrailingCloseError()
+    {
+        const string responseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "batch",
+                    "result": {
+                      "step_results": [
+                        {
+                          "cols": [],
+                          "rows": [],
+                          "affected_row_count": 3,
+                          "last_insert_rowid": "3"
+                        }
+                      ],
+                      "step_errors": [null]
+                    }
+                  }
+                },
+                {
+                  "type": "error",
+                  "error": {
+                    "message": "close failed",
+                    "code": "CLOSE_FAILED"
+                  }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(responseJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=False");
+        connection.Open();
+
+        using var batch = (TursoBatch)connection.CreateBatch();
+        var command = (TursoBatchCommand)batch.CreateBatchCommand();
+        command.CommandText = "INSERT INTO t VALUES (1), (2), (3)";
+        batch.BatchCommands.Add(command);
+
+        batch.ExecuteNonQuery().Should().Be(3);
+        command.RecordsAffected.Should().Be(3);
+
+        using var document = JsonDocument.Parse(server.RequestBody);
+        var requests = document.RootElement.GetProperty("requests");
+        requests.GetArrayLength().Should().Be(2);
+        requests[0].GetProperty("type").GetString().Should().Be("batch");
+        var steps = requests[0].GetProperty("batch").GetProperty("steps");
+        steps.GetArrayLength().Should().Be(1);
+        steps[0].GetProperty("stmt").GetProperty("want_rows").GetBoolean().Should().BeFalse();
+        requests[1].GetProperty("type").GetString().Should().Be("close");
+    }
+
+    [Test]
+    public void TestRemoteBatchSurfacesStepErrors()
+    {
+        const string responseJson = """
+            {
+              "baton": "stream.1",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "batch",
+                    "result": {
+                      "step_results": [null],
+                      "step_errors": [
+                        {
+                          "message": "no such table: missing",
+                          "code": "SQLITE_ERROR"
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        const string closeResponseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": { "type": "close" }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(responseJson, closeResponseJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=True");
+        connection.Open();
+
+        using var batch = (TursoBatch)connection.CreateBatch();
+        var command = (TursoBatchCommand)batch.CreateBatchCommand();
+        command.CommandText = "SELECT * FROM missing";
+        batch.BatchCommands.Add(command);
+
+        batch.Invoking(x => x.ExecuteNonQuery())
+            .Should().Throw<TursoException>()
+            .WithMessage("Remote SQL execution failed: no such table: missing (SQLITE_ERROR)");
+    }
+
+    [Test]
+    public void TestRemoteBatchRejectsMismatchedStepErrors()
+    {
+        const string responseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "batch",
+                    "result": {
+                      "step_results": [null],
+                      "step_errors": []
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(responseJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=True");
+        connection.Open();
+
+        using var batch = (TursoBatch)connection.CreateBatch();
+        var command = (TursoBatchCommand)batch.CreateBatchCommand();
+        command.CommandText = "SELECT * FROM missing";
+        batch.BatchCommands.Add(command);
+
+        batch.Invoking(x => x.ExecuteNonQuery())
+            .Should().Throw<TursoException>()
+            .WithMessage("Remote batch returned an unexpected result shape: 1 results, 0 errors, expected 1.");
+    }
+
+    [Test]
+    public void TestSyncRequiresReplicaConnection()
+    {
+        using var connection = new TursoConnection("Data Source=http://localhost:8080");
+        connection.Open();
+
+        connection.Invoking(x => x.Sync())
+            .Should().Throw<NotSupportedException>()
+            .WithMessage("Sync requires an embedded replica connection.");
+    }
+
+    [Test]
+    public async Task TestSyncAsyncRequiresReplicaConnection()
+    {
+        using var connection = new TursoConnection("Data Source=http://localhost:8080");
+        connection.Open();
+
+        var act = async () => await connection.SyncAsync();
+        await act.Should().ThrowAsync<NotSupportedException>()
+            .WithMessage("Sync requires an embedded replica connection.");
+    }
+
     private sealed class TestRemoteServer : IDisposable
     {
         private readonly CancellationTokenSource _cancellation = new();
@@ -431,6 +1218,8 @@ public class TursoRemoteTests
         public string? Authorization { get; private set; }
 
         public string RequestBody { get; private set; } = "";
+
+        public List<string> RequestBodies { get; } = [];
 
         public void Dispose()
         {
@@ -506,6 +1295,7 @@ public class TursoRemoteTests
 
                 RequestBody = new string(buffer, 0, read);
             }
+            RequestBodies.Add(RequestBody);
 
             var body = Encoding.UTF8.GetBytes(_responseJson.Dequeue());
             var headers = Encoding.ASCII.GetBytes(

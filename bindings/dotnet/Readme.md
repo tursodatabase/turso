@@ -74,7 +74,27 @@ var name = await command.ExecuteScalarAsync();
 
 Remote mode uses the Hrana HTTP `/v2/pipeline` protocol. `libsql://` URLs default to HTTPS; `Tls=False` maps them to HTTP for local development. `ws://` and `wss://` URLs are accepted and mapped to the equivalent HTTP pipeline endpoint. `Auth Token` requires HTTPS unless the host is `localhost` or loopback.
 
-Remote mode currently supports direct single-statement command execution. Remote transactions, ADO.NET batches, and embedded replicas are not enabled yet in the .NET provider. `Replica Path` and `Sync Interval` are parsed so applications fail early with clear errors.
+Remote mode also supports ADO.NET `DbBatch` for latency-sensitive workloads that should be sent in one Hrana batch:
+
+```C#
+await using var batch = connection.CreateBatch();
+
+var insert = batch.CreateBatchCommand();
+insert.CommandText = "INSERT INTO customers(name) VALUES ($name)";
+var name = insert.CreateParameter();
+name.ParameterName = "$name";
+name.Value = "Alice";
+insert.Parameters.Add(name);
+batch.BatchCommands.Add(insert);
+
+var select = batch.CreateBatchCommand();
+select.CommandText = "SELECT COUNT(*) FROM customers";
+batch.BatchCommands.Add(select);
+
+await using var reader = await batch.ExecuteReaderAsync();
+```
+
+Embedded replicas are not enabled yet in the .NET provider. `Replica Path` and `Sync Interval` are parsed so applications fail early with clear errors, and `TursoConnection.Sync()` / `SyncAsync(CancellationToken)` are reserved for that mode once `turso_sync_sdk_kit` is packaged and wired through .NET.
 
 Provider factories are available through `TursoFactory.Instance`:
 

@@ -38,6 +38,8 @@ internal sealed class TursoRemoteClient : IDisposable
         _disposeHttpClient = disposeHttpClient;
     }
 
+    public bool HasOpenSession => _baton is not null;
+
     public async Task<RemoteStatementResult> ExecuteAsync(
         string sql,
         TursoParameterCollection parameters,
@@ -64,6 +66,38 @@ internal sealed class TursoRemoteClient : IDisposable
         var response = await SendPipelineAsync(request, commandTimeout, cancellationToken).ConfigureAwait(false);
         UpdateSession(response, closeAfter);
         return ExtractExecuteResult(response);
+    }
+
+    public async Task<IReadOnlyList<RemoteStatementResult>> ExecuteBatchAsync(
+        IReadOnlyList<TursoBatchCommand> commands,
+        int commandTimeout,
+        bool wantRows,
+        bool closeAfter,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(commands);
+        if (commands.Count == 0)
+            throw new InvalidOperationException("Batch must contain at least one command.");
+
+        var steps = new List<RemoteBatchStep>(commands.Count);
+        foreach (var command in commands)
+            steps.Add(new RemoteBatchStep { Statement = BuildStatement(command.CommandText, command.Parameters, wantRows) });
+
+        var request = new RemotePipelineRequest
+        {
+            Baton = _baton,
+            Requests =
+            [
+                RemoteStreamRequest.Batch(new RemoteBatch { Steps = steps }),
+            ],
+        };
+
+        if (closeAfter)
+            request.Requests.Add(RemoteStreamRequest.Close());
+
+        var response = await SendPipelineAsync(request, commandTimeout, cancellationToken).ConfigureAwait(false);
+        UpdateSession(response, closeAfter);
+        return ExtractBatchResults(response, commands.Count);
     }
 
     public async Task CloseAsync(int commandTimeout, CancellationToken cancellationToken)
@@ -207,6 +241,36 @@ internal sealed class TursoRemoteClient : IDisposable
         return statementResult;
     }
 
+    private static IReadOnlyList<RemoteStatementResult> ExtractBatchResults(RemotePipelineResponse response, int expectedCount)
+    {
+        if (response.Results.Count == 0)
+            throw new TursoException("Remote batch returned no results.");
+
+        var result = response.Results[0];
+        List<RemoteStatementResult> statementResults;
+        switch (result.Type)
+        {
+            case "ok":
+                if (result.Response is null)
+                    throw new TursoException("Remote batch returned an empty ok response.");
+                if (result.Response.Type != "batch")
+                    throw new TursoException($"Remote batch returned unexpected response type: {result.Response.Type}");
+
+                var batch = result.Response.DeserializeResult<RemoteBatchResult>();
+                statementResults = ExtractBatchStepResults(batch, expectedCount);
+                break;
+
+            case "error":
+                throw CreateRemoteError(result.Error);
+
+            default:
+                throw new TursoException($"Remote batch returned unexpected result type: {result.Type}");
+        }
+
+        ValidateOptionalTrailingClose(response, "Remote batch");
+        return statementResults;
+    }
+
     private static void ValidateOptionalTrailingClose(RemotePipelineResponse response, string operation)
     {
         if (response.Results.Count == 1)
@@ -228,6 +292,31 @@ internal sealed class TursoRemoteClient : IDisposable
             default:
                 throw new TursoException($"{operation} returned unexpected result type: {result.Type}");
         }
+    }
+
+    private static List<RemoteStatementResult> ExtractBatchStepResults(RemoteBatchResult batch, int expectedCount)
+    {
+        if (batch.StepErrors.Count != expectedCount || batch.StepResults.Count != expectedCount)
+        {
+            throw new TursoException(
+                $"Remote batch returned an unexpected result shape: {batch.StepResults.Count} results, {batch.StepErrors.Count} errors, expected {expectedCount}.");
+        }
+
+        for (var i = 0; i < batch.StepErrors.Count; i++)
+        {
+            if (batch.StepErrors[i] is { } error)
+                throw CreateRemoteError(error);
+        }
+
+        var statementResults = new List<RemoteStatementResult>(expectedCount);
+        for (var i = 0; i < batch.StepResults.Count; i++)
+        {
+            var stepResult = batch.StepResults[i]
+                             ?? throw new TursoException($"Remote batch did not return a result for step {i}.");
+            statementResults.Add(stepResult);
+        }
+
+        return statementResults;
     }
 
     private static void ValidateCloseResult(RemotePipelineResponse response)
@@ -307,12 +396,24 @@ internal sealed class TursoRemoteClient : IDisposable
         [JsonPropertyName("stmt")]
         public RemoteStatement? Statement { get; init; }
 
+        [JsonPropertyName("batch")]
+        public RemoteBatch? BatchRequest { get; init; }
+
         public static RemoteStreamRequest Execute(RemoteStatement statement)
         {
             return new RemoteStreamRequest
             {
                 Type = "execute",
                 Statement = statement,
+            };
+        }
+
+        public static RemoteStreamRequest Batch(RemoteBatch batch)
+        {
+            return new RemoteStreamRequest
+            {
+                Type = "batch",
+                BatchRequest = batch,
             };
         }
 
@@ -338,6 +439,18 @@ internal sealed class TursoRemoteClient : IDisposable
 
         [JsonPropertyName("want_rows")]
         public bool WantRows { get; init; }
+    }
+
+    private sealed class RemoteBatch
+    {
+        [JsonPropertyName("steps")]
+        public List<RemoteBatchStep> Steps { get; init; } = [];
+    }
+
+    private sealed class RemoteBatchStep
+    {
+        [JsonPropertyName("stmt")]
+        public RemoteStatement Statement { get; init; } = new();
     }
 
     private sealed class RemoteNamedArg
@@ -458,6 +571,15 @@ internal sealed class RemoteError
 }
 
 internal sealed class TursoRemoteSqlException(string message) : TursoException(message);
+
+internal sealed class RemoteBatchResult
+{
+    [JsonPropertyName("step_results")]
+    public List<RemoteStatementResult?> StepResults { get; init; } = [];
+
+    [JsonPropertyName("step_errors")]
+    public List<RemoteError?> StepErrors { get; init; } = [];
+}
 
 internal sealed class RemoteStatementResult
 {

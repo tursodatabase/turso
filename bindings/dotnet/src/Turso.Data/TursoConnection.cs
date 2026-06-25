@@ -13,6 +13,7 @@ public class TursoConnection : DbConnection
     private TursoConnectionOptions _connectionOptions;
     private bool _disposed;
     private bool _readUncommitted;
+    private bool _remoteTransactionActive;
 
     [AllowNull]
     public override string ConnectionString
@@ -37,6 +38,8 @@ public class TursoConnection : DbConnection
         ? ConnectionState.Open
         : ConnectionState.Closed;
 
+    public override bool CanCreateBatch => _connectionOptions.IsRemote && !_connectionOptions.IsReplica;
+
     protected override DbProviderFactory DbProviderFactory => TursoFactory.Instance;
 
     public TursoConnection() : this("")
@@ -46,14 +49,6 @@ public class TursoConnection : DbConnection
     public TursoConnection(string connectionString)
     {
         _connectionOptions = TursoConnectionOptions.Parse(connectionString);
-    }
-
-    internal TursoConnection(string connectionString, TursoRemoteClient remoteClient)
-    {
-        ArgumentNullException.ThrowIfNull(remoteClient);
-
-        _connectionOptions = TursoConnectionOptions.Parse(connectionString);
-        _remoteClient = remoteClient;
     }
 
     public override void Open()
@@ -124,8 +119,6 @@ public class TursoConnection : DbConnection
         {
             throw new InvalidOperationException("Turso database is closed.");
         }
-        if (_remoteClient is not null)
-            throw new NotSupportedException("Remote transactions are not supported yet by the .NET provider.");
 
         return new TursoTransaction(this, isolationLevel);
     }
@@ -135,12 +128,38 @@ public class TursoConnection : DbConnection
         return new TursoCommand(this);
     }
 
+    protected override DbBatch CreateDbBatch()
+    {
+        if (!CanCreateBatch)
+            throw new NotSupportedException("Turso batch execution is currently supported only for remote connections.");
+
+        return new TursoBatch(this);
+    }
+
     public int ExecuteNonQuery(string sql)
     {
         using var command = CreateCommand();
         command.CommandText = sql;
 
         return command.ExecuteNonQuery();
+    }
+
+    public void Sync()
+    {
+        SyncAsync(CancellationToken.None).GetAwaiter().GetResult();
+    }
+
+    public Task SyncAsync(CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (cancellationToken.IsCancellationRequested)
+            return Task.FromCanceled(cancellationToken);
+        if (State != ConnectionState.Open)
+            throw new InvalidOperationException("Turso database is closed.");
+        if (!_connectionOptions.IsReplica)
+            throw new NotSupportedException("Sync requires an embedded replica connection.");
+
+        throw new NotSupportedException("Embedded replica sync is not supported yet by the .NET provider.");
     }
 
     public override void ChangeDatabase(string databaseName)
@@ -168,7 +187,7 @@ public class TursoConnection : DbConnection
         CancellationToken cancellationToken)
     {
         var remoteClient = _remoteClient ?? throw new InvalidOperationException("Turso database is closed.");
-        var closeAfter = !_connectionOptions.ReadYourWrites;
+        var closeAfter = !_connectionOptions.ReadYourWrites && !_remoteTransactionActive;
         try
         {
             return await remoteClient.ExecuteAsync(sql, parameters, wantRows, commandTimeout, closeAfter, cancellationToken)
@@ -182,6 +201,119 @@ public class TursoConnection : DbConnection
         {
             InvalidateRemoteSession();
             throw;
+        }
+    }
+
+    internal async Task<IReadOnlyList<RemoteStatementResult>> ExecuteRemoteBatchAsync(
+        IReadOnlyList<TursoBatchCommand> batchCommands,
+        int commandTimeout,
+        bool wantRows,
+        CancellationToken cancellationToken)
+    {
+        var remoteClient = _remoteClient ?? throw new InvalidOperationException("Turso database is closed.");
+        var closeAfter = !_connectionOptions.ReadYourWrites && !_remoteTransactionActive;
+        try
+        {
+            return await remoteClient.ExecuteBatchAsync(batchCommands, commandTimeout, wantRows, closeAfter, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (TursoRemoteSqlException)
+        {
+            throw;
+        }
+        catch
+        {
+            InvalidateRemoteSession();
+            throw;
+        }
+    }
+
+    internal void BeginRemoteTransaction(IsolationLevel isolationLevel)
+    {
+        _ = isolationLevel;
+        var remoteClient = _remoteClient ?? throw new InvalidOperationException("Turso database is closed.");
+        if (_remoteTransactionActive)
+            throw new InvalidOperationException("A transaction is already active on this connection.");
+
+        _remoteTransactionActive = true;
+        try
+        {
+            remoteClient
+                .ExecuteAsync("BEGIN", new TursoParameterCollection(), wantRows: false, DefaultTimeout, closeAfter: false, CancellationToken.None)
+                .GetAwaiter()
+                .GetResult();
+        }
+        catch (TursoRemoteSqlException)
+        {
+            _remoteTransactionActive = false;
+            throw;
+        }
+        catch
+        {
+            InvalidateRemoteSession();
+            throw;
+        }
+    }
+
+    internal void CommitRemoteTransaction()
+    {
+        var remoteClient = _remoteClient ?? throw new InvalidOperationException("Turso database is closed.");
+        if (!_remoteTransactionActive)
+            throw new InvalidOperationException("No remote transaction is active on this connection.");
+
+        try
+        {
+            remoteClient
+                .ExecuteAsync("COMMIT", new TursoParameterCollection(), wantRows: false, DefaultTimeout, closeAfter: false, CancellationToken.None)
+                .GetAwaiter()
+                .GetResult();
+        }
+        catch (TursoRemoteSqlException)
+        {
+            throw;
+        }
+        catch
+        {
+            InvalidateRemoteSession();
+            throw;
+        }
+
+        _remoteTransactionActive = false;
+    }
+
+    internal void RollbackRemoteTransaction()
+    {
+        var remoteClient = _remoteClient ?? throw new InvalidOperationException("Turso database is closed.");
+        if (!_remoteTransactionActive)
+            throw new InvalidOperationException("No remote transaction is active on this connection.");
+
+        try
+        {
+            remoteClient
+                .ExecuteAsync("ROLLBACK", new TursoParameterCollection(), wantRows: false, DefaultTimeout, closeAfter: false, CancellationToken.None)
+                .GetAwaiter()
+                .GetResult();
+            _remoteTransactionActive = false;
+        }
+        catch
+        {
+            InvalidateRemoteSession();
+            throw;
+        }
+    }
+
+    internal void CloseRemoteSessionIfStateless()
+    {
+        if (_connectionOptions.ReadYourWrites || _remoteClient is not { HasOpenSession: true } remoteClient)
+            return;
+
+        try
+        {
+            remoteClient.CloseAsync(DefaultTimeout, CancellationToken.None).GetAwaiter().GetResult();
+        }
+        catch
+        {
+            InvalidateRemoteSession();
         }
     }
 
@@ -220,7 +352,17 @@ public class TursoConnection : DbConnection
         Exception? closeError = null;
         try
         {
-            remoteClient.CloseAsync(DefaultTimeout, CancellationToken.None).GetAwaiter().GetResult();
+            if (_remoteTransactionActive)
+            {
+                remoteClient
+                    .ExecuteAsync("ROLLBACK", new TursoParameterCollection(), wantRows: false, DefaultTimeout, closeAfter: true, CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult();
+            }
+            else
+            {
+                remoteClient.CloseAsync(DefaultTimeout, CancellationToken.None).GetAwaiter().GetResult();
+            }
         }
         catch (Exception ex)
         {
@@ -230,6 +372,7 @@ public class TursoConnection : DbConnection
         {
             remoteClient.Dispose();
             _remoteClient = null;
+            _remoteTransactionActive = false;
             _readUncommitted = false;
         }
 
@@ -241,6 +384,7 @@ public class TursoConnection : DbConnection
     {
         _remoteClient?.Dispose();
         _remoteClient = null;
+        _remoteTransactionActive = false;
         _readUncommitted = false;
     }
 }
