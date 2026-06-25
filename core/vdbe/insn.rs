@@ -1694,6 +1694,11 @@ pub enum Insn {
         db: usize,
         max_errors: usize,
         roots: Vec<i64>,
+        /// Roots of dropped objects whose physical pages may not yet be freed. Walked tolerantly:
+        /// a page already accounted for (reused as another btree's child, or on the freelist) is
+        /// skipped rather than reported as doubly-referenced. Only genuinely-orphaned pages (a
+        /// drop not yet checkpointed) are walked, to avoid false "never used" reports.
+        dropped_roots: Vec<i64>,
         message_register: usize,
     },
     RenameTable {

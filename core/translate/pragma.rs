@@ -1413,12 +1413,37 @@ fn query_pragma(
         }
         PragmaName::IntegrityCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_integrity_check(schema, program, resolver, database_id, max_errors)?;
+            // integrity_check verifies the physical file, so for the main MVCC database use the
+            // latest shared schema (which reflects every committed+materialized object) rather
+            // than this connection's possibly-stale tx-snapshot — otherwise a table another
+            // connection just created and checkpointed is missing and its live page is
+            // mis-reported as orphaned.
+            let main_schema = (database_id == 0 && connection.mvcc_enabled())
+                .then(|| connection.db.schema.lock().clone());
+            let schema = main_schema.as_deref().unwrap_or(schema);
+            translate_integrity_check(
+                schema,
+                program,
+                resolver,
+                database_id,
+                max_errors,
+                &connection,
+            )?;
             Ok(TransactionMode::Read)
         }
         PragmaName::QuickCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_quick_check(schema, program, resolver, database_id, max_errors)?;
+            let main_schema = (database_id == 0 && connection.mvcc_enabled())
+                .then(|| connection.db.schema.lock().clone());
+            let schema = main_schema.as_deref().unwrap_or(schema);
+            translate_quick_check(
+                schema,
+                program,
+                resolver,
+                database_id,
+                max_errors,
+                &connection,
+            )?;
             Ok(TransactionMode::Read)
         }
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {

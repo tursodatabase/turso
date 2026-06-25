@@ -341,7 +341,7 @@ fn mvcc_active_write_tx_blocks_vacuum_gate() {
     let pager = db.conn.pager.load().clone();
     let tx_id = db
         .mvcc_store
-        .begin_exclusive_tx(pager.clone(), None, &db.conn)
+        .begin_exclusive_tx(pager.clone(), None, &db.conn, None)
         .unwrap();
 
     assert!(matches!(
@@ -367,7 +367,8 @@ fn mvcc_vacuum_gate_blocks_new_read_and_write_tx() {
         Err(LimboError::Busy)
     ));
     assert!(matches!(
-        db.mvcc_store.begin_exclusive_tx(pager, None, &db.conn),
+        db.mvcc_store
+            .begin_exclusive_tx(pager, None, &db.conn, None),
         Err(LimboError::Busy)
     ));
 
@@ -544,13 +545,9 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     );
 }
 
-/// A passive checkpoint serializes its structural phase (btree writes + the pager commit that
-/// swaps the freelist/header + version GC) under the blocking checkpoint lock, which a live
-/// `BEGIN CONCURRENT` reader holds shared for its lifetime. So a checkpoint that races an open
-/// reader must CONTEND OUT (Busy) rather than mutate the btree underneath it — and crucially
-/// must not corrupt anything: the reader keeps seeing a consistent snapshot, and once the reader
-/// finishes the checkpoint succeeds and a fresh reader agrees. (Running this phase off-lock is
-/// exactly what corrupted the durable forest under page reuse; serializing it is the fix.)
+/// Off-lock passive checkpoint may run btree write-out while a pinned `BEGIN CONCURRENT`
+/// reader is active. The reader must keep a consistent snapshot (dual-gate + version store);
+/// explicit `PRAGMA wal_checkpoint(PASSIVE)` must not corrupt it.
 #[test]
 fn mvcc_passive_checkpoint_busy_under_pinned_reader_no_corruption() {
     let db = MvccTestDbNoConn::new_with_random_db_passive();
@@ -564,7 +561,7 @@ fn mvcc_passive_checkpoint_busy_under_pinned_reader_no_corruption() {
 
     for i in 0..5 {
         writer
-            .execute(&format!("INSERT INTO t VALUES ('k{i}', 'v{i}')"))
+            .execute(format!("INSERT INTO t VALUES ('k{i}', 'v{i}')"))
             .unwrap();
     }
 
@@ -576,30 +573,103 @@ fn mvcc_passive_checkpoint_busy_under_pinned_reader_no_corruption() {
         "reader must see all 5 committed rows",
     );
 
-    // A passive checkpoint cannot acquire the write side of the checkpoint lock while the reader
-    // holds it shared: it must report Busy, not run its structural phase concurrently.
-    assert!(
-        matches!(
-            writer.execute("PRAGMA wal_checkpoint(PASSIVE)"),
-            Err(LimboError::Busy)
-        ),
-        "passive checkpoint must contend out (Busy) while a reader is pinned",
-    );
+    // Off-lock passive checkpoint may complete while the reader is pinned; it must not
+    // corrupt the reader's snapshot.
+    writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
 
-    // No corruption: the reader still sees a consistent snapshot.
     assert_eq!(
         get_rows(&reader, "SELECT count(*) FROM t"),
         vec![vec![Value::from_i64(5)]],
-        "reader snapshot must be unchanged after the contended checkpoint",
+        "reader snapshot must be unchanged after checkpoint under pinned reader",
     );
     reader.execute("COMMIT").unwrap();
 
-    // With the reader gone, the checkpoint succeeds and a fresh reader agrees.
-    writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
     assert_eq!(
         get_rows(&db.connect(), "SELECT count(*) FROM t"),
         vec![vec![Value::from_i64(5)]],
     );
+}
+
+/// Auto passive checkpoint must not abort when publish contends with a pinned reader: it yields
+/// and retries the brief publish lock (pager commit already done off-lock) until the reader
+/// releases.
+#[test]
+fn mvcc_passive_auto_checkpoint_retries_publish_while_reader_pinned() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv_store = db.get_mvcc_store();
+    mv_store.set_checkpoint_threshold(0);
+
+    let writer = db.connect();
+    let reader = db.connect();
+
+    writer
+        .execute("CREATE TABLE t(k TEXT PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+    reader.execute("BEGIN CONCURRENT").unwrap();
+
+    let durable_before = mv_store.durable_txid_max.load(Ordering::SeqCst);
+    let writer_thread = writer;
+    let commit_handle = std::thread::spawn(move || {
+        writer_thread.execute("BEGIN CONCURRENT").unwrap();
+        writer_thread
+            .execute("INSERT INTO t VALUES ('hello', 'hello')")
+            .unwrap();
+        writer_thread.execute("COMMIT").unwrap();
+    });
+
+    for _ in 0..10_000 {
+        if mv_store.durable_txid_max.load(Ordering::SeqCst) > durable_before {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    if mv_store.durable_txid_max.load(Ordering::SeqCst) == durable_before {
+        reader.execute("COMMIT").unwrap();
+    }
+    commit_handle.join().unwrap();
+
+    let durable_after = mv_store.durable_txid_max.load(Ordering::SeqCst);
+    assert!(
+        durable_after > durable_before,
+        "auto passive checkpoint should publish durable boundary despite pinned reader (before={durable_before}, after={durable_after})",
+    );
+
+    if reader.get_tx_state() != crate::connection::TransactionState::None {
+        reader.execute("COMMIT").unwrap();
+    }
+    assert_eq!(
+        get_rows(&db.connect(), "SELECT v FROM t WHERE k = 'hello'"),
+        vec![vec![Value::from_text("hello".to_string())]],
+    );
+}
+
+/// A passive checkpoint that publishes an UNRELATED object's physical roots must NOT invalidate
+/// an open transaction reading a different table. Invalidation is per-root and snapshot-scoped
+/// (see `MvccLazyCursor::new`): a reader is only re-prepared when the specific root it opens was
+/// dropped/reused at its snapshot — not whenever any concurrent checkpoint publishes some root.
+#[test]
+fn mvcc_passive_unrelated_root_publication_does_not_invalidate_open_txn() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let writer = db.connect();
+    let reader = db.connect();
+
+    writer.execute("CREATE TABLE t(x)").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    // `u` is created and checkpointed AFTER the reader's snapshot; it is irrelevant to `t`.
+    writer
+        .execute("CREATE TABLE u(y INTEGER PRIMARY KEY)")
+        .unwrap();
+    writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+    assert!(
+        reader.execute("SELECT * FROM t").is_ok(),
+        "reader of table t must not be invalidated by an unrelated table's passive checkpoint",
+    );
+    reader.execute("ROLLBACK").unwrap();
 }
 
 #[test]
@@ -616,13 +686,13 @@ fn mvcc_passive_drop_index_then_reuse_page_integrity() {
     };
 
     for i in 0..6 {
-        conn.execute(&format!(
+        conn.execute(format!(
             "CREATE TABLE t{i}(id INTEGER PRIMARY KEY, a TEXT, b TEXT)"
         ))
         .unwrap();
-        conn.execute(&format!("CREATE INDEX idx{i}_a ON t{i}(a)"))
+        conn.execute(format!("CREATE INDEX idx{i}_a ON t{i}(a)"))
             .unwrap();
-        conn.execute(&format!("INSERT INTO t{i} VALUES ({i}, 'a{i}', 'b{i}')"))
+        conn.execute(format!("INSERT INTO t{i} VALUES ({i}, 'a{i}', 'b{i}')"))
             .unwrap();
     }
     conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
@@ -633,12 +703,12 @@ fn mvcc_passive_drop_index_then_reuse_page_integrity() {
     // so this stands as a sanity test that serial free+reuse is correct.
     for round in 0..6 {
         for i in 0..6 {
-            conn.execute(&format!("DROP INDEX idx{i}_a")).unwrap();
+            conn.execute(format!("DROP INDEX idx{i}_a")).unwrap();
         }
         for i in 0..6 {
-            conn.execute(&format!("CREATE INDEX idx{i}_a ON t{i}(a, b)"))
+            conn.execute(format!("CREATE INDEX idx{i}_a ON t{i}(a, b)"))
                 .unwrap();
-            conn.execute(&format!(
+            conn.execute(format!(
                 "CREATE TABLE r{round}_{i}(id INTEGER PRIMARY KEY, v TEXT)"
             ))
             .unwrap();
@@ -6291,6 +6361,8 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
+        holds_blocking_checkpoint_read: AtomicBool::new(false),
+        schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
     }
 }
@@ -7979,6 +8051,8 @@ fn transaction_display() {
         commit_dep_counter: AtomicU64::new(0),
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
+        holds_blocking_checkpoint_read: AtomicBool::new(false),
+        schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
     };
 
@@ -16579,6 +16653,168 @@ fn test_integrity_check_ignores_dropped_root_that_is_live_after_recovery() {
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
+
+/// A passive checkpoint can free a dropped object's root page and the btree can then reuse that
+/// page as another object's child before the stale `dropped_root_pages` entry clears (a schema
+/// reparse can even resurrect it). `integrity_check` must walk such dropped roots tolerantly: a
+/// page already accounted for (reused as a child, or on the freelist) is not leaked, so it must
+/// not be reported as `referenced multiple times`. Regression for the whopper false positive
+/// `Page N referenced multiple times (references=[P, 0])`.
+#[test]
+fn test_integrity_check_tolerates_dropped_root_reused_as_btree_child() {
+    // The tolerant dropped-root walk is passive-only (other modes keep the strict walk), so this
+    // regression must run under a passive db.
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    // Enough rows (with a wide value) that t's btree grows past a single page, so the highest
+    // allocated page is a leaf *child* of t — referenced by its parent in t's btree.
+    for i in 0..1000 {
+        conn.execute(format!(
+            "INSERT INTO t VALUES ({i}, 'wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww')"
+        ))
+        .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // The last allocated page belongs to t's btree (only sqlite_schema + t exist, no freelist),
+    // so it is referenced as a child. Marking it dropped is exactly the freed+reused condition.
+    let page_count = get_rows(&conn, "PRAGMA page_count")[0][0].as_int().unwrap();
+    let root_page = get_rows(
+        &conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type='table' AND name='t'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    assert!(page_count > root_page, "t should span multiple pages");
+    // Inject into the shared db.schema, which is what integrity_check reads for the main MVCC db
+    // (the per-connection `with_schema_mut` copy is not consulted there).
+    {
+        let mut schema_guard = conn.db.schema.lock();
+        let schema = std::sync::Arc::make_mut(&mut schema_guard);
+        schema.dropped_root_pages.insert(page_count);
+    }
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        &rows[0][0].to_string(),
+        "ok",
+        "a reused dropped root must not be reported as doubly-referenced"
+    );
+}
+
+/// `begin_tx`'s schema-generation gate: a begin whose caller validated its prepared schema at a
+/// generation that no longer matches the store's current `schema_generation` (a passive checkpoint
+/// republished roots in the begin window) must fail with `SchemaUpdated` so the statement
+/// reprepares rather than begin against stale physical roots. A matching generation (or no gate)
+/// begins normally.
+#[test]
+fn test_begin_tx_schema_generation_gate() {
+    let db = MvccTestDb::new();
+    let pager = db.conn.pager.load().clone();
+    let generation = db.mvcc_store.schema_generation();
+
+    // Matching generation: begins normally.
+    let tx = db
+        .mvcc_store
+        .begin_tx_with_schema_generation(pager.clone(), Some(generation))
+        .unwrap();
+    db.mvcc_store
+        .rollback_tx(tx, pager.clone(), &db.conn, crate::MAIN_DB_ID);
+
+    // Stale (mismatched) generation: forced reprepare.
+    let err = db
+        .mvcc_store
+        .begin_tx_with_schema_generation(pager.clone(), Some(generation + 1))
+        .unwrap_err();
+    assert!(
+        matches!(err, LimboError::SchemaUpdated),
+        "stale schema generation should force reprepare, got {err:?}"
+    );
+
+    // No gate: begins normally.
+    let tx = db
+        .mvcc_store
+        .begin_tx_with_schema_generation(pager.clone(), None)
+        .unwrap();
+    db.mvcc_store
+        .rollback_tx(tx, pager, &db.conn, crate::MAIN_DB_ID);
+}
+
+/// PASSIVE-ONLY: the off-lock checkpoint mutates the pager's page-1 freelist on every commit, but
+/// the MVCC `global_header` (and the per-tx header snapshot captured at begin) only catches up at
+/// publish — so a reader can see a freelist head pointing at a page that has since been reused as a
+/// live btree leaf. `integrity_check` must read the physical freelist/db-size from the pager's live
+/// page 1 (consistent with the pages it walks), not the stale MVCC header. Regression for the
+/// whopper false positive `Page N referenced multiple times [0,P]` + `Freelist: invalid page number`.
+#[test]
+fn test_integrity_check_passive_reads_freelist_from_pager_not_stale_mvcc_header() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    for i in 0..500 {
+        conn.execute(format!(
+            "INSERT INTO t VALUES ({i}, 'wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww')"
+        ))
+        .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let page_count = get_rows(&conn, "PRAGMA page_count")[0][0].as_int().unwrap();
+    assert!(page_count > 2, "t should span multiple pages");
+
+    // Simulate the lag: point the MVCC global_header's freelist head at the last page (an in-use
+    // btree leaf) while the pager's real page 1 has an empty freelist. A passive integrity_check
+    // must use the pager's live freelist and stay "ok" rather than walking a live page as a trunk.
+    {
+        let mv_guard = conn.db.get_mv_store();
+        let mv = mv_guard.as_ref().expect("mvcc store");
+        let mut gh = mv.global_header.write();
+        let h = gh.as_mut().expect("global_header initialized");
+        h.freelist_trunk_page = pack1::U32BE::new(page_count as u32);
+        h.freelist_pages = pack1::U32BE::new(1);
+    }
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        &rows[0][0].to_string(),
+        "ok",
+        "passive integrity_check must read the freelist from the pager's live page 1, not the stale MVCC header"
+    );
+}
+
+/// PASSIVE port of PR #7620's reproducer: a checkpointed row gets an INSERT OR REPLACE (new
+/// btree-resident marker + replacement) then the replacement is deleted. GC must retain the
+/// btree-resident marker until checkpoint applies the physical delete, or the stale table row
+/// survives while its index entry is removed -> "row missing from index".
+#[test]
+fn test_mvcc_passive_replace_then_delete_keeps_table_and_index_consistent() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name, iq, year)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_iq ON t(iq)").unwrap();
+    conn.execute(
+        "INSERT INTO t VALUES (1,'v',100,2024),(2,'einstein',150,1950),(3,'newton',140,1850)",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    conn.execute("INSERT OR REPLACE INTO t(id,name,iq,year) VALUES(1,'v',120,2025)")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE id=1").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(
+        &rows[0][0].to_string(),
+        "ok",
+        "passive replace-then-delete must keep table/index consistent, got {rows:?}"
+    );
+}
+
 /// Snapshot stability under all of: nested-savepoint rollbacks, checkpoints,
 /// CREATE/DROP INDEX, and concurrent committed writers.
 ///

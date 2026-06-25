@@ -1870,7 +1870,14 @@ impl Connection {
                 || self
                     .has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema))
         {
-            *self.schema.write() = schema.clone();
+            let mut adopted = schema.clone();
+            // Resolve placeholder (negative) roots to the real pages a checkpoint has
+            // materialized, so consumers that skip negative roots (integrity_check) see them.
+            let mv_store_guard = self.db.get_mv_store();
+            if let Some(mv_store) = mv_store_guard.as_ref() {
+                mv_store.resolve_schema_negative_roots(Arc::make_mut(&mut adopted));
+            }
+            *self.schema.write() = adopted;
             self.bump_prepare_context_generation();
         }
     }
@@ -1898,6 +1905,35 @@ impl Connection {
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
         self.has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema)
+    }
+
+    /// Begin-tx schema gate for MVCC. Returns the `MvStore::schema_generation` this connection's
+    /// prepared schema is valid as of, or `SchemaUpdated` if it is already stale (a passive
+    /// checkpoint republished physical roots without a cookie change). The returned generation is
+    /// re-checked inside `begin_tx`'s clock callback: a publish bumps `schema_generation` under the
+    /// same clock, so if one lands between here and the begin clock the generations differ and the
+    /// statement is forced to reprepare against the published roots.
+    pub(crate) fn mvcc_begin_schema_generation(&self) -> Result<Option<u64>> {
+        let mv_guard = self.db.get_mv_store();
+        let Some(mv) = mv_guard.as_ref() else {
+            return Ok(None);
+        };
+        // Mid-transaction (e.g. a multi-statement BEGIN): the snapshot and schema are fixed at the
+        // first begin, so a later checkpoint republication must not gate or reprepare here. Mirror
+        // the guard of `mvcc_schema_requires_reprepare_before_tx`.
+        if !self.has_no_open_transaction_state() {
+            return Ok(None);
+        }
+        // Read the generation before the snapshot comparison: any publish that mutates the shared
+        // schema after this read is caught by the comparison below (it changes the Arc), and any
+        // publish that lands during begin is caught by the clock re-check (it bumps the generation).
+        let generation = mv.schema_generation();
+        let current_schema = self.schema.read().clone();
+        let schema = self.db.schema.lock();
+        if self.has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema) {
+            return Err(LimboError::SchemaUpdated);
+        }
+        Ok(Some(generation))
     }
 
     pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {

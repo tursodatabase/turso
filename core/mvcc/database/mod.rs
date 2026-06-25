@@ -980,6 +980,11 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// Hekaton Section 2.7: "CommitDepSet, that stores transaction IDs of the
     /// transactions that depend on T."
     commit_dep_set: Mutex<HashSet<TxID>>,
+    /// True when this transaction holds `blocking_checkpoint_lock` in read mode
+    /// (truncate / flag-off path only). Passive `begin_tx` does not pin the lock.
+    holds_blocking_checkpoint_read: AtomicBool,
+    /// `MvStore::schema_generation` captured at `begin_tx` (passive root publication gate).
+    schema_generation_at_begin: u64,
     /// This transaction's frozen WAL read mark `(checkpoint_seq, max_frame)`, captured when it
     /// pinned its read transaction at begin. A checkpoint-materialized B-tree is physically
     /// reachable by this transaction only if `materialized_at <= read_mark` — i.e. the
@@ -994,12 +999,14 @@ impl<A: RowVersionAllocator> Transaction<A> {
         begin_ts: u64,
         header: DatabaseHeader,
         read_mark: WalPos,
+        schema_generation_at_begin: u64,
     ) -> Transaction<A> {
         Transaction {
             state: TransactionState::Active.into(),
             tx_id,
             begin_ts,
             read_mark,
+            schema_generation_at_begin,
             write_set: Mutex::new(WriteSet::new()),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
@@ -1008,6 +1015,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             commit_dep_counter: AtomicU64::new(0),
             abort_now: AtomicBool::new(false),
             commit_dep_set: Mutex::new(HashSet::default()),
+            holds_blocking_checkpoint_read: AtomicBool::new(false),
         }
     }
 
@@ -3311,12 +3319,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             CommitState::Checkpoint { state_machine } => {
                 let step_result = {
                     let mut sm = state_machine.lock();
-                    sm.step(&())
+                    // Step the checkpoint SM directly so a passive publish retry can return
+                    // `Continue` and yield the commit executor (the `StateMachine` wrapper would
+                    // spin on `Continue` internally and starve pinned readers on the same thread).
+                    sm.inner_mut().step(&())
                 };
                 match step_result {
-                    Ok(IOResult::Done(_)) => {}
-                    Ok(IOResult::IO(iocompletions)) => {
+                    Ok(TransitionResult::Continue) => {
+                        return Ok(TransitionResult::Continue);
+                    }
+                    Ok(TransitionResult::Io(iocompletions)) => {
                         return Ok(TransitionResult::Io(iocompletions));
+                    }
+                    Ok(TransitionResult::Done(_)) => {
+                        state_machine.lock().finalize(&())?;
                     }
                     Err(err) => {
                         // Auto-checkpoint errors should not surface to the committed statement.
@@ -3975,6 +3991,12 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// (locked) publish durable_txid_max / global_header / schema roots; (unlocked) GC,
     /// CheckpointWal, truncate logical log, TruncateWal.
     blocking_checkpoint_lock: Arc<TursoRwLock>,
+    /// Passive publish drain: set for the brief in-memory publish window so new `begin_tx`
+    /// calls contend out instead of pinning a lifetime checkpoint read guard.
+    checkpoint_publish_in_progress: AtomicBool,
+    /// Bumped when a passive checkpoint publishes physical btree roots into the shared schema.
+    /// Open transactions compare their captured value and get [`LimboError::SchemaUpdated`].
+    schema_generation: AtomicU64,
     /// Single-orchestrator gate: set while a CheckpointStateMachine runs its unlocked
     /// write-out phase, cleared on completion/error. Commits racing `should_checkpoint()`
     /// contend on it; only one wins. Needed because the lock no longer guards the start
@@ -4166,6 +4188,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             global_header: Arc::new(RwLock::new(None)),
             backfill_floor: Arc::new(RwLock::new(WalPos::ORIGIN)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
+            checkpoint_publish_in_progress: AtomicBool::new(false),
+            schema_generation: AtomicU64::new(0),
             checkpoint_in_progress: AtomicBool::new(false),
             durable_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
@@ -4318,6 +4342,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 materialized_at,
             },
         );
+        // A page has one live owner. Claiming this page means it was freed+reused; retire any
+        // stale prior owner still marked live for it (its drop-time retire raced off-lock),
+        // else two live bindings resolve to one page (integrity_check: referenced twice).
+        let stale: Vec<(MVTableId, RootEntry)> = self
+            .table_id_to_rootpage
+            .iter()
+            .filter(|entry| {
+                let e = entry.value();
+                e.is_live() && e.root_page == Some(root_page) && *entry.key() != table_id
+            })
+            .map(|entry| (*entry.key(), *entry.value()))
+            .collect();
+        for (key, mut entry) in stale {
+            entry.end = begin_ts;
+            self.table_id_to_rootpage.insert(key, entry);
+        }
         self.bump_next_table_id_below(table_id, Some(root_page));
     }
 
@@ -5712,12 +5752,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         pager: Arc<Pager>,
         maybe_existing_tx_id: Option<TxID>,
         connection: &Connection,
+        expected_schema_generation: Option<u64>,
     ) -> Result<TxID> {
         #[cfg(not(any(test, injected_yields)))]
         let _ = connection;
         // Existing transactions already hold one blocking-checkpoint read guard
-        // from begin_tx(). When upgrading read->write, do not acquire another one.
-        let acquires_checkpoint_guard = maybe_existing_tx_id.is_none();
+        // from begin_tx() (truncate path only). When upgrading read->write, do not acquire another one.
+        let passive = self.experimental_mvcc_passive_checkpoint;
+        let acquires_checkpoint_guard = maybe_existing_tx_id.is_none() && !passive;
+        // Fresh write begins gate on the connection's prepared schema generation (same as
+        // begin_tx); upgrades keep the original snapshot, so the caller passes None. See begin_tx
+        // for why this closes the passive publish/begin race without a Busy.
+        let expected_schema_generation = if maybe_existing_tx_id.is_none() {
+            expected_schema_generation
+        } else {
+            None
+        };
         if acquires_checkpoint_guard && !self.blocking_checkpoint_lock.read() {
             // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
             return Err(LimboError::Busy);
@@ -5745,15 +5795,42 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // (possibly blocking I/O) happens before the clock lock is taken;
             // the error paths below remove this tx if begin fails. The real
             // header is set here, so the tail only flips `pager_commit_lock_held`.
-            let header = self.get_new_transaction_database_header(&pager);
-            // Capture the frozen WAL read mark this transaction will read against. It was pinned by
-            // `pager.begin_read_tx()` just before us and does not move for our lifetime, so reading
-            // it here is consistent (unlike a moving global boundary). See `read_mark`.
+            // Ensure page 1 / global_header is initialized (pager I/O only on first init). The
+            // header + schema_generation are re-read inside the clock callback below, not captured
+            // here, so a passive publish (which swaps global_header + bumps schema_generation under
+            // this same clock) cannot interleave between the capture and `txs.insert`.
+            self.get_new_transaction_database_header(&pager);
+            pager.mvcc_refresh_if_db_changed();
             let read_mark = WalPos::from_pair(pager.wal_pos());
-            self.clock.get_timestamp(|ts| {
-                self.txs
-                    .insert(tx_id, Transaction::new(tx_id, ts, header, read_mark));
-            })
+            let mut schema_stale = false;
+            let begin_ts = self.clock.get_timestamp(|ts| {
+                let schema_generation = self.schema_generation();
+                if expected_schema_generation.is_some_and(|exp| exp != schema_generation) {
+                    schema_stale = true;
+                    return;
+                }
+                let header = self
+                    .global_header
+                    .read()
+                    .expect("global_header initialized above");
+                self.txs.insert(
+                    tx_id,
+                    Transaction::new(tx_id, ts, header, read_mark, schema_generation),
+                );
+            });
+            if schema_stale {
+                unlock_checkpoint_guard();
+                return Err(LimboError::SchemaUpdated);
+            }
+            if acquires_checkpoint_guard {
+                if let Some(entry) = self.txs.get(&tx_id) {
+                    entry
+                        .value()
+                        .holds_blocking_checkpoint_read
+                        .store(true, Ordering::Release);
+                }
+            }
+            begin_ts
         };
         #[cfg(any(test, injected_yields))]
         let exclusive_yield_context = YieldContext::new(
@@ -5876,42 +5953,84 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// that you can use to perform operations within the transaction. All changes made within the
     /// transaction are isolated from other transactions until you commit the transaction.
     pub fn begin_tx(&self, pager: Arc<Pager>) -> Result<TxID> {
-        if !self.blocking_checkpoint_lock.read() {
-            // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
+        self.begin_tx_with_schema_generation(pager, None)
+    }
+
+    /// `begin_tx` with the connection's validated `schema_generation` gate (see
+    /// [`Connection::mvcc_begin_schema_generation`]). Used by the statement begin path so a passive
+    /// checkpoint that republishes physical roots into the begin window forces a reprepare instead
+    /// of a transaction beginning against stale roots.
+    pub fn begin_tx_with_schema_generation(
+        &self,
+        pager: Arc<Pager>,
+        expected_schema_generation: Option<u64>,
+    ) -> Result<TxID> {
+        let passive = self.experimental_mvcc_passive_checkpoint;
+        if !passive && !self.blocking_checkpoint_lock.read() {
+            // Stop-the-world truncate checkpoint in progress.
             return Err(LimboError::Busy);
         }
         let tx_id = self.get_tx_id();
 
-        // Set txn's header to the global header. Do the (possibly blocking)
-        // header read BEFORE taking the clock lock below.
-        let header = self.get_new_transaction_database_header(&pager);
+        // Ensure page 1 / global_header is initialized. The (possibly blocking) init I/O
+        // happens here, BEFORE the clock lock; the header value itself is re-read inside the
+        // clock callback below so it pairs atomically with begin_ts + schema_generation.
+        self.get_new_transaction_database_header(&pager);
 
         // Allocate begin_ts and publish the transaction into `txs` atomically
         // under the clock lock. This closes the "begin-publish window": between
         // allocating a snapshot timestamp and inserting into `txs`, the txn is
         // invisible to `compute_lwm`. Inline GC runs on the commit path holding
-        // only `blocking_checkpoint_lock.read()` (same as us), so a writer that
+        // only `blocking_checkpoint_lock.read()` (truncate path), so a writer that
         // commits in that window could compute an LWM above our begin_ts and
         // reclaim a version this snapshot still needs — a snapshot-isolation
         // violation. Publishing under the clock lock orders us strictly before
         // or after any commit timestamp (commits also take the clock lock), so
         // any GC that runs after a later commit already sees our begin_ts.
-        // Refresh the WAL read snapshot to the current committed frame NOW, while holding
-        // `blocking_checkpoint_lock.read()`, so `read_mark` is captured atomically with the
-        // `begin_ts` assigned just below under the clock lock. The caller pinned the snapshot
-        // (`pager.begin_read_tx()`) BEFORE we took the checkpoint read lock; under true thread
-        // concurrency a checkpoint can publish (advance the WAL + GC the version store) in that
-        // gap, leaving a `read_mark` that predates a `begin_ts` already past the checkpoint — a
-        // torn snapshot where the reader can reach neither the materialized B-tree (frame too
-        // low) nor the GC'd version-store rows. Holding `.read()` excludes the checkpoint's
-        // publish `.write()`, so this refresh and the `begin_ts` read are atomic w.r.t. any
-        // checkpoint.
+        //
+        // Truncate mode also holds `blocking_checkpoint_lock.read()` for the txn lifetime so
+        // publish cannot interleave with read_mark capture. Passive mode relies on the clock:
+        // its publish window runs under `get_timestamp` too, so begin and publish serialize on
+        // the clock and never need to block each other — a begin that orders after a publish
+        // simply observes the bumped `schema_generation` and reprepares (below).
         pager.mvcc_refresh_if_db_changed();
         let read_mark = WalPos::from_pair(pager.wal_pos());
+        let mut schema_stale = false;
         let begin_ts = self.clock.get_timestamp(|ts| {
-            self.txs
-                .insert(tx_id, Transaction::new(tx_id, ts, header, read_mark));
+            // Capture header (cookie) + schema_generation INSIDE the clock so they are
+            // consistent with the root map at insert time: a passive publish runs under this
+            // same clock, so it cannot interleave between this capture and the insert.
+            let schema_generation = self.schema_generation();
+            // A publish that ordered into our begin window bumped the generation past the value
+            // the caller validated its prepared schema against: reprepare instead of beginning
+            // with stale physical roots.
+            if expected_schema_generation.is_some_and(|exp| exp != schema_generation) {
+                schema_stale = true;
+                return;
+            }
+            let header = self
+                .global_header
+                .read()
+                .expect("global_header initialized above");
+            self.txs.insert(
+                tx_id,
+                Transaction::new(tx_id, ts, header, read_mark, schema_generation),
+            );
         });
+        if schema_stale {
+            if !passive {
+                self.blocking_checkpoint_lock.unlock();
+            }
+            return Err(LimboError::SchemaUpdated);
+        }
+        if !passive {
+            if let Some(entry) = self.txs.get(&tx_id) {
+                entry
+                    .value()
+                    .holds_blocking_checkpoint_read
+                    .store(true, Ordering::Release);
+            }
+        }
         tracing::trace!("begin_tx(tx_id={}, begin_ts={})", tx_id, begin_ts);
 
         Ok(tx_id)
@@ -5927,6 +6046,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.remove_sequence_allocations(tx_id);
         if let Some(entry) = self.txs.get(&tx_id) {
             let tx = entry.value();
+            let held_checkpoint_read = tx.holds_blocking_checkpoint_read.load(Ordering::Acquire);
             if let TransactionState::Committed(commit_ts) = tx.state.load() {
                 // Read-only transactions cannot leave row versions with stale TxID
                 // references, so they do not need finalized-state caching.
@@ -5945,9 +6065,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 dep_set.is_empty(),
                 "remove_tx({tx_id}): commit_dep_set is not empty"
             );
+            self.txs.remove(&tx_id);
+            if held_checkpoint_read {
+                self.blocking_checkpoint_lock.unlock();
+            }
+            return Ok(());
         }
         self.txs.remove(&tx_id);
-        self.blocking_checkpoint_lock.unlock();
         Ok(())
     }
 
@@ -6771,6 +6895,42 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         snapshot_ts
     }
 
+    /// Try to enter the passive publish window. Returns false if another publish is in flight.
+    pub(crate) fn try_begin_passive_publish_window(&self) -> bool {
+        debug_assert!(self.experimental_mvcc_passive_checkpoint);
+        self.checkpoint_publish_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Release the passive publish drain bit after a successful or failed publish attempt.
+    pub(crate) fn end_passive_publish_window(&self) {
+        self.checkpoint_publish_in_progress
+            .store(false, Ordering::Release);
+    }
+
+    pub(crate) fn schema_generation(&self) -> u64 {
+        self.schema_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn bump_schema_generation(&self) {
+        self.schema_generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Passive checkpoint published new physical roots after this transaction began.
+    pub fn schema_still_valid_for_tx(&self, tx_id: TxID) -> Result<()> {
+        if !self.experimental_mvcc_passive_checkpoint {
+            return Ok(());
+        }
+        let Some(entry) = self.txs.get(&tx_id) else {
+            return Ok(());
+        };
+        if entry.value().schema_generation_at_begin != self.schema_generation() {
+            return Err(LimboError::SchemaUpdated);
+        }
+        Ok(())
+    }
+
     /// Compute the low-water mark: the minimum begin_ts of all active or
     /// preparing transactions. Returns u64::MAX if no transactions are active.
     /// Used by GC to determine which row versions are safe to reclaim.
@@ -6891,18 +7051,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ///   the *complete* referenced-txid set across all chains, which a partial
     ///   sweep cannot produce. The checkpoint path still prunes it.
     pub fn gc_incremental(&self, max_chains: usize) -> usize {
-        // Hold the checkpoint read lock for the whole pass so a stop-the-world
-        // checkpoint cannot run concurrently.
-        if !self.blocking_checkpoint_lock.read() {
-            return 0;
-        }
-        struct CheckpointReadGuard<'a>(&'a TursoRwLock);
-        impl Drop for CheckpointReadGuard<'_> {
-            fn drop(&mut self) {
-                self.0.unlock();
+        // Truncate checkpoints hold the write side for the whole pass; pin a read
+        // guard so inline GC cannot race them. Passive checkpoints use the publish
+        // drain bit instead, so skip the lifetime-style pin here.
+        let _ckpt_guard = if self.experimental_mvcc_passive_checkpoint {
+            None
+        } else if self.blocking_checkpoint_lock.read() {
+            struct CheckpointReadGuard<'a>(&'a TursoRwLock);
+            impl Drop for CheckpointReadGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.unlock();
+                }
             }
-        }
-        let _ckpt_guard = CheckpointReadGuard(&self.blocking_checkpoint_lock);
+            Some(CheckpointReadGuard(&self.blocking_checkpoint_lock))
+        } else {
+            return 0;
+        };
 
         // Single-flight: only one inline GC pass runs at a time across all
         // connections (see `gc_in_progress`). Losing the race is a no-op — the
@@ -6925,7 +7089,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         let _gate = GcGate(&self.gc_in_progress);
 
-        let lwm = self.compute_lwm();
+        let passive = self.experimental_mvcc_passive_checkpoint;
+        let lwm = if passive {
+            let mut sampled = u64::MAX;
+            self.clock.get_timestamp(|_| sampled = self.compute_lwm());
+            sampled
+        } else {
+            self.compute_lwm()
+        };
 
         // Short-circuit when a long-running transaction has pinned the LWM at
         // the same value since the last pass: nothing newly reclaimable can
@@ -6964,14 +7135,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             // GC floor: retain rows of a freshly-materialized btree not yet visible to all readers.
             if !self.rootpage_gc_protected(&entry.key().table_id, min_reader_mark) {
-                let mut versions = entry.value().write();
-                dropped += Self::gc_version_chain(
-                    &mut versions,
-                    lwm,
-                    ckpt_max,
-                    self.experimental_mvcc_passive_checkpoint,
-                    min_reader_mark,
-                );
+                if passive {
+                    self.clock.get_timestamp(|_| {
+                        let lwm = self.compute_lwm();
+                        let mut versions = entry.value().write();
+                        dropped += Self::gc_version_chain(
+                            &mut versions,
+                            lwm,
+                            ckpt_max,
+                            true,
+                            min_reader_mark,
+                        );
+                    });
+                } else {
+                    let mut versions = entry.value().write();
+                    dropped += Self::gc_version_chain(
+                        &mut versions,
+                        lwm,
+                        ckpt_max,
+                        false,
+                        min_reader_mark,
+                    );
+                }
             }
             last_key = Some(entry.key().clone());
             processed += 1;
@@ -7027,6 +7212,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// (inclusive, to finish its remaining keys) and the inner scan resumes
     /// after the saved key; later indexes start from their first key.
     fn gc_index_incremental(&self, lwm: u64, ckpt_max: u64, max_chains: usize) -> usize {
+        let passive = self.experimental_mvcc_passive_checkpoint;
         let mut dropped = 0;
         let mut processed = 0;
         let mut last: Option<(MVTableId, Arc<SortableIndexKey>)> = None;
@@ -7061,13 +7247,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if processed >= max_chains {
                     break 'outer;
                 }
-                {
+                if passive {
+                    self.clock.get_timestamp(|_| {
+                        let lwm = self.compute_lwm();
+                        let mut versions = inner_entry.value().write();
+                        dropped += Self::gc_version_chain(
+                            &mut versions,
+                            lwm,
+                            ckpt_max,
+                            true,
+                            min_reader_mark,
+                        );
+                    });
+                } else {
                     let mut versions = inner_entry.value().write();
                     dropped += Self::gc_version_chain(
                         &mut versions,
                         lwm,
                         ckpt_max,
-                        self.experimental_mvcc_passive_checkpoint,
+                        false,
                         min_reader_mark,
                     );
                 }
@@ -7576,6 +7774,56 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
+    /// PASSIVE-mode sequence compaction (Option B; see
+    /// `docs/internals/mvcc/sequence-compaction-passive.md`). Snapshot-safe alternative to the
+    /// raw off-lock `purge_row_versions_during_checkpoint` + `cursor.delete()`, whose contract
+    /// requires `pager_commit_lock` to be held (only true for the blocking checkpoint).
+    ///
+    /// Instead of clearing the chain and removing the B-tree row off-lock — which lets a
+    /// concurrent transaction observe "row in B-tree, absent from MVCC" and synthesize a phantom
+    /// tombstone — this records a *proper end-stamped delete* and leaves the B-tree row intact.
+    /// A later checkpoint materializes the delete through the normal path. `end_ts` must be a
+    /// freshly allocated commit timestamp (> every concurrent reader's begin and > the durable
+    /// boundary this checkpoint publishes) so concurrent readers see the row live (and conflict on
+    /// delete) rather than missing, and so the next checkpoint still treats the delete as
+    /// uncheckpointed.
+    ///
+    /// Called only from the passive publish window (clock-ordered), so the `end_ts` ordering vs
+    /// concurrent `begin_tx` is well defined.
+    pub fn seqcompact_commit_delete(&self, rowid: RowID, num_cols: usize, end_ts: u64) {
+        let Ok(row_versions) = self.get_or_create_table_row_versions(rowid.clone()) else {
+            return;
+        };
+        let mut versions = row_versions.write();
+        // If a committed current version exists, mark it deleted as of end_ts — the normal
+        // collection then materializes the B-tree delete (begin <= durable_max => exists_in_db_file).
+        if let Some(rv) = versions.iter_mut().find(|rv| {
+            matches!(rv.begin(), Some(TxTimestampOrID::Timestamp(_))) && rv.end().is_none()
+        }) {
+            rv.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
+            return;
+        }
+        // Already tombstoned / no live version: nothing to delete again.
+        if versions.iter().any(|rv| rv.end().is_some()) {
+            return;
+        }
+        // Row lives only in the B-tree: record a B-tree-resident tombstone so the collection
+        // (btree_resident => exists_in_db_file) materializes the physical delete.
+        let version_id = self.get_version_id();
+        let row = Row::new_table_row(rowid, Vec::new(), num_cols);
+        let _ = self.insert_version_raw(
+            &mut versions,
+            RowVersion {
+                id: version_id,
+                begin: PackedTs::pack(None),
+                end: PackedTs::pack(Some(TxTimestampOrID::Timestamp(end_ts))),
+                row,
+                btree_resident: true,
+                materialized_at: WalPos::ORIGIN,
+            },
+        );
+    }
+
     pub fn get_last_table_rowid(
         &self,
         table_id: MVTableId,
@@ -7947,6 +8195,60 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
+    /// Rewrite placeholder (negative) root pages in `schema` to the real positive roots a
+    /// checkpoint has since materialized. A negative root whose `table_id_to_rootpage` entry
+    /// resolves to a positive page means the object's btree is durable; pointing the schema at
+    /// it keeps consumers that ignore negative roots (e.g. `integrity_check`, which skips them)
+    /// from treating the live page as orphaned. Objects not yet materialized stay negative.
+    pub(crate) fn resolve_schema_negative_roots(&self, schema: &mut crate::schema::Schema) {
+        let resolve = |root_page: i64| -> Option<i64> {
+            if root_page >= 0 {
+                return None;
+            }
+            self.table_id_to_rootpage
+                .get(&MVTableId::from(root_page))
+                .filter(|e| e.value().is_live())
+                .and_then(|e| e.value().root_page)
+                .map(|r| r as i64)
+        };
+        for table in schema.tables.values_mut() {
+            let needs = table
+                .btree()
+                .is_some_and(|b| resolve(b.root_page).is_some());
+            if !needs {
+                continue;
+            }
+            let table = Arc::make_mut(table);
+            if let Some(btree_table) = table.btree_mut() {
+                let btree_table = Arc::make_mut(btree_table);
+                if let Some(rp) = resolve(btree_table.root_page) {
+                    btree_table.root_page = rp;
+                }
+            }
+        }
+        for table_index_list in schema.indexes.values_mut() {
+            for index in table_index_list.iter_mut() {
+                if let Some(rp) = resolve(index.root_page) {
+                    Arc::make_mut(index).root_page = rp;
+                }
+            }
+        }
+    }
+
+    /// Resolve a single (possibly placeholder/negative) root page to the real positive page a
+    /// checkpoint has materialized for it, or return it unchanged if not yet materialized.
+    pub(crate) fn resolve_root_page(&self, root_page: i64) -> i64 {
+        if root_page >= 0 {
+            return root_page;
+        }
+        self.table_id_to_rootpage
+            .get(&MVTableId::from(root_page))
+            .filter(|e| e.value().is_live())
+            .and_then(|e| e.value().root_page)
+            .map(|r| r as i64)
+            .unwrap_or(root_page)
+    }
+
     /// Build an `Arc<Schema>` from a set of sqlite_schema rows (keyed by rowid).
     /// Shared by recovery (replayed rows) and the checkpoint's snapshot-consistent
     /// `BuildLocalSchemaView` (btree + MVCC-delta merge at snapshot_ts).
@@ -8014,6 +8316,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         "sqlite_schema root_page must be integer".to_string(),
                     ));
                 }
+            };
+            // A negative root is a not-yet-materialized placeholder. If a (passive) checkpoint
+            // has since materialized this object, resolve to its real positive root so the
+            // rebuilt schema reflects the btree page — otherwise integrity_check skips the
+            // negative root and reports its materialized page as orphaned ("never used").
+            let root_page = if root_page < 0 {
+                self.table_id_to_rootpage
+                    .get(&MVTableId::from(root_page))
+                    .filter(|e| e.value().is_live())
+                    .and_then(|e| e.value().root_page)
+                    .map(|r| r as i64)
+                    .unwrap_or(root_page)
+            } else {
+                root_page
             };
             let sql = match record.get_value_opt(4) {
                 Some(ValueRef::Text(v)) => Some(v.as_str()),
@@ -8923,6 +9239,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         "sqlite_schema root_page must be integer".to_string(),
                     ));
                 }
+            };
+            // A negative root is a not-yet-materialized placeholder. If a (passive) checkpoint
+            // has since materialized this object, resolve to its real positive root so the
+            // rebuilt schema reflects the btree page — otherwise integrity_check skips the
+            // negative root and reports its materialized page as orphaned ("never used").
+            let root_page = if root_page < 0 {
+                self.table_id_to_rootpage
+                    .get(&MVTableId::from(root_page))
+                    .filter(|e| e.value().is_live())
+                    .and_then(|e| e.value().root_page)
+                    .map(|r| r as i64)
+                    .unwrap_or(root_page)
+            } else {
+                root_page
             };
             let sql = match record.get_value_opt(4) {
                 Some(ValueRef::Text(v)) => Some(v.as_str()),
